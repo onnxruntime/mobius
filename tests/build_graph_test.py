@@ -3110,17 +3110,24 @@ class TestRegistryCompleteness:
 class TestBuildExternalCacheGraph:
     """Verify ExternalCacheCausalLMTask builds a valid graph."""
 
-    def test_external_cache_graph_builds(self):
-        """Build a Qwen2 model with ExternalCacheCausalLMTask."""
+    MAX_SEQ_LEN = 128
+
+    def _build_external_cache_model(
+        self, model_type: str = "qwen2", **config_overrides
+    ):
+        """Build a model with ExternalCacheCausalLMTask and return (model, config)."""
         from onnx_genai_models.tasks import ExternalCacheCausalLMTask
 
-        config = _base_config()
-        model_cls = registry.get("qwen2")
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
         module = model_cls(config)
-        max_seq_len = 128
-        task = ExternalCacheCausalLMTask(max_seq_len=max_seq_len)
+        task = ExternalCacheCausalLMTask(max_seq_len=self.MAX_SEQ_LEN)
         pkg = task.build(module, config)
-        model = pkg["model"]
+        return pkg["model"], config
+
+    def test_external_cache_graph_builds(self):
+        """Build a Qwen2 model with ExternalCacheCausalLMTask."""
+        model, _ = self._build_external_cache_model()
 
         assert model.graph is not None
         assert len(model.graph.inputs) > 0
@@ -3128,16 +3135,9 @@ class TestBuildExternalCacheGraph:
 
     def test_external_cache_graph_inputs(self):
         """Verify expected inputs: standard + per-layer caches + shared."""
-        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
-
-        config = _base_config()
-        model_cls = registry.get("qwen2")
-        module = model_cls(config)
-        task = ExternalCacheCausalLMTask(max_seq_len=128)
-        pkg = task.build(module, config)
-        model = pkg["model"]
-
+        model, config = self._build_external_cache_model()
         input_names = {inp.name for inp in model.graph.inputs}
+        num_layers = config.num_hidden_layers
 
         # Standard inputs
         assert "input_ids" in input_names
@@ -3145,69 +3145,76 @@ class TestBuildExternalCacheGraph:
         assert "position_ids" in input_names
 
         # Per-layer external cache inputs
-        for i in range(config.num_hidden_layers):
-            assert f"key_cache.{i}" in input_names, f"Missing key_cache.{i}"
-            assert f"value_cache.{i}" in input_names, f"Missing value_cache.{i}"
+        for i in range(num_layers):
+            assert f"key_cache.{i}" in input_names, (
+                f"Missing key_cache.{i}"
+            )
+            assert f"value_cache.{i}" in input_names, (
+                f"Missing value_cache.{i}"
+            )
 
         # Shared cache management inputs
         assert "write_indices" in input_names
         assert "nonpad_kv_seqlen" in input_names
 
+        # Exact count: 3 standard + 2*num_layers caches + 2 shared
+        expected_count = 3 + 2 * num_layers + 2
+        assert len(model.graph.inputs) == expected_count, (
+            f"Expected {expected_count} inputs, got {len(model.graph.inputs)}"
+        )
+
     def test_external_cache_graph_outputs(self):
         """Verify outputs: logits + updated caches per layer."""
-        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
-
-        config = _base_config()
-        model_cls = registry.get("qwen2")
-        module = model_cls(config)
-        task = ExternalCacheCausalLMTask(max_seq_len=128)
-        pkg = task.build(module, config)
-        model = pkg["model"]
-
+        model, config = self._build_external_cache_model()
         output_names = {out.name for out in model.graph.outputs}
+        num_layers = config.num_hidden_layers
 
         assert "logits" in output_names
 
         # Updated caches per layer (not present.{i}.key/value)
-        for i in range(config.num_hidden_layers):
-            assert f"updated_key_cache.{i}" in output_names, f"Missing updated_key_cache.{i}"
+        for i in range(num_layers):
+            assert f"updated_key_cache.{i}" in output_names, (
+                f"Missing updated_key_cache.{i}"
+            )
             assert f"updated_value_cache.{i}" in output_names, (
                 f"Missing updated_value_cache.{i}"
             )
 
         # Should NOT have internal cache outputs
-        assert not any(n.startswith("present.") for n in output_names), (
-            "External cache graph should not have present.* outputs"
+        assert not any(
+            n.startswith("present.") for n in output_names
+        ), "External cache graph should not have present.* outputs"
+
+        # Exact count: 1 logits + 2*num_layers updated caches
+        expected_count = 1 + 2 * num_layers
+        assert len(model.graph.outputs) == expected_count, (
+            f"Expected {expected_count} outputs, got {len(model.graph.outputs)}"
         )
 
     def test_external_cache_has_tensorscatter_and_attention(self):
         """Verify graph contains TensorScatter and Attention ops."""
-        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
-
-        config = _base_config()
-        model_cls = registry.get("qwen2")
-        module = model_cls(config)
-        task = ExternalCacheCausalLMTask(max_seq_len=128)
-        pkg = task.build(module, config)
-        model = pkg["model"]
+        model, _ = self._build_external_cache_model()
 
         op_types = {n.op_type for n in model.graph}
-        assert "TensorScatter" in op_types, "External cache graph should use TensorScatter"
-        assert "Attention" in op_types, "External cache graph should use Attention"
+        assert "TensorScatter" in op_types, (
+            "External cache graph should use TensorScatter"
+        )
+        assert "Attention" in op_types, (
+            "External cache graph should use Attention"
+        )
 
     def test_external_cache_has_initializers(self):
         """Verify the graph has model parameters."""
-        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
-
-        config = _base_config()
-        model_cls = registry.get("qwen2")
-        module = model_cls(config)
-        task = ExternalCacheCausalLMTask(max_seq_len=128)
-        pkg = task.build(module, config)
-        model = pkg["model"]
+        model, _ = self._build_external_cache_model()
 
         init_names = list(model.graph.initializers)
         assert len(init_names) > 0
         assert any("embed_tokens" in n for n in init_names)
         assert any("self_attn" in n for n in init_names)
         assert any("mlp" in n for n in init_names)
+
+    def test_external_cache_graph_validates(self):
+        """Verify the graph survives a serialization round-trip."""
+        model, config = self._build_external_cache_model()
+        proto = ir.serde.serialize_model(model)
+        assert len(proto.SerializeToString()) > 0
