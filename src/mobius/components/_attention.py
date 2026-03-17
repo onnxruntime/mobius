@@ -69,7 +69,13 @@ def _apply_attention(
         calling this function so that cached entries have RoPE baked in.
     """
     if external_cache is not None:
-        # Scatter new K/V into the pre-allocated cache at write_indices
+        # Scatter new K/V into the pre-allocated cache at write_indices.
+        # write_indices [B] is a START POSITION per batch item, not
+        # per-token.  TensorScatter writes:
+        #   cache[b, write_indices[b] + t] = update[b, t]
+        # for all t in range(seq_len).  This handles both prefill
+        # (write_indices=0, seq_len=N) and decode (write_indices=N,
+        # seq_len=1) with the same graph.
         updated_k = op.TensorScatter(
             external_cache.key_cache,
             key,

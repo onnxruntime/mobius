@@ -363,11 +363,19 @@ class ExternalCacheCausalLMTask(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
+        # attention_mask covers the full cache [batch, max_seq_len].
+        # create_attention_bias() slices the last seq_len positions as
+        # query indices, so the mask aligns correctly for both prefill
+        # (seq_len=N, attending to positions 0..N-1) and decode
+        # (seq_len=1, attending to positions 0..nonpad_kv_seqlen-1).
         attention_mask = ir.Value(
             name="attention_mask",
             shape=ir.Shape([batch, max_seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
+        # seq_len is intentionally dynamic: external cache supports both
+        # prefill (seq_len=N tokens) and single-token decode (seq_len=1)
+        # via the start-position semantics of write_indices.
         position_ids = ir.Value(
             name="position_ids",
             shape=ir.Shape([batch, seq_len]),
