@@ -25,6 +25,7 @@ __all__ = [
     "CodecTask",
     "ControlNetTask",
     "DenoisingTask",
+    "ExternalCacheCausalLMTask",
     "FeatureExtractionTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
@@ -55,7 +56,11 @@ from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
 from mobius.tasks._base import ModelTask
-from mobius.tasks._causal_lm import CausalLMTask, HybridCausalLMTask
+from mobius.tasks._causal_lm import (
+    CausalLMTask,
+    ExternalCacheCausalLMTask,
+    HybridCausalLMTask,
+)
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
@@ -74,6 +79,7 @@ from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
+
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
     QwenVLTask,
@@ -90,6 +96,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
+    "external-cache-text-generation": ExternalCacheCausalLMTask,
     "feature-extraction": FeatureExtractionTask,
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,

@@ -3105,3 +3105,109 @@ class TestRegistryCompleteness:
             f"Entries in _KNOWN_UNTESTED_MODEL_TYPES that are no longer "
             f"registered: {sorted(stale)}. Remove them."
         )
+
+
+class TestBuildExternalCacheGraph:
+    """Verify ExternalCacheCausalLMTask builds a valid graph."""
+
+    def test_external_cache_graph_builds(self):
+        """Build a Qwen2 model with ExternalCacheCausalLMTask."""
+        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+
+        config = _base_config()
+        model_cls = registry.get("qwen2")
+        module = model_cls(config)
+        max_seq_len = 128
+        task = ExternalCacheCausalLMTask(max_seq_len=max_seq_len)
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        assert model.graph is not None
+        assert len(model.graph.inputs) > 0
+        assert len(model.graph.outputs) > 0
+
+    def test_external_cache_graph_inputs(self):
+        """Verify expected inputs: standard + per-layer caches + shared."""
+        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+
+        config = _base_config()
+        model_cls = registry.get("qwen2")
+        module = model_cls(config)
+        task = ExternalCacheCausalLMTask(max_seq_len=128)
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        input_names = {inp.name for inp in model.graph.inputs}
+
+        # Standard inputs
+        assert "input_ids" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+
+        # Per-layer external cache inputs
+        for i in range(config.num_hidden_layers):
+            assert f"key_cache.{i}" in input_names, f"Missing key_cache.{i}"
+            assert f"value_cache.{i}" in input_names, f"Missing value_cache.{i}"
+
+        # Shared cache management inputs
+        assert "write_indices" in input_names
+        assert "nonpad_kv_seqlen" in input_names
+
+    def test_external_cache_graph_outputs(self):
+        """Verify outputs: logits + updated caches per layer."""
+        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+
+        config = _base_config()
+        model_cls = registry.get("qwen2")
+        module = model_cls(config)
+        task = ExternalCacheCausalLMTask(max_seq_len=128)
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        output_names = {out.name for out in model.graph.outputs}
+
+        assert "logits" in output_names
+
+        # Updated caches per layer (not present.{i}.key/value)
+        for i in range(config.num_hidden_layers):
+            assert f"updated_key_cache.{i}" in output_names, f"Missing updated_key_cache.{i}"
+            assert f"updated_value_cache.{i}" in output_names, (
+                f"Missing updated_value_cache.{i}"
+            )
+
+        # Should NOT have internal cache outputs
+        assert not any(n.startswith("present.") for n in output_names), (
+            "External cache graph should not have present.* outputs"
+        )
+
+    def test_external_cache_has_tensorscatter_and_attention(self):
+        """Verify graph contains TensorScatter and Attention ops."""
+        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+
+        config = _base_config()
+        model_cls = registry.get("qwen2")
+        module = model_cls(config)
+        task = ExternalCacheCausalLMTask(max_seq_len=128)
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        op_types = {n.op_type for n in model.graph}
+        assert "TensorScatter" in op_types, "External cache graph should use TensorScatter"
+        assert "Attention" in op_types, "External cache graph should use Attention"
+
+    def test_external_cache_has_initializers(self):
+        """Verify the graph has model parameters."""
+        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+
+        config = _base_config()
+        model_cls = registry.get("qwen2")
+        module = model_cls(config)
+        task = ExternalCacheCausalLMTask(max_seq_len=128)
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        init_names = list(model.graph.initializers)
+        assert len(init_names) > 0
+        assert any("embed_tokens" in n for n in init_names)
+        assert any("self_attn" in n for n in init_names)
+        assert any("mlp" in n for n in init_names)

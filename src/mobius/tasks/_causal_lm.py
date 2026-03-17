@@ -10,6 +10,7 @@ from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius.components._attention import ExternalCacheState
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -180,3 +181,180 @@ class HybridCausalLMTask(ModelTask):
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _make_external_cache_inputs(
+    num_layers: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    dtype: ir.DataType,
+    batch: ir.SymbolicDim,
+    max_seq_len: int,
+) -> tuple[list[ir.Value], list[ExternalCacheState]]:
+    """Create external KV cache inputs for ``num_layers`` layers.
+
+    Returns:
+        ``(flat_inputs, external_caches)`` where *flat_inputs* is a flat
+        list suitable for extending ``graph_inputs``, and
+        *external_caches* is a list of :class:`ExternalCacheState` tuples
+        for passing to the module via ``past_key_values``.
+    """
+    kv_hidden = num_key_value_heads * head_dim
+    flat: list[ir.Value] = []
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+
+    for i in range(num_layers):
+        key_cache = ir.Value(
+            name=f"key_cache.{i}",
+            shape=ir.Shape([batch, max_seq_len, kv_hidden]),
+            type=ir.TensorType(dtype),
+        )
+        value_cache = ir.Value(
+            name=f"value_cache.{i}",
+            shape=ir.Shape([batch, max_seq_len, kv_hidden]),
+            type=ir.TensorType(dtype),
+        )
+        flat.extend([key_cache, value_cache])
+        cache_pairs.append((key_cache, value_cache))
+
+    # Shared inputs across all layers
+    write_indices = ir.Value(
+        name="write_indices",
+        shape=ir.Shape([batch]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    nonpad_kv_seqlen = ir.Value(
+        name="nonpad_kv_seqlen",
+        shape=ir.Shape([batch]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    flat.extend([write_indices, nonpad_kv_seqlen])
+
+    # Build ExternalCacheState for each layer (shared indices)
+    external_caches: list[ExternalCacheState] = []
+    for key_cache, value_cache in cache_pairs:
+        external_caches.append(
+            ExternalCacheState(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                write_indices=write_indices,
+                nonpad_kv_seqlen=nonpad_kv_seqlen,
+            )
+        )
+
+    return flat, external_caches
+
+
+def _register_external_cache_outputs(
+    graph: ir.Graph,
+    present_key_values: list[tuple[ir.Value, ir.Value]],
+    dtype: ir.DataType,
+    batch: ir.SymbolicDim,
+    max_seq_len: int,
+    kv_hidden: int,
+) -> None:
+    """Name and register external cache outputs on the graph."""
+    for i, (updated_key, updated_value) in enumerate(present_key_values):
+        updated_key.name = f"updated_key_cache.{i}"
+        updated_value.name = f"updated_value_cache.{i}"
+        updated_key.shape = ir.Shape([batch, max_seq_len, kv_hidden])
+        updated_key.type = ir.TensorType(dtype)
+        updated_value.shape = ir.Shape([batch, max_seq_len, kv_hidden])
+        updated_value.type = ir.TensorType(dtype)
+        graph.outputs.append(updated_key)
+        graph.outputs.append(updated_value)
+
+
+class ExternalCacheCausalLMTask(ModelTask):
+    """Causal LM with externally managed KV cache.
+
+    Uses opset-24 TensorScatter + Attention for external cache management.
+    The caller provides pre-allocated cache buffers and receives updated
+    caches as outputs.
+
+    Inputs:
+        - input_ids: [batch, seq_len] INT64
+        - attention_mask: [batch, max_seq_len] INT64
+        - position_ids: [batch, seq_len] INT64
+        - key_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT per layer
+        - value_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT per layer
+        - write_indices: [batch] INT64
+        - nonpad_kv_seqlen: [batch] INT64
+
+    Outputs:
+        - logits: FLOAT
+        - updated_key_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT
+        - updated_value_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT
+
+    The module's ``forward()`` must accept
+    ``(op, input_ids, attention_mask, position_ids, past_key_values)``
+    and return ``(logits, list_of_(key, value)_tuples)``.  The
+    ``past_key_values`` entries will be :class:`ExternalCacheState` tuples.
+    """
+
+    def __init__(self, max_seq_len: int = 2048):
+        self._max_seq_len = max_seq_len
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, self._max_seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        position_ids = ir.Value(
+            name="position_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [input_ids, attention_mask, position_ids]
+
+        cache_inputs, external_caches = _make_external_cache_inputs(
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            self._max_seq_len,
+        )
+        graph_inputs.extend(cache_inputs)
+
+        graph, builder = _make_graph(graph_inputs)
+        op = builder.op
+
+        # ExternalCacheState objects flow through past_key_values;
+        # DecoderLayer dispatches them to Attention's external_cache.
+        logits, present_key_values = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=external_caches,
+        )
+
+        logits.name = "logits"
+        graph.outputs.append(logits)
+
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        _register_external_cache_outputs(
+            graph,
+            present_key_values,
+            config.dtype,
+            batch,
+            self._max_seq_len,
+            kv_hidden,
+        )
+
+        return ModelPackage({"model": _make_model(graph)}, config=config)
