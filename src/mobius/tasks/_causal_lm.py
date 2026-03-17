@@ -265,6 +265,39 @@ def _register_external_cache_outputs(
         graph.outputs.append(updated_value)
 
 
+def _validate_external_cache_support(module: nn.Module) -> None:
+    """Check that the module's decoder layers support ExternalCacheState.
+
+    Only :class:`DecoderLayer` has the ``isinstance(ExternalCacheState)``
+    dispatch in ``forward()``.  Custom decoder layers will silently unpack
+    the NamedTuple as a regular ``(key, value)`` tuple, producing wrong
+    results.
+
+    Raises:
+        TypeError: If any decoder layer is not a :class:`DecoderLayer`.
+    """
+    from onnx_genai_models.components._decoder import DecoderLayer
+
+    for name, child in module.named_modules():
+        if not isinstance(child, nn.ModuleList):
+            continue
+        for i, layer in enumerate(child):
+            if not isinstance(layer, nn.Module):
+                continue
+            # Only check modules that look like decoder layers
+            # (have self_attn attribute — the hallmark of a decoder layer)
+            if not hasattr(layer, "self_attn"):
+                continue
+            if not isinstance(layer, DecoderLayer):
+                raise TypeError(
+                    f"ExternalCacheCausalLMTask requires decoder layers that "
+                    f"inherit from DecoderLayer, but {name}[{i}] is "
+                    f"{type(layer).__name__}. Either use a compatible model "
+                    f"or add ExternalCacheState dispatch to "
+                    f"{type(layer).__name__}.forward()."
+                )
+
+
 class ExternalCacheCausalLMTask(ModelTask):
     """Causal LM with externally managed KV cache.
 
@@ -298,7 +331,7 @@ class ExternalCacheCausalLMTask(ModelTask):
     ``past_key_values`` entries will be :class:`ExternalCacheState` tuples.
     """
 
-    def __init__(self, max_seq_len: int = 2048):
+    def __init__(self, max_seq_len: int | None = None):
         self._max_seq_len = max_seq_len
 
     def build(
@@ -306,6 +339,16 @@ class ExternalCacheCausalLMTask(ModelTask):
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        max_seq_len = self._max_seq_len
+        if max_seq_len is None:
+            max_seq_len = getattr(config, "max_position_embeddings", 2048)
+
+        # Validate that the module's decoder layers support external cache.
+        # Only DecoderLayer has the isinstance(ExternalCacheState) dispatch;
+        # custom layers will silently unpack the NamedTuple as a regular
+        # tuple, producing wrong results.
+        _validate_external_cache_support(module)
+
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
@@ -316,7 +359,7 @@ class ExternalCacheCausalLMTask(ModelTask):
         )
         attention_mask = ir.Value(
             name="attention_mask",
-            shape=ir.Shape([batch, self._max_seq_len]),
+            shape=ir.Shape([batch, max_seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
         position_ids = ir.Value(
@@ -333,7 +376,7 @@ class ExternalCacheCausalLMTask(ModelTask):
             config.head_dim,
             config.dtype,
             batch,
-            self._max_seq_len,
+            max_seq_len,
         )
         graph_inputs.extend(cache_inputs)
 
@@ -359,7 +402,7 @@ class ExternalCacheCausalLMTask(ModelTask):
             present_key_values,
             config.dtype,
             batch,
-            self._max_seq_len,
+            max_seq_len,
             kv_hidden,
         )
 
