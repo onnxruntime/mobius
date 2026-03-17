@@ -341,7 +341,13 @@ class ExternalCacheCausalLMTask(ModelTask):
     ) -> ModelPackage:
         max_seq_len = self._max_seq_len
         if max_seq_len is None:
-            max_seq_len = getattr(config, "max_position_embeddings", 2048)
+            max_seq_len = getattr(config, "max_position_embeddings", None)
+        if max_seq_len is None or max_seq_len <= 0:
+            raise ValueError(
+                "max_seq_len must be a positive integer. Either pass it to "
+                "ExternalCacheCausalLMTask(max_seq_len=...) or ensure "
+                "config.max_position_embeddings is set."
+            )
 
         # Validate that the module's decoder layers support external cache.
         # Only DecoderLayer has the isinstance(ExternalCacheState) dispatch;

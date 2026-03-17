@@ -3215,6 +3215,6 @@ class TestBuildExternalCacheGraph:
 
     def test_external_cache_graph_validates(self):
         """Verify the graph survives a serialization round-trip."""
-        model, config = self._build_external_cache_model()
+        model, _config = self._build_external_cache_model()
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
