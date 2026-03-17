@@ -63,6 +63,10 @@ def _apply_attention(
         Scatters new key/value into the external cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
+
+    Note:
+        In external cache mode, RoPE must be applied to key *before*
+        calling this function so that cached entries have RoPE baked in.
     """
     if external_cache is not None:
         # Scatter new K/V into the pre-allocated cache at write_indices
@@ -217,8 +221,6 @@ class Attention(nn.Module):
                 key_states = op.Reshape(key_states, [0, 0, -1])
 
         # Apply rotary position embeddings (skip when not provided)
-        # RoPE is applied to K_new BEFORE TensorScatter so cached
-        # entries have RoPE baked in.
         if position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
                 op,
@@ -337,8 +339,6 @@ class Qwen35Attention(nn.Module):
         key_states = op.Reshape(key_states, [0, 0, -1])
 
         # Apply rotary position embeddings
-        # RoPE is applied to K_new BEFORE TensorScatter so cached
-        # entries have RoPE baked in.
         query_states = apply_rotary_pos_emb(
             op,
             x=query_states,

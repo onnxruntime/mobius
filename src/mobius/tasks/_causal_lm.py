@@ -1,7 +1,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Causal language model task with KV cache."""
+"""Causal language model tasks with internal and external KV cache."""
 
 from __future__ import annotations
 
@@ -271,6 +271,12 @@ class ExternalCacheCausalLMTask(ModelTask):
     Uses opset-24 TensorScatter + Attention for external cache management.
     The caller provides pre-allocated cache buffers and receives updated
     caches as outputs.
+
+    Compatible models:
+        Models using the base :class:`DecoderLayer` (Llama, Qwen2, Mistral,
+        etc.) work out of the box.  Custom decoder layers
+        (Qwen35DecoderLayer, Gemma2DecoderLayer, etc.) require their own
+        ``ExternalCacheState`` dispatch to use this task.
 
     Inputs:
         - input_ids: [batch, seq_len] INT64
