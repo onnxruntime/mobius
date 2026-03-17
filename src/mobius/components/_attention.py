@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -16,6 +16,100 @@ from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+
+class ExternalCacheState(NamedTuple):
+    """External KV cache state for opset-24 TensorScatter + Attention.
+
+    When used, the caller manages the KV cache externally. New key/value
+    tokens are scattered into the pre-allocated cache via TensorScatter,
+    and the full cache is passed to the Attention op with
+    ``nonpad_kv_seqlen`` to indicate valid token counts.
+
+    Fields:
+        key_cache: Pre-allocated key cache [B, max_seq, kv_hidden] 3D.
+        value_cache: Pre-allocated value cache [B, max_seq, kv_hidden] 3D.
+        write_indices: Position to write new tokens [B] int64.
+        nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
+    """
+
+    key_cache: ir.Value
+    value_cache: ir.Value
+    write_indices: ir.Value
+    nonpad_kv_seqlen: ir.Value
+
+
+def _apply_attention(
+    op: builder.OpBuilder,
+    query: ir.Value,
+    key: ir.Value,
+    value: ir.Value,
+    attn_mask: ir.Value,
+    past_key: ir.Value | None,
+    past_value: ir.Value | None,
+    *,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    scale: float,
+    external_cache: ExternalCacheState | None = None,
+) -> tuple[ir.Value, ir.Value, ir.Value]:
+    """Apply the ONNX Attention op with internal or external KV cache.
+
+    Internal cache mode (``external_cache is None``):
+        Concatenates ``past_key``/``past_value`` with new key/value
+        internally.  Returns ``(attn_output, present_key, present_value)``.
+
+    External cache mode (``external_cache is not None``):
+        Scatters new key/value into the external cache via TensorScatter,
+        then attends over the full cache using ``nonpad_kv_seqlen``.
+        Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
+    """
+    if external_cache is not None:
+        # Scatter new K/V into the pre-allocated cache at write_indices
+        updated_k = op.TensorScatter(
+            external_cache.key_cache,
+            key,
+            external_cache.write_indices,
+            axis=1,
+        )  # [B, max_seq, kv_hidden]
+        updated_v = op.TensorScatter(
+            external_cache.value_cache,
+            value,
+            external_cache.write_indices,
+            axis=1,
+        )  # [B, max_seq, kv_hidden]
+
+        # Attend over the full cache; nonpad_kv_seqlen tells the op
+        # how many tokens are valid per batch entry
+        attn_output, _, _ = op.Attention(
+            query,
+            updated_k,
+            updated_v,
+            attn_mask,
+            None,  # no past_key (full cache is already provided)
+            None,  # no past_value
+            external_cache.nonpad_kv_seqlen,
+            q_num_heads=num_attention_heads,
+            kv_num_heads=num_key_value_heads,
+            scale=scale,
+            _outputs=3,
+        )
+        return attn_output, updated_k, updated_v
+
+    # Internal cache mode: standard Attention with past KV concatenation
+    attn_output, present_key, present_value = op.Attention(
+        query,
+        key,
+        value,
+        attn_mask,
+        past_key,
+        past_value,
+        q_num_heads=num_attention_heads,
+        kv_num_heads=num_key_value_heads,
+        scale=scale,
+        _outputs=3,
+    )
+    return attn_output, present_key, present_value
 
 
 class Attention(nn.Module):
@@ -102,6 +196,7 @@ class Attention(nn.Module):
         attention_bias: ir.Value,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
+        external_cache: ExternalCacheState | None = None,
     ):
         query_states = self.q_proj(op, hidden_states)
         key_states = self.k_proj(op, hidden_states)
@@ -122,6 +217,8 @@ class Attention(nn.Module):
                 key_states = op.Reshape(key_states, [0, 0, -1])
 
         # Apply rotary position embeddings (skip when not provided)
+        # RoPE is applied to K_new BEFORE TensorScatter so cached
+        # entries have RoPE baked in.
         if position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
                 op,
@@ -140,18 +237,18 @@ class Attention(nn.Module):
                 interleaved=self._rope_interleave,
             )
 
-        # Use ONNX Attention op (opset 23)
-        attn_output, present_key, present_value = op.Attention(
+        attn_output, present_key, present_value = _apply_attention(
+            op,
             query_states,
             key_states,
             value_states,
             attention_bias,
             past_key_value[0] if past_key_value is not None else None,
             past_key_value[1] if past_key_value is not None else None,
-            kv_num_heads=self.num_key_value_heads,
-            q_num_heads=self.num_attention_heads,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
-            _outputs=3,
+            external_cache=external_cache,
         )
 
         attn_output = self.o_proj(op, attn_output)
@@ -217,6 +314,7 @@ class Qwen35Attention(nn.Module):
         attention_bias: ir.Value,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
+        external_cache: ExternalCacheState | None = None,
     ):
         # Q projection (doubled) → split into Q and gate per head
         q_gate = self.q_proj(op, hidden_states)
@@ -239,6 +337,8 @@ class Qwen35Attention(nn.Module):
         key_states = op.Reshape(key_states, [0, 0, -1])
 
         # Apply rotary position embeddings
+        # RoPE is applied to K_new BEFORE TensorScatter so cached
+        # entries have RoPE baked in.
         query_states = apply_rotary_pos_emb(
             op,
             x=query_states,
@@ -256,18 +356,18 @@ class Qwen35Attention(nn.Module):
             interleaved=self._rope_interleave,
         )
 
-        # Use ONNX Attention op (opset 23)
-        attn_output, present_key, present_value = op.Attention(
+        attn_output, present_key, present_value = _apply_attention(
+            op,
             query_states,
             key_states,
             value_states,
             attention_bias,
             past_key_value[0] if past_key_value is not None else None,
             past_key_value[1] if past_key_value is not None else None,
-            kv_num_heads=self.num_key_value_heads,
-            q_num_heads=self.num_attention_heads,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
-            _outputs=3,
+            external_cache=external_cache,
         )
 
         # Output gating: attn_output * sigmoid(gate)
