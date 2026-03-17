@@ -3112,9 +3112,7 @@ class TestBuildExternalCacheGraph:
 
     MAX_SEQ_LEN = 128
 
-    def _build_external_cache_model(
-        self, model_type: str = "qwen2", **config_overrides
-    ):
+    def _build_external_cache_model(self, model_type: str = "qwen2", **config_overrides):
         """Build a model with ExternalCacheCausalLMTask and return (model, config)."""
         from onnx_genai_models.tasks import ExternalCacheCausalLMTask
 
@@ -3146,12 +3144,8 @@ class TestBuildExternalCacheGraph:
 
         # Per-layer external cache inputs
         for i in range(num_layers):
-            assert f"key_cache.{i}" in input_names, (
-                f"Missing key_cache.{i}"
-            )
-            assert f"value_cache.{i}" in input_names, (
-                f"Missing value_cache.{i}"
-            )
+            assert f"key_cache.{i}" in input_names, f"Missing key_cache.{i}"
+            assert f"value_cache.{i}" in input_names, f"Missing value_cache.{i}"
 
         # Shared cache management inputs
         assert "write_indices" in input_names
@@ -3173,17 +3167,15 @@ class TestBuildExternalCacheGraph:
 
         # Updated caches per layer (not present.{i}.key/value)
         for i in range(num_layers):
-            assert f"updated_key_cache.{i}" in output_names, (
-                f"Missing updated_key_cache.{i}"
-            )
+            assert f"updated_key_cache.{i}" in output_names, f"Missing updated_key_cache.{i}"
             assert f"updated_value_cache.{i}" in output_names, (
                 f"Missing updated_value_cache.{i}"
             )
 
         # Should NOT have internal cache outputs
-        assert not any(
-            n.startswith("present.") for n in output_names
-        ), "External cache graph should not have present.* outputs"
+        assert not any(n.startswith("present.") for n in output_names), (
+            "External cache graph should not have present.* outputs"
+        )
 
         # Exact count: 1 logits + 2*num_layers updated caches
         expected_count = 1 + 2 * num_layers
@@ -3196,12 +3188,8 @@ class TestBuildExternalCacheGraph:
         model, _ = self._build_external_cache_model()
 
         op_types = {n.op_type for n in model.graph}
-        assert "TensorScatter" in op_types, (
-            "External cache graph should use TensorScatter"
-        )
-        assert "Attention" in op_types, (
-            "External cache graph should use Attention"
-        )
+        assert "TensorScatter" in op_types, "External cache graph should use TensorScatter"
+        assert "Attention" in op_types, "External cache graph should use Attention"
 
     def test_external_cache_has_initializers(self):
         """Verify the graph has model parameters."""
