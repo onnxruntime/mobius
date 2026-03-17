@@ -89,19 +89,24 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache; nonpad_kv_seqlen tells the op
-        # how many tokens are valid per batch entry
+        # Attend over the full cache.  We pass None for attn_mask and use
+        # is_causal=1 instead — the Attention op handles causal + padding
+        # masking internally via is_causal + nonpad_kv_seqlen.  Using
+        # create_attention_bias() here would produce incorrect causality
+        # during prefill because it cannot represent the relationship
+        # between query positions and the full cache length.
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
             updated_v,
-            attn_mask,
+            None,  # no attn_mask — is_causal handles masking
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
             external_cache.nonpad_kv_seqlen,
             q_num_heads=num_attention_heads,
             kv_num_heads=num_key_value_heads,
             scale=scale,
+            is_causal=1,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v

@@ -87,7 +87,7 @@ class DecoderLayer(nn.Module):
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
-        past_key_value: tuple | None,
+        past_key_value: tuple | ExternalCacheState | None,
     ):
         # Dispatch ExternalCacheState to the external_cache parameter;
         # custom DecoderLayer subclasses must add this check themselves.

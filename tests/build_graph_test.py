@@ -3206,3 +3206,38 @@ class TestBuildExternalCacheGraph:
         model, _config = self._build_external_cache_model()
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
+
+    def test_external_cache_attention_is_causal(self):
+        """Verify Attention ops use is_causal=1 in external cache mode."""
+        model, config = self._build_external_cache_model()
+
+        attention_nodes = [
+            n for n in model.graph if n.op_type == "Attention"
+        ]
+        assert len(attention_nodes) == config.num_hidden_layers
+
+        for node in attention_nodes:
+            is_causal = node.attributes.get("is_causal")
+            assert is_causal is not None, (
+                f"Attention node {node.name} missing is_causal attribute"
+            )
+            assert is_causal.as_int() == 1, (
+                f"Attention node {node.name} should have is_causal=1"
+            )
+
+    def test_external_cache_attention_no_attn_mask_input(self):
+        """Verify Attention ops do NOT receive attn_mask in external cache mode."""
+        model, config = self._build_external_cache_model()
+
+        attention_nodes = [
+            n for n in model.graph if n.op_type == "Attention"
+        ]
+        assert len(attention_nodes) == config.num_hidden_layers
+
+        for node in attention_nodes:
+            # Input 3 (0-indexed) is attn_mask — should be empty/None
+            attn_mask_input = node.inputs[3]
+            assert attn_mask_input is None or attn_mask_input.name == "", (
+                f"Attention node {node.name} should not have attn_mask "
+                f"connected, but got input: {attn_mask_input}"
+            )
