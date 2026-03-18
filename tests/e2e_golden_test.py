@@ -39,11 +39,18 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
 
 
-@pytest.fixture(autouse=True)
-def _use_temp_hf_cache(tmp_path):
-    """Redirect HuggingFace downloads to a temp dir so weights are cleaned up."""
-    cache_dir = str(tmp_path / "hf_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+@pytest.fixture(autouse=True, scope="session")
+def _use_temp_hf_cache(tmp_path_factory):
+    """Redirect HuggingFace downloads to a session-scoped temp dir.
+
+    Uses session scope so models downloaded by one test are reused by
+    others in the same run.  The temp dir is cleaned up when the session
+    ends, preventing unbounded disk growth.
+
+    Each pytest-xdist worker gets its own ``tmp_path_factory`` root, so
+    parallel workers don't collide.
+    """
+    cache_dir = str(tmp_path_factory.mktemp("hf_cache"))
     old = os.environ.get("HF_HOME")
     os.environ["HF_HOME"] = cache_dir
     yield
