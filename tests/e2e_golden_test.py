@@ -17,7 +17,6 @@ Run::
 from __future__ import annotations
 
 import os
-import tempfile
 import warnings
 
 import numpy as np
@@ -58,6 +57,7 @@ def _use_temp_hf_cache(tmp_path):
         os.environ.pop("HF_HOME", None)
     else:
         os.environ["HF_HOME"] = old
+
 
 # ---------------------------------------------------------------------------
 # Test case discovery (runs at collection time)
