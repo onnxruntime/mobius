@@ -95,6 +95,14 @@ def _apply_attention(
         # create_attention_bias() here would produce incorrect causality
         # during prefill because it cannot represent the relationship
         # between query positions and the full cache length.
+        #
+        # NOTE: The ONNX Attention spec supports attn_mask alongside
+        # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
+        # beyond causal + padding).  Currently we rely on is_causal=1 +
+        # nonpad_kv_seqlen for standard LLM causal + padding masking.
+        # TODO: Support user-provided attn_mask in external cache mode
+        # for advanced use cases (e.g., prefix masking, document
+        # boundaries in batched inference).
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
