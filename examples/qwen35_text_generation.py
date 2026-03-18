@@ -564,7 +564,7 @@ def main():
         # ---------------------------------------------------------------
         prompt = args.prompt or "Describe this image in detail."
         print(f"Building 3-model VL pipeline for {args.model!r} ...")
-        pkg = build(args.model, dtype="f32", load_weights=True)
+        pkg = build(args.model, dtype="f16", load_weights=True)
         config = pkg.config
 
         if args.save_to:
@@ -620,7 +620,7 @@ def main():
             args.model,
             task="hybrid-text-generation",
             module_class=Qwen35CausalLMModel,
-            dtype="f32",
+            dtype="f16",
             load_weights=True,
         )
         config = pkg.config
