@@ -100,9 +100,12 @@ def _apply_attention(
         # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
         # beyond causal + padding).  Currently we rely on is_causal=1 +
         # nonpad_kv_seqlen for standard LLM causal + padding masking.
-        # TODO: Support user-provided attn_mask in external cache mode
-        # for advanced use cases (e.g., prefix masking, document
-        # boundaries in batched inference).
+        # TODO(titaiwang): Support user-provided attn_mask in external
+        # cache mode for advanced use cases (e.g., prefix masking,
+        # document boundaries in batched inference).
+        # TODO(titaiwang): Support sliding window (circular cache mode)
+        # with external cache for long-context models that use local
+        # attention windows.
         attn_output, _, _ = op.Attention(
             query,
             updated_k,

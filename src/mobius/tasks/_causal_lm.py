@@ -396,7 +396,8 @@ class ExternalCacheCausalLMTask(ModelTask):
         # DecoderLayer dispatches them to Attention's external_cache.
         # attention_mask=None skips create_attention_bias() — causal
         # masking is handled by is_causal=1 on the Attention op.
-        # See _apply_attention() TODO for future attn_mask support.
+        # See _apply_attention() TODO(titaiwang) for future attn_mask
+        # and sliding window support.
         logits, present_key_values = module(
             op,
             input_ids=input_ids,
