@@ -268,15 +268,34 @@ def _register_external_cache_outputs(
 def _validate_external_cache_support(module: nn.Module) -> None:
     """Check that the module's decoder layers support ExternalCacheState.
 
-    Only :class:`DecoderLayer` has the ``isinstance(ExternalCacheState)``
-    dispatch in ``forward()``.  Custom decoder layers will silently unpack
-    the NamedTuple as a regular ``(key, value)`` tuple, producing wrong
-    results.
+    Only :class:`DecoderLayer` and :class:`MoEDecoderLayer` have the
+    ``isinstance(ExternalCacheState)`` dispatch in ``forward()``.  Custom
+    decoder layers will silently unpack the NamedTuple as a regular
+    ``(key, value)`` tuple, producing wrong results.
+
+    NOTE: The following models are NOT yet supported in external cache
+    mode and will raise TypeError from this check:
+
+    - **Gemma2**: ``Gemma2Attention`` overrides ``forward()`` and calls
+      ``op.Attention`` directly with ``attn_logit_softcapping``,
+      bypassing ``_apply_attention()``.  Needs Attention refactoring to
+      support softcap in the shared path.
+
+    - **GPT-2**: Uses learned positional embeddings (not RoPE).
+      ``_GPT2TextModel.forward()`` unconditionally calls
+      ``create_attention_bias()``, so ``attention_mask=None`` would
+      fail.  Needs position embedding adaptation.
+
+    - **Falcon (ALiBi)**: The ALiBi variant uses ``is_causal=0`` with a
+      position-dependent bias that encodes both causal masking and
+      distance-based attention decay.  This is fundamentally
+      incompatible with the ``is_causal=1`` external cache pattern.
 
     Raises:
-        TypeError: If any decoder layer is not a :class:`DecoderLayer`.
+        TypeError: If any decoder layer is not a supported type.
     """
     from mobius.components._decoder import DecoderLayer
+    from mobius.models.moe import MoEDecoderLayer
 
     for name, child in module.named_modules():
         if not isinstance(child, nn.ModuleList):
@@ -289,12 +308,12 @@ def _validate_external_cache_support(module: nn.Module) -> None:
             # "attn" (GPT-2 style).
             if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
-            if not isinstance(layer, DecoderLayer):
+            if not isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
                 raise TypeError(
                     f"ExternalCacheCausalLMTask requires decoder layers that "
-                    f"inherit from DecoderLayer, but {name}[{i}] is "
-                    f"{type(layer).__name__}. Either use a compatible model "
-                    f"or add ExternalCacheState dispatch to "
+                    f"inherit from DecoderLayer or MoEDecoderLayer, but "
+                    f"{name}[{i}] is {type(layer).__name__}. Either use a "
+                    f"compatible model or add ExternalCacheState dispatch to "
                     f"{type(layer).__name__}.forward()."
                 )
 

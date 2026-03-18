@@ -103,6 +103,16 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         "standard",
     ),
     (
+        "qwen2_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qkv_bias": True,
+        },
+        "external-cache-text-generation",
+        "standard",
+    ),
+    (
         "qwen3_moe",
         {
             "num_local_experts": 4,
@@ -110,6 +120,16 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "attn_qk_norm": True,
         },
         "text-generation",
+        "standard",
+    ),
+    (
+        "qwen3_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qk_norm": True,
+        },
+        "external-cache-text-generation",
         "standard",
     ),
     (
