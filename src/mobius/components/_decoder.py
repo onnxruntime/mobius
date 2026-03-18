@@ -85,7 +85,7 @@ class DecoderLayer(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
+        attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | ExternalCacheState | None,
     ):
@@ -118,8 +118,8 @@ class DecoderLayer(nn.Module):
     def _forward_pre_norm(
         self,
         op: builder.OpBuilder,
-        hidden_states,
-        attention_bias,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | None,
         external_cache: ExternalCacheState | None,
@@ -153,8 +153,8 @@ class DecoderLayer(nn.Module):
     def _forward_post_norm(
         self,
         op: builder.OpBuilder,
-        hidden_states,
-        attention_bias,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | None,
         external_cache: ExternalCacheState | None,

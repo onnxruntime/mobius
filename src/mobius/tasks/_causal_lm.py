@@ -284,9 +284,10 @@ def _validate_external_cache_support(module: nn.Module) -> None:
         for i, layer in enumerate(child):
             if not isinstance(layer, nn.Module):
                 continue
-            # Only check modules that look like decoder layers
-            # (have self_attn attribute — the hallmark of a decoder layer)
-            if not hasattr(layer, "self_attn"):
+            # Check modules that look like decoder layers: they have an
+            # attention sub-module named either "self_attn" (standard) or
+            # "attn" (GPT-2 style).
+            if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
             if not isinstance(layer, DecoderLayer):
                 raise TypeError(

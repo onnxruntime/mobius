@@ -79,7 +79,6 @@ from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
-
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
     QwenVLTask,

@@ -73,7 +73,7 @@ class TextModel(nn.Module):
         self,
         op: builder.OpBuilder,
         input_ids: ir.Value,
-        attention_mask: ir.Value,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
@@ -139,7 +139,7 @@ class CausalLMModel(nn.Module):
         self,
         op: builder.OpBuilder,
         input_ids: ir.Value,
-        attention_mask: ir.Value,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
