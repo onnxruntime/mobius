@@ -3240,3 +3240,26 @@ class TestBuildExternalCacheGraph:
                 f"Attention node {node.name} should not have attn_mask "
                 f"connected, but got input: {attn_mask_input}"
             )
+
+    def test_external_cache_moe_graph_builds(self):
+        """Build a MoE model (qwen2_moe) with ExternalCacheCausalLMTask."""
+        model, _config = self._build_external_cache_model(
+            model_type="qwen2_moe",
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            attn_qkv_bias=True,
+        )
+
+        assert model.graph is not None
+        assert len(model.graph.inputs) > 0
+        assert len(model.graph.outputs) > 0
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        assert "attention_mask" not in input_names
+
+        # Verify TensorScatter and Attention ops are present
+        op_types = {n.op_type for n in model.graph}
+        assert "TensorScatter" in op_types
+        assert "Attention" in op_types

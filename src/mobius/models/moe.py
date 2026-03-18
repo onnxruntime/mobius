@@ -55,7 +55,8 @@ class MoEDecoderLayer(nn.Module):
         position_embeddings: tuple,
         past_key_value: tuple | ExternalCacheState | None,
     ):
-        # Dispatch ExternalCacheState to the external_cache parameter
+        # Dispatch ExternalCacheState to the external_cache parameter;
+        # custom MoEDecoderLayer subclasses must add this check themselves.
         if isinstance(past_key_value, ExternalCacheState):
             external_cache = past_key_value
             past_key_value = None
