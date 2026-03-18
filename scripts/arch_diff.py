@@ -190,6 +190,17 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
 ]
 
 
+def _display_key(model_type: str, task_name: str) -> str:
+    """Build a unique display key for a model entry.
+
+    Returns just ``model_type`` for the default ``text-generation`` task
+    (backward compatible), or ``model_type (task_name)`` otherwise.
+    """
+    if task_name == "text-generation":
+        return model_type
+    return f"{model_type} ({task_name})"
+
+
 # ------------------------------------------------------------------
 # Detect affected model types from git diff
 # ------------------------------------------------------------------
@@ -518,7 +529,8 @@ def main() -> None:
         if model_type not in affected:
             continue
 
-        print(f"Building {model_type} at {args.base_ref} …")
+        display = _display_key(model_type, task_name)
+        print(f"Building {display} at {args.base_ref} …")
         base_pkg = _build_at_ref(
             args.base_ref,
             model_type,
@@ -526,7 +538,7 @@ def main() -> None:
             task_name,
             build_kind,
         )
-        print(f"Building {model_type} at {args.head_ref} …")
+        print(f"Building {display} at {args.head_ref} …")
         head_pkg = _build_at_ref(
             args.head_ref,
             model_type,
@@ -558,7 +570,7 @@ def main() -> None:
                 "_base_node_count": len(base_canon.get("nodes", [])),
                 "_head_node_count": len(head_canon.get("nodes", [])),
             }
-        all_diffs[model_type] = sub_models
+        all_diffs[display] = sub_models
 
     # 3. Render and write
     md = render_markdown(all_diffs)
