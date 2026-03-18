@@ -39,9 +39,13 @@ sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 #   build_kind is "standard", "whisper", or "mamba".
 _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     ("llama", {}, "text-generation", "standard"),
+    ("llama", {}, "external-cache-text-generation", "standard"),
     ("qwen2", {}, "text-generation", "standard"),
+    ("qwen2", {}, "external-cache-text-generation", "standard"),
     ("qwen", {}, "text-generation", "standard"),
+    ("qwen", {}, "external-cache-text-generation", "standard"),
     ("qwen3", {"attn_qk_norm": True}, "text-generation", "standard"),
+    ("qwen3", {"attn_qk_norm": True}, "external-cache-text-generation", "standard"),
     (
         "qwen3_5_text",
         {
@@ -112,6 +116,12 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         "phi3",
         {"partial_rotary_factor": 0.5},
         "text-generation",
+        "standard",
+    ),
+    (
+        "phi3",
+        {"partial_rotary_factor": 0.5},
+        "external-cache-text-generation",
         "standard",
     ),
     (
