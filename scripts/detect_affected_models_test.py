@@ -18,7 +18,7 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from detect_affected_models import (
+from detect_affected_models import (  # noqa: E402
     _build_class_to_source_module,
     _build_import_graph,
     _build_registry_class_to_types,

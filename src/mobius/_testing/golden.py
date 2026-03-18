@@ -194,7 +194,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         data = yaml.safe_load(f)
 
     if not isinstance(data, dict):
-        raise ValueError(f"Expected a YAML mapping in {yaml_path}, got {type(data)}")
+        raise TypeError(f"Expected a YAML mapping in {yaml_path}, got {type(data)}")
 
     # Validate required top-level fields
     _required = ("model_id", "revision", "task_type", "dtype", "level")

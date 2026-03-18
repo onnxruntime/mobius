@@ -431,7 +431,6 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     }
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
-    seq_len = input_ids.shape[1]
     for inp in onnx_model.graph.inputs:
         name = inp.name
         if name in feeds:

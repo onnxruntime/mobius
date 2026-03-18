@@ -478,13 +478,14 @@ def generate_golden_for_case(case: TestCase, json_path: Path, device: str) -> bo
 
     try:
         generator(case, json_path, device)
-        return True
     except Exception as exc:
         print(
             f"  ERROR: {case.case_id}: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         return False
+    else:
+        return True
 
 
 # ---- Main ----

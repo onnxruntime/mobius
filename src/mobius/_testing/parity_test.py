@@ -23,7 +23,7 @@ class TestCompareSynthetic:
         logits = np.random.default_rng(42).standard_normal((1, 100)).astype(np.float32)
         report = compare_synthetic(logits, logits.copy())
         assert report.result == ParityResult.PASS
-        assert report.max_abs_diff == 0.0
+        assert report.max_abs_diff == pytest.approx(0.0, abs=1e-12)
         assert report.cosine_similarity == pytest.approx(1.0, abs=1e-6)
 
     def test_small_diff_passes(self):

@@ -2,7 +2,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Detect which model_types are affected by a set of changed files.
+r"""Detect which model_types are affected by a set of changed files.
 
 Uses AST-based static import analysis (no actual imports) to determine
 which model types need testing when source files change. Designed for

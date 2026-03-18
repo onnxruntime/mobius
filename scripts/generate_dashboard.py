@@ -385,7 +385,7 @@ def _scan_l3_parity_status(models: dict[str, ModelInfo]) -> None:
         return
 
     try:
-        module = importlib.util.module_from_spec(spec)
+        _ = importlib.util.module_from_spec(spec)
         # Don't actually run the test — just load the module-level dicts
         # by extracting them from the source text
         content = parity_test.read_text()
