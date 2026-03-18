@@ -345,7 +345,9 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
                 getattr(vc, "num_hidden_layers", None) or getattr(vc, "depth", None)
             ),
             num_attention_heads=(
-                getattr(vc, "num_attention_heads", None) or getattr(vc, "num_heads", None)
+                getattr(vc, "num_attention_heads", None)
+                or getattr(vc, "num_heads", None)
+                or getattr(vc, "attention_heads", None)
             ),
             image_size=getattr(vc, "image_size", None),
             patch_size=getattr(vc, "patch_size", None),
@@ -1154,8 +1156,8 @@ class ArchitectureConfig(BaseModelConfig):
             )
         if self.num_hidden_layers <= 0:
             errors.append(f"num_hidden_layers must be positive, got {self.num_hidden_layers}")
-        if self.vocab_size <= 0:
-            errors.append(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.vocab_size < 0:
+            errors.append(f"vocab_size must be non-negative, got {self.vocab_size}")
         if self.head_dim <= 0:
             errors.append(f"head_dim must be positive, got {self.head_dim}")
         if (

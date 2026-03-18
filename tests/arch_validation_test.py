@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import resource
 
 import pytest
@@ -215,7 +216,14 @@ class TestArchValidation:
 
         Logs current RSS after graph construction and fails if it
         exceeds the 1.5 GB threshold (leaving headroom below 2 GB).
+
+        Skipped under pytest-xdist because ``ru_maxrss`` reports peak
+        RSS which is cumulative within a worker process and never
+        decreases — giving false positives when a worker runs many tests.
         """
+        if os.environ.get("PYTEST_XDIST_WORKER"):
+            pytest.skip("RSS budget check unreliable under pytest-xdist (cumulative peak RSS)")
+
         pkg = _build_graph(model_type, model_id)
 
         rss = _get_rss_bytes()
