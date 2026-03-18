@@ -16,6 +16,8 @@ Run::
 
 from __future__ import annotations
 
+import os
+import tempfile
 import warnings
 
 import numpy as np
@@ -35,6 +37,20 @@ from mobius._testing.golden import (
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+
+
+@pytest.fixture(autouse=True)
+def _use_temp_hf_cache(tmp_path):
+    """Redirect HuggingFace downloads to a temp dir so weights are cleaned up."""
+    cache_dir = str(tmp_path / "hf_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    old = os.environ.get("HF_HOME")
+    os.environ["HF_HOME"] = cache_dir
+    yield
+    if old is None:
+        os.environ.pop("HF_HOME", None)
+    else:
+        os.environ["HF_HOME"] = old
 
 # ---------------------------------------------------------------------------
 # Test case discovery (runs at collection time)
