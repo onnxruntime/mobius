@@ -276,7 +276,7 @@ def _validate_external_cache_support(module: nn.Module) -> None:
     Raises:
         TypeError: If any decoder layer is not a :class:`DecoderLayer`.
     """
-    from onnx_genai_models.components._decoder import DecoderLayer
+    from mobius.components._decoder import DecoderLayer
 
     for name, child in module.named_modules():
         if not isinstance(child, nn.ModuleList):
@@ -313,7 +313,6 @@ class ExternalCacheCausalLMTask(ModelTask):
 
     Inputs:
         - input_ids: [batch, seq_len] INT64
-        - attention_mask: [batch, max_seq_len] INT64
         - position_ids: [batch, seq_len] INT64
         - key_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT per layer
         - value_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT per layer
@@ -324,6 +323,11 @@ class ExternalCacheCausalLMTask(ModelTask):
         - logits: FLOAT
         - updated_key_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT
         - updated_value_cache.{i}: [batch, max_seq_len, kv_hidden] FLOAT
+
+    Note:
+        No ``attention_mask`` input — causal masking is handled by the
+        Attention op's ``is_causal=1`` attribute, and padding is handled
+        via ``nonpad_kv_seqlen``.
 
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
@@ -363,16 +367,6 @@ class ExternalCacheCausalLMTask(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
-        # attention_mask covers the full cache [batch, max_seq_len].
-        # create_attention_bias() slices the last seq_len positions as
-        # query indices, so the mask aligns correctly for both prefill
-        # (seq_len=N, attending to positions 0..N-1) and decode
-        # (seq_len=1, attending to positions 0..nonpad_kv_seqlen-1).
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, max_seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
         # seq_len is intentionally dynamic: external cache supports both
         # prefill (seq_len=N tokens) and single-token decode (seq_len=1)
         # via the start-position semantics of write_indices.
@@ -382,7 +376,7 @@ class ExternalCacheCausalLMTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph_inputs = [input_ids, attention_mask, position_ids]
+        graph_inputs = [input_ids, position_ids]
 
         cache_inputs, external_caches = _make_external_cache_inputs(
             config.num_hidden_layers,
@@ -399,10 +393,12 @@ class ExternalCacheCausalLMTask(ModelTask):
 
         # ExternalCacheState objects flow through past_key_values;
         # DecoderLayer dispatches them to Attention's external_cache.
+        # attention_mask=None skips create_attention_bias() — causal
+        # masking is handled by is_causal=1 on the Attention op.
         logits, present_key_values = module(
             op,
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=None,
             position_ids=position_ids,
             past_key_values=external_caches,
         )

@@ -3114,7 +3114,7 @@ class TestBuildExternalCacheGraph:
 
     def _build_external_cache_model(self, model_type: str = "qwen2", **config_overrides):
         """Build a model with ExternalCacheCausalLMTask and return (model, config)."""
-        from onnx_genai_models.tasks import ExternalCacheCausalLMTask
+        from mobius.tasks import ExternalCacheCausalLMTask
 
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
@@ -3139,8 +3139,11 @@ class TestBuildExternalCacheGraph:
 
         # Standard inputs
         assert "input_ids" in input_names
-        assert "attention_mask" in input_names
         assert "position_ids" in input_names
+
+        # No attention_mask in external cache mode — causal masking is
+        # handled by is_causal=1 on the Attention op.
+        assert "attention_mask" not in input_names
 
         # Per-layer external cache inputs
         for i in range(num_layers):
@@ -3151,8 +3154,8 @@ class TestBuildExternalCacheGraph:
         assert "write_indices" in input_names
         assert "nonpad_kv_seqlen" in input_names
 
-        # Exact count: 3 standard + 2*num_layers caches + 2 shared
-        expected_count = 3 + 2 * num_layers + 2
+        # Exact count: 2 standard + 2*num_layers caches + 2 shared
+        expected_count = 2 + 2 * num_layers + 2
         assert len(model.graph.inputs) == expected_count, (
             f"Expected {expected_count} inputs, got {len(model.graph.inputs)}"
         )
