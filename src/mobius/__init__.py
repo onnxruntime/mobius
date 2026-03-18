@@ -61,6 +61,7 @@ from mobius._configs import (
     WhisperConfig,
     YolosConfig,
 )
+from mobius._constants import OPSET_VERSION
 from mobius._diffusers_builder import build_diffusers_pipeline
 from mobius._model_package import ModelPackage
 from mobius._registry import (
@@ -69,5 +70,4 @@ from mobius._registry import (
     registry,
 )
 from mobius._weight_loading import apply_weights
-from mobius._constants import OPSET_VERSION
 from mobius.tasks import CausalLMTask, ModelTask

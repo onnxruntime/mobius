@@ -247,8 +247,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         from mobius.integrations.gguf import build_from_gguf
     except ImportError:
         print(
-            "GGUF support requires the gguf package. "
-            "Install with: pip install mobius-ai[gguf]"
+            "GGUF support requires the gguf package. Install with: pip install mobius-ai[gguf]"
         )
         raise SystemExit(1)
 

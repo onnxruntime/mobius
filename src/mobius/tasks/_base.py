@@ -14,9 +14,8 @@ from onnxscript._internal.builder import GraphBuilder
 
 import mobius
 from mobius._configs import BaseModelConfig
-from mobius._model_package import ModelPackage
-
 from mobius._constants import OPSET_VERSION
+from mobius._model_package import ModelPackage
 
 _FUNCTIONS_DOMAIN = "pkg.mobius"
 

@@ -51,9 +51,9 @@ __all__ = [
     "get_task",
 ]
 
+from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
-from mobius._constants import OPSET_VERSION
 from mobius.tasks._base import ModelTask
 from mobius.tasks._causal_lm import CausalLMTask, HybridCausalLMTask
 from mobius.tasks._codec import CodecTask

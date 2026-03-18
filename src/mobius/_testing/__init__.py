@@ -9,6 +9,7 @@ import onnx_ir as ir
 from onnxscript._internal.builder import GraphBuilder
 
 from mobius._configs import ArchitectureConfig
+from mobius._constants import OPSET_VERSION
 from mobius._testing.code_paths import (
     CODE_PATH_INDICATORS as CODE_PATH_INDICATORS,
 )
@@ -63,7 +64,6 @@ from mobius._testing.parity import (
 from mobius._testing.parity import (
     compare_synthetic as compare_synthetic,
 )
-from mobius._constants import OPSET_VERSION
 
 
 def create_test_builder():

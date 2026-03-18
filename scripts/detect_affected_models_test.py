@@ -42,9 +42,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/models/__init__.py") == "shared_infra"
 
     def test_component_file(self):
-        assert (
-            classify_file("src/mobius/components/_attention.py") == "shared_infra"
-        )
+        assert classify_file("src/mobius/components/_attention.py") == "shared_infra"
 
     def test_task_file(self):
         assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
