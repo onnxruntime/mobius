@@ -87,7 +87,7 @@ def _load_hf_config(model_id: str):
 
 
 def _resolve_hf_config(hf_config):
-    """Resolve nested config wrappers (thinker, talker, text).
+    """Resolve nested config wrappers (thinker, talker, text, llm, decoder).
 
     Mirrors the resolution logic in ``build()`` — some models
     wrap the actual config inside a parent config.
@@ -103,6 +103,12 @@ def _resolve_hf_config(hf_config):
             hf_config = thinker
     elif hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
+    elif hasattr(hf_config, "llm_config"):
+        # InternVL2 wraps the LLM config under llm_config
+        hf_config = hf_config.llm_config
+    elif hasattr(hf_config, "decoder"):
+        # VisionEncoderDecoder (TrOCR) wraps decoder config
+        hf_config = hf_config.decoder
     return hf_config, parent_config
 
 
