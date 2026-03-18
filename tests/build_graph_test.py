@@ -3214,9 +3214,7 @@ class TestBuildExternalCacheGraph:
         """Verify Attention ops use is_causal=1 in external cache mode."""
         model, config = self._build_external_cache_model()
 
-        attention_nodes = [
-            n for n in model.graph if n.op_type == "Attention"
-        ]
+        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
 
         for node in attention_nodes:
@@ -3232,9 +3230,7 @@ class TestBuildExternalCacheGraph:
         """Verify Attention ops do NOT receive attn_mask in external cache mode."""
         model, config = self._build_external_cache_model()
 
-        attention_nodes = [
-            n for n in model.graph if n.op_type == "Attention"
-        ]
+        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
 
         for node in attention_nodes:
