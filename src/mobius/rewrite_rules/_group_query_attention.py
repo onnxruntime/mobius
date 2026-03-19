@@ -37,19 +37,30 @@ from onnxscript.rewriter._rewrite_rule import (
 )
 
 
-def _extract_weight(matmul_node):
-    """Extract the weight numpy array from a MatMul node.
+def _extract_weight(proj_node):
+    """Extract the weight numpy array from a projection node.
 
-    Handles the ``Transpose(weight, perm=[1,0]) → MatMul`` pattern
-    commonly emitted by ``Linear`` layers.
+    Handles three patterns emitted by ``Linear`` layers:
+
+    1. ``Transpose(weight, perm=[1,0]) → MatMul(x, w_t)``
+    2. ``MatMul(x, weight)``  (no transpose)
+    3. ``FusedMatMul(x, weight, transB=1)``  (after fused_matmul rewrite)
 
     Returns:
         A tuple ``(numpy_array, is_transposed)`` where
-        ``is_transposed`` is ``True`` when the weight was preceded by a
-        ``Transpose``.  Returns ``(None, False)`` if the weight cannot
-        be extracted (e.g. not a constant initializer).
+        ``is_transposed`` is ``True`` when the weight is stored in
+        ``(out_features, hidden_size)`` layout.  Returns
+        ``(None, False)`` if the weight cannot be extracted.
     """
-    weight_input = matmul_node.inputs[1]
+    if proj_node.op_type == "FusedMatMul":
+        trans_b = proj_node.attributes.get_int("transB", 0)
+        weight_input = proj_node.inputs[1]
+        if weight_input.const_value is None:
+            return None, False
+        return weight_input.const_value.numpy(), bool(trans_b)
+
+    # MatMul — weight may be behind a Transpose
+    weight_input = proj_node.inputs[1]
     producer = weight_input.producer()
 
     if producer is not None and producer.op_type == "Transpose":
@@ -182,34 +193,37 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         """Try to pack Q/K/V projections into a single MatMul.
 
         Traces back from ``q_pre``, ``k_pre``, ``v`` to their producing
-        MatMul ops.  If all three share the same hidden_states input and
-        no QK norm is present, concatenates the weight matrices and
-        returns a single packed QKV output.
+        projection ops (``MatMul`` or ``FusedMatMul``).  If all three
+        share the same hidden_states input and no QK norm is present,
+        concatenates the weight matrices and returns a single packed QKV
+        output.
 
         Returns:
             The packed QKV ``ir.Value`` on success, or ``None`` when
             packing is not possible (e.g. QK norm present, weights not
             materialised, or different hidden_states inputs).
         """
-        # 1. All three must come directly from MatMul (no QK norm)
-        q_matmul = q_pre.producer()
-        k_matmul = k_pre.producer()
-        v_matmul = v.producer()
-        for node in (q_matmul, k_matmul, v_matmul):
-            if node is None or node.op_type != "MatMul":
+        proj_op_types = {"MatMul", "FusedMatMul"}
+
+        # 1. All three must come directly from a projection op (no QK norm)
+        q_proj = q_pre.producer()
+        k_proj = k_pre.producer()
+        v_proj = v.producer()
+        for node in (q_proj, k_proj, v_proj):
+            if node is None or node.op_type not in proj_op_types:
                 return None
 
-        # 2. All three MatMuls must share the same first input
-        if not (q_matmul.inputs[0] is k_matmul.inputs[0] is v_matmul.inputs[0]):
+        # 2. All three projections must share the same first input
+        if not (q_proj.inputs[0] is k_proj.inputs[0] is v_proj.inputs[0]):
             return None
 
-        hidden_states = q_matmul.inputs[0]
+        hidden_states = q_proj.inputs[0]
 
-        # 3. Extract weights, handling optional Transpose
+        # 3. Extract weights, handling Transpose and FusedMatMul
         weights_np = []
         is_transposed = None
-        for matmul in (q_matmul, k_matmul, v_matmul):
-            w_value, transposed = _extract_weight(matmul)
+        for proj in (q_proj, k_proj, v_proj):
+            w_value, transposed = _extract_weight(proj)
             if w_value is None:
                 return None
             # All weights must follow the same pattern
@@ -225,10 +239,18 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         concat_axis = 0 if is_transposed else 1
         w_qkv_np = np.concatenate(weights_np, axis=concat_axis)
 
-        # 5. Create the packed MatMul
+        # 5. Create the packed projection
         packed_weight = op.Constant(value=ir.Tensor(w_qkv_np))
         if is_transposed:
-            # Emit Transpose + MatMul (same pattern as the original)
+            # Use FusedMatMul if source projections were FusedMatMul,
+            # otherwise emit Transpose + MatMul
+            if q_proj.op_type == "FusedMatMul":
+                return op.op(
+                    "FusedMatMul",
+                    inputs=[hidden_states, packed_weight],
+                    domain="com.microsoft",
+                    attributes={"transB": 1},
+                )
             packed_weight_t = op.Transpose(packed_weight, perm=[1, 0])
             return op.MatMul(hidden_states, packed_weight_t)
         return op.MatMul(hidden_states, packed_weight)

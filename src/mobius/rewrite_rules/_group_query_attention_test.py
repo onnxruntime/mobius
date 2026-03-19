@@ -265,3 +265,33 @@ class TestGroupQueryAttentionRules:
         assert "logits" in result
         assert result["logits"].shape == (1, 3, 256)
         session.close()
+
+    def test_packed_qkv_after_fused_matmul_runs_with_ort(self):
+        """Packing works when fused_matmul runs first (--optimize=all)."""
+        from mobius.rewrite_rules import fused_matmul_rules
+
+        model = registry.get("llama")(_LLAMA_CONFIG)
+        pkg = build_from_module(model, _LLAMA_CONFIG)
+        m = pkg["model"]
+        fill_random_weights(m)
+
+        matmul_before = count_ops(m)["MatMul"]
+
+        # Apply fused_matmul first, then GQA (mirrors --optimize=all)
+        rewrite(m, pattern_rewrite_rules=fused_matmul_rules())
+        assert count_ops(m).get("FusedMatMul", 0) > 0
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        counts = count_ops(m)
+        assert counts["GroupQueryAttention"] == 2
+        # FusedMatMul count should decrease: 3 Q/K/V → 1 packed per layer
+        fused_after = counts.get("FusedMatMul", 0)
+        num_layers = _LLAMA_CONFIG.num_hidden_layers
+        assert fused_after <= matmul_before - 2 * num_layers
+
+        session = OnnxModelSession(m)
+        feeds = make_prefill_feeds(session)
+        result = session.run(feeds)
+        assert "logits" in result
+        assert result["logits"].shape == (1, 3, 256)
+        session.close()
