@@ -293,7 +293,11 @@ class PackQKVForGQA(RewriteRuleClassBase):
     data files for large models.
     """
 
-    _pack_counter: int = 0
+    _pack_counter: int
+
+    def __init__(self):
+        super().__init__()
+        self._pack_counter = 0
 
     # ------------------------------------------------------------------ pattern
 
