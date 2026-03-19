@@ -21,7 +21,7 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._attention import ExternalCacheState
+from mobius.components._attention import StaticCacheState
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -53,15 +53,15 @@ class MoEDecoderLayer(nn.Module):
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
-        past_key_value: tuple | ExternalCacheState | None,
+        past_key_value: tuple | StaticCacheState | None,
     ):
-        # Dispatch ExternalCacheState to the external_cache parameter;
+        # Dispatch StaticCacheState to the static_cache parameter;
         # custom MoEDecoderLayer subclasses must add this check themselves.
-        if isinstance(past_key_value, ExternalCacheState):
-            external_cache = past_key_value
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
             past_key_value = None
         else:
-            external_cache = None
+            static_cache = None
 
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
@@ -72,7 +72,7 @@ class MoEDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             position_embeddings=position_embeddings,
             past_key_value=past_key_value,
-            external_cache=external_cache,
+            static_cache=static_cache,
         )
         hidden_states = op.Add(residual, attn_output)
 
@@ -130,7 +130,7 @@ class MoETextModel(nn.Module):
         hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        # When attention_mask is None (external cache mode), skip bias
+        # When attention_mask is None (static cache mode), skip bias
         # creation entirely — the Attention op uses is_causal=1 instead.
         if attention_mask is not None:
             attention_bias = create_attention_bias(

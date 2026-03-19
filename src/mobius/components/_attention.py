@@ -18,10 +18,10 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-class ExternalCacheState(NamedTuple):
-    """External KV cache state for opset-24 TensorScatter + Attention.
+class StaticCacheState(NamedTuple):
+    """Static KV cache state for opset-24 TensorScatter + Attention.
 
-    When used, the caller manages the KV cache externally. New key/value
+    When used, the caller manages the KV cache statically. New key/value
     tokens are scattered into the pre-allocated cache via TensorScatter,
     and the full cache is passed to the Attention op with
     ``nonpad_kv_seqlen`` to indicate valid token counts.
@@ -51,24 +51,24 @@ def _apply_attention(
     num_attention_heads: int,
     num_key_value_heads: int,
     scale: float,
-    external_cache: ExternalCacheState | None = None,
+    static_cache: StaticCacheState | None = None,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
-    """Apply the ONNX Attention op with internal or external KV cache.
+    """Apply the ONNX Attention op with internal or static KV cache.
 
-    Internal cache mode (``external_cache is None``):
+    Dynamic cache mode (``static_cache is None``):
         Concatenates ``past_key``/``past_value`` with new key/value
         internally.  Returns ``(attn_output, present_key, present_value)``.
 
-    External cache mode (``external_cache is not None``):
-        Scatters new key/value into the external cache via TensorScatter,
+    Static cache mode (``static_cache is not None``):
+        Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
     Note:
-        In external cache mode, RoPE must be applied to key *before*
+        In static cache mode, RoPE must be applied to key *before*
         calling this function so that cached entries have RoPE baked in.
     """
-    if external_cache is not None:
+    if static_cache is not None:
         # Scatter new K/V into the pre-allocated cache at write_indices.
         # write_indices [B] is a START POSITION per batch item, not
         # per-token.  TensorScatter writes:
@@ -77,15 +77,15 @@ def _apply_attention(
         # (write_indices=0, seq_len=N) and decode (write_indices=N,
         # seq_len=1) with the same graph.
         updated_k = op.TensorScatter(
-            external_cache.key_cache,
+            static_cache.key_cache,
             key,
-            external_cache.write_indices,
+            static_cache.write_indices,
             axis=1,
         )  # [B, max_seq, kv_hidden]
         updated_v = op.TensorScatter(
-            external_cache.value_cache,
+            static_cache.value_cache,
             value,
-            external_cache.write_indices,
+            static_cache.write_indices,
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
@@ -104,7 +104,7 @@ def _apply_attention(
         # cache mode for advanced use cases (e.g., prefix masking,
         # document boundaries in batched inference).
         # TODO(titaiwang): Support sliding window (circular cache mode)
-        # with external cache for long-context models that use local
+        # with static cache for long-context models that use local
         # attention windows.
         attn_output, _, _ = op.Attention(
             query,
@@ -113,7 +113,7 @@ def _apply_attention(
             None,  # no attn_mask — is_causal handles masking
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
-            external_cache.nonpad_kv_seqlen,
+            static_cache.nonpad_kv_seqlen,
             q_num_heads=num_attention_heads,
             kv_num_heads=num_key_value_heads,
             scale=scale,
@@ -122,7 +122,7 @@ def _apply_attention(
         )
         return attn_output, updated_k, updated_v
 
-    # Internal cache mode: standard Attention with past KV concatenation
+    # Dynamic cache mode: standard Attention with past KV concatenation
     attn_output, present_key, present_value = op.Attention(
         query,
         key,
@@ -222,7 +222,7 @@ class Attention(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
-        external_cache: ExternalCacheState | None = None,
+        static_cache: StaticCacheState | None = None,
     ):
         query_states = self.q_proj(op, hidden_states)
         key_states = self.k_proj(op, hidden_states)
@@ -272,7 +272,7 @@ class Attention(nn.Module):
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
-            external_cache=external_cache,
+            static_cache=static_cache,
         )
 
         attn_output = self.o_proj(op, attn_output)
@@ -338,7 +338,7 @@ class Qwen35Attention(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
-        external_cache: ExternalCacheState | None = None,
+        static_cache: StaticCacheState | None = None,
     ):
         # Q projection (doubled) → split into Q and gate per head
         q_gate = self.q_proj(op, hidden_states)
@@ -389,7 +389,7 @@ class Qwen35Attention(nn.Module):
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
-            external_cache=external_cache,
+            static_cache=static_cache,
         )
 
         # Output gating: attn_output * sigmoid(gate)

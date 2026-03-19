@@ -39,13 +39,13 @@ sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 #   build_kind is "standard", "whisper", or "mamba".
 _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     ("llama", {}, "text-generation", "standard"),
-    ("llama", {}, "external-cache-text-generation", "standard"),
+    ("llama", {}, "static-cache-text-generation", "standard"),
     ("qwen2", {}, "text-generation", "standard"),
-    ("qwen2", {}, "external-cache-text-generation", "standard"),
+    ("qwen2", {}, "static-cache-text-generation", "standard"),
     ("qwen", {}, "text-generation", "standard"),
-    ("qwen", {}, "external-cache-text-generation", "standard"),
+    ("qwen", {}, "static-cache-text-generation", "standard"),
     ("qwen3", {"attn_qk_norm": True}, "text-generation", "standard"),
-    ("qwen3", {"attn_qk_norm": True}, "external-cache-text-generation", "standard"),
+    ("qwen3", {"attn_qk_norm": True}, "static-cache-text-generation", "standard"),
     (
         "qwen3_5_text",
         {
@@ -109,7 +109,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "num_experts_per_tok": 2,
             "attn_qkv_bias": True,
         },
-        "external-cache-text-generation",
+        "static-cache-text-generation",
         "standard",
     ),
     (
@@ -129,7 +129,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "num_experts_per_tok": 2,
             "attn_qk_norm": True,
         },
-        "external-cache-text-generation",
+        "static-cache-text-generation",
         "standard",
     ),
     (
@@ -141,7 +141,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     (
         "phi3",
         {"partial_rotary_factor": 0.5},
-        "external-cache-text-generation",
+        "static-cache-text-generation",
         "standard",
     ),
     (

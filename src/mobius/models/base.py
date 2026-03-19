@@ -84,7 +84,7 @@ class TextModel(nn.Module):
             hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        # When attention_mask is None (external cache mode), skip bias
+        # When attention_mask is None (static cache mode), skip bias
         # creation entirely — the Attention op uses is_causal=1 instead.
         if attention_mask is not None:
             attention_bias = create_attention_bias(

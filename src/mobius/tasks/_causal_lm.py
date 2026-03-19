@@ -1,7 +1,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Causal language model tasks with internal and external KV cache."""
+"""Causal language model tasks with internal and static KV cache."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
-from mobius.components._attention import ExternalCacheState
+from mobius.components._attention import StaticCacheState
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -183,20 +183,20 @@ class HybridCausalLMTask(ModelTask):
         return ModelPackage({"model": model}, config=config)
 
 
-def _make_external_cache_inputs(
+def _make_static_cache_inputs(
     num_layers: int,
     num_key_value_heads: int,
     head_dim: int,
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     max_seq_len: int,
-) -> tuple[list[ir.Value], list[ExternalCacheState]]:
-    """Create external KV cache inputs for ``num_layers`` layers.
+) -> tuple[list[ir.Value], list[StaticCacheState]]:
+    """Create static KV cache inputs for ``num_layers`` layers.
 
     Returns:
-        ``(flat_inputs, external_caches)`` where *flat_inputs* is a flat
+        ``(flat_inputs, static_caches)`` where *flat_inputs* is a flat
         list suitable for extending ``graph_inputs``, and
-        *external_caches* is a list of :class:`ExternalCacheState` tuples
+        *static_caches* is a list of :class:`StaticCacheState` tuples
         for passing to the module via ``past_key_values``.
     """
     kv_hidden = num_key_value_heads * head_dim
@@ -230,11 +230,11 @@ def _make_external_cache_inputs(
     )
     flat.extend([write_indices, nonpad_kv_seqlen])
 
-    # Build ExternalCacheState for each layer (shared indices)
-    external_caches: list[ExternalCacheState] = []
+    # Build StaticCacheState for each layer (shared indices)
+    static_caches: list[StaticCacheState] = []
     for key_cache, value_cache in cache_pairs:
-        external_caches.append(
-            ExternalCacheState(
+        static_caches.append(
+            StaticCacheState(
                 key_cache=key_cache,
                 value_cache=value_cache,
                 write_indices=write_indices,
@@ -242,10 +242,10 @@ def _make_external_cache_inputs(
             )
         )
 
-    return flat, external_caches
+    return flat, static_caches
 
 
-def _register_external_cache_outputs(
+def _register_static_cache_outputs(
     graph: ir.Graph,
     present_key_values: list[tuple[ir.Value, ir.Value]],
     dtype: ir.DataType,
@@ -253,7 +253,7 @@ def _register_external_cache_outputs(
     max_seq_len: int,
     kv_hidden: int,
 ) -> None:
-    """Name and register external cache outputs on the graph."""
+    """Name and register static cache outputs on the graph."""
     for i, (updated_key, updated_value) in enumerate(present_key_values):
         updated_key.name = f"updated_key_cache.{i}"
         updated_value.name = f"updated_value_cache.{i}"
@@ -265,15 +265,15 @@ def _register_external_cache_outputs(
         graph.outputs.append(updated_value)
 
 
-def _validate_external_cache_support(module: nn.Module) -> None:
-    """Check that the module's decoder layers support ExternalCacheState.
+def _validate_static_cache_support(module: nn.Module) -> None:
+    """Check that the module's decoder layers support StaticCacheState.
 
     Only :class:`DecoderLayer` and :class:`MoEDecoderLayer` have the
-    ``isinstance(ExternalCacheState)`` dispatch in ``forward()``.  Custom
+    ``isinstance(StaticCacheState)`` dispatch in ``forward()``.  Custom
     decoder layers will silently unpack the NamedTuple as a regular
     ``(key, value)`` tuple, producing wrong results.
 
-    NOTE: The following models are NOT yet supported in external cache
+    NOTE: The following models are NOT yet supported in static cache
     mode and will raise TypeError from this check:
 
     - **Gemma2**: ``Gemma2Attention`` overrides ``forward()`` and calls
@@ -289,7 +289,7 @@ def _validate_external_cache_support(module: nn.Module) -> None:
     - **Falcon (ALiBi)**: The ALiBi variant uses ``is_causal=0`` with a
       position-dependent bias that encodes both causal masking and
       distance-based attention decay.  This is fundamentally
-      incompatible with the ``is_causal=1`` external cache pattern.
+      incompatible with the ``is_causal=1`` static cache pattern.
 
     Raises:
         TypeError: If any decoder layer is not a supported type.
@@ -310,18 +310,18 @@ def _validate_external_cache_support(module: nn.Module) -> None:
                 continue
             if not isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
                 raise TypeError(
-                    f"ExternalCacheCausalLMTask requires decoder layers that "
+                    f"StaticCacheCausalLMTask requires decoder layers that "
                     f"inherit from DecoderLayer or MoEDecoderLayer, but "
                     f"{name}[{i}] is {type(layer).__name__}. Either use a "
-                    f"compatible model or add ExternalCacheState dispatch to "
+                    f"compatible model or add StaticCacheState dispatch to "
                     f"{type(layer).__name__}.forward()."
                 )
 
 
-class ExternalCacheCausalLMTask(ModelTask):
-    """Causal LM with externally managed KV cache.
+class StaticCacheCausalLMTask(ModelTask):
+    """Causal LM with statically managed KV cache.
 
-    Uses opset-24 TensorScatter + Attention for external cache management.
+    Uses opset-24 TensorScatter + Attention for static cache management.
     The caller provides pre-allocated cache buffers and receives updated
     caches as outputs.
 
@@ -329,7 +329,7 @@ class ExternalCacheCausalLMTask(ModelTask):
         Models using the base :class:`DecoderLayer` (Llama, Qwen2, Mistral,
         etc.) work out of the box.  Custom decoder layers
         (Qwen35DecoderLayer, Gemma2DecoderLayer, etc.) require their own
-        ``ExternalCacheState`` dispatch to use this task.
+        ``StaticCacheState`` dispatch to use this task.
 
     Inputs:
         - input_ids: [batch, seq_len] INT64
@@ -352,7 +352,7 @@ class ExternalCacheCausalLMTask(ModelTask):
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
     and return ``(logits, list_of_(key, value)_tuples)``.  The
-    ``past_key_values`` entries will be :class:`ExternalCacheState` tuples.
+    ``past_key_values`` entries will be :class:`StaticCacheState` tuples.
     """
 
     def __init__(self, max_seq_len: int | None = None):
@@ -369,15 +369,15 @@ class ExternalCacheCausalLMTask(ModelTask):
         if max_seq_len is None or max_seq_len <= 0:
             raise ValueError(
                 "max_seq_len must be a positive integer. Either pass it to "
-                "ExternalCacheCausalLMTask(max_seq_len=...) or ensure "
+                "StaticCacheCausalLMTask(max_seq_len=...) or ensure "
                 "config.max_position_embeddings is set."
             )
 
-        # Validate that the module's decoder layers support external cache.
-        # Only DecoderLayer has the isinstance(ExternalCacheState) dispatch;
+        # Validate that the module's decoder layers support static cache.
+        # Only DecoderLayer has the isinstance(StaticCacheState) dispatch;
         # custom layers will silently unpack the NamedTuple as a regular
         # tuple, producing wrong results.
-        _validate_external_cache_support(module)
+        _validate_static_cache_support(module)
 
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -387,7 +387,7 @@ class ExternalCacheCausalLMTask(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
-        # seq_len is intentionally dynamic: external cache supports both
+        # seq_len is intentionally dynamic: static cache supports both
         # prefill (seq_len=N tokens) and single-token decode (seq_len=1)
         # via the start-position semantics of write_indices.
         position_ids = ir.Value(
@@ -398,7 +398,7 @@ class ExternalCacheCausalLMTask(ModelTask):
 
         graph_inputs = [input_ids, position_ids]
 
-        cache_inputs, external_caches = _make_external_cache_inputs(
+        cache_inputs, static_caches = _make_static_cache_inputs(
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -411,8 +411,8 @@ class ExternalCacheCausalLMTask(ModelTask):
         graph, builder = _make_graph(graph_inputs)
         op = builder.op
 
-        # ExternalCacheState objects flow through past_key_values;
-        # DecoderLayer dispatches them to Attention's external_cache.
+        # StaticCacheState objects flow through past_key_values;
+        # DecoderLayer dispatches them to Attention's static_cache.
         # attention_mask=None skips create_attention_bias() — causal
         # masking is handled by is_causal=1 on the Attention op.
         # See _apply_attention() TODO(titaiwang) for future attn_mask
@@ -422,14 +422,14 @@ class ExternalCacheCausalLMTask(ModelTask):
             input_ids=input_ids,
             attention_mask=None,
             position_ids=position_ids,
-            past_key_values=external_caches,
+            past_key_values=static_caches,
         )
 
         logits.name = "logits"
         graph.outputs.append(logits)
 
         kv_hidden = config.num_key_value_heads * config.head_dim
-        _register_external_cache_outputs(
+        _register_static_cache_outputs(
             graph,
             present_key_values,
             config.dtype,

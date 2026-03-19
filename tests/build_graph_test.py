@@ -3107,33 +3107,33 @@ class TestRegistryCompleteness:
         )
 
 
-class TestBuildExternalCacheGraph:
-    """Verify ExternalCacheCausalLMTask builds a valid graph."""
+class TestBuildStaticCacheGraph:
+    """Verify StaticCacheCausalLMTask builds a valid graph."""
 
     MAX_SEQ_LEN = 128
 
-    def _build_external_cache_model(self, model_type: str = "qwen2", **config_overrides):
-        """Build a model with ExternalCacheCausalLMTask and return (model, config)."""
-        from mobius.tasks import ExternalCacheCausalLMTask
+    def _build_static_cache_model(self, model_type: str = "qwen2", **config_overrides):
+        """Build a model with StaticCacheCausalLMTask and return (model, config)."""
+        from mobius.tasks import StaticCacheCausalLMTask
 
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
-        task = ExternalCacheCausalLMTask(max_seq_len=self.MAX_SEQ_LEN)
+        task = StaticCacheCausalLMTask(max_seq_len=self.MAX_SEQ_LEN)
         pkg = task.build(module, config)
         return pkg["model"], config
 
-    def test_external_cache_graph_builds(self):
-        """Build a Qwen2 model with ExternalCacheCausalLMTask."""
-        model, _ = self._build_external_cache_model()
+    def test_static_cache_graph_builds(self):
+        """Build a Qwen2 model with StaticCacheCausalLMTask."""
+        model, _ = self._build_static_cache_model()
 
         assert model.graph is not None
         assert len(model.graph.inputs) > 0
         assert len(model.graph.outputs) > 0
 
-    def test_external_cache_graph_inputs(self):
+    def test_static_cache_graph_inputs(self):
         """Verify expected inputs: standard + per-layer caches + shared."""
-        model, config = self._build_external_cache_model()
+        model, config = self._build_static_cache_model()
         input_names = {inp.name for inp in model.graph.inputs}
         num_layers = config.num_hidden_layers
 
@@ -3141,11 +3141,11 @@ class TestBuildExternalCacheGraph:
         assert "input_ids" in input_names
         assert "position_ids" in input_names
 
-        # No attention_mask in external cache mode — causal masking is
+        # No attention_mask in static cache mode — causal masking is
         # handled by is_causal=1 on the Attention op.
         assert "attention_mask" not in input_names
 
-        # Per-layer external cache inputs
+        # Per-layer static cache inputs
         for i in range(num_layers):
             assert f"key_cache.{i}" in input_names, f"Missing key_cache.{i}"
             assert f"value_cache.{i}" in input_names, f"Missing value_cache.{i}"
@@ -3160,9 +3160,9 @@ class TestBuildExternalCacheGraph:
             f"Expected {expected_count} inputs, got {len(model.graph.inputs)}"
         )
 
-    def test_external_cache_graph_outputs(self):
+    def test_static_cache_graph_outputs(self):
         """Verify outputs: logits + updated caches per layer."""
-        model, config = self._build_external_cache_model()
+        model, config = self._build_static_cache_model()
         output_names = {out.name for out in model.graph.outputs}
         num_layers = config.num_hidden_layers
 
@@ -3175,9 +3175,9 @@ class TestBuildExternalCacheGraph:
                 f"Missing updated_value_cache.{i}"
             )
 
-        # Should NOT have internal cache outputs
+        # Should NOT have dynamic cache outputs
         assert not any(n.startswith("present.") for n in output_names), (
-            "External cache graph should not have present.* outputs"
+            "Static cache graph should not have present.* outputs"
         )
 
         # Exact count: 1 logits + 2*num_layers updated caches
@@ -3186,17 +3186,17 @@ class TestBuildExternalCacheGraph:
             f"Expected {expected_count} outputs, got {len(model.graph.outputs)}"
         )
 
-    def test_external_cache_has_tensorscatter_and_attention(self):
+    def test_static_cache_has_tensorscatter_and_attention(self):
         """Verify graph contains TensorScatter and Attention ops."""
-        model, _ = self._build_external_cache_model()
+        model, _ = self._build_static_cache_model()
 
         op_types = {n.op_type for n in model.graph}
-        assert "TensorScatter" in op_types, "External cache graph should use TensorScatter"
-        assert "Attention" in op_types, "External cache graph should use Attention"
+        assert "TensorScatter" in op_types, "Static cache graph should use TensorScatter"
+        assert "Attention" in op_types, "Static cache graph should use Attention"
 
-    def test_external_cache_has_initializers(self):
+    def test_static_cache_has_initializers(self):
         """Verify the graph has model parameters."""
-        model, _ = self._build_external_cache_model()
+        model, _ = self._build_static_cache_model()
 
         init_names = list(model.graph.initializers)
         assert len(init_names) > 0
@@ -3204,15 +3204,15 @@ class TestBuildExternalCacheGraph:
         assert any("self_attn" in n for n in init_names)
         assert any("mlp" in n for n in init_names)
 
-    def test_external_cache_graph_validates(self):
+    def test_static_cache_graph_validates(self):
         """Verify the graph survives a serialization round-trip."""
-        model, _config = self._build_external_cache_model()
+        model, _config = self._build_static_cache_model()
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
 
-    def test_external_cache_attention_is_causal(self):
-        """Verify Attention ops use is_causal=1 in external cache mode."""
-        model, config = self._build_external_cache_model()
+    def test_static_cache_attention_is_causal(self):
+        """Verify Attention ops use is_causal=1 in static cache mode."""
+        model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
@@ -3226,9 +3226,9 @@ class TestBuildExternalCacheGraph:
                 f"Attention node {node.name} should have is_causal=1"
             )
 
-    def test_external_cache_attention_no_attn_mask_input(self):
-        """Verify Attention ops do NOT receive attn_mask in external cache mode."""
-        model, config = self._build_external_cache_model()
+    def test_static_cache_attention_no_attn_mask_input(self):
+        """Verify Attention ops do NOT receive attn_mask in static cache mode."""
+        model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
@@ -3241,9 +3241,9 @@ class TestBuildExternalCacheGraph:
                 f"connected, but got input: {attn_mask_input}"
             )
 
-    def test_external_cache_moe_graph_builds(self):
-        """Build a MoE model (qwen2_moe) with ExternalCacheCausalLMTask."""
-        model, _config = self._build_external_cache_model(
+    def test_static_cache_moe_graph_builds(self):
+        """Build a MoE model (qwen2_moe) with StaticCacheCausalLMTask."""
+        model, _config = self._build_static_cache_model(
             model_type="qwen2_moe",
             num_local_experts=4,
             num_experts_per_tok=2,

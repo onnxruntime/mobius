@@ -25,7 +25,7 @@ __all__ = [
     "EncoderAttention",
     "EncoderDecoderAttention",
     "EncoderLayer",
-    "ExternalCacheState",
+    "StaticCacheState",
     "Gemma3MultiModalProjector",
     "GroupNorm",
     "INT64_MAX",
@@ -101,8 +101,8 @@ __all__ = [
 from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
-    ExternalCacheState,
     Qwen35Attention,
+    StaticCacheState,
 )
 from mobius.components._audio import ConformerEncoder
 from mobius.components._codec_conv import (

@@ -9,7 +9,7 @@
       "num_models": 1,
       "model_size_bytes": 435496
     },
-    "llama (external-cache-text-generation)": {
+    "llama (static-cache-text-generation)": {
       "num_nodes": 58,
       "num_models": 1,
       "model_size_bytes": 435456
@@ -19,7 +19,7 @@
       "num_models": 1,
       "model_size_bytes": 435496
     },
-    "qwen2 (external-cache-text-generation)": {
+    "qwen2 (static-cache-text-generation)": {
       "num_nodes": 58,
       "num_models": 1,
       "model_size_bytes": 435456
@@ -29,7 +29,7 @@
       "num_models": 1,
       "model_size_bytes": 431400
     },
-    "phi3 (external-cache-text-generation)": {
+    "phi3 (static-cache-text-generation)": {
       "num_nodes": 58,
       "num_models": 1,
       "model_size_bytes": 431360

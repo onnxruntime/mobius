@@ -92,9 +92,9 @@ def _display_key(model_type: str, task_name: str) -> str:
 # Top 10 diverse models spanning causal-LM, encoder-only, and seq2seq tasks.
 BENCHMARK_MODELS: list[_BenchEntry] = [
     _BenchEntry("llama", {}, "text-generation", "standard"),
-    _BenchEntry("llama", {}, "external-cache-text-generation", "standard"),
+    _BenchEntry("llama", {}, "static-cache-text-generation", "standard"),
     _BenchEntry("qwen2", {}, "text-generation", "standard"),
-    _BenchEntry("qwen2", {}, "external-cache-text-generation", "standard"),
+    _BenchEntry("qwen2", {}, "static-cache-text-generation", "standard"),
     _BenchEntry(
         "phi3",
         {"partial_rotary_factor": 0.5},
@@ -104,7 +104,7 @@ BENCHMARK_MODELS: list[_BenchEntry] = [
     _BenchEntry(
         "phi3",
         {"partial_rotary_factor": 0.5},
-        "external-cache-text-generation",
+        "static-cache-text-generation",
         "standard",
     ),
     _BenchEntry(

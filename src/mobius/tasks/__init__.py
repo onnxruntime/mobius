@@ -25,7 +25,7 @@ __all__ = [
     "CodecTask",
     "ControlNetTask",
     "DenoisingTask",
-    "ExternalCacheCausalLMTask",
+    "StaticCacheCausalLMTask",
     "FeatureExtractionTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
@@ -58,8 +58,8 @@ from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
 from mobius.tasks._base import ModelTask
 from mobius.tasks._causal_lm import (
     CausalLMTask,
-    ExternalCacheCausalLMTask,
     HybridCausalLMTask,
+    StaticCacheCausalLMTask,
 )
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
@@ -95,7 +95,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
-    "external-cache-text-generation": ExternalCacheCausalLMTask,
+    "static-cache-text-generation": StaticCacheCausalLMTask,
     "feature-extraction": FeatureExtractionTask,
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
