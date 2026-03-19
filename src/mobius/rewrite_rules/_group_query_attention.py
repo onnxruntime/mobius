@@ -346,15 +346,20 @@ class PackQKVForGQA(RewriteRuleClassBase):
         if not (q_proj.inputs[0] is k_proj.inputs[0] is v_proj.inputs[0]):
             return result.fail("Q/K/V don't share hidden_states")
 
-        # All weights must be extractable constants
+        # All weights must be extractable constants with consistent layout
+        is_transposed = None
         for name, proj in [
             ("q", q_proj),
             ("k", k_proj),
             ("v", v_proj),
         ]:
-            w_np, _ = _get_weight_tensor(proj)
+            w_np, transposed = _get_weight_tensor(proj)
             if w_np is None:
                 return result.fail(f"{name} weight not constant")
+            if is_transposed is None:
+                is_transposed = transposed
+            elif is_transposed != transposed:
+                return result.fail("Mixed transpose states")
 
         return result
 
