@@ -10,6 +10,13 @@ embedding into the attention kernel and replaces the explicit attention
 bias with ``seqlens_k`` / ``total_sequence_length`` inputs computed
 from the ``attention_mask`` graph input.
 
+When the Q, K, and V projections are separate MatMuls that share the
+same hidden_states input (and no QK norm is applied), the rule also
+packs the three weight matrices into a single ``W_qkv`` and emits one
+packed MatMul.  The packed QKV tensor is passed in the ``query`` slot
+of ``GroupQueryAttention`` with ``key`` and ``value`` set to ``None``.
+Models with QK norm (e.g. Qwen3) fall back to separate Q/K/V inputs.
+
 These rules are **not applied by default**.  Apply them post-export::
 
     from mobius.rewrite_rules import group_query_attention_rules
@@ -76,12 +83,23 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
     attention with KV cache), and ``cos`` / ``sin`` are position-gathered
     from rotary cache tables via ``Gather``.
 
-    **Replacement:**
+    **Replacement (packed QKV, when Q/K/V share the same hidden_states
+    input and no QK norm is present):**
 
     .. code-block:: text
 
-        seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
-        total_seq_len = Cast(Shape(attention_mask)[1], INT32)
+        W_qkv = concatenate([W_q, W_k, W_v])
+        packed_qkv = MatMul(hidden_states, W_qkv)
+        attn_out, present_key, present_value = GroupQueryAttention(
+            packed_qkv, None, None, past_key, past_value,
+            seqlens_k, total_seq_len, cos_cache, sin_cache,
+            num_heads=..., kv_num_heads=..., do_rotary=1,
+        )
+
+    **Replacement (separate Q/K/V, fallback for models with QK norm):**
+
+    .. code-block:: text
+
         attn_out, present_key, present_value = GroupQueryAttention(
             q_pre, k_pre, v, past_key, past_value,
             seqlens_k, total_seq_len, cos_cache, sin_cache,
