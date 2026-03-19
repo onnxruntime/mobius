@@ -86,14 +86,10 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
         skip_norm_rules,
     )
 
-    # Insertion order determines application order for --optimize=all.
-    # group_query_attention runs before fused_matmul so that packed QKV
-    # can trace the original Transpose+MatMul pattern.  (The GQA rule
-    # also handles FusedMatMul, but running first is more efficient.)
     rule_map = {
         "bias_gelu": bias_gelu_rules,
-        "group_query_attention": group_query_attention_rules,
         "fused_matmul": fused_matmul_rules,
+        "group_query_attention": group_query_attention_rules,
         "packed_attention": packed_attention_rules,
         "skip_layer_norm": skip_layer_norm_rules,
         "skip_norm": skip_norm_rules,

@@ -173,7 +173,7 @@ class TestGroupQueryAttentionRules:
 
         matmul_after = count_ops(m)["MatMul"]
         num_layers = _LLAMA_CONFIG.num_hidden_layers
-        # 3 separate Q/K/V MatMuls → 1 packed MatMul per layer = -2 per layer
+        # 3 separate Q/K/V MatMuls -> 1 packed MatMul per layer = -2 per layer
         assert matmul_after == matmul_before - 2 * num_layers
 
     def test_packed_weight_shape_is_correct(self):
@@ -185,29 +185,23 @@ class TestGroupQueryAttentionRules:
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
 
-        # Find a packed weight initializer by its shape
         q_dim = _LLAMA_CONFIG.num_attention_heads * _LLAMA_CONFIG.head_dim
         kv_dim = _LLAMA_CONFIG.num_key_value_heads * _LLAMA_CONFIG.head_dim
         hidden = _LLAMA_CONFIG.hidden_size
         expected_shape = (q_dim + 2 * kv_dim, hidden)
 
-        # Look through Constant nodes for the packed weight
+        # Packed weights are stored as graph initializers
         found = False
-        for node in m.graph:
-            if node.op_type != "Constant":
+        for init in m.graph.initializers.values():
+            if init.const_value is None:
                 continue
-            val = node.attributes.get("value", None)
-            if val is None:
-                continue
-            tensor = val.value
-            if tuple(tensor.shape) == expected_shape:
-                found = True
-                # Verify it's a valid float32 tensor
-                arr = tensor.numpy()
+            if tuple(init.const_value.shape) == expected_shape:
+                arr = init.const_value.numpy()
                 assert arr.dtype == np.float32
                 assert not np.any(np.isnan(arr))
+                found = True
                 break
-        assert found, f"No packed weight with shape {expected_shape} found"
+        assert found, f"No packed weight initializer with shape {expected_shape}"
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
         """Qwen3 (QK norm) falls back; MatMul count unchanged."""
@@ -284,7 +278,7 @@ class TestGroupQueryAttentionRules:
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         counts = count_ops(m)
         assert counts["GroupQueryAttention"] == 2
-        # FusedMatMul count should decrease: 3 Q/K/V → 1 packed per layer
+        # FusedMatMul count should decrease: 3 Q/K/V -> 1 packed per layer
         fused_after = counts.get("FusedMatMul", 0)
         num_layers = _LLAMA_CONFIG.num_hidden_layers
         assert fused_after <= matmul_before - 2 * num_layers
