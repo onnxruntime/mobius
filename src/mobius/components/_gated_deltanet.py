@@ -45,9 +45,9 @@ class _DepthwiseConv1d(nn.Module):
     (``conv1d.weight``) automatically align with ONNX initializer names.
 
     The ``forward()`` method calls the ``CausalConv1DWithState``
-    function op from the ``pkg.mobius`` domain, passing the
-    ``group`` attribute so one function definition works for all channel
-    sizes.  Because the module is invoked via ``__call__``,
+    function op from the ``pkg.mobius`` domain.  The function derives
+    group=channels internally from the input shape, so the caller does
+    not need to supply it.  Because the module is invoked via ``__call__``,
     ``self.weight`` is automatically realized as a graph initializer
     with the correct qualified name.
     """
@@ -86,7 +86,6 @@ class _DepthwiseConv1d(nn.Module):
             conv_bias,
             conv_state,
             activation="silu",
-            group=self._channels,
             _domain="com.microsoft",
             _outputs=2,
         )
