@@ -260,8 +260,8 @@ class TestGroupQueryAttentionRules:
         assert result["logits"].shape == (1, 3, 256)
         session.close()
 
-    def test_packed_qkv_after_fused_matmul_runs_with_ort(self):
-        """Packing works when fused_matmul runs first (--optimize=all)."""
+    def test_packed_gqa_then_fused_matmul_runs_with_ort(self):
+        """Packing runs before fused_matmul (mirrors --optimize=all order)."""
         from mobius.rewrite_rules import fused_matmul_rules
 
         model = registry.get("llama")(_LLAMA_CONFIG)
@@ -271,17 +271,17 @@ class TestGroupQueryAttentionRules:
 
         matmul_before = count_ops(m)["MatMul"]
 
-        # Apply fused_matmul first, then GQA (mirrors --optimize=all)
-        rewrite(m, pattern_rewrite_rules=fused_matmul_rules())
-        assert count_ops(m).get("FusedMatMul", 0) > 0
-
+        # GQA (with packing) runs first — sees plain MatMul nodes
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        counts = count_ops(m)
-        assert counts["GroupQueryAttention"] == 2
-        # FusedMatMul count should decrease: 3 Q/K/V -> 1 packed per layer
-        fused_after = counts.get("FusedMatMul", 0)
+        counts_after_gqa = count_ops(m)
+        assert counts_after_gqa["GroupQueryAttention"] == 2
         num_layers = _LLAMA_CONFIG.num_hidden_layers
-        assert fused_after <= matmul_before - 2 * num_layers
+        assert counts_after_gqa["MatMul"] == matmul_before - 2 * num_layers
+
+        # Then fused_matmul converts remaining Transpose+MatMul
+        rewrite(m, pattern_rewrite_rules=fused_matmul_rules())
+        counts_final = count_ops(m)
+        assert counts_final.get("FusedMatMul", 0) > 0
 
         session = OnnxModelSession(m)
         feeds = make_prefill_feeds(session)

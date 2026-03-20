@@ -36,7 +36,6 @@ from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleClassBase,
     RewriteRuleSet,
 )
-from onnxscript.rewriter.pattern import OrValue
 
 
 class RotaryAttentionToGQA(RewriteRuleClassBase):
@@ -226,26 +225,19 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 
 
 def _get_weight_tensor(proj_node):
-    """Extract the constant weight tensor from a projection node.
+    """Extract the constant weight tensor from a MatMul projection node.
 
-    Handles three patterns:
+    Handles two patterns:
 
-    1. ``Transpose(weight, perm=[1,0]) -> MatMul(x, w_t)``
+    1. ``Transpose(weight, perm=[1,0]) → MatMul(x, w_t)``
+       — weight shape is ``(out_features, hidden_size)``, transposed=True
     2. ``MatMul(x, weight)``  (no transpose)
-    3. ``FusedMatMul(x, weight, transB=1)``  (post fused_matmul rewrite)
+       — weight shape is ``(hidden_size, out_features)``, transposed=False
 
     Returns:
         ``(numpy_array, is_transposed)`` on success, or ``(None, False)``
         if the weight cannot be extracted as a constant.
     """
-    if proj_node.op_type == "FusedMatMul":
-        trans_b = proj_node.attributes.get_int("transB", 0)
-        tensor = ir.convenience.get_const_tensor(proj_node.inputs[1])
-        if tensor is None:
-            return None, False
-        return tensor.numpy(), bool(trans_b)
-
-    # MatMul -- weight may be behind a Transpose
     weight_input = proj_node.inputs[1]
     producer = weight_input.producer()
     if producer is not None and producer.op_type == "Transpose":
@@ -267,29 +259,33 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
     This rule runs **after** ``RotaryAttentionToGQA`` and looks for
     ``GroupQueryAttention`` nodes whose Q, K, V inputs each come from a
-    separate projection (``MatMul`` or ``FusedMatMul``) that shares
-    the same ``hidden_states`` input.
+    separate ``MatMul`` projection that shares the same ``hidden_states``
+    input.  The ``fused_matmul`` rewrite must run **after** this rule
+    so that projections are still plain ``MatMul`` nodes when this rule
+    matches.
 
     **Matched pattern:**
 
     .. code-block:: text
 
-        q = MatMul|FusedMatMul(hidden, W_q)
-        k = MatMul|FusedMatMul(hidden, W_k)
-        v = MatMul|FusedMatMul(hidden, W_v)
+        q = MatMul(hidden, W_q)
+        k = MatMul(hidden, W_k)
+        v = MatMul(hidden, W_v)
         out, pkey, pval = GroupQueryAttention(q, k, v, ...)
 
     **Replacement:**
 
     .. code-block:: text
 
-        W_qkv = concatenate([W_q, W_k, W_v])
-        packed = MatMul(hidden, W_qkv_t)
+        W_qkv = concatenate([W_q, W_k, W_v])  # normalized to (out, hidden)
+        packed = MatMul(hidden, Transpose(W_qkv))
         out, pkey, pval = GroupQueryAttention(packed, None, None, ...)
 
-    The packed weight is stored as a graph initializer (not a
-    ``Constant`` node attribute) so it can be serialised to external
-    data files for large models.
+    Each weight is independently normalized to ``(out_features,
+    hidden_size)`` before concatenation, so mixed transpose patterns
+    across Q/K/V are handled correctly.  The packed weight is stored as
+    a graph initializer (not a ``Constant`` node attribute) so it can
+    be serialised to external data files for large models.
     """
 
     _pack_counter: int
@@ -314,40 +310,9 @@ class PackQKVForGQA(RewriteRuleClassBase):
         cos_cache,
         sin_cache,
     ):
-        # Each projection may be MatMul or FusedMatMul (post fused_matmul)
-        q = OrValue(
-            [
-                op.MatMul(hidden, q_w),
-                op.FusedMatMul(
-                    hidden,
-                    q_w,
-                    _domain="com.microsoft",
-                    _allow_other_attributes=True,
-                ),
-            ]
-        )
-        k = OrValue(
-            [
-                op.MatMul(hidden, k_w),
-                op.FusedMatMul(
-                    hidden,
-                    k_w,
-                    _domain="com.microsoft",
-                    _allow_other_attributes=True,
-                ),
-            ]
-        )
-        v = OrValue(
-            [
-                op.MatMul(hidden, v_w),
-                op.FusedMatMul(
-                    hidden,
-                    v_w,
-                    _domain="com.microsoft",
-                    _allow_other_attributes=True,
-                ),
-            ]
-        )
+        q = op.MatMul(hidden, q_w)
+        k = op.MatMul(hidden, k_w)
+        v = op.MatMul(hidden, v_w)
 
         return op.GroupQueryAttention(
             q,
@@ -366,28 +331,17 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
     # ------------------------------------------------------------------ check
 
-    def check(self, context, q_w, k_w, v_w, gqa_out, **_):
+    def check(self, context, gqa_out, **_):
         result = MatchResult()
 
         gqa_node = gqa_out.producer()
-        # Extract projection nodes from the GQA inputs
-        projs = []
         for i, name in enumerate(("q", "k", "v")):
             proj = gqa_node.inputs[i].producer()
             if proj is None:
                 return result.fail(f"{name} projection missing")
-            projs.append(proj)
-
-        # All weights must be extractable constants with consistent layout
-        is_transposed = None
-        for name, proj in zip(("q", "k", "v"), projs):
-            w_np, transposed = _get_weight_tensor(proj)
+            w_np, _ = _get_weight_tensor(proj)
             if w_np is None:
                 return result.fail(f"{name} weight not constant")
-            if is_transposed is None:
-                is_transposed = transposed
-            elif is_transposed != transposed:
-                return result.fail("Mixed transpose states")
 
         return result
 
@@ -397,9 +351,6 @@ class PackQKVForGQA(RewriteRuleClassBase):
         self,
         op,
         hidden,
-        q_w,
-        k_w,
-        v_w,
         past_key,
         past_value,
         seqlens_k,
@@ -414,22 +365,17 @@ class PackQKVForGQA(RewriteRuleClassBase):
         gqa_node = gqa_out.producer()
         graph = gqa_node.graph
 
-        q_proj = gqa_node.inputs[0].producer()
-
-        # Extract and concatenate weights
-        weights_np = []
-        is_transposed = None
+        # Extract weights, normalizing each to (out_features, hidden_size)
+        weights = []
         for i in range(3):
             proj = gqa_node.inputs[i].producer()
             w_np, transposed = _get_weight_tensor(proj)
-            if is_transposed is None:
-                is_transposed = transposed
-            weights_np.append(w_np)
+            if not transposed:
+                w_np = w_np.T
+            weights.append(w_np)
 
-        # Transposed: (out_features, hidden) -> concat axis=0
-        # Non-transposed: (hidden, out_features) -> concat axis=1
-        concat_axis = 0 if is_transposed else 1
-        w_qkv_np = np.concatenate(weights_np, axis=concat_axis)
+        # Concatenate along axis=0: all weights are (out, hidden)
+        w_qkv_np = np.concatenate(weights, axis=0)
 
         # Store packed weight as a graph initializer
         self._pack_counter += 1
@@ -440,20 +386,9 @@ class PackQKVForGQA(RewriteRuleClassBase):
         )
         graph.register_initializer(packed_w)
 
-        # Create the packed projection
-        if is_transposed:
-            if q_proj.op_type == "FusedMatMul":
-                packed_qkv = op.op(
-                    "FusedMatMul",
-                    inputs=[hidden, packed_w],
-                    domain="com.microsoft",
-                    attributes={"transB": 1},
-                )
-            else:
-                packed_w_t = op.Transpose(packed_w, perm=[1, 0])
-                packed_qkv = op.MatMul(hidden, packed_w_t)
-        else:
-            packed_qkv = op.MatMul(hidden, packed_w)
+        # Transpose + MatMul for the packed projection
+        packed_w_t = op.Transpose(packed_w, perm=[1, 0])
+        packed_qkv = op.MatMul(hidden, packed_w_t)
 
         # Forward all original GQA attributes
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
