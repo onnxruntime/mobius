@@ -121,10 +121,12 @@ def linear_attention(
     op = gb.op
 
     # --- GQA: expand Q/K heads to match V head count ---
+    if num_v_heads % num_k_heads != 0:
+        raise ValueError(
+            f"num_v_heads ({num_v_heads}) must be divisible by num_k_heads ({num_k_heads})"
+        )
     gqa_ratio = num_v_heads // num_k_heads
-    query_expanded, key_expanded = _expand_kv_heads(
-        op, query, key, gqa_ratio=gqa_ratio
-    )
+    query_expanded, key_expanded = _expand_kv_heads(op, query, key, gqa_ratio=gqa_ratio)
 
     # --- Build Scan for sequential recurrence ---
     scan_body = _build_recurrence_body(uses_decay, uses_beta)
@@ -310,9 +312,18 @@ def _expand_kv_heads(op, query, key, *, gqa_ratio: int):
     q_tiled = op.Tile(q_5d, repeat_vec)
     k_tiled = op.Tile(k_5d, repeat_vec)
 
-    # Reshape: (B, H_kv, ratio, T, d_k) -> (B, H, T, d_k)
-    # Use 0 for dims that should be inferred from the input.
-    expanded_shape = op.Constant(value_ints=[0, -1, 0, 0])
-    return op.Reshape(q_tiled, expanded_shape), op.Reshape(
-        k_tiled, expanded_shape
+    # Reshape: (B, H_kv, ratio, T, d_k) -> (B, H_kv*ratio, T, d_k)
+    # Extract B, T, d_k from the original 4D query to build the target shape.
+    # We cannot use '0' sentinels because ONNX Reshape copies from the same
+    # positional index, and the 5D→4D dimension mapping doesn't align.
+    b_dim = op.Shape(query, start=0, end=1)
+    t_dim = op.Shape(query, start=2, end=3)
+    dk_dim = op.Shape(query, start=3, end=4)
+    expanded_shape = op.Concat(
+        b_dim,
+        op.Constant(value_ints=[-1]),
+        t_dim,
+        dk_dim,
+        axis=0,
     )
+    return op.Reshape(q_tiled, expanded_shape), op.Reshape(k_tiled, expanded_shape)
