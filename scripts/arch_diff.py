@@ -589,6 +589,7 @@ def main() -> None:
 
     # 2. Build + diff each affected model
     all_diffs: dict[str, dict[str, list]] = {}
+    failed_head_builds: list[str] = []
 
     for model_type, overrides, task_name, build_kind in _DIFF_MODELS:
         if model_type not in affected:
@@ -612,8 +613,14 @@ def main() -> None:
             build_kind,
         )
 
-        if base_pkg is None or head_pkg is None:
-            # Skip models that fail to build at one of the refs
+        if head_pkg is None:
+            # Head-ref (current code) build failure is always an error.
+            failed_head_builds.append(display)
+            continue
+
+        if base_pkg is None:
+            # Base-ref failure is expected for newly added models.
+            # Skip the diff but don't treat it as an error.
             continue
 
         sub_models: dict[str, dict] = {}
@@ -641,6 +648,16 @@ def main() -> None:
     md = render_markdown(all_diffs)
     Path(args.output).write_text(md, encoding="utf-8")
     print(f"Wrote {args.output}")
+
+    # 4. Fail if any head-ref builds failed
+    if failed_head_builds:
+        print(
+            f"\n✗ {len(failed_head_builds)} model(s) failed to build at {args.head_ref}:",
+            file=sys.stderr,
+        )
+        for name in failed_head_builds:
+            print(f"  - {name}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _empty_canonical() -> dict:
