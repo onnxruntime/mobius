@@ -235,7 +235,12 @@ def _make_hybrid_cache_inputs(
     mamba2_d_head = getattr(config, "mamba_d_head", 0)
     mamba2_d_state = getattr(config, "mamba_d_state", 0)
     mamba2_n_groups = getattr(config, "mamba_n_groups", 1)
-    mamba2_d_inner = config.hidden_size * mamba_expand
+    # Prefer n_heads * d_head (NemotronH); fall back to hidden * expand (Bamba)
+    mamba2_d_inner = (
+        mamba2_n_heads * mamba2_d_head
+        if mamba2_n_heads and mamba2_d_head
+        else config.hidden_size * mamba_expand
+    )
     mamba2_conv_dim = mamba2_d_inner + 2 * mamba2_n_groups * mamba2_d_state
 
     for i in range(config.num_hidden_layers):
@@ -254,6 +259,9 @@ def _make_hybrid_cache_inputs(
             )
             flat.extend([conv_state, rec_state])
             pairs.append((conv_state, rec_state))
+        elif ltype == "mlp":
+            # MLP-only layers are stateless — no cache inputs needed
+            pairs.append((None, None))
         elif ltype == "mamba":
             conv_state = ir.Value(
                 name=f"{prefix}.{i}.conv_state",
@@ -321,6 +329,8 @@ def _register_hybrid_cache_outputs(
     total_seq_len = ir.SymbolicDim("total_sequence_len")
     for i, (state_a, state_b) in enumerate(present_key_values):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+        if ltype == "mlp":
+            continue  # MLP layers produce no cache state
         if ltype == "linear_attention":
             state_a.name = f"{prefix}.{i}.conv_state"
             state_b.name = f"{prefix}.{i}.recurrent_state"

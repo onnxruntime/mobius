@@ -185,6 +185,8 @@ class TestBuildGraph:
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+            if ltype == "mlp":
+                continue  # MLP layers are stateless — no cache outputs
             if ltype in ("linear_attention",):
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"
