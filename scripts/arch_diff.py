@@ -36,7 +36,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 # Model build configs — mirrors the benchmark / test infrastructure
 # ------------------------------------------------------------------
 # Each entry: (model_type, config_overrides, task_name, build_kind)
-#   build_kind is "standard", "whisper", or "mamba".
+#   build_kind is "standard", "whisper", "mamba", or "qwen3_5_vl".
 _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     ("llama", {}, "text-generation", "standard"),
     ("llama", {}, "static-cache-text-generation", "standard"),
@@ -51,6 +51,11 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         {
             "partial_rotary_factor": 0.5,
             "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
         },
         "hybrid-text-generation",
         "standard",
@@ -66,6 +71,11 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "num_experts_per_tok": 2,
             "moe_intermediate_size": 32,
             "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
         },
         "hybrid-text-generation",
         "standard",
@@ -88,6 +98,11 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "shared_expert_intermediate_size": 32,
             "norm_topk_prob": True,
             "attn_qk_norm": True,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
         },
         "hybrid-text-generation",
         "standard",
@@ -185,6 +200,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         "seq2seq",
         "standard",
     ),
+    ("qwen3_5_vl", {}, "hybrid-qwen-vl", "qwen3_5_vl"),
     ("whisper", {}, "speech-to-text", "whisper"),
     ("mamba", {}, "ssm-text-generation", "mamba"),
 ]
@@ -362,10 +378,59 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
         task = SSMCausalLMTask()
         return build_from_module(module, config, task=task)
 
+    def _build_qwen3_5_vl():
+        from mobius._configs import ArchitectureConfig, VisionConfig
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+        config = ArchitectureConfig(
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            num_hidden_layers=TINY_LAYERS,
+            vocab_size=TINY_VOCAB,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10_000.0,
+            pad_token_id=0,
+            attn_qk_norm=True,
+            partial_rotary_factor=0.5,
+            layer_types=["linear_attention", "full_attention"],
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            deepstack_visual_indexes=[0],
+            image_token_id=248056,
+            mrope_section=[8, 12, 12],
+        )
+        model_cls = registry.get("qwen3_5_vl")
+        module = model_cls(config)
+        task = get_task("hybrid-qwen-vl")
+        return task.build(module, config)
+
     if build_kind == "whisper":
         pkg = _build_whisper()
     elif build_kind == "mamba":
         pkg = _build_mamba()
+    elif build_kind == "qwen3_5_vl":
+        pkg = _build_qwen3_5_vl()
     else:
         pkg = _build_standard()
 
