@@ -20,6 +20,7 @@ from mobius.components._common import (
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
 from mobius.components._moe import TopKGate
+from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
@@ -46,9 +47,21 @@ class Qwen35DecoderLayer(nn.Module):
 
     Both variants use :class:`OffsetRMSNorm` (the *1 + weight* variant)
     for pre-attention and post-attention normalization.
+
+    Args:
+        config: Architecture configuration.
+        layer_idx: Index of this layer in the decoder stack.
+        linear_class: Factory for MLP projection layers (e.g.
+            ``QuantizedLinear`` for GPTQ).  Only applied to MLP, not
+            to attention or DeltaNet projections.
     """
 
-    def __init__(self, config: ArchitectureConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        layer_idx: int,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         layer_types = config.layer_types or []
         self.layer_type: str = (
@@ -60,7 +73,7 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             self.self_attn = Qwen35Attention(config)
 
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -112,16 +125,35 @@ class Qwen35TextModel(nn.Module):
     :class:`Qwen35DecoderLayer` instances that dispatch to either
     ``GatedDeltaNet`` or ``Qwen35Attention`` based on
     ``config.layer_types``.
+
+    When quantization is configured (e.g. GPTQ), only the MLP layers
+    use ``QuantizedLinear``.  Attention and DeltaNet projections remain
+    full-precision — matching the GPTQ config exclusion pattern
+    ``-:.*attn.*``.
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
+
+        # Quantization: swap Linear for QuantizedLinear in MLP only.
+        linear_class = None
+        qc = getattr(config, "quantization", None)
+        if qc is not None and qc.quant_method != "none":
+            linear_class = make_quantized_linear_factory(
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+            )
+
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+            [
+                Qwen35DecoderLayer(config, layer_idx=i, linear_class=linear_class)
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
@@ -229,9 +261,18 @@ class Qwen35MoEBlock(nn.Module):
         experts.N.{gate,up,down}_proj.weight
         shared_expert.{gate,up,down}_proj.weight
         shared_expert_gate.weight   → sigmoid gate for shared expert
+
+    Args:
+        config: Architecture configuration.
+        linear_class: Factory for MLP projection layers (e.g.
+            ``QuantizedLinear`` for GPTQ).
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
@@ -243,13 +284,15 @@ class Qwen35MoEBlock(nn.Module):
         expert_config = dataclasses.replace(
             config, intermediate_size=config.moe_intermediate_size
         )
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(num_experts)])
+        self.experts = nn.ModuleList(
+            [MLP(expert_config, linear_class=linear_class) for _ in range(num_experts)]
+        )
 
         shared_config = dataclasses.replace(
             config,
             intermediate_size=config.shared_expert_intermediate_size,
         )
-        self.shared_expert = MLP(shared_config)
+        self.shared_expert = MLP(shared_config, linear_class=linear_class)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
@@ -288,9 +331,14 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
     :class:`Qwen35MoEBlock`.
     """
 
-    def __init__(self, config: ArchitectureConfig, layer_idx: int):
-        super().__init__(config, layer_idx)
-        self.mlp = Qwen35MoEBlock(config)
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        layer_idx: int,
+        linear_class: type | None = None,
+    ):
+        super().__init__(config, layer_idx, linear_class=linear_class)
+        self.mlp = Qwen35MoEBlock(config, linear_class=linear_class)
 
 
 class Qwen35MoETextModel(nn.Module):
@@ -300,18 +348,33 @@ class Qwen35MoETextModel(nn.Module):
     :class:`Qwen35TextModel`, but each layer uses MoE FFN
     (:class:`Qwen35MoEBlock`) instead of dense MLP.
 
+    When quantization is configured (e.g. GPTQ), only the MLP layers
+    use ``QuantizedLinear``.  Attention and DeltaNet projections remain
+    full-precision.
+
     HuggingFace class: ``Qwen3_5MoeModel``
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
+
+        # Quantization: swap Linear for QuantizedLinear in MLP only.
+        linear_class = None
+        qc = getattr(config, "quantization", None)
+        if qc is not None and qc.quant_method != "none":
+            linear_class = make_quantized_linear_factory(
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+            )
+
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
             [
-                Qwen35MoEDecoderLayer(config, layer_idx=i)
+                Qwen35MoEDecoderLayer(config, layer_idx=i, linear_class=linear_class)
                 for i in range(config.num_hidden_layers)
             ]
         )
