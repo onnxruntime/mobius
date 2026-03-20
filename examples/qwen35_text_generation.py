@@ -29,6 +29,9 @@ Usage::
 
     # Save the ONNX model to disk without running inference:
     python examples/qwen35_text_generation.py --save-to output/qwen35/
+
+    # Run on GPU:
+    python examples/qwen35_text_generation.py --device cuda
 """
 
 from __future__ import annotations
@@ -431,6 +434,7 @@ def generate_hf(
     model_id: str,
     prompt: str,
     max_new_tokens: int,
+    device: str = "cpu",
 ) -> str:
     """Run text-only generation with HuggingFace transformers."""
     import torch
@@ -439,10 +443,10 @@ def generate_hf(
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype=torch.float32,
-    ).to("cpu")
+    ).to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
-    inputs = tokenizer(prompt, return_tensors="pt").to("cpu")
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     print(f"\n[HF] Prompt: {prompt}")
     print("-" * 40)
@@ -464,6 +468,7 @@ def generate_with_image_hf(
     prompt: str,
     image_path: str,
     max_new_tokens: int,
+    device: str = "cpu",
 ) -> str:
     """Run multimodal generation with HuggingFace transformers."""
     import torch
@@ -473,7 +478,7 @@ def generate_with_image_hf(
     model = transformers.AutoModelForImageTextToText.from_pretrained(
         model_id,
         dtype=torch.float32,
-    ).to("cpu")
+    ).to(device)
     processor = transformers.AutoProcessor.from_pretrained(model_id)
 
     image = Image.open(image_path).convert("RGB")
@@ -495,7 +500,7 @@ def generate_with_image_hf(
         text=[text],
         images=[image],
         return_tensors="pt",
-    ).to("cpu")
+    ).to(device)
 
     print(f"\n[HF] Prompt: {prompt}")
     print(f"[HF] Image:  {image_path}")
@@ -552,9 +557,21 @@ def main():
         help="Save the ONNX model package to DIR and exit (no inference).",
     )
     parser.add_argument(
+        "--dtype",
+        default="f32",
+        choices=["f16", "f32"],
+        help="Precision type for the ONNX model (default: %(default)s).",
+    )
+    parser.add_argument(
         "--compare-hf",
         action="store_true",
         help="Also run with HuggingFace transformers and compare outputs.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device for ONNX Runtime and PyTorch inference (default: %(default)s).",
     )
     args = parser.parse_args()
 
@@ -564,7 +581,7 @@ def main():
         # ---------------------------------------------------------------
         prompt = args.prompt or "Describe this image in detail."
         print(f"Building 3-model VL pipeline for {args.model!r} ...")
-        pkg = build(args.model, dtype="f32", load_weights=True)
+        pkg = build(args.model, dtype=args.dtype, load_weights=True)
         config = pkg.config
 
         if args.save_to:
@@ -572,9 +589,9 @@ def main():
             print(f"Saved to {args.save_to}")
             return
 
-        decoder_session = OnnxModelSession(pkg["decoder"])
-        vision_session = OnnxModelSession(pkg["vision"])
-        embed_session = OnnxModelSession(pkg["embedding"])
+        decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
+        vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+        embed_session = OnnxModelSession(pkg["embedding"], device=args.device)
         processor = transformers.AutoProcessor.from_pretrained(args.model)
 
         print(f"\nPrompt: {prompt}")
@@ -601,6 +618,7 @@ def main():
                 prompt,
                 args.image,
                 args.max_new_tokens,
+                device=args.device,
             )
             if onnx_output == hf_output:
                 print("\n✓ Outputs match exactly!")
@@ -620,7 +638,7 @@ def main():
             args.model,
             task="hybrid-text-generation",
             module_class=Qwen35CausalLMModel,
-            dtype="f32",
+            dtype=args.dtype,
             load_weights=True,
         )
         config = pkg.config
@@ -630,7 +648,7 @@ def main():
             print(f"Saved to {args.save_to}")
             return
 
-        session = OnnxModelSession(pkg["model"])
+        session = OnnxModelSession(pkg["model"], device=args.device)
         tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
 
         print(f"\nPrompt: {prompt}")
@@ -652,6 +670,7 @@ def main():
                 args.model,
                 prompt,
                 args.max_new_tokens,
+                device=args.device,
             )
             if onnx_output == hf_output:
                 print("\n✓ Outputs match exactly!")
