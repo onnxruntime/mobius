@@ -318,7 +318,7 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
         return config_cls(**defaults)
 
     def _build_standard():
-        from mobius._exporter import registry
+        from mobius._registry import registry
         from mobius.tasks import get_task
         ov = dict(overrides)
         cls_name = ov.pop("_config_cls", None)
@@ -334,7 +334,7 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
 
     def _build_whisper():
         from mobius._configs import WhisperConfig
-        from mobius._exporter import build_from_module
+        from mobius._builder import build_from_module
         from mobius.models.whisper import (
             WhisperForConditionalGeneration,
         )
@@ -362,7 +362,7 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
 
     def _build_mamba():
         from mobius._configs import MambaConfig
-        from mobius._exporter import build_from_module
+        from mobius._builder import build_from_module
         from mobius.models.mamba import MambaCausalLMModel
         from mobius.tasks import SSMCausalLMTask
         config = MambaConfig(
