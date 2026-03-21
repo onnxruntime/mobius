@@ -114,7 +114,8 @@ class SelectiveScan(nn.Module):
 
         # --- Discretize state decay matrix A ---
         # a_neg = -exp(A_log): (d_inner, d_state)
-        a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+        # CastLike ensures A_log matches the compute dtype (fp16/bf16/fp32).
+        a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
 
         # Broadcast: dt (batch,1,d_inner,1) * A (1,1,d_inner,d_state)
         dt_4d = op.Unsqueeze(dt, [-1])  # (batch, 1, d_inner, 1)
@@ -144,7 +145,7 @@ class SelectiveScan(nn.Module):
 
         # --- Skip connection: y += D * x ---
         x_t = op.Squeeze(x, [1])  # (batch, d_inner)
-        y = op.Add(y, op.Mul(op.Cast(self.D, to=1), x_t))
+        y = op.Add(y, op.Mul(op.CastLike(self.D, x_t), x_t))
 
         # Restore seq dim: (batch, 1, d_inner)
         y = op.Unsqueeze(y, [1])
@@ -247,11 +248,12 @@ class Mamba2Scan(nn.Module):
             new_ssm_state: (batch, num_heads, d_head, d_state).
         """
         # dt = softplus(dt_input + dt_bias): (batch, num_heads)
-        dt = op.Add(dt_input, op.Cast(self.dt_bias, to=1))
+        # CastLike ensures parameters match the compute dtype (fp16/bf16/fp32).
+        dt = op.Add(dt_input, op.CastLike(self.dt_bias, dt_input))
         dt = op.Softplus(dt)
 
         # A = -exp(A_log): (num_heads,)
-        a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+        a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
 
         # Broadcast for state update
         dt_4d = op.Unsqueeze(dt, [2, 3])  # (batch, num_heads, 1, 1)
@@ -291,7 +293,7 @@ class Mamba2Scan(nn.Module):
         )  # (batch, num_heads, d_head)
 
         # Skip: y += D * x
-        d_3d = op.Unsqueeze(op.Cast(self.D, to=1), [0, 2])
+        d_3d = op.Unsqueeze(op.CastLike(self.D, hidden_3d), [0, 2])
         y = op.Add(y, op.Mul(d_3d, hidden_3d))
 
         # Flatten: (batch, num_heads * d_head)
@@ -315,4 +317,4 @@ class _RMSNorm(nn.Module):
             x,
             op.Sqrt(op.Add(variance, op.Constant(value_float=self._eps))),
         )
-        return op.Mul(x_normed, op.Cast(self.weight, to=1))
+        return op.Mul(x_normed, op.CastLike(self.weight, x_normed))
