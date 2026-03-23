@@ -367,6 +367,11 @@ Embedding(num_embeddings, embedding_dim, padding_idx=0)
    computations (window reordering, RoPE, spatial merge), and document how
    the ONNX graph maps to the HuggingFace reference implementation.
 
+7. **Keep components dtype-agnostic.** Components must work with any compute
+   dtype (float32, float16, bfloat16).  Never hardcode a target dtype — use
+   `op.CastLike(value, reference)` to match the graph's dtype at runtime.
+   See "Dtype-agnostic casting" below.
+
 ## Common ONNX op patterns
 
 ### Scalar constants
@@ -384,6 +389,35 @@ one = op.Constant(value_int=1)
 # Float constants
 eps = op.Constant(value_float=1e-6)
 ```
+
+### Dtype-agnostic casting with `CastLike`
+
+When a learned parameter or float constant must match the compute dtype
+(fp32/fp16/bf16), use `op.CastLike` instead of `op.Cast(to=<constant>)`.
+The `--dtype` flag sets the graph dtype at build time, so components must
+adapt automatically.
+
+```python
+# BAD — hardcoded to float32, breaks with bfloat16/float16 graphs
+a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+
+# GOOD — adapts to whatever dtype dt already has
+a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
+```
+
+Common cases where `CastLike` is needed:
+
+| Pattern | Example |
+|---------|---------|
+| SSM parameters (`A_log`, `D`, `dt_bias`) | `op.CastLike(self.D, hidden_states)` |
+| Float constants in arithmetic | `op.CastLike(op.Constant(value_float=1e-6), x)` |
+| Norm scale for `LayerNormalization` | `scale = op.CastLike(scale, hidden_states)` |
+
+**When `op.Cast(to=...)` IS appropriate:** converting between fundamentally
+different types (e.g. int64 position_ids to float for arithmetic, or float
+timesteps to the model's compute type).  The key rule: never use a hardcoded
+Cast on values that will be combined (Mul/Add/etc.) with activation tensors
+whose dtype depends on the build configuration.
 
 ### Shape manipulation
 

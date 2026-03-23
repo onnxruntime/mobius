@@ -733,6 +733,43 @@ for i in range(num_groups - 1):
     codec_sum += cp_embed[i, codes[i + 1], :]
 ```
 
+### 16. Hardcoded `Cast(to=float32)` breaks bfloat16/float16 models
+
+**Symptom:** `ONNXRuntimeError: Type parameter (T) of Optype (Mul) bound to
+different types (tensor(float) and tensor(bfloat16))` when loading a model
+built with `--dtype bf16` or from a bfloat16 checkpoint.
+
+**Root cause:** Component code uses `op.Cast(self.param, to=1)` (hardcoded
+to float32) to cast learned parameters before arithmetic.  When the graph is
+built in bfloat16, intermediate tensors are bf16, but the Cast forces float32,
+producing a type mismatch in the downstream `Mul`/`Add`.
+
+**Example (bad — from SSM components):**
+```python
+# BAD — hardcoded float32 regardless of graph dtype
+a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+dt = op.Add(dt_input, op.Cast(self.dt_bias, to=1))
+```
+
+**Fix:** Use `op.CastLike(param, reference_tensor)` which adapts to whatever
+dtype the graph is using:
+```python
+# GOOD — matches the compute dtype (fp32, fp16, or bf16)
+a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
+dt = op.Add(dt_input, op.CastLike(self.dt_bias, dt_input))
+```
+
+**Rule of thumb:** Never use `op.Cast(to=<constant>)` on learned parameters
+or scalar constants that will be combined with activation tensors.  Always
+use `op.CastLike(value, reference)` where `reference` is a tensor already
+in the compute dtype.
+
+**Affected patterns:**
+- SSM parameters: `A_log`, `D`, `dt_bias` in `Mamba2Scan`/`SelectiveScan`
+- Gated attention: `A_log` in `GatedDeltaNet`
+- Timestep embeddings in diffusion models
+- Any `op.Constant(value_float=...)` multiplied with activation tensors
+
 ## Reference implementations
 
 | Model | File | Key differences from base |
