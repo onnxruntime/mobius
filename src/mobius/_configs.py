@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import onnx_ir as ir
 import torch
@@ -549,12 +550,23 @@ class QuantizationConfig:
     configs (GPTQ, AWQ, etc.) so models can decide whether to use
     :class:`~mobius.components.QuantizedLinear` instead of
     :class:`~mobius.components.Linear`.
+
+    The ``exclude_patterns`` field stores regex patterns from the GPTQ
+    ``dynamic`` config (keys prefixed with ``-:``). These indicate
+    modules that should NOT be quantized. Models can check
+    ``is_excluded(module_name)`` at construction time to decide whether
+    a given layer should use quantized projections.
     """
 
     bits: int = 4
     group_size: int = 128
     quant_method: str = "none"
     sym: bool = True
+    exclude_patterns: tuple[str, ...] = ()
+
+    def is_excluded(self, module_name: str) -> bool:
+        """Return True if *module_name* matches any exclusion pattern."""
+        return any(re.search(p, module_name) for p in self.exclude_patterns)
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -573,11 +585,26 @@ class QuantizationConfig:
         method = qc.get("quant_method", "none")
         if method == "none":
             return None
+
+        # Extract exclusion patterns from GPTQ dynamic config.
+        # Keys prefixed with "-:" are module-name regexes to exclude.
+        exclude_patterns: list[str] = []
+        dynamic = qc.get("dynamic", {})
+        if isinstance(dynamic, dict):
+            for key in dynamic:
+                if isinstance(key, str) and key.startswith("-:"):
+                    exclude_patterns.append(key[2:])
+        # Also check modules_to_not_convert (explicit module names)
+        for mod in qc.get("modules_to_not_convert") or []:
+            if isinstance(mod, str) and mod:
+                exclude_patterns.append(re.escape(mod))
+
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
             quant_method=method,
             sym=qc.get("sym", True),
+            exclude_patterns=tuple(exclude_patterns),
         )
 
 

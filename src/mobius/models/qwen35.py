@@ -52,11 +52,11 @@ class Qwen35DecoderLayer(nn.Module):
     Args:
         config: Architecture configuration.
         layer_idx: Index of this layer in the decoder stack.
-        linear_class: Factory for quantized projection layers (e.g.
-            ``QuantizedLinear`` for GPTQ).  Applied to MLP,
-            GatedDeltaNet projections (``in_proj_qkv``, ``in_proj_z``,
-            ``out_proj``), and Qwen35Attention projections (``q/k/v/o_proj``).
-            Not applied to DeltaNet's small ``in_proj_a``/``in_proj_b``.
+        linear_class: Factory for MLP projection layers (e.g.
+            ``QuantizedLinear`` for GPTQ).
+        attn_linear_class: Factory for attention/DeltaNet projection
+            layers.  Only set when the GPTQ config does not exclude
+            attention modules.  ``None`` means standard ``Linear``.
     """
 
     def __init__(
@@ -64,6 +64,7 @@ class Qwen35DecoderLayer(nn.Module):
         config: ArchitectureConfig,
         layer_idx: int,
         linear_class: type | None = None,
+        attn_linear_class: type | None = None,
     ):
         super().__init__()
         layer_types = config.layer_types or []
@@ -72,9 +73,9 @@ class Qwen35DecoderLayer(nn.Module):
         )
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(config, linear_class=linear_class)
+            self.linear_attn = GatedDeltaNet(config, linear_class=attn_linear_class)
         else:
-            self.self_attn = Qwen35Attention(config, linear_class=linear_class)
+            self.self_attn = Qwen35Attention(config, linear_class=attn_linear_class)
 
         self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -129,33 +130,48 @@ class Qwen35TextModel(nn.Module):
     ``GatedDeltaNet`` or ``Qwen35Attention`` based on
     ``config.layer_types``.
 
-    When quantization is configured (e.g. GPTQ), the MLP layers,
-    GatedDeltaNet projections (``in_proj_qkv``, ``in_proj_z``,
-    ``out_proj``), and Qwen35Attention projections (``q/k/v/o_proj``)
-    use ``QuantizedLinear``.  DeltaNet's small ``in_proj_a``/``in_proj_b``
-    remain full-precision.
+    When quantization is configured (e.g. GPTQ), MLP layers always use
+    ``QuantizedLinear``.  Attention/DeltaNet projections are only
+    quantized when the GPTQ config does not exclude them (checked via
+    ``QuantizationConfig.exclude_patterns``).  DeltaNet's small
+    ``in_proj_a``/``in_proj_b`` always remain full-precision.
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
 
-        # Quantization: swap Linear for QuantizedLinear in MLP only.
-        linear_class = None
+        # Quantization: build QuantizedLinear factories.
+        # MLP is always quantized when GPTQ is active.
+        # Attention/DeltaNet projections are quantized only when not
+        # excluded by the GPTQ dynamic config (e.g. "-:.*attn.*").
+        mlp_linear_class = None
+        attn_linear_class = None
         qc = getattr(config, "quantization", None)
         if qc is not None and qc.quant_method != "none":
-            linear_class = make_quantized_linear_factory(
+            quantized_linear = make_quantized_linear_factory(
                 bits=qc.bits,
                 block_size=qc.group_size,
                 has_zero_point=not qc.sym,
             )
+            mlp_linear_class = quantized_linear
+            # Only quantize attention if not excluded by GPTQ config.
+            # The 27B official model excludes with "-:.*attn.*";
+            # community models may quantize everything.
+            if not qc.is_excluded("self_attn") and not qc.is_excluded("linear_attn"):
+                attn_linear_class = quantized_linear
 
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
             [
-                Qwen35DecoderLayer(config, layer_idx=i, linear_class=linear_class)
+                Qwen35DecoderLayer(
+                    config,
+                    layer_idx=i,
+                    linear_class=mlp_linear_class,
+                    attn_linear_class=attn_linear_class,
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -340,8 +356,14 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
         config: ArchitectureConfig,
         layer_idx: int,
         linear_class: type | None = None,
+        attn_linear_class: type | None = None,
     ):
-        super().__init__(config, layer_idx, linear_class=linear_class)
+        super().__init__(
+            config,
+            layer_idx,
+            linear_class=linear_class,
+            attn_linear_class=attn_linear_class,
+        )
         self.mlp = Qwen35MoEBlock(config, linear_class=linear_class)
 
 
@@ -352,9 +374,9 @@ class Qwen35MoETextModel(nn.Module):
     :class:`Qwen35TextModel`, but each layer uses MoE FFN
     (:class:`Qwen35MoEBlock`) instead of dense MLP.
 
-    When quantization is configured (e.g. GPTQ), the MLP layers,
-    GatedDeltaNet projections, and Qwen35Attention projections use
-    ``QuantizedLinear``.
+    When quantization is configured (e.g. GPTQ), MLP layers always use
+    ``QuantizedLinear``.  Attention/DeltaNet projections are only
+    quantized when not excluded by the GPTQ config.
 
     HuggingFace class: ``Qwen3_5MoeModel``
     """
@@ -363,22 +385,31 @@ class Qwen35MoETextModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
 
-        # Quantization: swap Linear for QuantizedLinear in MLP only.
-        linear_class = None
+        # Quantization: build QuantizedLinear factories.
+        mlp_linear_class = None
+        attn_linear_class = None
         qc = getattr(config, "quantization", None)
         if qc is not None and qc.quant_method != "none":
-            linear_class = make_quantized_linear_factory(
+            quantized_linear = make_quantized_linear_factory(
                 bits=qc.bits,
                 block_size=qc.group_size,
                 has_zero_point=not qc.sym,
             )
+            mlp_linear_class = quantized_linear
+            if not qc.is_excluded("self_attn") and not qc.is_excluded("linear_attn"):
+                attn_linear_class = quantized_linear
 
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
             [
-                Qwen35MoEDecoderLayer(config, layer_idx=i, linear_class=linear_class)
+                Qwen35MoEDecoderLayer(
+                    config,
+                    layer_idx=i,
+                    linear_class=mlp_linear_class,
+                    attn_linear_class=attn_linear_class,
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )

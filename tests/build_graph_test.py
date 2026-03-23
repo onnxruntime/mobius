@@ -592,9 +592,10 @@ class TestBuildGraphQuantized:
         assert len(matmulnbits) == expected
 
     def test_qwen35_gptq_int4_builds(self):
-        """Qwen3.5 hybrid model builds with GPTQ-Int4 quantization."""
+        """Qwen3.5 hybrid model builds with GPTQ-Int4 (all layers quantized)."""
         from mobius._configs import QuantizationConfig
 
+        # No exclude_patterns → all projections quantized (community model)
         qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=True)
         config = _base_config(
             num_hidden_layers=2,
@@ -636,6 +637,42 @@ class TestBuildGraphQuantized:
         scales_names = [n for n in init_names if ".scales" in n]
         assert len(scales_names) == expected, (
             f"Expected {expected} scales initializers, got {len(scales_names)}"
+        )
+
+    def test_qwen35_gptq_int4_mlp_only(self):
+        """Qwen3.5 GPTQ with attn excluded (official 27B pattern)."""
+        from mobius._configs import QuantizationConfig
+
+        # Exclude attention: "-:.*attn.*" matches both self_attn and linear_attn
+        qc = QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gptq",
+            sym=True,
+            exclude_patterns=(r".*attn.*",),
+        )
+        config = _base_config(
+            num_hidden_layers=2,
+            partial_rotary_factor=0.5,
+            layer_types=["linear_attention", "full_attention"],
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            quantization=qc,
+        )
+        model_cls = registry.get("qwen3_5_text")
+        module = model_cls(config)
+        task = get_task("hybrid-text-generation")
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        # Only MLP projections are quantized (attention is excluded)
+        matmulnbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
+        expected = config.num_hidden_layers * 3  # gate, up, down per layer
+        assert len(matmulnbits) == expected, (
+            f"Expected {expected} MatMulNBits (MLP only), got {len(matmulnbits)}"
         )
 
 
