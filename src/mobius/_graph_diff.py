@@ -338,6 +338,9 @@ def _op_diff_block(base_ops: list[str], head_ops: list[str]) -> str:
 
 def render_markdown(
     diffs: dict[str, dict[str, dict[str, Any]]],
+    *,
+    base_ref: str | None = None,
+    head_ref: str | None = None,
 ) -> str:
     """Render diffs for all affected models as GitHub-flavored Markdown.
 
@@ -347,6 +350,8 @@ def render_markdown(
             dict also carries ``"_base_ops"`` and ``"_head_ops"`` lists
             for rendering the diff block, and ``"_base_node_count"`` /
             ``"_head_node_count"`` ints for the summary.
+        base_ref: Short SHA or ref name for the base commit.
+        head_ref: Short SHA or ref name for the head commit.
 
     Returns:
         A Markdown string.
@@ -354,6 +359,9 @@ def render_markdown(
     lines: list[str] = []
     lines.append("<!-- arch-diff-bot -->")
     lines.append("## 🏗️ Architecture Diff\n")
+
+    if base_ref and head_ref:
+        lines.append(f"Comparing `{base_ref}` → `{head_ref}`\n")
 
     # ── summary table ────────────────────────────────────────────────
     lines.append("| Model | Sub-model | Changes | Status |")
