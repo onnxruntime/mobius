@@ -40,6 +40,9 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
     rows: list[tuple[str, str, str, str, str, str]] = []
     has_blocker = False
 
+    base_sha = baseline.get("_metadata", {}).get("commit", "unknown")
+    head_sha = current.get("_metadata", {}).get("commit", "unknown")
+
     for model, metrics in sorted(current["models"].items()):
         base = baseline.get("models", {}).get(model, {})
         for metric in THRESHOLDS:
@@ -70,6 +73,7 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
             )
 
     md = "## Performance Comparison\n\n"
+    md += f"Comparing `{base_sha}` → `{head_sha}`\n\n"
     md += "| Model | Metric | Baseline | Current | Delta | |\n"
     md += "|---|---|---:|---:|---:|---|\n"
     for model, metric, base_s, curr_s, delta_s, status in rows:
