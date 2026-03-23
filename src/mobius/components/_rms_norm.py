@@ -65,16 +65,20 @@ class GatedRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
-        # Gate first: hidden * SiLU(gate)
-        gate_activated = op.Mul(gate, op.Sigmoid(gate))
-        gated = op.Mul(hidden_states, gate_activated)
-        # Then normalize the gated result
-        return op.RMSNormalization(
+        # Upcast to fp32 for SiLU gating + RMSNorm variance, matching HF
+        # which does hidden_states.to(float32) and gate.to(float32).
+        h_f32 = op.Cast(hidden_states, to=1)
+        g_f32 = op.Cast(gate, to=1)
+        gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
+        gated = op.Mul(h_f32, gate_activated)
+        # RMSNorm in fp32, then cast back to input dtype
+        normed = op.RMSNormalization(
             gated,
-            self.weight,
+            op.Cast(self.weight, to=1),
             epsilon=self.variance_epsilon,
             axis=-1,
         )
+        return op.CastLike(normed, hidden_states)
 
 
 class PostGatedRMSNorm(nn.Module):
@@ -98,16 +102,20 @@ class PostGatedRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
-        # Normalize first
+        # RMSNorm uses stash_type=1 internally for fp32 variance.
         normed = op.RMSNormalization(
             hidden_states,
             self.weight,
             epsilon=self.variance_epsilon,
+            stash_type=1,
             axis=-1,
         )
-        # Then apply gate: normed * SiLU(gate)
-        gate_activated = op.Mul(gate, op.Sigmoid(gate))
-        return op.Mul(normed, gate_activated)
+        # Apply gate in fp32: normed * SiLU(gate), then cast back.
+        # Matches HF Qwen3_5RMSNormGated which does gate.to(float32).
+        g_f32 = op.Cast(gate, to=1)
+        gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
+        result = op.Mul(op.Cast(normed, to=1), gate_activated)
+        return op.CastLike(result, hidden_states)
 
 
 def apply_rms_norm(op: builder.OpBuilder, x, weight, eps):

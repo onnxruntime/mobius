@@ -367,10 +367,12 @@ Embedding(num_embeddings, embedding_dim, padding_idx=0)
    computations (window reordering, RoPE, spatial merge), and document how
    the ONNX graph maps to the HuggingFace reference implementation.
 
-7. **Keep components dtype-agnostic.** Components must work with any compute
-   dtype (float32, float16, bfloat16).  Never hardcode a target dtype — use
-   `op.CastLike(value, reference)` to match the graph's dtype at runtime.
-   See "Dtype-agnostic casting" below.
+7. **Match HuggingFace's precision behaviour.** Components must work with any
+   compute dtype (float32, float16, bfloat16).  For numerically sensitive ops
+   (`exp`, `softplus`, RMSNorm variance), upcast to float32 with
+   `op.Cast(to=1)`, compute, then cast back with `op.CastLike(result, input)`.
+   For dtype-adaptive parameters, use `op.CastLike(param, reference)`.
+   See "Precision-sensitive ops" below.
 
 ## Common ONNX op patterns
 
@@ -392,32 +394,58 @@ eps = op.Constant(value_float=1e-6)
 
 ### Dtype-agnostic casting with `CastLike`
 
-When a learned parameter or float constant must match the compute dtype
-(fp32/fp16/bf16), use `op.CastLike` instead of `op.Cast(to=<constant>)`.
-The `--dtype` flag sets the graph dtype at build time, so components must
-adapt automatically.
+When a parameter or constant needs to match an activation tensor's dtype
+without knowing what it is at graph-build time, use `op.CastLike`:
 
 ```python
-# BAD — hardcoded to float32, breaks with bfloat16/float16 graphs
-a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
-
-# GOOD — adapts to whatever dtype dt already has
-a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
+# GOOD — adapts to whatever dtype hidden_states has
+scale = op.CastLike(op.Constant(value_float=1e-6), hidden_states)
 ```
-
-Common cases where `CastLike` is needed:
-
-| Pattern | Example |
-|---------|---------|
-| SSM parameters (`A_log`, `D`, `dt_bias`) | `op.CastLike(self.D, hidden_states)` |
-| Float constants in arithmetic | `op.CastLike(op.Constant(value_float=1e-6), x)` |
-| Norm scale for `LayerNormalization` | `scale = op.CastLike(scale, hidden_states)` |
 
 **When `op.Cast(to=...)` IS appropriate:** converting between fundamentally
 different types (e.g. int64 position_ids to float for arithmetic, or float
-timesteps to the model's compute type).  The key rule: never use a hardcoded
-Cast on values that will be combined (Mul/Add/etc.) with activation tensors
-whose dtype depends on the build configuration.
+timesteps to the model's compute type), and for the fp32 upcast pattern
+below.
+
+### Precision-sensitive ops: fp32 upcast pattern
+
+Some operations are numerically unstable in float16/bfloat16 and must run
+in float32 to match HuggingFace's behaviour.  The pattern is:
+**upcast → compute → cast back**.
+
+```python
+# Upcast inputs to fp32 for numerically sensitive exp/softplus
+dt_f32 = op.Cast(dt, to=1)
+dt_f32 = op.Softplus(dt_f32)
+a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+...
+# Cast output back to input dtype
+y = op.CastLike(y_f32, x)
+```
+
+**Operations that need fp32 (based on HuggingFace source):**
+
+| Op | Why | HF pattern |
+|----|-----|-----------|
+| `Exp` on A_log/decay | Overflow/underflow in fp16 range | `self.A_log.float()` |
+| `Softplus` (dt) | Uses exp internally | `softplus(dt + dt_bias)` stays in fp32 context |
+| `Exp(dt * A)` (discretisation) | Exponential of product | `A.to(dtype=torch.float32)` |
+| SSM state update | Accumulates over many steps | `hidden_states.float()`, `B.float()`, `C.float()` |
+| RMSNorm variance | Small values squared then averaged | `hidden_states.to(torch.float32)` |
+| GatedRMSNorm (SiLU + norm) | Both gate and variance need fp32 | `gate.to(torch.float32)` |
+
+**When fp32 upcast is NOT needed:**
+
+- Linear projections (`MatMul`) — handled by the runtime
+- SiLU activation on conv output — stays in model dtype in HF
+- Standard attention — ONNX `Attention` op handles precision internally
+- `RMSNormalization` op — has `stash_type=1` (default) which auto-upcasts
+  the variance computation to fp32
+
+**Rule of thumb:** Check the HuggingFace source for `.float()` or
+`.to(torch.float32)` calls.  Every such call indicates an fp32 upcast
+region that the ONNX component must replicate with explicit
+`op.Cast(to=1)` ... `op.CastLike(result, input)` bracketing.
 
 ### Shape manipulation
 

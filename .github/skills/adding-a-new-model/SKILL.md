@@ -733,42 +733,57 @@ for i in range(num_groups - 1):
     codec_sum += cp_embed[i, codes[i + 1], :]
 ```
 
-### 16. Hardcoded `Cast(to=float32)` breaks bfloat16/float16 models
+### 16. Precision-sensitive ops need fp32 upcast
 
-**Symptom:** `ONNXRuntimeError: Type parameter (T) of Optype (Mul) bound to
-different types (tensor(float) and tensor(bfloat16))` when loading a model
-built with `--dtype bf16` or from a bfloat16 checkpoint.
+**Symptom:** Type mismatch errors (`tensor(float) vs tensor(bfloat16)`)
+when loading a model built with `--dtype bf16`, or numerical drift compared
+to HuggingFace when running in fp16/bf16.
 
-**Root cause:** Component code uses `op.Cast(self.param, to=1)` (hardcoded
-to float32) to cast learned parameters before arithmetic.  When the graph is
-built in bfloat16, intermediate tensors are bf16, but the Cast forces float32,
-producing a type mismatch in the downstream `Mul`/`Add`.
+**Root cause:** Operations like `exp`, `softplus`, `sigmoid` (in gated norms),
+and RMSNorm variance are numerically sensitive and must run in float32 to
+match HuggingFace, which explicitly upcasts with `.float()` /
+`.to(torch.float32)`.
 
-**Example (bad — from SSM components):**
+**Two distinct problems:**
+
+1. **Naive `CastLike` everywhere** — keeps everything in the model dtype
+   (e.g. bf16), but `exp` overflows and the SSM state diverges.
+2. **Naive `Cast(to=1)` everywhere** — computes in fp32 but forgets to cast
+   back, producing type mismatches with downstream bf16 ops.
+
+**Correct pattern — upcast → compute → cast back:**
 ```python
-# BAD — hardcoded float32 regardless of graph dtype
+# 1. Upcast to fp32 for the sensitive region
+dt_f32 = op.Cast(dt, to=1)
+dt_f32 = op.Softplus(dt_f32)
 a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
-dt = op.Add(dt_input, op.Cast(self.dt_bias, to=1))
+da = op.Exp(op.Mul(dt_4d, a_4d))  # all fp32 here
+...
+# 2. Cast back to input dtype at the boundary
+y = op.CastLike(y_f32, x)
+new_state = op.CastLike(new_state_f32, ssm_state)
 ```
 
-**Fix:** Use `op.CastLike(param, reference_tensor)` which adapts to whatever
-dtype the graph is using:
-```python
-# GOOD — matches the compute dtype (fp32, fp16, or bf16)
-a_neg = op.Neg(op.Exp(op.CastLike(self.A_log, dt)))
-dt = op.Add(dt_input, op.CastLike(self.dt_bias, dt_input))
-```
+**How to identify which ops need fp32:** Check the HuggingFace source for
+`.float()` or `.to(torch.float32)` calls.  Each one marks an fp32 region
+that the ONNX graph must replicate.
 
-**Rule of thumb:** Never use `op.Cast(to=<constant>)` on learned parameters
-or scalar constants that will be combined with activation tensors.  Always
-use `op.CastLike(value, reference)` where `reference` is a tensor already
-in the compute dtype.
+**Known fp32-required regions:**
 
-**Affected patterns:**
-- SSM parameters: `A_log`, `D`, `dt_bias` in `Mamba2Scan`/`SelectiveScan`
-- Gated attention: `A_log` in `GatedDeltaNet`
-- Timestep embeddings in diffusion models
-- Any `op.Constant(value_float=...)` multiplied with activation tensors
+| Region | HF evidence | ONNX pattern |
+|--------|-------------|-------------|
+| SSM recurrence (A, dt, exp, state) | `self.A_log.float()`, `hidden_states.float()`, `B.float()`, `C.float()` | `Cast(to=1)` all inputs, `CastLike` output |
+| GatedRMSNorm (SiLU + variance) | `hidden_states.to(torch.float32)`, `gate.to(torch.float32)` | Explicit fp32 for both, `CastLike` output |
+| RMSNorm variance | `hidden_states.to(torch.float32)` | ONNX `RMSNormalization` handles via `stash_type=1` (default) |
+
+**When fp32 upcast is NOT needed:**
+- Linear projections (`MatMul`) — runtime handles mixed precision
+- SiLU on conv output — HF keeps in model dtype
+- Standard attention — ONNX `Attention` op handles precision internally
+
+**Use `CastLike` for** parameters/constants that should match the *current*
+compute dtype (which is fp32 inside an upcast region, or the model dtype
+outside).  Use `Cast(to=1)` to explicitly enter an fp32 region.
 
 ## Reference implementations
 
