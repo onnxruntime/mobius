@@ -113,7 +113,7 @@ class PostGatedRMSNorm(nn.Module):
         # Matches HF Qwen3_5RMSNormGated which does gate.to(float32).
         g_f32 = op.Cast(gate, to=1)
         gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
-        result = op.Mul(op.Cast(normed, to=1), gate_activated)
+        result = op.Mul(op.Cast(normed, to=ir.DataType.FLOAT), gate_activated)
         return op.CastLike(result, hidden_states)
 
 
