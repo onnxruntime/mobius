@@ -11,6 +11,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_gptq_weights
 from mobius.components._attention import Qwen35Attention
 from mobius.components._common import (
     Embedding,
@@ -556,6 +557,12 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             elif stripped.startswith("language_model."):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
+
+        # Transpose/reshape GPTQ quantized weights for MatMulNBits
+        qc = getattr(self.config, "quantization", None)
+        if qc is not None and qc.quant_method == "gptq":
+            renamed = preprocess_gptq_weights(renamed, bits=qc.bits, group_size=qc.group_size)
+
         return renamed
 
 
