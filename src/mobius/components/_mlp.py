@@ -59,6 +59,14 @@ class FCMLP(nn.Module):
     different HuggingFace weight names (e.g. ``fc1``/``fc2``,
     ``c_fc``/``c_proj``) should rename in ``preprocess_weights()``.
 
+    Note: ``up_proj``/``down_proj`` was chosen over ``fc1``/``fc2`` for
+    consistency with the gated :class:`MLP` (``gate_proj``/``up_proj``/
+    ``down_proj``) and the broader LLM ecosystem (Llama, Qwen, Mistral).
+    HuggingFace models use many different names (fc1/fc2, lin1/lin2,
+    c_fc/c_proj, dense_h_to_4h/dense_4h_to_h, etc.) so no single choice
+    avoids renames for most models — 7 of 10 consolidated models need
+    ``preprocess_weights`` renames regardless.
+
     Args:
         hidden_size: Input/output dimension.
         intermediate_size: Hidden dimension of the inner layer.
