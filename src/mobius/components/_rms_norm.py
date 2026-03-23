@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class RMSNorm(nn.Module):
@@ -67,8 +64,8 @@ class GatedRMSNorm(nn.Module):
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # Upcast to fp32 for SiLU gating + RMSNorm variance, matching HF
         # which does hidden_states.to(float32) and gate.to(float32).
-        h_f32 = op.Cast(hidden_states, to=1)
-        g_f32 = op.Cast(gate, to=1)
+        h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
         gated = op.Mul(h_f32, gate_activated)
         # RMSNorm in fp32, then cast back to input dtype
@@ -111,7 +108,7 @@ class PostGatedRMSNorm(nn.Module):
         )
         # Apply gate in fp32: normed * SiLU(gate), then cast back.
         # Matches HF Qwen3_5RMSNormGated which does gate.to(float32).
-        g_f32 = op.Cast(gate, to=1)
+        g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
         result = op.Mul(op.Cast(normed, to=ir.DataType.FLOAT), gate_activated)
         return op.CastLike(result, hidden_states)

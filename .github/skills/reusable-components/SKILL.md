@@ -370,7 +370,7 @@ Embedding(num_embeddings, embedding_dim, padding_idx=0)
 7. **Match HuggingFace's precision behaviour.** Components must work with any
    compute dtype (float32, float16, bfloat16).  For numerically sensitive ops
    (`exp`, `softplus`, RMSNorm variance), upcast to float32 with
-   `op.Cast(to=1)`, compute, then cast back with `op.CastLike(result, input)`.
+   `op.Cast(to=ir.DataType.FLOAT)`, compute, then cast back with `op.CastLike(result, input)`.
    For dtype-adaptive parameters, use `op.CastLike(param, reference)`.
    See "Precision-sensitive ops" below.
 
@@ -415,9 +415,9 @@ in float32 to match HuggingFace's behaviour.  The pattern is:
 
 ```python
 # Upcast inputs to fp32 for numerically sensitive exp/softplus
-dt_f32 = op.Cast(dt, to=1)
+dt_f32 = op.Cast(dt, to=ir.DataType.FLOAT)
 dt_f32 = op.Softplus(dt_f32)
-a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
 ...
 # Cast output back to input dtype
 y = op.CastLike(y_f32, x)
@@ -445,7 +445,7 @@ y = op.CastLike(y_f32, x)
 **Rule of thumb:** Check the HuggingFace source for `.float()` or
 `.to(torch.float32)` calls.  Every such call indicates an fp32 upcast
 region that the ONNX component must replicate with explicit
-`op.Cast(to=1)` ... `op.CastLike(result, input)` bracketing.
+`op.Cast(to=ir.DataType.FLOAT)` ... `op.CastLike(result, input)` bracketing.
 
 ### Shape manipulation
 

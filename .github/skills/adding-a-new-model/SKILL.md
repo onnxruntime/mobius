@@ -748,15 +748,15 @@ match HuggingFace, which explicitly upcasts with `.float()` /
 
 1. **Naive `CastLike` everywhere** — keeps everything in the model dtype
    (e.g. bf16), but `exp` overflows and the SSM state diverges.
-2. **Naive `Cast(to=1)` everywhere** — computes in fp32 but forgets to cast
+2. **Naive `Cast(to=ir.DataType.FLOAT)` everywhere** — computes in fp32 but forgets to cast
    back, producing type mismatches with downstream bf16 ops.
 
 **Correct pattern — upcast → compute → cast back:**
 ```python
 # 1. Upcast to fp32 for the sensitive region
-dt_f32 = op.Cast(dt, to=1)
+dt_f32 = op.Cast(dt, to=ir.DataType.FLOAT)
 dt_f32 = op.Softplus(dt_f32)
-a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=1)))
+a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
 da = op.Exp(op.Mul(dt_4d, a_4d))  # all fp32 here
 ...
 # 2. Cast back to input dtype at the boundary
@@ -772,7 +772,7 @@ that the ONNX graph must replicate.
 
 | Region | HF evidence | ONNX pattern |
 |--------|-------------|-------------|
-| SSM recurrence (A, dt, exp, state) | `self.A_log.float()`, `hidden_states.float()`, `B.float()`, `C.float()` | `Cast(to=1)` all inputs, `CastLike` output |
+| SSM recurrence (A, dt, exp, state) | `self.A_log.float()`, `hidden_states.float()`, `B.float()`, `C.float()` | `Cast(to=ir.DataType.FLOAT)` all inputs, `CastLike` output |
 | GatedRMSNorm (SiLU + variance) | `hidden_states.to(torch.float32)`, `gate.to(torch.float32)` | Explicit fp32 for both, `CastLike` output |
 | RMSNorm variance | `hidden_states.to(torch.float32)` | ONNX `RMSNormalization` handles via `stash_type=1` (default) |
 
@@ -783,7 +783,7 @@ that the ONNX graph must replicate.
 
 **Use `CastLike` for** parameters/constants that should match the *current*
 compute dtype (which is fp32 inside an upcast region, or the model dtype
-outside).  Use `Cast(to=1)` to explicitly enter an fp32 region.
+outside).  Use `Cast(to=ir.DataType.FLOAT)` to explicitly enter an fp32 region.
 
 ## Reference implementations
 
