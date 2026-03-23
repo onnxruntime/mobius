@@ -105,7 +105,11 @@ class GatedDeltaNet(nn.Module):
     The recurrent state replaces the KV cache for these layers.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
@@ -117,17 +121,22 @@ class GatedDeltaNet(nn.Module):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
+        # Use QuantizedLinear when provided, else standard Linear.
+        # in_proj_a and in_proj_b are always full-precision (too small
+        # to quantize and excluded by GPTQ configs).
+        lin_class = linear_class or Linear
+
         # QKV projection (fused: Q, K, V in one linear)
-        self.in_proj_qkv = Linear(
+        self.in_proj_qkv = lin_class(
             self.hidden_size,
             self.key_dim * 2 + self.value_dim,
             bias=False,
         )
         # Gating projection (z for silu gating in output norm)
-        self.in_proj_z = Linear(self.hidden_size, self.value_dim, bias=False)
-        # Beta projection (forget gate)
+        self.in_proj_z = lin_class(self.hidden_size, self.value_dim, bias=False)
+        # Beta projection (forget gate) — always full-precision
         self.in_proj_b = Linear(self.hidden_size, self.num_v_heads, bias=False)
-        # Alpha projection (decay control)
+        # Alpha projection (decay control) — always full-precision
         self.in_proj_a = Linear(self.hidden_size, self.num_v_heads, bias=False)
 
         # Causal depthwise Conv1D
@@ -141,7 +150,7 @@ class GatedDeltaNet(nn.Module):
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
 
         # Output projection
-        self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = lin_class(self.value_dim, self.hidden_size, bias=False)
 
     def forward(
         self,

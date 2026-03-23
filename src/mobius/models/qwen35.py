@@ -52,9 +52,11 @@ class Qwen35DecoderLayer(nn.Module):
     Args:
         config: Architecture configuration.
         layer_idx: Index of this layer in the decoder stack.
-        linear_class: Factory for MLP projection layers (e.g.
-            ``QuantizedLinear`` for GPTQ).  Only applied to MLP, not
-            to attention or DeltaNet projections.
+        linear_class: Factory for quantized projection layers (e.g.
+            ``QuantizedLinear`` for GPTQ).  Applied to MLP,
+            GatedDeltaNet projections (``in_proj_qkv``, ``in_proj_z``,
+            ``out_proj``), and Qwen35Attention projections (``q/k/v/o_proj``).
+            Not applied to DeltaNet's small ``in_proj_a``/``in_proj_b``.
     """
 
     def __init__(
@@ -70,9 +72,9 @@ class Qwen35DecoderLayer(nn.Module):
         )
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(config)
+            self.linear_attn = GatedDeltaNet(config, linear_class=linear_class)
         else:
-            self.self_attn = Qwen35Attention(config)
+            self.self_attn = Qwen35Attention(config, linear_class=linear_class)
 
         self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -127,10 +129,11 @@ class Qwen35TextModel(nn.Module):
     ``GatedDeltaNet`` or ``Qwen35Attention`` based on
     ``config.layer_types``.
 
-    When quantization is configured (e.g. GPTQ), only the MLP layers
-    use ``QuantizedLinear``.  Attention and DeltaNet projections remain
-    full-precision — matching the GPTQ config exclusion pattern
-    ``-:.*attn.*``.
+    When quantization is configured (e.g. GPTQ), the MLP layers,
+    GatedDeltaNet projections (``in_proj_qkv``, ``in_proj_z``,
+    ``out_proj``), and Qwen35Attention projections (``q/k/v/o_proj``)
+    use ``QuantizedLinear``.  DeltaNet's small ``in_proj_a``/``in_proj_b``
+    remain full-precision.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -349,9 +352,9 @@ class Qwen35MoETextModel(nn.Module):
     :class:`Qwen35TextModel`, but each layer uses MoE FFN
     (:class:`Qwen35MoEBlock`) instead of dense MLP.
 
-    When quantization is configured (e.g. GPTQ), only the MLP layers
-    use ``QuantizedLinear``.  Attention and DeltaNet projections remain
-    full-precision.
+    When quantization is configured (e.g. GPTQ), the MLP layers,
+    GatedDeltaNet projections, and Qwen35Attention projections use
+    ``QuantizedLinear``.
 
     HuggingFace class: ``Qwen3_5MoeModel``
     """

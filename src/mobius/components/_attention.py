@@ -292,6 +292,7 @@ class Qwen35Attention(nn.Module):
     def __init__(
         self,
         config: ArchitectureConfig,
+        linear_class: type | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -306,23 +307,24 @@ class Qwen35Attention(nn.Module):
         )
         self._rope_interleave = config.rope_interleave
 
+        lin_class = linear_class or Linear
         q_dim = self.num_attention_heads * self.head_dim
-        self.q_proj = Linear(
+        self.q_proj = lin_class(
             self.hidden_size,
             q_dim * 2,
             bias=config.attn_qkv_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = lin_class(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = lin_class(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.o_proj = Linear(
+        self.o_proj = lin_class(
             q_dim,
             self.hidden_size,
             bias=config.attn_o_bias,

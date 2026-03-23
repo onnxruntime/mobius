@@ -613,12 +613,20 @@ class TestBuildGraphQuantized:
         pkg = task.build(module, config)
         model = pkg["model"]
 
-        # MLP projections (gate, up, down) are quantized;
-        # GatedDeltaNet and gated-attention projections use
-        # specialized components that bypass quantized linear.
+        # MLP projections (gate, up, down), GatedDeltaNet projections
+        # (in_proj_qkv, in_proj_z, out_proj), and Qwen35Attention
+        # projections (q, k, v, o) are all quantized.
         matmulnbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
         num_mlp_projections_per_layer = 3  # gate, up, down
-        expected = 2 * num_mlp_projections_per_layer
+        num_deltanet_projections = 3  # in_proj_qkv, in_proj_z, out_proj
+        num_attention_projections = 4  # q, k, v, o
+        num_linear_attn_layers = sum(1 for t in config.layer_types if t == "linear_attention")
+        num_full_attn_layers = sum(1 for t in config.layer_types if t == "full_attention")
+        expected = (
+            config.num_hidden_layers * num_mlp_projections_per_layer
+            + num_linear_attn_layers * num_deltanet_projections
+            + num_full_attn_layers * num_attention_projections
+        )
         assert len(matmulnbits) == expected, (
             f"Expected {expected} MatMulNBits, got {len(matmulnbits)}"
         )
