@@ -367,7 +367,13 @@ class Phi4MMCausalLMModel(Phi3CausalLMModel):
 
 
 class _Phi4MMSigLIPEncoder(nn.Module):
-    """SigLIP vision encoder for Phi4MM (no post_layernorm)."""
+    """SigLIP vision encoder for Phi4MM (no post_layernorm).
+
+    HuggingFace Phi4MM uses ``layer_idx=-2`` when extracting SigLIP
+    features, meaning it uses the *second-to-last* hidden state and
+    skips the final encoder layer.  We replicate this by instantiating
+    ``num_hidden_layers - 1`` encoder layers.
+    """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -384,8 +390,9 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             patch_size=patch_size,
             hidden_size=hidden_size,
         )
+        # layer_idx=-2: only run the first (num_layers - 1) encoder layers.
         self.encoder = VisionEncoder(
-            num_layers=num_layers,
+            num_layers=max(1, num_layers - 1),
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_heads=num_heads,
@@ -589,17 +596,26 @@ class _Phi4MMMultiModalTextModel(nn.Module):
 
 
 class _Phi4MMVisionModel(nn.Module):
-    """Phi4MM vision encoder: SigLIP + projection MLP + HD transform params.
+    """Phi4MM vision encoder: SigLIP + AvgPool + HD transform + projection MLP.
 
-    Takes raw pixel values, encodes through SigLIP, and projects to the
-    text decoder's hidden dimension. Includes glb_GN and sub_GN
-    parameters for HD spatial merge.
+    Takes raw pixel values (all crops) and image_sizes, encodes each crop
+    through SigLIP, applies 2x spatial compression (AvgPool2d), then assembles
+    the HD transform: arranges sub-crops in a spatial grid, adds row separator
+    tokens (sub_GN), and concatenates with the global crop feature in
+    sub-first order (sub | glb_GN | global).  The combined sequence is
+    projected to the text decoder's hidden dimension.
+
+    HF reference: ``Phi4MMImageEmbedding.forward`` with
+    ``image_token_compression_cls="avg_pool_2d"`` and
+    ``hd_transform_order="sub_glb"``.
 
     Inputs:
-        pixel_values: [batch, 3, image_size, image_size]
-        image_sizes: [num_images, 2] — (height, width) per image for HD crop
+        pixel_values: (N_crops, 3, image_size, image_size)
+        image_sizes: (1, 2) — [height_px, width_px] of the original image,
+            used to derive the sub-crop grid dimensions
+            (h = height_px // crop_size, w = width_px // crop_size).
     Outputs:
-        image_features: [num_image_tokens, hidden_size]
+        image_features: (total_image_tokens, text_hidden_size)
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -607,6 +623,16 @@ class _Phi4MMVisionModel(nn.Module):
         vc = config.vision
         vision_hidden = (vc.hidden_size if vc else None) or config.hidden_size
         text_hidden = config.hidden_size
+        image_size = (vc.image_size if vc else None) or 448
+        patch_size = (vc.patch_size if vc else None) or 14
+
+        # H: patches per side from SigLIP (e.g. 448/14 = 32)
+        # Hp: patches per side after AvgPool2d(kernel=2, stride=2) = H // 2 = 16
+        # crop_size: pixel width/height of one crop tile (= image_size for Phi4MM)
+        self._H = image_size // patch_size  # 32
+        self._Hp = self._H // 2  # 16 — post-AvgPool spatial dimension
+        self._C = vision_hidden  # 1152
+        self._crop_size = image_size  # 448
 
         self.img_processor = _Phi4MMSigLIPEncoder(config)
         self.img_projection = _Phi4MMProjectionMLP(vision_hidden, text_hidden)
@@ -619,10 +645,145 @@ class _Phi4MMVisionModel(nn.Module):
         pixel_values: ir.Value,
         image_sizes: ir.Value,
     ):
-        # image_sizes is plumbed for the I/O contract with ORT GenAI.
-        # It will be used by the HD dynamic crop transform in a follow-up.
+        """Encode crops through SigLIP + HD spatial reassembly.
+
+        Steps:
+          1. SigLIP: (N_crops, 3, H_px, W_px) → (N_crops, H*H, C)
+          2. AvgPool2d(kernel=2, stride=2): 32x32 -> 16x16 per crop
+          3. Extract grid ratio (h, w) from image_sizes
+          4. Global crop (index 0): reshape to (1, Hp, Hp, C) and append
+             sub_GN row separators → (1, Hp*(Hp+1), C)
+          5. Sub crops (indices 1..h*w): arrange in (h, w) grid →
+             (1, h*Hp, w*Hp, C) and append sub_GN row separators
+          6. Assemble sub-first: [sub | glb_GN | global]
+          7. Project flat sequence through img_projection MLP
+        """
+        H = self._H  # noqa: N806  # 32 patches per side from SigLIP
+        Hp = self._Hp  # noqa: N806  # 16 patches per side after AvgPool
+        C = self._C  # noqa: N806  # 1152 vision hidden dim
+
+        # ── Step 1: SigLIP encode all crops ────────────────────────────
+        # pixel_values: (N_crops, 3, 448, 448)
+        # vision_features: (N_crops, H*H, C) = (N_crops, 1024, 1152)
         vision_features = self.img_processor(op, pixel_values)
-        return self.img_projection(op, vision_features)
+
+        # ── Step 2: AvgPool2d — compress 32x32 patches to 16x16 ───────
+        # Reshape: (N_crops, H*H, C) -> (N_crops, H, H, C)
+        n_crops = op.Shape(vision_features, start=0, end=1)  # (1,) int64
+        feats = op.Reshape(
+            vision_features,
+            op.Concat(n_crops, op.Constant(value_ints=[H, H, C]), axis=0),
+        )  # (N_crops, 32, 32, 1152)
+        # NHWC -> NCHW for AveragePool
+        feats = op.Transpose(feats, perm=[0, 3, 1, 2])  # (N_crops, 1152, 32, 32)
+        feats = op.AveragePool(feats, kernel_shape=[2, 2], strides=[2, 2])
+        # (N_crops, 1152, 16, 16)
+        feats = op.Transpose(feats, perm=[0, 2, 3, 1])  # (N_crops, 16, 16, 1152)
+        # Flatten spatial dims: (N_crops, Hp*Hp, C)
+        feats = op.Reshape(
+            feats,
+            op.Concat(n_crops, op.Constant(value_ints=[Hp * Hp, C]), axis=0),
+        )  # (N_crops, 256, 1152)
+
+        # ── Step 3: Derive h, w grid dimensions from image_sizes ──────
+        # image_sizes: (1, 2) = [[height_px, width_px]]
+        # h = height_px // crop_size, w = width_px // crop_size
+        img_hw = op.Reshape(image_sizes, op.Constant(value_ints=[-1]))  # (2,)
+        crop_size_t = op.Constant(value_int=self._crop_size)  # scalar int64
+        h = op.Div(
+            op.Gather(img_hw, op.Constant(value_int=0), axis=0), crop_size_t
+        )  # scalar — num sub-crop rows
+        w = op.Div(
+            op.Gather(img_hw, op.Constant(value_int=1), axis=0), crop_size_t
+        )  # scalar — num sub-crop cols
+        B_ = op.Mul(h, w)  # noqa: N806  # total number of sub crops
+
+        # ── Step 4: Split global crop (index 0) and sub crops ─────────
+        # global: (1, Hp*Hp, C) = (1, 256, 1152)
+        global_feat = op.Slice(
+            feats,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[0]),
+        )
+
+        # sub: (h*w, Hp*Hp, C) — slices crops 1 through h*w (inclusive)
+        B_plus_1 = op.Unsqueeze(op.Add(B_, op.Constant(value_int=1)), [0])  # noqa: N806
+        sub_feat = op.Slice(
+            feats,
+            op.Constant(value_ints=[1]),
+            B_plus_1,  # end = h*w + 1
+            op.Constant(value_ints=[0]),
+        )  # (h*w, 256, 1152)
+
+        # ── Step 5: Process global crop — reshape + row separators ────
+        # Reshape to 2D grid: (1, Hp, Hp, C)
+        global_4d = op.Reshape(global_feat, op.Constant(value_ints=[1, Hp, Hp, C]))
+        # sub_GN: (1, 1, 1, C) -> tile to (1, Hp, 1, C) as row separators
+        temp_glb_gn = op.Tile(
+            self.sub_GN, op.Constant(value_ints=[1, Hp, 1, 1])
+        )  # (1, 16, 1, 1152)
+        # Append one separator per row: (1, Hp, Hp+1, C)
+        glb_rows = op.Concat(global_4d, temp_glb_gn, axis=2)
+        # Flatten rows: (1, Hp*(Hp+1), C) = (1, 272, 1152)
+        glb_img = op.Reshape(glb_rows, op.Constant(value_ints=[1, -1, C]))
+
+        # ── Step 6: Process sub crops — grid layout + row separators ──
+        # Reshape each crop to 2D grid: (h*w, Hp, Hp, C)
+        sub_4d_shape = op.Concat(
+            op.Unsqueeze(B_, [0]),
+            op.Constant(value_ints=[Hp, Hp, C]),
+            axis=0,
+        )
+        sub_4d = op.Reshape(sub_feat, sub_4d_shape)  # (h*w, 16, 16, 1152)
+
+        # Arrange in (h, w) spatial grid: (1, h, w, Hp, Hp, C)
+        sub_6d_shape = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h, [0]),
+            op.Unsqueeze(w, [0]),
+            op.Constant(value_ints=[Hp, Hp, C]),
+            axis=0,
+        )
+        sub_6d = op.Reshape(sub_4d, sub_6d_shape)  # (1, h, w, 16, 16, 1152)
+
+        # Permute row/col blocks to place spatially adjacent:
+        # (1, h, w, Hp, Hp, C) -> (1, h, Hp, w, Hp, C)
+        sub_6d_t = op.Transpose(sub_6d, perm=[0, 1, 3, 2, 4, 5])
+
+        # Flatten block dims: (1, h*Hp, w*Hp, C)
+        h_hp = op.Mul(h, op.Constant(value_int=Hp))  # h * 16
+        w_hp = op.Mul(w, op.Constant(value_int=Hp))  # w * 16
+        sub_flat_shape = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h_hp, [0]),
+            op.Unsqueeze(w_hp, [0]),
+            op.Constant(value_ints=[C]),
+            axis=0,
+        )
+        sub_grid = op.Reshape(sub_6d_t, sub_flat_shape)  # (1, h*16, w*16, 1152)
+
+        # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
+        sub_sep_tile = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h_hp, [0]),
+            op.Constant(value_ints=[1, 1]),
+            axis=0,
+        )
+        temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
+        # Append one separator per row: (1, h*Hp, w*Hp+1, C)
+        sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+        # Flatten rows: (1, h*Hp*(w*Hp+1), C)
+        sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+
+        # ── Step 7: Assemble sub-first and project ────────────────────
+        # HF hd_transform_order = "sub_glb": [sub | glb_GN | global]
+        # glb_GN: (1, 1, C) — separator between sub and global features
+        full_seq = op.Concat(sub_img, self.glb_GN, glb_img, axis=1)
+        # (1, total_tokens, C) -> (total_tokens, C)
+        flat = op.Reshape(full_seq, op.Constant(value_ints=[-1, C]))
+        # Project to text hidden dim: (total_tokens, text_hidden)
+        return self.img_projection(op, flat)
 
 
 class _Phi4MMSpeechModel(nn.Module):

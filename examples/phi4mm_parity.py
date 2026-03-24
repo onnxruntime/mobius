@@ -260,6 +260,7 @@ def load_hf_model(
     model_id: str,
     num_text_layers: int,
     num_audio_blocks: int | None = None,
+    num_vision_layers: int | None = None,
 ):
     """Load the HuggingFace Phi4MM model with merged LoRA adapters.
 
@@ -271,6 +272,12 @@ def load_hf_model(
     If ``num_audio_blocks`` is provided the conformer encoder is truncated
     to that many blocks after loading, so the HF reference uses the same
     encoder depth as the ONNX model built with that value.
+
+    If ``num_vision_layers`` is provided the SigLIP encoder is truncated
+    to that many layers.  The ONNX model with ``num_vision_layers=N``
+    runs ``N - 1`` encoder layers (HF uses ``layer_idx=-2``, i.e. the
+    second-to-last hidden state); truncating HF to ``N`` layers ensures
+    ``layer_idx=-2`` resolves to the same encoder depth as ONNX.
 
     Merging all LoRA adapters into the base weights ensures the HF
     model's behavior matches the ONNX model, which always applies all
@@ -330,6 +337,18 @@ def load_hf_model(
             enc = model.model.embed_tokens_extend.audio_embed.encoder
             enc.encoders = enc.encoders[:num_audio_blocks]
             print(f"  Truncated audio conformer to {num_audio_blocks} blocks")
+        except AttributeError:
+            pass
+
+    # Truncate SigLIP encoder to match ONNX vision depth.
+    # ONNX runs (num_vision_layers - 1) layers; HF uses layer_idx=-2.
+    # Truncating HF to num_vision_layers total layers makes layer_idx=-2
+    # resolve to the same depth (index num_vision_layers - 2).
+    if num_vision_layers is not None:
+        try:
+            enc = model.model.embed_tokens_extend.image_embed.img_processor.encoder
+            enc.layers = enc.layers[:num_vision_layers]
+            print(f"  Truncated SigLIP encoder to {num_vision_layers} layers")
         except AttributeError:
             pass
 
@@ -1033,17 +1052,75 @@ def test_vision(
 ) -> dict:
     """Text + image parity.
 
-    SKIPPED: The ONNX vision model does not implement the HD dynamic crop
-    transform. HuggingFace applies a multi-step spatial merge to the
-    SigLIP crops (glb_GN/sub_GN separators + 2x downsampling per
-    sub-crop) before the projection MLP. The ONNX model projects the
-    raw SigLIP crop features directly, producing mismatched features
-    and a large logit divergence (~100 max diff). This is a known
-    limitation to be addressed in a follow-up.
+    Compares the ONNX HD-transform vision pipeline against HuggingFace's
+    Phi4MMImageEmbedding, which applies AvgPool2d spatial compression,
+    glb_GN/sub_GN row separators, and sub-first ordering before the
+    projection MLP.
     """
-    return skipped_result(
+    if image_path is not None:
+        pixel_values, image_sizes, num_img_tokens = load_real_image(image_path)
+    else:
+        pixel_values, image_sizes, num_img_tokens = create_dummy_pixel_values(config)
+
+    prompt = "Describe this image"
+
+    print(
+        f"\n[ONNX] Running vision prefill + generate"
+        f" ({pixel_values.shape[0]} crops"
+        f" → {num_img_tokens} image tokens) ..."
+    )
+    input_ids = build_input_ids(tokenizer, prompt, num_image_tokens=num_img_tokens)
+    t0 = time.time()
+    onnx_logits = run_onnx_pipeline(
+        pkg,
+        config,
+        input_ids,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+    )
+    onnx_generated = generate_onnx(
+        pkg,
+        config,
+        tokenizer,
+        input_ids,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+    )
+    print(f"  ONNX: {time.time() - t0:.1f}s")
+
+    print("[HF] Running vision prefill + generate ...")
+    t0 = time.time()
+    hf_logits = run_hf_forward(
+        hf_model,
+        tokenizer,
+        prompt,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        num_image_tokens=num_img_tokens,
+        input_mode=1,
+    )
+    try:
+        hf_generated = generate_hf(
+            hf_model,
+            tokenizer,
+            prompt,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            num_image_tokens=num_img_tokens,
+            input_mode=1,
+        )
+    except Exception as e:
+        print(f"  Warning: HF generate failed ({e}); skipping generation comparison")
+        hf_generated = None
+    print(f"  HF:   {time.time() - t0:.1f}s")
+
+    return compare_logits(
+        onnx_logits,
+        hf_logits,
         "Text + Image",
-        "HD dynamic crop transform not yet implemented in ONNX vision model",
+        onnx_generated=onnx_generated,
+        hf_generated=hf_generated,
+        tokenizer=tokenizer,
     )
 
 
@@ -1272,7 +1349,10 @@ def main():
 
     print(f"\nLoading HuggingFace model from {args.model_id!r} ...")
     hf_model, tokenizer = load_hf_model(
-        args.model_id, args.num_text_layers, num_audio_blocks=args.num_audio_blocks
+        args.model_id,
+        args.num_text_layers,
+        num_audio_blocks=args.num_audio_blocks,
+        num_vision_layers=args.num_vision_layers,
     )
 
     # ------------------------------------------------------------------
