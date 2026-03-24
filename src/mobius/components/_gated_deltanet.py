@@ -234,34 +234,29 @@ class GatedDeltaNet(nn.Module):
         g = op.Mul(neg_a, softplus_val)  # (B, S, num_v_heads), float32
 
         # === LinearAttention ===
-        # The LinearAttention ir.Function declares all inputs as FLOAT.
-        # Cast activations to float32 before the call; cast outputs back.
-        # Transpose from (B, S, H, D) to (B, H, S, D)
+        # The LinearAttention function handles float32 casting internally.
+        # Transpose from (B, S, H, D) to (B, H, S, D).
         # Q/K keep native num_k_heads; V uses num_v_heads.
         # GQA expansion happens inside the function.
-        query_bhsd = op.Cast(op.Transpose(query, perm=[0, 2, 1, 3]), to=ir.DataType.FLOAT)
-        key_bhsd = op.Cast(op.Transpose(key, perm=[0, 2, 1, 3]), to=ir.DataType.FLOAT)
-        value_bhsd = op.Cast(op.Transpose(value, perm=[0, 2, 1, 3]), to=ir.DataType.FLOAT)
-        recurrent_state_f32 = op.Cast(recurrent_state, to=ir.DataType.FLOAT)
+        query_bhsd = op.Transpose(query, perm=[0, 2, 1, 3])
+        key_bhsd = op.Transpose(key, perm=[0, 2, 1, 3])
+        value_bhsd = op.Transpose(value, perm=[0, 2, 1, 3])
 
         # beta/decay: (B, S, H) -> (B, H, S)
-        beta_bhs = op.Cast(op.Transpose(beta, perm=[0, 2, 1]), to=ir.DataType.FLOAT)
-        g_bhs = op.Transpose(g, perm=[0, 2, 1])  # already float32
+        beta_bhs = op.Transpose(beta, perm=[0, 2, 1])
+        g_bhs = op.Transpose(g, perm=[0, 2, 1])  # float32 from decay computation
 
         output_4d, new_recurrent_state = op.LinearAttention(
             query_bhsd,  # (B, H_kv, S, d_k)
             key_bhsd,  # (B, H_kv, S, d_k)
             value_bhsd,  # (B, H, S, d_v)
-            recurrent_state_f32,  # (B, H, d_k, d_v)
-            g_bhs,  # (B, H, S) — decay in log-space
+            recurrent_state,  # (B, H, d_k, d_v)
+            g_bhs,  # (B, H, S) — decay in log-space, float32
             beta_bhs,  # (B, H, S) — update rate
             update_rule="gated_delta",
             _domain="com.microsoft",
             _outputs=2,
         )
-        # Cast outputs back to model precision (no-op for f32)
-        output_4d = op.CastLike(output_4d, hidden_states)
-        new_recurrent_state = op.CastLike(new_recurrent_state, hidden_states)
         # output_4d: (B, H, S, d_v) -> (B, S, H, d_v)
         output_per_head = op.Transpose(output_4d, perm=[0, 2, 1, 3])
 

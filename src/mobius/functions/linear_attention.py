@@ -74,39 +74,22 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs ---
+    # query/key/value/past_state/beta accept any floating-point precision
+    # (float16/bfloat16/float32) — they form the implicit type parameter T.
+    # decay is ALWAYS float32: it is computed in float32 at the call site
+    # (HF pattern: -A_log.float().exp() * softplus(a.float() + dt_bias))
+    # to avoid exp/softplus overflow in lower precision. Declaring it as FLOAT
+    # here keeps it outside the type parameter T so ORT does not see a type
+    # conflict when the rest of the inputs are float16/bfloat16.
     # Q/K may have fewer heads (H_kv) than V/state (H) for GQA.
-    query = ir.Value(
-        name="query",
-        shape=ir.Shape(["B", "H_kv", "T", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    key = ir.Value(
-        name="key",
-        shape=ir.Shape(["B", "H_kv", "T", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    value = ir.Value(
-        name="value",
-        shape=ir.Shape(["B", "H", "T", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    past_state = ir.Value(
-        name="past_state",
-        shape=ir.Shape(["B", "H", "d_k", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    # decay/beta are 3D: (B, H, T) — no trailing singleton dim.
-    # The Scan body handles unsqueezing for broadcasting.
-    decay = ir.Value(
-        name="decay",
-        shape=ir.Shape(["B", "H", "T"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    beta = ir.Value(
-        name="beta",
-        shape=ir.Shape(["B", "H", "T"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
+    query = ir.Value(name="query")
+    key = ir.Value(name="key")
+    value = ir.Value(name="value")
+    past_state = ir.Value(name="past_state")
+    # decay: (B, H, T) — always float32; Scan body handles unsqueezing.
+    decay = ir.Value(name="decay", type=ir.TensorType(ir.DataType.FLOAT))
+    # beta: (B, H, T) — same precision as other activations (type T).
+    beta = ir.Value(name="beta")
     inputs = [query, key, value, past_state, decay, beta]
 
     # --- Build function body graph ---
@@ -128,19 +111,30 @@ def linear_attention(
     gqa_ratio = num_v_heads // num_k_heads
     query_expanded, key_expanded = _expand_kv_heads(op, query, key, gqa_ratio=gqa_ratio)
 
+    # --- Cast to float32 for Scan recurrence precision ---
+    # The recurrence requires float32 for numerical stability; inputs may be
+    # float16 or bfloat16.  decay is already FLOAT (declared above), so its
+    # Cast is always a no-op — kept for uniformity with the other inputs.
+    query_f32 = op.Cast(query_expanded, to=ir.DataType.FLOAT)
+    key_f32 = op.Cast(key_expanded, to=ir.DataType.FLOAT)
+    value_f32 = op.Cast(value, to=ir.DataType.FLOAT)
+    state_f32 = op.Cast(past_state, to=ir.DataType.FLOAT)
+    decay_f32 = op.Cast(decay, to=ir.DataType.FLOAT)  # no-op: decay is always FLOAT
+    beta_f32 = op.Cast(beta, to=ir.DataType.FLOAT)
+
     # --- Build Scan for sequential recurrence ---
     scan_body = _build_recurrence_body(uses_decay, uses_beta)
 
     # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
-    q_t = op.Transpose(query_expanded, perm=[2, 0, 1, 3])
-    k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
-    v_t = op.Transpose(value, perm=[2, 0, 1, 3])
+    q_t = op.Transpose(query_f32, perm=[2, 0, 1, 3])
+    k_t = op.Transpose(key_f32, perm=[2, 0, 1, 3])
+    v_t = op.Transpose(value_f32, perm=[2, 0, 1, 3])
     # decay/beta: (B, H, T) -> (T, B, H)
-    decay_t = op.Transpose(decay, perm=[2, 0, 1])
-    beta_t = op.Transpose(beta, perm=[2, 0, 1])
+    decay_t = op.Transpose(decay_f32, perm=[2, 0, 1])
+    beta_t = op.Transpose(beta_f32, perm=[2, 0, 1])
 
     present_state, output_t = op.Scan(
-        past_state,  # carry: (B, H, d_k, d_v)
+        state_f32,  # carry: (B, H, d_k, d_v)
         q_t,  # (T, B, H, d_k)
         k_t,  # (T, B, H, d_k)
         v_t,  # (T, B, H, d_v)
@@ -155,6 +149,10 @@ def linear_attention(
 
     # Transpose output back: (T, B, H, d_v) -> (B, H, T, d_v)
     output = op.Transpose(output_t, perm=[1, 2, 0, 3])
+
+    # Cast outputs back to the caller's input precision (no-op for float32)
+    output = op.CastLike(output, query)
+    present_state = op.CastLike(present_state, query)
 
     output.name = "output"
     present_state.name = "present_state"
