@@ -8,51 +8,15 @@ Handles bfloat16 and other non-standard dtypes transparently via ml_dtypes.
 
 from __future__ import annotations
 
-import importlib.util
 import tempfile
 from pathlib import Path
 
 import numpy as np
-import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import onnxruntime.capi._pybind_state as _ort_c
 
 from mobius._model_package import ModelPackage
-
-_HAS_ML_DTYPES = importlib.util.find_spec("ml_dtypes") is not None
-if _HAS_ML_DTYPES:
-    # ml_dtypes provides bfloat16 and float8 variants not in standard numpy.
-    # When absent, OrtValues are created via the plain numpy path and these
-    # dtypes are unsupported.
-    import ml_dtypes
-
-
-def _ml_dtype_to_onnx_type(dtype: np.dtype) -> int | None:
-    """Return the ONNX element type integer for an ml_dtypes dtype, or None.
-
-    Only call this function when ``_HAS_ML_DTYPES`` is True.
-    """
-    if not _HAS_ML_DTYPES:
-        return None
-    tp = onnx.TensorProto
-    if dtype == ml_dtypes.bfloat16:
-        return tp.BFLOAT16
-    if dtype == ml_dtypes.float8_e4m3fn:
-        return tp.FLOAT8E4M3FN
-    if dtype == ml_dtypes.float8_e4m3fnuz:
-        return tp.FLOAT8E4M3FNUZ
-    if dtype == ml_dtypes.float8_e5m2:
-        return tp.FLOAT8E5M2
-    if dtype == ml_dtypes.float8_e5m2fnuz:
-        return tp.FLOAT8E5M2FNUZ
-    if dtype == ml_dtypes.uint4:
-        return tp.UINT4
-    if dtype == ml_dtypes.int4:
-        return tp.INT4
-    if dtype == ml_dtypes.float4_e2m1fn:
-        return tp.FLOAT4E2M1
-    return None
 
 
 def _to_ort_value(value: np.ndarray, device: str = "cpu") -> ort.OrtValue:
@@ -64,11 +28,14 @@ def _to_ort_value(value: np.ndarray, device: str = "cpu") -> ort.OrtValue:
             return ort.OrtValue(
                 _ort_c.OrtValue.from_dlpack(value.__dlpack__(), False), value
             )
-    if _HAS_ML_DTYPES and isinstance(value, np.ndarray):
-        onnx_type = _ml_dtype_to_onnx_type(value.dtype)
-        if onnx_type is not None:
+    if isinstance(value, np.ndarray):
+        try:
+            onnx_type = ir.DataType.from_numpy(value.dtype)
+        except TypeError:
+            pass
+        else:
             return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
-                value, onnx_element_type=onnx_type
+                value, onnx_element_type=onnx_type.value
             )
     return ort.OrtValue.ortvalue_from_numpy(np.asarray(value), device)
 
