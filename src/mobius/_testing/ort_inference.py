@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import onnxruntime.capi._pybind_state as _ort_c
@@ -26,16 +27,6 @@ if _HAS_ML_DTYPES:
     # dtypes are unsupported.
     import ml_dtypes
 
-# ONNX element type constants for dtypes not representable as plain numpy dtypes
-_BFLOAT16_TYPE = 16
-_FLOAT8E4M3FN_TYPE = 17
-_FLOAT8E4M3FNUZ_TYPE = 18
-_FLOAT8E5M2_TYPE = 19
-_FLOAT8E5M2FNUZ_TYPE = 20
-_UINT4_TYPE = 21
-_INT4_TYPE = 22
-_FLOAT4E2M1_TYPE = 23
-
 
 def _ml_dtype_to_onnx_type(dtype: np.dtype) -> int | None:
     """Return the ONNX element type integer for an ml_dtypes dtype, or None.
@@ -44,22 +35,23 @@ def _ml_dtype_to_onnx_type(dtype: np.dtype) -> int | None:
     """
     if not _HAS_ML_DTYPES:
         return None
+    tp = onnx.TensorProto
     if dtype == ml_dtypes.bfloat16:
-        return _BFLOAT16_TYPE
+        return tp.BFLOAT16
     if dtype == ml_dtypes.float8_e4m3fn:
-        return _FLOAT8E4M3FN_TYPE
+        return tp.FLOAT8E4M3FN
     if dtype == ml_dtypes.float8_e4m3fnuz:
-        return _FLOAT8E4M3FNUZ_TYPE
+        return tp.FLOAT8E4M3FNUZ
     if dtype == ml_dtypes.float8_e5m2:
-        return _FLOAT8E5M2_TYPE
+        return tp.FLOAT8E5M2
     if dtype == ml_dtypes.float8_e5m2fnuz:
-        return _FLOAT8E5M2FNUZ_TYPE
+        return tp.FLOAT8E5M2FNUZ
     if dtype == ml_dtypes.uint4:
-        return _UINT4_TYPE
+        return tp.UINT4
     if dtype == ml_dtypes.int4:
-        return _INT4_TYPE
+        return tp.INT4
     if dtype == ml_dtypes.float4_e2m1fn:
-        return _FLOAT4E2M1_TYPE
+        return tp.FLOAT4E2M1
     return None
 
 
