@@ -19,6 +19,10 @@ from mobius._model_package import ModelPackage
 
 _FUNCTIONS_DOMAIN = "pkg.mobius"
 
+# Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
+# layers.  MLP-only layers are stateless and use (None, None).
+StatePair = tuple[ir.Value, ir.Value] | tuple[None, None]
+
 
 class LinearAttentionDims(NamedTuple):
     """Dimension sizes for linear attention (DeltaNet) layers."""
@@ -201,21 +205,24 @@ def _make_hybrid_cache_inputs(
     past_seq_len: ir.SymbolicDim,
     *,
     prefix: str = "past_key_values",
-) -> tuple[list[ir.Value], list[tuple[ir.Value, ir.Value]]]:
+) -> tuple[list[ir.Value], list[StatePair]]:
     """Create cache inputs for hybrid models with mixed layer types.
 
     Supported layer types:
         ``"full_attention"`` — standard KV cache (key + value).
         ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
-        ``"mamba"`` — conv_state + ssm_state (Mamba SSM carry).
+        ``"mamba"`` / ``"mamba2"`` — conv_state + ssm_state.
+        ``"mlp"`` — stateless, produces ``(None, None)`` pair.
 
     Returns:
-        ``(flat_inputs, state_pairs)`` — same shape as
-        :func:`_make_kv_cache_inputs`.
+        ``(flat_inputs, state_pairs)`` — *flat_inputs* contains only
+        the ``ir.Value`` entries (no graph inputs for MLP layers);
+        *state_pairs* has one entry per layer, with ``(None, None)``
+        for stateless MLP layers.
     """
     layer_types = config.layer_types or []
     flat: list[ir.Value] = []
-    pairs: list[tuple[ir.Value, ir.Value]] = []
+    pairs: list[StatePair] = []
 
     # DeltaNet dimensions from config (computed once via shared helper)
     has_linear = "linear_attention" in layer_types
@@ -311,10 +318,10 @@ def _make_hybrid_cache_inputs(
 
 def _register_hybrid_cache_outputs(
     graph: ir.Graph,
-    present_key_values: list[tuple[ir.Value, ir.Value]],
+    present_key_values: list[StatePair],
     layer_types: list[str],
     *,
-    past_key_values: list[tuple[ir.Value, ir.Value]] | None = None,
+    past_key_values: list[StatePair] | None = None,
     prefix: str = "present",
 ) -> None:
     """Name and register hybrid cache outputs on the graph.
