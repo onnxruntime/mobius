@@ -831,6 +831,13 @@ class Phi4MMMultiModalModel(nn.Module):
         - ``model.layers.*`` -> ``decoder.layers.*``
         - ``model.norm.*`` -> ``decoder.norm.*``
         - ``lm_head.*`` -> ``decoder.lm_head.*``
+
+        Layer-count filtering: weights for layer indices beyond the truncated
+        layer counts (``config.num_hidden_layers``, ``config.vision.num_hidden_layers``,
+        ``config.audio.num_blocks``) are dropped here rather than showing as
+        UNEXPECTED warnings during ``apply_weights``.  This is expected when the
+        ONNX model is built with fewer layers than the full checkpoint (e.g. 2
+        text layers vs. the default 32).
         """
         state_dict = _preprocess_phi4mm_weights(self.config, state_dict)
 
@@ -846,6 +853,10 @@ class Phi4MMMultiModalModel(nn.Module):
             new_key = _remap_phi4mm_weight_key(key)
             renamed[new_key] = value
 
+        # Drop weights for truncated layers so they don't appear as UNEXPECTED
+        # in apply_weights when the ONNX model has fewer layers than the checkpoint.
+        renamed = _drop_truncated_layer_weights(renamed, self.config)
+
         # Duplicate embed_tokens weight for decoder (tied weights)
         embed_key = "embedding.embed_tokens.weight"
         lm_head_key = "decoder.lm_head.weight"
@@ -854,6 +865,74 @@ class Phi4MMMultiModalModel(nn.Module):
                 renamed[lm_head_key] = renamed[embed_key]
 
         return renamed
+
+
+def _layer_index_from_key(key: str, prefix: str) -> int | None:
+    """Return the layer index N from a key of the form ``{prefix}.{N}.rest``.
+
+    Returns ``None`` if the key doesn't match or N is not an integer.
+    """
+    if not key.startswith(prefix + "."):
+        return None
+    rest = key[len(prefix) + 1 :]
+    idx_str, _, _ = rest.partition(".")
+    try:
+        return int(idx_str)
+    except ValueError:
+        return None
+
+
+def _drop_truncated_layer_weights(
+    renamed: dict[str, torch.Tensor],
+    config: ArchitectureConfig,
+) -> dict[str, torch.Tensor]:
+    """Drop weights for layers/blocks beyond the truncated layer counts.
+
+    When the ONNX model is built with fewer layers than the full checkpoint
+    (e.g. ``num_text_layers=2`` against a 32-layer checkpoint) the extra
+    layer weights would otherwise all appear as UNEXPECTED in ``apply_weights``.
+    Dropping them here silences those spurious warnings.
+
+    Affected namespaces after prefix remapping:
+    - ``decoder.layers.{N}.*``       — drop if N >= config.num_hidden_layers
+    - ``vision_encoder.img_processor.encoder.layers.{N}.*``
+                                      — drop if N >= config.vision.num_hidden_layers
+    - ``speech_encoder.encoder.encoders.{N}.*``
+                                      — drop if N >= config.audio.num_blocks
+    """
+    max_decoder = config.num_hidden_layers
+    max_vision = (
+        config.vision.num_hidden_layers
+        if config.vision is not None and config.vision.num_hidden_layers is not None
+        else None
+    )
+    max_audio = (
+        config.audio.num_blocks
+        if config.audio is not None and config.audio.num_blocks is not None
+        else None
+    )
+
+    filtered: dict[str, torch.Tensor] = {}
+    for key, value in renamed.items():
+        # Decoder layers
+        idx = _layer_index_from_key(key, "decoder.layers")
+        if idx is not None and idx >= max_decoder:
+            continue
+
+        # Vision encoder layers
+        if max_vision is not None:
+            idx = _layer_index_from_key(key, "vision_encoder.img_processor.encoder.layers")
+            if idx is not None and idx >= max_vision:
+                continue
+
+        # Audio encoder blocks
+        if max_audio is not None:
+            idx = _layer_index_from_key(key, "speech_encoder.encoder.encoders")
+            if idx is not None and idx >= max_audio:
+                continue
+
+        filtered[key] = value
+    return filtered
 
 
 def _remap_phi4mm_weight_key(key: str) -> str:
