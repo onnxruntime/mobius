@@ -38,13 +38,13 @@ from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     Attention,
     Embedding,
+    FCMLP,
     Linear,
     Mamba2Block,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
 )
-from mobius.models.nemotron import NemotronMLP
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -149,7 +149,7 @@ class NemotronHAttentionLayer(nn.Module):
 
 
 class NemotronHMLPLayer(nn.Module):
-    """NemotronH MLP layer: RMSNorm → NemotronMLP → residual.
+    """NemotronH MLP layer: RMSNorm → FCMLP → residual.
 
     Single-mixer block — stateless, no cache.
 
@@ -159,7 +159,12 @@ class NemotronHMLPLayer(nn.Module):
 
     def __init__(self, config: NemotronHConfig):
         super().__init__()
-        self.mlp = NemotronMLP(config)
+        self.mlp = FCMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            activation=config.hidden_act,
+            bias=config.mlp_bias,
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
