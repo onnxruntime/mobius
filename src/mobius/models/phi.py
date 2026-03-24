@@ -253,19 +253,33 @@ class _LoRATextModel(TextModel):
 def _preprocess_phi4mm_weights(
     config: ArchitectureConfig, state_dict: dict[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
-    """Shared weight preprocessing for Phi4MM models (LoRA + fused QKV splitting).
+    """Shared weight preprocessing for Phi4MM models (LoRA + fused weight splitting).
 
-    Handles:
-    - Stripping ``base_layer.`` from LoRA-wrapped weight names
-    - Splitting fused ``qkv_proj`` into separate q/k/v weights
+    **LoRA strategy — separate parameters, not merged:**
+    The ONNX model keeps lora_A.{name}.weight and lora_B.{name}.weight as
+    separate initializers.  ``LoRALinear.forward()`` applies them at runtime:
+    ``out = base(x) + scale * x @ A.T @ B.T``.  This matches HuggingFace when
+    HF runs with ``merge_and_unload()`` (both vision + speech adapters merged).
 
-    ``gate_up_proj`` is NOT split here — the model uses
-    :class:`~mobius.models.base.FusedGateUpCausalLMModel` which keeps the
-    fused weight and splits activations in the MLP forward pass instead.
-    LoRA weights on ``gate_up_proj`` are passed through unchanged.
+    Do NOT merge LoRA into the base weight here — the separate-parameter
+    approach is intentional and produces correct output (100% token-match
+    parity confirmed in ``examples/phi4mm_parity.py``).
+
+    Steps performed:
+    1. Strip ``base_layer.`` from LoRA-wrapped weight names so
+       ``qkv_proj.base_layer.weight`` → ``qkv_proj.weight``.
+    2. Split fused ``qkv_proj`` weights (base + LoRA A/B) into separate
+       ``q_proj``, ``k_proj``, ``v_proj`` entries.
+    3. Split fused ``gate_up_proj`` weights (base + LoRA A/B) into
+       ``gate_proj`` and ``up_proj`` entries.
+    4. ``o_proj`` and ``down_proj`` LoRA A/B pass through unchanged
+       (not fused, no splitting needed).
     """
-    # Strip "base_layer." from LoRA-wrapped weight names
-    # HF stores e.g. "qkv_proj.base_layer.weight" → we need "qkv_proj.weight"
+    intermediate_size = config.intermediate_size
+
+    # Strip "base_layer." from LoRA-wrapped weight names.
+    # HF stores e.g. "qkv_proj.base_layer.weight"; after stripping this
+    # becomes "qkv_proj.weight" and falls through to the split logic below.
     for key in list(state_dict.keys()):
         if ".base_layer." in key:
             new_key = key.replace(".base_layer.", ".")
