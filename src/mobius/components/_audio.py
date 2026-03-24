@@ -513,11 +513,51 @@ class ConformerEncoder(nn.Module):
         x = self.encoder_embedding(op, audio_features)
         x = self.embed(op, x)  # [B, T', attention_dim]
 
-        # Compute relative attention bias from subsampled sequence length
-        seq_length = op.Shape(x, start=1, end=2)
-        rel_bias = self.relative_attention_bias_layer(op, seq_length)
+        # HF encoder chunks audio when T' > MAX_CHUNK=500 to keep positions
+        # within the T5 relative-bias table bounds (speech_conformer_encoder.py
+        # L2849).  We always use chunk_size = min(T', 500) so:
+        #   T' ≤ 500 → chunk_size = T', num_chunks = 1 → identity (no change).
+        #   T' > 500 → chunk_size = 500, multiple chunks processed as a batch.
+        batch = op.Shape(x, start=0, end=1)  # [1]
+        seq_len = op.Shape(x, start=1, end=2)  # [1]
+        d_model = op.Shape(x, start=2, end=3)  # [1]
+
+        max_chunk = op.Constant(value_ints=[500])
+        chunk_size = op.Min(seq_len, max_chunk)  # min(T', 500); [1]
+
+        # Ceiling division: num_chunks = ⌈T' / chunk_size⌉
+        num_chunks = op.Div(
+            op.Add(seq_len, op.Sub(chunk_size, op.Constant(value_ints=[1]))),
+            chunk_size,
+        )  # [1]
+        padded_len = op.Mul(num_chunks, chunk_size)  # num_chunks * chunk_size; [1]
+        pad_size = op.Sub(padded_len, seq_len)  # 0 when T' ≤ 500; [1]
+
+        # Pad time dim to a multiple of chunk_size (no-op when pad_size = 0).
+        # ONNX Pad pads layout for 3D [B, T, D]:
+        #   [begin_B, begin_T, begin_D, end_B, end_T, end_D]
+        pads = op.Concat(
+            op.Constant(value_ints=[0, 0, 0, 0]),  # begin all dims + end_B
+            pad_size,  # end_T (dynamic)
+            op.Constant(value_ints=[0]),  # end_D
+            axis=0,
+        )
+        x = op.Pad(x, pads)  # [B, padded_len, D]
+
+        # Fold into chunks: [B, padded_len, D] → [num_chunks, chunk_size, D]
+        # (B is always 1 here; num_chunks takes its place in the batch dim)
+        chunk_shape = op.Concat(num_chunks, chunk_size, d_model, axis=0)
+        x = op.Reshape(x, chunk_shape)  # [num_chunks, chunk_size, D]
+
+        # T5 relative bias sized for chunk positions (not global T')
+        rel_bias = self.relative_attention_bias_layer(op, chunk_size)
 
         for layer in self.encoders:
-            x = layer(op, x, rel_bias)
+            x = layer(op, x, rel_bias)  # [num_chunks, chunk_size, D]
+
+        # Fold back and strip padding: [num_chunks, chunk_size, D] → [B, T', D]
+        fold_shape = op.Concat(batch, padded_len, d_model, axis=0)
+        x = op.Reshape(x, fold_shape)  # [B, padded_len, D]
+        x = op.Slice(x, op.Constant(value_ints=[0]), seq_len, op.Constant(value_ints=[1]))
 
         return x

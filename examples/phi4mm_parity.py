@@ -12,8 +12,9 @@ for every modality combination:
     - **Text + image**: Vision encoder active.
     - **Text + audio (short)**: Speech encoder with short audio
       (audio_projection_mode=0).
-    - **Text + audio (long)**: Speech encoder with long audio to
-      exercise different sequence-length code paths in the Conformer.
+    - **Text + audio (long)**: Speech encoder with 4096 mel frames
+      (512 subsampled tokens), exercising the >500-token chunking
+      code path in the Conformer (speech_conformer_encoder.py L2849).
     - **Text + image + audio**: Both encoders active
       (audio_projection_mode=1 for combined mode).
 
@@ -104,8 +105,11 @@ DEFAULT_NUM_AUDIO_BLOCKS = 2
 
 # Short audio: 100 mel frames → 13 speech tokens after compression
 SHORT_AUDIO_FRAMES = 100
-# Long audio: 2000 mel frames → 250 speech tokens (exercises longer paths)
-LONG_AUDIO_FRAMES = 2000
+# Long audio: 4096 mel frames -> 512 subsampled tokens.
+# The conformer encoder chunks audio when seq_len > 500 subsampled tokens
+# (speech_conformer_encoder.py L2849).  With 3 stages of stride-2 (8x),
+# we need >4000 mel frames to exceed the threshold.  4096 gives 512 tokens.
+LONG_AUDIO_FRAMES = 4096
 # Number of new tokens to generate for the text preview (greedy decode)
 DEFAULT_MAX_NEW_TOKENS = 5
 
