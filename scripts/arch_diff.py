@@ -31,6 +31,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 
+_GITHUB_REPO_URL = "https://github.com/onnxruntime/mobius"
+
 
 # ------------------------------------------------------------------
 # Model build configs — mirrors the benchmark / test infrastructure
@@ -601,7 +603,9 @@ def main() -> None:
         if not affected:
             print("No model source files changed — nothing to diff.")
             # Write a minimal report
-            md = render_markdown({}, base_ref=base_sha, head_ref=head_sha)
+            md = render_markdown(
+                {}, base_ref=base_sha, head_ref=head_sha, repo_url=_GITHUB_REPO_URL
+            )
             Path(args.output).write_text(md, encoding="utf-8")
             return
 
@@ -665,7 +669,9 @@ def main() -> None:
         all_diffs[display] = sub_models
 
     # 3. Render and write
-    md = render_markdown(all_diffs, base_ref=base_sha, head_ref=head_sha)
+    md = render_markdown(
+        all_diffs, base_ref=base_sha, head_ref=head_sha, repo_url=_GITHUB_REPO_URL
+    )
     Path(args.output).write_text(md, encoding="utf-8")
     print(f"Wrote {args.output}")
 

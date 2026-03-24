@@ -341,6 +341,7 @@ def render_markdown(
     *,
     base_ref: str | None = None,
     head_ref: str | None = None,
+    repo_url: str | None = None,
 ) -> str:
     """Render diffs for all affected models as GitHub-flavored Markdown.
 
@@ -352,6 +353,9 @@ def render_markdown(
             ``"_head_node_count"`` ints for the summary.
         base_ref: Short SHA or ref name for the base commit.
         head_ref: Short SHA or ref name for the head commit.
+        repo_url: GitHub repository URL (e.g. ``https://github.com/org/repo``).
+            When provided together with *base_ref* and *head_ref*, each SHA is
+            rendered as a clickable link to the commit page.
 
     Returns:
         A Markdown string.
@@ -361,7 +365,13 @@ def render_markdown(
     lines.append("## 🏗️ Architecture Diff\n")
 
     if base_ref and head_ref:
-        lines.append(f"Comparing `{base_ref}` → `{head_ref}`\n")
+
+        def _sha_link(sha: str) -> str:
+            if repo_url:
+                return f"[`{sha}`]({repo_url}/commit/{sha})"
+            return f"`{sha}`"
+
+        lines.append(f"Comparing {_sha_link(base_ref)} → {_sha_link(head_ref)}\n")
 
     # ── summary table ────────────────────────────────────────────────
     lines.append("| Model | Sub-model | Changes | Status |")
