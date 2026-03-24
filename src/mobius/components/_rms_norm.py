@@ -71,6 +71,7 @@ class GatedRMSNorm(nn.Module):
         # RMSNorm in fp32, then cast back to input dtype
         normed = op.RMSNormalization(
             gated,
+            self.weight,
             epsilon=self.variance_epsilon,
             axis=-1,
         )
