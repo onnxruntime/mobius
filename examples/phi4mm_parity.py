@@ -200,6 +200,43 @@ def _patch_cache_utils_for_phi4mm() -> None:
         # returning an empty DynamicCache is always correct here.
         dc.from_legacy_cache = classmethod(lambda cls, past=None: cls())
 
+    if not hasattr(dc, "to_legacy_cache"):
+        # to_legacy_cache() → tuple of (key, value) tuples per layer.
+        # Transformers 5.x removed this method; the Phi4MM model only calls
+        # it on the legacy-cache code path (when past_key_values was a tuple),
+        # which newer transformers never triggers.  Add a stub for safety.
+        def _to_legacy_cache(self):
+            if hasattr(self, "key_cache") and hasattr(self, "value_cache"):
+                return tuple(zip(self.key_cache, self.value_cache))
+            return ()
+
+        dc.to_legacy_cache = _to_legacy_cache
+
+
+def _patch_num_logits_for_phi4mm(model) -> None:
+    """Patch a loaded Phi4MM model to handle num_logits_to_keep=None.
+
+    Newer transformers (5.x) passes ``num_logits_to_keep=None`` from
+    ``prepare_inputs_for_generation`` into the model's ``forward``.
+    Phi4MM's forward was written for 4.x which always passed an ``int``
+    (default 0).  Passing ``None`` causes a ``TypeError`` at the slice
+    ``hidden_states[:, -num_logits_to_keep:, :]``.
+
+    We wrap the model's instance ``forward`` to coerce ``None`` → ``0``
+    (meaning: return logits for all tokens, the same as the old default).
+    """
+    import functools
+
+    _orig_forward = model.forward
+
+    @functools.wraps(_orig_forward)
+    def _patched(*args, num_logits_to_keep=0, **kwargs):
+        if num_logits_to_keep is None:
+            num_logits_to_keep = 0
+        return _orig_forward(*args, num_logits_to_keep=num_logits_to_keep, **kwargs)
+
+    model.forward = _patched
+
 
 def _patch_no_meta_init() -> None:
     """Remove meta-device init context from PreTrainedModel.get_init_context.
@@ -351,6 +388,9 @@ def load_hf_model(
         if model.lm_head.weight.data_ptr() != embed_weight.data_ptr():
             model.lm_head.weight = embed_weight
             print("  Manually tied lm_head.weight → model.embed_tokens.weight")
+
+    # Patch num_logits_to_keep=None → 0 (newer transformers passes None)
+    _patch_num_logits_for_phi4mm(model)
 
     # Merge all LoRA adapters into base weights
     _merge_all_lora_adapters(model)
