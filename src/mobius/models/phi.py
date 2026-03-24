@@ -870,6 +870,9 @@ def _remap_phi4mm_weight_key(key: str) -> str:
         # Strip "audio_projection." since onnxscript resolves the speech
         # and vision projection branches directly on the module (Bug 5).
         suffix = suffix.removeprefix("audio_projection.")
+        # Strip PyTorch activation-checkpoint wrapper segment injected by
+        # gradient-checkpointing — not present in the ONNX module tree.
+        suffix = suffix.replace("._checkpoint_wrapped_module", "")
         return "speech_encoder." + suffix
 
     # Token embeddings -> embedding model

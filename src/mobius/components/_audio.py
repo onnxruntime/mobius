@@ -44,6 +44,13 @@ class _SwishModule(nn.Module):
         return op.Mul(x, op.Sigmoid(x))
 
 
+class _ReLUModule(nn.Module):
+    """ReLU activation as an nn.Module (no parameters)."""
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value):
+        return op.Relu(x)
+
+
 class _IdentityModule(nn.Module):
     """Identity (no-op) module, placeholder for dropout layers."""
 
@@ -153,14 +160,20 @@ class _GLUPointWiseConv(nn.Module):
 
 
 class _DepthwiseSepConv(nn.Module):
-    """Depthwise separable convolution: depthwise Conv1d + pointwise Conv1d."""
+    """Depthwise separable convolution: depthwise Conv1d + pointwise Conv1d.
+
+    Uses causal (left-only) padding so each output frame depends only on the
+    current and past input frames. This matches HF NeMo's causal ConvModule
+    which uses symmetric PyTorch padding then trims the right-side overflow.
+    """
 
     def __init__(self, channels: int, kernel_size: int):
         super().__init__()
         self.dw_conv = _ConvWeight(
             [channels, 1, kernel_size],
             kernel_shape=[kernel_size],
-            pads=[kernel_size // 2, kernel_size // 2],
+            # Causal: pad (kernel_size-1) on the left, 0 on the right
+            pads=[kernel_size - 1, 0],
             groups=channels,
         )
         self.pw_conv = _ConvWeight([channels, channels, 1])
@@ -197,13 +210,13 @@ class NeMoConvSubsampling(nn.Module):
         self.conv = nn.ModuleList(
             [
                 _Conv2d(1, c, kernel_size=3, stride=2, padding=1),  # 0
-                _SwishModule(),  # 1
+                _ReLUModule(),  # 1
                 _Conv2d(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 2
                 _Conv2d(c, c, kernel_size=1),  # 3
-                _SwishModule(),  # 4
+                _ReLUModule(),  # 4
                 _Conv2d(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 5
                 _Conv2d(c, c, kernel_size=1),  # 6
-                _SwishModule(),  # 7
+                _ReLUModule(),  # 7
             ]
         )
         self.out = Linear(conv_channels * freq, feat_out)
@@ -260,12 +273,12 @@ class T5RelativeAttentionBias(nn.Module):
         one = op.Constant(value_int=1)
         positions = op.Range(zero, seq_length, one)  # [seq]
 
-        # Pairwise relative positions: query_pos - key_pos
+        # Pairwise relative positions: key_pos - query_pos (memory - context, matching T5 convention)
         q_pos = op.Unsqueeze(positions, [1])  # [seq, 1]
         k_pos = op.Unsqueeze(positions, [0])  # [1, seq]
-        relative_pos = op.Sub(q_pos, k_pos)  # [seq, seq]
+        relative_pos = op.Sub(k_pos, q_pos)  # [seq, seq]: positive when key is ahead of query
 
-        # Shift and clip to valid bucket range
+        # Shift and clip to valid bucket range [0, num_buckets - 1]
         shifted = op.Add(relative_pos, op.Constant(value_int=self._max_distance))
         clipped = op.Clip(
             shifted,
@@ -345,9 +358,12 @@ class ConformerConvModule(nn.Module):
 class ConformerAttention(nn.Module):
     """Multi-head attention with relative position bias.
 
-    Uses the ONNX Attention op (opset 24) with separate Q/K/V/O projections.
-    The T5 relative bias is passed as ``attn_mask`` (attention bias) to the
-    Attention op.
+    Implements encoder-style (non-causal, no KV cache) multi-head attention
+    using explicit MatMul + Softmax ops. The T5 relative bias is added to the
+    scaled dot-product scores before softmax.
+
+    Shape convention: Q/K/V projections produce [B, T, H*D_h], which are
+    reshaped to [B, H, T, D_h] for the attention computation.
     """
 
     def __init__(self, d_model: int, num_heads: int):
@@ -362,23 +378,39 @@ class ConformerAttention(nn.Module):
 
     def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
         # x: [B, T, D], relative_attention_bias: [1, H, T, T]
-        q = self.linear_q(op, x)
+        q = self.linear_q(op, x)  # [B, T, H*D_h]
         k = self.linear_k(op, x)
         v = self.linear_v(op, x)
 
-        # op.Attention expects [B, T, H*D_h] for Q/K/V and [1, H, T, T] for bias
-        attn_output = op.Attention(
-            q,
-            k,
-            v,
-            relative_attention_bias,
-            kv_num_heads=self._num_heads,
-            q_num_heads=self._num_heads,
-            scale=self._scale,
-            _outputs=1,
-        )
+        batch = op.Shape(x, start=0, end=1)  # [1]
+        seq = op.Shape(x, start=1, end=2)  # [1]
 
-        return self.linear_out(op, attn_output)
+        head_dim = op.Constant(value_ints=[self._head_dim])
+        num_heads = op.Constant(value_ints=[self._num_heads])
+
+        # [B, T, H*D_h] → [B, T, H, D_h] → [B, H, T, D_h]
+        bthd_shape = op.Concat(batch, seq, num_heads, head_dim, axis=0)
+        q = op.Reshape(q, bthd_shape)
+        q = op.Transpose(q, perm=[0, 2, 1, 3])  # [B, H, T, D_h]
+        k = op.Reshape(k, bthd_shape)
+        k = op.Transpose(k, perm=[0, 2, 1, 3])
+        v = op.Reshape(v, bthd_shape)
+        v = op.Transpose(v, perm=[0, 2, 1, 3])
+
+        # Scaled dot-product: [B, H, T, T]
+        scale = op.Constant(value_float=self._scale)
+        scores = op.MatMul(op.Mul(q, scale), op.Transpose(k, perm=[0, 1, 3, 2]))
+        scores = op.Add(scores, relative_attention_bias)
+        attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
+
+        # Context: [B, H, T, D_h] → [B, T, H, D_h] → [B, T, H*D_h]
+        context = op.MatMul(attn_weights, v)  # [B, H, T, D_h]
+        context = op.Transpose(context, perm=[0, 2, 1, 3])  # [B, T, H, D_h]
+        d_model = op.Constant(value_ints=[self._num_heads * self._head_dim])
+        btd_shape = op.Concat(batch, seq, d_model, axis=0)
+        context = op.Reshape(context, btd_shape)  # [B, T, H*D_h]
+
+        return self.linear_out(op, context)
 
 
 class ConformerEncoderLayer(nn.Module):
