@@ -3258,161 +3258,119 @@ def test_qwen35_vl_3model_text_only_parity():
 @pytest.mark.integration
 @pytest.mark.integration_fast
 def test_qwen35_deltanet_single_layer_parity():
-    """Single GatedDeltaNet layer: ONNX matches HuggingFace.
+    """GatedDeltaNet hybrid model: ONNX matches HuggingFace Qwen3_5GatedDeltaNet.
 
-    Builds a standalone DeltaNet graph, loads random HF weights, runs a
-    single-token decode step, and verifies:
-    - hidden_states output matches HF
+    Builds a tiny 2-layer Qwen3.5 text model (1 DeltaNet + 1 attention)
+    locally without any HF Hub download. Transfers random HF weights to ONNX,
+    runs a single-token decode step, and verifies:
+    - output logits match HF
     - recurrent_state carry matches HF
     """
     import onnx_ir as ir
-    from onnxscript._internal import builder as onnx_builder
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        Qwen3_5DynamicCache,
-        Qwen3_5GatedDeltaNet,
-    )
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
+    from mobius import build_from_module
     from mobius._weight_loading import apply_weights
-    from mobius.components._gated_deltanet import (
-        GatedDeltaNet,
+    from mobius.models.qwen35 import Qwen35CausalLMModel
+
+    # Tiny config — built locally, no HF Hub download required.
+    # Two layers: one DeltaNet (linear_attention) + one full attention.
+    # A mixed config is needed because HF's cache requires at least one
+    # attention layer to compute sequence length correctly.
+    tc = Qwen3_5TextConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=128,
+        rope_parameters={
+            "rope_type": "default",
+            "partial_rotary_factor": 0.5,
+            "rope_theta": 10000.0,
+        },
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
     )
 
-    # Tiny config for isolated DeltaNet test
-    hf_config = _make_tiny_qwen35_vl_config()
-    tc = hf_config.text_config
-    tc.num_hidden_layers = 1
-    tc.layer_types = ["linear_attention"]
-
-    arch_config = ArchitectureConfig.from_transformers(
-        tc,
-        parent_config=hf_config,
-    )
+    # Build ONNX model via the hybrid task so that CausalConv1DWithState and
+    # LinearAttention are embedded as ONNX local functions in the model.
+    # (Building a bare component graph omits these definitions and ORT fails.)
+    arch_config = ArchitectureConfig.from_transformers(tc)
     arch_config.dtype = ir.DataType.FLOAT
+    onnx_module = Qwen35CausalLMModel(arch_config)
+    pkg = build_from_module(onnx_module, arch_config, task="hybrid-text-generation")
+    onnx_model = pkg["model"]
 
-    # DeltaNet dimensions
-    num_k_heads = arch_config.linear_num_key_heads
-    num_v_heads = arch_config.linear_num_value_heads
-    head_k_dim = arch_config.linear_key_head_dim
-    head_v_dim = arch_config.linear_value_head_dim
-    conv_kernel = arch_config.linear_conv_kernel_dim or 4
-    key_dim = head_k_dim * num_k_heads
-    value_dim = head_v_dim * num_v_heads
-    conv_dim = key_dim * 2 + value_dim
+    # Build HF model with deterministic random weights.
+    torch.manual_seed(42)
+    hf_model = Qwen3_5ForCausalLM._from_config(tc).float().eval()
 
-    # Build standalone ONNX graph for GatedDeltaNet
-    onnx_dn = GatedDeltaNet(arch_config)
-    batch = ir.SymbolicDim("batch")
-    hidden_in = ir.Value(
-        name="hidden_states",
-        shape=ir.Shape([batch, 1, arch_config.hidden_size]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    conv_in = ir.Value(
-        name="conv_state",
-        shape=ir.Shape([batch, conv_dim, conv_kernel - 1]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    rec_in = ir.Value(
-        name="recurrent_state",
-        shape=ir.Shape([batch, num_v_heads, head_k_dim, head_v_dim]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
+    # Transfer HF weights → ONNX via preprocess_weights.
+    preprocessed = onnx_module.preprocess_weights(dict(hf_model.state_dict()))
+    apply_weights(onnx_model, preprocessed)
 
-    graph = ir.Graph(
-        inputs=[hidden_in, conv_in, rec_in],
-        outputs=[],
-        nodes=[],
-        name="deltanet_test",
-        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
-    )
-    graph_builder = onnx_builder.GraphBuilder(graph)
-    op = graph_builder.op
-
-    output, new_conv, new_rec = onnx_dn(
-        op,
-        hidden_in,
-        conv_in,
-        rec_in,
-    )
-    output.name = "output"
-    new_conv.name = "new_conv_state"
-    new_rec.name = "new_recurrent_state"
-    graph.outputs.extend([output, new_conv, new_rec])
-
-    for name, param in onnx_dn.named_parameters():
-        param.name = name
-        # Initialize with zeros so register_initializer accepts them;
-        # apply_weights will overwrite with real HF values.
-        shape = [d if isinstance(d, int) else 1 for d in param.shape]
-        param.const_value = ir.Tensor(
-            np.zeros(shape, dtype=np.float32),
-            name=name,
-        )
-        graph.register_initializer(param)
-
-    onnx_model = ir.Model(graph, ir_version=10)
-
-    # Build HF DeltaNet layer with random weights
-    hf_dn = Qwen3_5GatedDeltaNet(tc, layer_idx=0)
-    hf_dn = hf_dn.to(torch.float32).eval()
-
-    # Transfer HF weights → ONNX
-    apply_weights(onnx_model, dict(hf_dn.state_dict()))
-
-    # Prepare inputs
+    # Single-token inputs (seq_len=1 for decode-step comparison).
     rng = np.random.default_rng(42)
-    hidden_np = rng.standard_normal(
-        (1, 1, arch_config.hidden_size),
-    ).astype(np.float32)
-    conv_np = rng.standard_normal(
-        (1, conv_dim, conv_kernel - 1),
-    ).astype(np.float32)
-    rec_np = rng.standard_normal(
-        (1, num_v_heads, head_k_dim, head_v_dim),
-    ).astype(np.float32)
+    input_ids = rng.integers(1, tc.vocab_size, size=(1, 1)).astype(np.int64)
+    attention_mask = np.ones((1, 1), dtype=np.int64)
+    position_ids = np.zeros((1, 1), dtype=np.int64)
 
-    # HF forward (single-token decode with pre-filled cache)
-    cache = Qwen3_5DynamicCache(tc)
-    # HF conv_state shape is (batch, conv_dim, conv_kernel_size) —
-    # pad with one extra left position vs ONNX (kernel_size - 1)
-    cache.conv_states[0] = torch.from_numpy(
-        np.pad(conv_np, ((0, 0), (0, 0), (1, 0))),
-    ).float()
-    cache.recurrent_states[0] = torch.from_numpy(rec_np).float()
-    # has_previous_state is True once conv_states[0] is set
-
+    # HF forward — no explicit cache so DeltaNet starts from zero state.
     with torch.no_grad():
-        hf_output = hf_dn(
-            hidden_states=torch.from_numpy(hidden_np).float(),
-            cache_params=cache,
-            cache_position=torch.tensor([conv_kernel - 1]),
-        ).numpy()
-    hf_rec = cache.recurrent_states[0].numpy()
+        hf_out = hf_model(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+        )
+    hf_logits = hf_out.logits.numpy()
+    # Layer 0 is the DeltaNet layer; extract its updated recurrent state.
+    hf_rec = hf_out.past_key_values.recurrent_states[0].numpy()
 
-    # ONNX forward
+    # ONNX forward — build feeds; DeltaNet states start at zero (matching HF).
+    feeds: dict[str, np.ndarray] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    for inp in onnx_model.graph.inputs:
+        name = inp.name
+        if name in feeds:
+            continue
+        shape = []
+        for d in inp.shape:
+            if isinstance(d, int):
+                shape.append(d)
+            elif "past" in str(d) or "sequence" in str(d):
+                shape.append(0)
+            else:
+                shape.append(1)  # batch
+        feeds[name] = np.zeros(shape, dtype=np.float32)
+
     sess = OnnxModelSession(onnx_model)
-    onnx_out = sess.run(
-        {
-            "hidden_states": hidden_np,
-            "conv_state": conv_np,
-            "recurrent_state": rec_np,
-        }
-    )
+    onnx_out = sess.run(feeds)
     sess.close()
 
-    np.testing.assert_allclose(
-        onnx_out["output"],
-        hf_output,
+    assert_logits_close(
+        onnx_out["logits"],
+        hf_logits,
         rtol=1e-3,
         atol=1e-3,
-        err_msg="DeltaNet output mismatch",
     )
     np.testing.assert_allclose(
-        onnx_out["new_recurrent_state"],
+        onnx_out["present.0.recurrent_state"],
         hf_rec,
         rtol=1e-3,
         atol=1e-3,
-        err_msg="DeltaNet recurrent_state mismatch",
+        err_msg="GatedDeltaNet recurrent_state mismatch vs HF Qwen3_5GatedDeltaNet",
     )
 
 
