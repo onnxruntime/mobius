@@ -3,24 +3,105 @@
 
 """ONNX Runtime inference session wrapper for ir.Model objects.
 
-Uses ``onnxruntime-easy`` which handles bfloat16 and other non-standard
-dtypes transparently.
+Handles bfloat16 and other non-standard dtypes transparently via ml_dtypes.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
-import onnxruntime_easy as ort_easy
+import onnxruntime as ort
+import onnxruntime.capi._pybind_state as _ort_c
 
 from mobius._model_package import ModelPackage
 
+_HAS_ML_DTYPES = importlib.util.find_spec("ml_dtypes") is not None
+if _HAS_ML_DTYPES:
+    # ml_dtypes provides bfloat16 and float8 variants not in standard numpy.
+    # When absent, OrtValues are created via the plain numpy path and these
+    # dtypes are unsupported.
+    import ml_dtypes
+
+# ONNX element type constants for dtypes not representable as plain numpy dtypes
+_BFLOAT16_TYPE = 16
+_FLOAT8E4M3FN_TYPE = 17
+_FLOAT8E4M3FNUZ_TYPE = 18
+_FLOAT8E5M2_TYPE = 19
+_FLOAT8E5M2FNUZ_TYPE = 20
+_UINT4_TYPE = 21
+_INT4_TYPE = 22
+_FLOAT4E2M1_TYPE = 23
+
+
+def _ml_dtype_to_onnx_type(dtype: np.dtype) -> int | None:
+    """Return the ONNX element type integer for an ml_dtypes dtype, or None.
+
+    Only call this function when ``_HAS_ML_DTYPES`` is True.
+    """
+    if not _HAS_ML_DTYPES:
+        return None
+    if dtype == ml_dtypes.bfloat16:
+        return _BFLOAT16_TYPE
+    if dtype == ml_dtypes.float8_e4m3fn:
+        return _FLOAT8E4M3FN_TYPE
+    if dtype == ml_dtypes.float8_e4m3fnuz:
+        return _FLOAT8E4M3FNUZ_TYPE
+    if dtype == ml_dtypes.float8_e5m2:
+        return _FLOAT8E5M2_TYPE
+    if dtype == ml_dtypes.float8_e5m2fnuz:
+        return _FLOAT8E5M2FNUZ_TYPE
+    if dtype == ml_dtypes.uint4:
+        return _UINT4_TYPE
+    if dtype == ml_dtypes.int4:
+        return _INT4_TYPE
+    if dtype == ml_dtypes.float4_e2m1fn:
+        return _FLOAT4E2M1_TYPE
+    return None
+
+
+def _to_ort_value(value: np.ndarray, device: str = "cpu") -> ort.OrtValue:
+    """Convert a numpy array to an OrtValue, handling special ml_dtypes dtypes."""
+    # Use DLPack when available (e.g. torch tensors or non-zero-size arrays)
+    if hasattr(value, "__dlpack__"):
+        is_zero_size = hasattr(value, "size") and value.size == 0
+        if not is_zero_size:
+            return ort.OrtValue(
+                _ort_c.OrtValue.from_dlpack(value.__dlpack__(), False), value
+            )
+    if _HAS_ML_DTYPES and isinstance(value, np.ndarray):
+        onnx_type = _ml_dtype_to_onnx_type(value.dtype)
+        if onnx_type is not None:
+            return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+                value, onnx_element_type=onnx_type
+            )
+    return ort.OrtValue.ortvalue_from_numpy(np.asarray(value), device)
+
+
+def _create_session(model_path: str, device: str = "cpu") -> ort.InferenceSession:
+    """Create an ORT InferenceSession with sensible defaults.
+
+    Args:
+        model_path: Path to the ONNX model file.
+        device: Execution device, ``"cpu"`` or ``"cuda"``.
+    """
+    if device == "cpu":
+        providers = ("CPUExecutionProvider",)
+    elif device == "cuda":
+        providers = ("CUDAExecutionProvider", "CPUExecutionProvider")
+    else:
+        raise ValueError(f"Unsupported device: {device!r}. Expected 'cpu' or 'cuda'.")
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.log_severity_level = 2  # warning
+    return ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+
 
 class OnnxModelSession:
-    """Wraps an ``onnxruntime_easy.EasySession`` for an ``ir.Model``.
+    """Wraps an ``ort.InferenceSession`` for an ``ir.Model``.
 
     Serializes the model to a temporary file and creates an ORT session.
     Provides a simple ``run()`` interface that accepts and returns numpy arrays.
@@ -37,7 +118,7 @@ class OnnxModelSession:
     def __init__(
         self,
         model: ir.Model | ModelPackage,
-        **load_kwargs,
+        device: str = "cpu",
     ):
         if isinstance(model, ModelPackage):
             if len(model) != 1:
@@ -46,11 +127,12 @@ class OnnxModelSession:
                     f"single ir.Model or index into the package."
                 )
             model = next(iter(model.values()))
+        self._device = device
         self._tmpdir = tempfile.TemporaryDirectory()
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
         ir.save(model, self._model_path, external_data="model.onnx.data")
 
-        self._session = ort_easy.load(self._model_path, **load_kwargs)
+        self._session = _create_session(self._model_path, device=device)
         self._input_names = [inp.name for inp in self._session.get_inputs()]
         self._output_names = [out.name for out in self._session.get_outputs()]
 
@@ -81,8 +163,12 @@ class OnnxModelSession:
             # because np.ascontiguousarray promotes them to 1-d.
             if v.ndim > 0:
                 v = np.ascontiguousarray(v)
-            ort_feeds[k] = ort_easy.ort_value(v)
-        raw_outputs = self._session(**ort_feeds)
+            ort_feeds[k] = _to_ort_value(v, device=self._device)
+        run_opts = ort.RunOptions()
+        run_opts.log_severity_level = 2  # warning
+        raw_outputs = self._session.run_with_ort_values(
+            None, ort_feeds, run_options=run_opts
+        )
         return dict(zip(self._output_names, (o.numpy() for o in raw_outputs)))
 
     def close(self) -> None:

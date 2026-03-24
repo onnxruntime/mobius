@@ -28,7 +28,8 @@ mobius = "mobius.__main__:main"
 transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
-    "onnxruntime-easy",
+    "onnxruntime",
+    "ml_dtypes",
     "torch",
     "transformers>=5.0",
     "safetensors",
