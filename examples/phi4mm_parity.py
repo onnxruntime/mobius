@@ -37,14 +37,14 @@ Prerequisites::
 
 Usage::
 
-    # Run all parity checks (CPU, float32):
+    # Run all parity checks against the full model (default):
     python examples/phi4mm_parity.py
 
     # Run a single mode:
     python examples/phi4mm_parity.py --mode text
 
-    # Use fewer decoder layers (faster, still validates pipeline):
-    python examples/phi4mm_parity.py --num-text-layers 2
+    # Use fewer layers for faster development / CI testing:
+    python examples/phi4mm_parity.py --num-text-layers 2 --num-vision-layers 2 --num-audio-blocks 2
 
     # Provide external test data:
     python examples/phi4mm_parity.py \
@@ -98,10 +98,12 @@ AUDIO_TOKEN_ID = 200011  # <|endoftext11|> — audio placeholder
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_N_MELS = 80
 
-# Default layer count overrides for faster testing
-DEFAULT_NUM_TEXT_LAYERS = 2
-DEFAULT_NUM_VISION_LAYERS = 2
-DEFAULT_NUM_AUDIO_BLOCKS = 2
+# Default layer counts: full microsoft/Phi-4-multimodal-instruct model.
+# Pass --num-text-layers / --num-vision-layers / --num-audio-blocks to
+# reduce these for faster development / CI testing.
+DEFAULT_NUM_TEXT_LAYERS = 32  # full decoder depth
+DEFAULT_NUM_VISION_LAYERS = 27  # full SigLIP encoder (uses layer_idx=-2 = 26)
+DEFAULT_NUM_AUDIO_BLOCKS = 24  # full Conformer encoder
 
 # Short audio: 100 mel frames → 13 speech tokens after compression
 SHORT_AUDIO_FRAMES = 100
@@ -1374,21 +1376,27 @@ def main():
         type=int,
         default=DEFAULT_NUM_TEXT_LAYERS,
         help=(
-            "Number of decoder layers to use (default: %(default)s). "
-            "Lower values are faster but still validate the pipeline."
+            "Number of decoder layers to use (default: %(default)s = full model). "
+            "Pass a smaller value (e.g. 2) for faster development testing."
         ),
     )
     parser.add_argument(
         "--num-vision-layers",
         type=int,
         default=DEFAULT_NUM_VISION_LAYERS,
-        help="Number of vision encoder layers (default: %(default)s).",
+        help=(
+            "Number of SigLIP vision encoder layers (default: %(default)s = full model). "
+            "The ONNX model runs N-1 layers; HF uses layer_idx=-2."
+        ),
     )
     parser.add_argument(
         "--num-audio-blocks",
         type=int,
         default=DEFAULT_NUM_AUDIO_BLOCKS,
-        help=("Number of audio Conformer blocks (default: %(default)s)."),
+        help=(
+            "Number of Conformer audio encoder blocks (default: %(default)s = full model). "
+            "Pass a smaller value for faster development testing."
+        ),
     )
     parser.add_argument(
         "--long-audio-frames",
