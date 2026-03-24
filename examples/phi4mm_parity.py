@@ -165,16 +165,40 @@ def load_onnx_package(
 
 
 def _patch_cache_utils_for_phi4mm() -> None:
-    """Add SlidingWindowCache stub if missing (transformers >= 5.0).
+    """Patch transformers cache_utils for compatibility with Phi4MM's HF model code.
 
-    The HuggingFace Phi4MM model file imports ``SlidingWindowCache``
-    which existed in transformers 4.x but was removed in 5.x.
-    We inject a minimal stub so the dynamic module can import.
+    Phi4MM's ``modeling_phi4mm.py`` was written against transformers 4.x and
+    uses several cache APIs that were removed or renamed in 5.x.  We patch them
+    back onto the live classes so the dynamic module can import and run.
+
+    Patches applied:
+    - ``SlidingWindowCache``: removed in 5.x; stub with ``DynamicCache``.
+    - ``DynamicCache.get_usable_length``: removed in 5.x, replaced by
+      ``get_seq_length``.  The two-argument signature
+      ``(kv_seq_len, layer_idx)`` is compatible because ``get_seq_length``
+      ignores both arguments and returns the current stored sequence length.
+    - ``DynamicCache.from_legacy_cache``: removed in 5.x; returns an empty
+      ``DynamicCache`` (the legacy ``None`` path, which is the only remaining
+      caller in Phi4MM).
     """
     from transformers import cache_utils
 
     if not hasattr(cache_utils, "SlidingWindowCache"):
         cache_utils.SlidingWindowCache = cache_utils.DynamicCache
+
+    dc = cache_utils.DynamicCache
+    if not hasattr(dc, "get_usable_length"):
+        # get_usable_length(kv_seq_len, layer_idx) → usable cached length.
+        # In transformers 5.x the equivalent is get_seq_length() (no args).
+        dc.get_usable_length = lambda self, kv_seq_len=None, layer_idx=None: (
+            self.get_seq_length()
+        )
+
+    if not hasattr(dc, "from_legacy_cache"):
+        # from_legacy_cache(past_key_values) → DynamicCache.
+        # In Phi4MM the only call site passes None (no existing cache), so
+        # returning an empty DynamicCache is always correct here.
+        dc.from_legacy_cache = classmethod(lambda cls, past=None: cls())
 
 
 def _patch_no_meta_init() -> None:
