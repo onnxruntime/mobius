@@ -315,18 +315,15 @@ class PackQKVForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ check
 
     def check(self, context, q_w, k_w, v_w, **_):
-        # Extract weights normalized to (out_features, hidden_size)
-        try:
-            q_np = _get_weight_tensor(q_w)
-            k_np = _get_weight_tensor(k_w)
-            v_np = _get_weight_tensor(v_w)
-        except MatchFailureError as e:
-            result = MatchResult()
-            return result.fail(e.reason)
+        # Extract weights normalized to (out_features, hidden_size).
+        # Raises MatchFailureError if any weight is not a constant.
+        q_np = _get_weight_tensor(q_w)
+        k_np = _get_weight_tensor(k_w)
+        v_np = _get_weight_tensor(v_w)
 
         # Concatenate along axis=0: all weights are (out, hidden)
         self._qkv_wt_transposed = np.concatenate([q_np, k_np, v_np], axis=0)
-        return MatchResult()
+        return True
 
     # ------------------------------------------------------------------ rewrite
 
