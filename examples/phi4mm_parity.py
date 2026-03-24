@@ -64,6 +64,10 @@ import time
 
 # Ensure we import mobius from the local src/ tree, not any installed
 # version, so audio/model fixes in this worktree are always active.
+# This is needed because this file is run as a standalone script (not via
+# `python -m`), so Python does not automatically add the package root to
+# sys.path.  Without this, a `pip install -e .` from a different worktree
+# would shadow the local source.
 _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
@@ -279,7 +283,14 @@ def load_hf_model(
     _patch_no_meta_init()
     _patch_tied_weights_keys_for_phi4mm()
 
-    hf_config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    hf_config = transformers.AutoConfig.from_pretrained(
+        model_id,
+        # trust_remote_code is required for Phi4MM because its model class
+        # is distributed in the HuggingFace repo as custom Python code
+        # (not yet part of the transformers library core).  Only use this
+        # with model IDs you trust; do NOT set it for arbitrary user input.
+        trust_remote_code=True,
+    )
     text_config = hf_config if not hasattr(hf_config, "text_config") else hf_config.text_config
     text_config.num_hidden_layers = num_text_layers
     text_config._attn_implementation = "eager"
@@ -295,7 +306,7 @@ def load_hf_model(
         model_id,
         config=hf_config,
         torch_dtype=torch.float32,
-        trust_remote_code=True,
+        trust_remote_code=True,  # see note above
     )
     model.eval()
 
@@ -696,7 +707,14 @@ def compare_logits(
             f"ONNX {onnx_logits.shape} vs HF {hf_logits.shape} (comparing last token only)"
         )
 
-    # Check if all close within tolerance
+    # Check if all close within tolerance.
+    # atol=1e-2 is intentionally looser than the project's standard 1e-4.
+    # Reasons: (1) this is a 4-model pipeline — numerical error compounds
+    # across speech encoder → projection → embedding → 32-layer decoder;
+    # (2) all LoRA adapters are always merged unconditionally, introducing
+    # a small systematic offset vs HF's per-mode adapter activation;
+    # (3) float32 accumulation over 32 decoder layers yields ~1e-3 spread.
+    # The argmax (token_match) is the primary correctness signal.
     atol = 1e-2
     rtol = 1e-2
     is_close = bool(

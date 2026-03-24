@@ -194,8 +194,15 @@ class NeMoConvSubsampling(nn.Module):
     Three stride-2 convolution stages reduce the time dimension by 8x.
     A depthwise-separable pattern is used for the 2nd and 3rd stages.
 
+    The activation between conv stages is ReLU — not Swish/SiLU.  This
+    matches NeMo's ``NemoConvSubsampling`` which uses ``nn.ReLU()`` as
+    its activation (see NeMo ASR subsampling implementation and
+    HuggingFace Phi4MM ``speech_conformer_encoder.py``).  The conformer
+    blocks themselves use Swish, but the subsampling module predates that
+    convention and retained ReLU.
+
     Input:  ``[batch, time, input_size]``
-    Output: ``[batch, time // 8, feat_out]``
+    Output: ``[batch, ceil(time/8), feat_out]``
     """
 
     def __init__(self, input_size: int, conv_channels: int, feat_out: int):
