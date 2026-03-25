@@ -366,18 +366,17 @@ class ConformerAttention(nn.Module):
     """Multi-head attention with relative position bias.
 
     Implements encoder-style (non-causal, no KV cache) multi-head attention
-    using explicit MatMul + Softmax ops. The T5 relative bias is added to the
-    scaled dot-product scores before softmax.
+    using the ONNX Attention op. The T5 relative bias is passed as an
+    additive attention mask (added to QK^T/scale before softmax).
 
-    Shape convention: Q/K/V projections produce [B, T, H*D_h], which are
-    reshaped to [B, H, T, D_h] for the attention computation.
+    Q/K/V projections produce [B, T, H*D_h]; op.Attention handles the
+    internal reshape to [B, H, T, D_h] and back.
     """
 
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
         self._num_heads = num_heads
         self._head_dim = d_model // num_heads
-        self._scale = float(self._head_dim) ** -0.5
         self.linear_q = Linear(d_model, d_model)
         self.linear_k = Linear(d_model, d_model)
         self.linear_v = Linear(d_model, d_model)
@@ -389,36 +388,19 @@ class ConformerAttention(nn.Module):
         k = self.linear_k(op, x)
         v = self.linear_v(op, x)
 
-        batch = op.Shape(x, start=0, end=1)  # [1]
-        seq = op.Shape(x, start=1, end=2)  # [1]
+        # op.Attention handles reshape, scale, softmax, and output reshape.
+        # The T5 relative bias is additive (added before softmax).
+        attn_output = op.Attention(
+            q,
+            k,
+            v,
+            relative_attention_bias,  # [1, H, T, T] additive bias
+            q_num_heads=self._num_heads,
+            kv_num_heads=self._num_heads,
+            scale=float(self._head_dim**-0.5),
+        )
 
-        head_dim = op.Constant(value_ints=[self._head_dim])
-        num_heads = op.Constant(value_ints=[self._num_heads])
-
-        # [B, T, H*D_h] → [B, T, H, D_h] → [B, H, T, D_h]
-        bthd_shape = op.Concat(batch, seq, num_heads, head_dim, axis=0)
-        q = op.Reshape(q, bthd_shape)
-        q = op.Transpose(q, perm=[0, 2, 1, 3])  # [B, H, T, D_h]
-        k = op.Reshape(k, bthd_shape)
-        k = op.Transpose(k, perm=[0, 2, 1, 3])
-        v = op.Reshape(v, bthd_shape)
-        v = op.Transpose(v, perm=[0, 2, 1, 3])
-
-        # Scaled dot-product: [B, H, T, T]
-        # CastLike ensures the scale matches q's dtype (fp16/bf16/fp32).
-        scale = op.CastLike(op.Constant(value_float=self._scale), q)
-        scores = op.MatMul(op.Mul(q, scale), op.Transpose(k, perm=[0, 1, 3, 2]))
-        scores = op.Add(scores, relative_attention_bias)
-        attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
-
-        # Context: [B, H, T, D_h] → [B, T, H, D_h] → [B, T, H*D_h]
-        context = op.MatMul(attn_weights, v)  # [B, H, T, D_h]
-        context = op.Transpose(context, perm=[0, 2, 1, 3])  # [B, T, H, D_h]
-        d_model = op.Constant(value_ints=[self._num_heads * self._head_dim])
-        btd_shape = op.Concat(batch, seq, d_model, axis=0)
-        context = op.Reshape(context, btd_shape)  # [B, T, H*D_h]
-
-        return self.linear_out(op, context)
+        return self.linear_out(op, attn_output)
 
 
 class ConformerEncoderLayer(nn.Module):
