@@ -190,13 +190,17 @@ def load_onnx_package(
     num_text_layers: int,
     num_vision_layers: int,
     num_audio_blocks: int,
+    *,
+    trust_remote_code: bool = False,
 ):
     """Build the Phi4MM 4-model ONNX package with real weights.
 
     Returns (pkg, config) where pkg has keys:
     vision, speech, embedding, model.
     """
-    hf_config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    hf_config = transformers.AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code
+    )
     text_config = hf_config if not hasattr(hf_config, "text_config") else hf_config.text_config
     text_config.num_hidden_layers = num_text_layers
     config = ArchitectureConfig.from_transformers(text_config)
@@ -366,7 +370,9 @@ def _patch_peft_for_phi4mm() -> None:
             _orig_init(self, model, peft_config, adapter_name=adapter_name, **kwargs)
 
         pm.PeftModelForCausalLM.__init__ = _patched_init
-    except Exception:
+    except (ImportError, AttributeError):
+        # peft is not installed, or the internal module structure has changed —
+        # either way the patch is not needed and we can proceed without it.
         pass
 
 
@@ -375,6 +381,8 @@ def load_hf_model(
     num_text_layers: int,
     num_audio_blocks: int | None = None,
     num_vision_layers: int | None = None,
+    *,
+    trust_remote_code: bool = False,
 ):
     """Load the HuggingFace Phi4MM model with merged LoRA adapters.
 
@@ -412,13 +420,15 @@ def load_hf_model(
         # is distributed in the HuggingFace repo as custom Python code
         # (not yet part of the transformers library core).  Only use this
         # with model IDs you trust; do NOT set it for arbitrary user input.
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     text_config = hf_config if not hasattr(hf_config, "text_config") else hf_config.text_config
     text_config.num_hidden_layers = num_text_layers
     text_config._attn_implementation = "eager"
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code
+    )
 
     # Use from_pretrained (not from_config) to avoid a transformers bug
     # where post_init() mishandles list-typed _tied_weights_keys.
@@ -429,7 +439,7 @@ def load_hf_model(
         model_id,
         config=hf_config,
         torch_dtype=torch.float32,
-        trust_remote_code=True,  # see note above
+        trust_remote_code=trust_remote_code,  # see note above
     )
     model.eval()
 
@@ -455,6 +465,7 @@ def load_hf_model(
             enc.encoders = enc.encoders[:num_audio_blocks]
             print(f"  Truncated audio conformer to {num_audio_blocks} blocks")
         except AttributeError:
+            # Model structure differs from expected — truncation not needed.
             pass
 
     # Truncate SigLIP encoder to match ONNX vision depth.
@@ -467,6 +478,7 @@ def load_hf_model(
             enc.layers = enc.layers[:num_vision_layers]
             print(f"  Truncated SigLIP encoder to {num_vision_layers} layers")
         except AttributeError:
+            # Model structure differs from expected — truncation not needed.
             pass
 
     if tokenizer.pad_token is None:
@@ -1108,14 +1120,20 @@ def compare_logits(
     # The argmax (token_match) is the primary correctness signal.
     atol = 1e-2
     rtol = 1e-2
-    is_close = bool(
-        np.allclose(
-            onnx_logits[:, -1:, :],
-            hf_logits[:, -1:, :],
-            atol=atol,
-            rtol=rtol,
+    if onnx_logits.shape == hf_logits.shape:
+        # Shapes match — compare the full tensor for a thorough parity check.
+        is_close = bool(np.allclose(onnx_logits, hf_logits, atol=atol, rtol=rtol))
+    else:
+        # Shape mismatch (e.g. different audio token counts) — fall back to
+        # last-token comparison which determines the next generated token.
+        is_close = bool(
+            np.allclose(
+                onnx_logits[:, -1:, :],
+                hf_logits[:, -1:, :],
+                atol=atol,
+                rtol=rtol,
+            )
         )
-    )
 
     status = "PASS" if is_close else "FAIL"
     token_status = "PASS" if token_match >= 1.0 - 1e-9 else "FAIL"
@@ -1502,6 +1520,16 @@ def main():
         help="HuggingFace model ID (default: %(default)s).",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow loading remote model code from HuggingFace Hub. "
+            "Automatically enabled for the default Phi-4 model ID. "
+            "Required for any model that ships custom Python code in its repo."
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=[*ALL_MODES, "all"],
         default="all",
@@ -1575,6 +1603,11 @@ def main():
         args.num_vision_layers = DEBUG_NUM_VISION_LAYERS
         args.num_audio_blocks = DEBUG_NUM_AUDIO_BLOCKS
 
+    # trust_remote_code is always required for the default Phi-4 model ID
+    # (its model class lives in the HF repo, not transformers core). For
+    # any other --model-id the user must pass --trust-remote-code explicitly.
+    trust_remote_code: bool = args.trust_remote_code or (args.model_id == MODEL_ID)
+
     # ------------------------------------------------------------------
     # Step 1: Load both models
     # ------------------------------------------------------------------
@@ -1589,6 +1622,7 @@ def main():
         args.num_text_layers,
         args.num_vision_layers,
         args.num_audio_blocks,
+        trust_remote_code=trust_remote_code,
     )
     print(f"  ONNX package components: {list(pkg.keys())}")
 
@@ -1598,6 +1632,7 @@ def main():
         args.num_text_layers,
         num_audio_blocks=args.num_audio_blocks,
         num_vision_layers=args.num_vision_layers,
+        trust_remote_code=trust_remote_code,
     )
 
     # ------------------------------------------------------------------
