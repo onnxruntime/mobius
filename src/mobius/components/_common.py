@@ -203,8 +203,11 @@ def create_padding_mask(
     bool_mask = op.Cast(attention_mask, to=ir.DataType.BOOL)
     # Unsqueeze to [B, 1, total_len] for broadcasting across q_len.
     mask_3d = op.Unsqueeze(bool_mask, [1])
-    # Build target shape [B, q_len, total_len] using input shapes.
-    input_shape = op.Shape(input_ids)
+    # Build target shape [B, q_len, total_len] using explicit slices.
+    # input_ids may be 2D (input_ids) or 3D (hidden_states when
+    # inputs_embeds is used), so we extract dims individually.
+    batch_size = op.Shape(input_ids, start=0, end=1)
+    q_len = op.Shape(input_ids, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
-    target_shape = op.Concat(input_shape, total_len, axis=0)
+    target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
     return op.Expand(mask_3d, target_shape)
