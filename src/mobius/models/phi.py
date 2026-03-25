@@ -1076,8 +1076,10 @@ def _drop_truncated_layer_weights(
                                       — drop if N >= config.audio.num_blocks
     """
     max_decoder = config.num_hidden_layers
+    # _Phi4MMSigLIPEncoder builds max(1, num_hidden_layers - 1) layers (layer_idx=-2),
+    # so drop weights for layers at or above that count.
     max_vision = (
-        config.vision.num_hidden_layers
+        max(1, config.vision.num_hidden_layers - 1)
         if config.vision is not None and config.vision.num_hidden_layers is not None
         else None
     )

@@ -954,15 +954,15 @@ def load_real_audio(
     return out["input_audio_embeds"].astype(np.float32)
 
 
-def _compute_num_img_tokens_from_sizes(image_sizes: np.ndarray, Hp: int = 16) -> int:
+def _compute_num_img_tokens_from_sizes(image_sizes: np.ndarray, hp: int = 16) -> int:
     """Compute the ONNX vision model's actual token count from image_sizes.
 
     The processor's num_img_tokens accounts for padding masking, but the ONNX
-    vision model always computes the full h×w grid (no masking).  Using
+    vision model always computes the full h x w grid (no masking).  Using
     image_sizes to compute the expected count ensures ONNX and HF-without-mask
     both use the same number of image placeholder tokens.
 
-    Formula: h*Hp*(w*Hp + 1) + 1 + Hp*(Hp + 1)
+    Formula: h*hp*(w*hp + 1) + 1 + hp*(hp + 1)
       where h = image_sizes[0][0] // 448  (crop rows)
             w = image_sizes[0][1] // 448  (crop cols)
     """
@@ -970,7 +970,7 @@ def _compute_num_img_tokens_from_sizes(image_sizes: np.ndarray, Hp: int = 16) ->
     w_px = int(image_sizes[0][1])
     h = h_px // 448
     w = w_px // 448
-    return h * Hp * (w * Hp + 1) + 1 + Hp * (Hp + 1)
+    return h * hp * (w * hp + 1) + 1 + hp * (hp + 1)
 
 
 def load_real_image(
