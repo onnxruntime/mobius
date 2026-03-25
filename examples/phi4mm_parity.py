@@ -57,6 +57,9 @@ Usage::
     # Long audio test (exercises different Conformer sequence lengths):
     python examples/phi4mm_parity.py --mode audio-long \
         --audio ~/phi4mm_testdata/TALK_GREENY_.wav
+
+    # Also verify onnxruntime-genai works with the exported model:
+    python examples/phi4mm_parity.py --debug --genai
 """
 
 from __future__ import annotations
@@ -1504,8 +1507,164 @@ def print_summary(results: list[dict]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# ORT GenAI verification
 # ---------------------------------------------------------------------------
+
+# Known Phi-4 token IDs for genai_config.json
+_PHI4MM_BOS_TOKEN_ID = 199999
+_PHI4MM_EOS_TOKEN_IDS = [199999, 200020]
+
+
+def run_genai_verification(
+    pkg,
+    config: ArchitectureConfig,
+    model_id: str,
+    tokenizer,
+    hf_model,
+    *,
+    trust_remote_code: bool = False,
+    max_new_tokens: int = 32,
+    prompt: str = "The capital of France is",
+) -> bool:
+    """Save the ONNX package and verify text generation with onnxruntime-genai.
+
+    Saves the already-built ``pkg`` to a temporary directory, writes
+    ``genai_config.json``, copies tokenizer files, then runs text-only
+    generation with ``onnxruntime_genai`` and compares the output against
+    HuggingFace to confirm the exported model is functional.
+
+    Args:
+        pkg: The built ``ModelPackage`` (vision, speech, embedding, model).
+        config: Architecture config used to build ``pkg``.
+        model_id: HuggingFace model ID (for tokenizer download).
+        tokenizer: Already-loaded HuggingFace tokenizer.
+        hf_model: Already-loaded HuggingFace model for comparison generation.
+        trust_remote_code: Passed to tokenizer download helpers.
+        max_new_tokens: Maximum tokens to generate.
+        prompt: Text prompt for the verification generation.
+
+    Returns:
+        ``True`` if the genai output matches HF, ``False`` otherwise.
+        Also returns ``True`` if onnxruntime-genai is not installed
+        (so the caller's ``all_pass`` is not penalised).
+    """
+    try:
+        import onnxruntime_genai as og
+    except ImportError:
+        print(
+            "\n[genai] Skipping ORT GenAI verification: onnxruntime_genai not installed.\n"
+            "        Install with: pip install onnxruntime-genai"
+        )
+        return True
+
+    import tempfile
+
+    import torch
+
+    from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
+
+    print("\n" + "=" * 60)
+    print("  ORT GenAI Verification")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory(prefix="phi4mm_genai_") as tmp_dir:
+        # ── 1. Save ONNX models ───────────────────────────────────────
+        print(f"  Saving ONNX models to {tmp_dir} ...")
+        pkg.save(tmp_dir, progress_bar=False)
+        print(f"  Saved components: {list(pkg.keys())}")
+
+        # ── 2. Write genai_config.json ────────────────────────────────
+        gen = GenaiConfigGenerator.from_config(
+            config,
+            "phi4mm",
+            bos_token_id=_PHI4MM_BOS_TOKEN_ID,
+            eos_token_id=_PHI4MM_EOS_TOKEN_IDS,
+        )
+        # Include vision/embedding/speech sections so ORT-GenAI loads the
+        # full 4-model layout (even for text-only inference).
+        gen.with_vision(
+            image_token_id=IMAGE_TOKEN_ID,
+            spatial_merge_size=None,
+            config_filename="vision_processor.json",
+            input_names={
+                "pixel_values": "pixel_values",
+                "image_sizes": "image_sizes",
+            },
+        )
+        gen.with_speech(audio_token_id=AUDIO_TOKEN_ID)
+        gen.write(tmp_dir)
+
+        # ── 3. Copy tokenizer files ───────────────────────────────────
+        try:
+            proc = transformers.AutoProcessor.from_pretrained(
+                model_id, trust_remote_code=trust_remote_code
+            )
+            proc.save_pretrained(tmp_dir)
+            print("  Tokenizer files copied.")
+        except Exception as e:
+            print(f"  Warning: could not copy tokenizer files — {e}")
+
+        # ── 4. Run ORT GenAI text generation ─────────────────────────
+        print(f"\n  Prompt: {prompt!r}")
+        print("  Running ORT GenAI generation ...")
+        try:
+            model_og = og.Model(tmp_dir)
+            tokenizer_og = og.Tokenizer(model_og)
+            input_ids_og = tokenizer_og.encode(prompt)
+            params = og.GeneratorParams(model_og)
+            params.set_search_options(
+                do_sample=False,
+                max_length=len(input_ids_og) + max_new_tokens,
+            )
+            generator = og.Generator(model_og, params)
+            generator.append_tokens(input_ids_og)
+
+            genai_tokens: list[int] = []
+            while not generator.is_done() and len(genai_tokens) < max_new_tokens:
+                generator.generate_next_token()
+                genai_tokens.append(int(generator.get_next_tokens()[0]))
+            del generator
+            del model_og
+
+            genai_text = tokenizer.decode(genai_tokens, skip_special_tokens=True)
+        except Exception as e:
+            print(f"  ORT GenAI generation FAILED: {e}")
+            print("=" * 60)
+            return False
+
+        # ── 5. Run HuggingFace text generation for comparison ─────────
+        print("  Running HuggingFace generation for comparison ...")
+        hf_text: str | None = None
+        try:
+            tok_input = tokenizer(prompt, return_tensors="pt")
+            input_ids_hf = tok_input["input_ids"]
+            with torch.no_grad():
+                out_ids = hf_model.generate(
+                    input_ids=input_ids_hf,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+            new_ids = out_ids[:, input_ids_hf.shape[1] :]
+            hf_text = tokenizer.decode(new_ids[0], skip_special_tokens=True)
+        except Exception as e:
+            print(f"  Warning: HuggingFace comparison failed — {e}")
+
+        # ── 6. Report ─────────────────────────────────────────────────
+        print(f"\n  {'=' * 56}")
+        print(f"  ORT GenAI:     {genai_text!r}")
+        if hf_text is not None:
+            print(f"  HuggingFace:   {hf_text!r}")
+            match = genai_text.strip() == hf_text.strip()
+            status = "✅ MATCH" if match else "⚠️  MISMATCH"
+            print(f"  Result:        {status}")
+        else:
+            print("  HuggingFace:   (comparison unavailable)")
+            print("  Result:        ✅ Generation succeeded (no comparison)")
+            match = True
+        print(f"  {'=' * 56}")
+        print()
+
+    return match
 
 
 def main():
@@ -1593,6 +1752,15 @@ def main():
             f"({DEBUG_NUM_TEXT_LAYERS} text, {DEBUG_NUM_VISION_LAYERS} vision, "
             f"{DEBUG_NUM_AUDIO_BLOCKS} audio). "
             f"Overrides --num-text-layers / --num-vision-layers / --num-audio-blocks."
+        ),
+    )
+    parser.add_argument(
+        "--genai",
+        action="store_true",
+        help=(
+            "After parity tests, save the ONNX models to a temp directory and "
+            "verify text-only generation matches HuggingFace using onnxruntime-genai. "
+            "Skipped silently if onnxruntime-genai is not installed."
         ),
     )
     args = parser.parse_args()
@@ -1747,6 +1915,21 @@ def main():
     # Step 3: Summary
     # ------------------------------------------------------------------
     all_pass = print_summary(results)
+
+    # ------------------------------------------------------------------
+    # Step 4: ORT GenAI verification (optional, --genai flag)
+    # ------------------------------------------------------------------
+    if args.genai:
+        genai_pass = run_genai_verification(
+            pkg,
+            config,
+            args.model_id,
+            tokenizer,
+            hf_model,
+            trust_remote_code=trust_remote_code,
+        )
+        all_pass = all_pass and genai_pass
+
     sys.exit(0 if all_pass else 1)
 
 
