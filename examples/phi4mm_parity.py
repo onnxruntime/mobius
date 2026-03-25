@@ -62,6 +62,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import glob as _glob
 import os
 import sys
 import time
@@ -121,8 +122,14 @@ SHORT_AUDIO_FRAMES = 100
 # (speech_conformer_encoder.py L2849).  With 3 stages of stride-2 (8x),
 # we need >4000 mel frames to exceed the threshold.  4096 gives 512 tokens.
 LONG_AUDIO_FRAMES = 4096
-# Number of new tokens to generate for the text preview (greedy decode)
-DEFAULT_MAX_NEW_TOKENS = 5
+# Number of new tokens to generate for the text preview (greedy decode).
+# Increased from 5 to 50 for more meaningful generation output.
+DEFAULT_MAX_NEW_TOKENS = 50
+
+# Default testdata directory. If present, real files are used automatically
+# instead of random dummy tensors. Audio files longer than this are capped.
+TESTDATA_DIR = os.path.expanduser("~/phi4mm_testdata")
+MAX_AUDIO_SECONDS = 60.0  # cap to avoid very long CPU inference
 
 ALL_MODES = ["text", "vision", "audio-short", "audio-long", "vision-audio"]
 
@@ -140,6 +147,37 @@ def _nemo_subsampling_output_len(num_frames: int, num_stages: int = 3) -> int:
     for _ in range(num_stages):
         num_frames = (num_frames - 1) // 2 + 1
     return num_frames
+
+
+def _discover_testdata(base_dir: str) -> dict[str, list[str]]:
+    """Discover real test files in ``base_dir``.
+
+    Looks for:
+    - ``images/``: JPEG/PNG files for vision tests.
+    - Top-level ``*.wav`` files for audio tests (excludes long files in
+      sub-directories like ``validation_audios/`` and ``ReproChunkedAudio/``).
+
+    Returns a dict with keys ``"images"`` and ``"audios"``, each a sorted list
+    of absolute file paths. Returns empty lists if the directory does not exist.
+    """
+    images: list[str] = []
+    audios: list[str] = []
+    if not os.path.isdir(base_dir):
+        return {"images": images, "audios": audios}
+
+    img_dir = os.path.join(base_dir, "images")
+    if os.path.isdir(img_dir):
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            images.extend(_glob.glob(os.path.join(img_dir, ext)))
+        images.sort()
+
+    # Only top-level WAV files — skip sub-directory collections which may
+    # contain 30+ files designed for bulk validation runs.
+    for ext in ("*.wav",):
+        audios.extend(_glob.glob(os.path.join(base_dir, ext)))
+    audios.sort()
+
+    return {"images": images, "audios": audios}
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +908,7 @@ def create_dummy_pixel_values(
     inputs = processor.image_processor(images=[img], return_tensors="np")
     pixel_values = inputs["input_image_embeds"].astype(np.float32)
     image_sizes = inputs["image_sizes"].astype(np.int64)
-    num_img_tokens = int(inputs["num_img_tokens"][0])
+    num_img_tokens = _compute_num_img_tokens_from_sizes(image_sizes)
     return pixel_values, image_sizes, num_img_tokens
 
 
@@ -889,30 +927,50 @@ def create_dummy_audio_features(
 
 def load_real_audio(
     audio_path: str,
+    max_seconds: float | None = MAX_AUDIO_SECONDS,
 ) -> np.ndarray:
     """Load audio file and compute mel spectrogram features.
 
+    ``max_seconds`` caps the waveform length before feature extraction to
+    avoid very long ONNX inference on CPU (default: ``MAX_AUDIO_SECONDS``).
+    Pass ``None`` to process the full file.
+
     Returns [1, time_frames, n_mels] float32 array.
     """
-    import torchaudio
+    import soundfile as sf
 
-    waveform, sr = torchaudio.load(audio_path)
-    if sr != AUDIO_SAMPLE_RATE:
-        waveform = torchaudio.functional.resample(waveform, sr, AUDIO_SAMPLE_RATE)
-    audio = waveform.mean(dim=0).numpy().astype(np.float32)
+    data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+    # data: (samples, channels) -> mono by averaging channels
+    audio = data.mean(axis=1).astype(np.float32)
+    if max_seconds is not None:
+        audio = audio[: int(max_seconds * sr)]
 
-    fe = transformers.WhisperFeatureExtractor(
-        feature_size=AUDIO_N_MELS,
-        sampling_rate=AUDIO_SAMPLE_RATE,
-    )
-    out = fe(
-        audio,
-        sampling_rate=AUDIO_SAMPLE_RATE,
-        return_tensors="np",
-        padding=False,
-    )
-    # (1, n_mels, time) → (1, time, n_mels)
-    return out["input_features"].astype(np.float32).transpose(0, 2, 1)
+    # Use Phi4MMAudioFeatureExtractor (no 30-second truncation limit) so
+    # long-audio tests exercise the >500-token conformer chunking path.
+    processor = transformers.AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    audio_fe = processor.audio_processor
+    out = audio_fe([(audio, sr)], return_tensors="np")
+    # input_audio_embeds: (1, T, 80)
+    return out["input_audio_embeds"].astype(np.float32)
+
+
+def _compute_num_img_tokens_from_sizes(image_sizes: np.ndarray, Hp: int = 16) -> int:
+    """Compute the ONNX vision model's actual token count from image_sizes.
+
+    The processor's num_img_tokens accounts for padding masking, but the ONNX
+    vision model always computes the full h×w grid (no masking).  Using
+    image_sizes to compute the expected count ensures ONNX and HF-without-mask
+    both use the same number of image placeholder tokens.
+
+    Formula: h*Hp*(w*Hp + 1) + 1 + Hp*(Hp + 1)
+      where h = image_sizes[0][0] // 448  (crop rows)
+            w = image_sizes[0][1] // 448  (crop cols)
+    """
+    h_px = int(image_sizes[0][0])
+    w_px = int(image_sizes[0][1])
+    h = h_px // 448
+    w = w_px // 448
+    return h * Hp * (w * Hp + 1) + 1 + Hp * (Hp + 1)
 
 
 def load_real_image(
@@ -921,6 +979,10 @@ def load_real_image(
     """Load an image file and process through the HF image processor.
 
     Returns (pixel_values, image_sizes, num_img_tokens).
+
+    num_img_tokens is derived from image_sizes using the full-grid formula
+    (not the processor's masked count) so it matches what the ONNX vision
+    model and HF-without-attention-mask both produce.
     """
     from PIL import Image
 
@@ -929,7 +991,7 @@ def load_real_image(
     inputs = processor.image_processor(images=[img], return_tensors="np")
     pixel_values = inputs["input_image_embeds"].astype(np.float32)
     image_sizes = inputs["image_sizes"].astype(np.int64)
-    num_img_tokens = int(inputs["num_img_tokens"][0])
+    num_img_tokens = _compute_num_img_tokens_from_sizes(image_sizes)
     return pixel_values, image_sizes, num_img_tokens
 
 
@@ -1196,7 +1258,7 @@ def test_vision(
     return compare_logits(
         onnx_logits,
         hf_logits,
-        "Text + Image",
+        f"Text + Image ({os.path.basename(image_path)})" if image_path else "Text + Image",
         onnx_generated=onnx_generated,
         hf_generated=hf_generated,
         tokenizer=tokenizer,
@@ -1211,15 +1273,17 @@ def test_audio(
     audio_path: str | None = None,
     num_frames: int = SHORT_AUDIO_FRAMES,
     label: str = "Text + Audio (short)",
+    max_audio_seconds: float | None = MAX_AUDIO_SECONDS,
 ) -> dict:
     """Text + audio parity.
 
     Uses random features by default, or loads from audio_path.
     ``num_frames`` controls the sequence length when using random data
     (short vs long exercises different code paths in the Conformer).
+    ``max_audio_seconds`` caps real audio files to avoid slow CPU inference.
     """
     if audio_path is not None:
-        audio_features = load_real_audio(audio_path)
+        audio_features = load_real_audio(audio_path, max_seconds=max_audio_seconds)
     else:
         audio_features = create_dummy_audio_features(config, num_frames=num_frames)
 
@@ -1537,7 +1601,20 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Step 2: Run parity tests
+    # Step 2: Discover real test data (if available)
+    # ------------------------------------------------------------------
+    testdata = _discover_testdata(TESTDATA_DIR)
+    if testdata["images"] or testdata["audios"]:
+        print(
+            f"\nUsing real test data from {TESTDATA_DIR}:"
+            f" {len(testdata['images'])} image(s),"
+            f" {len(testdata['audios'])} audio file(s)"
+        )
+    else:
+        print("\nNo testdata found — using synthetic dummy inputs.")
+
+    # ------------------------------------------------------------------
+    # Step 3: Run parity tests
     # ------------------------------------------------------------------
     modes = ALL_MODES if args.mode == "all" else [args.mode]
     results: list[dict] = []
@@ -1547,51 +1624,87 @@ def main():
             results.append(test_text_only(pkg, config, hf_model, tokenizer))
 
         elif mode == "vision":
-            results.append(
-                test_vision(
-                    pkg,
-                    config,
-                    hf_model,
-                    tokenizer,
-                    image_path=args.image,
-                )
+            # Iterate over all discovered images; fall back to --image or dummy.
+            image_paths: list[str | None] = testdata["images"] or (
+                [args.image] if args.image else [None]
             )
+            for img_path in image_paths:
+                try:
+                    results.append(
+                        test_vision(pkg, config, hf_model, tokenizer, image_path=img_path)
+                    )
+                except Exception as e:
+                    name = os.path.basename(img_path) if img_path else "dummy"
+                    print(f"\n  Warning: skipping {name!r} — {e}")
+                    results.append(skipped_result(f"Text + Image ({name})", f"error: {e}"))
 
         elif mode == "audio-short":
-            results.append(
-                test_audio(
-                    pkg,
-                    config,
-                    hf_model,
-                    tokenizer,
-                    audio_path=args.audio,
-                    num_frames=SHORT_AUDIO_FRAMES,
-                    label="Text + Audio (short)",
+            # Short audio: dummy frames or explicit --audio.
+            # When real testdata is present, use the first audio file capped
+            # to 30 s so the subsampled token count stays below 500 (no chunking).
+            if testdata["audios"] and not args.audio:
+                short_path = testdata["audios"][0]
+                short_label = f"Text + Audio (short): {os.path.basename(short_path)}"
+                results.append(
+                    test_audio(
+                        pkg,
+                        config,
+                        hf_model,
+                        tokenizer,
+                        audio_path=short_path,
+                        max_audio_seconds=30.0,
+                        label=short_label,
+                    )
                 )
-            )
+            else:
+                results.append(
+                    test_audio(
+                        pkg,
+                        config,
+                        hf_model,
+                        tokenizer,
+                        audio_path=args.audio,
+                        num_frames=SHORT_AUDIO_FRAMES,
+                        label="Text + Audio (short)",
+                    )
+                )
 
         elif mode == "audio-long":
-            results.append(
-                test_audio(
-                    pkg,
-                    config,
-                    hf_model,
-                    tokenizer,
-                    audio_path=args.audio,
-                    num_frames=args.long_audio_frames,
-                    label="Text + Audio (long)",
-                )
+            # Long audio: iterate all discovered audio files (each capped at
+            # MAX_AUDIO_SECONDS).  Exercises the >500-token chunking path.
+            audio_paths: list[str | None] = testdata["audios"] or (
+                [args.audio] if args.audio else [None]
             )
+            for aud_path in audio_paths:
+                label = (
+                    f"Text + Audio (long): {os.path.basename(aud_path)}"
+                    if aud_path
+                    else "Text + Audio (long)"
+                )
+                results.append(
+                    test_audio(
+                        pkg,
+                        config,
+                        hf_model,
+                        tokenizer,
+                        audio_path=aud_path,
+                        num_frames=args.long_audio_frames,
+                        label=label,
+                    )
+                )
 
         elif mode == "vision-audio":
+            # Combined: first image + first audio (or explicit --image/--audio).
+            img_path = args.image or (testdata["images"][0] if testdata["images"] else None)
+            aud_path = args.audio or (testdata["audios"][0] if testdata["audios"] else None)
             results.append(
                 test_vision_audio(
                     pkg,
                     config,
                     hf_model,
                     tokenizer,
-                    image_path=args.image,
-                    audio_path=args.audio,
+                    image_path=img_path,
+                    audio_path=aud_path,
                 )
             )
 
