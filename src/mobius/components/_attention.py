@@ -122,7 +122,10 @@ def _apply_attention(
         )
         return attn_output, updated_k, updated_v
 
-    # Dynamic cache mode: standard Attention with past KV concatenation
+    # Dynamic cache mode: standard Attention with past KV concatenation.
+    # is_causal=1 enables built-in causal masking, eliminating the need for
+    # callers to embed causality in the attn_mask. This allows attn_mask to
+    # be a simple bool padding mask, which unlocks Flash Attention eligibility.
     attn_output, present_key, present_value = op.Attention(
         query,
         key,
@@ -133,6 +136,7 @@ def _apply_attention(
         q_num_heads=num_attention_heads,
         kv_num_heads=num_key_value_heads,
         scale=scale,
+        is_causal=1,
         _outputs=3,
     )
     return attn_output, present_key, present_value

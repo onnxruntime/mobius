@@ -167,3 +167,44 @@ def create_attention_bias(
 
     # Unsqueeze to (batch_size, 1, query_length, total_length)
     return op.Unsqueeze(attention_bias, [1])
+
+
+def create_padding_mask(
+    op: builder.OpBuilder,
+    attention_mask,
+    input_ids,
+):
+    """Create a bool padding mask for the ONNX Attention op.
+
+    When used with ``is_causal=1`` on the Attention op, this provides a
+    minimal mask that encodes only padding information. Causal masking is
+    handled natively by the Attention op, avoiding the overhead of the
+    CumSum/GreaterOrEqual/Where chain in ``create_attention_bias()``.
+
+    Using a bool mask (instead of float additive bias) also unlocks Flash
+    Attention eligibility in ORT, since Flash requires ``attn_mask`` to be
+    either ``nullptr`` or ``bool`` type.
+
+    The output is a 3D ``(batch_size, q_len, total_length)`` bool tensor.
+    The ORT Attention op requires ``mask_dim[-2] == q_sequence_length``,
+    so the padding mask is broadcast-expanded along the query dimension.
+
+    Args:
+        op: The OpBuilder.
+        attention_mask: Attention mask of shape ``(batch_size, total_length)``.
+            INT64 tensor with ``1`` = valid token, ``0`` = padding.
+        input_ids: Input tensor of shape ``(batch_size, q_length)``, used
+            to derive the query sequence length for mask expansion.
+
+    Returns:
+        Bool mask of shape ``(batch_size, q_length, total_length)``.
+        ``True`` = attend, ``False`` = mask out.
+    """
+    bool_mask = op.Cast(attention_mask, to=ir.DataType.BOOL)
+    # Unsqueeze to [B, 1, total_len] for broadcasting across q_len.
+    mask_3d = op.Unsqueeze(bool_mask, [1])
+    # Build target shape [B, q_len, total_len] using input shapes.
+    input_shape = op.Shape(input_ids)
+    total_len = op.Shape(attention_mask, start=1, end=2)
+    target_shape = op.Concat(input_shape, total_len, axis=0)
+    return op.Expand(mask_3d, target_shape)
