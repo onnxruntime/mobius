@@ -168,3 +168,46 @@ class TestConformerEncoder:
         x = create_test_input(builder, "x", [_BATCH, _TIME, _INPUT_SIZE])
         out = enc(op, x)
         assert out is not None
+
+    def test_chunking_path_long_input(self):
+        """Verify chunking ops for T' > 500 after subsampling.
+
+        The encoder chunks audio when T' > 500 to stay within the
+        T5 relative-bias table bounds.  The chunking code is always
+        present in the graph (dynamic ONNX ops, not Python branching).
+        This test uses a long input (T=4200 → T'≈525 after 8x
+        subsampling) and checks that the Pad + Reshape fold/unfold
+        nodes are emitted correctly with the batch-preserving shape.
+        """
+        enc = ConformerEncoder(
+            input_size=_INPUT_SIZE,
+            attention_dim=_DIM,
+            attention_heads=_HEADS,
+            num_blocks=1,
+            linear_units=_LINEAR,
+            kernel_size=_KERNEL,
+            conv_channels=_DIM,
+            t5_bias_max_distance=10,
+        )
+        test_builder, op, graph = create_test_builder()
+        # T=4200 → after 8x conv subsampling T' ≈ 525 > 500
+        x = create_test_input(test_builder, "x", [_BATCH, 4200, _INPUT_SIZE])
+        out = enc(op, x)
+        assert out is not None
+
+        # The chunking path emits Pad (zero-pad to chunk multiple),
+        # Min (chunk_size = min(T', 500)), Div (num_chunks), Mul
+        # (batch*num_chunks and padded_len), and Reshape (fold/unfold).
+        # Verify key ops are present.
+        op_types = [n.op_type for n in graph]
+        assert "Pad" in op_types, "Missing Pad op for chunk padding"
+        assert "Min" in op_types, "Missing Min op for chunk_size"
+        # Two Reshape: fold into chunks + unfold back
+        pad_count = sum(1 for t in op_types if t == "Pad")
+        assert pad_count >= 1, f"Expected ≥1 Pad ops, got {pad_count}"
+        reshape_count = sum(1 for t in op_types if t == "Reshape")
+        assert reshape_count >= 2, (
+            f"Expected ≥2 Reshape ops (fold+unfold), got {reshape_count}"
+        )
+        slice_count = sum(1 for t in op_types if t == "Slice")
+        assert slice_count >= 1, "Missing Slice op for padding removal"

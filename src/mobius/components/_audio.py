@@ -405,7 +405,8 @@ class ConformerAttention(nn.Module):
         v = op.Transpose(v, perm=[0, 2, 1, 3])
 
         # Scaled dot-product: [B, H, T, T]
-        scale = op.Constant(value_float=self._scale)
+        # CastLike ensures the scale matches q's dtype (fp16/bf16/fp32).
+        scale = op.CastLike(op.Constant(value_float=self._scale), q)
         scores = op.MatMul(op.Mul(q, scale), op.Transpose(k, perm=[0, 1, 3, 2]))
         scores = op.Add(scores, relative_attention_bias)
         attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
@@ -544,18 +545,21 @@ class ConformerEncoder(nn.Module):
         )
         x = op.Pad(x, pads)  # [B, padded_len, D]
 
-        # Fold into chunks: [B, padded_len, D] → [num_chunks, chunk_size, D]
-        # (B is always 1 here; num_chunks takes its place in the batch dim)
-        chunk_shape = op.Concat(num_chunks, chunk_size, d_model, axis=0)
-        x = op.Reshape(x, chunk_shape)  # [num_chunks, chunk_size, D]
+        # Fold into chunks: [B, padded_len, D] → [B*num_chunks, chunk_size, D]
+        # Merging batch and chunk dims lets downstream layers broadcast
+        # correctly even when B > 1.
+        b_times_chunks = op.Mul(batch, num_chunks)
+        chunk_shape = op.Concat(b_times_chunks, chunk_size, d_model, axis=0)
+        x = op.Reshape(x, chunk_shape)  # [B*num_chunks, chunk_size, D]
 
         # T5 relative bias sized for chunk positions (not global T')
         rel_bias = self.relative_attention_bias_layer(op, chunk_size)
 
         for layer in self.encoders:
-            x = layer(op, x, rel_bias)  # [num_chunks, chunk_size, D]
+            x = layer(op, x, rel_bias)  # [B*num_chunks, chunk_size, D]
 
-        # Fold back and strip padding: [num_chunks, chunk_size, D] → [B, T', D]
+        # Unfold back and strip padding:
+        # [B*num_chunks, chunk_size, D] → [B, padded_len, D] → [B, T', D]
         fold_shape = op.Concat(batch, padded_len, d_model, axis=0)
         x = op.Reshape(x, fold_shape)  # [B, padded_len, D]
         x = op.Slice(x, op.Constant(value_ints=[0]), seq_len, op.Constant(value_ints=[1]))
