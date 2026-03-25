@@ -1284,15 +1284,95 @@ def test_vision_audio(
     image_path: str | None = None,
     audio_path: str | None = None,
 ) -> dict:
-    """Text + image + audio parity.
+    """Text + image + audio parity (combined VISION_SPEECH mode).
 
-    SKIPPED: Same limitation as test_vision — the ONNX vision model does
-    not implement the HD dynamic crop transform. Vision parity cannot be
-    validated until that transform is added.
+    Uses dummy data by default; pass image_path / audio_path for real inputs.
+    The combined mode uses audio_projection_mode=1 (vision branch of the speech
+    projector) and HF input_mode=3 (VISION_SPEECH).
     """
-    return skipped_result(
+    if image_path is not None:
+        pixel_values, image_sizes, num_img_tokens = load_real_image(image_path)
+    else:
+        pixel_values, image_sizes, num_img_tokens = create_dummy_pixel_values(config)
+
+    if audio_path is not None:
+        audio_features = load_real_audio(audio_path)
+    else:
+        audio_features = create_dummy_audio_features(config, num_frames=SHORT_AUDIO_FRAMES)
+    num_audio_tokens = _nemo_subsampling_output_len(audio_features.shape[1])
+
+    prompt = "Describe what you see and hear"
+    input_ids = build_input_ids(
+        tokenizer,
+        prompt,
+        num_image_tokens=num_img_tokens,
+        num_audio_tokens=num_audio_tokens,
+    )
+
+    print(
+        f"\n[ONNX] Running vision+audio prefill + generate"
+        f" ({pixel_values.shape[0]} crops → {num_img_tokens} image tokens,"
+        f" {audio_features.shape[1]} frames → {num_audio_tokens} audio tokens) ..."
+    )
+    t0 = time.time()
+    onnx_logits = run_onnx_pipeline(
+        pkg,
+        config,
+        input_ids,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        audio_features=audio_features,
+        audio_projection_mode=1,  # vision branch for combined mode
+    )
+    onnx_generated = generate_onnx(
+        pkg,
+        config,
+        tokenizer,
+        input_ids,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        audio_features=audio_features,
+        audio_projection_mode=1,
+    )
+    print(f"  ONNX: {time.time() - t0:.1f}s")
+
+    print("[HF] Running vision+audio prefill + generate ...")
+    t0 = time.time()
+    hf_logits = run_hf_forward(
+        hf_model,
+        tokenizer,
+        prompt,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
+        audio_features=audio_features,
+        num_image_tokens=num_img_tokens,
+        num_audio_tokens=num_audio_tokens,
+        input_mode=3,  # VISION_SPEECH
+    )
+    try:
+        hf_generated = generate_hf(
+            hf_model,
+            tokenizer,
+            prompt,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            audio_features=audio_features,
+            num_image_tokens=num_img_tokens,
+            num_audio_tokens=num_audio_tokens,
+            input_mode=3,
+        )
+    except Exception as e:
+        print(f"  Warning: HF generate failed ({e}); skipping generation comparison")
+        hf_generated = None
+    print(f"  HF:   {time.time() - t0:.1f}s")
+
+    return compare_logits(
+        onnx_logits,
+        hf_logits,
         "Text + Image + Audio",
-        "HD dynamic crop transform not yet implemented in ONNX vision model",
+        onnx_generated=onnx_generated,
+        hf_generated=hf_generated,
+        tokenizer=tokenizer,
     )
 
 
