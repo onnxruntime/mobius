@@ -58,6 +58,22 @@ class SymbolicShapeInferencePass(ir.passes.InPlacePass):
         return ir.passes.PassResult(model, modified=True)
 
 
+class CleanupMetadataPass(ir.passes.InPlacePass):
+    """ONNX IR pass that removes redundant metadata from all nodes."""
+
+    def __abs__(self):
+        self.keys_to_remove = ["pkg.onnxscript.shape_inference_error"]
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        modified = False
+        for node in model.graph.all_nodes():
+            for key in self.keys_to_remove:
+                if key in node.metadata_props:
+                    modified = True
+                    del node.metadata_props[key]
+        return ir.passes.PassResult(model, modified=modified)
+
+
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
     common_passes.LiftConstantsToInitializersPass(),
@@ -69,6 +85,7 @@ _DEFAULT_PASSES = [
     onnxscript.optimizer._constant_folding.FoldConstantsPass(
         shape_inference=False, input_size_limit=8192, output_size_limit=512 * 512
     ),
+    CleanupMetadataPass(),
 ]
 
 
