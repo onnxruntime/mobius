@@ -53,13 +53,24 @@ class GatedRMSNorm(nn.Module):
     The gate is applied first so it affects the normalization variance,
     matching HuggingFace's MambaRMSNormGated / BambaRMSNormGated.
 
-    Used in Mamba2 and Bamba layers.
+    When ``group_size`` is set, variance is computed per group
+    (matching HF's ``Zamba2RMSNormGated``). This is used by
+    NemotronH where group_size = d_inner // n_groups.
+
+    Used in Mamba2, Bamba, and NemotronH layers.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        group_size: int | None = None,
+    ):
         super().__init__()
+        self.hidden_size = hidden_size
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
+        self.group_size = group_size
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # Upcast to fp32 for SiLU gating + RMSNorm variance, matching HF
@@ -68,13 +79,38 @@ class GatedRMSNorm(nn.Module):
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
         gated = op.Mul(h_f32, gate_activated)
-        # RMSNorm in fp32, then cast back to input dtype
-        normed = op.RMSNormalization(
-            gated,
-            self.weight,
-            epsilon=self.variance_epsilon,
-            axis=-1,
-        )
+
+        if self.group_size is not None and self.group_size < self.hidden_size:
+            # Grouped RMSNorm: reshape to (batch, n_groups, group_size),
+            # normalize within each group, then reshape back.
+            # Matches HF Zamba2RMSNormGated which does per-group variance.
+            n_groups = self.hidden_size // self.group_size
+            grouped = op.Reshape(
+                gated,
+                op.Constant(value_ints=[0, n_groups, self.group_size]),
+            )
+            weight_grouped = op.Reshape(
+                self.weight,
+                op.Constant(value_ints=[n_groups, self.group_size]),
+            )
+            normed = op.RMSNormalization(
+                grouped,
+                weight_grouped,
+                epsilon=self.variance_epsilon,
+                axis=-1,
+            )
+            normed = op.Reshape(
+                normed,
+                op.Constant(value_ints=[0, self.hidden_size]),
+            )
+        else:
+            # Standard RMSNorm over the full dimension
+            normed = op.RMSNormalization(
+                gated,
+                self.weight,
+                epsilon=self.variance_epsilon,
+                axis=-1,
+            )
         return op.CastLike(normed, hidden_states)
 
 
