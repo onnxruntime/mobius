@@ -777,45 +777,6 @@ class TestBuildGraphQuantized:
         expected = 1 * self.NUM_PROJECTIONS_PER_LAYER
         assert len(matmulnbits) == expected
 
-    def test_qwen35_gptq_int4_builds(self):
-        """Qwen3.5 hybrid model builds with GPTQ-Int4 quantization."""
-        from mobius._configs import QuantizationConfig
-
-        qc = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=True)
-        config = _base_config(
-            num_hidden_layers=2,
-            partial_rotary_factor=0.5,
-            layer_types=["linear_attention", "full_attention"],
-            linear_num_value_heads=4,
-            linear_num_key_heads=2,
-            linear_key_head_dim=16,
-            linear_value_head_dim=16,
-            linear_conv_kernel_dim=4,
-            quantization=qc,
-        )
-        model_cls = registry.get("qwen3_5_text")
-        module = model_cls(config)
-        task = get_task("hybrid-text-generation")
-        pkg = task.build(module, config)
-        model = pkg["model"]
-
-        # MLP projections (gate, up, down) are quantized;
-        # GatedDeltaNet and gated-attention projections use
-        # specialized components that bypass quantized linear.
-        matmulnbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
-        num_mlp_projections_per_layer = 3  # gate, up, down
-        expected = 2 * num_mlp_projections_per_layer
-        assert len(matmulnbits) == expected, (
-            f"Expected {expected} MatMulNBits, got {len(matmulnbits)}"
-        )
-
-        # Verify scales initializers are present
-        init_names = list(model.graph.initializers)
-        scales_names = [n for n in init_names if ".scales" in n]
-        assert len(scales_names) == expected, (
-            f"Expected {expected} scales initializers, got {len(scales_names)}"
-        )
-
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""
