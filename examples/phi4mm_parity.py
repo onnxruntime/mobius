@@ -37,8 +37,11 @@ Prerequisites::
 
 Usage::
 
-    # Run all parity checks against the full model (default):
+    # Full model (default) — all 32 text layers, 27 vision, 24 audio:
     python examples/phi4mm_parity.py
+
+    # Quick smoke-test with reduced layer counts (2 each):
+    python examples/phi4mm_parity.py --debug
 
     # Run a single mode:
     python examples/phi4mm_parity.py --mode text
@@ -100,10 +103,16 @@ AUDIO_N_MELS = 80
 
 # Default layer counts: full microsoft/Phi-4-multimodal-instruct model.
 # Pass --num-text-layers / --num-vision-layers / --num-audio-blocks to
-# reduce these for faster development / CI testing.
+# reduce these for faster development / CI testing, or use --debug for a
+# preset of small values.
 DEFAULT_NUM_TEXT_LAYERS = 32  # full decoder depth
 DEFAULT_NUM_VISION_LAYERS = 27  # full SigLIP encoder (uses layer_idx=-2 = 26)
 DEFAULT_NUM_AUDIO_BLOCKS = 24  # full Conformer encoder
+
+# Reduced counts used by --debug for quick pipeline smoke-tests.
+DEBUG_NUM_TEXT_LAYERS = 2
+DEBUG_NUM_VISION_LAYERS = 2
+DEBUG_NUM_AUDIO_BLOCKS = 2
 
 # Short audio: 100 mel frames → 13 speech tokens after compression
 SHORT_AUDIO_FRAMES = 100
@@ -1404,7 +1413,23 @@ def main():
         default=LONG_AUDIO_FRAMES,
         help=("Number of mel frames for the long-audio test (default: %(default)s)."),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            f"Use reduced layer counts for fast pipeline smoke-testing "
+            f"({DEBUG_NUM_TEXT_LAYERS} text, {DEBUG_NUM_VISION_LAYERS} vision, "
+            f"{DEBUG_NUM_AUDIO_BLOCKS} audio). "
+            f"Overrides --num-text-layers / --num-vision-layers / --num-audio-blocks."
+        ),
+    )
     args = parser.parse_args()
+
+    # --debug overrides individual layer counts with small preset values.
+    if args.debug:
+        args.num_text_layers = DEBUG_NUM_TEXT_LAYERS
+        args.num_vision_layers = DEBUG_NUM_VISION_LAYERS
+        args.num_audio_blocks = DEBUG_NUM_AUDIO_BLOCKS
 
     # ------------------------------------------------------------------
     # Step 1: Load both models
