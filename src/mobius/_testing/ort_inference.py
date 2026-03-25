@@ -25,9 +25,7 @@ def _to_ort_value(value: np.ndarray, device: str = "cpu") -> ort.OrtValue:
     if hasattr(value, "__dlpack__"):
         is_zero_size = hasattr(value, "size") and value.size == 0
         if not is_zero_size:
-            return ort.OrtValue(
-                _ort_c.OrtValue.from_dlpack(value.__dlpack__(), False), value
-            )
+            return ort.OrtValue(_ort_c.OrtValue.from_dlpack(value.__dlpack__(), False), value)
     if isinstance(value, np.ndarray):
         try:
             onnx_type = ir.DataType.from_numpy(value.dtype)
@@ -125,9 +123,7 @@ class OnnxModelSession:
             ort_feeds[k] = _to_ort_value(v, device=self._device)
         run_opts = ort.RunOptions()
         run_opts.log_severity_level = 2  # warning
-        raw_outputs = self._session.run_with_ort_values(
-            None, ort_feeds, run_options=run_opts
-        )
+        raw_outputs = self._session.run_with_ort_values(None, ort_feeds, run_options=run_opts)
         return dict(zip(self._output_names, (o.numpy() for o in raw_outputs)))
 
     def close(self) -> None:
