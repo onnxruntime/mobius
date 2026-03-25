@@ -39,12 +39,12 @@ def linear_attention(
     num_k_heads: int,
     num_v_heads: int,
     update_rule: str = "gated_delta",
+    scale: float = 1.0,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
     Inputs:
-        query:      (B, H_kv, T, d_k) — query (may have fewer heads
-                    than value for GQA; pre-scaled by 1/sqrt(d_k))
+        query:      (B, H_kv, T, d_k) — query (L2-normalized, unscaled)
         key:        (B, H_kv, T, d_k) — key (L2-normalized)
         value:      (B, H, T, d_v) — value (H >= H_kv)
         past_state: (B, H, d_k, d_v) — recurrent state
@@ -59,10 +59,15 @@ def linear_attention(
         num_k_heads: Number of key/query heads (H_kv).
         num_v_heads: Number of value heads (H). Must be >= num_k_heads.
         update_rule: One of "linear", "gated", "delta", "gated_delta".
+        scale: Scalar multiplier applied to query before the recurrence.
+            Per the ONNX LinearAttention op spec, defaults to
+            ``1/sqrt(head_dim)`` in the op proposal.  Callers should
+            pass that value explicitly (or 1.0 if queries are
+            pre-scaled).
 
-    The function body handles GQA expansion and uses an ONNX Scan op
-    for the sequential recurrence.  A fused kernel can replace the
-    entire function for 10-50x speedup.
+    The function body handles GQA expansion, query scaling, and uses
+    an ONNX Scan op for the sequential recurrence.  A fused kernel
+    can replace the entire function for 10-50x speedup.
     """
     valid_rules = ("linear", "gated", "delta", "gated_delta")
     if update_rule not in valid_rules:
@@ -122,6 +127,11 @@ def linear_attention(
     decay_f32 = op.Cast(decay, to=ir.DataType.FLOAT)  # no-op: decay is always FLOAT
     beta_f32 = op.Cast(beta, to=ir.DataType.FLOAT)
 
+    # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
+    # Scale is applied after f32 cast for precision, and before the Scan
+    # recurrence.  A fused kernel reads the scale attribute directly.
+    query_f32 = op.Mul(query_f32, op.Constant(value_float=scale))
+
     # --- Build Scan for sequential recurrence ---
     scan_body = _build_recurrence_body(uses_decay, uses_beta)
 
@@ -165,11 +175,20 @@ def linear_attention(
         update_rule,
         ref_attr_name="update_rule",
     )
+    scale_attr = ir.Attr(
+        "scale",
+        ir.AttributeType.FLOAT,
+        scale,
+        ref_attr_name="scale",
+    )
     return ir.Function(
         domain=DOMAIN,
         name="LinearAttention",
         graph=graph,
-        attributes={"update_rule": update_rule_attr},
+        attributes={
+            "update_rule": update_rule_attr,
+            "scale": scale_attr,
+        },
     )
 
 

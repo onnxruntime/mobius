@@ -214,11 +214,6 @@ class GatedDeltaNet(nn.Module):
         # === L2 normalize Q and K ===
         query = _l2_normalize(op, query)
         key = _l2_normalize(op, key)
-        scale = op.CastLike(
-            op.Constant(value_float=1.0 / (self.head_k_dim**0.5)),
-            query,
-        )
-        query = op.Mul(query, scale)
 
         # === Compute gating parameters ===
         # beta: (B, S, num_v_heads)
@@ -254,6 +249,7 @@ class GatedDeltaNet(nn.Module):
             g_bhs,  # (B, H, S) — decay in log-space, float32
             beta_bhs,  # (B, H, S) — update rate
             update_rule="gated_delta",
+            scale=1.0 / (self.head_k_dim**0.5),
             _domain="com.microsoft",
             _outputs=2,
         )
