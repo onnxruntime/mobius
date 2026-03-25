@@ -61,7 +61,7 @@ class SymbolicShapeInferencePass(ir.passes.InPlacePass):
 class CleanupMetadataPass(ir.passes.InPlacePass):
     """ONNX IR pass that removes redundant metadata from all nodes."""
 
-    def __abs__(self):
+    def __init__(self):
         self.keys_to_remove = ["pkg.onnxscript.shape_inference_error"]
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
