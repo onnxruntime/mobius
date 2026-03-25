@@ -23,7 +23,9 @@ concurrency:
 jobs:
   golden-tests:
     name: L4/L5 Golden Tests
-    runs-on: onnxruntime-Linux-GPU-A10
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-github-linux-a10"
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
