@@ -57,12 +57,20 @@ def _apply_attention(
 
     Dynamic cache mode (``static_cache is None``):
         Concatenates ``past_key``/``past_value`` with new key/value
-        internally.  Returns ``(attn_output, present_key, present_value)``.
+        internally.  Uses ``is_causal=1`` so callers only need to provide
+        a bool padding mask (not a full causal+padding float bias).
+        Returns ``(attn_output, present_key, present_value)``.
 
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
+        Also uses ``is_causal=1``.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
+
+    Note:
+        Both paths set ``is_causal=1`` on the Attention op, which enables
+        built-in causal masking. This means ``attn_mask`` should encode
+        only padding information (as a bool mask), not causality.
 
     Note:
         In static cache mode, RoPE must be applied to key *before*

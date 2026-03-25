@@ -12,6 +12,7 @@ from mobius.components._common import (
     Embedding,
     Linear,
     create_attention_bias,
+    create_padding_mask,
 )
 
 
@@ -89,3 +90,55 @@ class TestCreateAttentionBias:
         bias = create_attention_bias(op, input_ids, attention_mask, sliding_window=4)
         assert bias is not None
         assert count_op_type(graph, "Less") >= 1
+
+
+class TestCreatePaddingMask:
+    def test_creates_bool_mask_with_2d_input_ids(self):
+        """Standard path: input_ids is 2D [batch, q_len]."""
+        builder, op, graph = create_test_builder()
+        input_ids = create_test_input(builder, "input_ids", [2, 4], dtype=ir.DataType.INT64)
+        attention_mask = create_test_input(
+            builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        mask = create_padding_mask(op, attention_mask, input_ids)
+        assert mask is not None
+        assert count_op_type(graph, "Cast") >= 1
+        assert count_op_type(graph, "Unsqueeze") >= 1
+        assert count_op_type(graph, "Expand") >= 1
+
+    def test_creates_bool_mask_with_3d_hidden_states(self):
+        """inputs_embeds path: input_ids is actually 3D hidden_states."""
+        builder, op, graph = create_test_builder()
+        hidden_states = create_test_input(
+            builder, "hidden_states", [2, 4, 256], dtype=ir.DataType.FLOAT
+        )
+        attention_mask = create_test_input(
+            builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        mask = create_padding_mask(op, attention_mask, hidden_states)
+        assert mask is not None
+        # Should still produce a valid graph (no crash from 3D input).
+        assert count_op_type(graph, "Cast") >= 1
+        assert count_op_type(graph, "Expand") >= 1
+
+    def test_uses_fewer_ops_than_attention_bias(self):
+        """Padding mask should use fewer ops than full causal bias."""
+        builder_pad, op_pad, graph_pad = create_test_builder()
+        input_ids_pad = create_test_input(
+            builder_pad, "input_ids", [2, 4], dtype=ir.DataType.INT64
+        )
+        mask_pad = create_test_input(
+            builder_pad, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        create_padding_mask(op_pad, mask_pad, input_ids_pad)
+
+        builder_bias, op_bias, graph_bias = create_test_builder()
+        input_ids_bias = create_test_input(
+            builder_bias, "input_ids", [2, 4], dtype=ir.DataType.INT64
+        )
+        mask_bias = create_test_input(
+            builder_bias, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        create_attention_bias(op_bias, input_ids_bias, mask_bias)
+
+        assert graph_pad.num_nodes() < graph_bias.num_nodes()

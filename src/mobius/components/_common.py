@@ -186,15 +186,18 @@ def create_padding_mask(
     either ``nullptr`` or ``bool`` type.
 
     The output is a 3D ``(batch_size, q_len, total_length)`` bool tensor.
-    The ORT Attention op requires ``mask_dim[-2] == q_sequence_length``,
+    The ORT Attention op requires ``mask_dim[-2] == q_sequence_length``
+    (validated in ``attention_helper.h:ComputeOutputShapeForAttention``),
     so the padding mask is broadcast-expanded along the query dimension.
 
     Args:
         op: The OpBuilder.
         attention_mask: Attention mask of shape ``(batch_size, total_length)``.
             INT64 tensor with ``1`` = valid token, ``0`` = padding.
-        input_ids: Input tensor of shape ``(batch_size, q_length)``, used
-            to derive the query sequence length for mask expansion.
+        input_ids: Input tensor of shape ``(batch_size, q_length)`` or
+            ``(batch_size, q_length, hidden_size)``, used to derive the
+            query sequence length for mask expansion. Only dims 0 and 1
+            are read, so 3D hidden_states (inputs_embeds path) are safe.
 
     Returns:
         Bool mask of shape ``(batch_size, q_length, total_length)``.
