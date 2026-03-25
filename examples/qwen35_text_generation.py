@@ -574,7 +574,7 @@ def main():
     parser.add_argument(
         "--dtype",
         default="f32",
-        choices=["f16", "f32"],
+        choices=["f16", "bf16", "f32"],
         help="Precision type for the ONNX model (default: %(default)s).",
     )
     parser.add_argument(
