@@ -339,9 +339,7 @@ class PackQKVForGQA(RewriteRuleClassBase):
         # Store packed weight as a graph initializer
         self._pack_counter += 1
         w_name = f"packed_qkv_weight_{self._pack_counter}"
-        packed_w = op.initializer(
-            ir.Tensor(self._qkv_wt_transposed, name=w_name), name=w_name
-        )
+        packed_w = op.initializer(ir.Tensor(self._qkv_wt_transposed, name=w_name), name=w_name)
         self._qkv_wt_transposed = None
 
         # Transpose + MatMul for the packed projection
