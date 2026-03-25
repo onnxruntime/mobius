@@ -391,8 +391,10 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             hidden_size=hidden_size,
         )
         # layer_idx=-2: only run the first (num_layers - 1) encoder layers.
+        # When num_layers == 1, this gives 0 layers — just patch embeddings,
+        # matching HF's layer_idx=-2 behaviour for a 1-layer SigLIP.
         self.encoder = VisionEncoder(
-            num_layers=max(1, num_layers - 1),
+            num_layers=num_layers - 1,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_heads=num_heads,
@@ -1076,10 +1078,10 @@ def _drop_truncated_layer_weights(
                                       — drop if N >= config.audio.num_blocks
     """
     max_decoder = config.num_hidden_layers
-    # _Phi4MMSigLIPEncoder builds max(1, num_hidden_layers - 1) layers (layer_idx=-2),
+    # _Phi4MMSigLIPEncoder builds (num_hidden_layers - 1) layers (layer_idx=-2),
     # so drop weights for layers at or above that count.
     max_vision = (
-        max(1, config.vision.num_hidden_layers - 1)
+        config.vision.num_hidden_layers - 1
         if config.vision is not None and config.vision.num_hidden_layers is not None
         else None
     )
