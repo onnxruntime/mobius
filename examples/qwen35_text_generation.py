@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 
+import ml_dtypes
 import numpy as np
 import transformers
 
@@ -52,7 +53,7 @@ MODEL_ID = "Qwen/Qwen3.5-0.8B"
 DEFAULT_PROMPT = "The capital of France is"
 MAX_NEW_TOKENS = 32
 
-DTYPE_MAP = {"f16": np.float16, "f32": np.float32}
+DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +61,7 @@ DTYPE_MAP = {"f16": np.float16, "f32": np.float32}
 # ---------------------------------------------------------------------------
 
 
-def init_hybrid_states(
-    config, dtype: np.dtype = np.float32
-) -> dict[str, np.ndarray]:
+def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.ndarray]:
     """Initialize per-layer states for the hybrid architecture.
 
     Full-attention layers get empty KV caches (past_seq_len=0).
@@ -453,7 +452,7 @@ def generate_hf(
     # modeling code can find it.
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
-        
+
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_id,
         config=hf_config,
