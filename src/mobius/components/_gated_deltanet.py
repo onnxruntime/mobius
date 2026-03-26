@@ -108,6 +108,7 @@ class GatedDeltaNet(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self._dtype = config.dtype
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -218,16 +219,24 @@ class GatedDeltaNet(nn.Module):
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
         beta = op.Sigmoid(b)
-        # Compute decay — upcast to float32 for Softplus/Exp numerical stability.
-        # fp16 Exp overflows at ~11.09; fp16 Softplus saturates similarly.
-        # This mirrors HF: -A_log.float().exp() * softplus(a.float() + dt_bias).
-        # Cast back to native dtype so downstream ops (LinearAttention) stay homogeneous.
-        a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
-        dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
-        a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
-        softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
-        neg_a = op.Neg(op.Exp(a_log_f32))
-        g = op.CastLike(op.Mul(neg_a, softplus_val), a)  # (B, T, num_v_heads)
+        # Compute decay: g = -exp(A_log) * softplus(a + dt_bias).
+        # fp16 Exp overflows at ~11.09; bf16 has the same exponent range as fp32
+        # (8-bit exponent) so no upcast is needed for bf16 or fp32.
+        # Mirrors HF: -A_log.float().exp() * softplus(a.float() + dt_bias).
+        if self._dtype == ir.DataType.FLOAT16:
+            # Upcast to fp32 to avoid fp16 Exp/Softplus overflow.
+            a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
+            dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
+            a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
+            softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
+            neg_a = op.Neg(op.Exp(a_log_f32))
+            g = op.CastLike(op.Mul(neg_a, softplus_val), a)  # cast back to fp16
+        else:
+            # bf16/fp32: sufficient exponent range, compute natively.
+            softplus_val = op.Softplus(op.Add(a, self.dt_bias))
+            neg_a = op.Neg(op.Exp(self.A_log))
+            g = op.Mul(neg_a, softplus_val)
+        # g: (B, T, num_v_heads)
 
         # === LinearAttention ===
         # Pack normalized Q, K, and V into a single tensor for the packed

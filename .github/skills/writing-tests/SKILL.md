@@ -427,7 +427,7 @@ in `model.functions` to decompose the custom op before execution.
 **fp16 Exp overflow:** `exp(x)` overflows to `inf` for `x > ~11.09` in
 fp16. The Softplus activation (`log(1 + exp(x))`) and decay computation
 `exp(-softplus(x))` are common overflow sites. Always upcast to float32
-for Exp/Softplus operations even when the rest of the model is fp16:
+for Exp/Softplus in fp16 models. bf16 has the same 8-bit exponent range as fp32 and does NOT need the upcast:
 ```python
 x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
 result = op.Exp(x_f32)
