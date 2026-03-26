@@ -10,7 +10,7 @@ memory per token during decoding.
 
 Architecture per layer:
     1. Linear projections -> Q, K, V, z (gate), b (forget), a (decay)
-    2. CausalConv1DWithState — depthwise Conv1D + SiLU + carry state
+    2. CausalConvWithState — depthwise Conv1D + SiLU + carry state
     3. L2-normalize Q and K
     4. Compute decay: g = -exp(A_log) * softplus(a + dt_bias)
     5. Compute forget: beta = sigmoid(b)
@@ -22,7 +22,7 @@ State carried across steps:
     - conv_state: (batch, conv_dim, kernel_size-1) — sliding conv window
     - recurrent_state: (batch, num_v_heads, k_dim, v_dim) — matrix accumulator
 
-The CausalConv1DWithState and LinearAttention ops are defined
+The CausalConvWithState and LinearAttention ops are defined
 as ir.Functions in ``mobius.functions`` and registered on
 the model by the task layer.
 """
@@ -39,12 +39,12 @@ from mobius.components._rms_norm import PostGatedRMSNorm
 
 
 class _DepthwiseConv1d(nn.Module):
-    """Depthwise 1D convolution via CausalConv1DWithState function op.
+    """Depthwise 1D convolution via CausalConvWithState function op.
 
     Wraps a single ``weight`` parameter so that HuggingFace weight names
     (``conv1d.weight``) automatically align with ONNX initializer names.
 
-    The ``forward()`` method calls the ``CausalConv1DWithState``
+    The ``forward()`` method calls the ``CausalConvWithState``
     function op in the ``com.microsoft`` domain (registered as an
     ``ir.Function`` by the task layer). The function is specialized
     for depthwise convolution with ``group = channels`` baked in at
@@ -66,7 +66,7 @@ class _DepthwiseConv1d(nn.Module):
         input_val: ir.Value,
         conv_state: ir.Value,
     ):
-        """Run CausalConv1DWithState function op.
+        """Run CausalConvWithState function op.
 
         Args:
             op: ONNX op builder.
@@ -83,7 +83,7 @@ class _DepthwiseConv1d(nn.Module):
             op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
-        return op.CausalConv1DWithState(
+        return op.CausalConvWithState(
             input_val,
             self.weight,
             conv_bias,
@@ -174,7 +174,7 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(op, hidden_states)
         a = self.in_proj_a(op, hidden_states)
 
-        # === CausalConv1DWithState ===
+        # === CausalConvWithState ===
         # Transpose for conv: (batch, conv_dim, seq_len)
         mixed_qkv_t = op.Transpose(mixed_qkv, perm=[0, 2, 1])
         conv_out, new_conv_state = self.conv1d(op, mixed_qkv_t, conv_state)

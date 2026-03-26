@@ -360,7 +360,7 @@ def _register_linear_attention_functions(
     model: ir.Model,
     config: BaseModelConfig,
 ) -> None:
-    """Register CausalConv1DWithState and LinearAttention functions.
+    """Register CausalConvWithState and LinearAttention functions.
 
     Only registers functions when the model has ``linear_attention`` layers.
     Adds the ``pkg.mobius`` opset import to the graph.
@@ -370,15 +370,16 @@ def _register_linear_attention_functions(
         return
 
     from mobius.functions import (
-        causal_conv1d_with_state,
+        CausalConvWithState,
         linear_attention,
     )
 
     dims = linear_attention_dims(config)
 
-    conv_func = causal_conv1d_with_state(
+    conv_func = CausalConvWithState(
         kernel_size=dims.conv_kernel,
         channels=dims.conv_dim,
+        ndim=1,
         activation="silu",
     )
     attn_func = linear_attention(

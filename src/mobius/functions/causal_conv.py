@@ -1,9 +1,9 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reference ir.Function for the proposed CausalConv1DWithState operator.
+"""Reference ir.Function for the CausalConvWithState operator.
 
-Implements depthwise causal 1D convolution with carry state for
+Implements depthwise causal N-d convolution with carry state for
 incremental decoding.  During autoregressive generation, the carry state
 (last K-1 time steps) avoids recomputing the full causal convolution.
 
@@ -23,141 +23,33 @@ DOMAIN = "com.microsoft"
 # TODO(justinchuby): Simplify function creation boilerplate
 
 
-def causal_conv1d_with_state(
-    *,
-    kernel_size: int,
-    channels: int,
-    activation: str = "silu",
-) -> ir.Function:
-    """Build an ir.Function for CausalConv1DWithState.
-
-    The convolution is always depthwise (group = channels).  The group
-    count is derived from the ``channels`` build-time parameter so
-    callers never need to supply it as a function attribute.
-
-    Args:
-        kernel_size: Convolution kernel size (K).
-        channels: Number of input channels (D).  Used as the Conv
-            ``group`` attribute for depthwise convolution.
-        activation: Fused activation — ``"silu"``, ``"swish"``, or
-            ``"none"``.
-
-    Inputs:
-        input:      (B, D, T)   — channels-first input
-        weight:     (D, 1, K)   — depthwise conv weights
-        bias:       (D,)        — bias (pass zeros if not needed)
-        conv_state: (B, D, K-1) — carry state from previous step
-
-    Outputs:
-        output:        (B, D, T)   — convolution output
-        present_state: (B, D, K-1) — updated carry state
-
-    The function body implements:
-        1. Prepend conv_state to input along the time axis
-        2. Slice out the new carry state (last K-1 positions)
-        3. Apply depthwise Conv1d (group = channels D, no padding)
-        4. Add bias
-        5. Apply activation (SiLU by default)
-    """
-    state_width = kernel_size - 1
-
-    # --- Define function inputs (shapes/types left dynamic) ---
-    input_val = ir.Value(name="input")
-    weight_val = ir.Value(name="weight")
-    bias_val = ir.Value(name="bias")
-    conv_state_val = ir.Value(name="conv_state")
-
-    # --- Build function body graph ---
-    graph = ir.Graph(
-        inputs=[input_val, weight_val, bias_val, conv_state_val],
-        outputs=[],
-        nodes=[],
-        name="CausalConv1DWithState_body",
-        opset_imports={"": OPSET_VERSION},
-    )
-    gb = builder.GraphBuilder(graph)
-    op = gb.op
-
-    # Step 1: Prepend conv_state along time axis
-    # conv_input: (B, D, K-1 + T)
-    conv_input = op.Concat(conv_state_val, input_val, axis=2)
-
-    # Step 2: Extract new carry state — last K-1 positions of conv_input
-    total_len = op.Gather(op.Shape(conv_input), op.Constant(value_int=2), axis=0)
-    state_start = op.Sub(total_len, op.Constant(value_int=state_width))
-    present_state = op.Slice(
-        conv_input,
-        op.Reshape(state_start, op.Constant(value_ints=[1])),
-        op.Reshape(total_len, op.Constant(value_ints=[1])),
-        op.Constant(value_ints=[2]),
-    )
-    present_state.name = "present_state"
-
-    # Step 3: Depthwise Conv1d (group = channels, always depthwise)
-    conv_out = op.Conv(
-        conv_input,
-        weight_val,
-        group=channels,
-        pads=[0, 0],
-    )
-
-    # Step 4: Add bias — reshape bias to (1, D, 1) for broadcasting
-    bias_reshaped = op.Reshape(bias_val, op.Constant(value_ints=[1, -1, 1]))
-    conv_out = op.Add(conv_out, bias_reshaped)
-
-    # Step 5: Apply activation
-    if activation in ("silu", "swish"):
-        output = op.Mul(conv_out, op.Sigmoid(conv_out))
-    elif activation == "none":
-        output = conv_out
-    else:
-        raise ValueError(
-            f"Unsupported activation: {activation!r}. Expected 'silu', 'swish', or 'none'."
-        )
-    output.name = "output"
-
-    graph.outputs.extend([output, present_state])
-
-    # --- Build the ir.Function ---
-    # NOTE: Do not set ``overload`` here — the call sites
-    # (op.CausalConv1DWithState) do not set an overload on the
-    # node, so setting one on the function would prevent the
-    # serializer from matching nodes to this function definition.
-    return ir.Function(
-        domain=DOMAIN,
-        name="CausalConv1DWithState",
-        graph=graph,
-        attributes={
-            "activation": ir.Attr(
-                "activation",
-                ir.AttributeType.STRING,
-                activation,
-            ),
-        },
-    )
-
-
-def causal_conv_nd_with_state(
+def CausalConvWithState(  # noqa: N802 — PascalCase matches the ONNX op name
     *,
     kernel_size: int,
     channels: int,
     ndim: int = 1,
     activation: str = "silu",
 ) -> ir.Function:
-    """Build an ``ir.Function`` for N-d CausalConvWithState.
+    """Build an ``ir.Function`` for the ``CausalConvWithState`` operator.
 
-    Generalises :func:`causal_conv1d_with_state` to 1-D, 2-D, and 3-D
-    depthwise causal convolution with carry state.  The carry state holds
-    the last ``K-1`` positions along the **last** (temporal) spatial
-    dimension so that incremental decoding can be performed without
-    recomputing the full convolution.
+    Implements depthwise causal N-d convolution with carry state for
+    incremental decoding.  The carry state holds the last ``K-1`` positions
+    along the **last** (temporal) spatial dimension so autoregressive
+    generation avoids recomputing the full causal convolution.
+
+    Supports 1-D, 2-D, and 3-D inputs:
+
+    * 1-D — ``(B, D, T)``         — temporal axis = 2
+    * 2-D — ``(B, D, H, W)``      — temporal axis = 3
+    * 3-D — ``(B, D, D1, D2, T)`` — temporal axis = 4
+
+    The convolution is always depthwise (``group = channels``).
 
     .. note:: **Dilation not supported**
 
-       The stateful carry-state mechanism assumes stride=1 and
-       dilation=1.  Dilated convolutions would require a larger state
-       buffer (``dilation*(K-1)`` instead of ``K-1``).  Dilations are
-       hardcoded to ``[1]*ndim`` in the generated Conv node.
+       The stateful carry-state mechanism assumes stride=1 and dilation=1.
+       Dilated convolutions would require a state buffer of size
+       ``dilation*(K-1)`` instead of ``K-1``.
 
     Args:
         kernel_size: Convolution kernel size ``K``.
@@ -167,17 +59,14 @@ def causal_conv_nd_with_state(
             ``"none"``.
 
     Inputs:
-        input:      ``(B, D, *spatial)``      — channels-first input
-        weight:     ``(D, 1, *[K]*ndim)``     — depthwise weights
-        bias:       ``(D,)``                  — bias
+        input:      ``(B, D, *spatial)``           — channels-first input
+        weight:     ``(D, 1, *[K]*ndim)``          — depthwise weights
+        bias:       ``(D,)``                       — bias
         conv_state: ``(B, D, *spatial[:-1], K-1)`` — carry state
 
     Outputs:
-        output:        ``(B, D, *spatial)``      — convolution output
+        output:        ``(B, D, *spatial)``           — convolution output
         present_state: ``(B, D, *spatial[:-1], K-1)`` — updated carry state
-
-    For ``ndim=1`` the behaviour is identical to
-    :func:`causal_conv1d_with_state`.
     """
     if ndim not in (1, 2, 3):
         raise ValueError(f"ndim must be 1, 2, or 3; got {ndim}")
@@ -195,7 +84,7 @@ def causal_conv_nd_with_state(
         inputs=[input_val, weight_val, bias_val, conv_state_val],
         outputs=[],
         nodes=[],
-        name=f"CausalConvNdWithState_{ndim}d_body",
+        name="CausalConvWithState_body",
         opset_imports={"": OPSET_VERSION},
     )
     gb = builder.GraphBuilder(graph)
@@ -246,9 +135,12 @@ def causal_conv_nd_with_state(
 
     graph.outputs.extend([output, present_state])
 
+    # NOTE: Do not set ``overload`` here — call sites (op.CausalConvWithState)
+    # do not set an overload, so setting one on the function would prevent the
+    # serializer from matching nodes to this function definition.
     return ir.Function(
         domain=DOMAIN,
-        name=f"CausalConv{ndim}dWithState",
+        name="CausalConvWithState",
         graph=graph,
         attributes={
             "activation": ir.Attr(
@@ -258,3 +150,28 @@ def causal_conv_nd_with_state(
             ),
         },
     )
+
+
+def causal_conv1d_with_state(
+    *,
+    kernel_size: int,
+    channels: int,
+    activation: str = "silu",
+) -> ir.Function:
+    """Build an ``ir.Function`` for 1-D CausalConvWithState.
+
+    .. deprecated::
+        Use :func:`CausalConvWithState` with ``ndim=1`` instead.  This
+        function is retained for backward compatibility and delegates to
+        the N-d implementation.
+    """
+    return CausalConvWithState(
+        kernel_size=kernel_size,
+        channels=channels,
+        ndim=1,
+        activation=activation,
+    )
+
+
+# Deprecated alias — remove once all callers use CausalConvWithState directly.
+causal_conv_nd_with_state = CausalConvWithState

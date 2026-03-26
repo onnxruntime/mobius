@@ -15,15 +15,15 @@ Each function returns an ``ir.Function`` that can be attached to an
 ``ir.Model`` or used as a rewrite target.
 
 Note:
-    ``causal_conv_nd_with_state`` is exported for use as a standalone ONNX
-    function by external consumers (e.g. onnxruntime-genai).  Within
-    mobius itself, only the 1-D variant (``causal_conv1d_with_state``) is
-    currently used by ``GatedDeltaNet``.
+    ``CausalConvWithState`` is the unified N-d builder (1-D, 2-D, 3-D).
+    ``causal_conv1d_with_state`` and ``causal_conv_nd_with_state`` are
+    deprecated aliases retained for backward compatibility.
 """
 
 from __future__ import annotations
 
 from mobius.functions.causal_conv import (
+    CausalConvWithState,
     causal_conv1d_with_state,
     causal_conv_nd_with_state,
 )
@@ -32,6 +32,7 @@ from mobius.functions.linear_attention import (
 )
 
 __all__ = [
+    "CausalConvWithState",
     "causal_conv1d_with_state",
     "causal_conv_nd_with_state",
     "linear_attention",
