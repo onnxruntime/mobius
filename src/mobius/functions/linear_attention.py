@@ -55,6 +55,7 @@ def linear_attention(
     scale: float = 1.0,
     packed_qkv: bool = False,
     head_k_dim: int | None = None,
+    compute_dtype: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
@@ -104,6 +105,9 @@ def linear_attention(
             it internally using ``head_k_dim``.
         head_k_dim: Key head dimension — required when ``packed_qkv``
             is True so the function knows where to split Q/K from V.
+        compute_dtype: Element type for the Scan body's internal
+            computation.  Must match the precision of the inputs
+            passed at the call site.  Defaults to ``FLOAT``.
 
     The function body handles 3D→4D reshape, GQA expansion, query
     scaling, and uses an ONNX Scan op for the sequential recurrence.
@@ -239,7 +243,7 @@ def linear_attention(
     )
 
     # --- Build Scan for sequential recurrence ---
-    scan_body = _build_recurrence_body(uses_decay, uses_beta)
+    scan_body = _build_recurrence_body(uses_decay, uses_beta, compute_dtype=compute_dtype)
 
     # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
     q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
@@ -322,12 +326,16 @@ def linear_attention(
 def _build_recurrence_body(
     uses_decay: bool,
     uses_beta: bool,
+    *,
+    compute_dtype: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
 
-    The body operates in whatever dtype the Scan inputs provide
-    (float16/bfloat16/float32).  No explicit dtype is set on body
-    inputs — the ONNX Scan op propagates types from the outer graph.
+    The body operates in ``compute_dtype`` precision.  Every body input
+    carries an explicit ``ir.TensorType`` so that the ONNX serializer
+    emits a valid ``type_proto`` — without it ORT cannot infer types
+    for the Scan subgraph and the MatMul nodes inside will fail with
+    shape-broadcast errors.
 
     Body inputs (in order):
         1. state: (B, H, d_k, d_v) [carry]
@@ -342,30 +350,37 @@ def _build_recurrence_body(
         2. output_t: (B, H, d_v) [scan output]
     """
     batch = ir.SymbolicDim("B")
+    dtype = ir.TensorType(compute_dtype)
 
     state_in = ir.Value(
         name="state",
         shape=ir.Shape([batch, "H", "d_k", "d_v"]),
+        type=dtype,
     )
     q_t = ir.Value(
         name="q_t",
         shape=ir.Shape([batch, "H", "d_k"]),
+        type=dtype,
     )
     k_t = ir.Value(
         name="k_t",
         shape=ir.Shape([batch, "H", "d_k"]),
+        type=dtype,
     )
     v_t = ir.Value(
         name="v_t",
         shape=ir.Shape([batch, "H", "d_v"]),
+        type=dtype,
     )
     decay_t = ir.Value(
         name="decay_t",
         shape=ir.Shape([batch, "H", "d_k"]),
+        type=dtype,
     )
     beta_t = ir.Value(
         name="beta_t",
         shape=ir.Shape([batch, "H"]),
+        type=dtype,
     )
 
     body_graph, body_builder = create_body_graph(

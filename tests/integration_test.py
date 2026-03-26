@@ -1726,12 +1726,21 @@ def _build_and_compare_qwen35(hf_model, text_config, onnx_module_cls):
     }
     # Create zero-initialized state feeds for all graph inputs
     # (KV cache for full_attention, conv/recurrent state for DeltaNet)
+    batch_size = input_ids.shape[0]
     for inp in onnx_model.graph.inputs:
         name = inp.name
         if name in feeds:
             continue
         if "past_key_values" in name:
-            shape = tuple(d if isinstance(d, int) else 0 for d in inp.shape)
+            # Map symbolic dims → 0 (e.g. past_sequence_len), but the
+            # batch dim (dim 0) must match the actual batch size —
+            # recurrent_state has all-concrete dims except batch, so
+            # batch=0 would create a 0-element tensor that mismatches
+            # the B=batch_size tensors computed from input_ids.
+            shape = tuple(
+                d if isinstance(d, int) else batch_size if i == 0 else 0
+                for i, d in enumerate(inp.shape)
+            )
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
     session = OnnxModelSession(onnx_model)
@@ -1849,8 +1858,13 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
         if name.endswith((".key", ".value")):
             feeds[name] = np.zeros(kv_shape, dtype=np.float32)
         elif name.endswith((".conv_state", ".recurrent_state")):
-            # Hybrid cache: use shape from the graph input
-            shape = tuple(d if isinstance(d, int) else 0 for d in inp.shape)
+            # Hybrid cache: use shape from the graph input.
+            # Batch dim (dim 0) must match actual batch size — see
+            # _build_and_compare_qwen35 for the full explanation.
+            shape = tuple(
+                d if isinstance(d, int) else 1 if i == 0 else 0
+                for i, d in enumerate(inp.shape)
+            )
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
     session = OnnxModelSession(onnx_model)
