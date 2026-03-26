@@ -58,8 +58,50 @@ _HF_CONFIG = Qwen3_5TextConfig(
 )
 
 
-def _build_onnx_model():
-    """Build the hybrid ONNX model and return (module, onnx_model)."""
+def _build_cache_feeds(
+    onnx_model: ir.Model,
+    base_feeds: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Return zero-valued feeds for all cache inputs not already in base_feeds.
+
+    For KV-cache inputs (``past_key_values.*.key`` / ``past_key_values.*.value``),
+    the batch dim (index 0) is set to 1 and any remaining symbolic dims (i.e.
+    the past-sequence dim) are set to 0 for an empty initial cache.
+    For all other inputs (DeltaNet conv/recurrent states), any symbolic dim is
+    mapped to 1 (batch dimension).
+    """
+    feeds = dict(base_feeds)
+    for inp in onnx_model.graph.inputs:
+        name = inp.name
+        if name in feeds:
+            continue
+        is_kv_cache = name.endswith((".key", ".value"))
+        # KV caches: batch (dim 0) → 1, past-sequence (non-0 symbolic) → 0.
+        # DeltaNet states / others: all symbolic dims → 1 (batch only).
+        shape = tuple(
+            d if isinstance(d, int) else (0 if (is_kv_cache and i > 0) else 1)
+            for i, d in enumerate(inp.shape)
+        )
+        feeds[name] = np.zeros(shape, dtype=np.float32)
+    return feeds
+
+
+@pytest.fixture(scope="class")
+def parity_outputs():
+    """Build models once and run a single-token decode step.
+
+    Shared across all tests in ``TestGatedDeltaNetParity`` so that the
+    expensive model construction + weight transfer happens only once per
+    test-class invocation.
+
+    Returns a dict with keys:
+      - ``hf_logits``: ``np.ndarray`` — HF model output logits
+      - ``hf_rec``:    ``np.ndarray`` — HF recurrent state for layer 0 (DeltaNet)
+      - ``onnx_out``:  ``dict[str, np.ndarray]`` — full ONNX output dict
+    """
+    torch.manual_seed(42)
+    hf_model = Qwen3_5ForCausalLM._from_config(_HF_CONFIG).float().eval()
+
     # Build ONNX model via the hybrid task so that CausalConv1DWithState and
     # LinearAttention are embedded as ONNX local functions in the model.
     # (Building a bare component graph omits these definitions and ORT fails.)
@@ -67,7 +109,40 @@ def _build_onnx_model():
     arch_config.dtype = ir.DataType.FLOAT
     onnx_module = Qwen35CausalLMModel(arch_config)
     pkg = build_from_module(onnx_module, arch_config, task="hybrid-text-generation")
-    return onnx_module, pkg["model"]
+    onnx_model = pkg["model"]
+
+    # Transfer HF weights → ONNX via preprocess_weights.
+    preprocessed = onnx_module.preprocess_weights(dict(hf_model.state_dict()))
+    apply_weights(onnx_model, preprocessed)
+
+    rng = np.random.default_rng(42)
+    input_ids = rng.integers(1, _HF_CONFIG.vocab_size, size=(1, 1)).astype(np.int64)
+    attention_mask = np.ones((1, 1), dtype=np.int64)
+    position_ids = np.zeros((1, 1), dtype=np.int64)
+
+    # HF forward — zero initial DeltaNet state; capture logits and recurrent state.
+    with torch.no_grad():
+        hf_out = hf_model(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+        )
+    hf_logits = hf_out.logits.numpy()
+    hf_rec = hf_out.past_key_values.recurrent_states[0].numpy()
+
+    # ONNX forward — build zero-valued cache feeds from graph inputs.
+    base_feeds: dict[str, np.ndarray] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    feeds = _build_cache_feeds(onnx_model, base_feeds)
+
+    sess = OnnxModelSession(onnx_model)
+    onnx_out = sess.run(feeds)
+    sess.close()
+
+    return {"hf_logits": hf_logits, "hf_rec": hf_rec, "onnx_out": onnx_out}
 
 
 @pytest.mark.integration
@@ -75,108 +150,20 @@ def _build_onnx_model():
 class TestGatedDeltaNetParity:
     """Numerical parity: ONNX GatedDeltaNet vs HuggingFace Qwen3_5GatedDeltaNet."""
 
-    def test_logits_match(self):
+    def test_logits_match(self, parity_outputs):
         """Single-token decode: output logits match HF Qwen3_5ForCausalLM."""
-        torch.manual_seed(42)
-        hf_model = Qwen3_5ForCausalLM._from_config(_HF_CONFIG).float().eval()
+        assert_logits_close(
+            parity_outputs["onnx_out"]["logits"],
+            parity_outputs["hf_logits"],
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
-        onnx_module, onnx_model = _build_onnx_model()
-
-        # Transfer HF weights → ONNX via preprocess_weights.
-        preprocessed = onnx_module.preprocess_weights(dict(hf_model.state_dict()))
-        apply_weights(onnx_model, preprocessed)
-
-        rng = np.random.default_rng(42)
-        input_ids = rng.integers(1, _HF_CONFIG.vocab_size, size=(1, 1)).astype(np.int64)
-        attention_mask = np.ones((1, 1), dtype=np.int64)
-        position_ids = np.zeros((1, 1), dtype=np.int64)
-
-        # HF forward — zero initial DeltaNet state.
-        with torch.no_grad():
-            hf_logits = hf_model(
-                input_ids=torch.from_numpy(input_ids),
-                attention_mask=torch.from_numpy(attention_mask),
-                position_ids=torch.from_numpy(position_ids),
-            ).logits.numpy()
-
-        # ONNX forward — build zero-valued cache feeds from graph inputs.
-        feeds: dict[str, np.ndarray] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-        for inp in onnx_model.graph.inputs:
-            name = inp.name
-            if name in feeds:
-                continue
-
-            # For cache inputs (past_key_values.*), use 0 for symbolic dims to represent
-            # an empty initial cache. For all other inputs, use 1 for symbolic dims.
-            if name.startswith("past_key_values"):
-                shape = tuple(d if isinstance(d, int) else 0 for d in inp.shape)
-            else:
-                shape = tuple(d if isinstance(d, int) else 1 for d in inp.shape)
-
-            # Default to float32 for recurrent state; this matches typical cache dtypes.
-            feeds[name] = np.zeros(shape, dtype=np.float32)
-
-        sess = OnnxModelSession(onnx_model)
-        onnx_out = sess.run(feeds)
-        sess.close()
-
-        assert_logits_close(onnx_out["logits"], hf_logits, rtol=1e-3, atol=1e-3)
-
-    def test_recurrent_state_matches(self):
+    def test_recurrent_state_matches(self, parity_outputs):
         """Single-token decode: DeltaNet recurrent state matches HF after one step."""
-        torch.manual_seed(42)
-        hf_model = Qwen3_5ForCausalLM._from_config(_HF_CONFIG).float().eval()
-
-        onnx_module, onnx_model = _build_onnx_model()
-
-        preprocessed = onnx_module.preprocess_weights(dict(hf_model.state_dict()))
-        apply_weights(onnx_model, preprocessed)
-
-        rng = np.random.default_rng(42)
-        input_ids = rng.integers(1, _HF_CONFIG.vocab_size, size=(1, 1)).astype(np.int64)
-        attention_mask = np.ones((1, 1), dtype=np.int64)
-        position_ids = np.zeros((1, 1), dtype=np.int64)
-
-        # HF forward — capture updated recurrent state for layer 0 (DeltaNet).
-        with torch.no_grad():
-            hf_out = hf_model(
-                input_ids=torch.from_numpy(input_ids),
-                attention_mask=torch.from_numpy(attention_mask),
-                position_ids=torch.from_numpy(position_ids),
-            )
-        hf_rec = hf_out.past_key_values.recurrent_states[0].numpy()
-
-        # ONNX forward.
-        feeds: dict[str, np.ndarray] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-        for inp in onnx_model.graph.inputs:
-            name = inp.name
-            if name in feeds:
-                continue
-            shape = []
-            for d in inp.shape:
-                if isinstance(d, int):
-                    shape.append(d)
-                elif "past" in str(d) or "sequence" in str(d):
-                    shape.append(0)
-                else:
-                    shape.append(1)  # batch
-            feeds[name] = np.zeros(shape, dtype=np.float32)
-
-        sess = OnnxModelSession(onnx_model)
-        onnx_out = sess.run(feeds)
-        sess.close()
-
         np.testing.assert_allclose(
-            onnx_out["present.0.recurrent_state"],
-            hf_rec,
+            parity_outputs["onnx_out"]["present.0.recurrent_state"],
+            parity_outputs["hf_rec"],
             rtol=1e-3,
             atol=1e-3,
             err_msg="GatedDeltaNet recurrent_state mismatch vs HF Qwen3_5GatedDeltaNet",
