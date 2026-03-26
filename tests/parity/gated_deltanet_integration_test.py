@@ -109,14 +109,15 @@ class TestGatedDeltaNetParity:
             name = inp.name
             if name in feeds:
                 continue
-            shape = []
-            for d in inp.shape:
-                if isinstance(d, int):
-                    shape.append(d)
-                elif "past" in str(d) or "sequence" in str(d):
-                    shape.append(0)
-                else:
-                    shape.append(1)  # batch
+
+            # For cache inputs (past_key_values.*), use 0 for symbolic dims to represent
+            # an empty initial cache. For all other inputs, use 1 for symbolic dims.
+            if name.startswith("past_key_values"):
+                shape = tuple(d if isinstance(d, int) else 0 for d in inp.shape)
+            else:
+                shape = tuple(d if isinstance(d, int) else 1 for d in inp.shape)
+
+            # Default to float32 for recurrent state; this matches typical cache dtypes.
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
         sess = OnnxModelSession(onnx_model)
