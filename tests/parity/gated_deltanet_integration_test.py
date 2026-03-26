@@ -9,7 +9,7 @@ processing a single token (decode-step mode).
 
 Run with::
 
-    pytest tests/gated_deltanet_integration_test.py -m integration -sv
+    pytest tests/parity/gated_deltanet_integration_test.py -m integration -sv
 """
 
 from __future__ import annotations
