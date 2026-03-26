@@ -8,6 +8,10 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+# ORT ≤1.24.4 CUDA kernel for RMSNormalization produces wrong results
+# when scale is 2D.  Set to True to emit decomposed ops as a workaround.
+_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND = False
+
 
 class RMSNorm(nn.Module):
     """RMS Layer Normalization using the ONNX RMSNormalization op (opset 23)."""
@@ -89,20 +93,41 @@ class GatedRMSNorm(nn.Module):
                 gated,
                 op.Constant(value_ints=[0, n_groups, self.group_size]),
             )
-            weight_grouped = op.Reshape(
-                self.weight,
-                op.Constant(value_ints=[n_groups, self.group_size]),
-            )
-            normed = op.RMSNormalization(
-                grouped,
-                weight_grouped,
-                epsilon=self.variance_epsilon,
-                axis=-1,
-            )
-            normed = op.Reshape(
-                normed,
-                op.Constant(value_ints=[0, self.hidden_size]),
-            )
+            if _ORT_CUDA_GROUPED_RMSNORM_WORKAROUND:
+                # ORT ≤1.24.4 CUDA kernel for RMSNormalization produces
+                # wrong results when scale is 2D (e.g. [n_groups,
+                # group_size] on [batch, n_groups, group_size] input).
+                # Decompose into basic ops as a workaround. See
+                # repro: my/repro_rmsnorm_cuda_bug.py
+                variance = op.ReduceMean(
+                    op.Mul(grouped, grouped), axes=[-1], keepdims=True,
+                )
+                rnorm = op.Reciprocal(
+                    op.Sqrt(op.Add(variance, self.variance_epsilon)),
+                )
+                normed = op.Mul(grouped, rnorm)
+                normed = op.Reshape(
+                    normed,
+                    op.Constant(value_ints=[0, self.hidden_size]),
+                )
+                normed = op.Mul(
+                    normed, op.Cast(self.weight, to=ir.DataType.FLOAT),
+                )
+            else:
+                weight_grouped = op.Reshape(
+                    self.weight,
+                    op.Constant(value_ints=[n_groups, self.group_size]),
+                )
+                normed = op.RMSNormalization(
+                    grouped,
+                    weight_grouped,
+                    epsilon=self.variance_epsilon,
+                    axis=-1,
+                )
+                normed = op.Reshape(
+                    normed,
+                    op.Constant(value_ints=[0, self.hidden_size]),
+                )
         else:
             # Standard RMSNorm over the full dimension
             normed = op.RMSNormalization(
