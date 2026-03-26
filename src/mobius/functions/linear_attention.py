@@ -120,6 +120,10 @@ def linear_attention(
             "head_k_dim is required when packed_qkv=True "
             "(needed to split the packed tensor into Q, K, V)."
         )
+    if q_num_heads <= 0:
+        raise ValueError(f"q_num_heads must be > 0; got {q_num_heads}")
+    if kv_num_heads <= 0:
+        raise ValueError(f"kv_num_heads must be > 0; got {kv_num_heads}")
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
@@ -158,7 +162,8 @@ def linear_attention(
 
     # --- Reshape 3D → 4D using head counts ---
     # Determine the reference tensor for B and T dimensions.
-    ref_input = qkv if packed_qkv else query
+    # inputs[0] is always the first input regardless of packed_qkv mode.
+    ref_input = inputs[0]
     b_dim = op.Shape(ref_input, start=0, end=1)
     t_dim = op.Shape(ref_input, start=1, end=2)
 

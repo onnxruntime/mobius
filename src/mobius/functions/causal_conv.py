@@ -74,6 +74,10 @@ def causal_conv_nd_with_state(
     """
     if ndim not in (1, 2, 3):
         raise ValueError(f"ndim must be 1, 2, or 3; got {ndim}")
+    if kernel_size < 1:
+        raise ValueError(f"kernel_size must be >= 1; got {kernel_size}")
+    if channels <= 0:
+        raise ValueError(f"channels must be > 0; got {channels}")
 
     state_width = kernel_size - 1
     # The temporal axis = last spatial dim = index (ndim + 1) in (B, D, *spatial).

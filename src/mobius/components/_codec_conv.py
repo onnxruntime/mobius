@@ -123,6 +123,12 @@ class CausalConvNd(nn.Module):
     ):
         if ndim not in (1, 2, 3):
             raise ValueError(f"ndim must be 1, 2, or 3; got {ndim}")
+        if groups <= 0:
+            raise ValueError(f"groups must be > 0; got {groups}")
+        if in_channels % groups != 0:
+            raise ValueError(
+                f"in_channels ({in_channels}) must be divisible by groups ({groups})"
+            )
         super().__init__()
         self._kernel_size = kernel_size
         self._ndim = ndim
