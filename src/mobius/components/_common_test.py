@@ -100,7 +100,7 @@ class TestCreatePaddingMask:
         attention_mask = create_test_input(
             builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
         )
-        mask = create_padding_mask(op, attention_mask, input_ids)
+        mask = create_padding_mask(op, input_ids, attention_mask)
         assert mask is not None
         assert count_op_type(graph, "Cast") >= 1
         assert count_op_type(graph, "Unsqueeze") >= 1
@@ -115,14 +115,14 @@ class TestCreatePaddingMask:
         attention_mask = create_test_input(
             builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
         )
-        mask = create_padding_mask(op, attention_mask, hidden_states)
+        mask = create_padding_mask(op, hidden_states, attention_mask)
         assert mask is not None
         # Should still produce a valid graph (no crash from 3D input).
         assert count_op_type(graph, "Cast") >= 1
         assert count_op_type(graph, "Expand") >= 1
 
-    def test_uses_fewer_ops_than_attention_bias(self):
-        """Padding mask should use fewer ops than full causal bias."""
+    def test_uses_simpler_ops_than_attention_bias(self):
+        """Padding mask uses simple broadcast ops, not the causal CumSum chain."""
         builder_pad, op_pad, graph_pad = create_test_builder()
         input_ids_pad = create_test_input(
             builder_pad, "input_ids", [2, 4], dtype=ir.DataType.INT64
@@ -130,7 +130,16 @@ class TestCreatePaddingMask:
         mask_pad = create_test_input(
             builder_pad, "attention_mask", [2, 8], dtype=ir.DataType.INT64
         )
-        create_padding_mask(op_pad, mask_pad, input_ids_pad)
+        create_padding_mask(op_pad, input_ids_pad, mask_pad)
+
+        # Padding mask uses only Cast + Unsqueeze + Expand (broadcast ops)
+        assert count_op_type(graph_pad, "Cast") >= 1
+        assert count_op_type(graph_pad, "Unsqueeze") >= 1
+        assert count_op_type(graph_pad, "Expand") >= 1
+        # Padding mask avoids the expensive causal-mask ops
+        assert count_op_type(graph_pad, "CumSum") == 0
+        assert count_op_type(graph_pad, "GreaterOrEqual") == 0
+        assert count_op_type(graph_pad, "Where") == 0
 
         builder_bias, op_bias, graph_bias = create_test_builder()
         input_ids_bias = create_test_input(
@@ -141,4 +150,7 @@ class TestCreatePaddingMask:
         )
         create_attention_bias(op_bias, input_ids_bias, mask_bias)
 
-        assert graph_pad.num_nodes() < graph_bias.num_nodes()
+        # Full causal bias requires CumSum + GreaterOrEqual + Where chain
+        assert count_op_type(graph_bias, "CumSum") >= 1
+        assert count_op_type(graph_bias, "GreaterOrEqual") >= 1
+        assert count_op_type(graph_bias, "Where") >= 1

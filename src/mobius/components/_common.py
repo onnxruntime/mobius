@@ -171,8 +171,8 @@ def create_attention_bias(
 
 def create_padding_mask(
     op: builder.OpBuilder,
-    attention_mask,
     input_ids,
+    attention_mask,
 ):
     """Create a bool padding mask for the ONNX Attention op.
 
@@ -192,12 +192,12 @@ def create_padding_mask(
 
     Args:
         op: The OpBuilder.
-        attention_mask: Attention mask of shape ``(batch_size, total_length)``.
-            INT64 tensor with ``1`` = valid token, ``0`` = padding.
         input_ids: Input tensor of shape ``(batch_size, q_length)`` or
             ``(batch_size, q_length, hidden_size)``, used to derive the
             query sequence length for mask expansion. Only dims 0 and 1
             are read, so 3D hidden_states (inputs_embeds path) are safe.
+        attention_mask: Attention mask of shape ``(batch_size, total_length)``.
+            INT64 tensor with ``1`` = valid token, ``0`` = padding.
 
     Returns:
         Bool mask of shape ``(batch_size, q_length, total_length)``.

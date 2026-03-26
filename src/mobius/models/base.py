@@ -90,13 +90,13 @@ class TextModel(nn.Module):
         # handled by is_causal=1 on the Attention op (set in
         # _apply_attention), so we only need padding information here.
         if attention_mask is not None:
-            attention_bias = create_padding_mask(
+            padding_mask = create_padding_mask(
                 op,
-                attention_mask=attention_mask,
                 input_ids=hidden_states if input_ids is None else input_ids,
+                attention_mask=attention_mask,
             )
         else:
-            attention_bias = None
+            padding_mask = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
@@ -104,7 +104,7 @@ class TextModel(nn.Module):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
-                attention_bias=attention_bias,
+                attention_bias=padding_mask,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
