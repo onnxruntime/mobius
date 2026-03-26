@@ -188,32 +188,32 @@ class GatedDeltaNet(nn.Module):
             axis=-1,
             _outputs=3,
         )
+        # query, key: [B, T, key_dim] (3D)
+        # value: [B, T, value_dim] (3D)
 
-        # === Reshape to head dimensions ===
+        # === L2 normalize Q and K (per-head, along d_k) ===
+        # Reshape to 4D for per-head normalization, then back to 3D.
         seq_dim = op.Shape(hidden_states, start=1, end=2)
-        qk_shape = op.Concat(
+        qk_4d_shape = op.Concat(
             batch_dim,
             seq_dim,
-            op.Constant(value_ints=[self.num_k_heads]),
-            op.Constant(value_ints=[self.head_k_dim]),
+            op.Constant(value_ints=[self.num_k_heads, self.head_k_dim]),
             axis=0,
         )
-        query = op.Reshape(query, qk_shape)
-        key = op.Reshape(key, qk_shape)
-
-        v_shape = op.Concat(
+        qk_3d_shape = op.Concat(
             batch_dim,
             seq_dim,
-            op.Constant(value_ints=[self.num_v_heads]),
-            op.Constant(value_ints=[self.head_v_dim]),
+            op.Constant(value_ints=[self.key_dim]),
             axis=0,
         )
-        value = op.Reshape(value, v_shape)
-        z = op.Reshape(z, v_shape)
-
-        # === L2 normalize Q and K ===
-        query = _l2_normalize(op, query)
-        key = _l2_normalize(op, key)
+        query = op.Reshape(
+            _l2_normalize(op, op.Reshape(query, qk_4d_shape)),
+            qk_3d_shape,
+        )
+        key = op.Reshape(
+            _l2_normalize(op, op.Reshape(key, qk_4d_shape)),
+            qk_3d_shape,
+        )
 
         # === Compute gating parameters ===
         # beta: (B, S, num_v_heads)
@@ -229,36 +229,30 @@ class GatedDeltaNet(nn.Module):
         g = op.Mul(neg_a, softplus_val)  # (B, S, num_v_heads), float32
 
         # === LinearAttention ===
-        # The LinearAttention function handles float32 casting internally.
-        # Transpose from (B, S, H, D) to (B, H, S, D).
-        # Q/K keep native num_k_heads; V uses num_v_heads.
-        # GQA expansion happens inside the function.
-        query_bhsd = op.Transpose(query, perm=[0, 2, 1, 3])
-        key_bhsd = op.Transpose(key, perm=[0, 2, 1, 3])
-        value_bhsd = op.Transpose(value, perm=[0, 2, 1, 3])
-
-        # beta/decay: (B, S, H) -> (B, H, S)
+        # Pass 3D Q/K/V directly; the function handles 3D→4D internally.
+        # beta/decay: (B, S, H) -> (B, H, S)  (Phase 2 will make these 3D)
         beta_bhs = op.Transpose(beta, perm=[0, 2, 1])
-        g_bhs = op.Transpose(g, perm=[0, 2, 1])  # float32 from decay computation
+        g_bhs = op.Transpose(g, perm=[0, 2, 1])
 
-        output_4d, new_recurrent_state = op.LinearAttention(
-            query_bhsd,  # (B, H_kv, S, d_k)
-            key_bhsd,  # (B, H_kv, S, d_k)
-            value_bhsd,  # (B, H, S, d_v)
-            recurrent_state,  # (B, H, d_k, d_v)
-            g_bhs,  # (B, H, S) — decay in log-space, float32
-            beta_bhs,  # (B, H, S) — update rate
+        output_3d, new_recurrent_state = op.LinearAttention(
+            query,  # (B, T, num_k_heads * d_k)
+            key,  # (B, T, num_k_heads * d_k)
+            value,  # (B, T, num_v_heads * d_v)
+            recurrent_state,  # (B, num_v_heads, d_k, d_v)
+            g_bhs,  # (B, H, T) — decay in log-space, float32
+            beta_bhs,  # (B, H, T) — update rate
             update_rule="gated_delta",
             scale=1.0 / (self.head_k_dim**0.5),
+            q_num_heads=self.num_k_heads,
+            kv_num_heads=self.num_v_heads,
             _domain="com.microsoft",
             _outputs=2,
         )
-        # output_4d: (B, H, S, d_v) -> (B, S, H, d_v)
-        output_per_head = op.Transpose(output_4d, perm=[0, 2, 1, 3])
+        # output_3d: (B, T, num_v_heads * d_v) — already 3D
 
         # === Gated RMSNorm ===
         flat_shape = op.Constant(value_ints=[-1, self.head_v_dim])
-        output_flat = op.Reshape(output_per_head, flat_shape)
+        output_flat = op.Reshape(output_3d, flat_shape)
         z_flat = op.Reshape(z, flat_shape)
         normed = self.norm(op, output_flat, z_flat)
 
@@ -269,8 +263,8 @@ class GatedDeltaNet(nn.Module):
             op.Constant(value_ints=[self.value_dim]),
             axis=0,
         )
-        output_3d = op.Reshape(normed, out_3d_shape)
-        output = self.out_proj(op, output_3d)
+        output = op.Reshape(normed, out_3d_shape)
+        output = self.out_proj(op, output)
 
         return output, new_conv_state, new_recurrent_state
 
