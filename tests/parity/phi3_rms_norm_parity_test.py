@@ -335,12 +335,17 @@ class TestPhi3RMSNormParityFloat16:
         weight_np: np.ndarray,
         x_fp16: np.ndarray,
     ) -> np.ndarray:
-        """Build a float16 ONNX RMSNorm model and run inference.
+        """Run the float32 ONNX RMSNorm model on float16 data promoted to float32.
 
-        The ONNX model accepts float32 input (ORT does not natively support
-        float16 graph inputs in all configurations), so we cast to float32
-        for the ONNX run and compare against Phi3RMSNorm's float16 output
-        cast to float32 for numerical comparison purposes.
+        The underlying ONNX graph is built with float32 weights and a float32
+        input ``x`` (ORT does not natively support float16 graph inputs in all
+        configurations). For this float16 parity test, we:
+
+        * start from float16 inputs ``x_fp16`` and float32 weights ``weight_np``,
+        * cast both to float32 when populating the ONNX initializers and inputs,
+        * run the float32 ONNX model, and
+        * compare its float32 output against Phi3RMSNorm's output, also viewed
+          as float32 for numerical comparison purposes.
         """
         import onnx_ir as ir
 
