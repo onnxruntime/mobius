@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from mobius.functions.causal_conv import (
     causal_conv1d_with_state,
+    causal_conv_nd_with_state,
 )
 from mobius.functions.linear_attention import (
     linear_attention,
@@ -26,5 +27,6 @@ from mobius.functions.linear_attention import (
 
 __all__ = [
     "causal_conv1d_with_state",
+    "causal_conv_nd_with_state",
     "linear_attention",
 ]

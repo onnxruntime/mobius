@@ -7,6 +7,7 @@ __all__ = [
     "AdaLayerNormZero",
     "BertEmbeddings",
     "CausalConv1d",
+    "CausalConvNd",
     "CausalTransConv1d",
     "CodecDecoderTransformerModel",
     "CodecEncoderTransformerModel",
@@ -108,6 +109,7 @@ from mobius.components._attention import (
 from mobius.components._audio import ConformerEncoder
 from mobius.components._codec_conv import (
     CausalConv1d,
+    CausalConvNd,
     CausalTransConv1d,
     ConvNeXtBlock,
     DecoderBlock,

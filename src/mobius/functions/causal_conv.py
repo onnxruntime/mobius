@@ -135,3 +135,119 @@ def causal_conv1d_with_state(
             ),
         },
     )
+
+
+def causal_conv_nd_with_state(
+    *,
+    kernel_size: int,
+    channels: int,
+    ndim: int = 1,
+    activation: str = "silu",
+) -> ir.Function:
+    """Build an ``ir.Function`` for N-d CausalConvWithState.
+
+    Generalises :func:`causal_conv1d_with_state` to 1-D, 2-D, and 3-D
+    depthwise causal convolution with carry state.  The carry state holds
+    the last ``K-1`` positions along the **last** (temporal) spatial
+    dimension so that incremental decoding can be performed without
+    recomputing the full convolution.
+
+    Args:
+        kernel_size: Convolution kernel size ``K``.
+        channels: Number of input/output channels ``D`` (always depthwise).
+        ndim: Number of spatial dimensions — 1, 2, or 3.
+        activation: Fused activation — ``"silu"``, ``"swish"``, or
+            ``"none"``.
+
+    Inputs:
+        input:      ``(B, D, *spatial)``      — channels-first input
+        weight:     ``(D, 1, *[K]*ndim)``     — depthwise weights
+        bias:       ``(D,)``                  — bias
+        conv_state: ``(B, D, *spatial[:-1], K-1)`` — carry state
+
+    Outputs:
+        output:        ``(B, D, *spatial)``      — convolution output
+        present_state: ``(B, D, *spatial[:-1], K-1)`` — updated carry state
+
+    For ``ndim=1`` the behaviour is identical to
+    :func:`causal_conv1d_with_state`.
+    """
+    if ndim not in (1, 2, 3):
+        raise ValueError(f"ndim must be 1, 2, or 3; got {ndim}")
+
+    state_width = kernel_size - 1
+    # The temporal axis = last spatial dim = index (ndim + 1) in (B, D, *spatial).
+    temporal_axis = ndim + 1
+
+    input_val = ir.Value(name="input")
+    weight_val = ir.Value(name="weight")
+    bias_val = ir.Value(name="bias")
+    conv_state_val = ir.Value(name="conv_state")
+
+    graph = ir.Graph(
+        inputs=[input_val, weight_val, bias_val, conv_state_val],
+        outputs=[],
+        nodes=[],
+        name=f"CausalConvNdWithState_{ndim}d_body",
+        opset_imports={"": OPSET_VERSION},
+    )
+    gb = builder.GraphBuilder(graph)
+    op = gb.op
+
+    # Step 1: Prepend conv_state along the temporal axis.
+    conv_input = op.Concat(conv_state_val, input_val, axis=temporal_axis)
+
+    # Step 2: Extract new carry state — last K-1 positions of conv_input.
+    total_len = op.Gather(op.Shape(conv_input), op.Constant(value_int=temporal_axis), axis=0)
+    state_start = op.Sub(total_len, op.Constant(value_int=state_width))
+    present_state = op.Slice(
+        conv_input,
+        op.Reshape(state_start, op.Constant(value_ints=[1])),
+        op.Reshape(total_len, op.Constant(value_ints=[1])),
+        op.Constant(value_ints=[temporal_axis]),
+    )
+    present_state.name = "present_state"
+
+    # Step 3: Depthwise N-d Conv (group = channels, no padding — already prepended).
+    kernel_shape = [kernel_size] * ndim
+    dilations = [1] * ndim
+    pads = [0] * (2 * ndim)
+    conv_out = op.Conv(
+        conv_input,
+        weight_val,
+        kernel_shape=kernel_shape,
+        dilations=dilations,
+        pads=pads,
+        group=channels,
+    )
+
+    # Step 4: Add bias — reshape to (1, D, *[1]*ndim) for broadcasting.
+    bias_shape = [1, -1] + [1] * ndim
+    bias_reshaped = op.Reshape(bias_val, op.Constant(value_ints=bias_shape))
+    conv_out = op.Add(conv_out, bias_reshaped)
+
+    # Step 5: Apply activation.
+    if activation in ("silu", "swish"):
+        output = op.Mul(conv_out, op.Sigmoid(conv_out))
+    elif activation == "none":
+        output = conv_out
+    else:
+        raise ValueError(
+            f"Unsupported activation: {activation!r}. Expected 'silu', 'swish', or 'none'."
+        )
+    output.name = "output"
+
+    graph.outputs.extend([output, present_state])
+
+    return ir.Function(
+        domain=DOMAIN,
+        name=f"CausalConv{ndim}dWithState",
+        graph=graph,
+        attributes={
+            "activation": ir.Attr(
+                "activation",
+                ir.AttributeType.STRING,
+                activation,
+            ),
+        },
+    )
