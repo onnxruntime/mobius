@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gpu-tests
+  group: gpu-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
