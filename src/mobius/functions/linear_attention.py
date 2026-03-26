@@ -54,8 +54,9 @@ def linear_attention(
         key:        (B, T, q_num_heads * d_k) — key (L2-normalized)
         value:      (B, T, kv_num_heads * d_v) — value
         past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
-        decay:      (B, kv_num_heads, T, d_k) — per-key-dim decay (log-space); use (B, kv_num_heads, T, 1) for per-head scalar (broadcasts)
-        beta:       (B, kv_num_heads, T) — update rate (sigmoid output)
+        decay:      (B, T, kv_num_heads * d_k) — per-key-dim decay (log-space);
+                    use (B, T, kv_num_heads) for per-head scalar (d_k=1, broadcasts)
+        beta:       (B, T, kv_num_heads) — update rate (sigmoid output)
 
     Outputs:
         output:        (B, T, kv_num_heads * d_v) — attention output (3D)
@@ -95,9 +96,9 @@ def linear_attention(
     key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
     value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
     past_state = ir.Value(name="past_state")
-    # decay: (B, kv_num_heads, T, d_k) — same dtype as other inputs
+    # decay: (B, T, kv_num_heads * d_k) — same dtype as other inputs
     decay = ir.Value(name="decay")
-    # beta: (B, kv_num_heads, T) — same dtype as other inputs
+    # beta: (B, T, kv_num_heads) — same dtype as other inputs
     beta = ir.Value(name="beta")
     inputs = [query, key, value, past_state, decay, beta]
 
@@ -150,6 +151,21 @@ def linear_attention(
     gqa_ratio = kv_num_heads // q_num_heads
     query_expanded, key_expanded = _expand_kv_heads(op, query_4d, key_4d, gqa_ratio=gqa_ratio)
 
+    # --- Reshape decay/beta 3D → 4D ---
+    # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
+    #     → transpose to (B, kv_num_heads, T, d_k)
+    decay_4d_shape = op.Concat(
+        b_dim,
+        t_dim,
+        op.Constant(value_ints=[kv_num_heads, -1]),
+        axis=0,
+    )
+    decay_4d = op.Transpose(
+        op.Reshape(decay, decay_4d_shape), perm=[0, 2, 1, 3]
+    )  # [B, kv_num_heads, T, d_k]
+    # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
+    beta_3d = op.Transpose(beta, perm=[0, 2, 1])  # [B, kv_num_heads, T]
+
     # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
     # CastLike ensures scale constant matches the input dtype.
     scaled_query = op.Mul(
@@ -165,9 +181,9 @@ def linear_attention(
     k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
     v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
     # decay: (B, H, T, d_k) -> (T, B, H, d_k)
-    decay_t = op.Transpose(decay, perm=[2, 0, 1, 3])
+    decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])
     # beta: (B, H, T) -> (T, B, H)
-    beta_t = op.Transpose(beta, perm=[2, 0, 1])
+    beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])
 
     present_state, output_t = op.Scan(
         past_state,  # carry: (B, H, d_k, d_v)
