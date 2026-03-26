@@ -105,7 +105,14 @@ def _run_phi3_rms_norm(
         float32 output (matching ``Phi3RMSNorm``), while float32 inputs
         produce a float32 output.
     """
-    from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
+    try:
+        from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
+    except (ImportError, ModuleNotFoundError):
+        pytest.skip(
+            "Phi3RMSNorm is not available in the installed transformers version; "
+            "skipping Phi-3 RMSNorm parity tests.",
+            allow_module_level=True,
+        )
 
     hidden_size = weight_np.shape[0]
     phi3_norm = Phi3RMSNorm(hidden_size, eps=eps).eval()
