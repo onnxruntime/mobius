@@ -66,7 +66,7 @@ class TestCausalConvNdWithState:
             causal_conv_nd_with_state(kernel_size=4, channels=8, activation="relu")
 
     def test_function_op_name_is_causal_conv_with_state(self):
-        """op type name must match call sites (op.CausalConvWithState)."""
+        """Op type name must match call sites (op.CausalConvWithState)."""
         func = causal_conv_nd_with_state(kernel_size=4, channels=8, ndim=1)
         assert func.name == "CausalConvWithState"
 
