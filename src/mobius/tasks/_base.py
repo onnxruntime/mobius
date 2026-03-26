@@ -370,13 +370,13 @@ def _register_linear_attention_functions(
         return
 
     from mobius.functions import (
-        CausalConvWithState,
+        causal_conv_nd_with_state,
         linear_attention,
     )
 
     dims = linear_attention_dims(config)
 
-    conv_func = CausalConvWithState(
+    conv_func = causal_conv_nd_with_state(
         kernel_size=dims.conv_kernel,
         channels=dims.conv_dim,
         ndim=1,

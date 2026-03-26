@@ -23,14 +23,18 @@ DOMAIN = "com.microsoft"
 # TODO(justinchuby): Simplify function creation boilerplate
 
 
-def CausalConvWithState(  # noqa: N802 — PascalCase matches the ONNX op name
+def causal_conv_nd_with_state(
     *,
     kernel_size: int,
     channels: int,
     ndim: int = 1,
     activation: str = "silu",
 ) -> ir.Function:
-    """Build an ``ir.Function`` for the ``CausalConvWithState`` operator.
+    """Build an ``ir.Function`` for the ``CausalConvWithState`` ONNX operator.
+
+    The Python factory is snake_case (``causal_conv_nd_with_state``) while
+    the ir.Function op type string is PascalCase (``"CausalConvWithState"``),
+    following the same convention as ``linear_attention`` / ``LinearAttention``.
 
     Implements depthwise causal N-d convolution with carry state for
     incremental decoding.  The carry state holds the last ``K-1`` positions
@@ -158,14 +162,13 @@ def causal_conv1d_with_state(
     channels: int,
     activation: str = "silu",
 ) -> ir.Function:
-    """Build an ``ir.Function`` for 1-D CausalConvWithState.
+    """Build an ``ir.Function`` for 1-D ``CausalConvWithState``.
 
     .. deprecated::
-        Use :func:`CausalConvWithState` with ``ndim=1`` instead.  This
-        function is retained for backward compatibility and delegates to
-        the N-d implementation.
+        Use :func:`causal_conv_nd_with_state` with ``ndim=1`` instead.
+        Retained for backward compatibility.
     """
-    return CausalConvWithState(
+    return causal_conv_nd_with_state(
         kernel_size=kernel_size,
         channels=channels,
         ndim=1,
@@ -173,5 +176,5 @@ def causal_conv1d_with_state(
     )
 
 
-# Deprecated alias — remove once all callers use CausalConvWithState directly.
-causal_conv_nd_with_state = CausalConvWithState
+# PascalCase alias — matches the ONNX op type name for discoverability.
+CausalConvWithState = causal_conv_nd_with_state

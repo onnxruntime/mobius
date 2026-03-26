@@ -14,10 +14,11 @@ They serve as:
 Each function returns an ``ir.Function`` that can be attached to an
 ``ir.Model`` or used as a rewrite target.
 
-Note:
-    ``CausalConvWithState`` is the unified N-d builder (1-D, 2-D, 3-D).
-    ``causal_conv1d_with_state`` and ``causal_conv_nd_with_state`` are
-    deprecated aliases retained for backward compatibility.
+Naming convention:
+    Python factory functions are snake_case (e.g. ``causal_conv_nd_with_state``,
+    ``linear_attention``) while the ir.Function op type strings are PascalCase
+    (``"CausalConvWithState"``, ``"LinearAttention"``).  PascalCase aliases
+    (``CausalConvWithState``) are provided for discoverability.
 """
 
 from __future__ import annotations
