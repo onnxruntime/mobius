@@ -2752,10 +2752,16 @@ def test_qwen35_vl_3model_builds_and_runs():
         max_position_embeddings=128,
         hidden_act="silu",
         rms_norm_eps=1e-6,
-        rope_type="default",
         rope_theta=10_000.0,
         attn_qk_norm=True,
         partial_rotary_factor=0.5,
+        # InterleavedMRope: decoder receives 3D position_ids (3, batch, seq).
+        # Without mrope_section, initialize_rope falls back to DefaultRope, and
+        # Gather(cos_cache, (3,B,S)) produces 4D cos which ORT rejects.
+        # rotary_dim = head_dim * partial_rotary_factor / 2 = 4; any mrope_section
+        # values work because InterleavedMRope guards with `if i < rotary_dim`.
+        mrope_section=[1, 1, 1],
+        mrope_interleaved=True,
         # Hybrid: 3 DeltaNet + 1 full attention (matches real 27B pattern)
         layer_types=[
             "linear_attention",
