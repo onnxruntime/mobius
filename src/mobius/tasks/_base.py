@@ -389,7 +389,7 @@ def _register_linear_attention_functions(
         scale=1.0 / (dims.head_k_dim**0.5),
         packed_qkv=True,
         head_k_dim=dims.head_k_dim,
-        compute_dtype=config.dtype,
+        stash_type=config.dtype,
     )
 
     model.functions[conv_func.identifier()] = conv_func
