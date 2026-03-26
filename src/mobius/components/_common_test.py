@@ -132,11 +132,10 @@ class TestCreatePaddingMask:
         )
         create_padding_mask(op_pad, input_ids_pad, mask_pad)
 
-        # Padding mask uses only Cast + Unsqueeze + Expand (broadcast ops)
+        # Padding mask avoids the CumSum/GreaterOrEqual/Where causal-bias chain
         assert count_op_type(graph_pad, "Cast") >= 1
         assert count_op_type(graph_pad, "Unsqueeze") >= 1
         assert count_op_type(graph_pad, "Expand") >= 1
-        # Padding mask avoids the expensive causal-mask ops
         assert count_op_type(graph_pad, "CumSum") == 0
         assert count_op_type(graph_pad, "GreaterOrEqual") == 0
         assert count_op_type(graph_pad, "Where") == 0
