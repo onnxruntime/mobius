@@ -88,22 +88,16 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs (3D for Q/K/V) ---
-    # query/key/value/past_state/beta accept any floating-point precision
-    # (float16/bfloat16/float32) — they form the implicit type parameter T.
-    # decay is ALWAYS float32: it is computed in float32 at the call site
-    # (HF pattern: -A_log.float().exp() * softplus(a.float() + dt_bias))
-    # to avoid exp/softplus overflow in lower precision. Rank-4
-    # (B, kv_num_heads, T, d_k) supports per-key-dim decay; use d_k=1 for
-    # per-head scalar decay (broadcasts over key dim). Declaring it as FLOAT
-    # keeps it outside the type parameter T so ORT does not see a type
-    # conflict when the rest of the inputs are float16/bfloat16.
+    # All inputs share the same floating-point precision (float16/bfloat16/
+    # float32).  The recurrence runs in the caller's native dtype — no
+    # internal upcast to float32.
     query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
     key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
     value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
     past_state = ir.Value(name="past_state")
-    # decay: (B, kv_num_heads, T, d_k) — always float32
-    decay = ir.Value(name="decay", type=ir.TensorType(ir.DataType.FLOAT))
-    # beta: (B, kv_num_heads, T) — same precision as activations
+    # decay: (B, kv_num_heads, T, d_k) — same dtype as other inputs
+    decay = ir.Value(name="decay")
+    # beta: (B, kv_num_heads, T) — same dtype as other inputs
     beta = ir.Value(name="beta")
     inputs = [query, key, value, past_state, decay, beta]
 
@@ -156,34 +150,27 @@ def linear_attention(
     gqa_ratio = kv_num_heads // q_num_heads
     query_expanded, key_expanded = _expand_kv_heads(op, query_4d, key_4d, gqa_ratio=gqa_ratio)
 
-    # --- Cast to float32 for Scan recurrence precision ---
-    # The recurrence requires float32 for numerical stability; inputs
-    # may be float16 or bfloat16.  decay is already FLOAT (declared
-    # above), so its Cast is always a no-op.
-    query_f32 = op.Cast(query_expanded, to=ir.DataType.FLOAT)
-    key_f32 = op.Cast(key_expanded, to=ir.DataType.FLOAT)
-    value_f32 = op.Cast(value_4d, to=ir.DataType.FLOAT)
-    state_f32 = op.Cast(past_state, to=ir.DataType.FLOAT)
-    decay_f32 = op.Cast(decay, to=ir.DataType.FLOAT)
-    beta_f32 = op.Cast(beta, to=ir.DataType.FLOAT)
-
     # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
-    query_f32 = op.Mul(query_f32, op.Constant(value_float=scale))
+    # CastLike ensures scale constant matches the input dtype.
+    scaled_query = op.Mul(
+        query_expanded,
+        op.CastLike(op.Constant(value_float=scale), query_expanded),
+    )
 
     # --- Build Scan for sequential recurrence ---
     scan_body = _build_recurrence_body(uses_decay, uses_beta)
 
     # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
-    q_t = op.Transpose(query_f32, perm=[2, 0, 1, 3])
-    k_t = op.Transpose(key_f32, perm=[2, 0, 1, 3])
-    v_t = op.Transpose(value_f32, perm=[2, 0, 1, 3])
+    q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
+    k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
+    v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
     # decay: (B, H, T, d_k) -> (T, B, H, d_k)
-    decay_t = op.Transpose(decay_f32, perm=[2, 0, 1, 3])
+    decay_t = op.Transpose(decay, perm=[2, 0, 1, 3])
     # beta: (B, H, T) -> (T, B, H)
-    beta_t = op.Transpose(beta_f32, perm=[2, 0, 1])
+    beta_t = op.Transpose(beta, perm=[2, 0, 1])
 
     present_state, output_t = op.Scan(
-        state_f32,  # carry: (B, H, d_k, d_v)
+        past_state,  # carry: (B, H, d_k, d_v)
         q_t,  # (T, B, H, d_k)
         k_t,  # (T, B, H, d_k)
         v_t,  # (T, B, H, d_v)
@@ -201,10 +188,6 @@ def linear_attention(
     output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
     out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
     output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
-
-    # Cast outputs back to the caller's input precision
-    output = op.CastLike(output, query)
-    present_state = op.CastLike(present_state, query)
 
     output.name = "output"
     present_state.name = "present_state"
@@ -254,6 +237,10 @@ def _build_recurrence_body(
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
 
+    The body operates in whatever dtype the Scan inputs provide
+    (float16/bfloat16/float32).  No explicit dtype is set on body
+    inputs — the ONNX Scan op propagates types from the outer graph.
+
     Body inputs (in order):
         1. state: (B, H, d_k, d_v) [carry]
         2. q_t: (B, H, d_k) [scan input]
@@ -271,32 +258,26 @@ def _build_recurrence_body(
     state_in = ir.Value(
         name="state",
         shape=ir.Shape([batch, "H", "d_k", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
     q_t = ir.Value(
         name="q_t",
         shape=ir.Shape([batch, "H", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
     k_t = ir.Value(
         name="k_t",
         shape=ir.Shape([batch, "H", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
     v_t = ir.Value(
         name="v_t",
         shape=ir.Shape([batch, "H", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
     decay_t = ir.Value(
         name="decay_t",
         shape=ir.Shape([batch, "H", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
     beta_t = ir.Value(
         name="beta_t",
         shape=ir.Shape([batch, "H"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
     )
 
     body_graph, body_builder = create_body_graph(

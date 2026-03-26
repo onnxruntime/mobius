@@ -218,15 +218,13 @@ class GatedDeltaNet(nn.Module):
         # === Compute gating parameters ===
         # beta: (B, S, num_v_heads)
         beta = op.Sigmoid(b)
-        # Compute decay in float32 for numerical stability — mirrors HF:
+        # Compute decay in native dtype — mirrors HF formula:
         #   g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        # Without .float(), exp() on fp16 A_log can produce -inf.
-        a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
-        dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
-        a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
-        softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
-        neg_a = op.Neg(op.Exp(a_log_f32))
-        g = op.Mul(neg_a, softplus_val)  # (B, S, num_v_heads), float32
+        # HF upcasts to float32 for numerical stability, but we compute in
+        # the model's native precision to keep the graph dtype-homogeneous.
+        softplus_val = op.Softplus(op.Add(a, self.dt_bias))
+        neg_a = op.Neg(op.Exp(self.A_log))
+        g = op.Mul(neg_a, softplus_val)  # (B, S, num_v_heads)
 
         # === LinearAttention ===
         # Pass 3D Q/K/V directly; the function handles 3D→4D internally.
