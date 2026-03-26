@@ -54,7 +54,7 @@ def linear_attention(
         key:        (B, T, q_num_heads * d_k) — key (L2-normalized)
         value:      (B, T, kv_num_heads * d_v) — value
         past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
-        decay:      (B, kv_num_heads, T) — exponential decay (log-space)
+        decay:      (B, kv_num_heads, T, d_k) — per-key-dim decay (log-space); use (B, kv_num_heads, T, 1) for per-head scalar (broadcasts)
         beta:       (B, kv_num_heads, T) — update rate (sigmoid output)
 
     Outputs:
@@ -92,14 +92,16 @@ def linear_attention(
     # (float16/bfloat16/float32) — they form the implicit type parameter T.
     # decay is ALWAYS float32: it is computed in float32 at the call site
     # (HF pattern: -A_log.float().exp() * softplus(a.float() + dt_bias))
-    # to avoid exp/softplus overflow in lower precision. Declaring it as
-    # FLOAT keeps it outside the type parameter T so ORT does not see a
-    # type conflict when the rest of the inputs are float16/bfloat16.
+    # to avoid exp/softplus overflow in lower precision. Rank-4
+    # (B, kv_num_heads, T, d_k) supports per-key-dim decay; use d_k=1 for
+    # per-head scalar decay (broadcasts over key dim). Declaring it as FLOAT
+    # keeps it outside the type parameter T so ORT does not see a type
+    # conflict when the rest of the inputs are float16/bfloat16.
     query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
     key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
     value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
     past_state = ir.Value(name="past_state")
-    # decay: (B, kv_num_heads, T) — always float32
+    # decay: (B, kv_num_heads, T, d_k) — always float32
     decay = ir.Value(name="decay", type=ir.TensorType(ir.DataType.FLOAT))
     # beta: (B, kv_num_heads, T) — same precision as activations
     beta = ir.Value(name="beta")
@@ -175,8 +177,9 @@ def linear_attention(
     q_t = op.Transpose(query_f32, perm=[2, 0, 1, 3])
     k_t = op.Transpose(key_f32, perm=[2, 0, 1, 3])
     v_t = op.Transpose(value_f32, perm=[2, 0, 1, 3])
-    # decay/beta: (B, H, T) -> (T, B, H)
-    decay_t = op.Transpose(decay_f32, perm=[2, 0, 1])
+    # decay: (B, H, T, d_k) -> (T, B, H, d_k)
+    decay_t = op.Transpose(decay_f32, perm=[2, 0, 1, 3])
+    # beta: (B, H, T) -> (T, B, H)
     beta_t = op.Transpose(beta_f32, perm=[2, 0, 1])
 
     present_state, output_t = op.Scan(
@@ -184,7 +187,7 @@ def linear_attention(
         q_t,  # (T, B, H, d_k)
         k_t,  # (T, B, H, d_k)
         v_t,  # (T, B, H, d_v)
-        decay_t,  # (T, B, H)
+        decay_t,  # (T, B, H, d_k)
         beta_t,  # (T, B, H)
         body=scan_body,
         num_scan_inputs=5,
@@ -256,7 +259,7 @@ def _build_recurrence_body(
         2. q_t: (B, H, d_k) [scan input]
         3. k_t: (B, H, d_k) [scan input]
         4. v_t: (B, H, d_v) [scan input]
-        5. decay_t: (B, H) [scan input]
+        5. decay_t: (B, H, d_k) [scan input]
         6. beta_t: (B, H) [scan input]
 
     Body outputs:
@@ -287,7 +290,7 @@ def _build_recurrence_body(
     )
     decay_t = ir.Value(
         name="decay_t",
-        shape=ir.Shape([batch, "H"]),
+        shape=ir.Shape([batch, "H", "d_k"]),
         type=ir.TensorType(ir.DataType.FLOAT),
     )
     beta_t = ir.Value(
@@ -309,9 +312,8 @@ def _build_recurrence_body(
 
     # --- State decay: state = exp(g) * past_state ---
     if uses_decay:
-        # decay_t: (B, H) -> (B, H, 1, 1)
-        axes_23 = bop.Constant(value_ints=[2, 3])
-        g_exp = bop.Exp(bop.Unsqueeze(decay_t, axes_23))
+        # decay_t: (B, H, d_k) -> (B, H, d_k, 1) for broadcasting with state (B, H, d_k, d_v)
+        g_exp = bop.Exp(bop.Unsqueeze(decay_t, axes_neg1))
         state = bop.Mul(state_in, g_exp)
     else:
         state = state_in

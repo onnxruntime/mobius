@@ -230,18 +230,21 @@ class GatedDeltaNet(nn.Module):
 
         # === LinearAttention ===
         # Pass 3D Q/K/V directly; the function handles 3D→4D internally.
-        # beta/decay: (B, S, H) -> (B, H, S)  (Phase 2 will make these 3D)
+        # beta: (B, S, H) -> (B, H, S)
         beta_bhs = op.Transpose(beta, perm=[0, 2, 1])
-        g_bhs = op.Transpose(g, perm=[0, 2, 1])
+        # decay: (B, S, H) -> (B, S, H, 1) -> (B, num_v_heads, S, 1) — rank-4 with d_k=1
+        # (broadcasts over key dim in the state). Per the ONNX LinearAttention spec,
+        # decay is (B, kv_num_heads, T, d_k).
+        g_4d = op.Unsqueeze(g, op.Constant(value_ints=[3]))  # (B, S, H, 1)
+        g_bhsd = op.Transpose(g_4d, perm=[0, 2, 1, 3])  # (B, num_v_heads, S, 1)
 
         output_3d, new_recurrent_state = op.LinearAttention(
             query,  # (B, T, num_k_heads * d_k)
             key,  # (B, T, num_k_heads * d_k)
             value,  # (B, T, num_v_heads * d_v)
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
-            g_bhs,  # (B, H, T) — decay in log-space, float32
-            beta_bhs,  # (B, H, T) — update rate
-            update_rule="gated_delta",
+            g_bhsd,  # (B, num_v_heads, T, 1) — decay in log-space, float32, broadcasts over d_k
+            beta_bhs,  # (B, num_v_heads, T) — update rate
             scale=1.0 / (self.head_k_dim**0.5),
             q_num_heads=self.num_k_heads,
             kv_num_heads=self.num_v_heads,
