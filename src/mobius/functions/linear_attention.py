@@ -137,7 +137,6 @@ def linear_attention(
         inputs = [qkv, past_state, decay, beta]
     else:
         # Separate mode: q, k, v + state + decay + beta (6 inputs)
-        qkv = None
         query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
         key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
         value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)

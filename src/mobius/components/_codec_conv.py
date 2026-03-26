@@ -141,7 +141,11 @@ class CausalConvNd(nn.Module):
                ``len(spatial) == ndim``.
 
         Returns:
-            Output with the same spatial shape as the input.
+            Output tensor with the same shape as the input for ndim=1.
+            For ndim>1, only the temporal (last) spatial dimension is
+            preserved; all other spatial dimensions shrink by
+            ``(kernel_size - 1)`` due to the kernel spanning all spatial
+            dims with no padding on non-temporal axes.
         """
         pad_left = (self._kernel_size - 1) * self._dilation
         if pad_left > 0:

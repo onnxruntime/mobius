@@ -218,13 +218,16 @@ class GatedDeltaNet(nn.Module):
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
         beta = op.Sigmoid(b)
-        # Compute decay in native dtype — mirrors HF formula:
-        #   g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        # HF upcasts to float32 for numerical stability, but we compute in
-        # the model's native precision to keep the graph dtype-homogeneous.
-        softplus_val = op.Softplus(op.Add(a, self.dt_bias))
-        neg_a = op.Neg(op.Exp(self.A_log))
-        g = op.Mul(neg_a, softplus_val)  # (B, T, num_v_heads)
+        # Compute decay — upcast to float32 for Softplus/Exp numerical stability.
+        # fp16 Exp overflows at ~11.09; fp16 Softplus saturates similarly.
+        # This mirrors HF: -A_log.float().exp() * softplus(a.float() + dt_bias).
+        # Cast back to native dtype so downstream ops (LinearAttention) stay homogeneous.
+        a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
+        dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
+        a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
+        softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
+        neg_a = op.Neg(op.Exp(a_log_f32))
+        g = op.CastLike(op.Mul(neg_a, softplus_val), a)  # (B, T, num_v_heads)
 
         # === LinearAttention ===
         # Pack normalized Q, K, and V into a single tensor for the packed
