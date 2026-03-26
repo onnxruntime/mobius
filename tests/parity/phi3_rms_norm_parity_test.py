@@ -100,7 +100,10 @@ def _run_phi3_rms_norm(
         eps: Variance epsilon.
 
     Returns:
-        Output numpy array in the same dtype as ``x_np``.
+        Output numpy array. Note that because ``weight_np`` is float32 and
+        PyTorch promotes the computation, float16 inputs will produce a
+        float32 output (matching ``Phi3RMSNorm``), while float32 inputs
+        produce a float32 output.
     """
     from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
 
