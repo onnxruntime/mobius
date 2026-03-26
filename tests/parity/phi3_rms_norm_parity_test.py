@@ -45,7 +45,8 @@ def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: in
         seq: Sequence dimension.
 
     Returns:
-        Tuple of (``ir.Model``, weight numpy array of shape ``(hidden_size,)``).
+        Tuple of (``ir.Model``, weight initializer for ``norm.weight`` whose data
+        has shape ``(hidden_size,)``).
     """
     import onnx_ir as ir
     from onnxscript._internal.builder import GraphBuilder
