@@ -3352,6 +3352,33 @@ def test_qwen35_deltanet_single_layer_parity():
 
     onnx_model = ir.Model(graph, ir_version=10)
 
+    # Register CausalConvWithState and LinearAttention function definitions.
+    # Building a bare component graph omits these; ORT needs the ONNX local
+    # function definitions embedded in the model to decompose the nodes.
+    from mobius.functions import (
+        causal_conv_nd_with_state,
+    )
+    from mobius.functions import (
+        linear_attention as linear_attention_fn,
+    )
+
+    conv_func = causal_conv_nd_with_state(
+        kernel_size=conv_kernel,
+        channels=conv_dim,
+        ndim=1,
+        activation="silu",
+    )
+    attn_func = linear_attention_fn(
+        q_num_heads=num_k_heads,
+        kv_num_heads=num_v_heads,
+        update_rule="gated_delta",
+        scale=1.0 / (head_k_dim**0.5),
+        packed_qkv=True,
+        head_k_dim=head_k_dim,
+    )
+    onnx_model.functions[conv_func.identifier()] = conv_func
+    onnx_model.functions[attn_func.identifier()] = attn_func
+
     # Build HF DeltaNet layer with random weights
     hf_dn = Qwen3_5GatedDeltaNet(tc, layer_idx=0)
     hf_dn = hf_dn.to(torch.float32).eval()
