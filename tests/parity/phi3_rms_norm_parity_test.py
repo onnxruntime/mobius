@@ -77,7 +77,7 @@ def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: in
 
     graph.outputs.append(out)
 
-    model = ir.Model(graph, ir_version=9)
+    model = ir.Model(graph, ir_version=10)
 
     # Initialize weight to ones (will be overwritten with real weights below)
     weight_np = np.ones(hidden_size, dtype=np.float32)
