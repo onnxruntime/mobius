@@ -84,6 +84,17 @@ def linear_attention(
         kv_num_heads: Number of heads for V and the output.  Matches
             ``q_num_heads`` in the standard Attention op (V determines
             the output head count).
+
+    .. note:: **Naming convention vs standard Attention**
+
+       In standard GQA (``Attention`` op), Q has *more* heads than K/V,
+       so ``q_num_heads >= kv_num_heads``.  In LinearAttention the roles
+       are flipped: Q/K are the *key-query* pair (fewer heads) while V
+       determines the *output* head count (more heads).  The attribute
+       names ``q_num_heads`` and ``kv_num_heads`` therefore map to the
+       *opposite* head counts compared to the standard Attention op.
+       This matches the ONNX LinearAttention op proposal
+       (onnx/onnx#7689) which uses the same naming convention.
         update_rule: One of "linear", "gated", "delta", "gated_delta".
         scale: Scalar multiplier applied to query before the recurrence.
             Per the ONNX LinearAttention op spec, should be set to

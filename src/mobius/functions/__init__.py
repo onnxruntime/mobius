@@ -13,6 +13,12 @@ They serve as:
 
 Each function returns an ``ir.Function`` that can be attached to an
 ``ir.Model`` or used as a rewrite target.
+
+Note:
+    ``causal_conv_nd_with_state`` is exported for use as a standalone ONNX
+    function by external consumers (e.g. onnxruntime-genai).  Within
+    mobius itself, only the 1-D variant (``causal_conv1d_with_state``) is
+    currently used by ``GatedDeltaNet``.
 """
 
 from __future__ import annotations

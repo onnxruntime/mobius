@@ -152,6 +152,13 @@ def causal_conv_nd_with_state(
     dimension so that incremental decoding can be performed without
     recomputing the full convolution.
 
+    .. note:: **Dilation not supported**
+
+       The stateful carry-state mechanism assumes stride=1 and
+       dilation=1.  Dilated convolutions would require a larger state
+       buffer (``dilation*(K-1)`` instead of ``K-1``).  Dilations are
+       hardcoded to ``[1]*ndim`` in the generated Conv node.
+
     Args:
         kernel_size: Convolution kernel size ``K``.
         channels: Number of input/output channels ``D`` (always depthwise).

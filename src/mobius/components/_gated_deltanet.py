@@ -216,7 +216,7 @@ class GatedDeltaNet(nn.Module):
         )
 
         # === Compute gating parameters ===
-        # beta: (B, S, num_v_heads)
+        # beta: (B, T, num_v_heads)
         beta = op.Sigmoid(b)
         # Compute decay in native dtype — mirrors HF formula:
         #   g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -224,15 +224,15 @@ class GatedDeltaNet(nn.Module):
         # the model's native precision to keep the graph dtype-homogeneous.
         softplus_val = op.Softplus(op.Add(a, self.dt_bias))
         neg_a = op.Neg(op.Exp(self.A_log))
-        g = op.Mul(neg_a, softplus_val)  # (B, S, num_v_heads)
+        g = op.Mul(neg_a, softplus_val)  # (B, T, num_v_heads)
 
         # === LinearAttention ===
         # Pack normalized Q, K, and V into a single tensor for the packed
         # QKV calling convention.  The LinearAttention function splits
         # it internally using head_k_dim.
         packed_qkv = op.Concat(query, key, value, axis=-1)  # (B, T, 2*key_dim + value_dim)
-        # beta: (B, S, num_v_heads) — already 3D, matches (B, T, kv_num_heads)
-        # decay g: (B, S, num_v_heads) — per-head scalar decay (d_k=1),
+        # beta: (B, T, num_v_heads) — already 3D, matches (B, T, kv_num_heads)
+        # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
         output_3d, new_recurrent_state = op.LinearAttention(
