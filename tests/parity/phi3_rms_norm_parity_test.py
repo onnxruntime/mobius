@@ -411,8 +411,8 @@ class TestPhi3RMSNormParityFloat16:
 
         onnx_out_f32 = self._run_onnx_fp16(hidden_size, eps, batch, seq, weight_np, x_fp16)
 
-        hf_out_fp16 = _run_phi3_rms_norm(weight_np, x_fp16, eps)
-        hf_out_f32 = hf_out_fp16.astype(np.float32)
+        hf_out_f32_internal = _run_phi3_rms_norm(weight_np, x_fp16, eps)
+        hf_out_f32 = hf_out_f32_internal.astype(np.float32)
 
         max_diff = float(np.max(np.abs(onnx_out_f32 - hf_out_f32)))
         # float16 machine epsilon is ~9.77e-4 ≈ 1e-3; normalized activations
