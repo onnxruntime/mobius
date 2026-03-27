@@ -139,7 +139,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     load_weights = not args.no_weights
     task: str | StaticCacheCausalLMTask | None = args.task
-    if args.static_cache and task is None:
+    if args.static_cache:
         task = StaticCacheCausalLMTask(max_seq_len=args.max_seq_len)
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
