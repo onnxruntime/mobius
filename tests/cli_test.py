@@ -147,6 +147,21 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
+    def test_non_positive_max_seq_len_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--static-cache",
+                    "--max-seq-len",
+                    "0",
+                ]
+            )
+
     def test_static_cache_with_matching_task_and_max_seq_len(self):
         """--max-seq-len must not be silently ignored when --task is also set."""
         with tempfile.TemporaryDirectory() as tmpdir:
