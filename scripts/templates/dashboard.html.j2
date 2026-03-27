@@ -512,14 +512,16 @@ function renderModelRow(m) {
   const expanded = expandedDetails.has(m.model_type);
 
   // Entire row is clickable; button uses stopPropagation to avoid double-toggle.
-  let row = `<tr style="cursor:pointer" onclick="toggleDetail(${JSON.stringify(m.model_type)})">
+  // Use single-quoted HTML attributes so JSON.stringify's double quotes don't
+  // break attribute parsing when this string is set via innerHTML.
+  let row = `<tr style="cursor:pointer" onclick='toggleDetail(${JSON.stringify(m.model_type)})'>
     <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
     <td><div class="level-dots" role="img" aria-label="Coverage: ${LEVEL_LABELS[m.confidence_level]}">${dots}</div></td>
     <td>${tags || '<span style="color:var(--text-muted)">none</span>'}</td>
-    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick="event.stopPropagation();toggleDetail(${JSON.stringify(m.model_type)})">${expanded ? '\u2212' : '+'}</button></td>
+    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick='event.stopPropagation();toggleDetail(${JSON.stringify(m.model_type)})'>${expanded ? '\u2212' : '+'}</button></td>
   </tr>`;
 
   if (expanded) {
