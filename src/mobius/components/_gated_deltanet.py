@@ -248,7 +248,9 @@ class GatedDeltaNet(nn.Module):
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
         output_3d, new_recurrent_state = op.LinearAttention(
-            packed_qkv,  # (B, T, 2*key_dim + value_dim)
+            packed_qkv,  # query: (B, T, 2*key_dim + value_dim) — packed QKV
+            None,  # key: unused in packed mode
+            None,  # value: unused in packed mode
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
             g,  # (B, T, num_v_heads) — decay in log-space, broadcasts over d_k
             beta,  # (B, T, num_v_heads) — update rate

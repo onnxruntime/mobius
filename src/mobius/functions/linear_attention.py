@@ -7,8 +7,8 @@ Implements the gated delta-rule linear attention recurrence as a
 self-contained function: 3D→4D reshape + GQA head expansion + query
 scaling + sequential Scan over the time dimension.  The component
 (GatedDeltaNet) simply calls
-``op.LinearAttention(qkv, state, decay, beta)`` — all complexity
-lives here.
+``op.LinearAttention(qkv, None, None, state, decay, beta)`` — all
+complexity lives here.
 
 The gated-delta variant (used by Qwen3.5 GatedDeltaNet) computes:
 
@@ -19,12 +19,15 @@ All activations are 3D ``[B, T, H*D]`` (matching the ONNX Attention op
 convention).  ``q_num_heads`` and ``kv_num_heads`` attributes tell
 the function how to reshape to 4D internally.
 
-Two input modes:
-  - **Packed QKV** (``packed_qkv=True``): a single ``qkv`` input
-    ``[B, T, q*dk + q*dk + kv*dv]`` is split into Q, K, V internally.
-    Requires ``head_k_dim``.
-  - **Separate Q/K/V** (``packed_qkv=False``, default): three inputs
-    ``query``, ``key``, ``value``.
+The function signature is always 6 inputs:
+  ``(query, key, value, past_state, decay, beta)``
+
+In **packed QKV** mode (``packed_qkv=True``), ``query`` carries the
+concatenated ``[Q|K|V]`` tensor and ``key``/``value`` are unused
+(callers pass ``None``).  The function splits ``query`` internally.
+
+In **separate** mode (``packed_qkv=False``), all three are used
+directly.
 
 GQA support: when Q/K have fewer heads (q_num_heads) than
 V/state (kv_num_heads), the function expands Q/K heads internally
@@ -59,20 +62,19 @@ def linear_attention(
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
-    Packed QKV mode (``packed_qkv=True``):
-        qkv:        (B, T, q_num_heads*d_k + q_num_heads*d_k + kv_num_heads*d_v)
+    The function always has 6 inputs regardless of ``packed_qkv``:
+        query:      (B, T, q_num_heads * d_k) — query (or packed QKV)
+        key:        (B, T, q_num_heads * d_k) — key (unused when packed)
+        value:      (B, T, kv_num_heads * d_v) — value (unused when packed)
         past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
         decay:      (B, T, kv_num_heads * d_k) — per-key-dim decay (log-space);
                     use (B, T, kv_num_heads) for per-head scalar (d_k=1, broadcasts)
         beta:       (B, T, kv_num_heads) — update rate (sigmoid output)
 
-    Separate Q/K/V mode (``packed_qkv=False``, default):
-        query:      (B, T, q_num_heads * d_k) — query (L2-normalized)
-        key:        (B, T, q_num_heads * d_k) — key (L2-normalized)
-        value:      (B, T, kv_num_heads * d_v) — value
-        past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
-        decay:      (B, T, kv_num_heads * d_k) — per-key-dim decay
-        beta:       (B, T, kv_num_heads) — update rate
+    When ``packed_qkv=True``, ``query`` carries the concatenated
+    ``[Q|K|V]`` tensor ``(B, T, q*dk + q*dk + kv*dv)`` and the
+    function splits it internally.  Callers pass ``None`` for ``key``
+    and ``value`` (like ``op.Attention``'s optional past_key/past_value).
 
     Outputs (both modes):
         output:        (B, T, kv_num_heads * d_v) — attention output (3D)
@@ -100,9 +102,9 @@ def linear_attention(
         scale: Scalar multiplier applied to query before the recurrence.
             Per the ONNX LinearAttention op spec, should be set to
             ``1/sqrt(head_dim)`` for correct scaling.
-        packed_qkv: When True, a single packed QKV tensor is accepted
-            instead of separate Q, K, V inputs.  The function splits
-            it internally using ``head_k_dim``.
+        packed_qkv: When True, the ``query`` input carries packed QKV
+            and the function splits it internally using ``head_k_dim``.
+            ``key`` and ``value`` inputs are unused (callers pass None).
         head_k_dim: Key head dimension — required when ``packed_qkv``
             is True so the function knows where to split Q/K from V.
         stash_type: Element type for the Scan body's internal
@@ -133,25 +135,16 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs ---
-    # All inputs share the same floating-point precision (float16/bfloat16/
-    # float32).  The recurrence runs in the caller's native dtype — no
-    # internal upcast to float32.
-    if packed_qkv:
-        # Packed mode: single QKV tensor + state + decay + beta (4 inputs)
-        qkv = ir.Value(name="qkv")
-        past_state = ir.Value(name="past_state")
-        decay = ir.Value(name="decay")
-        beta = ir.Value(name="beta")
-        inputs = [qkv, past_state, decay, beta]
-    else:
-        # Separate mode: q, k, v + state + decay + beta (6 inputs)
-        query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
-        key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
-        value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
-        past_state = ir.Value(name="past_state")
-        decay = ir.Value(name="decay")
-        beta = ir.Value(name="beta")
-        inputs = [query, key, value, past_state, decay, beta]
+    # Always 6 inputs: (query, key, value, past_state, decay, beta).
+    # In packed mode key/value are unused (callers pass None), but the
+    # signature is identical so there is only one ir.Function definition.
+    query = ir.Value(name="query")  # (B, T, q*d_k) or packed QKV
+    key = ir.Value(name="key")  # (B, T, q*d_k) — unused when packed
+    value = ir.Value(name="value")  # (B, T, kv*d_v) — unused when packed
+    past_state = ir.Value(name="past_state")
+    decay = ir.Value(name="decay")
+    beta = ir.Value(name="beta")
+    inputs = [query, key, value, past_state, decay, beta]
 
     # --- Build function body graph ---
     graph = ir.Graph(
@@ -165,25 +158,24 @@ def linear_attention(
     op = gb.op
 
     # --- Reshape 3D → 4D using head counts ---
-    # Determine the reference tensor for B and T dimensions.
-    # inputs[0] is always the first input regardless of packed_qkv mode.
-    ref_input = inputs[0]
-    b_dim = op.Shape(ref_input, start=0, end=1)
-    t_dim = op.Shape(ref_input, start=1, end=2)
+    # inputs[0] (query) is always the reference for B and T dimensions.
+    b_dim = op.Shape(query, start=0, end=1)
+    t_dim = op.Shape(query, start=1, end=2)
 
     if packed_qkv:
-        # Split packed QKV: (B, T, q*dk + q*dk + kv*dv) → q, k, v
+        # query carries packed [Q|K|V]: split into separate q, k, v.
+        # key/value inputs are unused in this mode.
         assert head_k_dim is not None  # validated above
         key_dim = q_num_heads * head_k_dim
         # Compute v_dim dynamically: total - 2*key_dim
-        total_dim = op.Shape(qkv, start=2, end=3)
+        total_dim = op.Shape(query, start=2, end=3)
         v_dim = op.Sub(total_dim, op.Constant(value_ints=[2 * key_dim]))
         split_sizes = op.Concat(
             op.Constant(value_ints=[key_dim, key_dim]),
             v_dim,
             axis=0,
         )
-        query, key, value = op.Split(qkv, split_sizes, axis=2, _outputs=3)
+        query, key, value = op.Split(query, split_sizes, axis=2, _outputs=3)
     # else: query, key, value already defined as separate inputs
 
     # Q/K: [B, T, q_num_heads*d_k] → [B, T, q_num_heads, d_k]

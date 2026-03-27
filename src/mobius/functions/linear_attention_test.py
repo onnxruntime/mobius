@@ -89,7 +89,12 @@ class TestLinearAttentionSeparateQKV:
 class TestLinearAttentionPackedQKV:
     """Tests for LinearAttention with packed QKV input."""
 
-    def test_function_has_four_inputs(self):
+    def test_function_has_six_inputs(self):
+        """Packed mode has the same 6-input signature as separate mode.
+
+        ``key`` and ``value`` inputs exist but are unused (callers
+        pass None).  This ensures a single ir.Function definition.
+        """
         func = linear_attention(
             q_num_heads=2,
             kv_num_heads=4,
@@ -97,9 +102,16 @@ class TestLinearAttentionPackedQKV:
             packed_qkv=True,
             head_k_dim=16,
         )
-        assert len(func.graph.inputs) == 4
+        assert len(func.graph.inputs) == 6
         names = [inp.name for inp in func.graph.inputs]
-        assert names == ["qkv", "past_state", "decay", "beta"]
+        assert names == [
+            "query",
+            "key",
+            "value",
+            "past_state",
+            "decay",
+            "beta",
+        ]
 
     def test_packed_qkv_attribute_is_one(self):
         func = linear_attention(
