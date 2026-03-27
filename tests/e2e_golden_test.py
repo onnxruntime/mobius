@@ -393,7 +393,6 @@ def _prepare_audio_feeds(
 def _run_vision_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
-    golden: GoldenRef,
     config: object,
 ) -> dict[str, np.ndarray]:
     """Run vision → embedding → decoder for vision-language models.
@@ -536,7 +535,7 @@ class TestL4CheckpointVerified:
         if case.task_type == "seq2seq":
             outputs = _run_seq2seq_prefill(pkg, golden, config)
         elif case.task_type == "image-text-to-text":
-            outputs = _run_vision_language_prefill(pkg, case, golden, config)
+            outputs = _run_vision_language_prefill(pkg, case, config)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:

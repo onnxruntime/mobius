@@ -355,6 +355,7 @@ def load_torch_vision_model(
     model_id: str,
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
+    trust_remote_code: bool = False,
 ):
     """Load a HuggingFace vision model for reference inference.
 
@@ -367,13 +368,13 @@ def load_torch_vision_model(
     import transformers
 
     processor = transformers.AutoImageProcessor.from_pretrained(
-        model_id, trust_remote_code=True
+        model_id, trust_remote_code=trust_remote_code
     )
     model = transformers.AutoModel.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map=device,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     model.eval()
 

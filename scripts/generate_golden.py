@@ -529,7 +529,9 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
         torch_vision_forward,
     )
 
-    model, processor = load_torch_vision_model(case.model_id, device=device)
+    model, processor = load_torch_vision_model(
+        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+    )
 
     # Load and preprocess image
     image = Image.open(Path("testdata") / case.images[0])

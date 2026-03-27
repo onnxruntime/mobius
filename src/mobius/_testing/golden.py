@@ -355,7 +355,7 @@ def save_golden_ref(
             k: [int(x) for x in v] for k, v in component_shapes.items()
         }
 
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")  # trailing newline for POSIX compliance
 
@@ -392,7 +392,7 @@ def save_generation_json(
     if generated_text is not None:
         data["generated_text"] = generated_text
 
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
 

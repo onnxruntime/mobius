@@ -565,10 +565,10 @@ that the ONNX model output must match.
 python scripts/generate_golden.py --level L4
 
 # Generate for a specific task type
-python scripts/generate_golden.py --level L4 --task text-generation
+python scripts/generate_golden.py --level L4 --task-type causal-lm
 
 # Generate for a specific model
-python scripts/generate_golden.py --level L4 --model llama-3_2-1b
+python scripts/generate_golden.py --level L4 --filter 'llama*'
 ```
 
 Golden files must be committed alongside new test case YAML files.

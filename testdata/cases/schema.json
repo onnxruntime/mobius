@@ -85,7 +85,7 @@
           "description": "Whether to use sampling. false = greedy decoding (required for reproducible golden tests)."
         }
       },
-      "additionalProperties": true,
+      "additionalProperties": false,
       "description": "HuggingFace GenerationConfig overrides. Only applicable for L5 generation tests."
     },
     "trust_remote_code": {
