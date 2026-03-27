@@ -108,8 +108,14 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   border-style: solid; border-width: 2px;
 }
 .dot.skipped {
+  /* test has skip_reason — not run, reason documented */
   background: transparent; border-color: var(--text-muted);
   border-style: dotted; border-width: 2px;
+}
+.dot.pending {
+  /* YAML test case exists but no golden data generated yet — awaiting data */
+  background: transparent; border-color: var(--accent);
+  border-style: dashed; border-width: 2px;
 }
 .dot.untested { background: transparent; border-color: var(--border); }
 .tag {
@@ -290,6 +296,7 @@ document.documentElement.setAttribute('data-theme',t);}())
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
     <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected failure</span>
     <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
+    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Awaiting data</span>
     <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No test</span>
   </div>
 </div>
@@ -515,10 +522,10 @@ function renderModelRow(m) {
       || (i === 5 && m.l5_case);
     // xfail: test RUNS but is expected to fail (known failure).
     const isXfail = i === 3 && m.l3_status === 'xfail';
-    // isSkipped: test is NOT run at all (L3 skip, or L4/L5 explicitly skipped).
+    // isSkipped: test has a skip_reason — not run, reason documented.
     const isL3Skip = i === 3 && m.l3_status === 'skip';
     const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped) || isL3Skip;
-    // isPending consolidated into skipped: test case defined but not yet run (L4/L5 only).
+    // isPending: YAML test case defined but no golden data generated yet (awaiting data).
     const isPending = hasTest && !active && !isXfail && !isL3Skip &&
       ((i === 4 && m.l4_case) || (i === 5 && m.l5_case));
     let cls = 'dot';
@@ -529,11 +536,13 @@ function renderModelRow(m) {
     } else if (isXfail) {
       cls += ' xfail';
       label += ` (expected failure: ${esc(m.l3_reason || 'xfail')})`;
-    } else if (isSkipped || isPending) {
+    } else if (isSkipped) {
       cls += ' skipped';
       if (isL3Skip) label += ` (skipped: ${esc(m.l3_reason || '')})`;
-      else if (isPending) label += ' (test case defined, not yet run)';
       else label += ` (skipped: ${esc(m.yaml_skip_reason || 'known issue')})`;
+    } else if (isPending) {
+      cls += ' pending';
+      label += ' (test case defined, awaiting golden data)';
     } else if (hasTest) {
       cls += ' failed';
       label += ' (test exists, not passing)';
@@ -596,8 +605,8 @@ function renderDetailRow(m) {
     ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, null],
     ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, null],
     ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3IconOverride],
-    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u23ED' : null],
-    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u23ED' : null],
+    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u23F3' : null],
+    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u23F3' : null],
   ];
 
   let levelHtml = '<table style="width:100%;margin-bottom:8px;border:none">';
