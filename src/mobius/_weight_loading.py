@@ -148,7 +148,7 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     """
     from huggingface_hub import hf_hub_download
 
-    from mobius._safetensors import load_safetensors_mmap
+    from mobius.integrations._safetensors import load_safetensors_mmap
 
     try:
         index_path = hf_hub_download(

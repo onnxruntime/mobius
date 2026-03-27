@@ -13,7 +13,7 @@ import pytest
 import safetensors.torch
 import torch
 
-from mobius._safetensors import (
+from mobius.integrations._safetensors import (
     _SAFETENSORS_DTYPE_TO_TORCH_DTYPE,
     _parse_header,
     load_safetensors_mmap,
@@ -231,8 +231,9 @@ class TestMmapStorageProperties:
     """Verify that tensors are backed by memory-mapped storage."""
 
     def test_tensors_share_file_storage(self, tmp_path):
-        """Multiple tensors from the same file share the same base
-        storage (or at least are not independent RAM copies).
+        """Multiple tensors from the same file share the same base storage.
+
+        At least they should not be independent RAM copies.
         """
         path = str(tmp_path / "model.safetensors")
         _create_safetensors_file(
@@ -249,10 +250,10 @@ class TestMmapStorageProperties:
         assert a_ptr != b_ptr
 
     def test_tensor_is_not_a_copy(self, tmp_path):
-        """The mmap tensor's storage should reference the file, not a
-        heap copy.  We verify by checking nbytes <= file_size for the
-        underlying untyped storage (a heap copy would have exactly
-        tensor-size bytes).
+        """The mmap tensor's storage should reference the file, not a heap copy.
+
+        We verify by checking nbytes <= file_size for the underlying untyped
+        storage (a heap copy would have exactly tensor-size bytes).
         """
         path = str(tmp_path / "model.safetensors")
         original = {"w": torch.randn(50)}

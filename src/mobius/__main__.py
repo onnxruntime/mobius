@@ -45,7 +45,7 @@ def _parse_size(size_str: str) -> int:
 
 def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
     """Load safetensors weights from a local model directory."""
-    from mobius._safetensors import load_safetensors_mmap
+    from mobius.integrations._safetensors import load_safetensors_mmap
 
     model_dir = os.path.abspath(model_dir)
     if os.path.isfile(model_dir):

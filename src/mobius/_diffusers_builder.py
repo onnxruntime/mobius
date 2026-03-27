@@ -126,7 +126,7 @@ def _download_diffusers_component_weights(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    from mobius._safetensors import load_safetensors_mmap
+    from mobius.integrations._safetensors import load_safetensors_mmap
 
     prefix = f"{component_name}/"
     # Diffusers uses two naming conventions for weight files
