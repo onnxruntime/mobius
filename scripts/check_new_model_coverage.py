@@ -6,9 +6,13 @@ r"""Check that newly registered model architectures have test coverage.
 
 For each model_type registered in ``src/mobius/_registry.py``, verifies:
 
-    a. L3 — has a synthetic build-graph test config in ``tests/_test_configs.py``
-    b. L4 — has a YAML test case in ``testdata/cases/``
-    c. L5 — has golden data in ``testdata/golden/`` (or a ``skip_reason`` in the YAML)
+    a. L1+L3 — has a parametrized test config in ``tests/_test_configs.py``,
+       which enables both the L1 graph-build test (build_graph_test.py) and
+       the L3 synthetic-parity test (integration_test.py).
+    b. L4 — has a YAML test case in ``testdata/cases/`` matched via the
+       model's ``test_model_id`` (exact HuggingFace model ID match).
+    c. L5 — has golden data in ``testdata/golden/`` (or a ``skip_reason``
+       in the YAML case).
 
 Usage::
 
@@ -39,24 +43,30 @@ _GOLDEN_DIR = _PROJECT_ROOT / "testdata" / "golden"
 # These are text-decoder or embedding sub-models that reuse the VL parent's
 # test coverage (YAML + golden are keyed on the parent model_type, not the
 # text-only variant). Excluding them avoids spurious L4/L5 failures.
-_VL_TEXT_SUFFIX_ALIASES: frozenset[str] = frozenset({
-    "_text",
-    "_multimodal",
-})
+_VL_TEXT_SUFFIX_ALIASES: frozenset[str] = frozenset(
+    {
+        "_text",
+        "_multimodal",
+    }
+)
 
 
 def _get_all_registered_types() -> list[str]:
     """Return all model_types from the live registry."""
     sys.path.insert(0, str(_SRC_ROOT.parent))
-    from mobius._registry import registry  # noqa: PLC0415
+    from mobius._registry import registry
 
     return sorted(registry.architectures())
 
 
 def _get_l3_types() -> set[str]:
-    """Return model_types that have a synthetic L3 build-graph test config."""
+    """Return model_types that have a parametrized test config in _test_configs.py.
+
+    These configs enable both L1 (graph-build) tests in build_graph_test.py
+    and L3 (synthetic parity) tests in integration_test.py.
+    """
     sys.path.insert(0, str(_TESTS_DIR))
-    from _test_configs import (  # noqa: PLC0415
+    from _test_configs import (
         ALL_CAUSAL_LM_CONFIGS,
         ENCODER_CONFIGS,
         SEQ2SEQ_CONFIGS,
@@ -75,39 +85,43 @@ def _get_l3_types() -> set[str]:
     return types
 
 
-def _get_yaml_cases() -> dict[str, Path]:
-    """Return {model_type_or_case_id: yaml_path} for all YAML test cases."""
-    import yaml  # noqa: PLC0415
+def _get_test_model_ids() -> dict[str, str]:
+    """Return ``{model_type: test_model_id}`` from the live registry.
 
-    cases: dict[str, Path] = {}
-    for yaml_path in _CASES_DIR.rglob("*.yaml"):
-        try:
-            with open(yaml_path) as f:
-                data = yaml.safe_load(f)
-            if isinstance(data, dict):
-                # Index by case_id (stem) and by model_id prefix heuristic
-                case_id = yaml_path.stem
-                cases[case_id] = yaml_path
-                # Also index by model_type if present in YAML
-                mt = data.get("task_type")  # not model_type, but task_type
-                # Primary key is the stem (e.g. "qwen2_5-0_5b")
-        except Exception:  # noqa: BLE001
-            pass
-    return cases
+    test_model_id is the HuggingFace model ID used for L2 config validation.
+    It is also used here to match YAML test cases by exact model_id value.
+    """
+    sys.path.insert(0, str(_SRC_ROOT.parent))
+    from mobius._registry import registry
+
+    result: dict[str, str] = {}
+    for arch in registry.architectures():
+        reg = registry.get_registration(arch)
+        if reg and reg.test_model_id:
+            result[arch] = reg.test_model_id
+    return result
 
 
 def _get_yaml_model_type_map() -> dict[str, dict]:
-    """Return {case_stem: parsed_yaml_data} for all YAML test cases."""
-    import yaml  # noqa: PLC0415
+    """Return ``{hf_model_id: yaml_data}`` for all YAML test cases.
+
+    Keyed by the ``model_id`` field inside each YAML file (the exact
+    HuggingFace model ID), enabling exact matching against registry
+    ``test_model_id`` values. A ``_yaml_path`` key is added to each entry
+    to allow golden file path derivation.
+    """
+    import yaml
 
     cases: dict[str, dict] = {}
     for yaml_path in _CASES_DIR.rglob("*.yaml"):
         try:
             with open(yaml_path) as f:
                 data = yaml.safe_load(f)
-            if isinstance(data, dict):
-                cases[yaml_path.stem] = data
-        except Exception:  # noqa: BLE001
+            if isinstance(data, dict) and "model_id" in data:
+                entry = dict(data)
+                entry["_yaml_path"] = yaml_path
+                cases[data["model_id"]] = entry
+        except Exception:
             pass
     return cases
 
@@ -148,7 +162,7 @@ def _get_new_model_types(diff_base: str) -> set[str] | None:
 
     # Only detect lines like:  +    reg.register("model_type", ...)
     # Ignoring _TEST_MODEL_IDS additions (those are test metadata, not new models).
-    import re  # noqa: PLC0415
+    import re
 
     added_types: set[str] = set()
     register_pattern = re.compile(r'^\+\s+reg\.register\(\s*"([^"]+)"')
@@ -170,7 +184,7 @@ def _is_vl_text_alias(model_type: str) -> bool:
     for suffix in _VL_TEXT_SUFFIX_ALIASES:
         if model_type.endswith(suffix):
             base = model_type[: -len(suffix)]
-            # Only flag as alias if the base type is also registered
+            # Only flag as alias if stripping the suffix yields a non-empty base name.
             return len(base) > 0
     return False
 
@@ -180,50 +194,61 @@ def _check_coverage(
     l3_types: set[str],
     yaml_cases: dict[str, dict],
     golden_stems: set[str],
+    test_model_ids: dict[str, str],
 ) -> dict[str, list[str]]:
-    """Return {model_type: [list of missing coverage items]} for each type."""
+    """Return {model_type: [list of missing coverage items]} for each type.
+
+    YAML coverage uses exact matching: a model's ``test_model_id`` (from the
+    registry) must appear as the ``model_id`` value in a YAML test case.
+    This prevents false positives from substring matching (e.g. 'bert' ⊂
+    'roberta', 't5' ⊂ 'mt5').
+    """
     gaps: dict[str, list[str]] = {}
-
-    # Build a set of model_types represented in YAML (by model_id or task_type)
-    # and golden files. YAML cases may cover multiple types via one file.
-    # We do a fuzzy match: a YAML case covers a model_type if the case stem
-    # contains the model_type (with underscores normalized).
-    def _normalize(s: str) -> str:
-        return s.replace("-", "_").replace(".", "_").lower()
-
-    yaml_normalized = {_normalize(k) for k in yaml_cases}
-    golden_normalized = {_normalize(s) for s in golden_stems}
-
-    # Also collect skip_reason fields from YAML
-    yaml_with_skip: set[str] = set()
-    for stem, data in yaml_cases.items():
-        if data.get("skip_reason"):
-            yaml_with_skip.add(_normalize(stem))
 
     for mt in model_types:
         if _is_vl_text_alias(mt):
             continue
 
         missing: list[str] = []
-        mt_norm = _normalize(mt)
 
-        # L3: synthetic build-graph test
+        # L1+L3: test config in _test_configs.py (enables both graph-build and parity tests)
         if mt not in l3_types:
-            missing.append("No L3 test config in tests/_test_configs.py")
+            missing.append("No test config in tests/_test_configs.py (needed for L1+L3)")
 
-        # L4/L5: YAML test case
-        has_yaml = any(mt_norm in s for s in yaml_normalized)
-        if not has_yaml:
-            missing.append("No YAML test case in testdata/cases/")
+        # L4/L5: YAML test case matched via exact test_model_id
+        test_model_id = test_model_ids.get(mt)
+        if not test_model_id:
+            # Without a test_model_id we cannot map to a YAML case.
+            missing.append(
+                "No test_model_id in _registry.py "
+                "(required for L2 config validation and YAML test case matching)"
+            )
+        elif test_model_id not in yaml_cases:
+            missing.append(
+                f"No YAML test case in testdata/cases/ (expected model_id: {test_model_id!r})"
+            )
         else:
-            # Has YAML — check golden unless skip_reason is set
-            has_golden = any(mt_norm in s for s in golden_normalized)
-            has_skip = any(mt_norm in s for s in yaml_with_skip)
-            if not has_golden and not has_skip:
-                missing.append(
-                    "No golden data in testdata/golden/ "
-                    "(add golden or set skip_reason in YAML)"
-                )
+            yaml_data = yaml_cases[test_model_id]
+            has_skip = bool(yaml_data.get("skip_reason"))
+            if not has_skip:
+                # Has active YAML case — check for golden data.
+                # Strategy 1: YAML-derived path (case_id may differ from model_type).
+                yaml_path: Path = yaml_data["_yaml_path"]
+                case_id = yaml_path.stem
+                task_dir = yaml_path.parent.name
+                has_golden = (_GOLDEN_DIR / task_dir / f"{case_id}.json").exists()
+                # Strategy 2: direct model_type stem in any golden subdirectory.
+                if not has_golden:
+                    has_golden = any(
+                        (d / f"{mt}.json").exists()
+                        for d in _GOLDEN_DIR.iterdir()
+                        if d.is_dir()
+                    )
+                if not has_golden:
+                    missing.append(
+                        "No golden data in testdata/golden/ "
+                        "(run generate_golden.py or set skip_reason in YAML)"
+                    )
 
         if missing:
             gaps[mt] = missing
@@ -257,6 +282,7 @@ def main() -> int:
     l3_types = _get_l3_types()
     yaml_cases = _get_yaml_model_type_map()
     golden_stems = _get_golden_stems()
+    test_model_ids = _get_test_model_ids()
 
     if args.diff_base:
         new_types = _get_new_model_types(args.diff_base)
@@ -280,7 +306,7 @@ def main() -> int:
         print(f"🔍 Auditing coverage for all {len(types_to_check)} registered model types.")
         print()
 
-    gaps = _check_coverage(types_to_check, l3_types, yaml_cases, golden_stems)
+    gaps = _check_coverage(types_to_check, l3_types, yaml_cases, golden_stems, test_model_ids)
 
     if not gaps:
         if args.diff_base:
@@ -310,9 +336,11 @@ def main() -> int:
     print(
         "To fix: See .github/skills/writing-tests/SKILL.md for how to add test coverage.\n"
         "Quick guide:\n"
-        "  1. Add a config entry to tests/_test_configs.py (L3)\n"
-        "  2. Add a YAML case to testdata/cases/<task-type>/<model>.yaml (L4/L5)\n"
-        "  3. Run: python scripts/generate_golden.py --filter <model_id> to create golden data\n"
+        "  1. Add a config entry to tests/_test_configs.py (enables L1 + L3)\n"
+        "  2. Add test_model_id to _TEST_MODEL_IDS in src/mobius/_registry.py\n"
+        "  3. Add a YAML case to testdata/cases/<task-type>/<model>.yaml (L4/L5)\n"
+        "     The YAML model_id must match the test_model_id exactly.\n"
+        "  4. Run: python scripts/generate_golden.py --filter <model_id> to create golden data\n"
         "     Or add skip_reason to the YAML if golden generation is not feasible."
     )
 

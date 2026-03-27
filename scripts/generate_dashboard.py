@@ -575,7 +575,7 @@ def _compute_summary(
             by_level[1] += 1
         if info.l2_arch_validation:
             by_level[2] += 1
-        if info.l3_synthetic_parity:
+        if info.l3_synthetic_parity and info.l3_status == "pass":
             by_level[3] += 1
         if info.l4_golden_files:
             by_level[4] += 1

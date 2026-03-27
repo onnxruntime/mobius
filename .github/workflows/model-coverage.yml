@@ -35,7 +35,7 @@ jobs:
             pip-coverage-
 
       - name: Install dependencies
-        run: pip install -e '.[testing]' --no-deps
+        run: pip install -e '.[testing]'
 
       - name: Fetch base branch
         run: git fetch origin main
