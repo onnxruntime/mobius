@@ -77,8 +77,7 @@ class GatedRMSNorm(nn.Module):
         self.group_size = group_size
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
-        # Upcast to fp32 for SiLU gating + RMSNorm variance, matching HF
-        # which does hidden_states.to(float32) and gate.to(float32).
+        # SiLU gating in fp32 for precision, matching HF.
         h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Mul(g_f32, op.Sigmoid(g_f32))
@@ -87,18 +86,15 @@ class GatedRMSNorm(nn.Module):
         if self.group_size is not None and self.group_size < self.hidden_size:
             # Grouped RMSNorm: reshape to (batch, n_groups, group_size),
             # normalize within each group, then reshape back.
-            # Matches HF Zamba2RMSNormGated which does per-group variance.
             n_groups = self.hidden_size // self.group_size
-            grouped = op.Reshape(
-                gated,
-                op.Constant(value_ints=[0, n_groups, self.group_size]),
-            )
             if _ORT_CUDA_GROUPED_RMSNORM_WORKAROUND:
                 # ORT ≤1.24.4 CUDA kernel for RMSNormalization produces
-                # wrong results when scale is 2D (e.g. [n_groups,
-                # group_size] on [batch, n_groups, group_size] input).
-                # Decompose into basic ops as a workaround. See
-                # repro: my/repro_rmsnorm_cuda_bug.py
+                # wrong results when scale is 2D. Decompose into basic
+                # ops as a workaround.
+                grouped = op.Reshape(
+                    gated,
+                    op.Constant(value_ints=[0, n_groups, self.group_size]),
+                )
                 variance = op.ReduceMean(
                     op.Mul(grouped, grouped), axes=[-1], keepdims=True,
                 )
@@ -114,6 +110,13 @@ class GatedRMSNorm(nn.Module):
                     normed, op.Cast(self.weight, to=ir.DataType.FLOAT),
                 )
             else:
+                # Cast gated back to native dtype; RMSNormalization's
+                # stash_type=1 handles internal fp32 for variance.
+                gated = op.CastLike(gated, hidden_states)
+                grouped = op.Reshape(
+                    gated,
+                    op.Constant(value_ints=[0, n_groups, self.group_size]),
+                )
                 weight_grouped = op.Reshape(
                     self.weight,
                     op.Constant(value_ints=[n_groups, self.group_size]),
@@ -129,7 +132,9 @@ class GatedRMSNorm(nn.Module):
                     op.Constant(value_ints=[0, self.hidden_size]),
                 )
         else:
-            # Standard RMSNorm over the full dimension
+            # Standard RMSNorm over the full dimension.
+            # Cast gated back to native dtype; stash_type=1 handles fp32.
+            gated = op.CastLike(gated, hidden_states)
             normed = op.RMSNormalization(
                 gated,
                 self.weight,
