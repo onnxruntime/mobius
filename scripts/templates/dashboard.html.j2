@@ -101,7 +101,13 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .dot.active-4 { background: var(--l4); border-color: var(--l4); }
 .dot.active-5 { background: var(--l5); border-color: var(--l5); }
 .dot.failed { background: var(--l0); border-color: var(--l0); }
+.dot.xfail {
+  /* test runs but is expected to fail — amber solid fill */
+  background: rgba(210,153,34,0.35); border-color: var(--l1);
+  border-style: solid; border-width: 2px;
+}
 .dot.pending {
+  /* test case exists, golden file not yet generated */
   background: transparent; border-color: var(--l1);
   border-style: dashed; border-width: 2px;
 }
@@ -286,8 +292,9 @@ document.documentElement.setAttribute('data-theme',t);}())
   <div class="dot-legend">
     <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Passed</span>
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
-    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Has test, not run</span>
-    <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
+    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Known failure</span>
+    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Pending golden data</span>
+    <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped / not run</span>
     <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No test</span>
   </div>
 </div>
@@ -510,24 +517,29 @@ function renderModelRow(m) {
       || (i === 3 && m.l3_status != null)
       || (i === 4 && m.l4_case)
       || (i === 5 && m.l5_case);
-    const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped);
-    const isPending = hasTest && !active && (
-      (i === 3 && (m.l3_status === 'xfail' || m.l3_status === 'skip'))
-      || (i === 4 && m.l4_case)
-      || (i === 5 && m.l5_case)
-    );
+    // xfail: test RUNS but is expected to fail (known failure).
+    const isXfail = i === 3 && m.l3_status === 'xfail';
+    // isSkipped: test is NOT run at all (L3 skip, or L4/L5 explicitly skipped).
+    const isL3Skip = i === 3 && m.l3_status === 'skip';
+    const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped) || isL3Skip;
+    // isPending: test case defined but golden file not yet generated (L4/L5 only).
+    const isPending = hasTest && !active && !isXfail && !isL3Skip &&
+      ((i === 4 && m.l4_case) || (i === 5 && m.l5_case));
     let cls = 'dot';
     let label = dotLabels[i-1];
     if (active) {
       cls += ' active-' + i;
       label += ' (passed)';
+    } else if (isXfail) {
+      cls += ' xfail';
+      label += ` (known failure: ${esc(m.l3_reason || 'xfail')})`;
     } else if (isSkipped) {
       cls += ' skipped';
-      label += ` (skipped: ${esc(m.yaml_skip_reason || 'known issue')})`;
+      if (isL3Skip) label += ` (skipped / not run: ${esc(m.l3_reason || '')})`;
+      else label += ` (skipped / not run: ${esc(m.yaml_skip_reason || 'known issue')})`;
     } else if (isPending) {
       cls += ' pending';
-      if (i === 3) label += ` (${m.l3_status}: ${esc(m.l3_reason || 'known issue')})`;
-      else label += ' (test case exists, no golden file)';
+      label += ' (test case exists, golden data not yet generated)';
     } else if (hasTest) {
       cls += ' failed';
       label += ' (test exists, not passing)';
@@ -543,9 +555,9 @@ function renderModelRow(m) {
   if (m.l3_status === 'pass') {
     l3Badge = ' <span class="l3-status l3-pass" title="L3 synthetic parity passes">\u2713</span>';
   } else if (m.l3_status === 'xfail') {
-    l3Badge = ` <span class="l3-status l3-xfail" title="L3 xfail: ${esc(m.l3_reason || '')}">xfail</span>`;
+    l3Badge = ` <span class="l3-status l3-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">xfail</span>`;
   } else if (m.l3_status === 'skip') {
-    l3Badge = ` <span class="l3-status l3-skip" title="L3 skip: ${esc(m.l3_reason || '')}">skip</span>`;
+    l3Badge = ` <span class="l3-status l3-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">skip</span>`;
   }
 
   // min_token_match_ratio badge
@@ -581,20 +593,24 @@ function renderModelRow(m) {
 
 function renderDetailRow(m) {
   const l3Active = m.l3 && m.l3_status === 'pass';
-  const l3Pending = !l3Active && (m.l3_status === 'xfail' || m.l3_status === 'skip');
+  // xfail = test runs but expected to fail; skip = test not run at all.
+  const l3IconOverride = l3Active ? null
+    : m.l3_status === 'xfail' ? '\u26A0\uFE0F'  // ⚠️ known failure
+    : m.l3_status === 'skip'  ? '\u23ED'         // ⏭ not run
+    : null;
   const levels = [
-    ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, false],
-    ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, false],
-    ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3Pending],
-    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4) && !m.l4_skipped],
-    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5) && !m.l5_skipped],
+    ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, null],
+    ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, null],
+    ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3IconOverride],
+    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u25D4' : null],
+    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u25D4' : null],
   ];
 
   let levelHtml = '<table style="width:100%;margin-bottom:8px;border:none">';
-  levels.forEach(([name, active, desc, hasTest, pending]) => {
+  levels.forEach(([name, active, desc, hasTest, iconOverride]) => {
     let icon;
     if (active) icon = '\u2705';
-    else if (pending) icon = '\u25D4';
+    else if (iconOverride) icon = iconOverride;
     else if (hasTest) icon = '\u274C';
     else icon = '\u2796';
     levelHtml += `<tr><td style="border:none;padding:2px 8px;width:30px">${icon}</td>
@@ -629,7 +645,11 @@ function renderDetailRow(m) {
 
   if (m.l3_status) {
     const statusColor = m.l3_status === 'pass' ? 'var(--l3)' : m.l3_status === 'xfail' ? 'var(--l1)' : 'var(--text-muted)';
-    goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${statusColor}">\u25CF</span> L3 parity: <strong>${m.l3_status}</strong>`;
+    const statusLabel = m.l3_status === 'pass' ? 'pass'
+      : m.l3_status === 'xfail' ? 'known failure (xfail)'
+      : m.l3_status === 'skip'  ? 'skipped / not run'
+      : m.l3_status;
+    goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${statusColor}">\u25CF</span> L3 parity: <strong>${statusLabel}</strong>`;
     if (m.l3_reason) goldenHtml += ` <span style="color:var(--text-muted)">\u2014 ${esc(m.l3_reason)}</span>`;
     goldenHtml += '</div>';
   }
