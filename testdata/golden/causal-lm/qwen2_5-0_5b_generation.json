@@ -1,0 +1,27 @@
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    12095,
+    13,
+    1084,
+    374,
+    279,
+    7772,
+    3283,
+    304,
+    4505,
+    323,
+    279,
+    2086,
+    7772,
+    304,
+    279,
+    1879,
+    13,
+    1084,
+    374,
+    1083
+  ],
+  "generated_text": " Paris. It is the largest city in Europe and the second largest in the world. It is also"
+}

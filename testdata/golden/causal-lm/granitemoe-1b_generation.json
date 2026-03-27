@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-granite/granite-3.0-1b-a400m-instruct",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    2716,
+    297,
+    32,
+    2716,
+    297,
+    438,
+    312,
+    36493,
+    11297,
+    623,
+    312,
+    20815,
+    8142,
+    461,
+    27668,
+    32,
+    2030,
+    438,
+    6765,
+    372
+  ],
+  "generated_text": " Paris. Paris is a beautiful city with a rich history and culture. It is home to"
+}

@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-granite/granite-3.3-2b-instruct",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    2716,
+    297,
+    32,
+    203,
+    203,
+    3533,
+    225,
+    35,
+    44,
+    17492,
+    1147,
+    322,
+    8456,
+    32,
+    203,
+    1318,
+    8456,
+    438,
+    322,
+    18926
+  ],
+  "generated_text": " Paris.\n\nStep 1: Identify the topic.\nThe topic is the capital"
+}

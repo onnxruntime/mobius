@@ -360,6 +360,56 @@ def save_golden_ref(
         f.write("\n")  # trailing newline for POSIX compliance
 
 
+def save_generation_json(
+    json_path: Path,
+    *,
+    model_id: str,
+    prompt: str,
+    generated_tokens: list[int],
+    generated_text: str | None = None,
+) -> None:
+    """Save a ``*_generation.json`` L5 marker file alongside the main golden.
+
+    These lightweight files record the human-readable generation output so
+    the dashboard can detect L5 coverage via a ``*_generation.json`` glob.
+
+    Args:
+        json_path: Destination path (e.g. ``testdata/golden/causal-lm/gpt2_generation.json``).
+        model_id: HuggingFace model ID.
+        prompt: The text prompt used for generation.
+        generated_tokens: Token IDs produced by greedy generation (prompt excluded).
+        generated_text: Decoded string of ``generated_tokens``. ``None`` if
+            the tokenizer was not available at generation time.
+    """
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict = {
+        "model_id": model_id,
+        "prompt": prompt,
+        "generated_tokens": [int(t) for t in generated_tokens],
+    }
+    if generated_text is not None:
+        data["generated_text"] = generated_text
+
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def generation_json_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the expected ``*_generation.json`` path for a test case.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_generation.json``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_generation.json"
+
+
 def discover_test_cases(
     task_type: str | None = None,
     level: str | None = None,

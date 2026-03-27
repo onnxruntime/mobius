@@ -1,0 +1,27 @@
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    12095,
+    13,
+    576,
+    6722,
+    315,
+    15344,
+    374,
+    21718,
+    13,
+    576,
+    6722,
+    315,
+    17689,
+    374,
+    24081,
+    13,
+    576,
+    6722,
+    315,
+    5616
+  ],
+  "generated_text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China"
+}

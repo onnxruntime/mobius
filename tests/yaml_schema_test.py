@@ -58,9 +58,7 @@ def test_yaml_validates_against_schema(yaml_path: Path) -> None:
 
     errors = sorted(_VALIDATOR.iter_errors(data), key=lambda e: e.json_path)
     if errors:
-        messages = "\n".join(
-            f"  [{e.json_path}] {e.message}" for e in errors
-        )
+        messages = "\n".join(f"  [{e.json_path}] {e.message}" for e in errors)
         pytest.fail(f"{yaml_path.relative_to(_REPO_ROOT)}:\n{messages}")
 
 

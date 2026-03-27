@@ -160,7 +160,7 @@ def _extract_logits_golden(
 
 def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a causal-lm (text-generation) model."""
-    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_model,
         torch_forward,
@@ -202,6 +202,18 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         input_ids=input_ids,
         generated_ids=generated_ids,
     )
+
+    # Save a separate *_generation.json marker for L5 dashboard detection.
+    if generated_ids is not None:
+        generated_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0],
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
 
 
 def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
@@ -245,7 +257,7 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a seq2seq (encoder-decoder) model."""
     import torch
 
-    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_seq2seq_model,
     )
@@ -290,6 +302,17 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
         generated_ids=generated_ids,
     )
 
+    if generated_ids is not None:
+        generated_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0],
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
+
 
 def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a vision-language (image-text-to-text) model.
@@ -300,7 +323,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     import torch
     from PIL import Image
 
-    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_multimodal_model,
     )
@@ -361,13 +384,29 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         generated_ids=generated_ids,
     )
 
+    if generated_ids is not None:
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else None
+        generated_text = (
+            tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+            if tokenizer is not None
+            else None
+        )
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0],
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
+
 
 def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a speech-to-text (Whisper) model."""
     import librosa
     import torch
 
-    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
         load_torch_whisper_model,
     )
@@ -417,6 +456,17 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
         input_ids=input_ids_np,
         generated_ids=generated_ids,
     )
+
+    if generated_ids is not None:
+        generated_text = processor.decode(generated_ids.tolist(), skip_special_tokens=True)
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.audio[0],
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
 
 
 def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: str) -> None:

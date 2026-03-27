@@ -1,0 +1,27 @@
+{
+  "model_id": "openai-community/gpt2",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    262,
+    3139,
+    286,
+    262,
+    4141,
+    2066,
+    11,
+    290,
+    262,
+    3139,
+    286,
+    262,
+    4141,
+    2066,
+    318,
+    262,
+    3139,
+    286,
+    262,
+    4141
+  ],
+  "generated_text": " the capital of the French Republic, and the capital of the French Republic is the capital of the French"
+}

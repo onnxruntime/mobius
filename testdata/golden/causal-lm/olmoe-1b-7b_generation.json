@@ -1,0 +1,27 @@
+{
+  "model_id": "allenai/OLMoE-1B-7B-0924",
+  "prompt": "The capital of France is",
+  "generated_tokens": [
+    7785,
+    15,
+    187,
+    187,
+    510,
+    5347,
+    273,
+    253,
+    1986,
+    2077,
+    310,
+    5041,
+    13,
+    399,
+    15,
+    36,
+    15,
+    187,
+    187,
+    510
+  ],
+  "generated_text": " Paris.\n\nThe capital of the United States is Washington, D.C.\n\nThe"
+}
