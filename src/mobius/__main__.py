@@ -134,12 +134,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     # Validate --static-cache + --task compatibility
     if args.static_cache and args.task is not None:
-        if args.task != "static-cache-text-generation":
-            raise SystemExit(
-                "Error: --static-cache cannot be combined with "
-                f"a different --task ('{args.task}'). "
-                "Remove --task to use --static-cache."
-            )
+        raise SystemExit(
+            "Error: --static-cache cannot be combined with --task. "
+            "Remove --task to use --static-cache."
+        )
 
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task

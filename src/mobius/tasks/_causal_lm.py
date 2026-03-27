@@ -404,15 +404,3 @@ def _validate_static_cache_support(module: nn.Module) -> None:
                     f"compatible model or add StaticCacheState dispatch to "
                     f"{type(layer).__name__}.forward()."
                 )
-
-
-class StaticCacheCausalLMTask(CausalLMTask):
-    """Convenience alias: equivalent to ``CausalLMTask(static_cache=True)``.
-
-    Prefer ``CausalLMTask(static_cache=True, max_seq_len=...)`` for new
-    code.  This subclass is provided for convenience and backward
-    compatibility.
-    """
-
-    def __init__(self, max_seq_len: int | None = None):
-        super().__init__(static_cache=True, max_seq_len=max_seq_len)

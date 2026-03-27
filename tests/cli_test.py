@@ -116,7 +116,8 @@ class TestCLIBuild:
                 ]
             )
 
-    def test_static_cache_with_conflicting_task_errors(self):
+    def test_static_cache_with_task_errors(self):
+        """--static-cache cannot be combined with any --task."""
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(
                 [
@@ -130,22 +131,6 @@ class TestCLIBuild:
                     "text-generation",
                 ]
             )
-
-    def test_static_cache_with_matching_task_succeeds(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main(
-                [
-                    "build",
-                    "--model",
-                    "Qwen/Qwen2.5-0.5B",
-                    tmpdir,
-                    "--no-weights",
-                    "--static-cache",
-                    "--task",
-                    "static-cache-text-generation",
-                ]
-            )
-            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
     def test_non_positive_max_seq_len_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
@@ -162,8 +147,8 @@ class TestCLIBuild:
                 ]
             )
 
-    def test_static_cache_with_matching_task_and_max_seq_len(self):
-        """--max-seq-len must not be silently ignored when --task is also set."""
+    def test_static_cache_with_max_seq_len(self):
+        """--max-seq-len is passed through to CausalLMTask."""
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
                 [
@@ -173,8 +158,6 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--static-cache",
-                    "--task",
-                    "static-cache-text-generation",
                     "--max-seq-len",
                     "256",
                 ]

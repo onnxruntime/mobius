@@ -25,10 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CausalLMTask` now supports both dynamic and static cache modes via
   `static_cache` and `max_seq_len` keyword arguments.  The `build()`
   method uses clean conditionals for cache setup and output registration.
-- `StaticCacheCausalLMTask` is now a convenience subclass of
-  `CausalLMTask` (equivalent to `CausalLMTask(static_cache=True)`).
-  Fully backward compatible — existing code using
-  `StaticCacheCausalLMTask` continues to work unchanged.
+
+#### Removed
+
+- `StaticCacheCausalLMTask` — use `CausalLMTask(static_cache=True,
+  max_seq_len=...)` instead.  The `'static-cache-text-generation'` task
+  registry entry has also been removed.
 
 ### Wave 9
 
