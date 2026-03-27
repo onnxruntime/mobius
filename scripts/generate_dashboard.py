@@ -614,6 +614,58 @@ def _compute_summary(
     }
 
 
+def _build_component_matrix(
+    models: dict[str, ModelInfo],
+) -> dict[str, Any]:
+    """Build component x family matrix for the heatmap visualization.
+
+    Returns a dict suitable for JSON serialization with:
+    - ``families``: sorted list of family names that have at least one component.
+    - ``rows``: one entry per component, with per-family max confidence levels.
+    """
+    from mobius._testing.code_paths import CODE_PATH_INDICATORS
+
+    # Gather only families that exercise at least one component.
+    families_with_paths: set[str] = set()
+    for info in models.values():
+        if info.code_paths:
+            families_with_paths.add(info.family)
+    sorted_families = sorted(families_with_paths)
+
+    # matrix[feature_label][family] = max confidence level among all models
+    # in that family that exercise this feature.
+    matrix: dict[str, dict[str, int]] = {ind.label: {} for ind in CODE_PATH_INDICATORS}
+    for info in models.values():
+        if not info.code_paths:
+            continue
+        for path in info.code_paths:
+            if path in matrix:
+                cur = matrix[path].get(info.family, -1)
+                matrix[path][info.family] = max(cur, info.confidence_level)
+
+    # Build rows — one per indicator, with a cell value per family.
+    rows = []
+    for ind in CODE_PATH_INDICATORS:
+        fam_cells = matrix[ind.label]
+        cells = [fam_cells.get(fam, -1) for fam in sorted_families]
+        family_count = sum(1 for c in cells if c >= 0)
+        # Total individual model count from summary (recomputed here for simplicity).
+        model_count = sum(1 for info in models.values() if ind.label in info.code_paths)
+        best_level = max((c for c in cells if c >= 0), default=-1)
+        rows.append(
+            {
+                "label": ind.label,
+                "description": ind.description,
+                "model_count": model_count,
+                "family_count": family_count,
+                "best_level": best_level,
+                "cells": cells,
+            }
+        )
+
+    return {"families": sorted_families, "rows": rows}
+
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
@@ -681,6 +733,7 @@ def _render_html(
     ]
 
     # Commit string is plain text; Jinja2 autoescape handles HTML encoding.
+    component_matrix = _build_component_matrix(models)
     context = {
         "timestamp": timestamp,
         "commit": commit if commit else "unknown",
@@ -690,6 +743,7 @@ def _render_html(
         # replacement prevents premature script-tag closure.
         "model_data_json": model_data_json,
         "code_path_json": _to_js_json(code_path_info),
+        "component_matrix_json": _to_js_json(component_matrix),
         "summary_json": _to_js_json(summary),
         "labels_json": _to_js_json(_CONFIDENCE_LABELS),
     }

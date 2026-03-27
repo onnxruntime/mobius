@@ -155,21 +155,65 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .golden-status { margin-top: 8px; padding: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85em; }
 .golden-status .status-row { display: flex; gap: 16px; align-items: center; margin: 2px 0; }
 .golden-status .status-icon { width: 20px; text-align: center; }
-.code-path-section {
+.component-section {
   margin-top: 24px; background: var(--surface);
   border: 1px solid var(--border); border-radius: 8px; padding: 16px;
 }
-.code-path-grid {
+.component-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 12px; margin-top: 12px;
 }
-.code-path-card {
+.component-card {
   background: var(--bg); border: 1px solid var(--border);
   border-radius: 6px; padding: 10px;
 }
-.code-path-card h4 { font-size: 0.9em; margin-bottom: 4px; }
-.code-path-card .desc { color: var(--text-muted); font-size: 0.8em; }
-.code-path-card .coverage { font-size: 0.85em; margin-top: 4px; }
+.component-card h4 { font-size: 0.9em; margin-bottom: 4px; }
+.component-card .desc { color: var(--text-muted); font-size: 0.8em; }
+.component-card .coverage { font-size: 0.85em; margin-top: 4px; }
+/* Component coverage heatmap matrix */
+.matrix-scroll { overflow-x: auto; margin-top: 12px; }
+.component-matrix { border-collapse: collapse; font-size: 0.78em; white-space: nowrap; }
+.component-matrix th, .component-matrix td { border: 1px solid var(--border); }
+.feat-label-cell {
+  padding: 6px 10px; text-align: left; font-weight: 600;
+  background: var(--surface); position: sticky; left: 0; z-index: 2;
+  min-width: 120px; max-width: 160px;
+}
+.feat-label-cell code { font-size: 0.9em; }
+.fam-header-cell {
+  padding: 0; vertical-align: bottom; width: 36px; max-width: 36px;
+}
+.fam-header-text {
+  writing-mode: vertical-lr; transform: rotate(180deg);
+  padding: 6px 4px; white-space: nowrap; font-weight: 500;
+  max-height: 120px; overflow: hidden; text-overflow: ellipsis;
+  display: block;
+}
+.matrix-cell {
+  width: 36px; max-width: 36px; height: 28px; text-align: center;
+  vertical-align: middle; cursor: default; transition: filter 0.15s;
+}
+.matrix-cell:hover { filter: brightness(0.85); }
+.matrix-total-cell {
+  padding: 4px 8px; text-align: center; font-size: 0.8em;
+  color: var(--text-muted); white-space: nowrap;
+  background: var(--surface); position: sticky; right: 0; z-index: 2;
+}
+/* Level color scale — rgba keeps it readable in both light and dark themes */
+.cell-l1 { background: rgba(76,175,80,0.15); }
+.cell-l2 { background: rgba(76,175,80,0.32); }
+.cell-l3 { background: rgba(76,175,80,0.52); }
+.cell-l4 { background: rgba(76,175,80,0.72); }
+.cell-l5 { background: rgba(76,175,80,0.92); }
+.matrix-legend {
+  display: flex; align-items: center; gap: 12px; margin-top: 8px;
+  font-size: 0.8em; color: var(--text-muted); flex-wrap: wrap;
+}
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot {
+  display: inline-block; width: 14px; height: 14px;
+  border-radius: 3px; border: 1px solid var(--border);
+}
 .progress {
   height: 6px; background: var(--border); border-radius: 3px;
   margin-top: 4px; overflow: hidden;
@@ -182,8 +226,8 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   display: flex; justify-content: space-between;
 }
 body, .summary-card, .filters, .filters input, .filters select,
-table, th, .detail-row td, .config-block, .code-path-section,
-.code-path-card, .toggle-group button, .copy-btn, .footer {
+table, th, .detail-row td, .config-block, .component-section,
+.component-card, .toggle-group button, .copy-btn, .footer {
   transition: background-color 0.25s ease, color 0.25s ease,
               border-color 0.25s ease;
 }
@@ -257,7 +301,7 @@ document.documentElement.setAttribute('data-theme',t);}())
         <th data-sort="module_class" style="width:15%" aria-sort="none">Module Class</th>
         <th data-sort="confidence_level" style="width:8%" aria-sort="none">Confidence</th>
         <th style="width:12%" title="Each dot represents a testing level (L1&#x2013;L5)">Coverage (L1&#x2013;L5)</th>
-        <th style="width:15%">Code Paths</th>
+        <th style="width:15%">Components</th>
         <th style="width:5%"></th>
       </tr>
     </thead>
@@ -265,13 +309,17 @@ document.documentElement.setAttribute('data-theme',t);}())
   </table>
 </div>
 
-<div class="code-path-section">
-  <h2>Code Path Coverage</h2>
-  <p class="subtitle">Which architectural code paths are exercised by test configs</p>
-  <div class="code-path-grid" id="code-path-grid"></div>
+<div class="component-section">
+  <h2>Component Coverage</h2>
+  <p class="subtitle">Which architectural components are exercised — and at what test level (darker = higher)</p>
+  <div class="matrix-scroll"><div id="component-matrix-container"></div></div>
+  <details style="margin-top:16px">
+    <summary style="cursor:pointer;font-size:0.9em;color:var(--text-muted)">Component details &amp; example configs</summary>
+    <div class="component-grid" id="component-grid"></div>
+  </details>
 </div>
 
-<div class="code-path-section" style="margin-top:16px">
+<div class="component-section" style="margin-top:16px">
   <h2>Missing Coverage</h2>
   <p class="subtitle">Models without any test config &mdash; copy-paste these to add coverage</p>
   <div id="missing-coverage"></div>
@@ -289,6 +337,7 @@ document.documentElement.setAttribute('data-theme',t);}())
 // for <script> injection; the </  → <\/ replacement prevents tag closure).
 const MODEL_DATA = {{ model_data_json | safe }};
 const CODE_PATH_INFO = {{ code_path_json | safe }};
+const COMPONENT_MATRIX = {{ component_matrix_json | safe }};
 const SUMMARY = {{ summary_json | safe }};
 const LEVEL_LABELS = {{ labels_json | safe }};
 </script>
@@ -662,15 +711,76 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   });
 });
 
-// --- Code path coverage grid ---
-(function renderCodePaths() {
-  const grid = document.getElementById('code-path-grid');
+// --- Component coverage matrix heatmap ---
+(function renderComponentMatrix() {
+  const container = document.getElementById('component-matrix-container');
+  if (!container || !COMPONENT_MATRIX || !COMPONENT_MATRIX.rows.length) return;
+
+  const fams = COMPONENT_MATRIX.families;
+  // Map confidence level (0–5) to a CSS class for the cell background.
+  const levelClass = l => l <= 0 ? '' : `cell-l${Math.min(l, 5)}`;
+  const levelTitle = l => {
+    const labels = ['No test', 'L1: Graph builds', 'L2: Config compat',
+                    'L3: Synthetic parity', 'L4: Golden match', 'L5: Generation'];
+    return labels[Math.max(0, Math.min(l, 5))];
+  };
+
+  let html = '<table class="component-matrix" role="grid" aria-label="Component × family coverage matrix">';
+
+  // Header row: one column per family, rotated text to save horizontal space.
+  html += '<thead><tr>';
+  html += '<th class="feat-label-cell" scope="col">Component</th>';
+  fams.forEach(fam => {
+    html += `<th class="fam-header-cell" scope="col" title="${esc(fam)}">` +
+            `<div class="fam-header-text">${esc(fam)}</div></th>`;
+  });
+  html += '<th class="matrix-total-cell" scope="col" title="Models / families exercising this component">Models</th>';
+  html += '</tr></thead><tbody>';
+
+  // Data rows: one per component/feature.
+  COMPONENT_MATRIX.rows.forEach(row => {
+    html += `<tr>`;
+    html += `<td class="feat-label-cell" title="${esc(row.description)}"><code>${esc(row.label)}</code></td>`;
+    row.cells.forEach((level, i) => {
+      if (level < 0) {
+        // Family doesn't exercise this component.
+        html += `<td class="matrix-cell" title="${esc(fams[i])}: not used"></td>`;
+      } else {
+        const cls = levelClass(level);
+        const tip = `${esc(fams[i])}: ${levelTitle(level)}`;
+        html += `<td class="matrix-cell ${cls}" title="${tip}"></td>`;
+      }
+    });
+    // Summary: model count + best level indicator.
+    html += `<td class="matrix-total-cell">${row.model_count}m / ${row.family_count}f</td>`;
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+
+  // Colour legend.
+  html += '<div class="matrix-legend">';
+  html += '<span>Level key:</span>';
+  [['', 'Not used'], ['cell-l1', 'L1'], ['cell-l2', 'L2'],
+   ['cell-l3', 'L3'], ['cell-l4', 'L4'], ['cell-l5', 'L5']].forEach(([cls, lbl]) => {
+    const extra = cls ? '' : 'border:1px solid var(--border)';
+    html += `<span class="legend-item"><span class="legend-dot ${cls}" style="${extra}"></span>${lbl}</span>`;
+  });
+  html += '</div>';
+
+  container.innerHTML = html;
+})();
+
+// --- Component details grid (inside <details>) ---
+(function renderComponentCards() {
+  const grid = document.getElementById('component-grid');
+  if (!grid) return;
   const total = MODEL_DATA.filter(m => m.l1).length;
   CODE_PATH_INFO.forEach(cp => {
     const count = SUMMARY.code_path_coverage[cp.label] || 0;
     const pct = total > 0 ? Math.round(count / total * 100) : 0;
     const color = pct > 50 ? 'var(--l3)' : pct > 20 ? 'var(--l2)' : 'var(--l0)';
-    grid.innerHTML += `<div class="code-path-card">
+    grid.innerHTML += `<div class="component-card">
       <h4><span class="tag">${esc(cp.label)}</span> ${esc(cp.description)}</h4>
       <div class="coverage">${count} / ${total} models (${pct}%)</div>
       <div class="progress"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
