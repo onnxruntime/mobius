@@ -97,6 +97,12 @@
       "type": ["string", "null"],
       "description": "If non-null/non-empty, the test is skipped with this message. Use for known failures or unimplemented features."
     },
+    "min_token_match_ratio": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Per-case L5 tolerance override for token match ratio. Overrides the global value in default_tolerances.yaml. Use when the model has known float32 precision divergence vs HuggingFace (e.g. VL 3-model pipeline accumulates rounding error over decode steps)."
+    },
     "notes": {
       "type": "string",
       "description": "Human-readable description of the test case. Not parsed by the test runner."

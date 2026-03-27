@@ -100,6 +100,12 @@ class GoldenTestCase:
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
 
+    min_token_match_ratio: float | None
+    """Per-case override for the L5 token match tolerance (0-1).
+    When ``None``, the global tolerance from ``default_tolerances.yaml`` is used.
+    Use when a model has known float32 precision divergence vs HF (e.g.
+    VL 3-model pipeline)."""
+
     yaml_path: Path
     """Absolute path to the source YAML file."""
 
@@ -219,6 +225,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
         skip_reason=data.get("skip_reason"),
+        min_token_match_ratio=data.get("min_token_match_ratio"),
         yaml_path=yaml_path,
     )
 

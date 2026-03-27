@@ -16,6 +16,7 @@ Run::
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import warnings
 from pathlib import Path
@@ -597,6 +598,231 @@ def _run_vision_language_prefill(
     return outputs
 
 
+def _make_vl_decoder_cache_feeds(
+    dec_session: OnnxModelSession,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Build empty past KV / recurrent state feeds for a VL decoder.
+
+    Handles full-attention (key/value), linear-attention (conv_state/
+    recurrent_state), and mamba/mamba2 (conv_state/ssm_state) layer types.
+    """
+    feeds: dict[str, np.ndarray] = {}
+    layer_types = getattr(config, "layer_types", None) or []
+    num_kv_heads = getattr(config, "num_key_value_heads", 1)
+    head_dim = getattr(config, "head_dim", 64)
+
+    for name in dec_session.input_names:
+        if not name.startswith("past_key_values."):
+            continue
+        parts = name.split(".")
+        layer_idx = int(parts[1]) if len(parts) >= 3 and parts[1].isdigit() else 0
+        ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
+        shape = dec_session.get_input_shape(name) or []
+
+        if ltype in ("linear_attention", "mamba", "mamba2"):
+            # Fixed-size recurrent state: replace symbolic/zero dims with 1
+            feeds[name] = np.zeros(
+                [d if isinstance(d, int) and d > 0 else 1 for d in shape], dtype=np.float32
+            )
+        else:
+            # Standard KV cache: seq dim starts at 0 (empty)
+            feeds[name] = np.zeros((1, num_kv_heads, 0, head_dim), dtype=np.float32)
+
+    return feeds
+
+
+def _update_vl_cache(
+    past_cache: dict[str, np.ndarray],
+    outputs: dict[str, np.ndarray],
+    config: object,
+) -> None:
+    """Update past KV / recurrent state entries with present step outputs."""
+    layer_types = getattr(config, "layer_types", None) or []
+    num_hidden_layers = getattr(config, "num_hidden_layers", 0)
+    for i in range(num_hidden_layers):
+        ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+        if ltype == "linear_attention":
+            suffixes = ("conv_state", "recurrent_state")
+        elif ltype in ("mamba", "mamba2"):
+            suffixes = ("conv_state", "ssm_state")
+        else:
+            suffixes = ("key", "value")
+        for suffix in suffixes:
+            src = f"present.{i}.{suffix}"
+            dst = f"past_key_values.{i}.{suffix}"
+            if src in outputs and dst in past_cache:
+                past_cache[dst] = outputs[src]
+
+
+def _run_vl_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+    max_new_tokens: int = 30,
+    eos_token_id: int | None = None,
+) -> np.ndarray:
+    """Run greedy generation for a VL model.
+
+    The VL decoder only accepts ``inputs_embeds`` (not raw ``input_ids``).
+    Each decode step therefore re-runs the embedding model with the next
+    token and empty image features to get a single-token embedding.
+
+    Returns newly generated token IDs (prompt excluded).
+    """
+    import transformers
+    from PIL import Image
+
+    # --- Step 0: prepare multimodal inputs ---
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    image = Image.open(_TESTDATA_DIR / case.images[0])
+
+    prompt_text = case.prompts[0]
+    if hasattr(processor, "apply_chat_template"):
+        content: list[dict[str, str]] = []
+        for img_path in case.images:
+            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
+        content.append({"type": "text", "text": prompt_text})
+        messages = [{"role": "user", "content": content}]
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
+    processed: dict[str, np.ndarray] = {
+        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
+    }
+
+    # --- Step 1: vision encoder ---
+    vis_session = OnnxModelSession(pkg["vision"])
+    try:
+        vis_feeds: dict[str, np.ndarray] = {
+            name: processed[name] for name in vis_session.input_names if name in processed
+        }
+        vis_out = vis_session.run(vis_feeds)
+    finally:
+        vis_session.close()
+
+    vis_hidden = vis_out[next(iter(vis_out))]  # image feature tensor
+
+    # --- Step 2: embedding (prefill) ---
+    # VL packages use "decoder" as the decoder key
+    dec_key = "decoder" if "decoder" in pkg else "model"
+    dec_session = OnnxModelSession(pkg[dec_key])
+    emb_session = OnnxModelSession(pkg["embedding"])
+
+    # Find the image features input name on the embedding model
+    image_feat_input = next(
+        (n for n in emb_session.input_names if n != "input_ids"),
+        None,
+    )
+
+    try:
+        emb_feeds: dict[str, np.ndarray] = {
+            "input_ids": processed["input_ids"].astype(np.int64),
+        }
+        if image_feat_input is not None:
+            emb_feeds[image_feat_input] = vis_hidden
+        emb_out = emb_session.run(emb_feeds)
+        inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
+
+        batch_size = 1
+        prompt_seq_len = inputs_embeds.shape[1]
+        hidden_size = inputs_embeds.shape[2]
+
+        # --- Step 3: determine position_ids style ---
+        pos_shape = dec_session.get_input_shape("position_ids")
+        uses_mrope = pos_shape is not None and len(pos_shape) == 3
+        spatial_merge = getattr(config, "spatial_merge_size", 2)
+
+        # --- Step 4: prefill decoder ---
+        past_cache = _make_vl_decoder_cache_feeds(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
+            **past_cache,
+        }
+        # Track the next decode position (may differ from token count for MRoPE
+        # because image tokens consume fewer positions than tokens: image group
+        # advances current_pos by max(H, W), not by num_image_tokens).
+        next_decode_pos: int
+        if "position_ids" in dec_session.input_names:
+            if uses_mrope:
+                prefill_pos_ids = _compute_mrope_position_ids(
+                    processed["input_ids"].astype(np.int64),
+                    processed.get("image_grid_thw"),
+                    spatial_merge_size=spatial_merge,
+                    mm_token_type_ids=processed.get("mm_token_type_ids"),
+                )
+                dec_feeds["position_ids"] = prefill_pos_ids
+                # Next decode position = last token's position + 1.
+                # For text tokens all three dims are equal; use dim 0.
+                next_decode_pos = int(prefill_pos_ids[0, 0, -1]) + 1
+            else:
+                dec_feeds["position_ids"] = np.arange(prompt_seq_len, dtype=np.int64).reshape(
+                    1, -1
+                )
+                next_decode_pos = prompt_seq_len
+        else:
+            next_decode_pos = prompt_seq_len
+
+        prefill_out = dec_session.run(dec_feeds)
+        logits = prefill_out["logits"]
+        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        _update_vl_cache(past_cache, prefill_out, config)
+
+        generated = [next_token]
+        # past_seq_len tracks total token count (for attention_mask length).
+        # next_decode_pos tracks the MRoPE position for the next new token.
+        past_seq_len = prompt_seq_len
+
+        # --- Step 5: decode loop ---
+        # Embed each new token through the embedding model with no image features.
+        empty_image = np.zeros((0, hidden_size), dtype=np.float32)
+        for _ in range(max_new_tokens - 1):
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+
+            # Embed single token (no new vision features during decode)
+            step_emb_feeds: dict[str, np.ndarray] = {"input_ids": next_token}
+            if image_feat_input is not None:
+                step_emb_feeds[image_feat_input] = empty_image
+            step_emb_out = emb_session.run(step_emb_feeds)
+            step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
+
+            total_len = past_seq_len + 1
+            step_feeds: dict[str, np.ndarray] = {
+                "inputs_embeds": step_embeds,
+                "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
+                **past_cache,
+            }
+            if "position_ids" in dec_session.input_names:
+                if uses_mrope:
+                    # Use the true MRoPE position (not the token count), since
+                    # image tokens occupy fewer positions than tokens.
+                    step_feeds["position_ids"] = np.full(
+                        (3, batch_size, 1), next_decode_pos, dtype=np.int64
+                    )
+                else:
+                    step_feeds["position_ids"] = np.array([[next_decode_pos]], dtype=np.int64)
+
+            step_out = dec_session.run(step_feeds)
+            logits = step_out["logits"]
+            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            generated.append(next_token)
+            _update_vl_cache(past_cache, step_out, config)
+            past_seq_len = total_len
+            next_decode_pos += 1
+
+    finally:
+        dec_session.close()
+        emb_session.close()
+
+    return np.concatenate(generated, axis=1)[0]  # [generated_len]
+
+
 # ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
@@ -678,12 +904,12 @@ class TestL4CheckpointVerified:
 # L5 Helpers
 # ---------------------------------------------------------------------------
 
-# Task types that support autoregressive generation via OnnxGenerator.
-# Other task types (seq2seq, speech-to-text, vision-language) require
-# specialised generation loops that are not yet implemented.
+# Task types that support autoregressive generation.
+# seq2seq and speech-to-text require specialised loops not yet implemented.
 _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
+        "image-text-to-text",
     }
 )
 
@@ -753,9 +979,9 @@ class TestL5GenerationE2E:
     """L5: Full autoregressive generation, compare token sequences.
 
     Gate: token match ratio >= ``min_token_match_ratio`` from tolerances.
-    Only causal-lm models are supported; other task types (seq2seq,
-    vision-language, speech-to-text) are skipped until specialised
-    generation loops are implemented.
+    Supported task types: ``text-generation`` (causal-LM via OnnxGenerator)
+    and ``image-text-to-text`` (VL three-model pipeline).
+    Other task types (seq2seq, speech-to-text) are skipped.
     """
 
     @pytest.mark.parametrize("case", _L5_CASES)
@@ -772,7 +998,8 @@ class TestL5GenerationE2E:
         _validate_greedy(case)
 
         # --- Load golden data ---
-        # L4 golden (main JSON) provides input_ids for the generation loop.
+        # For causal-lm: L4 golden (main JSON) provides input_ids.
+        # For VL: image is re-processed from the YAML case at generation time.
         golden_path = golden_path_for_case(case)
         golden = load_golden_ref(golden_path)
         if golden is None:
@@ -785,6 +1012,12 @@ class TestL5GenerationE2E:
             pytest.skip(f"Generation golden file missing: {gen_path}")
 
         tolerances = load_tolerances("L5", case.dtype)
+        # Per-case tolerance override (e.g. VL multi-model pipeline has known
+        # float32 precision divergence vs HF after several decode steps).
+        if case.min_token_match_ratio is not None:
+            tolerances = dataclasses.replace(
+                tolerances, min_token_match_ratio=case.min_token_match_ratio
+            )
 
         # --- Build and generate ---
         pkg = _build_model_package(case)
@@ -794,7 +1027,17 @@ class TestL5GenerationE2E:
             "cannot determine KV cache dimensions for generation"
         )
 
-        new_tokens = _run_causal_lm_generation(pkg, case, golden)
+        new_tokens = (
+            _run_vl_generation(
+                pkg,
+                case,
+                config,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 30),
+                eos_token_id=case.generation_params.get("eos_token_id"),
+            )
+            if case.task_type == "image-text-to-text"
+            else _run_causal_lm_generation(pkg, case, golden)
+        )
 
         # --- Diagnostics ---
         expected_tokens = np.array(expected_token_ids, dtype=np.int64)
