@@ -90,16 +90,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "image-text-to-text/qwen2_5-vl-3b": "VL prefill needs 3D position_ids (model-specific RoPE)",
 }
 
-# Legacy skip mechanism. New skip reasons should use the skip_reason field in YAML test case files.
-# Models where HF weight download fails (no safetensors, gated, etc.)
-_SKIP_REASONS: dict[str, str] = {
-    "feature-extraction/deberta-base": "HF repo has no safetensors (pytorch_model.bin only)",
-    "seq2seq/marian-en-de": "HF repo has no safetensors (pytorch_model.bin only)",
-    "seq2seq/mt5-small": "HF repo has no safetensors (pytorch_model.bin only)",
-    "audio-feature-extraction/wav2vec2-base": "HF repo has no safetensors (pytorch_model.bin only)",
-    "speech-to-text/whisper-tiny": "Whisper encoder needs audio input_features (not text input_ids)",
-}
-
 
 def _discover_cases(level: str) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
@@ -120,8 +110,6 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in _SKIP_REASONS:
-            marks.append(pytest.mark.skip(reason=_SKIP_REASONS[test_id]))
         elif test_id in _XFAIL_REASONS:
             marks.append(pytest.mark.xfail(reason=_XFAIL_REASONS[test_id], strict=False))
 
@@ -422,7 +410,7 @@ def _run_vision_language_prefill(
 
     # --- Step 0: Preprocess image with HF processor ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=True
+        case.model_id, trust_remote_code=case.trust_remote_code
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
