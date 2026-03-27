@@ -107,7 +107,7 @@ def generate(
 
     generated_ids: list[int] = []
 
-    for step in range(max_new_tokens):
+    for _step in range(max_new_tokens):
         cur_seq_len = cur_input_ids.shape[1]
         start_pos = int(write_indices[0])
 
