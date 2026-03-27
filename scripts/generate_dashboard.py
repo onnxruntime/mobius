@@ -78,7 +78,10 @@ class ModelInfo:
     # Golden test case coverage (from testdata/cases/ YAML files)
     l4_has_test_case: bool = False
     l5_has_test_case: bool = False
+    l4_test_case_skipped: bool = False
+    l5_test_case_skipped: bool = False
     yaml_test_case_file: str | None = None
+    yaml_test_case_skip_reason: str | None = None
     # L3 synthetic parity status: "pass", "xfail", "skip", or None
     l3_status: str | None = None
     l3_status_reason: str | None = None
@@ -355,8 +358,19 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         level = data.get("level", "")
         rel_path = str(yaml_file.relative_to(_REPO_ROOT))
 
-        # Skip test cases that are explicitly skipped — they don't count as coverage.
-        if data.get("skip_reason"):
+        # Skip test cases that are explicitly skipped — they don't count as coverage,
+        # but we still record them so the dashboard can show "skipped" status.
+        skip_reason = data.get("skip_reason")
+        if skip_reason:
+            matched_types = model_id_to_types.get(model_id, [])
+            for model_type in matched_types:
+                if model_type in models:
+                    models[model_type].yaml_test_case_file = rel_path
+                    models[model_type].yaml_test_case_skip_reason = skip_reason
+                    if "L4" in level:
+                        models[model_type].l4_test_case_skipped = True
+                    if "L5" in level:
+                        models[model_type].l5_test_case_skipped = True
             continue
 
         # Find matching model_types via test_model_id reverse index
@@ -477,6 +491,8 @@ def _compute_summary(
     }
     l4_case_count = 0
     l5_case_count = 0
+    l4_skipped_count = 0
+    l5_skipped_count = 0
 
     for info in models.values():
         by_level[info.confidence_level] += 1
@@ -494,6 +510,10 @@ def _compute_summary(
             l4_case_count += 1
         if info.l5_has_test_case:
             l5_case_count += 1
+        if info.l4_test_case_skipped:
+            l4_skipped_count += 1
+        if info.l5_test_case_skipped:
+            l5_skipped_count += 1
 
     return {
         "total": total,
@@ -504,6 +524,8 @@ def _compute_summary(
         "l3_status_counts": l3_status_counts,
         "l4_case_count": l4_case_count,
         "l5_case_count": l5_case_count,
+        "l4_skipped_count": l4_skipped_count,
+        "l5_skipped_count": l5_skipped_count,
     }
 
 
@@ -535,9 +557,12 @@ def _generate_html(
                 "l5": info.l5_generation_golden,
                 "l4_case": info.l4_has_test_case,
                 "l5_case": info.l5_has_test_case,
+                "l4_skipped": info.l4_test_case_skipped,
+                "l5_skipped": info.l5_test_case_skipped,
                 "l3_status": info.l3_status,
                 "l3_reason": info.l3_status_reason,
                 "yaml_case": info.yaml_test_case_file,
+                "yaml_skip_reason": info.yaml_test_case_skip_reason,
                 "code_paths": sorted(info.code_paths),
                 "config_overrides": _json_safe(info.config_overrides),
                 "has_integration_test": info.has_integration_test,
@@ -702,6 +727,10 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .dot.pending {
   background: transparent; border-color: var(--l1);
   border-style: dashed; border-width: 2px;
+}
+.dot.skipped {
+  background: transparent; border-color: var(--text-muted);
+  border-style: dotted; border-width: 2px;
 }
 .dot.untested { background: transparent; border-color: var(--border); }
 .tag {
@@ -907,10 +936,11 @@ const LEVEL_DESCRIPTIONS = {
     </div>`;
   }
   // Golden case coverage
-  bar.innerHTML += `<div class="summary-card" title="YAML test cases defined for golden testing">
+  bar.innerHTML += `<div class="summary-card" title="YAML test cases defined for golden testing (skipped = known issues)">
     <div class="number" style="font-size:1.2em">
       <span style="color:var(--l4)">${SUMMARY.l4_case_count || 0}</span> /
       <span style="color:var(--l5)">${SUMMARY.l5_case_count || 0}</span>
+      <span style="color:var(--text-muted); font-size:0.75em"> (+${SUMMARY.l4_skipped_count || 0}/${SUMMARY.l5_skipped_count || 0} skipped)</span>
     </div>
     <div class="label">L4/L5 Cases</div>
   </div>`;
@@ -1004,6 +1034,7 @@ function renderModelRow(m) {
       || (i === 3 && m.l3_status != null)
       || (i === 4 && m.l4_case)
       || (i === 5 && m.l5_case);
+    const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped);
     // Determine whether the test is in a "pending" state:
     // test infrastructure exists but hasn't been run or is expected to fail
     const isPending = hasTest && !active && (
@@ -1016,6 +1047,9 @@ function renderModelRow(m) {
     if (active) {
       cls += ' active-' + i;
       label += ' (passed)';
+    } else if (isSkipped) {
+      cls += ' skipped';
+      label += ` (skipped: ${esc(m.yaml_skip_reason || 'known issue')})`;
     } else if (isPending) {
       cls += ' pending';
       if (i === 3) label += ` (${m.l3_status}: ${esc(m.l3_reason || 'known issue')})`;
@@ -1068,8 +1102,8 @@ function renderDetailRow(m) {
     ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, false],
     ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, false],
     ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3Pending],
-    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case, m.l4_case && !m.l4],
-    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case, m.l5_case && !m.l5],
+    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4) && !m.l4_skipped],
+    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5) && !m.l5_skipped],
   ];
 
   let levelHtml = '<table style="width:100%;margin-bottom:8px;border:none">';
@@ -1089,12 +1123,16 @@ function renderDetailRow(m) {
   let goldenHtml = '<div class="golden-status">';
   goldenHtml += '<strong>Golden Test Status:</strong>';
   if (m.yaml_case) {
-    goldenHtml += `<div class="status-row"><span class="status-icon">\u2705</span> Test case: <code>${esc(m.yaml_case)}</code></div>`;
+    if (m.yaml_skip_reason) {
+      goldenHtml += `<div class="status-row"><span class="status-icon">\u23ED</span> Test case: <code>${esc(m.yaml_case)}</code> <span style="color:var(--text-muted)">\u2014 skipped: ${esc(m.yaml_skip_reason)}</span></div>`;
+    } else {
+      goldenHtml += `<div class="status-row"><span class="status-icon">\u2705</span> Test case: <code>${esc(m.yaml_case)}</code></div>`;
+    }
   } else {
     goldenHtml += '<div class="status-row"><span class="status-icon">\u274C</span> No YAML test case defined</div>';
   }
-  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l4 ? '\u2705' : m.l4_case ? '\u274C' : '\u2796'}</span> L4 golden data: ${m.l4 ? 'available' : m.l4_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
-  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l5 ? '\u2705' : m.l5_case ? '\u274C' : '\u2796'}</span> L5 golden data: ${m.l5 ? 'available' : m.l5_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
+  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l4 ? '\u2705' : m.l4_skipped ? '\u23ED' : m.l4_case ? '\u274C' : '\u2796'}</span> L4 golden data: ${m.l4 ? 'available' : m.l4_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l4_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
+  goldenHtml += `<div class="status-row"><span class="status-icon">${m.l5 ? '\u2705' : m.l5_skipped ? '\u23ED' : m.l5_case ? '\u274C' : '\u2796'}</span> L5 golden data: ${m.l5 ? 'available' : m.l5_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l5_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
 
   // L3 parity status
   if (m.l3_status) {
