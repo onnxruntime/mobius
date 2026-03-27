@@ -40,6 +40,7 @@ h1 { font-size: 1.5em; margin-bottom: 4px; }
 }
 .summary-card .number { font-size: 1.8em; font-weight: 700; }
 .summary-card .label { color: var(--text-muted); font-size: 0.8em; }
+.summary-card .card-annotation { color: var(--text-muted); font-size: 0.75em; margin-top: 2px; }
 .summary-card.level-0 .number { color: var(--l0); }
 .summary-card.level-1 .number { color: var(--l1); }
 .summary-card.level-2 .number { color: var(--l2); }
@@ -373,9 +374,18 @@ const LEVEL_DESCRIPTIONS = {
   bar.innerHTML = totalCard;
   for (let i = 0; i <= 5; i++) {
     const count = SUMMARY.by_level[i] || 0;
+    // Annotate L4 and L5 cards with skipped counts so the full picture is
+    // visible without a separate card.
+    let annotation = '';
+    if (i === 4 && SUMMARY.l4_skipped_count) {
+      annotation = `<div class="card-annotation">+${SUMMARY.l4_skipped_count} skipped</div>`;
+    } else if (i === 5 && SUMMARY.l5_skipped_count) {
+      annotation = `<div class="card-annotation">+${SUMMARY.l5_skipped_count} skipped</div>`;
+    }
     bar.innerHTML += `<div class="summary-card level-${i}" title="${LEVEL_DESCRIPTIONS[i]}">
       <div class="number">${count}</div>
       <div class="label">${LEVEL_LABELS[i]}</div>
+      ${annotation}
     </div>`;
   }
   // L3 parity breakdown
@@ -390,15 +400,7 @@ const LEVEL_DESCRIPTIONS = {
       <div class="label">L3 Parity Status</div>
     </div>`;
   }
-  // Golden case coverage
-  bar.innerHTML += `<div class="summary-card" title="YAML test cases defined for golden testing (skipped = known issues)">
-    <div class="number" style="font-size:1.2em">
-      <span style="color:var(--l4)">${SUMMARY.l4_case_count || 0}</span> /
-      <span style="color:var(--l5)">${SUMMARY.l5_case_count || 0}</span>
-      <span style="color:var(--text-muted); font-size:0.75em"> (+${SUMMARY.l4_skipped_count || 0}/${SUMMARY.l5_skipped_count || 0} skipped)</span>
-    </div>
-    <div class="label">L4/L5 Cases</div>
-  </div>`;
+  // (L4/L5 skipped counts are shown as annotations on the L4/L5 level cards above.)
 })();
 
 // --- Category filter ---
