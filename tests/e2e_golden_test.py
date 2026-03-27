@@ -87,6 +87,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "text-generation/gemma-2-2b": "Gemma-2 L5 generation diverges (10% token match ratio)",
 }
 
+# Legacy skip mechanism. New skip reasons should use the skip_reason field in YAML test case files.
 # Models where HF weight download fails (no safetensors, gated, etc.)
 _SKIP_REASONS: dict[str, str] = {
     "feature-extraction/deberta-base": "HF repo has no safetensors (pytorch_model.bin only)",
@@ -341,7 +342,6 @@ def _token_match_ratio(
 
 def _prepare_vision_feeds(
     case: GoldenTestCase,
-    session: OnnxModelSession,
 ) -> dict[str, np.ndarray]:
     """Prepare input feeds for an image-classification forward pass.
 
@@ -352,7 +352,7 @@ def _prepare_vision_feeds(
     from PIL import Image
 
     processor = transformers.AutoImageProcessor.from_pretrained(
-        case.model_id, trust_remote_code=True
+        case.model_id, trust_remote_code=case.trust_remote_code
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
     processed = processor(images=image, return_tensors="np")
@@ -364,7 +364,6 @@ def _prepare_vision_feeds(
 
 def _prepare_audio_feeds(
     case: GoldenTestCase,
-    session: OnnxModelSession,
 ) -> dict[str, np.ndarray]:
     """Prepare input feeds for an audio-feature-extraction forward pass.
 
@@ -377,11 +376,11 @@ def _prepare_audio_feeds(
     # Fall back to AutoFeatureExtractor for models without a tokenizer
     try:
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id, trust_remote_code=case.trust_remote_code
         )
     except (TypeError, OSError):
         processor = transformers.AutoFeatureExtractor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id, trust_remote_code=case.trust_remote_code
         )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -427,14 +426,14 @@ class TestL4CheckpointVerified:
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
-                feeds = _prepare_vision_feeds(case, session)
+                feeds = _prepare_vision_feeds(case)
                 outputs = session.run(feeds)
             finally:
                 session.close()
         elif case.task_type == "audio-feature-extraction":
             session = _open_decoder_session(pkg)
             try:
-                feeds = _prepare_audio_feeds(case, session)
+                feeds = _prepare_audio_feeds(case)
                 outputs = session.run(feeds)
             finally:
                 session.close()
