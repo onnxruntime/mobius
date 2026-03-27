@@ -22,6 +22,7 @@ __all__ = [
     "OPSET_VERSION",
     "Sam2Config",
     "SegformerConfig",
+    "StaticCacheCausalLMTask",
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
@@ -70,4 +71,4 @@ from mobius._registry import (
     registry,
 )
 from mobius._weight_loading import apply_weights
-from mobius.tasks import CausalLMTask, ModelTask
+from mobius.tasks import CausalLMTask, ModelTask, StaticCacheCausalLMTask
