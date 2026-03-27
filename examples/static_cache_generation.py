@@ -56,10 +56,10 @@ MAX_SEQ_LEN = 2048
 # ---------------------------------------------------------------------------
 
 
-def build_model(model_id: str, *, max_seq_len: int, dtype: str = "f32"):
+def build_model(model_id: str, *, max_seq_len: int):
     """Build an ONNX model with static KV cache."""
     task = StaticCacheCausalLMTask(max_seq_len=max_seq_len)
-    return build(model_id, task=task, dtype=dtype)
+    return build(model_id, task=task)
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,19 @@ def generate(
 
     generated_ids: list[int] = []
 
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         cur_seq_len = cur_input_ids.shape[1]
         start_pos = int(write_indices[0])
+
+        # Guard against exceeding the pre-allocated cache length.
+        if start_pos + cur_seq_len > max_seq_len:
+            print(
+                f"\n[Stopped] Cache full: position {start_pos} + "
+                f"seq_len {cur_seq_len} would exceed "
+                f"max_seq_len {max_seq_len}."
+            )
+            break
+
         position_ids = np.arange(start_pos, start_pos + cur_seq_len, dtype=np.int64)[
             np.newaxis, :
         ]

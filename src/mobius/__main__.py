@@ -124,9 +124,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     )
     from mobius.tasks import ModelTask, StaticCacheCausalLMTask
 
-    # Validate --max-seq-len requires --static-cache
-    if args.max_seq_len is not None and not args.static_cache:
-        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+    uses_static_cache = args.static_cache or args.task == "static-cache-text-generation"
+
+    # Validate --max-seq-len requires static cache (via flag or task)
+    if args.max_seq_len is not None and not uses_static_cache:
+        raise SystemExit(
+            "Error: --max-seq-len can only be used with "
+            "--static-cache or --task static-cache-text-generation."
+        )
 
     # Validate --max-seq-len is positive
     if args.max_seq_len is not None and args.max_seq_len <= 0:
@@ -143,7 +148,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
-    if args.static_cache:
+    if uses_static_cache:
         task = StaticCacheCausalLMTask(max_seq_len=args.max_seq_len)
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir

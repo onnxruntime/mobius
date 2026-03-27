@@ -181,6 +181,24 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
+    def test_task_static_cache_with_max_seq_len_no_flag(self):
+        """--task static-cache-text-generation + --max-seq-len works without --static-cache."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--task",
+                    "static-cache-text-generation",
+                    "--max-seq-len",
+                    "512",
+                ]
+            )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
 
 class TestCLIInfo:
     """Test the ``info`` subcommand."""
