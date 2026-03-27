@@ -23,5 +23,5 @@
     310,
     461
   ],
-  "generated_text": ""
+  "generated_text": "\n    if n == 0:\n        return 0\n    elif n == 1:\n        return"
 }

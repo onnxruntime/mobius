@@ -1,6 +1,6 @@
 {
   "model_id": "allenai/OLMo-1B-hf",
-  "prompt": "The capital of France is",
+  "prompt": "Here is my poem:",
   "generated_tokens": [
     510,
     806,

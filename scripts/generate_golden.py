@@ -200,7 +200,6 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=input_ids,
-        generated_ids=generated_ids,
     )
 
     # Save a separate *_generation.json marker for L5 dashboard detection.
@@ -299,7 +298,6 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=input_ids,
-        generated_ids=generated_ids,
     )
 
     if generated_ids is not None:
@@ -381,7 +379,6 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=input_ids_np,
-        generated_ids=generated_ids,
     )
 
     if generated_ids is not None:
@@ -454,7 +451,6 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=input_ids_np,
-        generated_ids=generated_ids,
     )
 
     if generated_ids is not None:

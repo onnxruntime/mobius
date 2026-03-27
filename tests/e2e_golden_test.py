@@ -30,8 +30,10 @@ from mobius._testing.golden import (
     GoldenRef,
     GoldenTestCase,
     discover_test_cases,
+    generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
+    load_generation_golden,
     load_golden_ref,
     load_tolerances,
 )
@@ -677,17 +679,19 @@ class TestL5GenerationE2E:
         _validate_greedy(case)
 
         # --- Load golden data ---
+        # L4 golden (main JSON) provides input_ids for the generation loop.
         golden_path = golden_path_for_case(case)
         golden = load_golden_ref(golden_path)
         if golden is None:
             pytest.skip(f"Golden file missing: {golden_path}")
 
-        tolerances = load_tolerances("L5", case.dtype)
+        # L5 generation golden is stored in the separate *_generation.json file.
+        gen_path = generation_json_path_for_case(case)
+        expected_token_ids = load_generation_golden(case)
+        if expected_token_ids is None:
+            pytest.skip(f"Generation golden file missing: {gen_path}")
 
-        assert golden.generated_ids is not None, (
-            f"Golden file for {case.case_id} includes L5 in its level "
-            f"but contains no generated_ids"
-        )
+        tolerances = load_tolerances("L5", case.dtype)
 
         # --- Build and generate ---
         pkg = _build_model_package(case)
@@ -700,7 +704,7 @@ class TestL5GenerationE2E:
         new_tokens = _run_causal_lm_generation(pkg, case, golden)
 
         # --- Diagnostics ---
-        expected_tokens = np.array(golden.generated_ids, dtype=np.int64)
+        expected_tokens = np.array(expected_token_ids, dtype=np.int64)
         expected_len = len(expected_tokens)
         actual_len = len(new_tokens)
         if actual_len != expected_len:
