@@ -5,17 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ONNX GenAI Models — Testing Confidence Dashboard</title>
 <style>
-:root, [data-theme="dark"] {
-  --bg: #0d1117;
-  --surface: #161b22;
-  --border: #30363d;
-  --text: #e6edf3;
-  --text-muted: #8b949e;
-  --accent: #58a6ff;
-  --l0: #f85149; --l1: #d29922; --l2: #e3b341;
-  --l3: #3fb950; --l4: #2ea043; --l5: #58a6ff;
-}
-[data-theme="light"] {
+:root, [data-theme="light"] {
   --bg: #ffffff;
   --surface: #f6f8fa;
   --border: #d0d7de;
@@ -24,6 +14,16 @@
   --accent: #0969da;
   --l0: #cf222e; --l1: #9a6700; --l2: #bf8700;
   --l3: #1a7f37; --l4: #116329; --l5: #0969da;
+}
+[data-theme="dark"] {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --l0: #f85149; --l1: #d29922; --l2: #e3b341;
+  --l3: #3fb950; --l4: #2ea043; --l5: #58a6ff;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -207,7 +207,7 @@ table, th, .detail-row td, .config-block, .code-path-section,
 </head>
 <body>
 <script>
-(function(){var t=localStorage.getItem('dashboard-theme')||'dark';
+(function(){var t=localStorage.getItem('dashboard-theme')||'light';
 document.documentElement.setAttribute('data-theme',t);}())
 </script>
 <noscript><p style="color:#e6edf3;padding:2em">This dashboard requires JavaScript to render.</p></noscript>
@@ -718,9 +718,9 @@ renderTable();
     btn.setAttribute('aria-label',
       theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
   }
-  applyTheme(localStorage.getItem('dashboard-theme') || 'dark');
+  applyTheme(localStorage.getItem('dashboard-theme') || 'light');
   btn.addEventListener('click', function() {
-    var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    var cur = document.documentElement.getAttribute('data-theme') || 'light';
     applyTheme(cur === 'dark' ? 'light' : 'dark');
   });
 })();
