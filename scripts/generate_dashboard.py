@@ -215,7 +215,11 @@ def _scan_registry() -> dict[str, ModelInfo]:
 
 
 def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
-    """Mark L1 coverage from test config presence in _test_configs.py."""
+    """Mark L1 coverage from test config presence in _test_configs.py.
+
+    Also marks models in ``_SPECIALIZED_TEST_MODEL_TYPES`` (VLM/audio models
+    tested via dedicated test methods rather than the parametrized config loop).
+    """
     from mobius._testing.code_paths import (
         detect_code_paths,
     )
@@ -235,6 +239,17 @@ def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
             models[model_type].config_overrides.append(config_overrides)
             paths = detect_code_paths(config_overrides)
             models[model_type].code_paths.update(paths)
+
+    # Specialized VLM/audio models have dedicated test methods in
+    # build_graph_test.py but are not in ALL_CONFIGS. They still build a graph.
+    try:
+        from build_graph_test import _SPECIALIZED_TEST_MODEL_TYPES
+    except ImportError:
+        return
+
+    for model_type in _SPECIALIZED_TEST_MODEL_TYPES:
+        if model_type in models:
+            models[model_type].l1_graph_build = True
 
 
 def _scan_l2_arch_tests(models: dict[str, ModelInfo]) -> None:
@@ -543,7 +558,29 @@ def _compute_summary(
     l5_skipped_count = 0
 
     for info in models.values():
-        by_level[info.confidence_level] += 1
+        # Per-flag counts: how many models have each level flag set, independently.
+        # These are NOT exclusive (a model counted in L3 may also be in L1/L2).
+        # by_level[0] = not-tested (no flags set at all).
+        if not any(
+            [
+                info.l1_graph_build,
+                info.l2_arch_validation,
+                info.l3_synthetic_parity,
+                info.l4_golden_files,
+                info.l5_generation_golden,
+            ]
+        ):
+            by_level[0] += 1
+        if info.l1_graph_build:
+            by_level[1] += 1
+        if info.l2_arch_validation:
+            by_level[2] += 1
+        if info.l3_synthetic_parity:
+            by_level[3] += 1
+        if info.l4_golden_files:
+            by_level[4] += 1
+        if info.l5_generation_golden:
+            by_level[5] += 1
         by_category[info.category] = by_category.get(info.category, 0) + 1
         all_code_paths.update(info.code_paths)
         for cp in info.code_paths:

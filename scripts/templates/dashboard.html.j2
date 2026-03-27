@@ -306,12 +306,12 @@ function esc(s) {
 
 // --- Summary bar ---
 const LEVEL_DESCRIPTIONS = {
-  0: "No test coverage at all",
-  1: "ONNX graph builds from tiny config",
-  2: "Full-size HuggingFace config produces valid graph",
-  3: "Random-weight forward pass matches HuggingFace (atol)",
-  4: "Real-weight logits match golden reference",
-  5: "Full generation output matches golden reference"
+  0: "Models with no test coverage at all",
+  1: "Models where the ONNX graph builds from a tiny config (L1 flag set)",
+  2: "Models where the full-size HuggingFace config produces a valid graph (L2 flag set)",
+  3: "Models where random-weight forward pass matches HuggingFace output (L3 flag set)",
+  4: "Models where real-weight logits match golden reference (L4 flag set)",
+  5: "Models where full generation output matches golden reference (L5 flag set)"
 };
 
 (function renderSummary() {
