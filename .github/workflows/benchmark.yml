@@ -7,7 +7,7 @@ on:
       base_ref:
         description: "Base git ref to benchmark (default: PR base / main)"
         required: false
-        default: "origin/main"
+        default: "main"
       head_ref:
         description: "Head git ref to benchmark (default: PR head / HEAD)"
         required: false
@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: benchmark-${{ github.event.pull_request.number || github.run_id }}
@@ -25,7 +24,7 @@ concurrency:
 # For PRs: uses the PR base and head SHAs for exact reproducibility.
 # For workflow_dispatch: uses the input values or falls back to origin/main/HEAD.
 env:
-  BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref || 'origin/main' }}
+  BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref || 'main' }}
   HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref || 'HEAD' }}
 
 jobs:
@@ -35,6 +34,8 @@ jobs:
   benchmark-base:
     name: Benchmark base (${{ github.event.pull_request.base.label || 'main' }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -50,7 +51,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/pip
-          key: pip-bench-base-${{ env.BASE_REF }}-${{ hashFiles('pyproject.toml') }}
+          key: pip-bench-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-bench-
 
       - name: Install PyTorch CPU
@@ -74,8 +75,10 @@ jobs:
   # Job 2: benchmark the head commit (PR branch)
   # --------------------------------------------------------------------------
   benchmark-head:
-    name: Benchmark head (PR)
+    name: Benchmark head
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -91,7 +94,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cache/pip
-          key: pip-bench-head-${{ env.HEAD_REF }}-${{ hashFiles('pyproject.toml') }}
+          key: pip-bench-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-bench-
 
       - name: Install PyTorch CPU
@@ -118,6 +121,9 @@ jobs:
     name: Compare results
     runs-on: ubuntu-latest
     needs: [benchmark-base, benchmark-head]
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
 
@@ -127,12 +133,12 @@ jobs:
           python-version: "3.12"
 
       - name: Download baseline
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-baseline
 
       - name: Download current
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: benchmark-current
 
@@ -143,8 +149,14 @@ jobs:
             --current current.json \
             --output comparison.md
 
+      - name: Write to job summary
+        run: cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
         uses: actions/github-script@v8
         with:
           script: |

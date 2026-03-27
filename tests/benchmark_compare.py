@@ -78,6 +78,13 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
                 )
             )
 
+    # Flag models present in baseline but missing from current as removed.
+    removed_models = sorted(
+        set(baseline.get("models", {}).keys()) - set(current["models"].keys())
+    )
+    for model in removed_models:
+        rows.append((model, "(removed)", "—", "—", "—", "\U0001f5d1\ufe0f"))
+
     def _sha_link(sha: str) -> str:
         return f"[`{sha}`]({_GITHUB_REPO_URL}/commit/{sha})"
 
