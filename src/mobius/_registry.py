@@ -769,8 +769,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen3_vl": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_vl_text": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_5": "Qwen/Qwen3.5-2B",
-    "qwen3_5_vl": "Qwen/Qwen3.5-2B",
-    "qwen3_5_vl_text": "Qwen/Qwen3.5-2B",
+    # qwen3_5_vl and qwen3_5_vl_text omitted: no VL Qwen3.5 model published yet
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",

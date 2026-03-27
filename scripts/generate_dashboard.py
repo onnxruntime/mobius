@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import html
 import json
 import sys
 from datetime import datetime, timezone
@@ -581,12 +580,20 @@ def _compute_summary(
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
+def _to_js_json(obj: Any) -> str:
+    """Serialize obj to JSON safe for inline <script> injection.
+
+    The ``</`` replacement prevents the string from accidentally closing
+    a ``<script>`` tag when embedded in HTML.
+    """
+    return json.dumps(obj, separators=(",", ":")).replace("</", "<\\/")
+
+
 def _render_html(
     models: dict[str, ModelInfo],
     commit: str | None = None,
 ) -> str:
     """Render the self-contained HTML dashboard via Jinja2 template."""
-    families = _group_by_family(models)
     summary = _compute_summary(models)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -623,9 +630,6 @@ def _render_html(
             }
         )
 
-    def _to_js_json(obj: Any) -> str:
-        return json.dumps(obj, separators=(",", ":")).replace("</", "<\\/")
-
     model_data_json = _to_js_json(sorted(model_data, key=lambda m: m["model_type"]))
 
     from mobius._testing.code_paths import CODE_PATH_INDICATORS
@@ -639,32 +643,26 @@ def _render_html(
         for ind in CODE_PATH_INDICATORS
     ]
 
-    # Family data for grouping — clients use this for histogram counts.
-    family_data = {}
-    for fam_name, fam_models in families.items():
-        family_code_paths: set[str] = set()
-        for m in fam_models:
-            family_code_paths.update(m.code_paths)
-        family_data[fam_name] = {
-            "count": len(fam_models),
-            "models": [m.model_type for m in fam_models],
-            "code_paths": sorted(family_code_paths),
-        }
-
+    # Commit string is plain text; Jinja2 autoescape handles HTML encoding.
     context = {
         "timestamp": timestamp,
-        "commit": html.escape(commit) if commit else "unknown",
+        "commit": commit if commit else "unknown",
         "total_models": summary["total"],
+        # JSON blobs injected into <script> tags: marked |safe in the template
+        # because json.dumps already produces valid JS values and the </
+        # replacement prevents premature script-tag closure.
         "model_data_json": model_data_json,
         "code_path_json": _to_js_json(code_path_info),
         "summary_json": _to_js_json(summary),
-        "family_json": _to_js_json(family_data),
         "labels_json": _to_js_json(_CONFIDENCE_LABELS),
     }
 
+    # autoescape=True: Jinja2 HTML-escapes all {{ var }} by default.
+    # Variables containing pre-serialized JSON are marked |safe in the template
+    # to bypass escaping — they are already safe for <script> injection.
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(_TEMPLATES_DIR)),
-        autoescape=False,
+        autoescape=True,
         keep_trailing_newline=True,
     )
     template = env.get_template("dashboard.html.j2")

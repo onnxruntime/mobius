@@ -284,13 +284,18 @@ document.documentElement.setAttribute('data-theme',t);}())
 
 <script>
 // Data injected from Python — must come before raw JS block.
+// These variables contain pre-serialized JSON and are marked |safe in the
+// template to bypass Jinja2 autoescape (json.dumps output is already safe
+// for <script> injection; the </  → <\/ replacement prevents tag closure).
 const MODEL_DATA = {{ model_data_json | safe }};
 const CODE_PATH_INFO = {{ code_path_json | safe }};
 const SUMMARY = {{ summary_json | safe }};
-const FAMILY_DATA = {{ family_json | safe }};
 const LEVEL_LABELS = {{ labels_json | safe }};
 </script>
 <script>
+{# {% raw %} is required because JS template literals use ${...} which
+   conflicts with Jinja2's {{ }} syntax. All JS logic lives inside this
+   block so Jinja2 leaves it untouched. #}
 {% raw %}
 // Escape HTML entities to prevent XSS when inserting into innerHTML.
 function esc(s) {
@@ -423,7 +428,6 @@ function renderTable() {
     const sortedFamilies = Object.keys(groups).sort();
     sortedFamilies.forEach(fam => {
       const models = groups[fam];
-      const maxLevel = Math.max(...models.map(m => m.confidence_level));
       const expanded = expandedFamilies.has(fam);
       const arrow = expanded ? '\u25BC' : '\u25B6';
       const famPaths = [...new Set(models.flatMap(m => m.code_paths))].sort();
@@ -508,14 +512,14 @@ function renderModelRow(m) {
   const expanded = expandedDetails.has(m.model_type);
 
   // Entire row is clickable; button uses stopPropagation to avoid double-toggle.
-  let row = `<tr style="cursor:pointer" onclick="toggleDetail('${m.model_type}')">
+  let row = `<tr style="cursor:pointer" onclick="toggleDetail(${JSON.stringify(m.model_type)})">
     <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
     <td><div class="level-dots" role="img" aria-label="Coverage: ${LEVEL_LABELS[m.confidence_level]}">${dots}</div></td>
     <td>${tags || '<span style="color:var(--text-muted)">none</span>'}</td>
-    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick="event.stopPropagation();toggleDetail('${m.model_type}')">${expanded ? '\u2212' : '+'}</button></td>
+    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick="event.stopPropagation();toggleDetail(${JSON.stringify(m.model_type)})">${expanded ? '\u2212' : '+'}</button></td>
   </tr>`;
 
   if (expanded) {
