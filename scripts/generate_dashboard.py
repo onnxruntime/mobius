@@ -82,6 +82,7 @@ class ModelInfo:
     l5_test_case_skipped: bool = False
     yaml_test_case_file: str | None = None
     yaml_test_case_skip_reason: str | None = None
+    yaml_min_token_match_ratio: float | None = None
     # L3 synthetic parity status: "pass", "xfail", "skip", or None
     l3_status: str | None = None
     l3_status_reason: str | None = None
@@ -361,12 +362,17 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         # Skip test cases that are explicitly skipped — they don't count as coverage,
         # but we still record them so the dashboard can show "skipped" status.
         skip_reason = data.get("skip_reason")
+        min_token_match_ratio = data.get("min_token_match_ratio")
         if skip_reason:
             matched_types = model_id_to_types.get(model_id, [])
             for model_type in matched_types:
                 if model_type in models:
                     models[model_type].yaml_test_case_file = rel_path
                     models[model_type].yaml_test_case_skip_reason = skip_reason
+                    if min_token_match_ratio is not None:
+                        models[model_type].yaml_min_token_match_ratio = float(
+                            min_token_match_ratio
+                        )
                     if "L4" in level:
                         models[model_type].l4_test_case_skipped = True
                     if "L5" in level:
@@ -378,6 +384,10 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         for model_type in matched_types:
             if model_type in models:
                 models[model_type].yaml_test_case_file = rel_path
+                if min_token_match_ratio is not None:
+                    models[model_type].yaml_min_token_match_ratio = float(
+                        min_token_match_ratio
+                    )
                 if "L4" in level:
                     models[model_type].l4_has_test_case = True
                 if "L5" in level:
@@ -563,6 +573,7 @@ def _generate_html(
                 "l3_reason": info.l3_status_reason,
                 "yaml_case": info.yaml_test_case_file,
                 "yaml_skip_reason": info.yaml_test_case_skip_reason,
+                "min_token_match_ratio": info.yaml_min_token_match_ratio,
                 "code_paths": sorted(info.code_paths),
                 "config_overrides": _json_safe(info.config_overrides),
                 "has_integration_test": info.has_integration_test,
@@ -765,6 +776,10 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .l3-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
 .l3-xfail { background: rgba(210,153,34,0.2); color: var(--l1); }
 .l3-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
+.ratio-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
+.ratio-high { background: rgba(63,185,80,0.2); color: var(--l3); }
+.ratio-medium { background: rgba(210,153,34,0.2); color: var(--l1); }
+.ratio-low { background: rgba(248,81,73,0.2); color: var(--l0); }
 .golden-status { margin-top: 8px; padding: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85em; }
 .golden-status .status-row { display: flex; gap: 16px; align-items: center; margin: 2px 0; }
 .golden-status .status-icon { width: 20px; text-align: center; }
@@ -1074,13 +1089,21 @@ function renderModelRow(m) {
     l3Badge = ` <span class="l3-status l3-skip" title="L3 skip: ${esc(m.l3_reason || '')}">skip</span>`;
   }
 
+  let ratioBadge = '';
+  if (m.min_token_match_ratio != null) {
+    const r = m.min_token_match_ratio;
+    const cls = r >= 0.9 ? 'ratio-high' : r >= 0.5 ? 'ratio-medium' : 'ratio-low';
+    const pct = Math.round(r * 100);
+    ratioBadge = ` <span class="ratio-badge ${cls}" title="L5 min_token_match_ratio: ${r} (per-case override)">${pct}%</span>`;
+  }
+
   const tags = m.code_paths.map(p =>
     `<span class="tag">${esc(p)}</span>`
   ).join('');
   const expanded = expandedDetails.has(m.model_type);
 
   let row = `<tr>
-    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}</td>
+    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
@@ -1133,6 +1156,16 @@ function renderDetailRow(m) {
   }
   goldenHtml += `<div class="status-row"><span class="status-icon">${m.l4 ? '\u2705' : m.l4_skipped ? '\u23ED' : m.l4_case ? '\u274C' : '\u2796'}</span> L4 golden data: ${m.l4 ? 'available' : m.l4_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l4_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
   goldenHtml += `<div class="status-row"><span class="status-icon">${m.l5 ? '\u2705' : m.l5_skipped ? '\u23ED' : m.l5_case ? '\u274C' : '\u2796'}</span> L5 golden data: ${m.l5 ? 'available' : m.l5_skipped ? `skipped (${esc(m.yaml_skip_reason || 'known issue')})` : m.l5_case ? 'test case exists, run generate_golden.py' : 'none'}</div>`;
+
+  if (m.min_token_match_ratio != null) {
+    const r = m.min_token_match_ratio;
+    const cls = r >= 0.9 ? 'ratio-high' : r >= 0.5 ? 'ratio-medium' : 'ratio-low';
+    const pct = Math.round(r * 100);
+    const msg = r < 0.5 ? ' \u26A0\uFE0F low \u2014 test may not be meaningful'
+              : r < 0.9 ? ' \u26A0\uFE0F below recommended threshold (0.9)'
+              : '';
+    goldenHtml += `<div class="status-row"><span class="status-icon">\uD83C\uDFAF</span> L5 token match threshold: <span class="ratio-badge ${cls}">${pct}%</span><span style="color:var(--text-muted)">${msg}</span></div>`;
+  }
 
   // L3 parity status
   if (m.l3_status) {
