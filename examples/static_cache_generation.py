@@ -59,7 +59,7 @@ MAX_SEQ_LEN = 2048
 def build_model(model_id: str, *, max_seq_len: int):
     """Build an ONNX model with static KV cache."""
     task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
-    return build(model_id, task=task)
+    return build(model_id, task=task, dtype="f32")
 
 
 # ---------------------------------------------------------------------------
