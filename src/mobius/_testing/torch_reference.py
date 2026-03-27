@@ -411,8 +411,13 @@ def load_torch_audio_model(
     model_id: str,
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
+    trust_remote_code: bool = False,
 ):
     """Load a HuggingFace audio model for reference inference.
+
+    Args:
+        trust_remote_code: Whether to allow executing remote code from the
+            model repository.  Defaults to False for safety.
 
     Returns:
         Tuple of (model, processor).
@@ -423,17 +428,17 @@ def load_torch_audio_model(
     # not a full processor with a tokenizer.  Fall back gracefully.
     try:
         processor = transformers.AutoProcessor.from_pretrained(
-            model_id, trust_remote_code=True
+            model_id, trust_remote_code=trust_remote_code
         )
     except (TypeError, OSError):
         processor = transformers.AutoFeatureExtractor.from_pretrained(
-            model_id, trust_remote_code=True
+            model_id, trust_remote_code=trust_remote_code
         )
     model = transformers.AutoModel.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map=device,
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     model.eval()
 

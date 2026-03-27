@@ -433,7 +433,9 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
         torch_audio_forward,
     )
 
-    model, processor = load_torch_audio_model(case.model_id, device=device)
+    model, processor = load_torch_audio_model(
+        case.model_id, device=device, trust_remote_code=True
+    )
 
     # Load and preprocess audio
     audio_path = Path("testdata") / case.audio[0]

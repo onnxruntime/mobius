@@ -207,14 +207,16 @@ class GatedDeltaNet(nn.Module):
             op.Constant(value_ints=[self.key_dim]),
             axis=0,
         )
-        query = op.Reshape(
-            op.LpNormalization(op.Reshape(query, qk_4d_shape), axis=-1, p=2),
-            qk_3d_shape,
-        )
-        key = op.Reshape(
-            op.LpNormalization(op.Reshape(key, qk_4d_shape), axis=-1, p=2),
-            qk_3d_shape,
-        )
+        # L2-normalize along head_dim: x / max(‖x‖₂, ε)
+        # Manual implementation because ORT doesn't yet support LpNormalization opset 22.
+        eps = op.Constant(value_float=1e-12)
+        q_4d = op.Reshape(query, qk_4d_shape)
+        q_norm = op.Sqrt(op.ReduceSumSquare(q_4d, [-1], keepdims=True))
+        query = op.Reshape(op.Div(q_4d, op.Max(q_norm, eps)), qk_3d_shape)
+
+        k_4d = op.Reshape(key, qk_4d_shape)
+        k_norm = op.Sqrt(op.ReduceSumSquare(k_4d, [-1], keepdims=True))
+        key = op.Reshape(op.Div(k_4d, op.Max(k_norm, eps)), qk_3d_shape)
 
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
