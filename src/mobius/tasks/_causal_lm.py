@@ -120,7 +120,7 @@ class CausalLMTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        # --- Cache setup ---
+        # --- Cache setup (static vs dynamic) ---
         if static:
             attention_mask = None
             graph_inputs = [input_ids, position_ids]
@@ -169,7 +169,7 @@ class CausalLMTask(ModelTask):
         logits.name = "logits"
         graph.outputs.append(logits)
 
-        # --- Output registration ---
+        # --- Output registration (static vs dynamic) ---
         if static:
             kv_hidden = config.num_key_value_heads * config.head_dim
             _register_static_cache_outputs(
@@ -409,9 +409,9 @@ def _validate_static_cache_support(module: nn.Module) -> None:
 class StaticCacheCausalLMTask(CausalLMTask):
     """Convenience alias: equivalent to ``CausalLMTask(static_cache=True)``.
 
-    .. deprecated::
-        Use ``CausalLMTask(static_cache=True, max_seq_len=...)`` directly.
-        This alias is kept for backward compatibility.
+    Prefer ``CausalLMTask(static_cache=True, max_seq_len=...)`` for new
+    code.  This subclass is provided for convenience and backward
+    compatibility.
     """
 
     def __init__(self, max_seq_len: int | None = None):
