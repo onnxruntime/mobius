@@ -1315,9 +1315,12 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
 // --- Missing coverage ---
 (function renderMissing() {
   const el = document.getElementById('missing-coverage');
-  const missing = MODEL_DATA.filter(m => !m.l1);
+  // A model has coverage if it has any L1 test config OR any YAML test case.
+  const missing = MODEL_DATA.filter(m =>
+    !m.l1 && !m.l4_case && !m.l5_case && !m.l4_skipped && !m.l5_skipped
+  );
   if (missing.length === 0) {
-    el.innerHTML = '<p style="color:var(--l3)">\u2705 All models have at least L1 coverage!</p>';
+    el.innerHTML = '<p style="color:var(--l3)">\u2705 All models have at least some test coverage!</p>';
     return;
   }
   const groups = {};
