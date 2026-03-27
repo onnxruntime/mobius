@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Static Cache Support
+
+#### Added
+
+- **Static KV cache in CLI and Python API** — `--static-cache` and
+  `--max-seq-len` CLI flags for `mobius build`. Python API:
+  `CausalLMTask(static_cache=True, max_seq_len=2048)`.  Static cache
+  pre-allocates fixed-size KV buffers updated via TensorScatter, avoiding
+  repeated concatenation (dynamic cache remains the default).
+- `examples/static_cache_generation.py` — greedy text generation example
+  with static KV cache, demonstrating `write_indices` and
+  `nonpad_kv_seqlen` management.
+
+#### Changed
+
+- `CausalLMTask` now supports both dynamic and static cache modes via
+  `static_cache` and `max_seq_len` keyword arguments.  The `build()`
+  method uses clean conditionals for cache setup and output registration.
+- `StaticCacheCausalLMTask` is now a convenience subclass of
+  `CausalLMTask` (equivalent to `CausalLMTask(static_cache=True)`).
+  Fully backward compatible — existing code using
+  `StaticCacheCausalLMTask` continues to work unchanged.
+
 ### Wave 9
 
 #### Added
