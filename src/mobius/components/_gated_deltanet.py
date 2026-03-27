@@ -208,11 +208,11 @@ class GatedDeltaNet(nn.Module):
             axis=0,
         )
         query = op.Reshape(
-            _l2_normalize(op, op.Reshape(query, qk_4d_shape)),
+            op.LpNormalization(op.Reshape(query, qk_4d_shape), axis=-1, p=2),
             qk_3d_shape,
         )
         key = op.Reshape(
-            _l2_normalize(op, op.Reshape(key, qk_4d_shape)),
+            op.LpNormalization(op.Reshape(key, qk_4d_shape), axis=-1, p=2),
             qk_3d_shape,
         )
 
@@ -275,12 +275,3 @@ class GatedDeltaNet(nn.Module):
         output = self.out_proj(op, output)
 
         return output, new_conv_state, new_recurrent_state
-
-
-def _l2_normalize(op: builder.OpBuilder, x, eps: float = 1e-6):
-    """L2 normalize along the last dimension."""
-    sq = op.Mul(x, x)
-    sq_sum = op.ReduceSum(sq, [-1], keepdims=True)
-    eps_val = op.CastLike(op.Constant(value_float=eps), x)
-    inv_norm = op.Reciprocal(op.Sqrt(op.Add(sq_sum, eps_val)))
-    return op.Mul(x, inv_norm)
