@@ -391,6 +391,8 @@ def _prepare_audio_feeds(
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
     processed = processor(audio_array, sampling_rate=16000, return_tensors="np")
     feeds: dict[str, np.ndarray] = {
+        # Assumes the ONNX model's input is named "input_values" — the
+        # standard key for Wav2Vec2-family audio encoder models.
         "input_values": processed["input_values"].astype(np.float32),
     }
     return feeds
