@@ -88,6 +88,7 @@ _XFAIL_REASONS: dict[str, str] = {
     # VL multi-model inference: test infra needs model-specific position_ids
     "image-text-to-text/qwen3-vl-2b": "VL prefill needs 3D position_ids (model-specific RoPE)",
     "image-text-to-text/qwen2_5-vl-3b": "VL prefill needs 3D position_ids (model-specific RoPE)",
+    "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
 }
 
 
