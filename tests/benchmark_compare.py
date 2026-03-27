@@ -1,14 +1,18 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-r"""Compare benchmark results against baseline for regression detection.
+r"""Compare benchmark results between two commits for regression detection.
 
 Usage::
 
     python tests/benchmark_compare.py \\
-        --current results.json \\
-        --baseline tests/perf_baseline.json \\
+        --baseline baseline.json \\
+        --current current.json \\
         --output comparison.md
+
+In CI this is called dynamically: ``baseline.json`` comes from benchmarking
+the PR base commit (main) and ``current.json`` from the PR head commit.
+Both files are produced by ``benchmark_build.py --json <path>``.
 
 Exit code 0 = no blockers, 1 = blocker regression detected.
 Only deterministic metrics (num_nodes, model_size_bytes) can trigger
@@ -107,7 +111,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Compare benchmark results against baseline")
     p.add_argument("--current", required=True)
-    p.add_argument("--baseline", default="tests/perf_baseline.json")
+    p.add_argument("--baseline", required=True)
     p.add_argument("--output", default="comparison.md")
     args = p.parse_args()
     md, has_blocker = compare(args.current, args.baseline)
