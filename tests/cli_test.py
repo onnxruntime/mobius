@@ -72,6 +72,81 @@ class TestCLIBuild:
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(["build", tmpdir])  # no --model or --config
 
+    def test_build_static_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--static-cache",
+                ]
+            )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
+    def test_build_static_cache_with_max_seq_len(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--static-cache",
+                    "--max-seq-len",
+                    "512",
+                ]
+            )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
+    def test_max_seq_len_without_static_cache_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--max-seq-len",
+                    "512",
+                ]
+            )
+
+    def test_static_cache_with_conflicting_task_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--static-cache",
+                    "--task",
+                    "text-generation",
+                ]
+            )
+
+    def test_static_cache_with_matching_task_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--static-cache",
+                    "--task",
+                    "static-cache-text-generation",
+                ]
+            )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
 
 class TestCLIInfo:
     """Test the ``info`` subcommand."""
