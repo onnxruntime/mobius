@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mobius._testing.golden import TestCase
+    from mobius._testing.golden import GoldenTestCase as TestCase
 
 import numpy as np
 
@@ -450,6 +450,46 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
     )
 
 
+def _generate_image_classification(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for image classification (ViT, CLIP, etc.).
+
+    Similar to encoder-only: last hidden state is used as the
+    "logit" vector for top-k extraction.
+    """
+    from PIL import Image
+
+    from mobius._testing.golden import save_golden_ref
+    from mobius._testing.torch_reference import (
+        load_torch_vision_model,
+        torch_vision_forward,
+    )
+
+    model, processor = load_torch_vision_model(case.model_id, device=device)
+
+    # Load and preprocess image
+    image = Image.open(Path("testdata") / case.images[0])
+    # Use PyTorch tensors then convert — some processors don't support np
+    processed = processor(images=image, return_tensors="pt")
+    pixel_values = processed["pixel_values"].numpy()
+
+    # Forward pass → last_hidden_state
+    hidden_states = torch_vision_forward(model, pixel_values)
+    # Use the last patch token's hidden state for top-k extraction
+    last_hidden = hidden_states[0, -1, :]  # (hidden_size,)
+    golden = _extract_logits_golden(last_hidden)
+
+    # Image classification is L4-only (no generation)
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=np.array([[0]], dtype=np.int64),  # placeholder
+    )
+
+
 # ---- Dispatcher ----
 
 # Map task_type strings to generator functions.
@@ -458,6 +498,7 @@ _GENERATORS = {
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,
     "image-text-to-text": _generate_vision_language,
+    "image-classification": _generate_image_classification,
     "speech-to-text": _generate_speech_to_text,
     "audio-feature-extraction": _generate_audio_feature_extraction,
 }

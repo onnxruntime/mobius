@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -36,6 +37,9 @@ from mobius._testing.golden import (
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+
+# Root of test data (images, audio, etc.)
+_TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
 
 
 @pytest.fixture(autouse=True)
@@ -298,12 +302,17 @@ def _extract_logits(
     """Extract the logit tensor from model outputs.
 
     For text-generation and seq2seq tasks, returns ``outputs["logits"]``.
-    For feature-extraction (encoder), falls back to
-    ``outputs["last_hidden_state"]``.
+    For feature-extraction, image-classification, and audio-feature-extraction
+    tasks, falls back to ``outputs["last_hidden_state"]``.
     """
     if "logits" in outputs:
         return outputs["logits"]
-    if task_type == "feature-extraction" and "last_hidden_state" in outputs:
+    _hidden_state_tasks = {
+        "feature-extraction",
+        "image-classification",
+        "audio-feature-extraction",
+    }
+    if task_type in _hidden_state_tasks and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
         f"No logits found in outputs for task_type={task_type!r}. "
@@ -328,6 +337,59 @@ def _token_match_ratio(
         return 0.0
     matches = sum(1 for a, e in zip(actual[:min_len], expected[:min_len]) if a == e)
     return matches / len(expected)
+
+
+def _prepare_vision_feeds(
+    case: GoldenTestCase,
+    session: OnnxModelSession,
+) -> dict[str, np.ndarray]:
+    """Prepare input feeds for an image-classification forward pass.
+
+    Loads the test image and preprocesses it with the HuggingFace
+    image processor to produce ``pixel_values``.
+    """
+    import transformers
+    from PIL import Image
+
+    processor = transformers.AutoImageProcessor.from_pretrained(
+        case.model_id, trust_remote_code=True
+    )
+    image = Image.open(_TESTDATA_DIR / case.images[0])
+    processed = processor(images=image, return_tensors="np")
+    feeds: dict[str, np.ndarray] = {
+        "pixel_values": processed["pixel_values"].astype(np.float32),
+    }
+    return feeds
+
+
+def _prepare_audio_feeds(
+    case: GoldenTestCase,
+    session: OnnxModelSession,
+) -> dict[str, np.ndarray]:
+    """Prepare input feeds for an audio-feature-extraction forward pass.
+
+    Loads the test audio and preprocesses it with the HuggingFace
+    feature extractor to produce ``input_values``.
+    """
+    import librosa
+    import transformers
+
+    # Fall back to AutoFeatureExtractor for models without a tokenizer
+    try:
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+    except (TypeError, OSError):
+        processor = transformers.AutoFeatureExtractor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+    processed = processor(audio_array, sampling_rate=16000, return_tensors="np")
+    feeds: dict[str, np.ndarray] = {
+        "input_values": processed["input_values"].astype(np.float32),
+    }
+    return feeds
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +424,20 @@ class TestL4CheckpointVerified:
         # Seq2seq models require running encoder → decoder
         if case.task_type == "seq2seq":
             outputs = _run_seq2seq_prefill(pkg, golden, config)
+        elif case.task_type == "image-classification":
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_vision_feeds(case, session)
+                outputs = session.run(feeds)
+            finally:
+                session.close()
+        elif case.task_type == "audio-feature-extraction":
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_audio_feeds(case, session)
+                outputs = session.run(feeds)
+            finally:
+                session.close()
         else:
             session = _open_decoder_session(pkg)
             try:

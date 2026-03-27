@@ -15,4 +15,5 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
+skip_reason: "Awaiting GPU golden generation (7B params, requires CUDA)."
 notes: "LLaVA 1.5 7B. CLIP vision encoder + Vicuna decoder."

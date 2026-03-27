@@ -358,6 +358,9 @@ def load_torch_vision_model(
 ):
     """Load a HuggingFace vision model for reference inference.
 
+    For multi-modal models like CLIP, extracts just the vision sub-model
+    so that ``torch_vision_forward`` can run with only ``pixel_values``.
+
     Returns:
         Tuple of (model, processor).
     """
@@ -373,6 +376,11 @@ def load_torch_vision_model(
         trust_remote_code=True,
     )
     model.eval()
+
+    # Multi-modal models (CLIP, SigLIP) wrap a vision sub-model that
+    # can be called with pixel_values alone.
+    if hasattr(model, "vision_model"):
+        model = model.vision_model
 
     return model, processor
 
@@ -411,7 +419,16 @@ def load_torch_audio_model(
     """
     import transformers
 
-    processor = transformers.AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    # Some audio models (e.g. HuBERT) only have a feature extractor,
+    # not a full processor with a tokenizer.  Fall back gracefully.
+    try:
+        processor = transformers.AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True
+        )
+    except (TypeError, OSError):
+        processor = transformers.AutoFeatureExtractor.from_pretrained(
+            model_id, trust_remote_code=True
+        )
     model = transformers.AutoModel.from_pretrained(
         model_id,
         torch_dtype=dtype,
