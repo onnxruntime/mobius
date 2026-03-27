@@ -355,6 +355,10 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         level = data.get("level", "")
         rel_path = str(yaml_file.relative_to(_REPO_ROOT))
 
+        # Skip test cases that are explicitly skipped — they don't count as coverage.
+        if data.get("skip_reason"):
+            continue
+
         # Find matching model_types via test_model_id reverse index
         matched_types = model_id_to_types.get(model_id, [])
         for model_type in matched_types:
