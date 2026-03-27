@@ -106,11 +106,6 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   background: rgba(210,153,34,0.35); border-color: var(--l1);
   border-style: solid; border-width: 2px;
 }
-.dot.pending {
-  /* test case exists, golden file not yet generated */
-  background: transparent; border-color: var(--l1);
-  border-style: dashed; border-width: 2px;
-}
 .dot.skipped {
   background: transparent; border-color: var(--text-muted);
   border-style: dotted; border-width: 2px;
@@ -290,11 +285,10 @@ document.documentElement.setAttribute('data-theme',t);}())
     <button data-group="flat" aria-pressed="false">Flat</button>
   </div>
   <div class="dot-legend">
-    <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Passed</span>
+    <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Tested</span>
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
-    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Known failure</span>
-    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Pending golden data</span>
-    <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped / not run</span>
+    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected failure</span>
+    <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
     <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No test</span>
   </div>
 </div>
@@ -522,7 +516,7 @@ function renderModelRow(m) {
     // isSkipped: test is NOT run at all (L3 skip, or L4/L5 explicitly skipped).
     const isL3Skip = i === 3 && m.l3_status === 'skip';
     const isSkipped = (i === 4 && m.l4_skipped) || (i === 5 && m.l5_skipped) || isL3Skip;
-    // isPending: test case defined but golden file not yet generated (L4/L5 only).
+    // isPending consolidated into skipped: test case defined but not yet run (L4/L5 only).
     const isPending = hasTest && !active && !isXfail && !isL3Skip &&
       ((i === 4 && m.l4_case) || (i === 5 && m.l5_case));
     let cls = 'dot';
@@ -532,14 +526,12 @@ function renderModelRow(m) {
       label += ' (passed)';
     } else if (isXfail) {
       cls += ' xfail';
-      label += ` (known failure: ${esc(m.l3_reason || 'xfail')})`;
-    } else if (isSkipped) {
+      label += ` (expected failure: ${esc(m.l3_reason || 'xfail')})`;
+    } else if (isSkipped || isPending) {
       cls += ' skipped';
-      if (isL3Skip) label += ` (skipped / not run: ${esc(m.l3_reason || '')})`;
-      else label += ` (skipped / not run: ${esc(m.yaml_skip_reason || 'known issue')})`;
-    } else if (isPending) {
-      cls += ' pending';
-      label += ' (test case exists, golden data not yet generated)';
+      if (isL3Skip) label += ` (skipped: ${esc(m.l3_reason || '')})`;
+      else if (isPending) label += ' (test case defined, not yet run)';
+      else label += ` (skipped: ${esc(m.yaml_skip_reason || 'known issue')})`;
     } else if (hasTest) {
       cls += ' failed';
       label += ' (test exists, not passing)';
@@ -602,8 +594,8 @@ function renderDetailRow(m) {
     ['L1: Graph Build', m.l1, 'Model builds a valid ONNX graph from tiny config', m.config_overrides.length > 0, null],
     ['L2: Config Compatible', m.l2, 'Full-size HF config produces valid graph', !!m.test_model_id, null],
     ['L3: Synthetic Parity', l3Active, 'Random-weight forward pass matches HF (atol)', m.l3_status != null, l3IconOverride],
-    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u25D4' : null],
-    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u25D4' : null],
+    ['L4: Golden Match', m.l4, 'Real-weight logits match golden reference', m.l4_case && !m.l4_skipped, (m.l4_case && !m.l4 && !m.l4_skipped) ? '\u23ED' : null],
+    ['L5: Generation', m.l5, 'Full generation matches golden output', m.l5_case && !m.l5_skipped, (m.l5_case && !m.l5 && !m.l5_skipped) ? '\u23ED' : null],
   ];
 
   let levelHtml = '<table style="width:100%;margin-bottom:8px;border:none">';
