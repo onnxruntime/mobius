@@ -3,8 +3,7 @@
 
 """ONNX Runtime inference session wrapper for ir.Model objects.
 
-Uses ``onnxruntime-easy`` which handles bfloat16 and other non-standard
-dtypes transparently.
+Handles bfloat16 and other non-standard dtypes transparently via ml_dtypes.
 """
 
 from __future__ import annotations
@@ -14,13 +13,52 @@ from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
-import onnxruntime_easy as ort_easy
+import onnxruntime as ort
+import onnxruntime.capi._pybind_state as _ort_c
 
 from mobius._model_package import ModelPackage
 
 
+def _to_ort_value(value: np.ndarray, device: str = "cpu") -> ort.OrtValue:
+    """Convert a numpy array to an OrtValue, handling special ml_dtypes dtypes."""
+    # Use DLPack when available (e.g. torch tensors or non-zero-size arrays)
+    if hasattr(value, "__dlpack__"):
+        is_zero_size = hasattr(value, "size") and value.size == 0
+        if not is_zero_size:
+            return ort.OrtValue(_ort_c.OrtValue.from_dlpack(value.__dlpack__(), False), value)
+    if isinstance(value, np.ndarray):
+        try:
+            onnx_type = ir.DataType.from_numpy(value.dtype)
+        except TypeError:
+            pass
+        else:
+            return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+                value, onnx_element_type=onnx_type.value
+            )
+    return ort.OrtValue.ortvalue_from_numpy(np.asarray(value), device)
+
+
+def _create_session(model_path: str, device: str = "cpu") -> ort.InferenceSession:
+    """Create an ORT InferenceSession with sensible defaults.
+
+    Args:
+        model_path: Path to the ONNX model file.
+        device: Execution device, ``"cpu"`` or ``"cuda"``.
+    """
+    if device == "cpu":
+        providers = ("CPUExecutionProvider",)
+    elif device == "cuda":
+        providers = ("CUDAExecutionProvider", "CPUExecutionProvider")
+    else:
+        raise ValueError(f"Unsupported device: {device!r}. Expected 'cpu' or 'cuda'.")
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.log_severity_level = 2  # warning
+    return ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+
+
 class OnnxModelSession:
-    """Wraps an ``onnxruntime_easy.EasySession`` for an ``ir.Model``.
+    """Wraps an ``ort.InferenceSession`` for an ``ir.Model``.
 
     Serializes the model to a temporary file and creates an ORT session.
     Provides a simple ``run()`` interface that accepts and returns numpy arrays.
@@ -37,7 +75,7 @@ class OnnxModelSession:
     def __init__(
         self,
         model: ir.Model | ModelPackage,
-        **load_kwargs,
+        device: str = "cpu",
     ):
         if isinstance(model, ModelPackage):
             if len(model) != 1:
@@ -46,11 +84,12 @@ class OnnxModelSession:
                     f"single ir.Model or index into the package."
                 )
             model = next(iter(model.values()))
+        self._device = device
         self._tmpdir = tempfile.TemporaryDirectory()
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
         ir.save(model, self._model_path, external_data="model.onnx.data")
 
-        self._session = ort_easy.load(self._model_path, **load_kwargs)
+        self._session = _create_session(self._model_path, device=device)
         self._input_names = [inp.name for inp in self._session.get_inputs()]
         self._output_names = [out.name for out in self._session.get_outputs()]
 
@@ -91,8 +130,10 @@ class OnnxModelSession:
             # because np.ascontiguousarray promotes them to 1-d.
             if v.ndim > 0:
                 v = np.ascontiguousarray(v)
-            ort_feeds[k] = ort_easy.ort_value(v)
-        raw_outputs = self._session(**ort_feeds)
+            ort_feeds[k] = _to_ort_value(v, device=self._device)
+        run_opts = ort.RunOptions()
+        run_opts.log_severity_level = 2  # warning
+        raw_outputs = self._session.run_with_ort_values(None, ort_feeds, run_options=run_opts)
         return dict(zip(self._output_names, (o.numpy() for o in raw_outputs)))
 
     def close(self) -> None:
