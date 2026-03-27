@@ -296,6 +296,16 @@ def _prepare_prefill_feeds(
     return feeds
 
 
+# Task types that produce ``last_hidden_state`` instead of ``logits``.
+_HIDDEN_STATE_TASKS: frozenset[str] = frozenset(
+    {
+        "feature-extraction",
+        "image-classification",
+        "audio-feature-extraction",
+    }
+)
+
+
 def _extract_logits(
     outputs: dict[str, np.ndarray],
     task_type: str,
@@ -308,12 +318,7 @@ def _extract_logits(
     """
     if "logits" in outputs:
         return outputs["logits"]
-    _hidden_state_tasks = {
-        "feature-extraction",
-        "image-classification",
-        "audio-feature-extraction",
-    }
-    if task_type in _hidden_state_tasks and "last_hidden_state" in outputs:
+    if task_type in _HIDDEN_STATE_TASKS and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
         f"No logits found in outputs for task_type={task_type!r}. "

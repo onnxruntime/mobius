@@ -474,7 +474,9 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
 
     # Forward pass → last_hidden_state
     hidden_states = torch_vision_forward(model, pixel_values)
-    # Use the last patch token's hidden state for top-k extraction
+    # Use the last patch token rather than the CLS token (index 0) because
+    # patch-based ViT models aggregate spatial context into trailing tokens;
+    # the last token provides a stable, architecture-neutral summary vector.
     last_hidden = hidden_states[0, -1, :]  # (hidden_size,)
     golden = _extract_logits_golden(last_hidden)
 
