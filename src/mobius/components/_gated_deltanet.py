@@ -208,24 +208,17 @@ class GatedDeltaNet(nn.Module):
             axis=0,
         )
         # L2-normalize query and key per head along head_k_dim (axis=-1).
-        # TODO: Use op.LpNormalization(x, axis=-1, p=2) once ORT >=1.25 supports it.
-        # 1e-6 chosen to be representable in float16 (1e-12 underflows to 0 in fp16).
-        # CastLike ensures the epsilon matches the input dtype (fp16/bf16/fp32).
+        # Decomposed form of op.LpNormalization(x, axis=-1, p=2).
+        # TODO: Use op.LpNormalization directly once ORT >=1.25 supports it.
         q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
         q_l2 = op.Sqrt(
-            op.Add(
-                op.ReduceSumSquare(q_4d, axes=[-1], keepdims=1),
-                op.CastLike(op.Constant(value_float=1e-6), q_4d),
-            )
+            op.ReduceSumSquare(q_4d, axes=[-1], keepdims=1)
         )  # (B, T, num_k_heads, 1) — L2 norm per head
         query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
 
         k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
         k_l2 = op.Sqrt(
-            op.Add(
-                op.ReduceSumSquare(k_4d, axes=[-1], keepdims=1),
-                op.CastLike(op.Constant(value_float=1e-6), k_4d),
-            )
+            op.ReduceSumSquare(k_4d, axes=[-1], keepdims=1)
         )  # (B, T, num_k_heads, 1) — L2 norm per head
         key = op.Reshape(op.Div(k_4d, k_l2), qk_3d_shape)  # (B, T, key_dim)
 
