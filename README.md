@@ -64,10 +64,9 @@ pkg.save("output/llama-3.2-1b/")
 useful when you know the maximum sequence length up front:
 
 ```python
-from mobius import build
-from mobius.tasks import StaticCacheCausalLMTask
+from mobius import build, CausalLMTask
 
-task = StaticCacheCausalLMTask(max_seq_len=2048)
+task = CausalLMTask(static_cache=True, max_seq_len=2048)
 pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```

@@ -122,7 +122,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         _load_diffusers_pipeline_index,
         build_diffusers_pipeline,
     )
-    from mobius.tasks import ModelTask, StaticCacheCausalLMTask
+    from mobius.tasks import CausalLMTask, ModelTask
 
     # Validate --max-seq-len requires --static-cache
     if args.max_seq_len is not None and not args.static_cache:
@@ -144,7 +144,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
-        task = StaticCacheCausalLMTask(max_seq_len=args.max_seq_len)
+        task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)

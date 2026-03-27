@@ -263,10 +263,9 @@ def build(
 
     Example with static cache::
 
-        from mobius import build
-        from mobius.tasks import StaticCacheCausalLMTask
+        from mobius import build, CausalLMTask
 
-        task = StaticCacheCausalLMTask(max_seq_len=2048)
+        task = CausalLMTask(static_cache=True, max_seq_len=2048)
         pkg = build("meta-llama/Llama-3-8B", task=task)
     """
     import dataclasses

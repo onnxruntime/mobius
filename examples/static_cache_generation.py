@@ -39,7 +39,7 @@ import transformers
 
 from mobius import build
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.tasks import StaticCacheCausalLMTask
+from mobius.tasks import CausalLMTask
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -58,7 +58,7 @@ MAX_SEQ_LEN = 2048
 
 def build_model(model_id: str, *, max_seq_len: int):
     """Build an ONNX model with static KV cache."""
-    task = StaticCacheCausalLMTask(max_seq_len=max_seq_len)
+    task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
     return build(model_id, task=task)
 
 
