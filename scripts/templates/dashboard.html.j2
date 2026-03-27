@@ -381,13 +381,18 @@ const LEVEL_DESCRIPTIONS = {
   bar.innerHTML = totalCard;
   for (let i = 0; i <= 5; i++) {
     const count = SUMMARY.by_level[i] || 0;
-    // Annotate L4 and L5 cards with skipped counts so the full picture is
-    // visible without a separate card.
+    // Annotate L4 and L5 cards with skipped + awaiting-data counts so the full
+    // picture is visible without a separate redundant card.
     let annotation = '';
-    if (i === 4 && SUMMARY.l4_skipped_count) {
-      annotation = `<div class="card-annotation">+${SUMMARY.l4_skipped_count} skipped</div>`;
-    } else if (i === 5 && SUMMARY.l5_skipped_count) {
-      annotation = `<div class="card-annotation">+${SUMMARY.l5_skipped_count} skipped</div>`;
+    if (i === 4 || i === 5) {
+      const skipped = i === 4 ? (SUMMARY.l4_skipped_count || 0) : (SUMMARY.l5_skipped_count || 0);
+      const caseKey = i === 4 ? 'l4_case' : 'l5_case';
+      const levelKey = 'l' + i;
+      const awaiting = MODEL_DATA.filter(m => m[caseKey] && !m[levelKey]).length;
+      const parts = [];
+      if (skipped) parts.push(`${skipped} skipped`);
+      if (awaiting) parts.push(`${awaiting} awaiting data`);
+      if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     bar.innerHTML += `<div class="summary-card level-${i}" title="${LEVEL_DESCRIPTIONS[i]}">
       <div class="number">${count}</div>
