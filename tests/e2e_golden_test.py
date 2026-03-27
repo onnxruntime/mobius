@@ -88,9 +88,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "text-generation/stablelm-2-1_6b": "StableLM parity failure (argmax mismatch, 0% Jaccard)",
     "text-generation/gemma-2-2b": "Gemma-2 L5 generation diverges (10% token match ratio)",
     # VL multi-model inference: test infra needs model-specific position_ids
-    "image-text-to-text/qwen3-vl-2b": "VL prefill needs 3D position_ids (model-specific RoPE)",
-    "image-text-to-text/qwen2_5-vl-3b": "VL prefill needs 3D position_ids (model-specific RoPE)",
-    "image-text-to-text/qwen3_5-2b": "VL prefill needs 3D position_ids (model-specific RoPE)",
+    "image-text-to-text/qwen3_5-2b": "LpNormalization(22) not supported in installed ORT version",
     "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
 }
 
@@ -393,6 +391,89 @@ def _prepare_audio_feeds(
     return feeds
 
 
+def _compute_mrope_position_ids(
+    input_ids: np.ndarray,
+    image_grid_thw: np.ndarray,
+    spatial_merge_size: int,
+    mm_token_type_ids: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute 3D MRoPE position IDs for Qwen VL models.
+
+    Ports the HuggingFace ``get_rope_index`` / ``get_vision_position_ids``
+    logic to numpy so that no HF model weights need to be loaded.
+
+    For each token in the sequence:
+    - Text tokens: all three dims (T, H, W) equal to the sequential position.
+    - Image tokens: T=start_pos (flat), H=row within image grid, W=column.
+
+    Args:
+        input_ids: ``[batch, seq_len]`` int64 — token IDs.
+        image_grid_thw: ``[num_images, 3]`` int64 — (T, H, W) grid per image
+            *after* vision backbone (before spatial merge).
+        spatial_merge_size: Factor by which H and W are reduced in the backbone.
+        mm_token_type_ids: ``[batch, seq_len]`` int32 — 0=text, 1=image,
+            2=video.  If ``None``, falls back to sequential 1D position IDs
+            broadcast to shape ``[3, batch, seq_len]``.
+
+    Returns:
+        position_ids ``[3, batch, seq_len]`` int64.
+    """
+    batch_size, seq_len = input_ids.shape
+
+    if mm_token_type_ids is None:
+        # Fallback: plain sequential IDs replicated across all 3 dims.
+        ids_1d = np.arange(seq_len, dtype=np.int64).reshape(1, 1, seq_len)
+        return np.broadcast_to(ids_1d, (3, batch_size, seq_len)).copy()
+
+    import itertools
+
+    position_ids = np.zeros((3, batch_size, seq_len), dtype=np.int64)
+
+    for batch_idx in range(batch_size):
+        token_types = mm_token_type_ids[batch_idx]  # (seq_len,)
+        image_iter = iter(image_grid_thw)
+        current_pos = 0
+        out_pos = np.zeros((3, seq_len), dtype=np.int64)
+
+        # Group consecutive tokens by modality type.
+        for tok_type, group in itertools.groupby(
+            enumerate(token_types.tolist()), key=lambda x: x[1]
+        ):
+            indices = [i for i, _ in group]
+            span_len = len(indices)
+
+            if tok_type == 0:
+                # Text: sequential 1D position IDs for all three dims.
+                positions = np.arange(current_pos, current_pos + span_len, dtype=np.int64)
+                out_pos[:, indices[0] : indices[-1] + 1] = positions[np.newaxis, :]
+                current_pos += span_len
+
+            else:
+                # Image (1) or video (2): 3D vision positions.
+                grid_thw = next(image_iter)
+                t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
+                llm_h = h // spatial_merge_size
+                llm_w = w // spatial_merge_size
+                llm_t = t  # temporal merge size = 1 for images
+
+                pos_t = np.full(llm_h * llm_w * llm_t, current_pos, dtype=np.int64)
+                pos_h = np.repeat(
+                    np.arange(current_pos, current_pos + llm_h, dtype=np.int64),
+                    llm_w * llm_t,
+                )
+                pos_w = np.tile(
+                    np.arange(current_pos, current_pos + llm_w, dtype=np.int64),
+                    llm_h * llm_t,
+                )
+                vision_pos = np.stack([pos_t, pos_h, pos_w], axis=0)  # (3, tokens)
+                out_pos[:, indices[0] : indices[-1] + 1] = vision_pos
+                current_pos += max(llm_h, llm_w)
+
+        position_ids[:, batch_idx, :] = out_pos
+
+    return position_ids
+
+
 def _run_vision_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -490,7 +571,18 @@ def _run_vision_language_prefill(
             elif name == "attention_mask":
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
             elif name == "position_ids":
-                dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+                # Check if the decoder expects 3D MRoPE position_ids [3, batch, seq_len].
+                pos_shape = dec_session.get_input_shape(name)
+                if pos_shape is not None and len(pos_shape) == 3:
+                    spatial_merge = getattr(config, "spatial_merge_size", 2)
+                    dec_feeds[name] = _compute_mrope_position_ids(
+                        processed["input_ids"].astype(np.int64),
+                        processed.get("image_grid_thw"),
+                        spatial_merge_size=spatial_merge,
+                        mm_token_type_ids=processed.get("mm_token_type_ids"),
+                    )
+                else:
+                    dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
             elif name.startswith("past_key_values."):
                 num_kv_heads = getattr(config, "num_key_value_heads", 1)
                 head_dim = getattr(config, "head_dim", 64)
