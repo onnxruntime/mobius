@@ -34,24 +34,29 @@ __all__ = [
 ]
 
 import json
-import logging
 import os
 import struct
 from typing import Any
 
 import torch
 
-logger = logging.getLogger(__name__)
-
 # The first 8 bytes of a safetensors file are a little-endian uint64
 # encoding the length of the JSON header that follows.
 _HEADER_SIZE_BYTES = 8
+
+# Maximum header size (100 MB).  The reference safetensors Rust
+# implementation enforces a similar cap.  Without this a crafted file
+# could set header_size to gigabytes and cause an OOM on ``f.read()``.
+_MAX_HEADER_SIZE = 100 * 1024 * 1024
 
 # Safetensors dtype strings → PyTorch dtypes.
 # Reference: https://github.com/huggingface/safetensors/blob/main/safetensors/src/tensor.rs
 _SAFETENSORS_DTYPE_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
     "BOOL": torch.bool,
     "U8": torch.uint8,
+    "U16": torch.uint16,
+    "U32": torch.uint32,
+    "U64": torch.uint64,
     "I8": torch.int8,
     "I16": torch.int16,
     "I32": torch.int32,
@@ -81,6 +86,11 @@ def _parse_header(
         if len(raw_size) < _HEADER_SIZE_BYTES:
             raise ValueError(f"Safetensors file too small to contain a valid header: {path}")
         header_size = struct.unpack("<Q", raw_size)[0]
+        if header_size > _MAX_HEADER_SIZE:
+            raise ValueError(
+                f"Safetensors header size {header_size} exceeds "
+                f"maximum allowed {_MAX_HEADER_SIZE} bytes: {path}"
+            )
         raw_header = f.read(header_size)
         if len(raw_header) < header_size:
             raise ValueError(
@@ -139,15 +149,26 @@ def load_safetensors_mmap(
         shape = metadata["shape"]
         start, end = metadata["data_offsets"]
 
+        # Validate data offsets to prevent silent out-of-bounds reads.
+        if start < 0 or end < start:
+            raise ValueError(
+                f"Invalid data_offsets [{start}, {end}) for tensor "
+                f"'{name}': offsets must satisfy 0 <= start <= end"
+            )
+        if data_offset + end > file_size:
+            raise ValueError(
+                f"Tensor '{name}' data_offsets [{start}, {end}) "
+                f"extend beyond file size "
+                f"({data_offset + end} > {file_size}): {path}"
+            )
+
         # Slice the UntypedStorage to the tensor's byte range.
         byte_start = data_offset + start
         byte_end = data_offset + end
         sub_storage = storage[byte_start:byte_end]
 
         # Create a tensor backed by the sub-storage and reshape.
-        tensor = (
-            torch.empty(0, dtype=torch_dtype).set_(sub_storage).reshape(shape)
-        )
+        tensor = torch.empty(0, dtype=torch_dtype).set_(sub_storage).reshape(shape)
 
         tensors[name] = tensor
 

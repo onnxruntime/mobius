@@ -14,6 +14,7 @@ import safetensors.torch
 import torch
 
 from mobius.integrations._safetensors import (
+    _MAX_HEADER_SIZE,
     _SAFETENSORS_DTYPE_TO_TORCH_DTYPE,
     _parse_header,
     load_safetensors_mmap,
@@ -77,6 +78,15 @@ class TestParseHeader:
         with pytest.raises(ValueError, match="truncated"):
             _parse_header(path)
 
+    def test_oversized_header_raises(self, tmp_path):
+        """A header size exceeding _MAX_HEADER_SIZE must raise."""
+        path = tmp_path / "huge.safetensors"
+        # Claim header is larger than the cap (but don't write that much)
+        path.write_bytes(struct.pack("<Q", _MAX_HEADER_SIZE + 1))
+
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            _parse_header(path)
+
 
 # ---------------------------------------------------------------------------
 # Dtype mapping
@@ -98,6 +108,9 @@ class TestDtypeMapping:
             ("I32", torch.int32),
             ("I64", torch.int64),
             ("U8", torch.uint8),
+            ("U16", torch.uint16),
+            ("U32", torch.uint32),
+            ("U64", torch.uint64),
             ("BOOL", torch.bool),
         ],
     )
@@ -339,3 +352,70 @@ class TestMultiShardLoading:
             state_dict.update(load_safetensors_mmap(str(tmp_path / shard_file)))
 
         assert len(state_dict) == 4
+
+
+# ---------------------------------------------------------------------------
+# Data offset validation
+# ---------------------------------------------------------------------------
+
+
+def _write_crafted_safetensors(
+    path: str,
+    data_offsets: list[int],
+    *,
+    tensor_bytes: int = 8,
+) -> None:
+    """Write a safetensors file with arbitrary data_offsets for testing.
+
+    Always writes *tensor_bytes* bytes of raw data after the header.
+    """
+    header = {
+        "w": {
+            "dtype": "F32",
+            "shape": [tensor_bytes // 4] if tensor_bytes else [0],
+            "data_offsets": data_offsets,
+        },
+    }
+    header_bytes = json.dumps(header).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(b"\x00" * tensor_bytes)
+
+
+class TestDataOffsetValidation:
+    """Verify that invalid data offsets are rejected."""
+
+    def test_negative_start_raises(self, tmp_path):
+        """Negative start offset must raise ValueError."""
+        path = str(tmp_path / "neg.safetensors")
+        _write_crafted_safetensors(path, [-4, 8])
+
+        with pytest.raises(ValueError, match="0 <= start <= end"):
+            load_safetensors_mmap(path)
+
+    def test_end_before_start_raises(self, tmp_path):
+        """End < start must raise ValueError."""
+        path = str(tmp_path / "inverted.safetensors")
+        _write_crafted_safetensors(path, [8, 4])
+
+        with pytest.raises(ValueError, match="0 <= start <= end"):
+            load_safetensors_mmap(path)
+
+    def test_offsets_beyond_file_size_raises(self, tmp_path):
+        """Offsets extending past the end of the file must raise."""
+        path = str(tmp_path / "oob.safetensors")
+        # Write only 8 bytes of data, but claim offsets [0, 1000)
+        _write_crafted_safetensors(path, [0, 1000], tensor_bytes=8)
+
+        with pytest.raises(ValueError, match="beyond file size"):
+            load_safetensors_mmap(path)
+
+    def test_valid_offsets_accepted(self, tmp_path):
+        """Valid offsets should load without error."""
+        path = str(tmp_path / "ok.safetensors")
+        _write_crafted_safetensors(path, [0, 8], tensor_bytes=8)
+
+        result = load_safetensors_mmap(path)
+        assert "w" in result
+        assert result["w"].shape == torch.Size([2])
