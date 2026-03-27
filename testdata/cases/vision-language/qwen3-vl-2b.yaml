@@ -15,5 +15,4 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "Awaiting GPU golden generation (2B params, requires CUDA)."
 notes: "Qwen3-VL 2B. Latest Qwen vision-language model."

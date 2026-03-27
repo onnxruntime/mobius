@@ -85,6 +85,9 @@ _XFAIL_REASONS: dict[str, str] = {
     "text-generation/granitemoe-1b": "GraniteMoE parity failure (argmax mismatch, 0% Jaccard)",
     "text-generation/stablelm-2-1_6b": "StableLM parity failure (argmax mismatch, 0% Jaccard)",
     "text-generation/gemma-2-2b": "Gemma-2 L5 generation diverges (10% token match ratio)",
+    # VL multi-model inference: test infra needs model-specific position_ids
+    "image-text-to-text/qwen3-vl-2b": "VL prefill needs 3D position_ids (model-specific RoPE)",
+    "image-text-to-text/qwen2_5-vl-3b": "VL prefill needs 3D position_ids (model-specific RoPE)",
 }
 
 # Legacy skip mechanism. New skip reasons should use the skip_reason field in YAML test case files.
@@ -398,6 +401,119 @@ def _prepare_audio_feeds(
     return feeds
 
 
+def _run_vision_language_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run vision → embedding → decoder for vision-language models.
+
+    The VL pipeline has 3 ONNX models:
+    - ``vision``: pixel_values → image hidden states
+    - ``embedding``: input_ids + image hidden states → inputs_embeds
+    - ``model``: inputs_embeds → logits
+
+    This replicates the full HuggingFace forward pass used during
+    golden generation.
+    """
+    import transformers
+    from PIL import Image
+
+    # --- Step 0: Preprocess image with HF processor ---
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=True
+    )
+    image = Image.open(_TESTDATA_DIR / case.images[0])
+
+    # Build chat template for models that need it
+    prompt_text = case.prompts[0]
+    if hasattr(processor, "apply_chat_template"):
+        content: list[dict[str, str]] = []
+        for img_path in case.images:
+            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
+        content.append({"type": "text", "text": prompt_text})
+        messages = [{"role": "user", "content": content}]
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    # Use PyTorch tensors then convert — some processors don't support np
+    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
+    processed: dict[str, np.ndarray] = {
+        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
+    }
+
+    # --- Step 1: Run vision encoder ---
+    vis_session = OnnxModelSession(pkg["vision"])
+    try:
+        vis_feeds: dict[str, np.ndarray] = {}
+        for name in vis_session.input_names:
+            if name in processed:
+                val = processed[name]
+                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+        vis_out = vis_session.run(vis_feeds)
+    finally:
+        vis_session.close()
+
+    # Extract the image hidden states (first output)
+    vis_hidden_key = next(iter(vis_out))
+    vis_hidden = vis_out[vis_hidden_key]
+
+    # --- Step 2: Run embedding model ---
+    emb_session = OnnxModelSession(pkg["embedding"])
+    try:
+        emb_feeds: dict[str, np.ndarray] = {
+            "input_ids": processed["input_ids"].astype(np.int64),
+        }
+        # Pass vision hidden states
+        for name in emb_session.input_names:
+            if name not in emb_feeds and name in vis_out:
+                emb_feeds[name] = vis_out[name]
+            elif name == "image_features":
+                emb_feeds[name] = vis_hidden
+        emb_out = emb_session.run(emb_feeds)
+    finally:
+        emb_session.close()
+
+    # Extract inputs_embeds
+    emb_key = next(iter(emb_out))
+    inputs_embeds = emb_out[emb_key]
+
+    # --- Step 3: Run decoder ---
+    # VL packages may use "model" or "decoder" for the text decoder.
+    dec_key = "model" if "model" in pkg else "decoder"
+    dec_session = OnnxModelSession(pkg[dec_key])
+    try:
+        seq_len = inputs_embeds.shape[1]
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+        }
+        # Pass through processor outputs that match decoder inputs
+        # (e.g., attention_mask, position_ids with model-specific shapes)
+        for name in dec_session.input_names:
+            if name in dec_feeds:
+                continue
+            if name in processed:
+                dec_feeds[name] = processed[name]
+            elif name == "attention_mask":
+                dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
+            elif name == "position_ids":
+                dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+            elif name.startswith("past_key_values."):
+                num_kv_heads = getattr(config, "num_key_value_heads", 1)
+                head_dim = getattr(config, "head_dim", 64)
+                dec_feeds[name] = np.zeros(
+                    (1, num_kv_heads, 0, head_dim),
+                    dtype=np.float32,
+                )
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
+
+
 # ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
@@ -430,6 +546,8 @@ class TestL4CheckpointVerified:
         # Seq2seq models require running encoder → decoder
         if case.task_type == "seq2seq":
             outputs = _run_seq2seq_prefill(pkg, golden, config)
+        elif case.task_type == "image-text-to-text":
+            outputs = _run_vision_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:

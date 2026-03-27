@@ -310,9 +310,22 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
 
+    # Build chat-formatted prompt with image placeholders if the
+    # processor supports apply_chat_template (Qwen-VL, Gemma-3, etc.)
+    prompt_text = case.prompts[0]
+    if hasattr(processor, "apply_chat_template"):
+        content: list[dict[str, str]] = []
+        for img_path in case.images:
+            content.append({"type": "image", "image": str(Path("testdata") / img_path)})
+        content.append({"type": "text", "text": prompt_text})
+        messages = [{"role": "user", "content": content}]
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
     # Process multimodal inputs through the HF processor
     processed = processor(
-        text=case.prompts[0],
+        text=prompt_text,
         images=images if images else None,
         return_tensors="pt",
     ).to(device)
@@ -537,6 +550,14 @@ def generate_golden_for_case(case: TestCase, json_path: Path, device: str) -> bo
 def main() -> int:
     """Entry point.  Returns 0 on success, 1 if any cases failed."""
     args = parse_args()
+
+    if args.device.startswith("cuda"):
+        import torch
+
+        # Disable cuDNN to avoid CUDNN_STATUS_NOT_INITIALIZED on
+        # systems where the cuDNN library version doesn't match the
+        # CUDA toolkit bundled with PyTorch.
+        torch.backends.cudnn.enabled = False
 
     from mobius._testing.golden import (
         discover_test_cases,

@@ -15,5 +15,4 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "Awaiting GPU golden generation (3B params, requires CUDA)."
 notes: "Qwen2.5-VL 3B. Vision encoder + embedding + decoder pipeline."

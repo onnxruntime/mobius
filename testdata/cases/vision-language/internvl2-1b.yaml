@@ -16,5 +16,5 @@ generation:
   do_sample: false
 
 trust_remote_code: true
-skip_reason: "Awaiting GPU golden generation (requires trust_remote_code and CUDA)."
+skip_reason: "Custom processor incompatible with transformers 5.x AutoProcessor."
 notes: "InternVL2 1B. InternViT vision encoder + InternLM2 decoder."
