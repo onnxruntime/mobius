@@ -285,28 +285,63 @@ def _scan_l3_synthetic_parity(models: dict[str, ModelInfo]) -> None:
 
 
 def _scan_l4_golden_files(models: dict[str, ModelInfo]) -> None:
-    """Mark L4 coverage from testdata/golden/ directory."""
+    """Mark L4 coverage from testdata/golden/ directory.
+
+    Two matching strategies:
+    1. Direct: ``golden/<category>/<model_type>.json`` — works when the golden
+       file stem equals the registry model_type.
+    2. Indirect: when a model has a YAML test case, derive the expected golden
+       path from the case_id (the YAML file stem).  This handles cases like
+       ``golden/vision-language/qwen2_5-vl-3b.json`` → model_type ``qwen2_5_vl``.
+    """
     golden_dir = _REPO_ROOT / "testdata" / "golden"
     if not golden_dir.exists():
         return
 
-    # Walk golden directories for model-type-named files
+    # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*.json"):
-        # Convention: golden/<category>/<model_type>.json
+        if "_generation" in golden_file.name:
+            continue
         model_type = golden_file.stem
         if model_type in models:
             models[model_type].l4_golden_files = True
 
+    # Strategy 2: YAML-derived path (case_id may differ from model_type)
+    for model_type, info in models.items():
+        if info.l4_golden_files or not info.yaml_test_case_file:
+            continue
+        case_path = _REPO_ROOT / info.yaml_test_case_file
+        case_id = case_path.stem
+        task_dir = case_path.parent.name
+        golden_path = golden_dir / task_dir / f"{case_id}.json"
+        if golden_path.exists():
+            models[model_type].l4_golden_files = True
+
 
 def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
-    """Mark L5 coverage from generation golden files."""
+    """Mark L5 coverage from generation golden files.
+
+    Uses the same two-strategy matching as :func:`_scan_l4_golden_files`.
+    """
     golden_dir = _REPO_ROOT / "testdata" / "golden"
     if not golden_dir.exists():
         return
 
+    # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*_generation.json"):
         model_type = golden_file.stem.removesuffix("_generation")
         if model_type in models:
+            models[model_type].l5_generation_golden = True
+
+    # Strategy 2: YAML-derived path (case_id may differ from model_type)
+    for model_type, info in models.items():
+        if info.l5_generation_golden or not info.yaml_test_case_file:
+            continue
+        case_path = _REPO_ROOT / info.yaml_test_case_file
+        case_id = case_path.stem
+        task_dir = case_path.parent.name
+        gen_path = golden_dir / task_dir / f"{case_id}_generation.json"
+        if gen_path.exists():
             models[model_type].l5_generation_golden = True
 
 
@@ -467,9 +502,11 @@ def collect_all_model_info() -> dict[str, ModelInfo]:
     _scan_l2_arch_tests(models)
     _scan_l3_synthetic_parity(models)
     _scan_l3_parity_status(models)
+    # YAML test cases must be scanned before golden files so that the
+    # YAML-derived golden paths can be used for indirect model_type matching.
+    _scan_yaml_test_cases(models)
     _scan_l4_golden_files(models)
     _scan_l5_generation_golden(models)
-    _scan_yaml_test_cases(models)
     _scan_integration_tests(models)
     return models
 
@@ -1013,7 +1050,7 @@ function renderTable() {
     const sortedFamilies = Object.keys(groups).sort();
     sortedFamilies.forEach(fam => {
       const models = groups[fam];
-      const minLevel = Math.min(...models.map(m => m.confidence_level));
+      const maxLevel = Math.max(...models.map(m => m.confidence_level));
       const expanded = expandedFamilies.has(fam);
       const arrow = expanded ? '\u25BC' : '\u25B6';
       // Aggregate code paths for the family
@@ -1022,7 +1059,7 @@ function renderTable() {
       html += `<tr class="family-row" onclick="toggleFamily('${esc(fam)}')">
         <td><span class="family-toggle">${arrow}</span>${esc(fam)} <span style="color:var(--text-muted)">(x${models.length})</span></td>
         <td></td><td></td>
-        <td><span class="badge badge-${minLevel}">${LEVEL_LABELS[minLevel]}</span></td>
+        <td><span class="badge badge-${maxLevel}">${LEVEL_LABELS[maxLevel]}</span></td>
         <td></td>
         <td class="family-paths">${pathTags}</td>
         <td></td>
@@ -1102,14 +1139,14 @@ function renderModelRow(m) {
   ).join('');
   const expanded = expandedDetails.has(m.model_type);
 
-  let row = `<tr>
+  let row = `<tr style="cursor:pointer" onclick="toggleDetail('${m.model_type}')">
     <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l3Badge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
     <td><div class="level-dots" role="img" aria-label="Coverage: ${LEVEL_LABELS[m.confidence_level]}">${dots}</div></td>
     <td>${tags || '<span style="color:var(--text-muted)">none</span>'}</td>
-    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick="toggleDetail('${m.model_type}')">${expanded ? '\u2212' : '+'}</button></td>
+    <td><button class="expand-btn" aria-expanded="${expanded}" aria-label="Expand details for ${m.model_type}" onclick="event.stopPropagation();toggleDetail('${m.model_type}')">${expanded ? '\u2212' : '+'}</button></td>
   </tr>`;
 
   if (expanded) {
