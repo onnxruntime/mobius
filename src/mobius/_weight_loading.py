@@ -146,8 +146,9 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
 
     Uses parallel downloads when multiple safetensors shards exist.
     """
-    import safetensors.torch
     from huggingface_hub import hf_hub_download
+
+    from mobius._safetensors import load_safetensors_mmap
 
     try:
         index_path = hf_hub_download(
@@ -167,5 +168,5 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(safetensors.torch.load_file(path))
+        state_dict.update(load_safetensors_mmap(path))
     return state_dict

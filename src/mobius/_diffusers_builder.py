@@ -123,9 +123,10 @@ def _download_diffusers_component_weights(
     as the weight filename. Sharded weights use a corresponding
     ``.index.json`` file.
     """
-    import safetensors.torch
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
+
+    from mobius._safetensors import load_safetensors_mmap
 
     prefix = f"{component_name}/"
     # Diffusers uses two naming conventions for weight files
@@ -173,7 +174,7 @@ def _download_diffusers_component_weights(
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-        state_dict.update(safetensors.torch.load_file(path))
+        state_dict.update(load_safetensors_mmap(path))
     return state_dict
 
 
