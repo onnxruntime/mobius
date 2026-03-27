@@ -1850,7 +1850,12 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
         "attention_mask": attention_mask,
         "position_ids": position_ids,
     }
-    kv_shape = (1, arch_config.num_key_value_heads, 0, arch_config.head_dim)
+    kv_shape = (
+        input_ids.shape[0],
+        arch_config.num_key_value_heads,
+        0,
+        arch_config.head_dim,
+    )
     for inp in onnx_model.graph.inputs:
         name = inp.name
         if name in feeds:
@@ -1861,8 +1866,9 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
             # Hybrid cache: use shape from the graph input.
             # Batch dim (dim 0) must match actual batch size — see
             # _build_and_compare_qwen35 for the full explanation.
+            batch_size = input_ids.shape[0]
             shape = tuple(
-                d if isinstance(d, int) else 1 if i == 0 else 0
+                d if isinstance(d, int) else batch_size if i == 0 else 0
                 for i, d in enumerate(inp.shape)
             )
             feeds[name] = np.zeros(shape, dtype=np.float32)
@@ -3276,7 +3282,6 @@ def test_qwen35_vl_3model_text_only_parity():
 
 
 @pytest.mark.integration
-@pytest.mark.integration_fast
 def test_qwen35_vl_vision_features_match():
     """Qwen3.5-VL vision encoder: ONNX features match HuggingFace.
 
@@ -3519,8 +3524,6 @@ def test_qwen35_deltanet_single_layer_parity():
         kv_num_heads=num_v_heads,
         update_rule="gated_delta",
         scale=1.0 / (head_k_dim**0.5),
-        packed_qkv=True,
-        head_k_dim=head_k_dim,
     )
     onnx_model.functions[conv_func.identifier()] = conv_func
     onnx_model.functions[attn_func.identifier()] = attn_func

@@ -71,6 +71,17 @@ def causal_conv_nd_with_state(
     Outputs:
         output:        ``(B, D, *spatial)``           — convolution output
         present_state: ``(B, D, *spatial[:-1], K-1)`` — updated carry state
+
+    .. important::
+
+       The underlying convolution uses **valid** (unpadded) kernels of shape
+       ``[K] * ndim`` over all spatial dimensions.  Causal left-padding is
+       applied only to the last (temporal) axis, so for ``ndim > 1`` non-
+       temporal spatial dimensions shrink by ``K-1``.
+
+       For incremental decoding with carry state, non-temporal spatial
+       dimensions are typically size-1, e.g. ``(B, D, 1, T)`` for
+       ``ndim=2``, so the output shape effectively matches the input.
     """
     if ndim not in (1, 2, 3):
         raise ValueError(f"ndim must be 1, 2, or 3; got {ndim}")
