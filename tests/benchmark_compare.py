@@ -85,6 +85,11 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
     for model in removed_models:
         rows.append((model, "(removed)", "—", "—", "—", "\U0001f5d1\ufe0f"))
 
+    # Flag models present in current but absent from baseline as new.
+    new_models = sorted(set(current["models"].keys()) - set(baseline.get("models", {}).keys()))
+    for model in new_models:
+        rows.append((model, "(new)", "—", "—", "NEW", "\U0001f195"))
+
     def _sha_link(sha: str) -> str:
         return f"[`{sha}`]({_GITHUB_REPO_URL}/commit/{sha})"
 
@@ -116,10 +121,14 @@ def _fmt(value: float | int, metric: str) -> str:
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Compare benchmark results against baseline")
-    p.add_argument("--current", required=True)
-    p.add_argument("--baseline", required=True)
-    p.add_argument("--output", default="comparison.md")
+    p = argparse.ArgumentParser(
+        description="Compare benchmark results between two commits for regression detection."
+    )
+    p.add_argument("--current", required=True, help="Path to current (head) benchmark JSON")
+    p.add_argument(
+        "--baseline", required=True, help="Path to baseline (base branch) benchmark JSON"
+    )
+    p.add_argument("--output", default="comparison.md", help="Output markdown file path")
     args = p.parse_args()
     md, has_blocker = compare(args.current, args.baseline)
     Path(args.output).write_text(md)

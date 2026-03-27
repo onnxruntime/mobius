@@ -9,9 +9,9 @@ on:
         required: false
         default: "main"
       head_ref:
-        description: "Head git ref to benchmark (default: PR head / HEAD)"
+        description: "Head git ref to benchmark (default: PR head / main)"
         required: false
-        default: "HEAD"
+        default: "main"
 
 permissions:
   contents: read
@@ -22,10 +22,10 @@ concurrency:
 
 # Resolve base/head refs once; used by both benchmark jobs.
 # For PRs: uses the PR base and head SHAs for exact reproducibility.
-# For workflow_dispatch: uses the input values or falls back to origin/main/HEAD.
+# For workflow_dispatch: uses the input values or falls back to main.
 env:
   BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref || 'main' }}
-  HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref || 'HEAD' }}
+  HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref || 'main' }}
 
 jobs:
   # --------------------------------------------------------------------------
