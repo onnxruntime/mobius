@@ -50,11 +50,6 @@ class TestLinearAttentionSeparateQKV:
         assert "kv_num_heads" in attr_names
         assert "scale" in attr_names
         assert "update_rule" in attr_names
-        assert "packed_qkv" in attr_names
-
-    def test_packed_qkv_attribute_is_zero(self):
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
-        assert func.attributes["packed_qkv"].value == 0
 
     def test_graph_contains_scan(self):
         func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
@@ -84,100 +79,6 @@ class TestLinearAttentionSeparateQKV:
                 kv_num_heads=4,
                 update_rule="invalid",
             )
-
-
-class TestLinearAttentionPackedQKV:
-    """Tests for LinearAttention with packed QKV input."""
-
-    def test_function_has_six_inputs(self):
-        """Packed mode has the same 6-input signature as separate mode.
-
-        ``key`` and ``value`` inputs exist but are unused (callers
-        pass None).  This ensures a single ir.Function definition.
-        """
-        func = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=4,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        assert len(func.graph.inputs) == 6
-        names = [inp.name for inp in func.graph.inputs]
-        assert names == [
-            "query",
-            "key",
-            "value",
-            "past_state",
-            "decay",
-            "beta",
-        ]
-
-    def test_packed_qkv_attribute_is_one(self):
-        func = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=4,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        assert func.attributes["packed_qkv"].value == 1
-
-    def test_packed_graph_contains_split(self):
-        """Packed mode must Split the QKV tensor."""
-        func = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=4,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        op_types = [n.op_type for n in func.graph]
-        assert "Split" in op_types
-
-    def test_packed_graph_contains_scan(self):
-        func = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=4,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        op_types = {n.op_type for n in func.graph}
-        assert "Scan" in op_types
-
-    def test_packed_without_head_k_dim_raises(self):
-        with pytest.raises(ValueError, match="head_k_dim is required"):
-            linear_attention(
-                q_num_heads=2,
-                kv_num_heads=4,
-                scale=0.25,
-                packed_qkv=True,
-            )
-
-    def test_packed_gqa_has_tile(self):
-        """Packed mode with GQA still expands Q/K heads."""
-        func = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=8,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        op_types = [n.op_type for n in func.graph]
-        assert "Tile" in op_types
-
-    def test_packed_same_outputs_as_separate(self):
-        """Both modes produce the same number of outputs."""
-        sep = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
-        packed = linear_attention(
-            q_num_heads=2,
-            kv_num_heads=4,
-            scale=0.25,
-            packed_qkv=True,
-            head_k_dim=16,
-        )
-        assert len(sep.graph.outputs) == len(packed.graph.outputs)
 
 
 class TestLinearAttentionUpdateRules:

@@ -239,25 +239,20 @@ class GatedDeltaNet(nn.Module):
         # g: (B, T, num_v_heads)
 
         # === LinearAttention ===
-        # Pack normalized Q, K, and V into a single tensor for the packed
-        # QKV calling convention.  The LinearAttention function splits
-        # it internally using head_k_dim.
-        packed_qkv = op.Concat(query, key, value, axis=-1)  # (B, T, 2*key_dim + value_dim)
         # beta: (B, T, num_v_heads) — already 3D, matches (B, T, kv_num_heads)
         # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
         output_3d, new_recurrent_state = op.LinearAttention(
-            packed_qkv,  # query: (B, T, 2*key_dim + value_dim) — packed QKV
-            None,  # key: unused in packed mode
-            None,  # value: unused in packed mode
+            query,  # (B, T, num_k_heads * head_k_dim)
+            key,  # (B, T, num_k_heads * head_k_dim)
+            value,  # (B, T, num_v_heads * head_v_dim)
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
             g,  # (B, T, num_v_heads) — decay in log-space, broadcasts over d_k
             beta,  # (B, T, num_v_heads) — update rate
             scale=1.0 / (self.head_k_dim**0.5),
             q_num_heads=self.num_k_heads,
             kv_num_heads=self.num_v_heads,
-            packed_qkv=1,
             _domain="com.microsoft",
             _outputs=2,
         )
