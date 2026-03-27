@@ -122,9 +122,25 @@ def _cmd_build(args: argparse.Namespace) -> None:
         _load_diffusers_pipeline_index,
         build_diffusers_pipeline,
     )
+    from mobius.tasks import StaticCacheCausalLMTask
+
+    # Validate --max-seq-len requires --static-cache
+    if args.max_seq_len is not None and not args.static_cache:
+        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+
+    # Validate --static-cache + --task compatibility
+    if args.static_cache and args.task is not None:
+        if args.task != "static-cache-text-generation":
+            raise SystemExit(
+                "Error: --static-cache conflicts with --task "
+                f"'{args.task}'. Either drop --task or use "
+                "'--task static-cache-text-generation'."
+            )
 
     load_weights = not args.no_weights
-    task = args.task
+    task: str | StaticCacheCausalLMTask | None = args.task
+    if args.static_cache and task is None:
+        task = StaticCacheCausalLMTask(max_seq_len=args.max_seq_len)
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -424,6 +440,20 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="NAME",
         help="Build only this component from a diffusers pipeline (e.g. --component vae_decoder).",
+    )
+    build_parser.add_argument(
+        "--static-cache",
+        action="store_true",
+        help="Use static KV cache (pre-allocated buffers with TensorScatter). "
+        "Requires models using DecoderLayer or MoEDecoderLayer.",
+    )
+    build_parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum sequence length for static cache buffers. "
+        "Only used with --static-cache. Defaults to max_position_embeddings from config.",
     )
     build_parser.set_defaults(func=_cmd_build)
 
