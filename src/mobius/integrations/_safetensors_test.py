@@ -562,7 +562,7 @@ class TestLazyLoading:
         state_dict = load_safetensors_mmap(path, lazy=True)
         desc = state_dict["qkv"]
         # Simulate transform preprocess_weights: split QKV
-        q, k, v = desc.split([3, 3, 2], dim=0)
+        q, _k, _v = desc.split([3, 3, 2], dim=0)
         assert desc.is_materialized()  # triggered by .split()
         torch.testing.assert_close(q, original[:3])
 
