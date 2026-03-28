@@ -19,6 +19,54 @@ import onnxruntime_easy as ort_easy
 from mobius._model_package import ModelPackage
 
 
+def _fix_scan_body_value_info(graph) -> None:
+    """Patch Scan body value_info names after ONNX function inlining.
+
+    The ONNX inliner appends a suffix (e.g. ``__2``) to node output
+    names inside inlined function bodies but does *not* update the
+    corresponding ``value_info`` entries.  This leaves the shape
+    annotations orphaned — ORT cannot match them to actual values,
+    so CUDA EP falls back to ``dim_value=0`` (size 1) for all dims.
+
+    This function detects the suffix by comparing original value_info
+    names against actual node output names, then renames value_info
+    entries to match.
+    """
+    for node in graph.node:
+        if node.op_type != "Scan":
+            continue
+        for attr in node.attribute:
+            if attr.name != "body":
+                continue
+            body = attr.g
+
+            # Collect all node output names in the body
+            node_outputs = set()
+            for n in body.node:
+                for o in n.output:
+                    node_outputs.add(o)
+
+            # Detect the inliner suffix by finding a value_info name
+            # that is a prefix of a node output name
+            suffix = ""
+            for vi in body.value_info:
+                for name in node_outputs:
+                    if name.startswith(vi.name) and len(name) > len(vi.name):
+                        suffix = name[len(vi.name) :]
+                        break
+                if suffix:
+                    break
+
+            if not suffix:
+                continue
+
+            # Update value_info names to include the suffix
+            for vi in body.value_info:
+                new_name = vi.name + suffix
+                if new_name in node_outputs:
+                    vi.name = new_name
+
+
 class OnnxModelSession:
     """Wraps an ``onnxruntime_easy.EasySession`` for an ``ir.Model``.
 
@@ -50,9 +98,45 @@ class OnnxModelSession:
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
         ir.save(model, self._model_path, external_data="model.onnx.data")
 
+        # Inline local functions before loading with ORT.
+        # ORT's own function inliner drops dim_value annotations from
+        # Scan body subgraph inputs, causing CUDA EP to misallocate
+        # carry buffers (dim_value=0 → size 1).  Pre-inlining with
+        # the ONNX library preserves concrete shapes.
+        if model.functions:
+            self._inline_functions()
+
         self._session = ort_easy.load(self._model_path, **load_kwargs)
         self._input_names = [inp.name for inp in self._session.get_inputs()]
         self._output_names = [out.name for out in self._session.get_outputs()]
+
+    def _inline_functions(self) -> None:
+        """Inline local functions in the saved model.
+
+        ORT's own function inliner renames Scan body node outputs
+        but does not update the body's ``value_info`` entries, leaving
+        them orphaned.  Without matching value_info, CUDA EP cannot
+        resolve intermediate shapes and falls back to ``dim_value=0``
+        (size 1) for symbolic dims.
+
+        This method:
+        1. Inlines with the ONNX library (preserves body input shapes).
+        2. Patches each Scan body's value_info names to match the
+           inliner's suffix convention (e.g. ``__2``).
+        """
+        import onnx
+        from onnx.inliner import inline_local_functions
+
+        proto = onnx.load(self._model_path)
+        inlined = inline_local_functions(proto)
+        _fix_scan_body_value_info(inlined.graph)
+        onnx.save(
+            inlined,
+            self._model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.onnx.data",
+        )
 
     @property
     def input_names(self) -> list[str]:
