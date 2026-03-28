@@ -256,7 +256,7 @@ class Gemma3nAltUp(nn.Module):
 
         # correction_coefs: [batch, seq, num_inputs] + 1
         all_coefs = self.correction_coefs(op, modalities)
-        all_coefs = op.Add(all_coefs, 1.0)
+        all_coefs = op.Add(all_coefs, op.CastLike(op.Constant(value_float=1.0), all_coefs))
 
         corrected = []
         for i in range(self.altup_num_inputs):
