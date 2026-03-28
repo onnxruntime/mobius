@@ -43,9 +43,7 @@ def generate_flags_docs(app: Sphinx) -> None:
     )
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Feature flags doc generation failed:\n{result.stderr}"
-        )
+        raise RuntimeError(f"Feature flags doc generation failed:\n{result.stderr}")
 
     if result.stdout:
         logger.info(result.stdout.strip())

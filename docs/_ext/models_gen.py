@@ -37,9 +37,7 @@ def generate_model_pages(app: Sphinx) -> None:
     )
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Model page generation failed:\n{result.stderr}"
-        )
+        raise RuntimeError(f"Model page generation failed:\n{result.stderr}")
 
     if result.stdout:
         logger.info(result.stdout.strip())

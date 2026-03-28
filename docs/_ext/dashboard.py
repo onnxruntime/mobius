@@ -62,9 +62,7 @@ def generate_dashboard(app: Sphinx, exception: Exception | None) -> None:
     )
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Dashboard generation failed:\n{result.stderr}"
-        )
+        raise RuntimeError(f"Dashboard generation failed:\n{result.stderr}")
 
     if result.stdout:
         logger.info(result.stdout.strip())
