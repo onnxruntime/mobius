@@ -110,6 +110,10 @@ def linear_attention(
         raise ValueError(f"q_num_heads must be > 0; got {q_num_heads}")
     if kv_num_heads <= 0:
         raise ValueError(f"kv_num_heads must be > 0; got {kv_num_heads}")
+    if head_k_dim <= 0:
+        raise ValueError(f"head_k_dim must be > 0; got {head_k_dim}")
+    if head_v_dim <= 0:
+        raise ValueError(f"head_v_dim must be > 0; got {head_v_dim}")
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
@@ -143,7 +147,7 @@ def linear_attention(
     qk_4d_shape = op.Concat(
         b_dim,
         t_dim,
-        op.Constant(value_ints=[q_num_heads, -1]),
+        op.Constant(value_ints=[q_num_heads, head_k_dim]),
         axis=0,
     )
     query_4d = op.Transpose(
@@ -154,11 +158,10 @@ def linear_attention(
     )  # [B, q_num_heads, T, d_k]
 
     # V: [B, T, kv_num_heads*d_v] → [B, kv_num_heads, T, d_v]
-    # Reuse kv_4d_shape for both V and decay (same [B, T, kv_num_heads, -1]).
     kv_4d_shape = op.Concat(
         b_dim,
         t_dim,
-        op.Constant(value_ints=[kv_num_heads, -1]),
+        op.Constant(value_ints=[kv_num_heads, head_v_dim]),
         axis=0,
     )
     value_4d = op.Transpose(
@@ -176,8 +179,14 @@ def linear_attention(
     # --- Reshape decay/beta 3D → 4D ---
     # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
     #     → transpose to (B, kv_num_heads, T, d_k)
+    decay_4d_shape = op.Concat(
+        b_dim,
+        t_dim,
+        op.Constant(value_ints=[kv_num_heads, head_k_dim]),
+        axis=0,
+    )
     decay_4d = op.Transpose(
-        op.Reshape(decay, kv_4d_shape), perm=[0, 2, 1, 3]
+        op.Reshape(decay, decay_4d_shape), perm=[0, 2, 1, 3]
     )  # [B, kv_num_heads, T, d_k]
     # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
     beta_3d = op.Transpose(beta, perm=[0, 2, 1])  # [B, kv_num_heads, T]

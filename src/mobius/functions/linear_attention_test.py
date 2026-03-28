@@ -178,3 +178,85 @@ class TestLinearAttentionDecayShapes:
         # At least: q, k, v (3D→4D), decay (3D→4D), beta,
         # q/k/v/decay/beta (4D→T-first for Scan), output (T→B first)
         assert transpose_count >= 6
+
+
+class TestScanBodyConcreteShapes:
+    """Regression tests: Scan body inputs must have concrete (not symbolic) dims.
+
+    ORT CUDA EP cannot resolve symbolic dim_params in Scan body graphs
+    inside inlined functions.  These tests guard against reintroduction
+    of symbolic H/d_k/d_v dims.
+    """
+
+    def test_scan_body_inputs_have_concrete_dims(self):
+        """Scan body state/q/k/v/decay inputs use integer dims for H, d_k, d_v."""
+        func = linear_attention(
+            q_num_heads=2,
+            kv_num_heads=4,
+            head_k_dim=16,
+            head_v_dim=24,
+            scale=0.25,
+        )
+        scan_nodes = [n for n in func.graph if n.op_type == "Scan"]
+        assert len(scan_nodes) == 1
+        body = scan_nodes[0].attributes["body"].value
+
+        # body inputs: state(B,H,d_k,d_v), q(B,H,d_k), k(B,H,d_k),
+        #              v(B,H,d_v), decay(B,H,d_k), beta(B,H)
+        state_shape = body.inputs[0].shape
+        q_shape = body.inputs[1].shape
+        v_shape = body.inputs[3].shape
+
+        # state: (B, 4, 16, 24) — H, d_k, d_v must be concrete ints
+        assert state_shape[1] == 4  # kv_num_heads
+        assert state_shape[2] == 16  # head_k_dim
+        assert state_shape[3] == 24  # head_v_dim
+
+        # q: (B, 4, 16) — H, d_k concrete
+        assert q_shape[1] == 4
+        assert q_shape[2] == 16
+
+        # v: (B, 4, 24) — H, d_v concrete
+        assert v_shape[1] == 4
+        assert v_shape[2] == 24
+
+        # Batch dim should remain symbolic (not a plain int)
+        assert not isinstance(state_shape[0], int)
+
+    def test_asymmetric_head_dims(self):
+        """d_k != d_v is correctly reflected in body shapes."""
+        func = linear_attention(
+            q_num_heads=1,
+            kv_num_heads=2,
+            head_k_dim=8,
+            head_v_dim=32,
+            scale=0.125,
+        )
+        scan_nodes = [n for n in func.graph if n.op_type == "Scan"]
+        body = scan_nodes[0].attributes["body"].value
+
+        # k input: (B, 2, 8)
+        k_shape = body.inputs[2].shape
+        assert k_shape[1] == 2
+        assert k_shape[2] == 8
+
+        # v input: (B, 2, 32)
+        v_shape = body.inputs[3].shape
+        assert v_shape[1] == 2
+        assert v_shape[2] == 32
+
+
+class TestLinearAttentionValidation:
+    """Tests for input validation guards."""
+
+    def test_head_k_dim_zero_raises(self):
+        with pytest.raises(ValueError, match="head_k_dim must be > 0"):
+            linear_attention(
+                q_num_heads=2, kv_num_heads=4, head_k_dim=0, head_v_dim=16, scale=0.25
+            )
+
+    def test_head_v_dim_negative_raises(self):
+        with pytest.raises(ValueError, match="head_v_dim must be > 0"):
+            linear_attention(
+                q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=-1, scale=0.25
+            )
