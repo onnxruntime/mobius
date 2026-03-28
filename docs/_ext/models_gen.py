@@ -6,13 +6,15 @@ Hooks into ``builder-inited`` to run the existing model page generator
 
 from __future__ import annotations
 
-import importlib
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from sphinx.application import Sphinx
+
+logger = logging.getLogger(__name__)
 
 
 def generate_model_pages(app: Sphinx) -> None:
@@ -21,7 +23,7 @@ def generate_model_pages(app: Sphinx) -> None:
     script = docs_dir / "_generate_models.py"
 
     if not script.exists():
-        app.warn(f"Model generation script not found: {script}")
+        logger.warning("Model generation script not found: %s", script)
         return
 
     # Run as subprocess to avoid polluting Sphinx's import state.
@@ -40,7 +42,7 @@ def generate_model_pages(app: Sphinx) -> None:
         )
 
     if result.stdout:
-        app.verbosity and print(result.stdout.strip())
+        logger.info(result.stdout.strip())
 
 
 def setup(app: Sphinx) -> dict[str, Any]:

@@ -7,12 +7,15 @@ Also creates a redirect from the old ``/docs/`` path to the new root.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from sphinx.application import Sphinx
+
+logger = logging.getLogger(__name__)
 
 _REDIRECT_HTML = """\
 <!DOCTYPE html>
@@ -33,7 +36,7 @@ def generate_dashboard(app: Sphinx, exception: Exception | None) -> None:
     script = repo_root / "scripts" / "generate_dashboard.py"
 
     if not script.exists():
-        app.warn(f"Dashboard script not found: {script}")
+        logger.warning("Dashboard script not found: %s", script)
         return
 
     outdir = Path(app.outdir)
@@ -64,7 +67,7 @@ def generate_dashboard(app: Sphinx, exception: Exception | None) -> None:
         )
 
     if result.stdout:
-        print(result.stdout.strip())
+        logger.info(result.stdout.strip())
 
     # Add redirect from old /docs/ path to root
     docs_redirect_dir = outdir / "docs"

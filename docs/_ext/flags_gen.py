@@ -8,12 +8,15 @@ separate PR branch and may not be merged yet).
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from sphinx.application import Sphinx
+
+logger = logging.getLogger(__name__)
 
 
 def generate_flags_docs(app: Sphinx) -> None:
@@ -28,6 +31,7 @@ def generate_flags_docs(app: Sphinx) -> None:
 
     if not script.exists():
         # Not an error — feature-flags PR may not be merged yet
+        logger.debug("Flags docs generator not found; skipping")
         return
 
     result = subprocess.run(
@@ -44,7 +48,7 @@ def generate_flags_docs(app: Sphinx) -> None:
         )
 
     if result.stdout:
-        app.verbosity and print(result.stdout.strip())
+        logger.info(result.stdout.strip())
 
 
 def setup(app: Sphinx) -> dict[str, Any]:
