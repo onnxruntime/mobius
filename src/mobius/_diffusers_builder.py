@@ -15,6 +15,7 @@ __all__ = [
 
 import json
 import logging
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -23,6 +24,9 @@ import tqdm
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._weight_loading import _parallel_download, apply_weights
+
+if TYPE_CHECKING:
+    from mobius.integrations._safetensors import MmapTensorDescriptor
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +119,7 @@ def _load_diffusers_pipeline_index(model_id: str) -> dict | None:
 
 def _download_diffusers_component_weights(
     model_id: str, component_name: str
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | MmapTensorDescriptor]:
     """Download weights for a specific component of a diffusers pipeline.
 
     Diffusers pipelines store weights in subdirectories using either
@@ -172,7 +176,7 @@ def _download_diffusers_component_weights(
         desc=f"{component_name} weights",
     )
 
-    state_dict: dict[str, torch.Tensor] = {}
+    state_dict: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
     for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
         state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict

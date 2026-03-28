@@ -96,7 +96,7 @@ def _assign_weight(
     # If the descriptor was materialized by preprocess_weights (the
     # model did tensor ops like split/reshape), reuse the cached tensor.
     if isinstance(tensor, MmapTensorDescriptor):
-        tensor = tensor._ensure_tensor()
+        tensor = tensor.ensure_materialized()
 
     if tensor.dtype != target_dtype:
 

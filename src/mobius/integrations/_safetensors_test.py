@@ -109,9 +109,30 @@ class TestDtypeMapping:
             ("I32", torch.int32),
             ("I64", torch.int64),
             ("U8", torch.uint8),
-            ("U16", torch.uint16),
-            ("U32", torch.uint32),
-            ("U64", torch.uint64),
+            pytest.param(
+                "U16",
+                getattr(torch, "uint16", None),
+                marks=pytest.mark.skipif(
+                    not hasattr(torch, "uint16"),
+                    reason="torch.uint16 requires PyTorch 2.3+",
+                ),
+            ),
+            pytest.param(
+                "U32",
+                getattr(torch, "uint32", None),
+                marks=pytest.mark.skipif(
+                    not hasattr(torch, "uint32"),
+                    reason="torch.uint32 requires PyTorch 2.3+",
+                ),
+            ),
+            pytest.param(
+                "U64",
+                getattr(torch, "uint64", None),
+                marks=pytest.mark.skipif(
+                    not hasattr(torch, "uint64"),
+                    reason="torch.uint64 requires PyTorch 2.3+",
+                ),
+            ),
             ("BOOL", torch.bool),
         ],
     )

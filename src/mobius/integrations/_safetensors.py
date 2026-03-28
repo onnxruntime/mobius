@@ -135,13 +135,13 @@ class MmapTensorDescriptor:
         """Create a :class:`torch.Tensor` from the mmap'd storage.
 
         Each call creates a fresh tensor view into the memory-mapped
-        file.  The result is **not** cached — use :meth:`_ensure_tensor`
+        file.  The result is **not** cached — use :meth:`ensure_materialized`
         or attribute delegation (via ``__getattr__``) for repeated access.
         """
         sub_storage = self._storage[self._byte_start : self._byte_end]
         return torch.empty(0, dtype=self._dtype).set_(sub_storage).reshape(list(self._shape))
 
-    def _ensure_tensor(self) -> torch.Tensor:
+    def ensure_materialized(self) -> torch.Tensor:
         """Materialize (if needed) and cache the tensor."""
         if self._tensor is None:
             self._tensor = self.materialize()
@@ -156,7 +156,7 @@ class MmapTensorDescriptor:
         # Materialize once and cache for attribute delegation.
         # This path is hit by preprocess_weights methods that do
         # tensor operations (split, reshape, t, etc.).
-        return getattr(self._ensure_tensor(), name)
+        return getattr(self.ensure_materialized(), name)
 
     @classmethod
     def __torch_function__(
@@ -177,7 +177,7 @@ class MmapTensorDescriptor:
 
         def _to_tensor(x: Any) -> Any:
             if isinstance(x, MmapTensorDescriptor):
-                return x._ensure_tensor()
+                return x.ensure_materialized()
             if isinstance(x, (list, tuple)):
                 return type(x)(_to_tensor(i) for i in x)
             return x
@@ -289,6 +289,20 @@ def load_safetensors_mmap(
                 f"Tensor '{name}' data_offsets [{start}, {end}) "
                 f"extend beyond file size "
                 f"({data_offset + end} > {file_size}): {path}"
+            )
+
+        # Validate that byte size matches expected size from shape and dtype.
+        num_elements = 1
+        for dim in shape:
+            num_elements *= dim
+        element_size = torch.tensor([], dtype=torch_dtype).element_size()
+        expected_bytes = num_elements * element_size
+        actual_bytes = end - start
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"Tensor '{name}' byte size mismatch: data_offsets "
+                f"span {actual_bytes} bytes but shape {shape} with "
+                f"dtype {dtype_str} requires {expected_bytes} bytes"
             )
 
         byte_start = data_offset + start
