@@ -110,16 +110,15 @@ _XFAIL_REASONS: dict[str, str] = {
     "starcoder2": "LayerNorm implementation differs from HF",
     "ctrl": "Absolute positional embedding implementation differs",
     "opt": "OPT architecture differences (learned pos embeddings)",
-    # GPT-2 family with different layernorm
-    "gpt2": "GPT2 conv1d vs linear weight handling",
-    "biogpt": "GPT2 family layernorm differences",
-    "gpt-sw3": "GPT2 family layernorm differences",
-    "gpt_bigcode": "GPT2 family layernorm differences",
-    "gpt_neo": "GPT2 family layernorm differences",
-    "openai-gpt": "GPT2 family layernorm differences",
-    "xglm": "GPT2 family layernorm differences",
+    # GPT-2 family: imagegpt/xlm/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
     "xlm": "GPT2 family layernorm differences",
+    # GPT-NeoX Japanese: diverges with small but out-of-tolerance error (unfixable in current arch)
+    "gpt_neox_japanese": "GPT-NeoX Japanese architecture diverges (out-of-tolerance)",
+    # StableLM uses LayerNorm with bias (not RMSNorm) — bias weights are skipped
+    "stablelm": "HF StableLM uses LayerNorm with bias (not RMSNorm)",
+    # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
+    "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Granite scaling multipliers
     "granite_0": "Granite embedding/logit scaling differences",
     # Gemma family: query_pre_attn_scalar
@@ -134,17 +133,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "deepseek_v2": "MLA implementation differs from HF",
     "deepseek_v3": "MLA + MoE implementation differs",
     # Weight naming: HF uses different prefix/structure than ONNX
-    "codegen": "HF uses transformer.h prefix, no gated MLP",
-    "gptj": "HF uses transformer.h prefix, no gated MLP",
-    "gpt_neox": "HF uses gpt_neox prefix + fused QKV",
-    "gpt_neox_japanese": "HF uses gpt_neox prefix + fused QKV",
-    "persimmon": "HF uses fused query_key_value + dense (not o_proj)",
-    "mpt": "HF MPT uses Wqkv naming, not query_key_value",
-    # Architecture: LayerNorm with bias instead of RMSNorm
-    "stablelm": "HF uses LayerNorm with bias (not RMSNorm)",
-    "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
-    "phi": "HF Phi uses dense/fc1/fc2 naming + LayerNorm",
     # Hybrid Mamba: weight naming and MoE routing differences
     "jamba": "Jamba MoE/Mamba weight naming + routing differences",
     # Additional divergences (newly registered models)
@@ -165,7 +154,7 @@ _HF_READONLY_FIELDS: set[str] = {"head_dim"}
 # Model types that need extra HF config fields beyond our defaults.
 _HF_EXTRA_CONFIG: dict[str, dict] = {
     "phi3": {"pad_token_id": 0},
-    "phi": {"pad_token_id": 0},
+    "phi": {"pad_token_id": 0, "layer_norm_eps": 1e-6},
     "phimoe": {"pad_token_id": 0},
     "gemma2": {"query_pre_attn_scalar": TINY_HEAD_DIM},
     "shieldgemma2": {"query_pre_attn_scalar": TINY_HEAD_DIM},
@@ -179,15 +168,28 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "num_key_value_heads": TINY_HEADS,
         "intermediate_size": 4 * TINY_HIDDEN,
     },
-    # GPT-J/CodeGen use rotary_dim (not partial_rotary_factor)
-    "gptj": {"rotary_dim": int(TINY_HEAD_DIM * 0.25)},
-    "codegen": {"rotary_dim": int(TINY_HEAD_DIM * 0.5)},
+    # GPT-J/CodeGen use rotary_dim (not partial_rotary_factor) and n_inner (not intermediate_size).
+    # HF field for LayerNorm eps is layer_norm_epsilon (not layer_norm_eps); HF default is 1e-5.
+    "gptj": {"rotary_dim": int(TINY_HEAD_DIM * 0.25), "n_inner": TINY_INTERMEDIATE},
+    "codegen": {"rotary_dim": int(TINY_HEAD_DIM * 0.5), "n_inner": TINY_INTERMEDIATE},
+    # GPT-2 family: control MLP width via model-specific field names
+    # (HF ignores the generic 'intermediate_size' for these models)
+    "gpt2": {"n_inner": TINY_INTERMEDIATE},
+    "gpt_neo": {"layer_norm_epsilon": 1e-5, "n_inner": TINY_INTERMEDIATE},
+    "gpt_bigcode": {"n_inner": TINY_INTERMEDIATE, "multi_query": False},
+    "xglm": {"ffn_dim": TINY_INTERMEDIATE},
+    "biogpt": {"ffn_dim": TINY_INTERMEDIATE},
     # Jamba requires CUDA mamba kernels by default; disable for CPU tests
     "jamba": {"use_mamba_kernels": False},
     # Nemotron uses norm_eps (not rms_norm_eps) in HF config
     "nemotron": {"norm_eps": 1e-5},
     # Qwen3.5 has head_dim as an explicit config param (default 256)
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
+    # GPT-NeoX/Pythia use layer_norm_eps (not rms_norm_eps) for their LayerNorms
+    "gpt_neox": {"layer_norm_eps": 1e-6},
+    "gpt_neox_japanese": {"layer_norm_eps": 1e-6},
+    # MPT uses layer_norm_epsilon (not rms_norm_eps) for its LayerNorms
+    "mpt": {"layer_norm_epsilon": 1e-6},
 }
 
 

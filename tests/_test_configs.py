@@ -133,7 +133,14 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("ctrl", {"hidden_act": "gelu_new", "tie_word_embeddings": True}, True),
     (
         "gpt2",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+        },
         True,
     ),
     (
@@ -452,7 +459,20 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("minicpm3", {}, True),
     ("mistral3", {}, False),
     ("openelm", {}, True),
-    ("persimmon", {}, True),
+    (
+        "persimmon",
+        {
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "relu2",
+            # HF Persimmon uses layer_norm_eps=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
     ("yi", {}, False),
     ("zamba", {}, True),
     # === Architecture-specific (untested classes) ===
@@ -467,7 +487,17 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
-    ("phi", {"partial_rotary_factor": 0.5}, True),
+    (
+        "phi",
+        {
+            "partial_rotary_factor": 0.5,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "hidden_act": "gelu_new",
+        },
+        True,
+    ),
     ("phi3small", {"partial_rotary_factor": 0.5}, True),
     ("qwen", {}, True),
     # === MoE aliases ===
@@ -500,12 +530,60 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("apertus", {}, False),
     ("arcee", {}, False),
     ("code_llama", {}, False),
-    ("codegen", {"partial_rotary_factor": 0.5}, False),
+    (
+        "codegen",
+        {
+            "partial_rotary_factor": 0.5,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu_new",
+            # HF CodeGen defaults to layer_norm_epsilon=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
     ("csm", {}, False),
     ("evolla", {}, False),
-    ("gpt_neox", {}, False),
-    ("gpt_neox_japanese", {}, False),
-    ("gptj", {"partial_rotary_factor": 0.25}, False),
+    (
+        "gpt_neox",
+        {
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            # HF GPT-NeoX defaults to partial_rotary_factor=0.25
+            "partial_rotary_factor": 0.25,
+        },
+        False,
+    ),
+    (
+        "gpt_neox_japanese",
+        {
+            # GPT-NeoX-Japanese has NO QKV bias (only a separate dense_bias for output proj)
+            "attn_qkv_bias": False,
+            "attn_o_bias": True,
+            "mlp_bias": False,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            "partial_rotary_factor": 0.25,
+            # GPT-NeoX-Japanese uses intermediate_multiple_size (default 4) not intermediate_size
+            "intermediate_size": 4 * TINY_HIDDEN,
+        },
+        False,
+    ),
+    (
+        "gptj",
+        {
+            "partial_rotary_factor": 0.25,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu_new",
+            # HF GPT-J defaults to layer_norm_epsilon=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
     ("longcat_flash", {}, False),
     ("open-llama", {}, False),
     ("seed_oss", {}, False),
@@ -516,38 +594,96 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("zamba2", {}, False),
     # === Additional GPT2 aliases ===
+    # num_key_value_heads=TINY_HEADS: GPT-2 family never uses GQA; setting
+    # kv_heads = num_heads ensures ONNX KV-cache and HF weight shapes agree.
+    # attn_qkv_bias / attn_o_bias: all GPT-2 family models use attention biases.
     (
         "biogpt",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
         False,
     ),
     (
         "gpt-sw3",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
         False,
     ),
     (
         "gpt_bigcode",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+        },
         False,
     ),
     (
         "gpt_neo",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        # GPT-Neo does not scale attention (no 1/sqrt(head_dim)), so set attention_multiplier=1.0.
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": False,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+            "attention_multiplier": 1.0,
+        },
         False,
     ),
     (
         "openai-gpt",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        # OpenAI-GPT uses post-norm (attn → residual+norm) instead of GPT-2 pre-norm.
+        # Also: always uses 4 * n_embd for MLP; no n_inner config option.
+        # No final LayerNorm (ln_f injected as identity in preprocess_weights).
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "intermediate_size": 4 * TINY_HIDDEN,
+            "post_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
         False,
     ),
     (
         "xglm",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
         False,
     ),
     # === Additional Falcon aliases ===
-    ("mpt", {"attn_qkv_bias": True}, False),
+    (
+        "mpt",
+        {
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            # MPT hardcodes 4*hidden_size; set our intermediate_size to match
+            "intermediate_size": 4 * TINY_HIDDEN,
+        },
+        False,
+    ),
     # === Additional MoE aliases ===
     (
         "ernie4_5_moe",

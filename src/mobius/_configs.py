@@ -715,6 +715,10 @@ class ArchitectureConfig(BaseModelConfig):
     # Falcon config
     alibi: bool = False
     parallel_attn: bool = False
+    dual_ln: bool = False  # True for models with two separate norms in parallel layers (MPT, GPT-NeoX-Falcon)
+
+    # Post-norm vs pre-norm architecture toggle (used by OpenAI-GPT vs standard GPT-2)
+    post_norm: bool = False
 
     # Granite scaling multipliers
     embedding_multiplier: float = 1.0

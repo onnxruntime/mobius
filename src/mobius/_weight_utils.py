@@ -145,6 +145,99 @@ def split_fused_qkv(
     return q, k, v
 
 
+def split_interleaved_qkv(
+    weight: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a fused QKV weight with per-head interleaved layout.
+
+    Used by models like GPT-NeoX and Persimmon where the fused projection
+    groups QKV **per head** rather than grouping all Q heads together:
+
+        [h0_q, h0_k, h0_v,  h1_q, h1_k, h1_v, ...]
+
+    This is the layout produced by ``nn.Linear(H, 3*H)`` when the output
+    is then reshaped to ``[num_heads, 3, head_dim]`` and indexed.
+
+    Args:
+        weight: Fused QKV tensor of shape ``[num_heads * 3 * head_dim, ...]``
+            or ``[num_heads * 3 * head_dim]`` for bias vectors.
+        num_heads: Number of query attention heads (MHA only: equals num_kv_heads).
+        num_kv_heads: Number of key/value heads (must equal num_heads for MHA).
+        head_dim: Dimension per attention head.
+
+    Returns:
+        Tuple of (q, k, v) each of shape ``[num_heads * head_dim, ...]``.
+    """
+    expected = num_heads * 3 * head_dim
+    if weight.shape[0] != expected:
+        raise ValueError(
+            f"Interleaved QKV dim 0 is {weight.shape[0]}, expected "
+            f"{expected} (num_heads={num_heads}, head_dim={head_dim})"
+        )
+    if num_kv_heads != num_heads:
+        raise ValueError(
+            f"split_interleaved_qkv requires MHA (num_kv_heads == num_heads), "
+            f"got GQA (num_kv_heads={num_kv_heads}, num_heads={num_heads})"
+        )
+    rest = weight.shape[1:]  # () for bias, (hidden_size,) for weight
+    # Reshape to [num_heads, 3, head_dim, *rest] to un-interleave
+    w = weight.reshape(num_heads, 3, head_dim, *rest)
+    q = w[:, 0].reshape(num_heads * head_dim, *rest)
+    k = w[:, 1].reshape(num_kv_heads * head_dim, *rest)
+    v = w[:, 2].reshape(num_kv_heads * head_dim, *rest)
+    return q, k, v
+
+
+def split_codegen_qkv(
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    mp_num: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a CodeGen fused QKV weight with model-parallel interleaved layout.
+
+    CodeGen uses a QVK (not QKV!) layout interleaved by model-parallel blocks:
+
+        [q_mp0, v_mp0, k_mp0,  q_mp1, v_mp1, k_mp1, ...]
+
+    where each block covers ``local_dim = num_heads * head_dim // mp_num``
+    output neurons.  After splitting, the heads from each mp-block are
+    concatenated to form the full Q, K, V projections.
+
+    Args:
+        weight: Fused QKV weight of shape ``[3 * num_heads * head_dim, hidden]``.
+            CodeGen QKV has no bias, so this is always 2D.
+        num_heads: Number of attention heads.
+        head_dim: Dimension per attention head.
+        mp_num: Number of model-parallel blocks (default 4, matches CodeGen source).
+
+    Returns:
+        Tuple of (q, k, v) each of shape ``[num_heads * head_dim, hidden]``.
+    """
+    total = 3 * num_heads * head_dim
+    if weight.shape[0] != total:
+        raise ValueError(
+            f"CodeGen QKV dim 0 is {weight.shape[0]}, expected {total} "
+            f"(num_heads={num_heads}, head_dim={head_dim})"
+        )
+    if (num_heads * head_dim) % mp_num != 0:
+        raise ValueError(
+            f"num_heads * head_dim ({num_heads * head_dim}) must be divisible by "
+            f"mp_num ({mp_num})"
+        )
+    local_dim = num_heads * head_dim // mp_num  # output neurons per mp-block per projection
+    hidden = weight.shape[1]
+    # [mp_num, 3 * local_dim, hidden] — each row is one mp-block
+    w = weight.reshape(mp_num, 3 * local_dim, hidden)
+    q = w[:, :local_dim, :].reshape(num_heads * head_dim, hidden)
+    v = w[:, local_dim : 2 * local_dim, :].reshape(num_heads * head_dim, hidden)
+    k = w[:, 2 * local_dim :, :].reshape(num_heads * head_dim, hidden)
+    return q, k, v
+
+
 def split_gate_up_proj(
     weight: torch.Tensor,
     intermediate_size: int,
