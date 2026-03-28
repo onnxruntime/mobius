@@ -107,6 +107,13 @@ def override_flags(**kwargs: bool) -> Iterator[None]:
     Restores the original values on exit, even if an exception is raised.
     Intended for use in tests.
 
+    .. note::
+        **Thread safety:** ``override_flags`` is not thread-safe — concurrent
+        calls in different threads may interleave the save/restore cycle
+        (TOCTOU). For pytest, this is safe when running with ``-n auto``
+        because xdist spawns separate worker *processes* (not threads), so
+        each worker has its own copy of the flag singleton.
+
     Raises:
         ValueError: If any key in *kwargs* is not a known flag name.
 
