@@ -21,9 +21,9 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
+    create_padding_mask,
 )
 from mobius.components._attention import Attention
-from mobius.components._common import create_padding_mask
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -104,10 +104,6 @@ class GPT2CausalLMModel(CausalLMModel):
         hidden = self.config.hidden_size
         num_heads = self.config.num_attention_heads
         head_dim = hidden // num_heads
-
-        # OpenAI-GPT has no final LayerNorm (unlike GPT-2). Detect this by
-        # checking for tokens_embed.weight, then inject identity ln_f weights.
-        _is_openai_gpt = any("tokens_embed.weight" in k for k in state_dict)
 
         # Detect Conv1D variant: GPT2/OpenAI-GPT/GPT-SW3 store c_attn as [in, out]
         # (shape[0] < shape[1]), while GPT-BigCode stores it as nn.Linear [out, in].
@@ -212,12 +208,7 @@ class GPT2CausalLMModel(CausalLMModel):
                 prefix = name.replace("attn.c_attn.bias", "attn.")
                 q_size = hidden
                 kv_size = (tensor.shape[0] - q_size) // 2
-                if kv_size == 0:
-                    # Conv1D fused QKV bias is a single vector of shape [3*hidden].
-                    # GPT-2 splits it evenly: each proj gets the same full vector
-                    # (bias is not actually split — all three projections share it).
-                    q, k, v = tensor.split(hidden, dim=0)
-                elif kv_size == hidden and not _conv1d_attn:
+                if kv_size == hidden and not _conv1d_attn:
                     # GPT-BigCode MHA (multi_query=False): interleaved per-head layout
                     # [Q_h0, K_h0, V_h0, Q_h1, ...] → reorder to standard [Q_all, K_all, V_all]
                     t = tensor.view(num_heads, 3, head_dim)
@@ -299,7 +290,7 @@ class GPT2CausalLMModel(CausalLMModel):
         # ── 8. Tied word embeddings ──────────────────────────────────────────
         if "lm_head.weight" not in new and "transformer.wte.weight" in new:
             new["lm_head.weight"] = new["transformer.wte.weight"]
-        return new
+        return super().preprocess_weights(new)
 
 
 class _GPT2TextModel(nn.Module):
@@ -360,6 +351,7 @@ class _GPT2TextModel(nn.Module):
         if not self.post_norm:
             hidden_states = self.ln_f(op, hidden_states)
         return hidden_states, present_key_values
+
 
 class _GPT2DecoderLayer(nn.Module):
     """GPT-2 decoder layer with LayerNorm.

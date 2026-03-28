@@ -317,11 +317,7 @@ class _FalconTextModel(nn.Module):
         self.word_embeddings = Embedding(config.vocab_size, config.hidden_size)
 
         parallel_attn = config.parallel_attn
-        # Falcon new_decoder_architecture implies dual LN for parallel mode
-        # Detect via: if num_kv_heads != num_attention_heads and alibi,
-        # it's likely Falcon-40B/180B with new_decoder_architecture.
-        # For test configs, default to False (single LN).
-        dual_ln = False
+        dual_ln = config.dual_ln
 
         self.h = nn.ModuleList()
         for _ in range(config.num_hidden_layers):
@@ -571,4 +567,93 @@ class BloomCausalLMModel(FalconCausalLMModel):
             new_key = key.replace(".input_layernorm.", ".ln_attn.")
             new_key = new_key.replace(".post_attention_layernorm.", ".ln_mlp.")
             renamed[new_key] = value
+        return super().preprocess_weights(renamed)
+
+
+class MPTCausalLMModel(FalconCausalLMModel):
+    """MPT (MosaicML Pretrain Transformer) causal language model.
+
+    MPT uses a sequential pre-norm architecture with ALiBi positional encoding:
+
+        norm_1 → attention → residual → norm_2 → MLP → residual
+
+    This is the standard pre-norm transformer (not parallel attention), with
+    two separate LayerNorms per block.
+
+    Weight naming differences from Falcon:
+
+    - ``transformer.blocks.N.*`` instead of ``transformer.h.N.*``
+    - ``norm_1`` / ``norm_2`` instead of ``ln_attn`` / ``ln_mlp``
+    - ``attn.Wqkv`` (fused QKV) instead of ``self_attention.query_key_value``
+    - ``attn.out_proj`` instead of ``self_attention.dense``
+    - ``ffn.up_proj`` / ``ffn.down_proj`` (already matches our naming!)
+    - ``transformer.wte`` instead of ``transformer.word_embeddings``
+    - ``transformer.norm_f`` instead of ``transformer.ln_f``
+    - Uses ALiBi positional encoding (no RoPE)
+
+    MPT only supports MHA (no GQA), so ``num_key_value_heads`` is forced to
+    match ``num_attention_heads``.
+
+    Replicates HuggingFace's ``MptForCausalLM``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        # MPT is MHA only — override KV heads to prevent shape mismatches
+        config = dataclasses.replace(config, num_key_value_heads=config.num_attention_heads)
+        # MPT uses ALiBi (no RoPE) and sequential pre-norm (standard transformer):
+        # norm_1 → attn → residual → norm_2 → mlp → residual
+        # parallel_attn=False enables sequential computation with separate LNs.
+        config = dataclasses.replace(config, alibi=True, parallel_attn=False)
+        super().__init__(config)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Map HF MPT weight names to FalconCausalLMModel attribute names.
+
+        MPT uses a different naming convention from Falcon. This method
+        translates all MPT-specific names into Falcon-compatible ones before
+        delegating to ``FalconCausalLMModel.preprocess_weights``:
+
+        1. Blocks prefix: ``transformer.blocks.N.`` → ``transformer.h.N.``
+        2. Norms: ``norm_1.`` → ``ln_attn.``, ``norm_2.`` → ``ln_mlp.``
+        3. Fused QKV: ``attn.Wqkv.`` → ``self_attention.query_key_value.``
+        4. Output proj: ``attn.out_proj.`` → ``self_attention.dense.``
+        5. FFN: ``ffn.up_proj.`` / ``ffn.down_proj.`` → ``mlp.up_proj.`` / ``mlp.down_proj.``
+           (FalconCausalLMModel.preprocess_weights converts ``dense_h_to_4h``/
+           ``dense_4h_to_h`` to up/down, but MPT already uses up/down naming)
+        6. Embeddings: ``transformer.wte.`` → ``transformer.word_embeddings.``
+        7. Final norm: ``transformer.norm_f.`` → ``transformer.ln_f.``
+        """
+        import re
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            # Block index rename: transformer.blocks.N.* → transformer.h.N.*
+            key = re.sub(r"transformer\.blocks\.(\d+)\.", r"transformer.h.\1.", key)
+            # Layer norm renames
+            key = key.replace(".norm_1.", ".ln_attn.")
+            key = key.replace(".norm_2.", ".ln_mlp.")
+            # Attention renames
+            key = key.replace(".attn.Wqkv.", ".self_attention.query_key_value.")
+            key = key.replace(".attn.out_proj.", ".self_attention.dense.")
+            # FFN: MPT already uses up_proj/down_proj so map to Falcon's intermediate names
+            # that FalconCausalLMModel.preprocess_weights will then convert to up/down
+            key = key.replace(".ffn.up_proj.", ".mlp.dense_h_to_4h.")
+            key = key.replace(".ffn.down_proj.", ".mlp.dense_4h_to_h.")
+            # Top-level renames
+            key = key.replace("transformer.wte.", "transformer.word_embeddings.")
+            key = key.replace("transformer.norm_f.", "transformer.ln_f.")
+            renamed[key] = value
+
+        # MPT has no LayerNorm bias (bias=None), but our FalconDecoderLayer uses
+        # LayerNorm which always allocates a bias parameter.  Initialize all LN
+        # biases to zero so the computation matches HF MPT exactly.
+        h = self.config.hidden_size
+        for i in range(self.config.num_hidden_layers):
+            renamed[f"transformer.h.{i}.ln_attn.bias"] = torch.zeros(h)
+            renamed[f"transformer.h.{i}.ln_mlp.bias"] = torch.zeros(h)
+        renamed["transformer.ln_f.bias"] = torch.zeros(h)
+
+        # Delegate to FalconCausalLMModel to handle QKV splitting and final renames
         return super().preprocess_weights(renamed)

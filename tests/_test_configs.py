@@ -566,9 +566,13 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mlp_bias": False,
             "num_key_value_heads": TINY_HEADS,
             "hidden_act": "gelu",
-            "partial_rotary_factor": 0.25,
+            # NOTE: HF GPT-NeoX-Japanese reads partial_rotary_factor from config.rope_parameters,
+            # not from a top-level field. HF default is 1.0 (full rotary). Use 1.0 here so both
+            # ONNX and HF apply rotary to all head_dim dimensions.
             # GPT-NeoX-Japanese uses intermediate_multiple_size (default 4) not intermediate_size
             "intermediate_size": 4 * TINY_HIDDEN,
+            # HF GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; match it
+            "rms_norm_eps": 1e-5,
         },
         False,
     ),

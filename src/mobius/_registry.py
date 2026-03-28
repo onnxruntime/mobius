@@ -283,14 +283,17 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.clip import CLIPTextModel, CLIPVisionModel
     from mobius.models.depth_anything import DepthAnythingForDepthEstimation
     from mobius.models.distilbert import DistilBertModel
-    from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel
+    from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
     from mobius.models.gemma3n import Gemma3nCausalLMModel
     from mobius.models.gpt2 import GPT2CausalLMModel
+    from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
+    from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
     from mobius.models.layoutlmv3 import LayoutLMv3Model
     from mobius.models.llava import LLaVAModel
     from mobius.models.mllama import MllamaCausalLMModel
     from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
     from mobius.models.opt import OPTCausalLMModel
+    from mobius.models.persimmon import PersimmonCausalLMModel
     from mobius.models.sam2 import Sam2VisionModel
     from mobius.models.segformer import SegformerForSemanticSegmentation
     from mobius.models.t5 import T5ForConditionalGeneration
@@ -307,7 +310,6 @@ def _create_default_registry() -> ModelRegistry:
         "arcee",
         "baichuan",
         "code_llama",
-        "codegen",
         "codegen2",
         "cohere",
         "cohere2",
@@ -321,9 +323,6 @@ def _create_default_registry() -> ModelRegistry:
         "exaone4",
         "glm",
         "glm4",
-        "gpt_neox",
-        "gpt_neox_japanese",
-        "gptj",
         "helium",
         "hunyuan_v1_dense",
         "llama",
@@ -338,7 +337,6 @@ def _create_default_registry() -> ModelRegistry:
         "nanochat",
         "open-llama",
         "openelm",
-        "persimmon",
         "qwen2",
         "seed_oss",
         "solar_open",
@@ -355,10 +353,15 @@ def _create_default_registry() -> ModelRegistry:
     for name, cls in {
         "bloom": BloomCausalLMModel,
         "chatglm": ChatGLMCausalLMModel,
+        "codegen": CodeGenCausalLMModel,
         "ernie4_5": ErnieCausalLMModel,
         "falcon": FalconCausalLMModel,
         "falcon_h1": FalconCausalLMModel,
-        "mpt": FalconCausalLMModel,
+        "gpt_neox": GPTNeoXCausalLMModel,
+        "gpt_neox_japanese": GPTNeoXJapaneseCausalLMModel,
+        "gptj": GPTJCausalLMModel,
+        "mpt": MPTCausalLMModel,
+        "persimmon": PersimmonCausalLMModel,
         "gemma": GemmaCausalLMModel,
         "gemma2": Gemma2CausalLMModel,
         "shieldgemma2": Gemma2CausalLMModel,

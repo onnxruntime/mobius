@@ -21,6 +21,7 @@ __all__ = [
     "DeepSeekV3CausalLMModel",
     "ErnieCausalLMModel",
     "FalconCausalLMModel",
+    "MPTCausalLMModel",
     "FluxTransformer2DModel",
     "HunyuanDiT2DModel",
     "Gemma2CausalLMModel",
@@ -28,6 +29,10 @@ __all__ = [
     "Gemma3MultiModalModel",
     "GemmaCausalLMModel",
     "GPT2CausalLMModel",
+    "GPTNeoXCausalLMModel",
+    "GPTNeoXJapaneseCausalLMModel",
+    "GPTJCausalLMModel",
+    "CodeGenCausalLMModel",
     "GPTOSSCausalLMModel",
     "GraniteCausalLMModel",
     "InternLM2CausalLMModel",
@@ -48,6 +53,7 @@ __all__ = [
     "Phi4MMCausalLMModel",
     "Phi4MMMultiModalModel",
     "PhiCausalLMModel",
+    "PersimmonCausalLMModel",
     "Qwen25VLCausalLMModel",
     "Qwen25VLDecoderModel",
     "Qwen25VLEmbeddingModel",
@@ -104,12 +110,14 @@ from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.ernie import ErnieCausalLMModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel
+from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.models.gemma3_text import Gemma3CausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
+from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
+from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.granite import GraniteCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.internlm import InternLM2CausalLMModel
@@ -125,6 +133,7 @@ from mobius.models.moe import (
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
+from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.phi import (
     Phi3SmallCausalLMModel,
     Phi4MMCausalLMModel,

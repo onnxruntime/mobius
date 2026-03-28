@@ -113,8 +113,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # GPT-2 family: imagegpt/xlm/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
     "xlm": "GPT2 family layernorm differences",
-    # GPT-NeoX Japanese: diverges with small but out-of-tolerance error (unfixable in current arch)
-    "gpt_neox_japanese": "GPT-NeoX Japanese architecture diverges (out-of-tolerance)",
     # StableLM uses LayerNorm with bias (not RMSNorm) — bias weights are skipped
     "stablelm": "HF StableLM uses LayerNorm with bias (not RMSNorm)",
     # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
@@ -170,7 +168,11 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     },
     # GPT-J/CodeGen use rotary_dim (not partial_rotary_factor) and n_inner (not intermediate_size).
     # HF field for LayerNorm eps is layer_norm_epsilon (not layer_norm_eps); HF default is 1e-5.
-    "gptj": {"rotary_dim": int(TINY_HEAD_DIM * 0.25), "n_inner": TINY_INTERMEDIATE},
+    "gptj": {
+        "rotary_dim": int(TINY_HEAD_DIM * 0.25),
+        "n_inner": TINY_INTERMEDIATE,
+        "layer_norm_epsilon": 1e-5,
+    },
     "codegen": {"rotary_dim": int(TINY_HEAD_DIM * 0.5), "n_inner": TINY_INTERMEDIATE},
     # GPT-2 family: control MLP width via model-specific field names
     # (HF ignores the generic 'intermediate_size' for these models)
@@ -187,7 +189,7 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
     # GPT-NeoX/Pythia use layer_norm_eps (not rms_norm_eps) for their LayerNorms
     "gpt_neox": {"layer_norm_eps": 1e-6},
-    "gpt_neox_japanese": {"layer_norm_eps": 1e-6},
+    # GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; test config matches via rms_norm_eps=1e-5
     # MPT uses layer_norm_epsilon (not rms_norm_eps) for its LayerNorms
     "mpt": {"layer_norm_epsilon": 1e-6},
 }

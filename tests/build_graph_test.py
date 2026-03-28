@@ -218,7 +218,8 @@ class TestBuildGraph:
 
         # Check for expected parameter patterns (allow model-specific naming)
         has_embed = any(
-            "embed_tokens" in n or "word_embeddings" in n or "wte" in n for n in init_names
+            "embed_tokens" in n or "word_embeddings" in n or "wte" in n or "embed_in" in n
+            for n in init_names
         )
         has_attn = any(
             "self_attn" in n or "self_attention" in n or "attention" in n or ".attn." in n
