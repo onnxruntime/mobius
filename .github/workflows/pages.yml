@@ -46,31 +46,8 @@ jobs:
           pip install -r docs/requirements.txt
           pip install -e '.[testing]'
 
-      - name: Generate docs content
-        run: |
-          python docs/_generate_models.py
-          if [ -f scripts/generate_flags_docs.py ]; then
-            python scripts/generate_flags_docs.py
-          fi
-
-      - name: Build Sphinx docs
+      - name: Build documentation
         run: sphinx-build docs _site
-
-      - name: Generate dashboard
-        run: |
-          mkdir -p _site/dashboard
-          python scripts/generate_dashboard.py \
-            --output _site/dashboard/index.html \
-            --commit $(git rev-parse --short HEAD)
-
-      - name: Add redirect from old /docs/ path
-        run: |
-          mkdir -p _site/docs
-          cat > _site/docs/index.html << 'EOF'
-          <!DOCTYPE html>
-          <html><head><meta http-equiv="refresh" content="0; url=../"><title>Redirecting...</title></head>
-          <body><a href="../">Click here</a></body></html>
-          EOF
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
