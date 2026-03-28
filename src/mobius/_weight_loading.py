@@ -28,8 +28,7 @@ import torch
 import tqdm
 from onnx_ir import tensor_adapters
 
-from mobius._flags import flags
-from mobius.integrations._safetensors import MmapTensorDescriptor
+from mobius.integrations._safetensors import MmapTensorDescriptor, load_safetensors_mmap
 
 logger = logging.getLogger(__name__)
 
@@ -186,10 +185,8 @@ def _download_weights(
 
     Uses parallel downloads when multiple safetensors shards exist.
 
-    When ``flags.mmap_loading`` is enabled, returns
-    :class:`MmapTensorDescriptor` objects that defer tensor creation
-    until first attribute access (controlled by ``flags.lazy_weight_loading``).
-    Otherwise, loads all tensors eagerly using safetensors.
+    Returns :class:`MmapTensorDescriptor` objects that defer tensor creation
+    until first attribute access via memory-mapped loading.
     """
     from huggingface_hub import hf_hub_download
 
@@ -210,14 +207,6 @@ def _download_weights(
     paths = _parallel_download(model_id, all_files, desc="safetensors")
 
     state_dict: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
-    if flags.mmap_loading:
-        from mobius.integrations._safetensors import load_safetensors_mmap
-
-        for path in tqdm.tqdm(paths, desc="Loading weights"):
-            state_dict.update(load_safetensors_mmap(path, lazy=flags.lazy_weight_loading))
-    else:
-        import safetensors.torch
-
-        for path in tqdm.tqdm(paths, desc="Loading weights"):
-            state_dict.update(safetensors.torch.load_file(path))
+    for path in tqdm.tqdm(paths, desc="Loading weights"):
+        state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict

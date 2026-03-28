@@ -126,7 +126,7 @@ def _download_diffusers_component_weights(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    from mobius._flags import flags
+    from mobius.integrations._safetensors import load_safetensors_mmap
 
     prefix = f"{component_name}/"
     # Diffusers uses two naming conventions for weight files
@@ -173,16 +173,8 @@ def _download_diffusers_component_weights(
     )
 
     state_dict: dict[str, torch.Tensor] = {}
-    if flags.mmap_loading:
-        from mobius.integrations._safetensors import load_safetensors_mmap
-
-        for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-            state_dict.update(load_safetensors_mmap(path, lazy=True))
-    else:
-        import safetensors.torch
-
-        for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-            state_dict.update(safetensors.torch.load_file(path))
+    for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
+        state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict
 
 
