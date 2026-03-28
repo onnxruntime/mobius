@@ -18,6 +18,7 @@ HF weight naming:
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING
 
@@ -550,6 +551,10 @@ class BloomCausalLMModel(FalconCausalLMModel):
     """
 
     def __init__(self, config: ArchitectureConfig):
+        # Bloom always uses ALiBi positional encoding — enforce it regardless
+        # of whether the caller set alibi=True in the config, since HF's
+        # BloomConfig has no alibi field and ArchitectureConfig defaults to False.
+        config = dataclasses.replace(config, alibi=True)
         super().__init__(config)
         self.transformer = _BloomTextModel(config)
 
