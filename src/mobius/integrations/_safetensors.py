@@ -30,6 +30,7 @@ region).
 from __future__ import annotations
 
 __all__ = [
+    "MmapTensorDescriptor",
     "load_safetensors_mmap",
 ]
 
@@ -70,6 +71,83 @@ _SAFETENSORS_DTYPE_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
 }
 
 
+class MmapTensorDescriptor:
+    """Lightweight descriptor for a tensor stored in a memory-mapped file.
+
+    Holds only the metadata (shape, dtype) and a reference to the
+    parent :class:`torch.UntypedStorage` plus byte offsets.  The actual
+    :class:`torch.Tensor` is created on demand via :meth:`materialize`,
+    so for models whose ``preprocess_weights`` only renames keys the
+    tensor data is never touched during weight loading.
+
+    Attribute access other than :attr:`shape` and :attr:`dtype` is
+    delegated to the materialized tensor, providing transparent
+    compatibility with code that expects a :class:`torch.Tensor`.
+    """
+
+    __slots__ = (
+        "_byte_end",
+        "_byte_start",
+        "_dtype",
+        "_shape",
+        "_storage",
+        "_tensor",
+    )
+
+    def __init__(
+        self,
+        storage: torch.UntypedStorage,
+        byte_start: int,
+        byte_end: int,
+        dtype: torch.dtype,
+        shape: list[int],
+    ) -> None:
+        self._storage = storage
+        self._byte_start = byte_start
+        self._byte_end = byte_end
+        self._dtype = dtype
+        self._shape = torch.Size(shape)
+        self._tensor: torch.Tensor | None = None
+
+    @property
+    def shape(self) -> torch.Size:
+        """Tensor shape (available without materialization)."""
+        return self._shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Tensor dtype (available without materialization)."""
+        return self._dtype
+
+    def is_materialized(self) -> bool:
+        """Return True if the tensor has been materialized."""
+        return self._tensor is not None
+
+    def materialize(self) -> torch.Tensor:
+        """Create a :class:`torch.Tensor` from the mmap'd storage.
+
+        Each call creates a fresh tensor view into the memory-mapped
+        file.  The result is **not** cached — use attribute delegation
+        (via ``__getattr__``) for repeated access.
+        """
+        sub_storage = self._storage[self._byte_start : self._byte_end]
+        return torch.empty(0, dtype=self._dtype).set_(sub_storage).reshape(list(self._shape))
+
+    def __getattr__(self, name: str) -> Any:
+        # Materialize once and cache for attribute delegation.
+        # This path is hit by preprocess_weights methods that do
+        # tensor operations (split, reshape, t, etc.).
+        if self._tensor is None:
+            self._tensor = self.materialize()
+        return getattr(self._tensor, name)
+
+    def __repr__(self) -> str:
+        status = "materialized" if self._tensor is not None else "lazy"
+        return (
+            f"MmapTensorDescriptor(dtype={self._dtype}, shape={list(self._shape)}, {status})"
+        )
+
+
 def _parse_header(
     path: str | os.PathLike,
 ) -> tuple[dict[str, dict[str, Any]], int]:
@@ -103,7 +181,9 @@ def _parse_header(
 
 def load_safetensors_mmap(
     path: str | os.PathLike,
-) -> dict[str, torch.Tensor]:
+    *,
+    lazy: bool = False,
+) -> dict[str, torch.Tensor | MmapTensorDescriptor]:
     """Load tensors from a safetensors file using memory-mapped I/O.
 
     This is a drop-in replacement for ``safetensors.torch.load_file()``
@@ -113,10 +193,16 @@ def load_safetensors_mmap(
 
     Args:
         path: Path to the ``.safetensors`` file.
+        lazy: If ``True``, return :class:`MmapTensorDescriptor` objects
+            instead of :class:`torch.Tensor`.  Descriptors defer tensor
+            creation until first attribute access (beyond ``.shape`` /
+            ``.dtype``), enabling near-zero peak memory for weight
+            pipelines that only rename keys.
 
     Returns:
         A dictionary mapping tensor names to :class:`torch.Tensor`
-        instances backed by memory-mapped storage.
+        instances (or :class:`MmapTensorDescriptor` when *lazy* is
+        ``True``) backed by memory-mapped storage.
 
     Raises:
         ValueError: If the file is corrupted or truncated.
@@ -133,7 +219,7 @@ def load_safetensors_mmap(
     # lazily page in only the regions that are actually accessed.
     storage = torch.UntypedStorage.from_file(path, shared=False, nbytes=file_size)
 
-    tensors: dict[str, torch.Tensor] = {}
+    tensors: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
     for name, metadata in header.items():
         if name == "__metadata__":
             continue
@@ -162,14 +248,17 @@ def load_safetensors_mmap(
                 f"({data_offset + end} > {file_size}): {path}"
             )
 
-        # Slice the UntypedStorage to the tensor's byte range.
         byte_start = data_offset + start
         byte_end = data_offset + end
-        sub_storage = storage[byte_start:byte_end]
 
-        # Create a tensor backed by the sub-storage and reshape.
-        tensor = torch.empty(0, dtype=torch_dtype).set_(sub_storage).reshape(shape)
-
-        tensors[name] = tensor
+        if lazy:
+            # Store a lightweight descriptor — no torch.Tensor created.
+            tensors[name] = MmapTensorDescriptor(
+                storage, byte_start, byte_end, torch_dtype, shape
+            )
+        else:
+            # Eagerly create a tensor backed by mmap'd sub-storage.
+            sub_storage = storage[byte_start:byte_end]
+            tensors[name] = torch.empty(0, dtype=torch_dtype).set_(sub_storage).reshape(shape)
 
     return tensors

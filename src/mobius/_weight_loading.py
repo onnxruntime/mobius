@@ -28,12 +28,14 @@ import torch
 import tqdm
 from onnx_ir import tensor_adapters
 
+from mobius.integrations._safetensors import MmapTensorDescriptor
+
 logger = logging.getLogger(__name__)
 
 
 def _assign_weight(
     initializer: ir.Value,
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | MmapTensorDescriptor,
     name: str,
 ) -> None:
     """Assign a weight tensor to an initializer with shape/dtype handling.
@@ -42,12 +44,18 @@ def _assign_weight(
 
     * **Shape mismatch error** — raises :class:`ValueError` when the
       tensor shape differs from the initializer shape.
+    * **Lazy mmap path** — when the tensor is a
+      :class:`MmapTensorDescriptor` that has not yet been materialized,
+      wraps it in ``ir.LazyTensor`` so the data is read from the
+      memory-mapped file only at ONNX serialization time.  This keeps
+      peak memory near-zero for rename-only weight pipelines.
     * **Lazy dtype cast** — when the tensor dtype differs from the
       initializer's declared ONNX type, wraps the tensor in
       ``ir.LazyTensor`` so the cast happens at serialization time,
       avoiding eager memory allocation.
     """
     # Raise on shape mismatch (initializers always have concrete int dims).
+    # Both torch.Tensor and MmapTensorDescriptor expose .shape / .dtype.
     init_shape = initializer.shape
     if init_shape is not None:
         expected = list(init_shape)
@@ -60,6 +68,35 @@ def _assign_weight(
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+
+    # Fast path: descriptor was never touched by preprocess_weights
+    # (rename-only models).  Create an ir.LazyTensor whose closure
+    # materializes the tensor from the mmap'd file at serialization
+    # time — one tensor at a time, minimizing peak memory.
+    if isinstance(tensor, MmapTensorDescriptor) and not tensor.is_materialized():
+
+        def lazy_mmap_func(
+            desc: MmapTensorDescriptor = tensor,
+            dt: torch.dtype = target_dtype,
+            n: str = name,
+        ) -> tensor_adapters.TorchTensor:
+            t = desc.materialize()
+            if t.dtype != dt:
+                t = t.to(dt)
+            return tensor_adapters.TorchTensor(t, name=n)
+
+        initializer.const_value = ir.LazyTensor(
+            lazy_mmap_func,
+            dtype=onnx_dtype,
+            shape=ir.Shape(tensor.shape),
+            name=name,
+        )
+        return
+
+    # If the descriptor was materialized by preprocess_weights (the
+    # model did tensor ops like split/reshape), extract the real tensor.
+    if isinstance(tensor, MmapTensorDescriptor):
+        tensor = tensor.materialize()
 
     if tensor.dtype != target_dtype:
 
@@ -141,10 +178,14 @@ def _parallel_download(
     return [path_map[f] for f in filenames]
 
 
-def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
-    """Download weights from HuggingFace and return as a state dict.
+def _download_weights(
+    model_id: str,
+) -> dict[str, torch.Tensor | MmapTensorDescriptor]:
+    """Download weights from HuggingFace and return as a lazy state dict.
 
     Uses parallel downloads when multiple safetensors shards exist.
+    Returns :class:`MmapTensorDescriptor` objects that defer tensor
+    creation until first attribute access.
     """
     from huggingface_hub import hf_hub_download
 
@@ -166,7 +207,7 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
 
     paths = _parallel_download(model_id, all_files, desc="safetensors")
 
-    state_dict: dict[str, torch.Tensor] = {}
+    state_dict: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(load_safetensors_mmap(path))
+        state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict

@@ -174,7 +174,7 @@ def _download_diffusers_component_weights(
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-        state_dict.update(load_safetensors_mmap(path))
+        state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict
 
 

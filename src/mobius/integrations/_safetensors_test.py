@@ -16,6 +16,7 @@ import torch
 from mobius.integrations._safetensors import (
     _MAX_HEADER_SIZE,
     _SAFETENSORS_DTYPE_TO_TORCH_DTYPE,
+    MmapTensorDescriptor,
     _parse_header,
     load_safetensors_mmap,
 )
@@ -419,3 +420,223 @@ class TestDataOffsetValidation:
         result = load_safetensors_mmap(path)
         assert "w" in result
         assert result["w"].shape == torch.Size([2])
+
+
+# ---------------------------------------------------------------------------
+# MmapTensorDescriptor
+# ---------------------------------------------------------------------------
+
+
+class TestMmapTensorDescriptor:
+    """Tests for the lazy MmapTensorDescriptor."""
+
+    def test_shape_dtype_without_materialization(self, tmp_path):
+        """Shape and dtype are available without creating a torch.Tensor."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(3, 4, dtype=torch.float16)})
+
+        result = load_safetensors_mmap(path, lazy=True)
+        desc = result["w"]
+        assert isinstance(desc, MmapTensorDescriptor)
+        assert desc.shape == torch.Size([3, 4])
+        assert desc.dtype == torch.float16
+        assert not desc.is_materialized()
+
+    def test_materialize_gives_correct_values(self, tmp_path):
+        """Materialized tensor must match eagerly-loaded tensor."""
+        path = str(tmp_path / "model.safetensors")
+        original = {"w": torch.randn(5, 3)}
+        _create_safetensors_file(path, original)
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        tensor = desc.materialize()
+        assert isinstance(tensor, torch.Tensor)
+        torch.testing.assert_close(tensor, original["w"])
+
+    def test_materialize_does_not_cache(self, tmp_path):
+        """Each materialize() call returns a fresh tensor."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(4)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        t1 = desc.materialize()
+        t2 = desc.materialize()
+        # Same values
+        torch.testing.assert_close(t1, t2)
+        # materialize alone does not flip is_materialized
+        assert not desc.is_materialized()
+
+    def test_getattr_delegates_to_tensor(self, tmp_path):
+        """Accessing tensor methods triggers materialization."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(6)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        assert not desc.is_materialized()
+        # .sum() is a tensor method — triggers __getattr__
+        result = desc.sum()
+        assert desc.is_materialized()
+        assert isinstance(result, torch.Tensor)
+
+    def test_getattr_caches_for_repeated_access(self, tmp_path):
+        """Attribute delegation caches the tensor for efficiency."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(4)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        _ = desc.sum()  # triggers materialization + caching
+        _ = desc.mean()  # uses cached tensor
+        assert desc.is_materialized()
+
+    def test_repr_shows_status(self, tmp_path):
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(2, 3)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        assert "lazy" in repr(desc)
+        _ = desc.sum()
+        assert "materialized" in repr(desc)
+
+    def test_split_works_through_delegation(self, tmp_path):
+        """Tensor operations like split work via __getattr__."""
+        path = str(tmp_path / "model.safetensors")
+        t = torch.randn(6, 4)
+        _create_safetensors_file(path, {"w": t})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        a, b = desc.split(3, dim=0)
+        torch.testing.assert_close(a, t[:3])
+        torch.testing.assert_close(b, t[3:])
+
+
+# ---------------------------------------------------------------------------
+# Lazy loading mode
+# ---------------------------------------------------------------------------
+
+
+class TestLazyLoading:
+    """Tests for load_safetensors_mmap(lazy=True)."""
+
+    def test_returns_descriptors(self, tmp_path):
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"a": torch.randn(4), "b": torch.randn(2, 3)})
+
+        result = load_safetensors_mmap(path, lazy=True)
+        assert isinstance(result["a"], MmapTensorDescriptor)
+        assert isinstance(result["b"], MmapTensorDescriptor)
+
+    def test_lazy_false_returns_tensors(self, tmp_path):
+        """Default (lazy=False) still returns torch.Tensor."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(4)})
+
+        result = load_safetensors_mmap(path, lazy=False)
+        assert isinstance(result["w"], torch.Tensor)
+
+    def test_rename_preserves_descriptors(self, tmp_path):
+        """Simulating rename-only preprocess_weights keeps descriptors."""
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(
+            path,
+            {"old.weight": torch.randn(4, 4), "old.bias": torch.randn(4)},
+        )
+
+        state_dict = load_safetensors_mmap(path, lazy=True)
+        # Simulate rename-only preprocess_weights: pop + assign
+        new_dict: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
+        new_dict["new.weight"] = state_dict.pop("old.weight")
+        new_dict["new.bias"] = state_dict.pop("old.bias")
+
+        # Descriptors survive the rename without materializing
+        assert isinstance(new_dict["new.weight"], MmapTensorDescriptor)
+        assert isinstance(new_dict["new.bias"], MmapTensorDescriptor)
+        assert not new_dict["new.weight"].is_materialized()
+        assert not new_dict["new.bias"].is_materialized()
+
+    def test_transform_materializes(self, tmp_path):
+        """Tensor ops materialize the descriptor (transform models)."""
+        path = str(tmp_path / "model.safetensors")
+        original = torch.randn(8, 4)
+        _create_safetensors_file(path, {"qkv": original})
+
+        state_dict = load_safetensors_mmap(path, lazy=True)
+        desc = state_dict["qkv"]
+        # Simulate transform preprocess_weights: split QKV
+        q, k, v = desc.split([3, 3, 2], dim=0)
+        assert desc.is_materialized()  # triggered by .split()
+        torch.testing.assert_close(q, original[:3])
+
+
+# ---------------------------------------------------------------------------
+# Integration with _assign_weight
+# ---------------------------------------------------------------------------
+
+
+class TestAssignWeightWithDescriptor:
+    """Test _assign_weight handling of MmapTensorDescriptor."""
+
+    def test_descriptor_creates_lazy_tensor(self, tmp_path):
+        """Unmaterialized descriptors become ir.LazyTensor."""
+        import onnx_ir as ir
+
+        from mobius._weight_loading import _assign_weight
+
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(3, 4, dtype=torch.float32)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        assert not desc.is_materialized()
+
+        # Create a mock initializer
+        initializer = ir.Value(name="w")
+        initializer.type = ir.TensorType(ir.DataType.FLOAT)
+        initializer.shape = ir.Shape([3, 4])
+
+        _assign_weight(initializer, desc, "w")
+        # Should be LazyTensor (not eagerly materialized)
+        assert isinstance(initializer.const_value, ir.LazyTensor)
+        # Descriptor should NOT have been materialized yet
+        assert not desc.is_materialized()
+
+    def test_materialized_descriptor_uses_regular_path(self, tmp_path):
+        """Materialized descriptors use the regular torch path."""
+        import onnx_ir as ir
+        from onnx_ir import tensor_adapters
+
+        from mobius._weight_loading import _assign_weight
+
+        path = str(tmp_path / "model.safetensors")
+        _create_safetensors_file(path, {"w": torch.randn(3, 4, dtype=torch.float32)})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        _ = desc.sum()  # force materialization
+        assert desc.is_materialized()
+
+        initializer = ir.Value(name="w")
+        initializer.type = ir.TensorType(ir.DataType.FLOAT)
+        initializer.shape = ir.Shape([3, 4])
+
+        _assign_weight(initializer, desc, "w")
+        # Should be TorchTensor (immediate, since already materialized)
+        assert isinstance(initializer.const_value, tensor_adapters.TorchTensor)
+
+    def test_lazy_tensor_evaluates_correctly(self, tmp_path):
+        """The LazyTensor closure produces correct values at eval time."""
+        import onnx_ir as ir
+
+        from mobius._weight_loading import _assign_weight
+
+        path = str(tmp_path / "model.safetensors")
+        original = torch.randn(2, 3, dtype=torch.float32)
+        _create_safetensors_file(path, {"w": original})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+
+        initializer = ir.Value(name="w")
+        initializer.type = ir.TensorType(ir.DataType.FLOAT)
+        initializer.shape = ir.Shape([2, 3])
+
+        _assign_weight(initializer, desc, "w")
+        # Evaluate the lazy tensor
+        result = initializer.const_value.numpy()
+        torch.testing.assert_close(torch.from_numpy(result), original)

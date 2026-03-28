@@ -66,7 +66,7 @@ def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(load_safetensors_mmap(path))
+        state_dict.update(load_safetensors_mmap(path, lazy=True))
     return state_dict
 
 
