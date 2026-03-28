@@ -145,9 +145,9 @@ class SparseMixerGate(nn.Module):
         factor = op.Max(abs_scores, max_score)
         diff = op.Sub(max_score, scores)
         ratio = op.Div(diff, factor)
-        threshold = op.Constant(value_float=2.0 * jitter_eps)
+        threshold = op.CastLike(op.Constant(value_float=2.0 * jitter_eps), scores)
         mask = op.Greater(ratio, threshold)
-        neg_inf = op.Constant(value_float=-1e30)
+        neg_inf = op.CastLike(op.Constant(value_float=-1e30), scores)
         masked_scores = op.Where(mask, neg_inf, scores)
         weights = op.Softmax(masked_scores, axis=-1)
         k_one = op.Constant(value_ints=[1])
@@ -169,7 +169,7 @@ class SparseMixerGate(nn.Module):
             )
             all_weights.append(weight_k)
             all_experts.append(expert_k)
-            neg_inf = op.Constant(value_float=-1e30)
+            neg_inf = op.CastLike(op.Constant(value_float=-1e30), current_scores)
             current_scores = op.ScatterElements(
                 current_scores,
                 expert_k,

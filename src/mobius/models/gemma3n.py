@@ -196,7 +196,7 @@ class Gemma3nAltUp(nn.Module):
     def _compute_router_modalities(self, op: builder.OpBuilder, x):
         """Compute router modalities: tanh(router(norm(x) * scale))."""
         router_input = self.router_norm(op, x)
-        scale = op.Constant(value_float=self.router_input_scale)
+        scale = op.CastLike(op.Constant(value_float=self.router_input_scale), router_input)
         router_input = op.Mul(router_input, scale)
         routed = self.modality_router(op, router_input)
         return op.Tanh(routed)
@@ -335,7 +335,9 @@ class Gemma3nDecoderLayer(nn.Module):
         # Residual + Laurel (with sqrt(2) normalization)
         attn_gated = op.Add(active, attn_output)
         attn_laurel = op.Add(attn_gated, laurel_output)
-        attn_laurel = op.Div(attn_laurel, op.Constant(value_float=float(math.sqrt(2))))
+        attn_laurel = op.Div(
+            attn_laurel, op.CastLike(op.Constant(value_float=float(math.sqrt(2))), attn_laurel)
+        )
 
         # MLP
         mlp_input = self.pre_feedforward_layernorm(op, attn_laurel)

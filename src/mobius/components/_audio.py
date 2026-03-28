@@ -409,7 +409,7 @@ class ConformerEncoderLayer(nn.Module):
         self.layer_norm = LayerNorm(d_model)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
-        half = op.Constant(value_float=0.5)
+        half = op.CastLike(op.Constant(value_float=0.5), x)
 
         # Macaron feed-forward in
         x = op.Add(x, op.Mul(self.feed_forward_in(op, x), half))
