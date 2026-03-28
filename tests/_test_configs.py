@@ -339,7 +339,14 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "bloom",
-        {"alibi": True, "attn_qkv_bias": True, "mlp_bias": True},
+        {
+            "alibi": True,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "intermediate_size": 4 * TINY_HIDDEN,
+        },
         True,
     ),
     # === Additional Llama-compatible aliases ===

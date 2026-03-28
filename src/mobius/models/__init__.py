@@ -9,6 +9,7 @@ __all__ = [
     "BartForConditionalGeneration",
     "BertModel",
     "Blip2Model",
+    "BloomCausalLMModel",
     "CausalLMModel",
     "CLIPVisionModel",
     "CogVideoXTransformer3DModel",
@@ -103,7 +104,7 @@ from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.ernie import ErnieCausalLMModel
-from mobius.models.falcon import FalconCausalLMModel
+from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel

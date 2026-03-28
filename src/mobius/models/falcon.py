@@ -389,10 +389,78 @@ class _FalconTextModel(nn.Module):
         return hidden_states, present_key_values
 
 
-class FalconCausalLMModel(nn.Module):
-    """Falcon/Bloom CausalLM with ALiBi or RoPE positional encoding.
+class _BloomTextModel(_FalconTextModel):
+    """Bloom text model with word_embeddings_layernorm after token embedding.
 
-    Supports both ALiBi (Falcon-40B, 180B, Bloom) and RoPE (Falcon-7B)
+    HF Bloom applies LayerNorm to word embeddings before the transformer
+    layers, which Falcon does not.  Attribute name matches the HF weight
+    ``transformer.word_embeddings_layernorm.{weight,bias}``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self.word_embeddings_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states = self.word_embeddings(op, input_ids)
+        # Bloom applies LayerNorm to word embeddings before transformer
+        hidden_states = self.word_embeddings_layernorm(op, hidden_states)
+        present_key_values = []
+
+        if self._alibi:
+            seq_len = op.Shape(input_ids, start=1, end=2)
+            if past_key_values is not None and len(past_key_values) > 0:
+                past_len = op.Shape(past_key_values[0][0], start=2, end=3)
+                total_len = op.Add(seq_len, past_len)
+            else:
+                total_len = seq_len
+
+            alibi_bias = _create_alibi_bias(op, self._num_heads, seq_len, total_len)
+
+            for i, layer in enumerate(self.h):
+                past_kv = past_key_values[i] if past_key_values else None
+                hidden_states, present_kv = layer(
+                    op,
+                    hidden_states,
+                    alibi_bias,
+                    past_kv,
+                )
+                present_key_values.append(present_kv)
+        else:
+            position_embeddings = self.rotary_emb(op, position_ids)
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+
+            for i, layer in enumerate(self.h):
+                past_kv = past_key_values[i] if past_key_values else None
+                hidden_states, present_kv = layer(
+                    op,
+                    hidden_states,
+                    attention_bias,
+                    position_embeddings,
+                    past_kv,
+                )
+                present_key_values.append(present_kv)
+
+        hidden_states = self.ln_f(op, hidden_states)
+        return hidden_states, present_key_values
+
+
+class FalconCausalLMModel(nn.Module):
+    """Falcon CausalLM with ALiBi or RoPE positional encoding.
+
+    Supports both ALiBi (Falcon-40B, 180B) and RoPE (Falcon-7B)
     positional encoding, as well as parallel and sequential attention+MLP.
 
     Outer attribute ``transformer`` matches HF Falcon weight prefix.
@@ -470,3 +538,32 @@ class FalconCausalLMModel(nn.Module):
                 new_state_dict[head_key] = new_state_dict[embed_key]
 
         return new_state_dict
+
+
+class BloomCausalLMModel(FalconCausalLMModel):
+    """Bloom CausalLM with ALiBi and word_embeddings_layernorm.
+
+    Bloom applies LayerNorm to word embeddings before the transformer
+    blocks, which standard Falcon does not.
+
+    Replicates HuggingFace's ``BloomForCausalLM``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self.transformer = _BloomTextModel(config)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Map HF Bloom weight names to our names.
+
+        Bloom uses ``input_layernorm`` / ``post_attention_layernorm``
+        while our ``_ALiBiDecoderLayer`` uses ``ln_attn`` / ``ln_mlp``.
+        """
+        renamed = {}
+        for key, value in state_dict.items():
+            new_key = key.replace(".input_layernorm.", ".ln_attn.")
+            new_key = new_key.replace(".post_attention_layernorm.", ".ln_mlp.")
+            renamed[new_key] = value
+        return super().preprocess_weights(renamed)

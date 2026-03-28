@@ -283,7 +283,7 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.clip import CLIPTextModel, CLIPVisionModel
     from mobius.models.depth_anything import DepthAnythingForDepthEstimation
     from mobius.models.distilbert import DistilBertModel
-    from mobius.models.falcon import FalconCausalLMModel
+    from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel
     from mobius.models.gemma3n import Gemma3nCausalLMModel
     from mobius.models.gpt2 import GPT2CausalLMModel
     from mobius.models.layoutlmv3 import LayoutLMv3Model
@@ -353,7 +353,7 @@ def _create_default_registry() -> ModelRegistry:
 
     # --- Text Generation (architecture-specific) ---
     for name, cls in {
-        "bloom": FalconCausalLMModel,
+        "bloom": BloomCausalLMModel,
         "chatglm": ChatGLMCausalLMModel,
         "ernie4_5": ErnieCausalLMModel,
         "falcon": FalconCausalLMModel,

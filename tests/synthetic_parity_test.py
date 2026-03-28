@@ -104,6 +104,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "gemma2": "Attention softcapping implementation differs",
     "shieldgemma2": "Attention softcapping implementation differs",
     # Tied embeddings / layernorm differences
+    "bloom": "LayerNorm implementation differs from HF",
     "cohere": "LayerNorm implementation differs from HF",
     "cohere2": "LayerNorm implementation differs from HF",
     "starcoder2": "LayerNorm implementation differs from HF",
@@ -146,7 +147,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "phi": "HF Phi uses dense/fc1/fc2 naming + LayerNorm",
     # Hybrid Mamba: weight naming and MoE routing differences
     "jamba": "Jamba MoE/Mamba weight naming + routing differences",
-    "bamba": "Bamba precision differences (near-threshold, 0.0017)",
     # Additional divergences (newly registered models)
     "doge": "DOGE dynamic mask / attention implementation differs",
     "nanochat": "NanoChat architecture implementation differs",
@@ -174,6 +174,11 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma3n": {"query_pre_attn_scalar": TINY_HEAD_DIM},
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM},
     "opt": {"word_embed_proj_dim": TINY_HIDDEN},
+    # Bloom uses MHA (num_kv_heads == num_heads) and 4*hidden intermediate
+    "bloom": {
+        "num_key_value_heads": TINY_HEADS,
+        "intermediate_size": 4 * TINY_HIDDEN,
+    },
     # GPT-J/CodeGen use rotary_dim (not partial_rotary_factor)
     "gptj": {"rotary_dim": int(TINY_HEAD_DIM * 0.25)},
     "codegen": {"rotary_dim": int(TINY_HEAD_DIM * 0.5)},
