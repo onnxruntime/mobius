@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     import onnx_ir as ir
     import torch
 
+    from mobius.integrations._safetensors import MmapTensorDescriptor
+
 from mobius._builder import (
     DTYPE_MAP,
     build,
@@ -43,9 +45,11 @@ def _parse_size(size_str: str) -> int:
     return int(size_str)
 
 
-def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
+def _load_weights_from_dir(
+    model_dir: str,
+) -> dict[str, torch.Tensor | MmapTensorDescriptor]:
     """Load safetensors weights from a local model directory."""
-    from mobius.integrations._safetensors import load_safetensors_mmap
+    from mobius._flags import flags
 
     model_dir = os.path.abspath(model_dir)
     if os.path.isfile(model_dir):
@@ -64,9 +68,17 @@ def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
     if not paths:
         raise FileNotFoundError(f"No safetensors files found in {model_dir}")
 
-    state_dict: dict[str, torch.Tensor] = {}
-    for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(load_safetensors_mmap(path, lazy=True))
+    state_dict: dict[str, torch.Tensor | MmapTensorDescriptor] = {}
+    if flags.mmap_loading:
+        from mobius.integrations._safetensors import load_safetensors_mmap
+
+        for path in tqdm.tqdm(paths, desc="Loading weights"):
+            state_dict.update(load_safetensors_mmap(path, lazy=True))
+    else:
+        import safetensors.torch
+
+        for path in tqdm.tqdm(paths, desc="Loading weights"):
+            state_dict.update(safetensors.torch.load_file(path))
     return state_dict
 
 

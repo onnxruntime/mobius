@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from mobius._flags import Flags, flags, list_flags, override_flags
@@ -20,10 +18,10 @@ class TestDefaultValues:
         f = Flags()
         assert f.mmap_loading is False
 
-    def test_lazy_cast_default_on(self, monkeypatch):
-        monkeypatch.delenv("MOBIUS_LAZY_CAST", raising=False)
+    def test_lazy_weight_loading_default_on(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_LAZY_WEIGHT_LOADING", raising=False)
         f = Flags()
-        assert f.lazy_cast is True
+        assert f.lazy_weight_loading is True
 
     def test_suppress_dedup_warning_default_on(self, monkeypatch):
         monkeypatch.delenv("MOBIUS_SUPPRESS_DEDUP_WARNING", raising=False)
@@ -42,9 +40,9 @@ class TestEnvVarOverride:
 
     @pytest.mark.parametrize("val", ["0", "false", "False", "FALSE", "no", "NO"])
     def test_falsy_values(self, monkeypatch, val):
-        monkeypatch.setenv("MOBIUS_LAZY_CAST", val)
+        monkeypatch.setenv("MOBIUS_LAZY_WEIGHT_LOADING", val)
         f = Flags()
-        assert f.lazy_cast is False
+        assert f.lazy_weight_loading is False
 
     def test_unknown_value_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MOBIUS_MMAP_LOADING", "maybe")
@@ -68,13 +66,13 @@ class TestProgrammaticOverride:
         finally:
             flags.mmap_loading = original
 
-    def test_set_lazy_cast(self):
-        original = flags.lazy_cast
+    def test_set_lazy_weight_loading(self):
+        original = flags.lazy_weight_loading
         try:
-            flags.lazy_cast = not original
-            assert flags.lazy_cast is not original
+            flags.lazy_weight_loading = not original
+            assert flags.lazy_weight_loading is not original
         finally:
-            flags.lazy_cast = original
+            flags.lazy_weight_loading = original
 
     def test_set_suppress_dedup_warning(self):
         original = flags.suppress_dedup_warning
@@ -96,18 +94,17 @@ class TestOverrideFlagsContextManager:
 
     def test_multiple_flags_restored(self):
         orig_mmap = flags.mmap_loading
-        orig_lazy = flags.lazy_cast
-        with override_flags(mmap_loading=not orig_mmap, lazy_cast=not orig_lazy):
+        orig_lazy = flags.lazy_weight_loading
+        with override_flags(mmap_loading=not orig_mmap, lazy_weight_loading=not orig_lazy):
             assert flags.mmap_loading is not orig_mmap
-            assert flags.lazy_cast is not orig_lazy
+            assert flags.lazy_weight_loading is not orig_lazy
         assert flags.mmap_loading is orig_mmap
-        assert flags.lazy_cast is orig_lazy
+        assert flags.lazy_weight_loading is orig_lazy
 
     def test_restored_on_exception(self):
         original = flags.mmap_loading
-        with pytest.raises(RuntimeError):
-            with override_flags(mmap_loading=not original):
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), override_flags(mmap_loading=not original):
+            raise RuntimeError("boom")
         assert flags.mmap_loading is original
 
     def test_nested_overrides(self):
@@ -129,13 +126,13 @@ class TestListFlags:
     def test_contains_all_flags(self):
         result = list_flags()
         assert "mmap_loading" in result
-        assert "lazy_cast" in result
+        assert "lazy_weight_loading" in result
         assert "suppress_dedup_warning" in result
 
     def test_values_match_singleton(self):
         result = list_flags()
         assert result["mmap_loading"] == flags.mmap_loading
-        assert result["lazy_cast"] == flags.lazy_cast
+        assert result["lazy_weight_loading"] == flags.lazy_weight_loading
         assert result["suppress_dedup_warning"] == flags.suppress_dedup_warning
 
     def test_returns_snapshot_not_live_view(self):

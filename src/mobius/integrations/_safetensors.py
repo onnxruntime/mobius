@@ -52,12 +52,10 @@ _MAX_HEADER_SIZE = 100 * 1024 * 1024
 
 # Safetensors dtype strings → PyTorch dtypes.
 # Reference: https://github.com/huggingface/safetensors/blob/main/safetensors/src/tensor.rs
+# U16/U32/U64 require PyTorch 2.3+; gracefully omit if unavailable.
 _SAFETENSORS_DTYPE_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
     "BOOL": torch.bool,
     "U8": torch.uint8,
-    "U16": torch.uint16,
-    "U32": torch.uint32,
-    "U64": torch.uint64,
     "I8": torch.int8,
     "I16": torch.int16,
     "I32": torch.int32,
@@ -69,6 +67,12 @@ _SAFETENSORS_DTYPE_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
 }
+
+# torch.uint16/uint32/uint64 added in PyTorch 2.3
+for _sf_name, _torch_name in (("U16", "uint16"), ("U32", "uint32"), ("U64", "uint64")):
+    _dt = getattr(torch, _torch_name, None)
+    if _dt is not None:
+        _SAFETENSORS_DTYPE_TO_TORCH_DTYPE[_sf_name] = _dt
 
 
 class MmapTensorDescriptor:
@@ -83,6 +87,10 @@ class MmapTensorDescriptor:
     Attribute access other than :attr:`shape` and :attr:`dtype` is
     delegated to the materialized tensor, providing transparent
     compatibility with code that expects a :class:`torch.Tensor`.
+
+    Implements ``__torch_function__`` so that torch free-functions
+    like :func:`torch.stack` and :func:`torch.cat` auto-materialize
+    descriptors instead of raising :class:`TypeError`.
     """
 
     __slots__ = (
@@ -127,19 +135,54 @@ class MmapTensorDescriptor:
         """Create a :class:`torch.Tensor` from the mmap'd storage.
 
         Each call creates a fresh tensor view into the memory-mapped
-        file.  The result is **not** cached — use attribute delegation
-        (via ``__getattr__``) for repeated access.
+        file.  The result is **not** cached — use :meth:`_ensure_tensor`
+        or attribute delegation (via ``__getattr__``) for repeated access.
         """
         sub_storage = self._storage[self._byte_start : self._byte_end]
         return torch.empty(0, dtype=self._dtype).set_(sub_storage).reshape(list(self._shape))
 
+    def _ensure_tensor(self) -> torch.Tensor:
+        """Materialize (if needed) and cache the tensor."""
+        if self._tensor is None:
+            self._tensor = self.materialize()
+        return self._tensor
+
     def __getattr__(self, name: str) -> Any:
+        # Guard: private/dunder names should not trigger materialization.
+        # Without this, copy/deepcopy or access before __init__ can
+        # cause infinite recursion (self._tensor -> __getattr__ -> ...).
+        if name.startswith("_"):
+            raise AttributeError(name)
         # Materialize once and cache for attribute delegation.
         # This path is hit by preprocess_weights methods that do
         # tensor operations (split, reshape, t, etc.).
-        if self._tensor is None:
-            self._tensor = self.materialize()
-        return getattr(self._tensor, name)
+        return getattr(self._ensure_tensor(), name)
+
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Any,
+        types: Any,
+        args: Any = (),
+        kwargs: Any = None,
+    ) -> Any:
+        """Auto-materialize when passed to torch free-functions.
+
+        Without this, ``torch.stack([desc1, desc2])`` and
+        ``torch.cat([desc1, desc2])`` raise TypeError because
+        they don't trigger ``__getattr__``.
+        """
+        if kwargs is None:
+            kwargs = {}
+
+        def _to_tensor(x: Any) -> Any:
+            if isinstance(x, MmapTensorDescriptor):
+                return x._ensure_tensor()
+            if isinstance(x, (list, tuple)):
+                return type(x)(_to_tensor(i) for i in x)
+            return x
+
+        return func(*_to_tensor(args), **{k: _to_tensor(v) for k, v in kwargs.items()})
 
     def __repr__(self) -> str:
         status = "materialized" if self._tensor is not None else "lazy"

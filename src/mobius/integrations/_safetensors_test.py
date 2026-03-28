@@ -640,3 +640,77 @@ class TestAssignWeightWithDescriptor:
         # Evaluate the lazy tensor
         result = initializer.const_value.numpy()
         torch.testing.assert_close(torch.from_numpy(result), original)
+
+
+# ---------------------------------------------------------------------------
+# MmapTensorDescriptor __torch_function__ tests
+# ---------------------------------------------------------------------------
+
+
+class TestMmapTensorDescriptorTorchFunction:
+    """Test that torch free-functions auto-materialize MmapTensorDescriptor."""
+
+    def test_torch_stack_with_descriptors(self, tmp_path):
+        """torch.stack works on lazy descriptors."""
+        path = str(tmp_path / "model.safetensors")
+        a = torch.tensor([1.0, 2.0, 3.0])
+        b = torch.tensor([4.0, 5.0, 6.0])
+        _create_safetensors_file(path, {"a": a, "b": b})
+
+        state = load_safetensors_mmap(path, lazy=True)
+        result = torch.stack([state["a"], state["b"]])
+        expected = torch.stack([a, b])
+        torch.testing.assert_close(result, expected)
+
+    def test_torch_cat_with_descriptors(self, tmp_path):
+        """torch.cat works on lazy descriptors."""
+        path = str(tmp_path / "model.safetensors")
+        a = torch.tensor([1.0, 2.0])
+        b = torch.tensor([3.0, 4.0])
+        _create_safetensors_file(path, {"a": a, "b": b})
+
+        state = load_safetensors_mmap(path, lazy=True)
+        result = torch.cat([state["a"], state["b"]])
+        expected = torch.cat([a, b])
+        torch.testing.assert_close(result, expected)
+
+    def test_torch_function_mixed_descriptor_and_tensor(self, tmp_path):
+        """torch.cat with a mix of descriptors and plain tensors."""
+        path = str(tmp_path / "model.safetensors")
+        a = torch.tensor([1.0, 2.0])
+        _create_safetensors_file(path, {"a": a})
+
+        desc = load_safetensors_mmap(path, lazy=True)["a"]
+        plain = torch.tensor([3.0, 4.0])
+        result = torch.cat([desc, plain])
+        expected = torch.cat([a, plain])
+        torch.testing.assert_close(result, expected)
+
+
+# ---------------------------------------------------------------------------
+# MmapTensorDescriptor __getattr__ recursion guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestMmapTensorDescriptorGetattr:
+    """Test __getattr__ edge cases."""
+
+    def test_private_attr_raises_attribute_error(self, tmp_path):
+        """Accessing _private attributes raises AttributeError directly."""
+        path = str(tmp_path / "model.safetensors")
+        t = torch.tensor([1.0, 2.0])
+        _create_safetensors_file(path, {"w": t})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        with pytest.raises(AttributeError, match="_nonexistent"):
+            _ = desc._nonexistent
+
+    def test_public_attr_delegates_to_tensor(self, tmp_path):
+        """Public attributes are forwarded to the materialized tensor."""
+        path = str(tmp_path / "model.safetensors")
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        _create_safetensors_file(path, {"w": t})
+
+        desc = load_safetensors_mmap(path, lazy=True)["w"]
+        # .ndim comes from the materialized tensor
+        assert desc.ndim == 2

@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,9 +61,10 @@ class Flags:
 
     # When mmap_loading is enabled, return MmapTensorDescriptor (lazy) objects
     # that defer materialisation to serialisation time.
-    # Default ON; set MOBIUS_LAZY_CAST=0 to force eager materialisation.
-    lazy_cast: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_LAZY_CAST", True)
+    # Default ON; set MOBIUS_LAZY_WEIGHT_LOADING=0 to force eager
+    # materialisation of mmap'd tensors.
+    lazy_weight_loading: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_LAZY_WEIGHT_LOADING", True)
     )
 
     # Suppress spurious "has no constant value" warnings emitted by the
@@ -90,9 +91,14 @@ def override_flags(**kwargs: bool) -> Generator[None, None, None]:
     Restores the original values on exit, even if an exception is raised.
     Intended for use in tests.
 
+    .. note::
+
+        Not thread-safe.  Tests use separate processes (pytest-xdist)
+        so there is no TOCTOU race in practice.
+
     Example::
 
-        with override_flags(mmap_loading=True, lazy_cast=False):
+        with override_flags(mmap_loading=True, lazy_weight_loading=False):
             result = build(model_id)
     """
     old = {k: getattr(flags, k) for k in kwargs}

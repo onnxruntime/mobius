@@ -95,9 +95,9 @@ def _assign_weight(
         return
 
     # If the descriptor was materialized by preprocess_weights (the
-    # model did tensor ops like split/reshape), extract the real tensor.
+    # model did tensor ops like split/reshape), reuse the cached tensor.
     if isinstance(tensor, MmapTensorDescriptor):
-        tensor = tensor.materialize()
+        tensor = tensor._ensure_tensor()
 
     if tensor.dtype != target_dtype:
 
@@ -188,7 +188,7 @@ def _download_weights(
 
     When ``flags.mmap_loading`` is enabled, returns
     :class:`MmapTensorDescriptor` objects that defer tensor creation
-    until first attribute access (controlled by ``flags.lazy_cast``).
+    until first attribute access (controlled by ``flags.lazy_weight_loading``).
     Otherwise, loads all tensors eagerly using safetensors.
     """
     from huggingface_hub import hf_hub_download
@@ -214,7 +214,7 @@ def _download_weights(
         from mobius.integrations._safetensors import load_safetensors_mmap
 
         for path in tqdm.tqdm(paths, desc="Loading weights"):
-            state_dict.update(load_safetensors_mmap(path, lazy=flags.lazy_cast))
+            state_dict.update(load_safetensors_mmap(path, lazy=flags.lazy_weight_loading))
     else:
         import safetensors.torch
 

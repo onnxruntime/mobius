@@ -404,7 +404,7 @@ class TestCorruptedFileHandling:
         apply_weights(model, provider.get_state_dict())
         assert model.graph.initializers[name].const_value is not None
 
-    def test_apply_weights_dtype_mismatch_uses_lazy_cast(self):
+    def test_apply_weights_dtype_mismatch_uses_lazy_weight_loading(self):
         """When dtype differs, apply_weights wraps with LazyTensor for lazy cast."""
         model, init_names = _build_model_with_weights()
         assert len(init_names) > 0
