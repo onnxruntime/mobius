@@ -56,6 +56,7 @@ jobs:
       - name: Build Sphinx docs
         run: |
           python docs/_generate_models.py
+          python scripts/generate_flags_docs.py
           sphinx-build docs _site/docs
 
       - name: Upload Pages artifact
