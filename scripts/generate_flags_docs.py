@@ -40,7 +40,6 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from mobius._flags import Flags  # noqa: E402 (after sys.path manipulation)
 
-
 # ---------------------------------------------------------------------------
 # AST extraction helpers
 # ---------------------------------------------------------------------------
@@ -113,7 +112,8 @@ _STATIC_PREAMBLE = """\
 
 mobius exposes runtime feature flags that control experimental or
 environment-specific behaviour. Flags live in `mobius._flags` and are
-accessible through the public API.
+for **internal use only** — external callers configure them via environment
+variables (see below).
 
 """
 
@@ -134,15 +134,15 @@ Accepted truthy values: `1`, `true`, `yes` (case-insensitive).\\
 Accepted falsy values: `0`, `false`, `no` (case-insensitive).\\
 Any other value falls back to the field default.
 
-## Setting flags programmatically
+## Setting flags programmatically (internal code only)
 
-Assign directly to the `flags` singleton at any point after import:
+Internal modules can import `flags` directly and assign to it:
 
 ```python
-import mobius
+from mobius._flags import flags
 
-mobius.flags.suppress_dedup_warning = False  # disable
-mobius.flags.suppress_dedup_warning = True   # re-enable
+flags.suppress_dedup_warning = False  # disable
+flags.suppress_dedup_warning = True   # re-enable
 ```
 
 ## Using `override_flags()` in tests
@@ -151,7 +151,7 @@ For tests that need a temporary flag value, use the `override_flags` context
 manager. It restores the original values on exit, even if the test raises:
 
 ```python
-from mobius import override_flags
+from mobius._flags import override_flags
 
 def test_build_with_warnings(tmp_path):
     with override_flags(suppress_dedup_warning=False):
@@ -169,9 +169,9 @@ def test_build_with_warnings(tmp_path):
 ## Listing all flags
 
 ```python
-import mobius
+from mobius._flags import list_flags
 
-print(mobius.list_flags())
+print(list_flags())
 ```
 
 ## Adding new flags
@@ -214,9 +214,7 @@ def generate(output: Path = _OUTPUT) -> str:
         # Collapse multi-line docstrings to a single line for the table cell.
         doc_single = " ".join(doc.split())
         default_str = str(default).lower()  # "true" / "false"
-        table_rows.append(
-            f"| `{name}` | `{env_var}` | `{default_str}` | {doc_single} |"
-        )
+        table_rows.append(f"| `{name}` | `{env_var}` | `{default_str}` | {doc_single} |")
 
     table = (
         "## Available flags\n\n"
