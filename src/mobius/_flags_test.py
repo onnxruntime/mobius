@@ -15,7 +15,7 @@ class TestDefaultValues:
 
     def test_suppress_dedup_warning_default_on(self, monkeypatch):
         monkeypatch.delenv("MOBIUS_SUPPRESS_DEDUP_WARNING", raising=False)
-        f = _flags.Flags()
+        f = _flags._Flags()
         assert f.suppress_dedup_warning is True
 
 
@@ -25,18 +25,18 @@ class TestEnvVarOverride:
     @pytest.mark.parametrize("val", ["1", "true", "True", "TRUE", "yes", "YES"])
     def test_truthy_values(self, monkeypatch, val):
         monkeypatch.setenv("MOBIUS_SUPPRESS_DEDUP_WARNING", val)
-        f = _flags.Flags()
+        f = _flags._Flags()
         assert f.suppress_dedup_warning is True
 
     @pytest.mark.parametrize("val", ["0", "false", "False", "FALSE", "no", "NO"])
     def test_falsy_values(self, monkeypatch, val):
         monkeypatch.setenv("MOBIUS_SUPPRESS_DEDUP_WARNING", val)
-        f = _flags.Flags()
+        f = _flags._Flags()
         assert f.suppress_dedup_warning is False
 
     def test_unknown_value_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MOBIUS_SUPPRESS_DEDUP_WARNING", "maybe")
-        f = _flags.Flags()
+        f = _flags._Flags()
         assert f.suppress_dedup_warning is True  # default
 
 

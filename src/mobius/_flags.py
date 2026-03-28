@@ -7,13 +7,13 @@ Flags control experimental or environment-specific behaviour. Each flag can be
 set via an environment variable (``MOBIUS_<FLAG_NAME>``) or programmatically
 by assigning to the :data:`flags` singleton.
 
-Environment variable values are read each time a :class:`Flags` instance is
+Environment variable values are read each time a :class:`_Flags` instance is
 constructed. The global :data:`flags` singleton is constructed at import time,
 so env vars should be set before importing mobius. Valid truthy strings are
 ``1``, ``true``, ``yes``; falsy are ``0``, ``false``, ``no``
 (case-insensitive). Any other value falls back to the field default.
 
-**Adding new flags:** add a field to :class:`Flags` with a
+**Adding new flags:** add a field to :class:`_Flags` with a
 ``dataclasses.field(default_factory=...)`` that calls :func:`_env_bool`,
 plus a docstring string literal immediately after the field for documentation
 generation.
@@ -56,11 +56,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 @dataclasses.dataclass
-class Flags:
+class _Flags:
     """Runtime feature flags singleton.
 
     Each flag maps to a ``MOBIUS_<FLAG_NAME>`` environment variable read when
-    a :class:`Flags` instance is constructed. The global :data:`flags`
+    a :class:`_Flags` instance is constructed. The global :data:`flags`
     singleton is constructed at import time. Flags can be overridden
     programmatically at any point or scoped temporarily with
     :func:`override_flags`.
@@ -92,7 +92,7 @@ class Flags:
 
 
 # Global singleton — import and use this directly.
-flags = Flags()
+flags = _Flags()
 
 
 def list_flags() -> dict[str, object]:
@@ -122,7 +122,7 @@ def override_flags(**kwargs: bool) -> Iterator[None]:
         with override_flags(suppress_dedup_warning=False):
             build(model_id)
     """
-    valid = {f.name for f in dataclasses.fields(Flags)}
+    valid = {f.name for f in dataclasses.fields(_Flags)}
     unknown = sorted(set(kwargs) - valid)
     if unknown:
         available = ", ".join(sorted(valid))
