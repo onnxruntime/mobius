@@ -47,6 +47,8 @@ def linear_attention(
     *,
     q_num_heads: int,
     kv_num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
     update_rule: str = "gated_delta",
     scale: float = 1.0,
     stash_type: ir.DataType = ir.DataType.FLOAT,
@@ -73,6 +75,8 @@ def linear_attention(
         kv_num_heads: Number of heads for V and the output.  Matches
             ``q_num_heads`` in the standard Attention op (V determines
             the output head count).
+        head_k_dim: Dimension of each key/query head.
+        head_v_dim: Dimension of each value head.
 
     .. note:: **Naming convention vs standard Attention**
 
@@ -186,7 +190,14 @@ def linear_attention(
     )
 
     # --- Build Scan for sequential recurrence ---
-    scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
+    scan_body = _build_recurrence_body(
+        uses_decay,
+        uses_beta,
+        kv_num_heads=kv_num_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        stash_type=stash_type,
+    )
 
     # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
     q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
@@ -263,6 +274,9 @@ def _build_recurrence_body(
     uses_decay: bool,
     uses_beta: bool,
     *,
+    kv_num_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
     stash_type: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
@@ -272,6 +286,11 @@ def _build_recurrence_body(
     emits a valid ``type_proto`` — without it ORT cannot infer types
     for the Scan subgraph and the MatMul nodes inside will fail with
     shape-broadcast errors.
+
+    H, d_k, and d_v are concrete integers (not symbolic dim_params).
+    ORT CUDA EP cannot resolve symbolic dim_params inside Scan body
+    graphs within inlined functions — it falls back to dim_value=0→1,
+    creating undersized carry buffers.  Only batch (B) remains symbolic.
 
     Body inputs (in order):
         1. state: (B, H, d_k, d_v) [carry]
@@ -290,32 +309,32 @@ def _build_recurrence_body(
 
     state_in = ir.Value(
         name="state",
-        shape=ir.Shape([batch, "H", "d_k", "d_v"]),
+        shape=ir.Shape([batch, kv_num_heads, head_k_dim, head_v_dim]),
         type=dtype,
     )
     q_t = ir.Value(
         name="q_t",
-        shape=ir.Shape([batch, "H", "d_k"]),
+        shape=ir.Shape([batch, kv_num_heads, head_k_dim]),
         type=dtype,
     )
     k_t = ir.Value(
         name="k_t",
-        shape=ir.Shape([batch, "H", "d_k"]),
+        shape=ir.Shape([batch, kv_num_heads, head_k_dim]),
         type=dtype,
     )
     v_t = ir.Value(
         name="v_t",
-        shape=ir.Shape([batch, "H", "d_v"]),
+        shape=ir.Shape([batch, kv_num_heads, head_v_dim]),
         type=dtype,
     )
     decay_t = ir.Value(
         name="decay_t",
-        shape=ir.Shape([batch, "H", "d_k"]),
+        shape=ir.Shape([batch, kv_num_heads, head_k_dim]),
         type=dtype,
     )
     beta_t = ir.Value(
         name="beta_t",
-        shape=ir.Shape([batch, "H"]),
+        shape=ir.Shape([batch, kv_num_heads]),
         type=dtype,
     )
 

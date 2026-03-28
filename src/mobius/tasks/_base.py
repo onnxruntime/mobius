@@ -385,6 +385,8 @@ def _register_linear_attention_functions(
     attn_func = linear_attention(
         q_num_heads=dims.num_k_heads,
         kv_num_heads=dims.num_v_heads,
+        head_k_dim=dims.head_k_dim,
+        head_v_dim=dims.head_v_dim,
         update_rule="gated_delta",
         scale=1.0 / (dims.head_k_dim**0.5),
         stash_type=config.dtype,

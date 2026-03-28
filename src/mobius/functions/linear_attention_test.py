@@ -14,7 +14,9 @@ class TestLinearAttentionSeparateQKV:
     """Tests for LinearAttention with separate Q, K, V inputs."""
 
     def test_function_has_six_inputs(self):
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         assert len(func.graph.inputs) == 6
         names = [inp.name for inp in func.graph.inputs]
         assert names == [
@@ -27,14 +29,18 @@ class TestLinearAttentionSeparateQKV:
         ]
 
     def test_function_has_two_outputs(self):
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         assert len(func.graph.outputs) == 2
         names = [out.name for out in func.graph.outputs]
         assert "output" in names[0]
         assert "present_state" in names[1]
 
     def test_function_name_and_domain(self):
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         assert func.name == "LinearAttention"
         assert func.domain == "com.microsoft"
 
@@ -42,6 +48,8 @@ class TestLinearAttentionSeparateQKV:
         func = linear_attention(
             q_num_heads=2,
             kv_num_heads=4,
+            head_k_dim=16,
+            head_v_dim=16,
             scale=0.25,
             update_rule="gated_delta",
         )
@@ -52,31 +60,41 @@ class TestLinearAttentionSeparateQKV:
         assert "update_rule" in attr_names
 
     def test_graph_contains_scan(self):
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         op_types = {n.op_type for n in func.graph}
         assert "Scan" in op_types
 
     def test_gqa_ratio_1_no_tile(self):
         """When q_num_heads == kv_num_heads, no Tile is needed."""
-        func = linear_attention(q_num_heads=4, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=4, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         op_types = [n.op_type for n in func.graph]
         assert "Tile" not in op_types
 
     def test_gqa_ratio_gt1_has_tile(self):
         """When kv_num_heads > q_num_heads, Tile expands heads."""
-        func = linear_attention(q_num_heads=2, kv_num_heads=8, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=8, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         op_types = [n.op_type for n in func.graph]
         assert "Tile" in op_types
 
     def test_invalid_gqa_ratio_raises(self):
         with pytest.raises(ValueError, match="divisible"):
-            linear_attention(q_num_heads=3, kv_num_heads=5, scale=0.25)
+            linear_attention(
+                q_num_heads=3, kv_num_heads=5, head_k_dim=16, head_v_dim=16, scale=0.25
+            )
 
     def test_invalid_update_rule_raises(self):
         with pytest.raises(ValueError, match="Unknown update_rule"):
             linear_attention(
                 q_num_heads=2,
                 kv_num_heads=4,
+                head_k_dim=16,
+                head_v_dim=16,
                 update_rule="invalid",
             )
 
@@ -92,6 +110,8 @@ class TestLinearAttentionUpdateRules:
         func = linear_attention(
             q_num_heads=2,
             kv_num_heads=4,
+            head_k_dim=16,
+            head_v_dim=16,
             scale=0.25,
             update_rule=rule,
         )
@@ -105,6 +125,8 @@ class TestLinearAttentionUpdateRules:
         func = linear_attention(
             q_num_heads=2,
             kv_num_heads=4,
+            head_k_dim=16,
+            head_v_dim=16,
             scale=0.25,
             update_rule="gated_delta",
         )
@@ -121,6 +143,8 @@ class TestLinearAttentionUpdateRules:
         func = linear_attention(
             q_num_heads=2,
             kv_num_heads=4,
+            head_k_dim=16,
+            head_v_dim=16,
             scale=0.25,
             update_rule="linear",
         )
@@ -137,7 +161,9 @@ class TestLinearAttentionDecayShapes:
 
     def test_decay_reshape_present(self):
         """Function should Reshape decay from 3D to 4D."""
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         # Count Reshape ops — should have reshapes for
         # q, k, v, decay (3D→4D) and output (4D→3D)
         reshape_count = sum(1 for n in func.graph if n.op_type == "Reshape")
@@ -145,7 +171,9 @@ class TestLinearAttentionDecayShapes:
 
     def test_beta_transpose_present(self):
         """Function should Transpose beta from (B,T,H) to (B,H,T)."""
-        func = linear_attention(q_num_heads=2, kv_num_heads=4, scale=0.25)
+        func = linear_attention(
+            q_num_heads=2, kv_num_heads=4, head_k_dim=16, head_v_dim=16, scale=0.25
+        )
         transpose_count = sum(1 for n in func.graph if n.op_type == "Transpose")
         # At least: q, k, v (3D→4D), decay (3D→4D), beta,
         # q/k/v/decay/beta (4D→T-first for Scan), output (T→B first)
