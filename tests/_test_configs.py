@@ -189,7 +189,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # === Other Llama-compatible ===
-    ("modernbert-decoder", {}, False),
+    ("modernbert-decoder", {"num_key_value_heads": TINY_HEADS}, False),
     # === Text Generation (architecture-specific) ===
     (
         "gemma",
