@@ -249,12 +249,14 @@ def _create_default_registry() -> ModelRegistry:
         DeepSeekV3CausalLMModel,
         DiffLlamaCausalLMModel,
         DogeCausalLMModel,
+        Ernie45MoECausalLMModel,
         ErnieCausalLMModel,
         ExaOne4CausalLMModel,
         Gemma2CausalLMModel,
         Gemma3CausalLMModel,
         Gemma3MultiModalModel,
         GemmaCausalLMModel,
+        Glm4MoECausalLMModel,
         GPTOSSCausalLMModel,
         GraniteCausalLMModel,
         InternLM2CausalLMModel,
@@ -400,9 +402,7 @@ def _create_default_registry() -> ModelRegistry:
     for name in (
         "arctic",
         "dbrx",
-        "ernie4_5_moe",
         "flex_olmo",
-        "glm4_moe",
         "granitemoe",
         "granitemoehybrid",
         "granitemoeshared",
@@ -415,6 +415,8 @@ def _create_default_registry() -> ModelRegistry:
         "qwen3_vl_moe",
     ):
         reg.register(name, MoECausalLMModel)
+    reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
+    reg.register("glm4_moe", Glm4MoECausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
 
     from mobius.models.minimax import MiniMaxCausalLMModel

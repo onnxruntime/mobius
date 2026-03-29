@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,7 +24,7 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._attention import StaticCacheState
-from mobius.components._moe import MLP, SoftmaxTopKGate
+from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -341,6 +342,133 @@ class Qwen2MoECausalLMModel(CausalLMModel):
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
         return super().preprocess_weights(state_dict)
+
+
+class UngatedSharedMoELayer(MoELayer):
+    """MoE layer with always-active shared expert (Ernie4.5-MoE / GLM4-MoE style).
+
+    Extends the standard MoE routing with a ``shared_expert`` MLP that runs
+    unconditionally on every token. Unlike :class:`Qwen2MoELayer`, there is
+    no sigmoid gate scaling the shared expert contribution.
+
+    Forward: ``routing_output + shared_expert(h)``
+
+    Replicates HuggingFace ``Ernie4_5_MoeBlock`` and ``Glm4MoeMoE``.
+    """
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+        super().__init__(config, gate=gate)
+        assert config.shared_expert_intermediate_size is not None, (
+            "UngatedSharedMoELayer requires config.shared_expert_intermediate_size"
+        )
+        shared_config = dataclasses.replace(
+            config, intermediate_size=config.shared_expert_intermediate_size
+        )
+        self.shared_expert = MLP(shared_config)
+
+    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+        # Routed expert output: top-k weighted sum  [B, S, H]
+        routing_output = super().forward(op, hidden_states)
+        # Shared expert always runs on every token, no gate scaling
+        shared_output = self.shared_expert(op, hidden_states)  # [B, S, H]
+        return op.Add(routing_output, shared_output)
+
+
+class UngatedSharedMoEDecoderLayer(MoEDecoderLayer):
+    """Decoder layer using UngatedSharedMoELayer (with ungated shared expert) as the MLP block."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        norm_class: type = RMSNorm,
+    ):
+        super().__init__(config, gate=gate, norm_class=norm_class)
+        # Replace the standard MoELayer with the ungated shared variant.
+        # Re-use the gate already created by MoEDecoderLayer.__init__.
+        self.mlp = UngatedSharedMoELayer(config, gate=self.mlp.gate)
+
+
+def _preprocess_shared_moe_weights(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Rename weights for models with batched expert weights and ungated shared experts.
+
+    Handles two renames beyond the generic ``_rename_moe_expert_weights``:
+    - ``shared_experts.*`` → ``shared_expert.*``: HF uses plural; we use singular.
+    - Drops ``e_score_correction_bias`` (always zero at init, not used in ONNX routing).
+    """
+    state_dict = _rename_moe_expert_weights(state_dict)
+    # HF names shared expert module "shared_experts" (plural); ours is "shared_expert"
+    state_dict = {
+        (k.replace(".shared_experts.", ".shared_expert.") if ".shared_experts." in k else k): v
+        for k, v in state_dict.items()
+    }
+    # Drop correction bias buffers (zeros at init, not part of ONNX routing graph)
+    state_dict = {k: v for k, v in state_dict.items() if "e_score_correction_bias" not in k}
+    return state_dict
+
+
+class Ernie45MoECausalLMModel(CausalLMModel):
+    """Ernie 4.5 Mixture of Experts causal language model.
+
+    Uses SoftmaxTopKGate routing with an always-active shared expert per layer
+    (no sigmoid gate on the shared contribution), matching ``Ernie4_5_MoeForCausalLM``.
+
+    Key differences from :class:`MoECausalLMModel`:
+    - Each MoE layer adds a ``shared_expert`` MLP summed unconditionally.
+    - Expert weights stored as fused 3D tensors in HF; split in ``preprocess_weights``.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self.config = config
+        self.model = MoETextModel(config, layer_class=UngatedSharedMoEDecoderLayer)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        state_dict = _preprocess_shared_moe_weights(state_dict)
+        return super().preprocess_weights(state_dict)
+
+
+class Glm4MoECausalLMModel(CausalLMModel):
+    """GLM4 Mixture of Experts causal language model.
+
+    Uses SigmoidTopKGate routing (sigmoid over logits, not softmax) with an
+    always-active shared expert per layer, matching ``Glm4MoeMoE``.
+
+    Key differences from :class:`MoECausalLMModel`:
+    - Gate applies sigmoid instead of softmax before top-k selection.
+    - Each MoE layer adds a ``shared_expert`` MLP summed unconditionally.
+    - Expert weights stored as fused 3D tensors in HF; split in ``preprocess_weights``.
+    - For GLM4's default config (n_group=1), group routing collapses to standard top-k.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self.config = config
+        gate_factory = functools.partial(
+            SigmoidTopKGate,
+            norm_topk_prob=config.norm_topk_prob,
+            routed_scaling_factor=config.routed_scaling_factor,
+        )
+        self.model = MoETextModel(
+            config, gate_factory=gate_factory, layer_class=UngatedSharedMoEDecoderLayer
+        )
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        state_dict = _preprocess_shared_moe_weights(state_dict)
+        return super().preprocess_weights(state_dict)
+
 
 def _rename_moe_expert_weights(
     state_dict: dict[str, torch.Tensor],

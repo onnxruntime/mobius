@@ -76,12 +76,8 @@ class DogeAttention(Attention):
 
         # QK-norm (per-head): reshape 3D→4D, norm, reshape back
         if self.q_norm is not None and self.k_norm is not None:
-            query_states = op.Reshape(
-                query_states, [0, 0, -1, self.head_dim]
-            )
-            key_states = op.Reshape(
-                key_states, [0, 0, -1, self.head_dim]
-            )
+            query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
             query_states = self.q_norm(op, query_states)
             key_states = self.k_norm(op, key_states)
             query_states = op.Reshape(query_states, [0, 0, -1])
@@ -164,9 +160,7 @@ class DogeDecoderLayer(nn.Module):
         self.self_attn = DogeAttention(config, layer_idx=layer_idx)
         self.input_residual = nn.Parameter([config.hidden_size])
 
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = self._make_mlp(config)
         self.post_attention_residual = nn.Parameter([config.hidden_size])
 
@@ -201,17 +195,13 @@ class DogeDecoderLayer(nn.Module):
             static_cache=static_cache,
         )
         # Learnable residual: input_residual * residual + attn_output
-        hidden_states = op.Add(
-            op.Mul(self.input_residual, residual), hidden_states
-        )
+        hidden_states = op.Add(op.Mul(self.input_residual, residual), hidden_states)
 
         # MLP with learnable residual gate
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(op, hidden_states)
         hidden_states = self.mlp(op, hidden_states)
-        hidden_states = op.Add(
-            op.Mul(self.post_attention_residual, residual), hidden_states
-        )
+        hidden_states = op.Add(op.Mul(self.post_attention_residual, residual), hidden_states)
 
         return hidden_states, present_key_value
 
@@ -224,10 +214,7 @@ class DogeTextModel(nn.Module):
         self._dtype = config.dtype
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [
-                DogeDecoderLayer(config, layer_idx=i)
-                for i in range(config.num_hidden_layers)
-            ]
+            [DogeDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -291,8 +278,12 @@ class DogeCausalLMModel(CausalLMModel):
         static_cache: StaticCacheState | None = None,
     ):
         hidden_states, present_key_values = self.model(
-            op, input_ids, attention_mask, position_ids,
-            past_key_values, static_cache,
+            op,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            static_cache,
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values

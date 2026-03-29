@@ -111,7 +111,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     "qwen2_moe": 0.02,
     # MoE models with per-expert vs batched matmul FP accumulation differences:
     "flex_olmo": 0.15,  # ~0.143 max diff, cosine=0.966 (post-norm MoE)
-    "glm4_moe": 0.08,  # ~0.076 max diff, cosine=0.987 (sigmoid+group routing)
+    # GLM4-MoE: sigmoid-gated routing FP accumulation differs from HF batched dispatch.
+    # Argmax correct, cosine≥0.999 — functionally correct.
+    "glm4_moe": 0.005,
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
     "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
@@ -126,7 +128,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "granitemoehybrid": "MoE routing + linear attention differences",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     "dbrx": "MoE routing differences",
-    "ernie4_5_moe": "Ernie4.5-MoE uses e_score_correction_bias for routing selection + shared expert not implemented",
+    "ernie4_5_moe": "Ernie4.5 zero-initializes gate.weight; PyTorch/ONNX TopK break ties differently (PyTorch: higher indices, ONNX: lower), routing to different experts in the synthetic test. Real trained models are unaffected.",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
     "qwen3_omni_moe": "MoE routing differences",
@@ -232,6 +234,19 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "stablelm": {"layer_norm_eps": 1e-6},
     # StarCoder2: disable bias (use_bias=True HF default) and fix norm_epsilon field
     "starcoder2": {"norm_epsilon": 1e-6, "use_bias": False},
+    # Ernie4.5-MoE: make all 2 tiny layers MoE (default moe_layer_start_index=1 skips layer 0)
+    # moe_num_shared_experts=1 keeps shared_expert_intermediate_size = moe_intermediate_size * 1
+    "ernie4_5_moe": {
+        "moe_layer_start_index": 0,
+        "moe_layer_end_index": TINY_LAYERS - 1,
+        "moe_num_shared_experts": 1,
+    },
+    # GLM4-MoE: make all 2 tiny layers MoE (default first_k_dense_replace=1 makes layer 0 dense)
+    # n_shared_experts=1 keeps shared_expert_intermediate_size = moe_intermediate_size * 1
+    "glm4_moe": {
+        "first_k_dense_replace": 0,
+        "n_shared_experts": 1,
+    },
 }
 
 
@@ -354,7 +369,12 @@ def _create_hf_config(model_type: str, config_overrides: dict):
                 hf_kwargs[dst_field] = hf_kwargs.pop(src_field)
 
     # Remove ONNX-internal keys that HF configs don't have
-    onnx_only_keys = {"attn_qk_norm", "attn_qk_norm_full", "post_feedforward_norm"}
+    onnx_only_keys = {
+        "attn_qk_norm",
+        "attn_qk_norm_full",
+        "post_feedforward_norm",
+        "shared_expert_intermediate_size",
+    }
     for key in onnx_only_keys:
         hf_kwargs.pop(key, None)
 

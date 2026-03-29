@@ -50,6 +50,8 @@ __all__ = [
     "MiniMaxCausalLMModel",
     "MoECausalLMModel",
     "Qwen2MoECausalLMModel",
+    "Ernie45MoECausalLMModel",
+    "Glm4MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "OLMo2CausalLMModel",
@@ -147,6 +149,8 @@ from mobius.models.llava import LLaVAModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
+    Ernie45MoECausalLMModel,
+    Glm4MoECausalLMModel,
     GPTOSSCausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,

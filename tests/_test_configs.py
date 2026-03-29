@@ -742,7 +742,12 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Additional MoE aliases ===
     (
         "ernie4_5_moe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
         False,
     ),
     (
@@ -758,7 +763,12 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "glm4_moe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 128},
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
         False,
     ),
     (

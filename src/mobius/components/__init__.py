@@ -81,6 +81,7 @@ __all__ = [
     "RMSNorm",
     "SiLU",
     "SnakeBeta",
+    "SigmoidTopKGate",
     "SoftmaxTopKGate",
     "SpeakerEncoder",
     "SparseMixerGate",
@@ -174,6 +175,7 @@ from mobius.components._mamba_block import Mamba2Block, MambaBlock
 from mobius.components._mlp import FCMLP, MLP
 from mobius.components._moe import (
     MoELayer,
+    SigmoidTopKGate,
     SoftmaxTopKGate,
     SparseMixerGate,
     TopKGate,
