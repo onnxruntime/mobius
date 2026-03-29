@@ -142,7 +142,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # Weight naming: HF uses different prefix/structure than ONNX
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
     # Additional divergences (newly registered models)
-    "doge": "DOGE dynamic mask / attention implementation differs",
     "apertus": "Apertus architecture differences",
     "modernbert-decoder": "ModernBERT decoder implementation differs",
     "longcat_flash": "Flash attention implementation differs",
