@@ -131,6 +131,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
     "gemma3n_text": 0.1,   # ~0.094 max diff worst-case (AltUp magnitude ratio)
     "gemma3n": 0.1,        # same architecture
+    # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
+    # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
+    "gemma3": 0.05,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -153,8 +156,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "shieldgemma2": "ShieldGemma2 HF AutoModelForCausalLM does not support config class",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
-    # Gemma family: gemma, gemma2, gemma3_text, gemma3n now pass with atol overrides
-    "gemma3": "Gemma3 lm_head weight shape mismatch (sliding window arch)",
+    # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
     # Qwen3_next: linear attention (DeltaNet)
     "qwen3_next": "DeltaNet linear attention differs from HF",
     # DeepSeek MLA
