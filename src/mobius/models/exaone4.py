@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import dataclasses
 
+from onnxscript import nn
+
 from mobius._configs import ArchitectureConfig
 from mobius.components import DecoderLayer
 from mobius.models.base import CausalLMModel
-
-from onnxscript import nn
 
 
 class ExaOne4CausalLMModel(CausalLMModel):

@@ -107,8 +107,14 @@ class ApertusCausalLMModel(CausalLMModel):
             name = name.replace(".feedforward_layernorm.", ".post_attention_layernorm.")
 
             # xIELU params: HF has scalar [1], ONNX nn.Parameter is [1]
-            if name.endswith((".mlp.act_fn.alpha_p", ".mlp.act_fn.alpha_n",
-                              ".mlp.act_fn.beta", ".mlp.act_fn.eps")):
+            if name.endswith(
+                (
+                    ".mlp.act_fn.alpha_p",
+                    ".mlp.act_fn.alpha_n",
+                    ".mlp.act_fn.beta",
+                    ".mlp.act_fn.eps",
+                )
+            ):
                 new_state_dict[name] = tensor.reshape(1)
                 continue
 

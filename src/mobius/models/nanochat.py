@@ -18,10 +18,8 @@ from __future__ import annotations
 
 import dataclasses
 
-import numpy as np
 import torch
 
-import onnx_ir as ir
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
 from mobius.models.base import CausalLMModel
@@ -65,17 +63,9 @@ class NanoChatCausalLMModel(CausalLMModel):
         ones_head = torch.ones(head_dim)
         for i in range(self.config.num_hidden_layers):
             prefix = f"model.layers.{i}"
-            new_state_dict.setdefault(
-                f"{prefix}.input_layernorm.weight", ones_hidden
-            )
-            new_state_dict.setdefault(
-                f"{prefix}.post_attention_layernorm.weight", ones_hidden
-            )
-            new_state_dict.setdefault(
-                f"{prefix}.self_attn.q_norm.weight", ones_head
-            )
-            new_state_dict.setdefault(
-                f"{prefix}.self_attn.k_norm.weight", ones_head
-            )
+            new_state_dict.setdefault(f"{prefix}.input_layernorm.weight", ones_hidden)
+            new_state_dict.setdefault(f"{prefix}.post_attention_layernorm.weight", ones_hidden)
+            new_state_dict.setdefault(f"{prefix}.self_attn.q_norm.weight", ones_head)
+            new_state_dict.setdefault(f"{prefix}.self_attn.k_norm.weight", ones_head)
         new_state_dict.setdefault("model.norm.weight", ones_hidden)
         return super().preprocess_weights(new_state_dict)
