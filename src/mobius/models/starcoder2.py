@@ -16,6 +16,7 @@ import torch
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import rename_mlp_projections
 from mobius.components import FCMLP, DecoderLayer, LayerNorm
 from mobius.models.base import LayerNormCausalLMModel, LayerNormTextModel
 
@@ -80,7 +81,6 @@ class StarCoder2CausalLMModel(LayerNormCausalLMModel):
         """
         renamed = {}
         for key, value in state_dict.items():
-            key = key.replace(".mlp.c_fc.", ".mlp.up_proj.")
-            key = key.replace(".mlp.c_proj.", ".mlp.down_proj.")
+            key = rename_mlp_projections(key, "c_fc", "c_proj")
             renamed[key] = value
         return super().preprocess_weights(renamed)

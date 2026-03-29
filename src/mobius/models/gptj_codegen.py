@@ -28,7 +28,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_codegen_qkv
+from mobius._weight_utils import rename_mlp_projections, split_codegen_qkv
 from mobius.components import (
     FCMLP,
     Embedding,
@@ -200,8 +200,7 @@ class GPTJCausalLMModel(CausalLMModel):
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             key = key.replace(".attn.out_proj.", ".attn.o_proj.")
-            key = key.replace(".mlp.fc_in.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc_out.", ".mlp.down_proj.")
+            key = rename_mlp_projections(key, "fc_in", "fc_out")
             new_state_dict[key] = value
 
         # Weight tying fallback
@@ -289,8 +288,7 @@ class CodeGenCausalLMModel(CausalLMModel):
                 continue
 
             key = key.replace(".attn.out_proj.", ".attn.o_proj.")
-            key = key.replace(".mlp.fc_in.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc_out.", ".mlp.down_proj.")
+            key = rename_mlp_projections(key, "fc_in", "fc_out")
             new_state_dict[key] = value
 
         # Weight tying fallback

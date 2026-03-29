@@ -25,7 +25,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_interleaved_qkv
+from mobius._weight_utils import rename_mlp_projections, split_interleaved_qkv_weights
 from mobius.components import (
     FCMLP,
     Embedding,
@@ -206,28 +206,21 @@ class PersimmonCausalLMModel(CausalLMModel):
         5. MLP up rename:   ``mlp.dense_h_to_4h.*`` → ``mlp.up_proj.*``
         6. MLP down rename: ``mlp.dense_4h_to_h.*`` → ``mlp.down_proj.*``
         """
+        # Split per-head interleaved QKV: [h0_q, h0_k, h0_v, h1_q, ...]
+        state_dict = split_interleaved_qkv_weights(
+            state_dict,
+            fused_key="self_attn.query_key_value",
+            num_heads=self.config.num_attention_heads,
+            kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+        )
+
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if "self_attn.query_key_value" in key:
-                # Split per-head interleaved QKV: [h0_q, h0_k, h0_v, h1_q, ...]
-                q, k, v = split_interleaved_qkv(
-                    value,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                )
-                suffix = key.split("self_attn.query_key_value")[1]  # ".weight" or ".bias"
-                prefix = key.split("self_attn.query_key_value")[0]  # "model.layers.N."
-                new_state_dict[f"{prefix}self_attn.q_proj{suffix}"] = q
-                new_state_dict[f"{prefix}self_attn.k_proj{suffix}"] = k
-                new_state_dict[f"{prefix}self_attn.v_proj{suffix}"] = v
-                continue
-
             key = key.replace(".self_attn.dense.", ".self_attn.o_proj.")
             key = key.replace(".self_attn.q_layernorm.", ".self_attn.q_norm.")
             key = key.replace(".self_attn.k_layernorm.", ".self_attn.k_norm.")
-            key = key.replace(".mlp.dense_h_to_4h.", ".mlp.up_proj.")
-            key = key.replace(".mlp.dense_4h_to_h.", ".mlp.down_proj.")
+            key = rename_mlp_projections(key, "dense_h_to_4h", "dense_4h_to_h")
             new_state_dict[key] = value
 
         return super().preprocess_weights(new_state_dict)

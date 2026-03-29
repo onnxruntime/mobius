@@ -31,6 +31,7 @@ import torch
 from onnxscript._internal import builder
 
 from mobius._configs import NanoChatConfig
+from mobius._weight_utils import rename_mlp_projections
 from mobius.components import FCMLP, Attention, Linear
 from mobius.components._attention import _apply_attention
 from mobius.components._common import create_padding_mask
@@ -235,9 +236,7 @@ class NanoChatCausalLMModel(CausalLMModel):
         """
         new_state_dict = {}
         for name, tensor in state_dict.items():
-            # fc1 → up_proj, fc2 → down_proj
-            name = name.replace(".mlp.fc1.", ".mlp.up_proj.")
-            name = name.replace(".mlp.fc2.", ".mlp.down_proj.")
+            name = rename_mlp_projections(name, "fc1", "fc2")  # fc1 → up_proj, fc2 → down_proj
             new_state_dict[name] = tensor
 
         # Inject ones for all norm weights (parameter-free in HF)

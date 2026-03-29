@@ -22,7 +22,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_interleaved_qkv
+from mobius._weight_utils import rename_mlp_projections, split_interleaved_qkv_weights
 from mobius.components import (
     FCMLP,
     Embedding,
@@ -196,33 +196,26 @@ class GPTNeoXCausalLMModel(CausalLMModel):
         3. MLP up rename: ``mlp.dense_h_to_4h.*`` → ``mlp.up_proj.*``
         4. MLP down rename: ``mlp.dense_4h_to_h.*`` → ``mlp.down_proj.*``
         """
+        # gpt_neox_japanese uses the same architecture but a different top-level
+        # module prefix; normalize it so the rest of the renames apply uniformly
+        state_dict = {k.replace("gpt_neox_japanese.", "gpt_neox."): v for k, v in state_dict.items()}
+
+        # Split per-head interleaved QKV: [h0_q, h0_k, h0_v, h1_q, ...]
+        state_dict = split_interleaved_qkv_weights(
+            state_dict,
+            fused_key="attention.query_key_value",
+            num_heads=self.config.num_attention_heads,
+            kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+        )
+
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            # gpt_neox_japanese uses the same architecture but a different top-level
-            # module prefix; normalize it so the rest of the renames apply uniformly
-            key = key.replace("gpt_neox_japanese.", "gpt_neox.")
-
-            if "attention.query_key_value" in key:
-                # Split per-head interleaved QKV: [h0_q, h0_k, h0_v, h1_q, ...]
-                q, k, v = split_interleaved_qkv(
-                    value,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                )
-                suffix = key.split("attention.query_key_value")[1]  # ".weight" or ".bias"
-                prefix = key.split("attention.query_key_value")[0]  # "gpt_neox.layers.N."
-                new_state_dict[f"{prefix}attention.q_proj{suffix}"] = q
-                new_state_dict[f"{prefix}attention.k_proj{suffix}"] = k
-                new_state_dict[f"{prefix}attention.v_proj{suffix}"] = v
-                continue
-
             key = key.replace(".attention.dense.", ".attention.o_proj.")
             # GPT-NeoX-Japanese stores the output projection bias as a separate
             # parameter (not as part of the Linear layer)
             key = key.replace(".attention.dense_bias", ".attention.o_proj.bias")
-            key = key.replace(".mlp.dense_h_to_4h.", ".mlp.up_proj.")
-            key = key.replace(".mlp.dense_4h_to_h.", ".mlp.down_proj.")
+            key = rename_mlp_projections(key, "dense_h_to_4h", "dense_4h_to_h")
             new_state_dict[key] = value
 
         return super().preprocess_weights(new_state_dict)

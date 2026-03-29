@@ -191,6 +191,86 @@ def split_interleaved_qkv(
     return q, k, v
 
 
+def split_interleaved_qkv_weights(
+    state_dict: dict[str, torch.Tensor],
+    fused_key: str,
+    num_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> dict[str, torch.Tensor]:
+    """Expand all fused interleaved QKV weights in a state dict.
+
+    Scans *state_dict* for keys containing *fused_key* (e.g.
+    ``"attention.query_key_value"``), splits each matched weight with
+    :func:`split_interleaved_qkv`, and emits three new keys:
+    ``{prefix}{attn_name}.q_proj{suffix}``,
+    ``{prefix}{attn_name}.k_proj{suffix}``,
+    ``{prefix}{attn_name}.v_proj{suffix}``.
+
+    The ``attn_name`` is the segment of *fused_key* up to
+    ``.query_key_value`` (e.g. ``"attention"`` or ``"self_attn"``).
+    This consolidates the identical scaffolding code that appears in
+    GPT-NeoX and Persimmon ``preprocess_weights`` implementations.
+
+    Args:
+        state_dict: Input weight dictionary.
+        fused_key: Substring identifying fused QKV keys, e.g.
+            ``"attention.query_key_value"`` or
+            ``"self_attn.query_key_value"``.
+        num_heads: Number of query attention heads.
+        kv_heads: Number of key/value attention heads.
+        head_dim: Dimension per attention head.
+
+    Returns:
+        New dictionary with fused QKV keys replaced by split q/k/v keys.
+    """
+    attn_name = fused_key.rsplit(".query_key_value", 1)[0]
+    result: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if fused_key in key:
+            q, k, v = split_interleaved_qkv(value, num_heads, kv_heads, head_dim)
+            suffix = key.split(fused_key)[1]  # ".weight" or ".bias"
+            prefix = key.split(fused_key)[0]  # e.g. "gpt_neox.layers.N."
+            result[f"{prefix}{attn_name}.q_proj{suffix}"] = q
+            result[f"{prefix}{attn_name}.k_proj{suffix}"] = k
+            result[f"{prefix}{attn_name}.v_proj{suffix}"] = v
+        else:
+            result[key] = value
+    return result
+
+
+def rename_mlp_projections(
+    name: str,
+    old_up: str,
+    old_down: str,
+    new_up: str = "up_proj",
+    new_down: str = "down_proj",
+) -> str:
+    """Rename MLP projection weight keys to the canonical ``up_proj``/``down_proj`` names.
+
+    Many HuggingFace models use architecture-specific MLP projection names
+    (``fc_in``/``fc_out``, ``c_fc``/``c_proj``, ``dense_h_to_4h``/
+    ``dense_4h_to_h``, ``fc1``/``fc2``) while our ONNX ``FCMLP`` component
+    always uses ``up_proj``/``down_proj``.  This helper centralises the
+    two-replacement pattern that would otherwise be duplicated in every
+    ``preprocess_weights`` implementation.
+
+    Args:
+        name: A single weight key string.
+        old_up: HF name for the first (up) projection, e.g. ``"fc_in"``.
+        old_down: HF name for the second (down) projection, e.g. ``"fc_out"``.
+        new_up: Target name for the up projection (default ``"up_proj"``).
+        new_down: Target name for the down projection (default ``"down_proj"``).
+
+    Returns:
+        The key with ``mlp.{old_up}`` → ``mlp.{new_up}`` and
+        ``mlp.{old_down}`` → ``mlp.{new_down}`` applied.
+    """
+    return name.replace(f".mlp.{old_up}.", f".mlp.{new_up}.").replace(
+        f".mlp.{old_down}.", f".mlp.{new_down}."
+    )
+
+
 def split_codegen_qkv(
     weight: torch.Tensor,
     num_heads: int,
