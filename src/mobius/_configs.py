@@ -654,6 +654,9 @@ class ArchitectureConfig(BaseModelConfig):
     moe_intermediate_size: int | None = None
     shared_expert_intermediate_size: int | None = None
     norm_topk_prob: bool = True
+    # When True, the decoder layer uses post-norm style (FlexOLMo): norms are applied
+    # to sub-layer outputs instead of inputs, with an extra post_feedforward_layernorm.
+    post_feedforward_norm: bool = False
     n_group: int = 1
     topk_group: int = 1
     routed_scaling_factor: float = 1.0
@@ -866,9 +869,12 @@ class ArchitectureConfig(BaseModelConfig):
                 model_type
                 in (
                     "gemma3_text",
+                    "flex_olmo",
+                    "olmoe",
                     "olmo2",
                     "olmo3",
                     "qwen3",
+                    "qwen3_moe",
                     "qwen3_tts_talker",
                     "qwen3_5_vl",
                     "qwen3_5_vl_text",
@@ -877,7 +883,7 @@ class ArchitectureConfig(BaseModelConfig):
                 )
                 or getattr(config, "use_qk_norm", False)
             ),
-            attn_qk_norm_full=(model_type in ("olmo2", "olmo3")),
+            attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(getattr(config, "use_mlp_bias", False)),
             rope=rope_config,
             # Set flat rope fields for direct access by components
@@ -907,6 +913,7 @@ class ArchitectureConfig(BaseModelConfig):
                 getattr(config, "shared_expert_intermediate_size", None)
             ),
             norm_topk_prob=(getattr(config, "norm_topk_prob", True)),
+            post_feedforward_norm=(model_type in ("flex_olmo",)),
             n_group=getattr(config, "n_group", 1),
             topk_group=getattr(config, "topk_group", 1),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),

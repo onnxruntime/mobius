@@ -78,23 +78,23 @@ _SKIP_REASONS: dict[str, str] = {
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
 # Each maps model_type → reason the outputs diverge.
 _XFAIL_REASONS: dict[str, str] = {
-    # MoE routing: ONNX TopKGate differs from HF's router impl
-    "qwen2_moe": "MoE routing differences",
-    "qwen3_moe": "MoE routing differences",
+    # MoE routing: small floating-point accumulation differences from ONNX Runtime vs PyTorch
+    "qwen2_moe": "MoE shared_expert architecture not yet implemented",
+    "qwen3_moe": "MoE routing FP accumulation (~0.020 max diff, argmax matches)",
     "qwen3_5_moe": "MoE routing differences",
-    "granitemoe": "MoE routing differences",
-    "granitemoeshared": "MoE routing differences",
+    "granitemoe": "MoE routing FP accumulation (~0.021 max diff, argmax matches)",
+    "granitemoeshared": "MoE routing FP accumulation (~0.021 max diff)",
     "granitemoehybrid": "MoE routing + linear attention differences",
-    "olmoe": "MoE routing differences",
-    "phimoe": "MoE routing differences",
-    "jetmoe": "MoE routing differences",
+    "olmoe": "MoE routing FP accumulation (~0.031 max diff, argmax matches)",
+    "phimoe": "SparseMixerGate iterative routing FP sensitivity (~0.058 max diff)",
+    "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     "dbrx": "MoE routing differences",
     "ernie4_5_moe": "MoE routing differences",
-    "flex_olmo": "MoE routing differences",
+    "flex_olmo": "MoE routing FP accumulation (post-norm architecture)",
     "glm4_moe": "MoE routing differences",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "minimax": "MoE routing differences",
+    "minimax": "MiniMax uses gated linear attention — different attention architecture",
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
@@ -136,11 +136,9 @@ _XFAIL_REASONS: dict[str, str] = {
     "apertus": "Apertus architecture differences",
     "arcee": "Arcee architecture differences",
     "modernbert-decoder": "ModernBERT decoder implementation differs",
-    "mixtral": "MoE routing differences",
     "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
-
 # Fields that are properties in HF configs and cannot be set directly.
 _HF_READONLY_FIELDS: set[str] = {"head_dim"}
 
@@ -286,6 +284,31 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             # All mamba — use large offset/period
             hf_kwargs["attn_layer_offset"] = len(layer_types)
             hf_kwargs["attn_layer_period"] = len(layer_types)
+
+    # Some models use different field names for num_local_experts and num_experts_per_tok.
+    # Maps hf_model_type -> {our_field: hf_field} for field name translation.
+    expert_field_aliases: dict[str, dict[str, str]] = {
+        # Standard: num_experts (not num_local_experts)
+        "olmoe": {"num_local_experts": "num_experts"},
+        "qwen2_moe": {"num_local_experts": "num_experts"},
+        "qwen3_moe": {"num_local_experts": "num_experts"},
+        "qwen3_omni_moe": {"num_local_experts": "num_experts"},
+        "qwen3_vl_moe": {"num_local_experts": "num_experts"},
+        # Ernie4.5 MoE uses moe_num_experts / moe_k
+        "ernie4_5_moe": {
+            "num_local_experts": "moe_num_experts",
+            "num_experts_per_tok": "moe_k",
+        },
+    }
+    if hf_model_type in expert_field_aliases:
+        for src_field, dst_field in expert_field_aliases[hf_model_type].items():
+            if src_field in hf_kwargs:
+                hf_kwargs[dst_field] = hf_kwargs.pop(src_field)
+
+    # Remove ONNX-internal keys that HF configs don't have
+    onnx_only_keys = {"attn_qk_norm", "attn_qk_norm_full", "post_feedforward_norm"}
+    for key in onnx_only_keys:
+        hf_kwargs.pop(key, None)
 
     try:
         hf_config = AutoConfig.for_model(hf_model_type, **hf_kwargs)
