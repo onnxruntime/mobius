@@ -110,7 +110,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
-    "diffllama": "HF DiffLlama has extra lambda parameters",
     "llama4_text": "HF Llama4 MoE differs from our implementation",
     # Softcapping/scaling differences
     "gemma2": "Attention softcapping implementation differs",
@@ -122,8 +121,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # GPT-2 family: imagegpt/xlm/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
     "xlm": "GPT2 family layernorm differences",
-    # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
-    "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Granite scaling multipliers
     "granite_0": "Granite embedding/logit scaling differences",
     # Gemma family: query_pre_attn_scalar
@@ -140,15 +137,13 @@ _XFAIL_REASONS: dict[str, str] = {
     # Weight naming: HF uses different prefix/structure than ONNX
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
     # Hybrid Mamba: weight naming and MoE routing differences
-    "jamba": "Jamba MoE/Mamba weight naming + routing differences",
+    "jamba": "MoE routing FP accumulation + Mamba SSM shape mismatch",
     # Additional divergences (newly registered models)
-    "doge": "DOGE dynamic mask / attention implementation differs",
-    "nanochat": "NanoChat architecture implementation differs",
-    "exaone4": "ExaOne4 architecture differences",
-    "apertus": "Apertus architecture differences",
-    "arcee": "Arcee architecture differences",
+    "doge": "DOGE learnable residual gates and SSM attention not implemented",
+    "nanochat": "NanoChat applies RoPE before QK-norm (our Attention does norm→RoPE)",
+    "apertus": "xIELU Softplus FP accumulation (~0.016 max diff, argmax matches)",
     "modernbert-decoder": "ModernBERT decoder implementation differs",
-    "longcat_flash": "Flash attention implementation differs",
+    "longcat_flash": "LongCatFlash uses two MLA attention modules per layer + MoE",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
 # Fields that are properties in HF configs and cannot be set directly.
@@ -302,6 +297,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     expert_field_aliases: dict[str, dict[str, str]] = {
         # Standard: num_experts (not num_local_experts)
         "olmoe": {"num_local_experts": "num_experts"},
+        "jamba": {"num_local_experts": "num_experts"},
         "qwen2_moe": {"num_local_experts": "num_experts"},
         "qwen3_moe": {"num_local_experts": "num_experts"},
         "qwen3_omni_moe": {"num_local_experts": "num_experts"},

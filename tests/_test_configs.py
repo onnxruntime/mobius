@@ -536,7 +536,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     # === Additional CausalLM aliases ===
     ("apertus", {}, False),
-    ("arcee", {}, False),
+    ("arcee", {"hidden_act": "relu2"}, False),
     ("code_llama", {}, False),
     (
         "codegen",
@@ -849,6 +849,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_d_conv": 4,
             "mamba_expand": 2,
             "mamba_dt_rank": 4,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "expert_layer_period": 2,
+            "expert_layer_offset": 1,
         },
         False,
     ),

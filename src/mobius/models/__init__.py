@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 __all__ = [
+    "ApertusCausalLMModel",
+    "ArceeCausalLMModel",
     "AutoencoderKLModel",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
@@ -23,6 +25,7 @@ __all__ = [
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "ErnieCausalLMModel",
+    "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
     "MPTCausalLMModel",
     "FluxTransformer2DModel",
@@ -44,6 +47,7 @@ __all__ = [
     "JambaCausalLMModel",
     "LLaVAModel",
     "MoECausalLMModel",
+    "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
@@ -96,9 +100,12 @@ __all__ = [
     "Qwen3TTSCodecDecoderModel",
     "Qwen3TTSCodecEncoderModel",
     "Qwen3TTSTokenizerV2Model",
+    "DiffLlamaCausalLMModel",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
+from mobius.models.apertus import ApertusCausalLMModel
+from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
@@ -111,9 +118,11 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
+from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.ernie import ErnieCausalLMModel
+from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
@@ -134,6 +143,7 @@ from mobius.models.moe import (
     MoECausalLMModel,
     Phi3MoECausalLMModel,
 )
+from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
