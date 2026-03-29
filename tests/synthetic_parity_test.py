@@ -109,7 +109,7 @@ _XFAIL_REASONS: dict[str, str] = {
     "ernie4_5_moe": "MoE routing differences",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "minimax": "Lightning Attention: exponential decay mask, block-based linear attention, output gate",
+    "minimax": "Lightning Attention: block-based linear attention with state=state*decay+K^T@V loop, output gate, residual scaling",
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
