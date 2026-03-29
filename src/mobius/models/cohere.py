@@ -19,13 +19,14 @@ Replicates HuggingFace's ``CohereForCausalLM`` and ``Cohere2ForCausalLM``.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius.components import Attention, LayerNorm, LayerNormNoBias, MLP, StaticCacheState
+from mobius.components import MLP, Attention, LayerNorm, LayerNormNoBias, StaticCacheState
 from mobius.models.base import LayerNormCausalLMModel, LayerNormTextModel
 
 if TYPE_CHECKING:
@@ -122,7 +123,7 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
         logits, present_key_values = super().forward(
             op, input_ids, attention_mask, position_ids, past_key_values
         )
-        if self.logit_scale != 1.0:
+        if not math.isclose(self.logit_scale, 1.0):
             # Scale logits by the model's configured logit_scale scalar
             # (HF default: 0.0625 = 1/16 for all Cohere models).
             logits = op.Mul(logits, op.Constant(value_float=float(self.logit_scale)))

@@ -16,7 +16,7 @@ import torch
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components import FCMLP, DecoderLayer, LayerNorm, Linear
+from mobius.components import FCMLP, DecoderLayer, LayerNorm
 from mobius.models.base import LayerNormCausalLMModel, LayerNormTextModel
 
 
