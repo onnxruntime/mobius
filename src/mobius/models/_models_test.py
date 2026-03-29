@@ -264,9 +264,8 @@ def test_build_moe_model_architecture(arch):
     assert model.graph.num_nodes() > 0
     output_names = [v.name for v in model.graph.outputs]
     assert "logits" in output_names
-    # MoE models should have expert parameters
+    # MoE models should have expert parameters (our models use mlp.experts naming)
     init_names = list(model.graph.initializers.keys())
-    assert any("block_sparse_moe" in n for n in init_names)
     assert any("experts" in n for n in init_names)
 
 
