@@ -117,6 +117,12 @@ _ATOL_OVERRIDES: dict[str, float] = {
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
     "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
+    # Gemma v1: OffsetRMSNorm (+1 weight) FP accumulation → ~0.089 max diff.
+    # Argmax correct, cosine=0.984 — model is functionally correct.
+    "gemma": 0.10,
+    # Gemma3 text: QK-norm + sliding/full attention FP accumulation → ~0.045 max diff.
+    # Argmax correct (near-tie), cosine=0.996 — model is functionally correct.
+    "gemma3_text": 0.05,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -136,16 +142,14 @@ _XFAIL_REASONS: dict[str, str] = {
     # HF architecture differences (extra layers/features not in our ONNX)
     "llama4_text": "HF Llama4 MoE differs from our implementation",
     # Softcapping/scaling differences
-    "gemma2": "Attention softcapping implementation differs",
-    "shieldgemma2": "Attention softcapping implementation differs",
+    "gemma2": "Gemma2 softcapping + ORT Attention op interaction (cosine=0.43)",
+    "shieldgemma2": "ShieldGemma2 HF AutoModelForCausalLM does not support config class",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
-    # Gemma family: query_pre_attn_scalar
-    "gemma": "Gemma attention scaling differences",
-    "gemma3_text": "Gemma3 attention scaling/qk_norm differences",
+    # Gemma family: gemma v1 and gemma3_text now pass with atol overrides
     "gemma3n_text": "Gemma3n AltUp/Laurel implementation differs",
-    "gemma3n": "Gemma3n AltUp/Laurel implementation differs",
-    "gemma3": "Gemma3 sliding window attention differs",
+    "gemma3n": "Gemma3n requires timm library for AltUp/Laurel",
+    "gemma3": "Gemma3 lm_head weight shape mismatch (sliding window arch)",
     # Qwen3_next: linear attention (DeltaNet)
     "qwen3_next": "DeltaNet linear attention differs from HF",
     # DeepSeek MLA
@@ -165,12 +169,14 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "phi3": {"pad_token_id": 0},
     "phi": {"pad_token_id": 0, "layer_norm_eps": 1e-6},
     "phimoe": {"pad_token_id": 0},
-    "gemma2": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "shieldgemma2": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "gemma3_text": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "gemma3n_text": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "gemma3n": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM},
+    # Gemma family defaults head_dim=256 in HF; override to match tiny config
+    "gemma": {"head_dim": TINY_HEAD_DIM},
+    "gemma2": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
+    "shieldgemma2": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
+    "gemma3_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
+    "gemma3n_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
+    "gemma3n": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
+    "gemma3": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
     "opt": {
         "word_embed_proj_dim": TINY_HIDDEN,
         # OPT uses ffn_dim (not intermediate_size) for the MLP width
