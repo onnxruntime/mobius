@@ -84,27 +84,29 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # MoE models: HF uses fused batched-expert matmul while we use per-expert
     # MLP. Different FP accumulation order causes small numeric differences.
     # All have argmax_match=True — models are functionally correct.
+    "glm4_moe": 0.08,  # ~0.076 max diff, cosine=0.987 (sigmoid+group routing)
     "granitemoe": 0.025,  # ~0.021 max diff, cosine=0.999
     "granitemoeshared": 0.025,  # ~0.021 max diff, cosine=0.999
+    "jamba": 0.03,  # ~0.023 max diff, cosine=0.999 (MoE + Mamba SSM)
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
-    "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
+    "qwen2_moe": 0.04,  # ~0.034 max diff, cosine=0.998 (shared_expert)
+    "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
 # Each maps model_type → reason the outputs diverge.
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing: small floating-point accumulation differences from ONNX Runtime vs PyTorch
-    "qwen2_moe": "MoE shared_expert architecture not yet implemented",
     "qwen3_5_moe": "MoE routing differences",
-    # granitemoe, granitemoeshared, olmoe, qwen3_moe, phimoe use wider atol
-    # in _ATOL_OVERRIDES and PASS (argmax correct, FP accumulation only).
+    # granitemoe, granitemoeshared, olmoe, qwen3_moe, phimoe, qwen2_moe,
+    # glm4_moe, jamba use wider atol in _ATOL_OVERRIDES and PASS
+    # (argmax correct, FP accumulation only).
     "granitemoehybrid": "MoE routing + linear attention differences",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     "dbrx": "MoE routing differences",
     "ernie4_5_moe": "MoE routing differences",
     "flex_olmo": "MoE routing FP accumulation (post-norm architecture)",
-    "glm4_moe": "GLM4-MoE uses sigmoid router + group routing + shared expert — architecture not fully implemented",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
     "minimax": "MiniMax uses gated linear attention — different attention architecture",
@@ -135,7 +137,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # Weight naming: HF uses different prefix/structure than ONNX
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
     # Hybrid Mamba: weight naming and MoE routing differences
-    "jamba": "Jamba MoE/Mamba weight naming + routing differences",
     # Additional divergences (newly registered models)
     "doge": "DOGE dynamic mask / attention implementation differs",
     "nanochat": "NanoChat architecture implementation differs",
