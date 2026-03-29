@@ -243,6 +243,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "_config_cls": Gemma3nConfig,
             "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["full_attention", "sliding_attention"],
             "altup_num_inputs": 2,
@@ -259,6 +260,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "_config_cls": Gemma3nConfig,
             "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["full_attention", "sliding_attention"],
             "altup_num_inputs": 2,
@@ -956,6 +958,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "_config_cls": Gemma3nConfig,
             "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["full_attention"] * TINY_LAYERS,
             "altup_num_inputs": 2,
