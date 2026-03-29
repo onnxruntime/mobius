@@ -23,6 +23,7 @@ from mobius._configs import (
     JambaConfig,
     Mamba2Config,
     MambaConfig,
+    NanoChatConfig,
     Sam2Config,
     SegformerConfig,
     YolosConfig,
@@ -71,7 +72,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("llama4_text", {}, False),
     ("ministral", {}, False),
     ("ministral3", {}, False),
-    ("nanochat", {"hidden_act": "relu2"}, True),
+    (
+        "nanochat",
+        {
+            "_config_cls": NanoChatConfig,
+            "hidden_act": "relu2",
+            "final_logit_softcapping": 15.0,
+        },
+        True,
+    ),
     (
         "olmo2",
         {"attn_qk_norm": True, "attn_qk_norm_full": True},
@@ -189,7 +198,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # === Other Llama-compatible ===
-    ("modernbert-decoder", {"num_key_value_heads": TINY_HEADS}, False),
+    ("modernbert-decoder", {}, False),
     # === Text Generation (architecture-specific) ===
     (
         "gemma",

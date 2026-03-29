@@ -1286,6 +1286,24 @@ class Gemma2Config(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class NanoChatConfig(CausalLMConfig):
+    """Configuration for NanoChat models with final logit soft-capping.
+
+    Adds ``final_logit_softcapping`` used by :mod:`models.nanochat`.
+    """
+
+    final_logit_softcapping: float = 0.0
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> NanoChatConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
+        )
+
+
+@dataclasses.dataclass
 class Gemma3nConfig(CausalLMConfig):
     """Configuration for Gemma3n models with AltUp and Laurel compression.
 

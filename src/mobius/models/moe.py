@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -22,7 +23,7 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._attention import StaticCacheState
-from mobius.components._moe import SoftmaxTopKGate
+from mobius.components._moe import MLP, SoftmaxTopKGate
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -124,6 +125,7 @@ class MoETextModel(nn.Module):
 
     Uses RMSNorm by default (Mixtral, GraniteMoE, OLMoE, Qwen2-MoE).
     PhiMoE overrides with LayerNorm via norm_class parameter.
+    Pass layer_class to substitute a custom decoder layer type.
     """
 
     def __init__(
@@ -131,6 +133,7 @@ class MoETextModel(nn.Module):
         config: ArchitectureConfig,
         gate_factory: type[nn.Module] | None = None,
         norm_class: type = RMSNorm,
+        layer_class: type[MoEDecoderLayer] | None = None,
     ):
         super().__init__()
         self._dtype = config.dtype
@@ -153,9 +156,10 @@ class MoETextModel(nn.Module):
                 config.hidden_size, config.num_local_experts, config.num_experts_per_tok
             )
 
+        _layer_class = layer_class if layer_class is not None else MoEDecoderLayer
         self.layers = nn.ModuleList(
             [
-                MoEDecoderLayer(config, gate=_make_gate(), norm_class=norm_class)
+                _layer_class(config, gate=_make_gate(), norm_class=norm_class)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -248,7 +252,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
 class MoECausalLMModel(CausalLMModel):
     """Generic Mixture of Experts causal language model.
 
-    Compatible with Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE, GraniteMoE, and
+    Compatible with Mixtral, Qwen3-MoE, OLMoE, GraniteMoE, and
     other standard MoE architectures using top-k sparse routing.
     """
 
@@ -266,6 +270,77 @@ class MoECausalLMModel(CausalLMModel):
         state_dict = _rename_moe_expert_weights(state_dict)
         return super().preprocess_weights(state_dict)
 
+
+class Qwen2MoELayer(MoELayer):
+    """MoE layer with shared expert (always-active MLP) for Qwen2-MoE.
+
+    Extends the standard MoE routing with:
+    - ``shared_expert``: MLP applied to every token unconditionally.
+    - ``shared_expert_gate``: Linear(hidden, 1) whose sigmoid output scales
+      the shared expert contribution.
+
+    Forward: ``routing_output + sigmoid(shared_gate(h)) * shared_expert(h)``
+
+    Replicates HuggingFace ``Qwen2MoeSparseMoeBlock``.
+    """
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+        super().__init__(config, gate=gate)
+        assert config.shared_expert_intermediate_size is not None, (
+            "Qwen2MoELayer requires config.shared_expert_intermediate_size"
+        )
+        shared_config = dataclasses.replace(
+            config, intermediate_size=config.shared_expert_intermediate_size
+        )
+        self.shared_expert = MLP(shared_config)
+        self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
+
+    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+        # Routing expert output: top-k weighted sum  [B, S, H]
+        expert_output = super().forward(op, hidden_states)
+        # Shared expert always runs on every token
+        shared_output = self.shared_expert(op, hidden_states)  # [B, S, H]
+        # Gate scales shared contribution: sigmoid([B, S, 1]) broadcast over H
+        gate_val = op.Sigmoid(self.shared_expert_gate(op, hidden_states))  # [B, S, 1]
+        return op.Add(expert_output, op.Mul(shared_output, gate_val))
+
+
+class Qwen2MoEDecoderLayer(MoEDecoderLayer):
+    """Decoder layer using Qwen2MoELayer (with shared expert) as the MLP block."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        norm_class: type = RMSNorm,
+    ):
+        super().__init__(config, gate=gate, norm_class=norm_class)
+        # Replace the standard MoELayer with the Qwen2 variant (shared expert).
+        # Re-use the gate already created by MoEDecoderLayer.__init__.
+        self.mlp = Qwen2MoELayer(config, gate=self.mlp.gate)
+
+
+class Qwen2MoECausalLMModel(CausalLMModel):
+    """Qwen2-MoE causal language model.
+
+    Differs from the generic ``MoECausalLMModel`` by adding a per-layer
+    shared expert (always active) and a sigmoid gate that scales its
+    contribution, matching ``Qwen2MoeForCausalLM``.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self.config = config
+        self.model = MoETextModel(config, layer_class=Qwen2MoEDecoderLayer)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        state_dict = _rename_moe_expert_weights(state_dict)
+        return super().preprocess_weights(state_dict)
 
 def _rename_moe_expert_weights(
     state_dict: dict[str, torch.Tensor],

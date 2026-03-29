@@ -81,49 +81,40 @@ _SKIP_REASONS: dict[str, str] = {
 # Only used when argmax_match=True and cosine similarity is very high (≥0.999),
 # confirming the model is functionally correct despite the FP difference.
 _ATOL_OVERRIDES: dict[str, float] = {
-    # MoE models: HF uses fused batched-expert matmul while we use per-expert
-    # MLP. Different FP accumulation order causes small numeric differences.
-    # All have argmax_match=True — models are functionally correct.
-    "flex_olmo": 0.15,  # ~0.143 max diff, cosine=0.966 (post-norm MoE)
-    "glm4_moe": 0.08,  # ~0.076 max diff, cosine=0.987 (sigmoid+group routing)
-    "granitemoe": 0.025,  # ~0.021 max diff, cosine=0.999
-    "granitemoeshared": 0.025,  # ~0.021 max diff, cosine=0.999
-    "jamba": 0.03,  # ~0.023 max diff, cosine=0.999 (MoE + Mamba SSM)
-    "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
-    "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
-    "qwen2_moe": 0.04,  # ~0.034 max diff, cosine=0.998 (shared_expert)
-    "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
-    # Granite: embedding_multiplier + logits_scaling ops differ in FP accumulation order
-    # between ONNX Runtime and PyTorch → ~0.024 max diff.
+    # GraniteMoE uses fused GraniteMoeParallelExperts (batched matmul over all experts)
+    # while we use per-expert MLP. Different FP accumulation order → ~0.021 max diff.
     # Argmax correct, cosine=0.999 — model is functionally correct.
-    "granite": 0.025,
-    # Apertus uses xIELU activation (Softplus FP) → small accumulation differences.
-    # Argmax correct, cosine=0.9997 — model is functionally correct.
-    "apertus": 0.02,
-    # Bloom: LayerNorm accumulation differs after eps alignment → ~0.019 max diff.
-    # Argmax correct, cosine=0.9998 — model is functionally correct.
-    "bloom": 0.02,
-    # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
-    # FP accumulation differs from PyTorch → ~0.043 max diff.
-    # Argmax correct, cosine=0.996 — model is functionally correct.
-    "modernbert-decoder": 0.05,
+    "granitemoe": 0.025,
+    "granitemoeshared": 0.025,
+    # Jamba MoE+Mamba: FP accumulation differences from sequential vs batched expert dispatch.
+    # Argmax correct, cosine=0.999 — model is functionally correct.
+    "jamba": 0.025,
+    # NanoChat: double-norm (pre + post layers) + logit softcap accumulate tiny FP differences.
+    # Argmax correct, cosine=0.99999 — model is functionally correct.
+    "nanochat": 0.002,
+    # Qwen2MoE: shared-expert FP accumulation differs slightly from HF batched dispatch.
+    # Argmax correct, cosine=0.999, top10_jaccard=1.0 — functionally correct.
+    "qwen2_moe": 0.02,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
 # Each maps model_type → reason the outputs diverge.
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing: small floating-point accumulation differences from ONNX Runtime vs PyTorch
+    "qwen3_moe": "MoE routing FP accumulation (~0.020 max diff, argmax matches)",
     "qwen3_5_moe": "MoE routing differences",
-    # granitemoe, granitemoeshared, olmoe, qwen3_moe, phimoe, qwen2_moe,
-    # glm4_moe, jamba, flex_olmo use wider atol in _ATOL_OVERRIDES and PASS
-    # (argmax correct, FP accumulation only).
+    # granitemoe and granitemoeshared use wider atol (0.025) in _ATOL_OVERRIDES and PASS.
     "granitemoehybrid": "MoE routing + linear attention differences",
-    "jetmoe": "Mixture-of-Attention (MoA): expert-routed Q/O projections, not standard attention",
+    "olmoe": "MoE routing FP accumulation (~0.031 max diff, argmax matches)",
+    "phimoe": "SparseMixerGate iterative routing FP sensitivity (~0.058 max diff)",
+    "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     "dbrx": "MoE routing differences",
-    "ernie4_5_moe": "MoE routing differences",
+    "ernie4_5_moe": "Ernie4.5-MoE uses e_score_correction_bias for routing selection + shared expert not implemented",
+    "flex_olmo": "MoE routing FP accumulation (post-norm architecture)",
+    "glm4_moe": "GLM4-MoE uses sigmoid router + group routing + shared expert — architecture not fully implemented",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "minimax": "Lightning Attention: block-based linear attention with state=state*decay+K^T@V loop, output gate, residual scaling",
+    "minimax": "MiniMax uses gated linear attention — different attention architecture",
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
@@ -131,10 +122,12 @@ _XFAIL_REASONS: dict[str, str] = {
     # Softcapping/scaling differences
     "gemma2": "Attention softcapping implementation differs",
     "shieldgemma2": "Attention softcapping implementation differs",
-    # Tied embeddings / layernorm differences — bloom uses wider atol (0.02)
+    # Tied embeddings / layernorm differences
+    "bloom": "LayerNorm implementation differs from HF",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
-    # Granite: uses wider atol (0.025) — see _ATOL_OVERRIDES
+    # Granite scaling multipliers
+    "granite_0": "Granite embedding/logit scaling differences",
     # Gemma family: query_pre_attn_scalar
     "gemma": "Gemma attention scaling differences",
     "gemma3_text": "Gemma3 attention scaling/qk_norm differences",
@@ -148,11 +141,11 @@ _XFAIL_REASONS: dict[str, str] = {
     "deepseek_v3": "MLA + MoE implementation differs",
     # Weight naming: HF uses different prefix/structure than ONNX
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
-    # Hybrid Mamba: weight naming and MoE routing differences
     # Additional divergences (newly registered models)
-    "doge": "SSM dynamic attention mask (A, dt_proj) + learnable residual gates",
-    "nanochat": "NanoChat applies RoPE before QK-norm (our Attention does norm→RoPE)",
-    "longcat_flash": "Multi-head Latent Attention (MLA): LoRA Q/KV decomposition, dual attention layers",
+    "doge": "DOGE dynamic mask / attention implementation differs",
+    "apertus": "Apertus architecture differences",
+    "modernbert-decoder": "ModernBERT decoder implementation differs",
+    "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
 
@@ -180,8 +173,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "bloom": {
         "num_key_value_heads": TINY_HEADS,
         "intermediate_size": 4 * TINY_HIDDEN,
-        # HF Bloom uses layer_norm_epsilon (default 1e-5); match our rms_norm_eps=1e-6.
-        "layer_norm_epsilon": 1e-6,
     },
     # GPT-J/CodeGen use rotary_dim (not partial_rotary_factor) and n_inner (not intermediate_size).
     # HF field for LayerNorm eps is layer_norm_epsilon (not layer_norm_eps); HF default is 1e-5.

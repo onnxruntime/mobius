@@ -3249,6 +3249,7 @@ class TestBuildStaticCacheGraph:
             num_local_experts=4,
             num_experts_per_tok=2,
             attn_qkv_bias=True,
+            shared_expert_intermediate_size=64,
         )
 
         assert model.graph is not None

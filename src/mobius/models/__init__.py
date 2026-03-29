@@ -24,6 +24,7 @@ __all__ = [
     "ChatGLMCausalLMModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
+    "DogeCausalLMModel",
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
@@ -47,6 +48,7 @@ __all__ = [
     "JambaCausalLMModel",
     "LLaVAModel",
     "MoECausalLMModel",
+    "Qwen2MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "OLMo2CausalLMModel",
@@ -124,6 +126,7 @@ from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
+from mobius.models.doge import DogeCausalLMModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
@@ -145,6 +148,7 @@ from mobius.models.moe import (
     GPTOSSCausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
+    Qwen2MoECausalLMModel,
 )
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel

@@ -268,6 +268,7 @@ def _create_default_registry() -> ModelRegistry:
         Phi3SmallCausalLMModel,
         Phi4MMMultiModalModel,
         PhiCausalLMModel,
+        Qwen2MoECausalLMModel,
         Qwen3CausalLMModel,
         Qwen3NextCausalLMModel,
         Qwen3VL3ModelCausalLMModel,
@@ -409,12 +410,12 @@ def _create_default_registry() -> ModelRegistry:
         "minimax",
         "mixtral",
         "olmoe",
-        "qwen2_moe",
         "qwen3_moe",
         "qwen3_omni_moe",
         "qwen3_vl_moe",
     ):
         reg.register(name, MoECausalLMModel)
+    reg.register("qwen2_moe", Qwen2MoECausalLMModel)
     reg.register("gptoss", GPTOSSCausalLMModel)
     reg.register("gpt_oss", GPTOSSCausalLMModel)
     reg.register("phimoe", Phi3MoECausalLMModel)
