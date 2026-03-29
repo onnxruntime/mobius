@@ -81,11 +81,14 @@ _SKIP_REASONS: dict[str, str] = {
 # Only used when argmax_match=True and cosine similarity is very high (≥0.999),
 # confirming the model is functionally correct despite the FP difference.
 _ATOL_OVERRIDES: dict[str, float] = {
-    # GraniteMoE uses fused GraniteMoeParallelExperts (batched matmul over all experts)
-    # while we use per-expert MLP. Different FP accumulation order → ~0.021 max diff.
-    # Argmax correct, cosine=0.999 — model is functionally correct.
-    "granitemoe": 0.025,
-    "granitemoeshared": 0.025,
+    # MoE models: HF uses fused batched-expert matmul while we use per-expert
+    # MLP. Different FP accumulation order causes small numeric differences.
+    # All have argmax_match=True — models are functionally correct.
+    "granitemoe": 0.025,  # ~0.021 max diff, cosine=0.999
+    "granitemoeshared": 0.025,  # ~0.021 max diff, cosine=0.999
+    "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
+    "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
+    "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -93,12 +96,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing: small floating-point accumulation differences from ONNX Runtime vs PyTorch
     "qwen2_moe": "MoE shared_expert architecture not yet implemented",
-    "qwen3_moe": "MoE routing FP accumulation (~0.020 max diff, argmax matches)",
     "qwen3_5_moe": "MoE routing differences",
-    # granitemoe and granitemoeshared use wider atol (0.025) in _ATOL_OVERRIDES and PASS.
+    # granitemoe, granitemoeshared, olmoe, qwen3_moe, phimoe use wider atol
+    # in _ATOL_OVERRIDES and PASS (argmax correct, FP accumulation only).
     "granitemoehybrid": "MoE routing + linear attention differences",
-    "olmoe": "MoE routing FP accumulation (~0.031 max diff, argmax matches)",
-    "phimoe": "SparseMixerGate iterative routing FP sensitivity (~0.058 max diff)",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     "dbrx": "MoE routing differences",
     "ernie4_5_moe": "MoE routing differences",
