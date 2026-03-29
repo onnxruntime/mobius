@@ -69,6 +69,34 @@ class LayerNorm(nn.Module):
         )
 
 
+class LayerNorm1P(nn.Module):
+    """Layer Normalization where the learned weight is a delta around 1.
+
+    HF stores the weight as a delta, and the effective scale is ``weight + 1``:
+        F.layer_norm(x, normalized_shape, weight + 1, bias, eps)
+
+    Used by Nemotron's ``NemotronLayerNorm1P``.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter([hidden_size])
+        self.bias = nn.Parameter([hidden_size])
+        self.eps = eps
+
+    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+        # Effective scale = weight + 1 (matching NemotronLayerNorm1P)
+        one = op.Constant(value_float=1.0)
+        effective_weight = op.Add(self.weight, one)
+        return op.LayerNormalization(
+            hidden_states,
+            effective_weight,
+            self.bias,
+            epsilon=self.eps,
+            axis=-1,
+        )
+
+
 class LayerNormNoBias(nn.Module):
     """Layer Normalization with weight-only affine (no bias).
 
