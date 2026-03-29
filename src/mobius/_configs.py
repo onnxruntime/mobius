@@ -726,6 +726,9 @@ class ArchitectureConfig(BaseModelConfig):
     logits_scaling: float = 1.0
     residual_multiplier: float = 1.0
 
+    # Cohere logit scale: multiplied into the final logits before softmax
+    logit_scale: float = 1.0
+
     # YOLOS object detection config
     num_labels: int = 91
 
@@ -941,6 +944,8 @@ class ArchitectureConfig(BaseModelConfig):
             attention_multiplier=getattr(config, "attention_multiplier", None),
             logits_scaling=getattr(config, "logits_scaling", 1.0),
             residual_multiplier=getattr(config, "residual_multiplier", 1.0),
+            # Cohere logit scale
+            logit_scale=getattr(config, "logit_scale", 1.0),
             # Falcon config
             alibi=getattr(config, "alibi", False),
             parallel_attn=getattr(config, "parallel_attn", False),

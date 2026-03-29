@@ -253,6 +253,7 @@ def _create_default_registry() -> ModelRegistry:
         GPTOSSCausalLMModel,
         GraniteCausalLMModel,
         InternLM2CausalLMModel,
+        LayerNormCausalLMModel,
         MoECausalLMModel,
         NemotronCausalLMModel,
         OLMo2CausalLMModel,
@@ -281,6 +282,7 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.bert import BertModel
     from mobius.models.blip import BlipVisionModel
     from mobius.models.clip import CLIPTextModel, CLIPVisionModel
+    from mobius.models.cohere import CohereCausalLMModel
     from mobius.models.depth_anything import DepthAnythingForDepthEstimation
     from mobius.models.distilbert import DistilBertModel
     from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
@@ -296,6 +298,7 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.persimmon import PersimmonCausalLMModel
     from mobius.models.sam2 import Sam2VisionModel
     from mobius.models.segformer import SegformerForSemanticSegmentation
+    from mobius.models.starcoder2 import StarCoder2CausalLMModel
     from mobius.models.t5 import T5ForConditionalGeneration
     from mobius.models.trocr import TrOCRForConditionalGeneration
     from mobius.models.vit import ViTModel
@@ -311,8 +314,6 @@ def _create_default_registry() -> ModelRegistry:
         "baichuan",
         "code_llama",
         "codegen2",
-        "cohere",
-        "cohere2",
         "command_r",
         "csm",
         "diffllama",
@@ -340,8 +341,6 @@ def _create_default_registry() -> ModelRegistry:
         "qwen2",
         "seed_oss",
         "solar_open",
-        "stablelm",
-        "starcoder2",
         "yi",
         "youtu",
         "zamba",
@@ -354,6 +353,8 @@ def _create_default_registry() -> ModelRegistry:
         "bloom": BloomCausalLMModel,
         "chatglm": ChatGLMCausalLMModel,
         "codegen": CodeGenCausalLMModel,
+        "cohere": CohereCausalLMModel,
+        "cohere2": CohereCausalLMModel,
         "ernie4_5": ErnieCausalLMModel,
         "falcon": FalconCausalLMModel,
         "falcon_h1": FalconCausalLMModel,
@@ -362,6 +363,8 @@ def _create_default_registry() -> ModelRegistry:
         "gptj": GPTJCausalLMModel,
         "mpt": MPTCausalLMModel,
         "persimmon": PersimmonCausalLMModel,
+        "stablelm": LayerNormCausalLMModel,
+        "starcoder2": StarCoder2CausalLMModel,
         "gemma": GemmaCausalLMModel,
         "gemma2": Gemma2CausalLMModel,
         "shieldgemma2": Gemma2CausalLMModel,

@@ -105,16 +105,11 @@ _XFAIL_REASONS: dict[str, str] = {
     "shieldgemma2": "Attention softcapping implementation differs",
     # Tied embeddings / layernorm differences
     "bloom": "LayerNorm implementation differs from HF",
-    "cohere": "LayerNorm implementation differs from HF",
-    "cohere2": "LayerNorm implementation differs from HF",
-    "starcoder2": "LayerNorm implementation differs from HF",
     "ctrl": "Absolute positional embedding implementation differs",
     "opt": "OPT architecture differences (learned pos embeddings)",
     # GPT-2 family: imagegpt/xlm/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
     "xlm": "GPT2 family layernorm differences",
-    # StableLM uses LayerNorm with bias (not RMSNorm) — bias weights are skipped
-    "stablelm": "HF StableLM uses LayerNorm with bias (not RMSNorm)",
     # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
     "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Granite scaling multipliers
@@ -192,6 +187,13 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     # GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; test config matches via rms_norm_eps=1e-5
     # MPT uses layer_norm_epsilon (not rms_norm_eps) for its LayerNorms
     "mpt": {"layer_norm_epsilon": 1e-6},
+    # Cohere/Cohere2 use layer_norm_eps (HF default 1e-5); force to match our rms_norm_eps=1e-6
+    "cohere": {"layer_norm_eps": 1e-6},
+    "cohere2": {"layer_norm_eps": 1e-6},
+    # StableLM uses layer_norm_eps (HF default 1e-5); force to match our rms_norm_eps=1e-6
+    "stablelm": {"layer_norm_eps": 1e-6},
+    # StarCoder2: disable bias (use_bias=True HF default) and fix norm_epsilon field
+    "starcoder2": {"norm_epsilon": 1e-6, "use_bias": False},
 }
 
 

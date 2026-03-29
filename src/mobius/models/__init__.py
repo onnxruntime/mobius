@@ -11,6 +11,9 @@ __all__ = [
     "Blip2Model",
     "BloomCausalLMModel",
     "CausalLMModel",
+    "CohereCausalLMModel",
+    "LayerNormCausalLMModel",
+    "StarCoder2CausalLMModel",
     "CLIPVisionModel",
     "CogVideoXTransformer3DModel",
     "ControlNetModel",
@@ -98,12 +101,13 @@ __all__ = [
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
 from mobius.models.bert import BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
+from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
@@ -184,6 +188,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLVisionEncoderModel,
 )
 from mobius.models.smollm import SmolLM3CausalLMModel
+from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.unet import UNet2DConditionModel
 from mobius.models.vae import AutoencoderKLModel
