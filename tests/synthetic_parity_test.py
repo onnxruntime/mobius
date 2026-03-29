@@ -84,6 +84,7 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # MoE models: HF uses fused batched-expert matmul while we use per-expert
     # MLP. Different FP accumulation order causes small numeric differences.
     # All have argmax_match=True — models are functionally correct.
+    "flex_olmo": 0.15,  # ~0.143 max diff, cosine=0.966 (post-norm MoE)
     "glm4_moe": 0.08,  # ~0.076 max diff, cosine=0.987 (sigmoid+group routing)
     "granitemoe": 0.025,  # ~0.021 max diff, cosine=0.999
     "granitemoeshared": 0.025,  # ~0.021 max diff, cosine=0.999
@@ -100,16 +101,15 @@ _XFAIL_REASONS: dict[str, str] = {
     # MoE routing: small floating-point accumulation differences from ONNX Runtime vs PyTorch
     "qwen3_5_moe": "MoE routing differences",
     # granitemoe, granitemoeshared, olmoe, qwen3_moe, phimoe, qwen2_moe,
-    # glm4_moe, jamba use wider atol in _ATOL_OVERRIDES and PASS
+    # glm4_moe, jamba, flex_olmo use wider atol in _ATOL_OVERRIDES and PASS
     # (argmax correct, FP accumulation only).
     "granitemoehybrid": "MoE routing + linear attention differences",
-    "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
+    "jetmoe": "Mixture-of-Attention (MoA): expert-routed Q/O projections, not standard attention",
     "dbrx": "MoE routing differences",
     "ernie4_5_moe": "MoE routing differences",
-    "flex_olmo": "MoE routing FP accumulation (post-norm architecture)",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "minimax": "MiniMax uses gated linear attention — different attention architecture",
+    "minimax": "Lightning Attention: exponential decay mask, block-based linear attention, output gate",
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
@@ -138,11 +138,11 @@ _XFAIL_REASONS: dict[str, str] = {
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
     # Hybrid Mamba: weight naming and MoE routing differences
     # Additional divergences (newly registered models)
-    "doge": "DOGE dynamic mask / attention implementation differs",
-    "nanochat": "NanoChat architecture implementation differs",
-    "apertus": "Apertus architecture differences",
-    "modernbert-decoder": "ModernBERT decoder implementation differs",
-    "longcat_flash": "Flash attention implementation differs",
+    "doge": "SSM dynamic attention mask (A, dt_proj) + learnable residual gates",
+    "nanochat": "NanoChat applies RoPE before QK-norm (our Attention does norm→RoPE)",
+    "apertus": "xIELU Softplus FP accumulation (~0.016 max diff, argmax matches)",
+    "modernbert-decoder": "Complex LM head (dense+GELU+LayerNorm+decoder bias)",
+    "longcat_flash": "Multi-head Latent Attention (MLA): LoRA Q/KV decomposition, dual attention layers",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
 
