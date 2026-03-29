@@ -202,15 +202,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Text Generation (architecture-specific) ===
     (
         "gemma",
-        {"attn_qkv_bias": True, "attn_o_bias": True},
+        {"attn_qkv_bias": False, "attn_o_bias": False},
         True,
     ),
     (
         "gemma2",
         {
             "_config_cls": Gemma2Config,
-            "attn_qkv_bias": True,
-            "attn_o_bias": True,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
             "attn_logit_softcapping": 50.0,
             "final_logit_softcapping": 30.0,
             "query_pre_attn_scalar": TINY_HEAD_DIM,
@@ -221,8 +221,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "shieldgemma2",
         {
             "_config_cls": Gemma2Config,
-            "attn_qkv_bias": True,
-            "attn_o_bias": True,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
             "attn_logit_softcapping": 50.0,
             "final_logit_softcapping": 30.0,
             "query_pre_attn_scalar": TINY_HEAD_DIM,

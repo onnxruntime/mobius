@@ -123,6 +123,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3 text: QK-norm + sliding/full attention FP accumulation → ~0.045 max diff.
     # Argmax correct (near-tie), cosine=0.996 — model is functionally correct.
     "gemma3_text": 0.05,
+    # Gemma2: softcapping (tanh) + OffsetRMSNorm FP accumulation → ~0.042 max diff.
+    # Argmax correct (near-tie), cosine=0.998 — model is functionally correct.
+    "gemma2": 0.05,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -142,7 +145,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # HF architecture differences (extra layers/features not in our ONNX)
     "llama4_text": "HF Llama4 MoE differs from our implementation",
     # Softcapping/scaling differences
-    "gemma2": "Gemma2 softcapping + ORT Attention op interaction (cosine=0.43)",
     "shieldgemma2": "ShieldGemma2 HF AutoModelForCausalLM does not support config class",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
