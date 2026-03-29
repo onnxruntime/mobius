@@ -118,8 +118,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "bloom": "LayerNorm implementation differs from HF",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
-    # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
-    "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Granite scaling multipliers
     "granite_0": "Granite embedding/logit scaling differences",
     # Gemma family: query_pre_attn_scalar
@@ -141,7 +139,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "doge": "DOGE dynamic mask / attention implementation differs",
     "nanochat": "NanoChat architecture implementation differs",
     "apertus": "Apertus architecture differences",
-    "arcee": "Arcee architecture differences",
     "modernbert-decoder": "ModernBERT decoder implementation differs",
     "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
