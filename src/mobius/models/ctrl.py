@@ -112,9 +112,7 @@ _CTRL_LAYER_RENAMES: list[tuple[str, str]] = [
 ]
 
 
-def _rename_ctrl_weight(
-    name: str, tensor: torch.Tensor
-) -> dict[str, torch.Tensor] | None:
+def _rename_ctrl_weight(name: str, tensor: torch.Tensor) -> dict[str, torch.Tensor] | None:
     """Rename a single HF CTRL weight to our GPT-2-compatible naming.
 
     HF CTRL naming:
@@ -139,19 +137,19 @@ def _rename_ctrl_weight(
 
     # Final LayerNorm: transformer.layernorm → transformer.ln_f
     if name.startswith("transformer.layernorm."):
-        suffix = name[len("transformer.layernorm."):]
+        suffix = name[len("transformer.layernorm.") :]
         return {f"transformer.ln_f.{suffix}": tensor}
 
     # Per-layer weights: transformer.h.{N}.{sub_module}.{param}
     if name.startswith("transformer.h."):
-        rest = name[len("transformer.h."):]
+        rest = name[len("transformer.h.") :]
         dot = rest.index(".")
         layer_idx = rest[:dot]
-        sub = rest[dot + 1:]
+        sub = rest[dot + 1 :]
 
         for old, new in _CTRL_LAYER_RENAMES:
             if sub.startswith(old):
-                remainder = sub[len(old):]
+                remainder = sub[len(old) :]
                 return {f"transformer.h.{layer_idx}.{new}{remainder}": tensor}
 
     return None

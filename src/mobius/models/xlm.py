@@ -46,7 +46,10 @@ class _XLMTextModel(nn.Module):
         self.layer_norm_emb = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.h = nn.ModuleList(
             # XLM uses post-norm (LayerNorm after residual, like BERT/OpenAI-GPT)
-            [_GPT2DecoderLayer(config, post_norm=True) for _ in range(config.num_hidden_layers)]
+            [
+                _GPT2DecoderLayer(config, post_norm=True)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
 
     def forward(
@@ -146,9 +149,7 @@ _XLM_LAYER_RENAMES: list[tuple[str, str]] = [
 ]
 
 
-def _rename_xlm_weight(
-    name: str, tensor: torch.Tensor
-) -> dict[str, torch.Tensor] | None:
+def _rename_xlm_weight(name: str, tensor: torch.Tensor) -> dict[str, torch.Tensor] | None:
     """Rename a single HF XLM weight to our GPT-2-compatible naming.
 
     HF XLM uses flat-indexed sub-modules under ``transformer.*``:
@@ -165,13 +166,13 @@ def _rename_xlm_weight(
     """
     # LM head: pred_layer.proj → lm_head
     if name.startswith("pred_layer.proj."):
-        suffix = name[len("pred_layer.proj."):]
+        suffix = name[len("pred_layer.proj.") :]
         return {f"lm_head.{suffix}": tensor}
 
     if not name.startswith("transformer."):
         return None
 
-    rest = name[len("transformer."):]
+    rest = name[len("transformer.") :]
 
     # Token embedding
     if rest == "embeddings.weight":
@@ -183,7 +184,7 @@ def _rename_xlm_weight(
 
     # Post-embedding LayerNorm
     if rest.startswith("layer_norm_emb."):
-        suffix = rest[len("layer_norm_emb."):]
+        suffix = rest[len("layer_norm_emb.") :]
         return {f"transformer.layer_norm_emb.{suffix}": tensor}
 
     # Per-layer attention: attentions.{N}.{q_lin|k_lin|v_lin|out_lin}.{weight|bias}
@@ -196,7 +197,7 @@ def _rename_xlm_weight(
         sub = ".".join(parts[2:])
         for old, new in _XLM_LAYER_RENAMES:
             if sub.startswith(old):
-                remainder = sub[len(old):]
+                remainder = sub[len(old) :]
                 return {f"transformer.h.{layer_idx}.{new}{remainder}": tensor}
         return None
 
@@ -217,10 +218,10 @@ def _rename_xlm_weight(
         layer_idx = parts[1]
         sub_and_param = ".".join(parts[2:])
         if sub_and_param.startswith("lin1."):
-            param = sub_and_param[len("lin1."):]
+            param = sub_and_param[len("lin1.") :]
             return {f"transformer.h.{layer_idx}.mlp.up_proj.{param}": tensor}
         if sub_and_param.startswith("lin2."):
-            param = sub_and_param[len("lin2."):]
+            param = sub_and_param[len("lin2.") :]
             return {f"transformer.h.{layer_idx}.mlp.down_proj.{param}": tensor}
         return None
 

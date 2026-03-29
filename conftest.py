@@ -1,6 +1,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 """Root conftest: ensure the local worktree src/ is on sys.path first."""
+
 from __future__ import annotations
 
 import importlib
