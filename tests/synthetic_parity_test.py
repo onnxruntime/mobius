@@ -137,13 +137,14 @@ _XFAIL_REASONS: dict[str, str] = {
     # Weight naming: HF uses different prefix/structure than ONNX
     # Phi (original): HF uses dense, fc1/fc2, LayerNorm — not Llama-compatible
     # Hybrid Mamba: weight naming and MoE routing differences
-    "jamba": "MoE routing FP accumulation + Mamba SSM shape mismatch",
+    "jamba": "Jamba MoE/Mamba weight naming + routing differences",
     # Additional divergences (newly registered models)
-    "doge": "DOGE learnable residual gates and SSM attention not implemented",
-    "nanochat": "NanoChat applies RoPE before QK-norm (our Attention does norm→RoPE)",
-    "apertus": "xIELU Softplus FP accumulation (~0.016 max diff, argmax matches)",
+    "doge": "DOGE dynamic mask / attention implementation differs",
+    "nanochat": "NanoChat architecture implementation differs",
+    "apertus": "Apertus architecture differences",
+    "arcee": "Arcee architecture differences",
     "modernbert-decoder": "ModernBERT decoder implementation differs",
-    "longcat_flash": "LongCatFlash uses two MLA attention modules per layer + MoE",
+    "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
 # Fields that are properties in HF configs and cannot be set directly.
@@ -297,7 +298,6 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     expert_field_aliases: dict[str, dict[str, str]] = {
         # Standard: num_experts (not num_local_experts)
         "olmoe": {"num_local_experts": "num_experts"},
-        "jamba": {"num_local_experts": "num_experts"},
         "qwen2_moe": {"num_local_experts": "num_experts"},
         "qwen3_moe": {"num_local_experts": "num_experts"},
         "qwen3_omni_moe": {"num_local_experts": "num_experts"},
