@@ -116,11 +116,10 @@ _XFAIL_REASONS: dict[str, str] = {
     "shieldgemma2": "Attention softcapping implementation differs",
     # Tied embeddings / layernorm differences
     "bloom": "LayerNorm implementation differs from HF",
-    "ctrl": "Absolute positional embedding implementation differs",
-    "opt": "OPT architecture differences (learned pos embeddings)",
-    # GPT-2 family: imagegpt/xlm/gpt-sw3 still differ; the rest are fixed
+    # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
-    "xlm": "GPT2 family layernorm differences",
+    # Nemotron attention differs fundamentally from base Llama (large 0.44 error)
+    "nemotron": "Nemotron attention differs from base (needs investigation)",
     # Granite scaling multipliers
     "granite_0": "Granite embedding/logit scaling differences",
     # Gemma family: query_pre_attn_scalar
@@ -147,8 +146,10 @@ _XFAIL_REASONS: dict[str, str] = {
     "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
 }
-# Fields that are properties in HF configs and cannot be set directly.
-_HF_READONLY_FIELDS: set[str] = {"head_dim"}
+
+# Fields that are properties in HF configs and cannot be set directly,
+# or internal mobius-only fields that HF configs don't recognize.
+_HF_READONLY_FIELDS: set[str] = {"head_dim", "attn_qkv_bias", "attn_o_bias", "mlp_bias"}
 
 # Model types that need extra HF config fields beyond our defaults.
 _HF_EXTRA_CONFIG: dict[str, dict] = {
@@ -161,7 +162,11 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma3n_text": {"query_pre_attn_scalar": TINY_HEAD_DIM},
     "gemma3n": {"query_pre_attn_scalar": TINY_HEAD_DIM},
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM},
-    "opt": {"word_embed_proj_dim": TINY_HIDDEN},
+    "opt": {
+        "word_embed_proj_dim": TINY_HIDDEN,
+        # OPT uses ffn_dim (not intermediate_size) for the MLP width
+        "ffn_dim": TINY_INTERMEDIATE,
+    },
     # Bloom uses MHA (num_kv_heads == num_heads) and 4*hidden intermediate
     "bloom": {
         "num_key_value_heads": TINY_HEADS,
@@ -182,6 +187,24 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gpt_bigcode": {"n_inner": TINY_INTERMEDIATE, "multi_query": False},
     "xglm": {"ffn_dim": TINY_INTERMEDIATE},
     "biogpt": {"ffn_dim": TINY_INTERMEDIATE},
+    # CTRL uses old-style config field names (n_embd, n_layer, n_head, dff).
+    # Sinusoidal PE is computed at runtime; n_positions must match max_position_embeddings.
+    "ctrl": {
+        "n_embd": TINY_HIDDEN,
+        "n_layer": TINY_LAYERS,
+        "n_head": TINY_HEADS,
+        "dff": TINY_INTERMEDIATE,
+        "n_positions": 128,
+    },
+    # XLM uses emb_dim/n_layers/n_heads; MLP dim is hardcoded 4*emb_dim in HF
+    # (test config sets intermediate_size=4*TINY_HIDDEN to match).
+    # causal=True forces causal masking to match our ONNX Attention (is_causal=1).
+    "xlm": {
+        "emb_dim": TINY_HIDDEN,
+        "n_layers": TINY_LAYERS,
+        "n_heads": TINY_HEADS,
+        "causal": True,
+    },
     # Jamba requires CUDA mamba kernels by default; disable for CPU tests
     "jamba": {"use_mamba_kernels": False},
     # Nemotron uses norm_eps (not rms_norm_eps) in HF config

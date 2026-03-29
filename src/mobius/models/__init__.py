@@ -51,7 +51,9 @@ __all__ = [
     "NemotronCausalLMModel",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
+    "CTRLCausalLMModel",
     "OPTCausalLMModel",
+    "XLMCausalLMModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "Phi3CausalLMModel",
@@ -116,6 +118,7 @@ from mobius.models.clip import CLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
+from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.diffllama import DiffLlamaCausalLMModel
@@ -206,3 +209,4 @@ from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.whisper import WhisperForConditionalGeneration
+from mobius.models.xlm import XLMCausalLMModel

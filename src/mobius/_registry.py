@@ -288,6 +288,7 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.blip import BlipVisionModel
     from mobius.models.clip import CLIPTextModel, CLIPVisionModel
     from mobius.models.cohere import CohereCausalLMModel
+    from mobius.models.ctrl import CTRLCausalLMModel
     from mobius.models.depth_anything import DepthAnythingForDepthEstimation
     from mobius.models.distilbert import DistilBertModel
     from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
@@ -308,6 +309,7 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.trocr import TrOCRForConditionalGeneration
     from mobius.models.vit import ViTModel
     from mobius.models.wav2vec2 import Wav2Vec2Model
+    from mobius.models.xlm import XLMCausalLMModel
     from mobius.models.yolos import YolosForObjectDetection
 
     reg = ModelRegistry()
@@ -588,16 +590,16 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("gpt2", GPT2CausalLMModel)
     for name in (
         "biogpt",
-        "ctrl",
         "gpt-sw3",
         "gpt_bigcode",
         "gpt_neo",
         "imagegpt",
         "openai-gpt",
         "xglm",
-        "xlm",
     ):
         reg.register(name, GPT2CausalLMModel)
+    reg.register("ctrl", CTRLCausalLMModel)
+    reg.register("xlm", XLMCausalLMModel)
     reg.register("opt", OPTCausalLMModel)
 
     # --- Encoder-decoder ---

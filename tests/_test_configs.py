@@ -130,7 +130,18 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("youtu", {"tie_word_embeddings": True}, False),
     # === Absolute positional embeddings (non-RoPE) ===
-    ("ctrl", {"hidden_act": "gelu_new", "tie_word_embeddings": True}, True),
+    (
+        "ctrl",
+        {
+            # HF CTRL FFN uses ReLU (not gelu_new); token embeds scaled by sqrt(n_embd)
+            "hidden_act": "relu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
+        True,
+    ),
     (
         "gpt2",
         {
@@ -148,10 +159,33 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {"hidden_act": "gelu_new", "tie_word_embeddings": True},
         False,
     ),
-    ("opt", {"hidden_act": "relu", "tie_word_embeddings": True}, True),
+    (
+        "opt",
+        {
+            "hidden_act": "relu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            # HF OPT uses eps=1e-5 for its LayerNorms (nn.LayerNorm default)
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
     (
         "xlm",
-        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        {
+            # HF XLM uses standard GELU (erf-based) and eps=1e-12 for LayerNorms
+            "hidden_act": "gelu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            # XLM uses 4*emb_dim for feedforward (hardcoded in HF)
+            "intermediate_size": 4 * TINY_HIDDEN,
+            # HF XLM uses eps=1e-12 for all LayerNorms
+            "rms_norm_eps": 1e-12,
+        },
         False,
     ),
     # === Other Llama-compatible ===
