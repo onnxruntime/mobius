@@ -85,8 +85,9 @@ class LayerNorm1P(nn.Module):
         self.eps = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        # Effective scale = weight + 1 (matching NemotronLayerNorm1P)
-        one = op.Constant(value_float=1.0)
+        # Effective scale = weight + 1 (matching NemotronLayerNorm1P).
+        # CastLike ensures the constant matches weight dtype (fp16/bf16/fp32).
+        one = op.CastLike(op.Constant(value_float=1.0), self.weight)
         effective_weight = op.Add(self.weight, one)
         return op.LayerNormalization(
             hidden_states,

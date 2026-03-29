@@ -126,5 +126,6 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
         if not math.isclose(self.logit_scale, 1.0):
             # Scale logits by the model's configured logit_scale scalar
             # (HF default: 0.0625 = 1/16 for all Cohere models).
-            logits = op.Mul(logits, op.Constant(value_float=float(self.logit_scale)))
+            # CastLike ensures the constant matches logits dtype (fp16/bf16/fp32).
+            logits = op.Mul(logits, op.CastLike(op.Constant(value_float=float(self.logit_scale)), logits))
         return logits, present_key_values
