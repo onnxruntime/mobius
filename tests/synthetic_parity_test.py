@@ -81,7 +81,6 @@ _SKIP_REASONS: dict[str, str] = {
 # Only used when argmax_match=True and cosine similarity is very high (≥0.999),
 # confirming the model is functionally correct despite the FP difference.
 _ATOL_OVERRIDES: dict[str, float] = {
-_ATOL_OVERRIDES: dict[str, float] = {
     # MoE models: HF uses fused batched-expert matmul while we use per-expert
     # MLP. Different FP accumulation order causes small numeric differences.
     # All have argmax_match=True — models are functionally correct.
