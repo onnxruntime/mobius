@@ -783,8 +783,13 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "minimax",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
+        {
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        True,
     ),
     (
         "qwen3_omni_moe",

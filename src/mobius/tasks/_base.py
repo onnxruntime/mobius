@@ -241,7 +241,19 @@ def _make_hybrid_cache_inputs(
     for i in range(config.num_hidden_layers):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
 
-        if ltype == "linear_attention":
+        if ltype == "lightning_attention":
+            # Lightning Attention: single recurrent state only (no conv_state)
+            # State: (B, num_heads, head_dim, head_dim) — square matrix accumulator
+            rec_state = ir.Value(
+                name=f"{prefix}.{i}.recurrent_state",
+                shape=ir.Shape(
+                    [batch, config.num_attention_heads, config.head_dim, config.head_dim]
+                ),
+                type=ir.TensorType(dtype),
+            )
+            flat.append(rec_state)
+            pairs.append((rec_state,))  # 1-tuple: lightning has no conv_state
+        elif ltype == "linear_attention":
             conv_state = ir.Value(
                 name=f"{prefix}.{i}.conv_state",
                 shape=ir.Shape([batch, dims.conv_dim, dims.conv_kernel - 1]),
@@ -303,15 +315,16 @@ def _make_hybrid_cache_inputs(
 
 def _register_hybrid_cache_outputs(
     graph: ir.Graph,
-    present_key_values: list[tuple[ir.Value, ir.Value]],
+    present_key_values: list[tuple[ir.Value, ...]],
     layer_types: list[str],
     *,
-    past_key_values: list[tuple[ir.Value, ir.Value]] | None = None,
+    past_key_values: list[tuple[ir.Value, ...]] | None = None,
     prefix: str = "present",
 ) -> None:
     """Name and register hybrid cache outputs on the graph.
 
     Uses ``.key``/``.value`` for full attention layers,
+    ``.recurrent_state`` for lightning attention layers (1-tuple),
     ``.conv_state``/``.recurrent_state`` for linear attention layers,
     and ``.conv_state``/``.ssm_state`` for mamba/mamba2 layers.
 
@@ -319,41 +332,54 @@ def _register_hybrid_cache_outputs(
     from the corresponding past inputs.
     """
     total_seq_len = ir.SymbolicDim("total_sequence_len")
-    for i, (state_a, state_b) in enumerate(present_key_values):
+    for i, states in enumerate(present_key_values):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "linear_attention":
-            state_a.name = f"{prefix}.{i}.conv_state"
-            state_b.name = f"{prefix}.{i}.recurrent_state"
-        elif ltype in ("mamba", "mamba2"):
-            state_a.name = f"{prefix}.{i}.conv_state"
-            state_b.name = f"{prefix}.{i}.ssm_state"
-        else:
-            state_a.name = f"{prefix}.{i}.key"
-            state_b.name = f"{prefix}.{i}.value"
-        if past_key_values is not None:
-            past_a, past_b = past_key_values[i]
-            if ltype == "full_attention":
-                # KV cache: replace seq_len dim with total_seq_len
-                if past_a.shape is not None and len(past_a.shape) >= 3:
-                    state_a.shape = ir.Shape(
-                        [*past_a.shape[:-2], total_seq_len, past_a.shape[-1]]
-                    )
-                if past_b.shape is not None and len(past_b.shape) >= 3:
-                    state_b.shape = ir.Shape(
-                        [*past_b.shape[:-2], total_seq_len, past_b.shape[-1]]
-                    )
-            else:
-                # Recurrent/conv states have fixed shape
+        if ltype == "lightning_attention":
+            # Single recurrent state only (no conv_state for lightning)
+            (state_a,) = states
+            state_a.name = f"{prefix}.{i}.recurrent_state"
+            if past_key_values is not None:
+                (past_a,) = past_key_values[i]
                 if past_a.shape is not None:
                     state_a.shape = past_a.shape
-                if past_b.shape is not None:
-                    state_b.shape = past_b.shape
-            if past_a.type is not None:
-                state_a.type = past_a.type
-            if past_b.type is not None:
-                state_b.type = past_b.type
-        graph.outputs.append(state_a)
-        graph.outputs.append(state_b)
+                if past_a.type is not None:
+                    state_a.type = past_a.type
+            graph.outputs.append(state_a)
+        else:
+            state_a, state_b = states
+            if ltype == "linear_attention":
+                state_a.name = f"{prefix}.{i}.conv_state"
+                state_b.name = f"{prefix}.{i}.recurrent_state"
+            elif ltype in ("mamba", "mamba2"):
+                state_a.name = f"{prefix}.{i}.conv_state"
+                state_b.name = f"{prefix}.{i}.ssm_state"
+            else:
+                state_a.name = f"{prefix}.{i}.key"
+                state_b.name = f"{prefix}.{i}.value"
+            if past_key_values is not None:
+                past_a, past_b = past_key_values[i]
+                if ltype == "full_attention":
+                    # KV cache: replace seq_len dim with total_seq_len
+                    if past_a.shape is not None and len(past_a.shape) >= 3:
+                        state_a.shape = ir.Shape(
+                            [*past_a.shape[:-2], total_seq_len, past_a.shape[-1]]
+                        )
+                    if past_b.shape is not None and len(past_b.shape) >= 3:
+                        state_b.shape = ir.Shape(
+                            [*past_b.shape[:-2], total_seq_len, past_b.shape[-1]]
+                        )
+                else:
+                    # Recurrent/conv states have fixed shape
+                    if past_a.shape is not None:
+                        state_a.shape = past_a.shape
+                    if past_b.shape is not None:
+                        state_b.shape = past_b.shape
+                if past_a.type is not None:
+                    state_a.type = past_a.type
+                if past_b.type is not None:
+                    state_b.type = past_b.type
+            graph.outputs.append(state_a)
+            graph.outputs.append(state_b)
 
 
 def _register_linear_attention_functions(
@@ -362,11 +388,15 @@ def _register_linear_attention_functions(
 ) -> None:
     """Register CausalConvWithState and LinearAttention functions.
 
-    Only registers functions when the model has ``linear_attention`` layers.
+    Registers functions for DeltaNet (``linear_attention`` layers) and/or
+    Lightning Attention (``lightning_attention`` layers) as needed.
     Adds the ``pkg.mobius`` opset import to the graph.
     """
     layer_types = getattr(config, "layer_types", None) or []
-    if "linear_attention" not in layer_types:
+    has_deltanet = "linear_attention" in layer_types
+    has_lightning = "lightning_attention" in layer_types
+
+    if not has_deltanet and not has_lightning:
         return
 
     from mobius.functions import (
@@ -374,22 +404,33 @@ def _register_linear_attention_functions(
         linear_attention,
     )
 
-    dims = linear_attention_dims(config)
+    if has_deltanet:
+        dims = linear_attention_dims(config)
+        conv_func = causal_conv_nd_with_state(
+            kernel_size=dims.conv_kernel,
+            channels=dims.conv_dim,
+            ndim=1,
+            activation="silu",
+        )
+        attn_func = linear_attention(
+            q_num_heads=dims.num_k_heads,
+            kv_num_heads=dims.num_v_heads,
+            update_rule="gated_delta",
+            scale=1.0 / (dims.head_k_dim**0.5),
+            stash_type=config.dtype,
+        )
+        model.functions[conv_func.identifier()] = conv_func
+        model.functions[attn_func.identifier()] = attn_func
 
-    conv_func = causal_conv_nd_with_state(
-        kernel_size=dims.conv_kernel,
-        channels=dims.conv_dim,
-        ndim=1,
-        activation="silu",
-    )
-    attn_func = linear_attention(
-        q_num_heads=dims.num_k_heads,
-        kv_num_heads=dims.num_v_heads,
-        update_rule="gated_delta",
-        scale=1.0 / (dims.head_k_dim**0.5),
-        stash_type=config.dtype,
-    )
+    if has_lightning:
+        head_dim = config.head_dim
+        attn_func_gated = linear_attention(
+            q_num_heads=config.num_attention_heads,
+            kv_num_heads=config.num_attention_heads,
+            update_rule="gated",
+            scale=1.0 / (head_dim**0.5),
+            stash_type=config.dtype,
+        )
+        model.functions[attn_func_gated.identifier()] = attn_func_gated
 
-    model.functions[conv_func.identifier()] = conv_func
-    model.functions[attn_func.identifier()] = attn_func
     model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1

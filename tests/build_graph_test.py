@@ -185,7 +185,12 @@ class TestBuildGraph:
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-            if ltype in ("linear_attention",):
+            if ltype == "lightning_attention":
+                # Lightning Attention: single recurrent state only (no conv_state)
+                assert f"present.{i}.recurrent_state" in output_names, (
+                    f"Missing present.{i}.recurrent_state"
+                )
+            elif ltype in ("linear_attention",):
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"
                 )

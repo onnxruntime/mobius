@@ -47,6 +47,7 @@ __all__ = [
     "IPAdapterModel",
     "JambaCausalLMModel",
     "LLaVAModel",
+    "MiniMaxCausalLMModel",
     "MoECausalLMModel",
     "Qwen2MoECausalLMModel",
     "NanoChatCausalLMModel",
@@ -144,6 +145,7 @@ from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     GPTOSSCausalLMModel,
     MoECausalLMModel,

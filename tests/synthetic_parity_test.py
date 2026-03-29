@@ -86,9 +86,23 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Argmax correct, cosine=0.999 — model is functionally correct.
     "granitemoe": 0.025,
     "granitemoeshared": 0.025,
+    "granite": 0.025,
+    # Apertus uses xIELU activation (Softplus FP) → small accumulation differences.
+    # Argmax correct, cosine=0.9997 — model is functionally correct.
+    "apertus": 0.02,
+    # Bloom: LayerNorm accumulation differs after eps alignment → ~0.019 max diff.
+    # Argmax correct, cosine=0.9998 — model is functionally correct.
+    "bloom": 0.02,
     # Jamba MoE+Mamba: FP accumulation differences from sequential vs batched expert dispatch.
     # Argmax correct, cosine=0.999 — model is functionally correct.
     "jamba": 0.025,
+    # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
+    # FP accumulation differs from PyTorch → ~0.043 max diff.
+    # Argmax correct, cosine=0.996 — model is functionally correct.
+    "modernbert-decoder": 0.05,
+    # MiniMax: hybrid MoE + Lightning Attention; batched-expert FP accumulation
+    # differences → ~0.046 max diff. Argmax correct, cosine=0.996.
+    "minimax": 0.05,
     # NanoChat: double-norm (pre + post layers) + logit softcap accumulate tiny FP differences.
     # Argmax correct, cosine=0.99999 — model is functionally correct.
     "nanochat": 0.002,
@@ -114,7 +128,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "glm4_moe": "GLM4-MoE uses sigmoid router + group routing + shared expert — architecture not fully implemented",
     "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "minimax": "MiniMax uses gated linear attention — different attention architecture",
     "qwen3_omni_moe": "MoE routing differences",
     "qwen3_vl_moe": "MoE routing differences",
     # HF architecture differences (extra layers/features not in our ONNX)
@@ -316,6 +329,14 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             # All mamba — use large offset/period
             hf_kwargs["attn_layer_offset"] = len(layer_types)
             hf_kwargs["attn_layer_period"] = len(layer_types)
+
+    # MiniMax uses "linear_attention" in its HF config for lightning attention layers.
+    # Our internal key is "lightning_attention" — translate back for HF.
+    if hf_model_type in ("minimax",) and "layer_types" in hf_kwargs:
+        hf_kwargs["layer_types"] = [
+            "linear_attention" if lt == "lightning_attention" else lt
+            for lt in hf_kwargs["layer_types"]
+        ]
 
     # Some models use different field names for num_local_experts and num_experts_per_tok.
     # Maps hf_model_type -> {our_field: hf_field} for field name translation.

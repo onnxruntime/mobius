@@ -408,7 +408,6 @@ def _create_default_registry() -> ModelRegistry:
         "granitemoeshared",
         "hunyuan_v1_moe",
         "jetmoe",
-        "minimax",
         "mixtral",
         "olmoe",
         "qwen3_moe",
@@ -417,6 +416,10 @@ def _create_default_registry() -> ModelRegistry:
     ):
         reg.register(name, MoECausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
+
+    from mobius.models.minimax import MiniMaxCausalLMModel
+
+    reg.register("minimax", MiniMaxCausalLMModel)
     reg.register("gptoss", GPTOSSCausalLMModel)
     reg.register("gpt_oss", GPTOSSCausalLMModel)
     reg.register("phimoe", Phi3MoECausalLMModel)
