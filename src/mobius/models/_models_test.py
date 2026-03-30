@@ -256,7 +256,13 @@ _MOE_MODELS = ["phimoe", "gptoss", "granitemoe", "mixtral", "olmoe", "qwen2_moe"
 @pytest.mark.parametrize("arch", _MOE_MODELS)
 def test_build_moe_model_architecture(arch):
     """Test that MoE architectures build a valid ONNX model."""
-    config = make_config(num_local_experts=4, num_experts_per_tok=2)
+    config = make_config(
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        # qwen2_moe requires shared_expert_intermediate_size for its
+        # shared expert MLP. Other MoE models ignore it (defaults to None).
+        shared_expert_intermediate_size=64,
+    )
     model_class = registry.get(arch)
     module = model_class(config)
     model = build_from_module(module, config)["model"]

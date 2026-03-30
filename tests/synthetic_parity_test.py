@@ -183,8 +183,6 @@ _ATOL_OVERRIDES: dict[str, float] = {
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
-    # HF architecture differences (extra layers/features not in our ONNX)
-    "diffllama": "HF DiffLlama has extra lambda parameters",
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
