@@ -95,7 +95,9 @@ class GatedRMSNorm(nn.Module):
                     op.Constant(value_ints=[0, n_groups, self.group_size]),
                 )
                 variance = op.ReduceMean(
-                    op.Mul(grouped, grouped), axes=[-1], keepdims=True,
+                    op.Mul(grouped, grouped),
+                    axes=[-1],
+                    keepdims=True,
                 )
                 rnorm = op.Reciprocal(
                     op.Sqrt(op.Add(variance, self.variance_epsilon)),
@@ -106,7 +108,8 @@ class GatedRMSNorm(nn.Module):
                     op.Constant(value_ints=[0, self.hidden_size]),
                 )
                 normed = op.Mul(
-                    normed, op.Cast(self.weight, to=ir.DataType.FLOAT),
+                    normed,
+                    op.Cast(self.weight, to=ir.DataType.FLOAT),
                 )
             else:
                 # Cast gated back to native dtype; RMSNormalization's

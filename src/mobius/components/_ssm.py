@@ -252,7 +252,12 @@ class Mamba2Scan(nn.Module):
         # dt = softplus(dt_input + dt_bias) in fp32: (batch, num_heads)
         # Upcast to fp32 for softplus/exp to match HuggingFace which
         # computes the SSM recurrence in float32.
-        dt = op.Softplus(op.Add(op.Cast(dt_input, to=ir.DataType.FLOAT), op.Cast(self.dt_bias, to=ir.DataType.FLOAT)))
+        dt = op.Softplus(
+            op.Add(
+                op.Cast(dt_input, to=ir.DataType.FLOAT),
+                op.Cast(self.dt_bias, to=ir.DataType.FLOAT),
+            )
+        )
 
         # A = -exp(A_log) in fp32: (num_heads,)
         a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
