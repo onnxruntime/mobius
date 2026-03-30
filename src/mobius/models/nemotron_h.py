@@ -36,9 +36,9 @@ from onnxscript._internal import builder
 from mobius._configs import NemotronHConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
+    FCMLP,
     Attention,
     Embedding,
-    FCMLP,
     Linear,
     Mamba2Block,
     RMSNorm,

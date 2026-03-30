@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
