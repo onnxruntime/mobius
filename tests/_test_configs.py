@@ -62,12 +62,12 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("exaone4", {}, False),
     (
         "glm",
-        {"attn_qkv_bias": True, "attn_o_bias": True},
-        True,
+        {"attn_qkv_bias": True},
+        False,
     ),
     (
         "glm4",
-        {"attn_qkv_bias": True, "attn_o_bias": True},
+        {"attn_qkv_bias": True},
         False,
     ),
     ("helium", {}, False),

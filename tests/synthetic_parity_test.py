@@ -75,10 +75,6 @@ _SKIP_REASONS: dict[str, str] = {
     # without Mamba SSM. The default HF config has no attention layers, causing
     # Zamba2HybridDynamicCache to crash on init (transformer_layers[0] out of range).
     "zamba2": "Zamba2 is Mamba2+Attention hybrid — ONNX CausalLMModel lacks Mamba SSM layers",
-    # GLM models use 4 LayerNorms per layer + fused gate_up_proj; CausalLMModel
-    # implements 2 LayerNorms + separate gate/up projections — architecturally incompatible.
-    "glm": "GLM: 4 layer norms/layer + fused gate_up_proj incompatible with CausalLMModel",
-    "glm4": "GLM4: 4 layer norms/layer + fused gate_up_proj incompatible with CausalLMModel",
     # Non-CausalLM models: their config class is not registered with AutoModelForCausalLM
     "csm": "CsmConfig not registered with AutoModelForCausalLM (speech model)",
     "evolla": "EvollaConfig not registered with AutoModelForCausalLM (multimodal VLM)",
@@ -131,6 +127,12 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # GLM4-MoE: sigmoid-gated routing FP accumulation differs from HF batched dispatch.
     # Argmax correct, cosine≥0.999 — functionally correct.
     "glm4_moe": 0.005,
+    # GLM: partial_rotary_factor=0.5 RoPE FP accumulation → ~0.003 max diff.
+    # Argmax correct, cosine≥0.999 — functionally correct.
+    "glm": 0.005,
+    # GLM4: pre+post norm FP accumulation → ~0.007 max diff.
+    # Argmax correct, cosine≥0.999 — functionally correct.
+    "glm4": 0.01,
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
     "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
@@ -269,6 +271,10 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "seed_oss": {"head_dim": TINY_HEAD_DIM},
     # HunYuan V1 dense defaults head_dim=None in HF (causes pow(None,float) error)
     "hunyuan_v1_dense": {"head_dim": TINY_HEAD_DIM},
+    # GLM/GLM4: head_dim=128 (explicit, not hidden/num_heads), pad_token_id > vocab_size
+    # in default config causes embedding assertion; override both.
+    "glm": {"head_dim": TINY_HEAD_DIM, "pad_token_id": 0},
+    "glm4": {"head_dim": TINY_HEAD_DIM, "pad_token_id": 0},
     "opt": {
         "word_embed_proj_dim": TINY_HIDDEN,
         # OPT uses ffn_dim (not intermediate_size) for the MLP width

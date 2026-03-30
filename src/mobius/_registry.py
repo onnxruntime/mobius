@@ -42,7 +42,9 @@ from mobius.models import (
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
     GemmaCausalLMModel,
+    Glm4CausalLMModel,
     Glm4MoECausalLMModel,
+    GlmCausalLMModel,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     HunYuanMoEV1CausalLMModel,
@@ -340,8 +342,6 @@ def _create_default_registry() -> ModelRegistry:
         "dots1",
         "evolla",
         "exaone",
-        "glm",
-        "glm4",
         "helium",
         "llama",
         "llama4_text",
@@ -424,6 +424,8 @@ def _create_default_registry() -> ModelRegistry:
     ):
         reg.register(name, MoECausalLMModel)
     reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
+    reg.register("glm", GlmCausalLMModel)
+    reg.register("glm4", Glm4CausalLMModel)
     reg.register("glm4_moe", Glm4MoECausalLMModel)
 
     reg.register("jetmoe", JetMoeCausalLMModel)
