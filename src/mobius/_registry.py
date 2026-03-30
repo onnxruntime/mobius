@@ -46,6 +46,7 @@ from mobius.models import (
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     HunYuanMoEV1CausalLMModel,
+    HunYuanV1DenseCausalLMModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
     Llama4CausalLMModel,
@@ -342,7 +343,6 @@ def _create_default_registry() -> ModelRegistry:
         "glm",
         "glm4",
         "helium",
-        "hunyuan_v1_dense",
         "llama",
         "llama4_text",
         "minicpm",
@@ -427,6 +427,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("glm4_moe", Glm4MoECausalLMModel)
 
     reg.register("jetmoe", JetMoeCausalLMModel)
+    reg.register("hunyuan_v1_dense", HunYuanV1DenseCausalLMModel)
     reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
 

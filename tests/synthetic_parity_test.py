@@ -90,13 +90,6 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
-    # HunyuanV1Dense always uses QK-norm (query_layernorm / key_layernorm weights) but
-    # CausalLMModel.preprocess_weights does not rename them to the q_norm/k_norm keys
-    # expected by our ONNX Attention component with attn_qk_norm=True.
-    "hunyuan_v1_dense": (
-        "HunyuanV1Dense uses query_layernorm/key_layernorm; "
-        "CausalLMModel.preprocess_weights does not rename them to q_norm/k_norm"
-    ),
 }
 
 # Per-model atol overrides for L3 synthetic parity.
