@@ -19,8 +19,6 @@ Weight name alignment (HF → ONNX):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 import onnx_ir as ir
 from onnxscript import nn
@@ -35,9 +33,6 @@ from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
     get_rotary_pos_emb,
 )
-
-if TYPE_CHECKING:
-    pass
 
 
 class PixtralRoPE2D(nn.Module):

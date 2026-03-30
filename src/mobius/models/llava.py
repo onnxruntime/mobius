@@ -196,11 +196,11 @@ class LLaVAModel(nn.Module):
         self.decoder = _LLaVADecoderModel(config)
         # Dispatch: use Pixtral vision encoder for pixtral-based models,
         # CLIP/SigLIP for everything else.
-        is_pixtral = (
+        self._is_pixtral = (
             config.vision
             and getattr(config.vision, "model_type", None) == "pixtral"
         )
-        if is_pixtral:
+        if self._is_pixtral:
             self.vision_encoder = _PixtralVisionEncoderModel(config)
         else:
             self.vision_encoder = _LLaVAVisionEncoderModel(config)
@@ -218,12 +218,7 @@ class LLaVAModel(nn.Module):
         # Mistral-3 / Pixtral models prefix decoder weights with
         # ``language_model.`` — strip it so the decoder/embedding
         # sub-models can find their weights.
-        is_pixtral = (
-            self.config.vision
-            and getattr(self.config.vision, "model_type", None)
-            == "pixtral"
-        )
-        if is_pixtral:
+        if self._is_pixtral:
             return _preprocess_pixtral_weights(
                 state_dict, self.config.tie_word_embeddings
             )

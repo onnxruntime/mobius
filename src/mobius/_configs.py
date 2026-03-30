@@ -369,9 +369,10 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
             out_hidden_size=getattr(vc, "out_hidden_size", None),
-            in_channels=(
-                getattr(vc, "in_channels", None)
-                or getattr(vc, "num_channels", 3)
+            in_channels=_first_not_none(
+                getattr(vc, "in_channels", None),
+                getattr(vc, "num_channels", None),
+                default=3,
             ),
             spatial_merge_size=getattr(vc, "spatial_merge_size", 2),
             temporal_patch_size=getattr(vc, "temporal_patch_size", 2),
