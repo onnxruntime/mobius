@@ -168,7 +168,6 @@ _ATOL_OVERRIDES: dict[str, float] = {
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
-    "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     # HF architecture differences (extra layers/features not in our ONNX)
     # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
     # Qwen3-Next: all variants xfail — DeltaNet linear attention output differs from HF.
@@ -212,6 +211,12 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},
     # Qwen3-Next defaults head_dim=256 in HF; override to match tiny config
     "qwen3_next": {"head_dim": TINY_HEAD_DIM},
+    # JetMoE: kv_channels sets head_dim (not derived from hidden/num_heads).
+    # num_kv_heads maps to num_key_value_heads (HF uses a non-standard field name).
+    "jetmoe": {
+        "kv_channels": TINY_HEAD_DIM,
+        "num_kv_heads": TINY_KV_HEADS,
+    },
     "opt": {
         "word_embed_proj_dim": TINY_HIDDEN,
         # OPT uses ffn_dim (not intermediate_size) for the MLP width

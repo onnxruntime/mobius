@@ -22,6 +22,7 @@ from mobius._configs import (
     Gemma3nConfig,
     GraniteMoeHybridConfig,
     JambaConfig,
+    JetMoeConfig,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -578,7 +579,13 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "jetmoe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        {
+            "_config_cls": JetMoeConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HEAD_DIM,  # kv_channels = head_dim; not hidden/num_heads
+            # num_attention_heads = num_experts_per_tok * num_kv_heads = 2 * 2 = 4 (TINY_HEADS)
+        },
         False,
     ),
     # === Additional CausalLM aliases ===

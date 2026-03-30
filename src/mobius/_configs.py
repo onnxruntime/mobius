@@ -1774,6 +1774,33 @@ class GraniteMoeHybridConfig(BambaConfig):
 
 
 @dataclasses.dataclass
+class JetMoeConfig(CausalLMConfig):
+    """Configuration for JetMoE: Mixture-of-Attention + MoE FFN model.
+
+    JetMoE uses ``kv_channels`` as the per-head key/value dimension rather
+    than deriving it from ``hidden_size // num_attention_heads``.  The
+    standard formula gives the wrong answer because ``num_attention_heads``
+    is the *total* Q head count (``top_k * num_kv_heads``), not the KV head
+    count.  We therefore read ``kv_channels`` directly from the HF config
+    and store it as ``head_dim``.
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> JetMoeConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        # Override head_dim to use kv_channels directly, not hidden/num_heads.
+        kv_channels = getattr(config, "kv_channels", base.head_dim)
+        # Also map num_kv_heads → num_key_value_heads if present (HF JetMoE
+        # uses num_kv_heads instead of the standard num_key_value_heads).
+        num_kv = getattr(config, "num_kv_heads", None)
+        base_fields = _shallow_fields(base)
+        base_fields["head_dim"] = kv_channels
+        if num_kv is not None:
+            base_fields["num_key_value_heads"] = num_kv
+        return cls(**base_fields)
+
+
+@dataclasses.dataclass
 class WhisperConfig(BaseModelConfig):
     """Configuration for Whisper encoder-decoder models."""
 

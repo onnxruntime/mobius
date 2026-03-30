@@ -407,7 +407,6 @@ def _create_default_registry() -> ModelRegistry:
         "flex_olmo",
         "granitemoe",
         "granitemoeshared",
-        "jetmoe",
         "mixtral",
         "olmoe",
         "qwen3_moe",
@@ -417,6 +416,10 @@ def _create_default_registry() -> ModelRegistry:
         reg.register(name, MoECausalLMModel)
     reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
     reg.register("glm4_moe", Glm4MoECausalLMModel)
+
+    from mobius.models.jetmoe import JetMoeCausalLMModel
+
+    reg.register("jetmoe", JetMoeCausalLMModel)
     reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
 
