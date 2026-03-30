@@ -273,7 +273,11 @@ def _extract_rope_config(config) -> RoPEConfig:
             _nested_rope_theta(rope_scaling, "full_attention"),
             default=10_000.0,
         ),
-        rope_scaling=(_normalize_rope_scaling(rope_scaling) or None),
+        rope_scaling=(
+            _normalize_rope_scaling(rope_scaling)
+            or _normalize_rope_scaling(rope_parameters)
+            or None
+        ),
         partial_rotary_factor=_first_not_none(
             getattr(config, "partial_rotary_factor", None),
             rope_scaling.get("partial_rotary_factor", None),
@@ -284,12 +288,12 @@ def _extract_rope_config(config) -> RoPEConfig:
             getattr(config, "rope_local_base_freq", None),
             _nested_rope_theta(rope_scaling, "sliding_attention"),
         ),
-        original_max_position_embeddings=(
-            getattr(
-                config,
-                "original_max_position_embeddings",
-                rope_scaling.get("original_max_position_embeddings", None),
-            )
+        original_max_position_embeddings=_first_not_none(
+            getattr(config, "original_max_position_embeddings", None),
+            rope_scaling.get("original_max_position_embeddings", None),
+            rope_parameters.get(
+                "original_max_position_embeddings", None
+            ),
         ),
     )
 

@@ -542,7 +542,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("minicpm", {}, True),
     ("minicpm3", {}, True),
-    ("mistral3", {}, False),
     ("openelm", {}, True),
     (
         "persimmon",

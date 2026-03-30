@@ -1114,6 +1114,7 @@ class TestBuildGraphVisionLanguage:
             "idefics3",
             "instructblip",
             "molmo",
+            "mistral3",
             "paligemma",
             "pixtral",
         ):
@@ -3195,6 +3196,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "llava_next",
     "llava_next_video",
     "llava_onevision",
+    "mistral3",
     "molmo",
     "ovis2",
     "paligemma",
