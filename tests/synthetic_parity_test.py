@@ -159,6 +159,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # PyTorch and ONNX. With random weights, the routing diverges slightly.
     # Argmax correct, cosine=0.985 — model is functionally correct.
     "ernie4_5_moe": 0.10,
+    # Llama4: feed_forward naming + ONNX sequential vs PyTorch fused ops → ~0.004 max diff.
+    # Argmax correct, cosine=0.9999 — model is functionally correct.
+    "llama4_text": 0.005,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -170,10 +173,8 @@ _XFAIL_REASONS: dict[str, str] = {
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     # HF architecture differences (extra layers/features not in our ONNX)
     # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
-    # Qwen3-Next: primary hybrid variant (qwen3_next_0) passes; edge-case variants
-    # with all-full-attention or all-linear-attention hit HF cache bugs.
-    "qwen3_next_1": "HF Qwen3NextDynamicCache bug with all-full-attention config",
-    "qwen3_next_2": "HF Qwen3NextDynamicCache bug with all-linear-attention config",
+    # Qwen3-Next: all variants xfail — DeltaNet linear attention output differs from HF.
+    # (Both variants use mixed linear+full configs to satisfy HF cache requirements.)
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
@@ -299,8 +300,10 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     # Llama4Text requires head_dim to match our tiny num_heads × head_dim = hidden_size.
     # Disable MoE (we use dense CausalLMModel) and Llama4-specific attention features
     # (QK-norm and temperature tuning) not implemented in CausalLMModel.
+    # intermediate_size_mlp is separate from intermediate_size in Llama4 (default 16384).
     "llama4_text": {
         "head_dim": TINY_HEAD_DIM,
+        "intermediate_size_mlp": TINY_INTERMEDIATE,
         "moe_layers": [],
         "use_qk_norm": False,
         "attn_temperature_tuning": False,

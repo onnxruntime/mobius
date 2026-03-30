@@ -819,27 +819,35 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # --- Variant coverage: architecture code-path variants ---
-    # qwen3_next: all full-attention layers (no linear_attention/DeltaNet)
+    # qwen3_next: mostly full-attention (1 linear + 1 full) — exercises full-attention path
+    # while satisfying HF Qwen3NextDynamicCache's requirement for at least one linear layer.
     (
         "qwen3_next",
         {
             "hidden_act": "silu",
-            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "layer_types": ["full_attention", "linear_attention"],
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "moe_intermediate_size": 32,
             "shared_expert_intermediate_size": 32,
             "norm_topk_prob": True,
             "attn_qk_norm": True,
+            "partial_rotary_factor": 0.25,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
         },
         False,
     ),
-    # qwen3_next: all linear-attention layers (DeltaNet only, no full attn)
+    # qwen3_next: mostly linear-attention (1 linear + 1 full) — exercises DeltaNet path
+    # while satisfying HF Qwen3NextDynamicCache's requirement for at least one full-attn layer.
     (
         "qwen3_next",
         {
             "hidden_act": "silu",
-            "layer_types": ["linear_attention"] * TINY_LAYERS,
+            "layer_types": ["linear_attention", "full_attention"],
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "moe_intermediate_size": 32,
