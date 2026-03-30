@@ -143,6 +143,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
+    # DeepSeek-V3: sigmoid-gated MoE with fused expert weights. Sequential vs batched
+    # expert dispatch produces FP accumulation differences → ~0.034 max diff.
+    # Near-tie argmax, cosine=0.996 — functionally correct.
+    "deepseek_v3": 0.04,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -165,9 +169,9 @@ _XFAIL_REASONS: dict[str, str] = {
     # with all-full-attention or all-linear-attention hit HF cache bugs.
     "qwen3_next_1": "HF Qwen3NextDynamicCache bug with all-full-attention config",
     "qwen3_next_2": "HF Qwen3NextDynamicCache bug with all-linear-attention config",
-    # DeepSeek MLA
-    "deepseek_v2": "MLA implementation differs from HF",
-    "deepseek_v3": "MLA + MoE implementation differs",
+    # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
+    # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
+    "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
     "longcat_flash": "Flash attention implementation differs",
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
@@ -424,6 +428,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "num_local_experts": "moe_num_experts",
             "num_experts_per_tok": "moe_k",
         },
+        # DeepSeek V2/V3 use n_routed_experts (not num_local_experts)
+        "deepseek_v2": {"num_local_experts": "n_routed_experts"},
+        "deepseek_v3": {"num_local_experts": "n_routed_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():
