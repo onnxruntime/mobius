@@ -105,7 +105,7 @@ class SigmoidTopKGate(nn.Module):
         if self.norm_topk_prob:
             # Renormalize selected weights to sum to 1 (prevents vanishing gradients)
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = op.CastLike(op.Constant(value_float=1e-20), routing_weights)
+            eps = op.CastLike(op.Constant(value_float=1e-9), routing_weights)
             routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             scale = op.CastLike(
