@@ -1304,6 +1304,38 @@ class NanoChatConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class LongcatFlashConfig(CausalLMConfig):
+    """Configuration for LongCat Flash dual-sublayer models.
+
+    Adds ``zero_expert_num`` for identity/pass-through MoE experts.
+    Unlike standard MoE, LongCat uses a fixed shortcut MoE block per
+    physical layer alongside two dense sub-attentions and two dense MLPs.
+    """
+
+    zero_expert_num: int = 0
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> LongcatFlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        # LongCat uses ffn_hidden_size for dense MLP (not the generic intermediate_size)
+        ffn_hidden_size = getattr(config, "ffn_hidden_size", None)
+        if ffn_hidden_size is not None:
+            base = dataclasses.replace(base, intermediate_size=ffn_hidden_size)
+        # LongCat uses moe_topk (not num_experts_per_tok)
+        moe_topk = getattr(config, "moe_topk", None)
+        if moe_topk is not None:
+            base = dataclasses.replace(base, num_experts_per_tok=moe_topk)
+        # LongCat uses expert_ffn_hidden_size (not moe_intermediate_size)
+        expert_ffn_hidden_size = getattr(config, "expert_ffn_hidden_size", None)
+        if expert_ffn_hidden_size is not None:
+            base = dataclasses.replace(base, moe_intermediate_size=expert_ffn_hidden_size)
+        return cls(
+            **_shallow_fields(base),
+            zero_expert_num=getattr(config, "zero_expert_num", 0),
+        )
+
+
+@dataclasses.dataclass
 class Gemma3nConfig(CausalLMConfig):
     """Configuration for Gemma3n models with AltUp and Laurel compression.
 
@@ -1716,6 +1748,28 @@ class BambaConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class GraniteMoeHybridConfig(BambaConfig):
+    """Configuration for GraniteMoeHybrid: Mamba2+Attention hybrid with MoE on all layers.
+
+    Extends BambaConfig with ``shared_intermediate_size`` for the dense shared MLP
+    that runs alongside the routed MoE block on every layer.
+    """
+
+    shared_intermediate_size: int = 1024
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GraniteMoeHybridConfig:
+        # Reuse BambaConfig.from_transformers for mamba fields + layer_types conversion
+        # (converts HF "mamba"→"mamba2" and "attention"→"full_attention")
+        bamba = BambaConfig.from_transformers(config, parent_config)
+        bamba_fields = _shallow_fields(bamba)
+        return cls(
+            **bamba_fields,
+            shared_intermediate_size=getattr(config, "shared_intermediate_size", 1024),
         )
 
 

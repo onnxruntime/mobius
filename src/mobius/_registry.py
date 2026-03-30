@@ -335,7 +335,7 @@ def _create_default_registry() -> ModelRegistry:
         "helium",
         "hunyuan_v1_dense",
         "llama",
-        "longcat_flash",
+        "llama4_text",
         "minicpm",
         "minicpm3",
         "ministral",
@@ -406,7 +406,6 @@ def _create_default_registry() -> ModelRegistry:
         "dbrx",
         "flex_olmo",
         "granitemoe",
-        "granitemoehybrid",
         "granitemoeshared",
         "jetmoe",
         "mixtral",
@@ -420,6 +419,15 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("glm4_moe", Glm4MoECausalLMModel)
     reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
+
+    from mobius.models.longcat_flash import LongcatFlashCausalLMModel
+
+    reg.register("longcat_flash", LongcatFlashCausalLMModel)
+
+    # --- GraniteMoeHybrid (Mamba2+Attention hybrid with MoE on all layers) ---
+    from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
+
+    reg.register("granitemoehybrid", GraniteMoeHybridCausalLMModel)
 
     from mobius.models.minimax import MiniMaxCausalLMModel
 

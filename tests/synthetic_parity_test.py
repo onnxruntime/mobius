@@ -143,8 +143,8 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3n: AltUp magnitude normalization (target_mag/new_mag ratio) amplifies
     # FP differences between ORT and PyTorch, especially with random weight init.
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
-    "gemma3n_text": 0.1,   # ~0.094 max diff worst-case (AltUp magnitude ratio)
-    "gemma3n": 0.1,        # same architecture
+    "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
+    "gemma3n": 0.1,  # same architecture
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
@@ -159,6 +159,8 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Llama4: feed_forward naming + ONNX sequential vs PyTorch fused ops → ~0.004 max diff.
     # Argmax correct, cosine=0.9999 — model is functionally correct.
     "llama4_text": 0.005,
+    # LongCat Flash: per-expert MoE dispatch accumulates FP differences.
+    "longcat_flash": 0.05,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -166,7 +168,6 @@ _ATOL_OVERRIDES: dict[str, float] = {
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
-    "granitemoehybrid": "Mamba layers not implemented — ONNX model is missing mamba SSM weights",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
     # HF architecture differences (extra layers/features not in our ONNX)
     # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
@@ -176,7 +177,7 @@ _XFAIL_REASONS: dict[str, str] = {
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
-    "longcat_flash": "Flash attention implementation differs",
+    "zamba2": "Zamba2 HF modeling bug (list index out of range)",
     # Llama4: Llama4CausalLMModel is currently a stub (CausalLMModel base).
     # HF llama4_text uses chunked/interleaved attention (alternating full/local windows)
     # which differs from standard causal attention even with moe_layers=[] and
@@ -310,6 +311,16 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "use_qk_norm": False,
         "attn_temperature_tuning": False,
     },
+    # LongCat Flash uses ffn_hidden_size for dense MLP and num_layers (physical) instead of
+    # num_hidden_layers. HF num_hidden_layers = 2 * num_layers, so pass num_layers=TINY_LAYERS.
+    # head_dim must match qk_rope_head_dim=8 (HF defaults head_dim=64 for RoPE computation).
+    # rope_parameters must match our rope_theta=10000.0 (HF default is 10000000.0).
+    "longcat_flash": {
+        "num_layers": TINY_LAYERS,
+        "ffn_hidden_size": TINY_INTERMEDIATE,
+        "head_dim": 8,  # qk_rope_head_dim from our test config
+        "rope_parameters": {"rope_theta": 10_000.0, "rope_type": "default"},
+    },
 }
 
 
@@ -436,6 +447,16 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in hf_kwargs["layer_types"]
         ]
 
+    # GraniteMoeHybrid uses layers_block_type (HF field) with "mamba"/"attention" values.
+    # Convert our layer_types (which may use "mamba2"/"full_attention" internal names or
+    # the HF-format values from _HF_EXTRA_CONFIG) to layers_block_type for HF.
+    if hf_model_type in ("granitemoehybrid",) and "layer_types" in hf_kwargs:
+        layer_types = hf_kwargs.pop("layer_types")
+        hf_kwargs["layers_block_type"] = [
+            "attention" if lt in ("full_attention", "attention") else "mamba"
+            for lt in layer_types
+        ]
+
     # Some models use different field names for num_local_experts and num_experts_per_tok.
     # Maps hf_model_type -> {our_field: hf_field} for field name translation.
     expert_field_aliases: dict[str, dict[str, str]] = {
@@ -456,6 +477,12 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         # DeepSeek V2/V3 use n_routed_experts (not num_local_experts)
         "deepseek_v2": {"num_local_experts": "n_routed_experts"},
         "deepseek_v3": {"num_local_experts": "n_routed_experts"},
+        # LongCat Flash uses n_routed_experts, moe_topk, and expert_ffn_hidden_size
+        "longcat_flash": {
+            "num_local_experts": "n_routed_experts",
+            "num_experts_per_tok": "moe_topk",
+            "moe_intermediate_size": "expert_ffn_hidden_size",
+        },
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():

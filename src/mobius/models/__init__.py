@@ -44,6 +44,7 @@ __all__ = [
     "GemmaCausalLMModel",
     "Glm4MoECausalLMModel",
     "GraniteCausalLMModel",
+    "GraniteMoeHybridCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunyuanDiT2DModel",
     "IPAdapterModel",
@@ -53,6 +54,7 @@ __all__ = [
     "Llama4CausalLMModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
@@ -145,12 +147,14 @@ from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.granite import GraniteCausalLMModel
+from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
+from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
