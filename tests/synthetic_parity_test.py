@@ -73,6 +73,15 @@ _SKIP_REASONS: dict[str, str] = {
     "yi": "HF AutoConfig does not recognize yi",
     # Mamba2 standalone model: HF creates different architecture
     "mamba2": "HF Mamba2 standalone is not a causal LM model",
+    # VLM-wrapper models: their text-only config class is not registered with
+    # AutoModelForCausalLM so we cannot create a reference HF model for comparison.
+    "glm4v_moe_text": "Glm4vMoeTextConfig not registered with AutoModelForCausalLM",
+    "qwen3_omni_moe": "Qwen3OmniMoeConfig not registered with AutoModelForCausalLM",
+    "qwen3_vl_moe": "Qwen3VLMoeTextConfig not registered with AutoModelForCausalLM",
+    # Non-standard config format: DbrxConfig uses d_model/n_heads/n_layers/attn_config
+    # (nested sub-configs) rather than standard hidden_size/num_attention_heads keys.
+    # Cannot create a correctly-sized tiny reference model with our generic test infra.
+    "dbrx": "DbrxConfig uses non-standard nested sub-config parameters",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -142,14 +151,10 @@ _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
     "qwen3_5_moe": "MoE routing differences",
-    "granitemoehybrid": "MoE routing + linear attention differences",
+    "granitemoehybrid": "MoE routing + Mamba hybrid differences",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
-    "dbrx": "MoE routing differences",
-    "ernie4_5_moe": "Ernie4.5 zero-initializes gate.weight; PyTorch/ONNX TopK break ties differently (PyTorch: higher indices, ONNX: lower), routing to different experts in the synthetic test. Real trained models are unaffected.",
-    "glm4v_moe_text": "MoE routing differences",
     "hunyuan_v1_moe": "MoE routing differences",
-    "qwen3_omni_moe": "MoE routing differences",
-    "qwen3_vl_moe": "MoE routing differences",
+    "ernie4_5_moe": "Ernie4.5 zero-initializes gate.weight; PyTorch/ONNX TopK break ties differently (PyTorch: higher indices, ONNX: lower), routing to different experts in the synthetic test. Real trained models are unaffected.",
     # HF architecture differences (extra layers/features not in our ONNX)
     "llama4_text": "HF Llama4 MoE differs from our implementation",
     # Softcapping/scaling differences
@@ -157,8 +162,10 @@ _XFAIL_REASONS: dict[str, str] = {
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
     "imagegpt": "GPT2 family layernorm differences",
     # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
-    # Qwen3_next: linear attention (DeltaNet)
-    "qwen3_next": "DeltaNet linear attention differs from HF",
+    # Qwen3-Next: primary hybrid variant (qwen3_next_0) passes; edge-case variants
+    # with all-full-attention or all-linear-attention hit HF cache bugs.
+    "qwen3_next_1": "HF Qwen3NextDynamicCache bug with all-full-attention config",
+    "qwen3_next_2": "HF Qwen3NextDynamicCache bug with all-linear-attention config",
     # DeepSeek MLA
     "deepseek_v2": "MLA implementation differs from HF",
     "deepseek_v3": "MLA + MoE implementation differs",
@@ -197,6 +204,8 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},
+    # Qwen3-Next defaults head_dim=256 in HF; override to match tiny config
+    "qwen3_next": {"head_dim": TINY_HEAD_DIM},
     "opt": {
         "word_embed_proj_dim": TINY_HIDDEN,
         # OPT uses ffn_dim (not intermediate_size) for the MLP width
@@ -273,6 +282,13 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "first_k_dense_replace": 0,
         "n_shared_experts": 1,
     },
+    # GraniteMoeHybrid requires layer_types (defaults to None, causing runtime error).
+    # HF accepts 'mamba' and 'attention' (not 'linear_attention'/'full_attention').
+    "granitemoehybrid": {"layer_types": ["mamba", "attention"]},
+    # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
+    "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
+    # Llama4Text requires head_dim to match our tiny num_heads × head_dim = hidden_size.
+    "llama4_text": {"head_dim": TINY_HEAD_DIM},
 }
 
 
@@ -310,6 +326,9 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     "gemma3": "gemma3_text",
     # Gemma3nConfig is the multimodal wrapper; text-only parity uses Gemma3nTextConfig.
     "gemma3n": "gemma3n_text",
+    # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
+    # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
+    "qwen3_5_moe": "qwen3_5_moe_text",
 }
 
 
@@ -395,7 +414,10 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "qwen2_moe": {"num_local_experts": "num_experts"},
         "qwen3_moe": {"num_local_experts": "num_experts"},
         "qwen3_omni_moe": {"num_local_experts": "num_experts"},
+        "qwen3_vl_moe_text": {"num_local_experts": "num_experts"},
         "qwen3_vl_moe": {"num_local_experts": "num_experts"},
+        "qwen3_5_moe_text": {"num_local_experts": "num_experts"},
+        "qwen3_next": {"num_local_experts": "num_experts"},
         # Ernie4.5 MoE uses moe_num_experts / moe_k
         "ernie4_5_moe": {
             "num_local_experts": "moe_num_experts",
@@ -407,12 +429,13 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             if src_field in hf_kwargs:
                 hf_kwargs[dst_field] = hf_kwargs.pop(src_field)
 
-    # Remove ONNX-internal keys that HF configs don't have
+    # Remove ONNX-internal keys that HF configs don't have.
+    # Note: shared_expert_intermediate_size is intentionally NOT in this set —
+    # it is a real HF parameter for qwen2_moe, qwen3_5_moe_text, and others.
     onnx_only_keys = {
         "attn_qk_norm",
         "attn_qk_norm_full",
         "post_feedforward_norm",
-        "shared_expert_intermediate_size",
     }
     for key in onnx_only_keys:
         hf_kwargs.pop(key, None)
