@@ -148,6 +148,7 @@ from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
+from mobius.models.gptoss import GPTOSSCausalLMModel
 from mobius.models.granite import GraniteCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
@@ -164,7 +165,6 @@ from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
     Glm4MoECausalLMModel,
-    GPTOSSCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,

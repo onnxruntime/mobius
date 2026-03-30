@@ -170,6 +170,10 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # gpt-sw3: GPT-2-family LayerNorm eps alignment causes minor FP accumulation differences.
     # Argmax correct, cosine=1.0000 — model is functionally correct.
     "gpt-sw3": 0.005,
+    # GPT-OSS: MoE with sequential per-expert dispatch + custom silu_alpha activation
+    # accumulates small FP differences vs HF batched computation → ~0.05 max diff.
+    # Argmax correct, cosine≥0.999 — model is functionally correct.
+    "gpt_oss": 0.05,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -383,6 +387,12 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "new_decoder_architecture": True,
         "ffn_hidden_size": TINY_INTERMEDIATE,
         "layer_norm_epsilon": 1e-6,
+    },
+    # GPT-OSS: head_dim is an explicit config param (HF default 64, not hidden/num_heads).
+    # layer_types must have exactly TINY_LAYERS entries.
+    "gpt_oss": {
+        "head_dim": TINY_HEAD_DIM,
+        "layer_types": ["sliding_attention", "full_attention"],
     },
 }
 

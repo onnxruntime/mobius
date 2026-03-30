@@ -819,6 +819,17 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    (
+        "gpt_oss",
+        {
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 64,
+            "head_dim": TINY_HEAD_DIM,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        True,
+    ),
     # --- Variant coverage: architecture code-path variants ---
     # qwen3_next: mostly full-attention (1 linear + 1 full) — exercises full-attention path
     # while satisfying HF Qwen3NextDynamicCache's requirement for at least one linear layer.
@@ -1695,14 +1706,13 @@ _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 # the registry but should not appear in any test parametrization.  Their real
 # HF model_type counterpart (or the underlying model class) is already tested.
 _EXCLUDED_ALIASES: set[str] = {
-    "qwen3_5_vl_text",   # VL text decoder; real type is qwen3_5_text
-    "qwen3_omni_moe",    # VL MoE; no HF AutoModelForCausalLM support
-    "qwen3_vl_moe",      # VL MoE; no HF AutoModelForCausalLM support
-    "glm4v_moe_text",    # VL MoE text; no HF AutoModelForCausalLM support
-    "glm4v_text",        # VL text; GLM architecture incompatible with CausalLMModel
-    "deepseek_v2_moe",   # our custom alias; real type is deepseek_v2
-    "gptoss",            # alias for gpt_oss
-    "gpt_oss",           # packed expert layout mismatch
+    "qwen3_5_vl_text",  # VL text decoder; real type is qwen3_5_text
+    "qwen3_omni_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "qwen3_vl_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
+    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
+    "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
+    "gptoss",  # alias for gpt_oss; real type tested via gpt_oss entry
 }
 
 

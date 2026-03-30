@@ -3071,14 +3071,13 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 # from test configs because they duplicate existing coverage or
 # cannot be tested with our generic test infrastructure.
 _KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
-    "qwen3_5_vl_text",   # VL text decoder; real type is qwen3_5_text
-    "qwen3_omni_moe",    # VL MoE; no HF AutoModelForCausalLM support
-    "qwen3_vl_moe",      # VL MoE; no HF AutoModelForCausalLM support
-    "glm4v_moe_text",    # VL MoE text; no HF AutoModelForCausalLM support
-    "glm4v_text",        # VL text; GLM architecture incompatible with CausalLMModel
-    "deepseek_v2_moe",   # our custom alias; real type is deepseek_v2
-    "gptoss",            # alias for gpt_oss
-    "gpt_oss",           # packed expert layout mismatch
+    "qwen3_5_vl_text",  # VL text decoder; real type is qwen3_5_text
+    "qwen3_omni_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "qwen3_vl_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
+    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
+    "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
+    "gptoss",  # alias for gpt_oss; real type tested via gpt_oss entry
 }
 
 

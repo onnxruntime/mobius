@@ -228,28 +228,6 @@ class Phi3MoECausalLMModel(CausalLMModel):
         return super().preprocess_weights(state_dict)
 
 
-class GPTOSSCausalLMModel(CausalLMModel):
-    """GPTOSS Mixture of Experts model with sink attention and local attention patterns.
-
-    Features sink attention, local attention patterns, and MoE with
-    mscale-applied RoPE.
-    """
-
-    category: str = "Mixture of Experts"
-
-    def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = MoETextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
-
-
 class MoECausalLMModel(CausalLMModel):
     """Generic Mixture of Experts causal language model.
 
