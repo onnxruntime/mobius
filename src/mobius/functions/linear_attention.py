@@ -274,11 +274,7 @@ def _build_recurrence_body(
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
 
-    The body operates in ``stash_type`` precision.  Every body input
-    carries an explicit ``ir.TensorType`` so that the ONNX serializer
-    emits a valid ``type_proto`` — without it ORT cannot infer types
-    for the Scan subgraph and the MatMul nodes inside will fail with
-    shape-broadcast errors.
+    The body operates in ``stash_type`` precision.
 
     Body inputs (in order):
         1. state: (B, H, d_k, d_v) [carry]
