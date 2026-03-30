@@ -26,9 +26,14 @@
         "image-text-to-text",
         "speech-to-text",
         "audio-feature-extraction",
+        "audio-to-audio",
         "feature-extraction",
         "seq2seq",
         "image-classification",
+        "image-segmentation",
+        "image-to-image",
+        "image-to-text",
+        "depth-estimation",
         "object-detection"
       ],
       "description": "Task type string matching the mobius registry."
