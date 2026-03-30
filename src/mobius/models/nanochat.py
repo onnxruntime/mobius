@@ -189,9 +189,7 @@ class NanoChatCausalLMModel(CausalLMModel):
         self.config = config
         self.model = NanoChatTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-        self._final_logit_softcapping = getattr(
-            config, "final_logit_softcapping", 0.0
-        )
+        self._final_logit_softcapping = getattr(config, "final_logit_softcapping", 0.0)
         # Replace gated MLP → non-gated FCMLP and standard Attention → NanoChatAttention
         for layer in self.model.layers:
             layer.mlp = FCMLP(

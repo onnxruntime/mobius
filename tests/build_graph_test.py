@@ -39,6 +39,9 @@ from _test_configs import (
     _base_config,
 )
 
+# --- ONNX Checker infrastructure (merged from onnx_checker_test.py) --------
+from onnx_ir.passes.common import CheckerPass
+
 from mobius._builder import (
     DTYPE_MAP,
     build_from_module,
@@ -59,9 +62,6 @@ from mobius.tasks import (
     Qwen3VLVisionLanguageTask,
     get_task,
 )
-
-# --- ONNX Checker infrastructure (merged from onnx_checker_test.py) --------
-from onnx_ir.passes.common import CheckerPass
 
 _onnx_checker = CheckerPass()
 
@@ -107,6 +107,7 @@ def _run_onnx_checker(pkg: dict[str, ir.Model], model_type: str) -> None:
     for model in pkg.values():
         _fill_dummy_weights(model)
         _onnx_checker(model)
+
 
 # Minimal configs for each architecture. These are hand-crafted small configs
 # that exercise each model class without needing to download from HuggingFace.
@@ -2395,7 +2396,6 @@ class TestBuildCodecGraph:
     @staticmethod
     def _codec_config():
         from mobius._configs import (
-            ArchitectureConfig,
             CodecDecoderConfig,
             CodecEncoderConfig,
         )

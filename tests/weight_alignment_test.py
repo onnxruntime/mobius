@@ -32,22 +32,13 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
-    TINY_HEAD_DIM,
-    TINY_HEADS,
-    TINY_HIDDEN,
-    TINY_INTERMEDIATE,
-    TINY_KV_HEADS,
-    TINY_LAYERS,
-    TINY_VOCAB,
     VISION_CONFIGS,
     _base_config,
 )
 
 from mobius._config_resolver import _default_task_for_model
-from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius.tasks import get_task
-
 
 # ---------------------------------------------------------------------------
 # Helpers

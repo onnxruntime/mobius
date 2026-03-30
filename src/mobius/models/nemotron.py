@@ -40,6 +40,5 @@ class NemotronCausalLMModel(CausalLMModel):
                 config.hidden_size, eps=config.rms_norm_eps
             )
             layer.post_attention_layernorm = OffsetLayerNorm(
-
                 config.hidden_size, eps=config.rms_norm_eps
             )

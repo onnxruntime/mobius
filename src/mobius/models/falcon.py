@@ -480,14 +480,12 @@ def _split_falcon_interleaved_qkv(
         ``(num_kv_heads * head_dim, ...)``.
     """
     group_size = num_heads // num_kv_heads  # Q heads per KV group
-    # Each group: group_size Q heads + 1 K head + 1 V head
-    rows_per_group = (group_size + 2) * head_dim
     # Reshape: (num_kv_heads, group_size + 2, head_dim, ...)
-    shape = (num_kv_heads, group_size + 2, head_dim) + fused.shape[1:]
+    shape = (num_kv_heads, group_size + 2, head_dim, *fused.shape[1:])
     grouped = fused.reshape(shape)
 
     q_parts = grouped[:, :group_size]  # (num_kv_heads, group_size, head_dim, ...)
-    k_parts = grouped[:, group_size]   # (num_kv_heads, head_dim, ...)
+    k_parts = grouped[:, group_size]  # (num_kv_heads, head_dim, ...)
     v_parts = grouped[:, group_size + 1]  # (num_kv_heads, head_dim, ...)
 
     # Flatten Q: (num_kv_heads, group_size, head_dim, ...) → (num_heads * head_dim, ...)
@@ -558,7 +556,10 @@ class FalconCausalLMModel(nn.Module):
             # Handle fused QKV — Falcon interleaved layout
             if "query_key_value" in key:
                 q, k, v = _split_falcon_interleaved_qkv(
-                    value, num_heads, num_kv_heads, head_dim,
+                    value,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
                 )
                 base = key.replace(
                     "self_attention.query_key_value.",

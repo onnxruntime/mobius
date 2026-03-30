@@ -107,12 +107,8 @@ class Glm4DecoderLayer(DecoderLayer):
         super().__init__(config)
 
         # Add the two extra post-sub-layer norms
-        self.post_self_attn_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_mlp_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_self_attn_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -171,9 +167,7 @@ class Glm4CausalLMModel(CausalLMModel):
         self.model = Glm4TextModel(config)
         from mobius.components import Linear
 
-        self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
