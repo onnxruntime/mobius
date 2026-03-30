@@ -155,19 +155,12 @@ class TestCLIBuild:
             # dimension. Static cache shape: [batch, max_seq_len, kv_hidden]
             model = onnx.load(model_path)
             cache_inputs = [
-                inp
-                for inp in model.graph.input
-                if inp.name.startswith("key_cache.")
+                inp for inp in model.graph.input if inp.name.startswith("key_cache.")
             ]
             assert len(cache_inputs) > 0, "No key_cache inputs found"
-            seq_dim = (
-                cache_inputs[0]
-                .type.tensor_type.shape.dim[1]
-                .dim_value
-            )
+            seq_dim = cache_inputs[0].type.tensor_type.shape.dim[1].dim_value
             assert seq_dim == max_seq_len, (
-                f"key_cache.0 seq dimension is {seq_dim}, "
-                f"expected {max_seq_len}"
+                f"key_cache.0 seq dimension is {seq_dim}, expected {max_seq_len}"
             )
 
 
