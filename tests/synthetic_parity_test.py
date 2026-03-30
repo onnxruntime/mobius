@@ -184,9 +184,7 @@ _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
     # HF architecture differences (extra layers/features not in our ONNX)
-    # Gemma family: gemma, gemma2, gemma3_text, gemma3n, gemma3 now pass with atol overrides
-    # Qwen3-Next: all variants xfail — DeltaNet linear attention output differs from HF.
-    # (Both variants use mixed linear+full configs to satisfy HF cache requirements.)
+    "diffllama": "HF DiffLlama has extra lambda parameters",
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",

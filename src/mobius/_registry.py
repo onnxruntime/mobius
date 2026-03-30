@@ -467,6 +467,11 @@ def _create_default_registry() -> ModelRegistry:
     # --- Hybrid Mamba2+Attention (Bamba) ---
     reg.register("bamba", BambaCausalLMModel)
 
+    # --- Hybrid Mamba2+Attention+MLP (NemotronH) ---
+    from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+    reg.register("nemotron_h", NemotronHCausalLMModel)
+
     # --- Multimodal ---
     for name in (
         "chameleon",
