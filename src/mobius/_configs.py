@@ -95,6 +95,10 @@ class VisionConfig:
     norm_eps: float = 1e-6
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    # Pixtral / Mistral-3 vision fields
+    model_type: str | None = None
+    head_dim: int | None = None
+    rope_theta: float | None = None
     # Qwen VL-specific
     out_hidden_size: int | None = None
     in_channels: int = 3
@@ -359,9 +363,16 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             image_size=getattr(vc, "image_size", None),
             patch_size=getattr(vc, "patch_size", None),
             norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
+            # Pixtral / Mistral-3 vision fields
+            model_type=getattr(vc, "model_type", None),
+            head_dim=getattr(vc, "head_dim", None),
+            rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
             out_hidden_size=getattr(vc, "out_hidden_size", None),
-            in_channels=getattr(vc, "in_channels", 3),
+            in_channels=(
+                getattr(vc, "in_channels", None)
+                or getattr(vc, "num_channels", 3)
+            ),
             spatial_merge_size=getattr(vc, "spatial_merge_size", 2),
             temporal_patch_size=getattr(vc, "temporal_patch_size", 2),
             num_position_embeddings=getattr(vc, "num_position_embeddings", None),

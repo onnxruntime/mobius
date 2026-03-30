@@ -1114,7 +1114,6 @@ class TestBuildGraphVisionLanguage:
             "idefics3",
             "instructblip",
             "molmo",
-            "mistral3",
             "paligemma",
             "pixtral",
         ):
@@ -1133,6 +1132,35 @@ class TestBuildGraphVisionLanguage:
             assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}, (
                 f"{model_type} vision missing pixel_values"
             )
+
+    def test_mistral3_pixtral_vision_build(self):
+        """Build Mistral-3 with Pixtral vision encoder (2D RoPE + patch merge)."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                model_type="pixtral",
+            ),
+            image_token_id=32000,
+        )
+        model_cls = registry.get("mistral3")
+        module = model_cls(config)
+        task_name = _default_task_for_model("mistral3")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert "logits" in {
+            o.name for o in pkg["decoder"].graph.outputs
+        }
+        assert "pixel_values" in {
+            i.name for i in pkg["vision"].graph.inputs
+        }
 
     def test_mllama_vision_language_graph(self):
         """Build Mllama (Llama 3.2 Vision) with cross-attention decoder."""

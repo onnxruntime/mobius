@@ -135,6 +135,49 @@ class _LLaVAEmbeddingModel(nn.Module):
         return vlm_embedding_weights(state_dict)
 
 
+class _PixtralVisionEncoderModel(nn.Module):
+    """Pixtral vision encoder: 2D RoPE vision tower + Mistral3 projector.
+
+    Used for ``mistral3`` / ``pixtral`` model types that use the
+    Pixtral vision architecture instead of CLIP/SigLIP.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        from mobius.components._pixtral_vision import (
+            Mistral3MultiModalProjector,
+            PixtralVisionTower,
+        )
+
+        self.vision_tower = PixtralVisionTower(config)
+        self.multi_modal_projector = Mistral3MultiModalProjector(
+            vision_hidden_size=config.vision.hidden_size,
+            text_hidden_size=config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+        )
+
+    def forward(
+        self, op: builder.OpBuilder, pixel_values: ir.Value
+    ):
+        hidden_states, grid_h, grid_w = self.vision_tower(
+            op, pixel_values
+        )
+        return self.multi_modal_projector(
+            op, hidden_states, grid_h, grid_w
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if key.startswith(
+                ("vision_tower.", "multi_modal_projector.")
+            )
+        }
+
+
 class LLaVAModel(nn.Module):
     """LLaVA vision-language model (3-model split).
 
@@ -151,7 +194,16 @@ class LLaVAModel(nn.Module):
         super().__init__()
         self.config = config
         self.decoder = _LLaVADecoderModel(config)
-        self.vision_encoder = _LLaVAVisionEncoderModel(config)
+        # Dispatch: use Pixtral vision encoder for pixtral-based models,
+        # CLIP/SigLIP for everything else.
+        is_pixtral = (
+            config.vision
+            and getattr(config.vision, "model_type", None) == "pixtral"
+        )
+        if is_pixtral:
+            self.vision_encoder = _PixtralVisionEncoderModel(config)
+        else:
+            self.vision_encoder = _LLaVAVisionEncoderModel(config)
         self.embedding = _LLaVAEmbeddingModel(config)
 
     def forward(self, op: builder.OpBuilder, **kwargs):
@@ -163,9 +215,58 @@ class LLaVAModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # Mistral-3 / Pixtral models prefix decoder weights with
+        # ``language_model.`` — strip it so the decoder/embedding
+        # sub-models can find their weights.
+        is_pixtral = (
+            self.config.vision
+            and getattr(self.config.vision, "model_type", None)
+            == "pixtral"
+        )
+        if is_pixtral:
+            return _preprocess_pixtral_weights(
+                state_dict, self.config.tie_word_embeddings
+            )
+        # Default LLaVA: only handle weight tying
         if self.config.tie_word_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
         return state_dict
+
+
+def _preprocess_pixtral_weights(
+    state_dict: dict[str, torch.Tensor],
+    tie_word_embeddings: bool,
+) -> dict[str, torch.Tensor]:
+    """Remap HF Mistral-3/Pixtral weight names to ONNX sub-model names.
+
+    HF prefixes decoder weights with ``language_model.``; vision and
+    projector weights have no extra prefix.  This function adds the
+    ``vision_encoder.`` prefix expected by the ONNX module tree and
+    strips ``language_model.`` for the decoder/embedding sub-models.
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith(
+            ("vision_tower.", "multi_modal_projector.")
+        ):
+            # Vision/projector: add vision_encoder. prefix
+            renamed[f"vision_encoder.{key}"] = value
+        elif key.startswith(
+            "language_model.model.embed_tokens."
+        ):
+            # Embedding weights go to both decoder and embedding
+            suffix = key[len("language_model.model."):]
+            renamed[f"decoder.model.{suffix}"] = value
+            renamed[f"embedding.{suffix}"] = value
+            if tie_word_embeddings:
+                renamed["decoder.lm_head.weight"] = value
+        elif key.startswith("language_model.lm_head."):
+            suffix = key[len("language_model."):]
+            renamed[f"decoder.{suffix}"] = value
+        elif key.startswith("language_model."):
+            suffix = key[len("language_model."):]
+            renamed[f"decoder.{suffix}"] = value
+    return renamed
