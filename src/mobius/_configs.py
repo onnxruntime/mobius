@@ -592,6 +592,11 @@ class QuantizationConfig:
         method = qc.get("quant_method", "none")
         if method == "none":
             return None
+        # FP8 per-tensor quantization (float8_e4m3fn + scalar scale)
+        # is handled by dtype casting in _assign_weight(), not by
+        # QuantizedLinear block quantization.
+        if method == "fp8":
+            return None
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
