@@ -73,7 +73,6 @@ from mobius.models import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35VL3ModelCausalLMModel,
-    Qwen35VLTextModel,
     QwenCausalLMModel,
     SmolLM3CausalLMModel,
     WhisperForConditionalGeneration,
@@ -439,7 +438,6 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("granitemoehybrid", GraniteMoeHybridCausalLMModel)
 
     reg.register("minimax", MiniMaxCausalLMModel)
-    reg.register("gptoss", GPTOSSCausalLMModel)
     reg.register("gpt_oss", GPTOSSCausalLMModel)
     reg.register("phimoe", Phi3MoECausalLMModel)
     reg.register("qwen3_5_moe", Qwen35MoECausalLMModel)
@@ -448,7 +446,6 @@ def _create_default_registry() -> ModelRegistry:
     # --- DeepSeek (MLA + MoE) ---
     for name in (
         "deepseek_v2",
-        "deepseek_v2_moe",
         "deepseek_v3",
     ):
         reg.register(name, DeepSeekV3CausalLMModel)
@@ -524,7 +521,6 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("qwen3_vl_text", Qwen3VLTextModel)
     reg.register("qwen3_5", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
     reg.register("qwen3_5_vl", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
-    reg.register("qwen3_5_vl_text", Qwen35VLTextModel)
 
     # --- Speech ---
     reg.register(
@@ -779,7 +775,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gpt_neo": "EleutherAI/gpt-neo-125m",
     "gpt_neox_japanese": "abeja/gpt-neox-japanese-2.7b",
     "gpt_oss": "openai/gpt-oss-20b",
-    "gptoss": "openai/gpt-oss-20b",
     "hunyuan_v1_dense": "optimum-intel-internal-testing/tiny-random-hunyuan-v1-dense",
     "hunyuan_v1_moe": "tencent/Hunyuan-A13B-Instruct",
     "imagegpt": "openai/imagegpt-small",
@@ -996,14 +991,12 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_vl_moe": "qwen",
     "qwen3_5": "qwen",
     "qwen3_5_vl": "qwen",
-    "qwen3_5_vl_text": "qwen",
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
-    "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
@@ -1072,7 +1065,6 @@ _FAMILY_OVERRIDES: dict[str, str] = {
 _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v3": "mla+moe",
-    "deepseek_v2_moe": "mla+moe",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",

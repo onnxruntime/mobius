@@ -818,6 +818,35 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     (
+        "glm4v_text",
+        {},
+        False,
+    ),
+    (
+        "glm4v_moe_text",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        False,
+    ),
+    (
+        "qwen3_omni_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        False,
+    ),
+    (
+        "qwen3_vl_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        False,
+    ),
+    (
         "granitemoehybrid",
         {
             "_config_cls": GraniteMoeHybridConfig,
@@ -1762,15 +1791,7 @@ _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 # Internal aliases removed from test configs — they are still registered in
 # the registry but should not appear in any test parametrization.  Their real
 # HF model_type counterpart (or the underlying model class) is already tested.
-_EXCLUDED_ALIASES: set[str] = {
-    "qwen3_5_vl_text",  # VL text decoder; real type is qwen3_5_text
-    "qwen3_omni_moe",  # VL MoE; no HF AutoModelForCausalLM support
-    "qwen3_vl_moe",  # VL MoE; no HF AutoModelForCausalLM support
-    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
-    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
-    "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
-    "gptoss",  # alias for gpt_oss; real type tested via gpt_oss entry
-}
+_EXCLUDED_ALIASES: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
