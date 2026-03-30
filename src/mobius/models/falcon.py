@@ -454,6 +454,49 @@ class _BloomTextModel(_FalconTextModel):
         return hidden_states, present_key_values
 
 
+def _split_falcon_interleaved_qkv(
+    fused: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split Falcon's interleaved fused QKV weight into separate Q, K, V.
+
+    HF Falcon (``new_decoder_architecture=True``) groups the fused QKV
+    weight as ``[Q0..Q_{g-1}, K, V]`` per KV-group, where
+    ``g = num_heads // num_kv_heads``.  Each block is ``head_dim`` rows.
+
+    Args:
+        fused: Weight tensor, shape ``(total_qkv, hidden_size)`` for weights
+               or ``(total_qkv,)`` for biases.
+        num_heads: Number of query attention heads.
+        num_kv_heads: Number of key/value heads.
+        head_dim: Dimension per head.
+
+    Returns:
+        (Q, K, V) tensors with shapes
+        ``(num_heads * head_dim, ...)``,
+        ``(num_kv_heads * head_dim, ...)``,
+        ``(num_kv_heads * head_dim, ...)``.
+    """
+    group_size = num_heads // num_kv_heads  # Q heads per KV group
+    # Each group: group_size Q heads + 1 K head + 1 V head
+    rows_per_group = (group_size + 2) * head_dim
+    # Reshape: (num_kv_heads, group_size + 2, head_dim, ...)
+    shape = (num_kv_heads, group_size + 2, head_dim) + fused.shape[1:]
+    grouped = fused.reshape(shape)
+
+    q_parts = grouped[:, :group_size]  # (num_kv_heads, group_size, head_dim, ...)
+    k_parts = grouped[:, group_size]   # (num_kv_heads, head_dim, ...)
+    v_parts = grouped[:, group_size + 1]  # (num_kv_heads, head_dim, ...)
+
+    # Flatten Q: (num_kv_heads, group_size, head_dim, ...) → (num_heads * head_dim, ...)
+    q = q_parts.reshape(num_heads * head_dim, *fused.shape[1:])
+    k = k_parts.reshape(num_kv_heads * head_dim, *fused.shape[1:])
+    v = v_parts.reshape(num_kv_heads * head_dim, *fused.shape[1:])
+    return q, k, v
+
+
 class FalconCausalLMModel(nn.Module):
     """Falcon CausalLM with ALiBi or RoPE positional encoding.
 
@@ -500,16 +543,22 @@ class FalconCausalLMModel(nn.Module):
         Most names now match HF directly after attribute alignment.
         Only output projection rename (dense→o_proj) and fused QKV
         splitting remain.
+
+        Falcon with ``new_decoder_architecture=True`` uses an interleaved
+        QKV layout: for each KV-group the weight rows are
+        ``[Q_0, Q_1, ..., Q_{g-1}, K, V]`` where ``g = num_heads / num_kv_heads``.
+        This differs from the standard contiguous ``[Q..., K..., V...]`` layout.
         """
+        num_heads = self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim
+
         new_state_dict = {}
         for key, value in state_dict.items():
-            # Handle fused QKV
+            # Handle fused QKV — Falcon interleaved layout
             if "query_key_value" in key:
-                q, k, v = split_fused_qkv(
-                    value,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
+                q, k, v = _split_falcon_interleaved_qkv(
+                    value, num_heads, num_kv_heads, head_dim,
                 )
                 base = key.replace(
                     "self_attention.query_key_value.",
@@ -617,7 +666,8 @@ class MPTCausalLMModel(FalconCausalLMModel):
 
         1. Blocks prefix: ``transformer.blocks.N.`` → ``transformer.h.N.``
         2. Norms: ``norm_1.`` → ``ln_attn.``, ``norm_2.`` → ``ln_mlp.``
-        3. Fused QKV: ``attn.Wqkv.`` → ``self_attention.query_key_value.``
+        3. Fused QKV: ``attn.Wqkv.`` → split into ``q_proj``, ``k_proj``, ``v_proj``
+           (MPT uses contiguous ``[Q, K, V]`` layout, unlike Falcon's interleaved)
         4. Output proj: ``attn.out_proj.`` → ``self_attention.dense.``
         5. FFN: ``ffn.up_proj.`` / ``ffn.down_proj.`` → ``mlp.up_proj.`` / ``mlp.down_proj.``
            (FalconCausalLMModel.preprocess_weights converts ``dense_h_to_4h``/
@@ -634,8 +684,20 @@ class MPTCausalLMModel(FalconCausalLMModel):
             # Layer norm renames
             key = key.replace(".norm_1.", ".ln_attn.")
             key = key.replace(".norm_2.", ".ln_mlp.")
-            # Attention renames
-            key = key.replace(".attn.Wqkv.", ".self_attention.query_key_value.")
+            # Attention: split contiguous QKV before renaming to Falcon format.
+            # MPT uses [Q, K, V] contiguous layout (unlike Falcon's interleaved).
+            if ".attn.Wqkv." in key:
+                q, k, v = split_fused_qkv(
+                    value,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                )
+                base = key.replace(".attn.Wqkv.", ".self_attention.")
+                renamed[base.replace(".self_attention.", ".self_attention.q_proj.")] = q
+                renamed[base.replace(".self_attention.", ".self_attention.k_proj.")] = k
+                renamed[base.replace(".self_attention.", ".self_attention.v_proj.")] = v
+                continue
             key = key.replace(".attn.out_proj.", ".self_attention.dense.")
             # FFN: MPT already uses up_proj/down_proj so map to Falcon's intermediate names
             # that FalconCausalLMModel.preprocess_weights will then convert to up/down

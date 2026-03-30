@@ -60,19 +60,11 @@ _SKIP_REASONS: dict[str, str] = {
     "minicpm3": "HF AutoConfig does not recognize minicpm3 (requires trust_remote_code)",
     "baichuan": "HF AutoConfig does not recognize baichuan (requires trust_remote_code)",
     "arctic": "HF AutoConfig does not recognize arctic (requires trust_remote_code)",
-    # Custom model_type not in transformers: deepseek_v2_moe is not registered natively
-    "deepseek_v2_moe": "HF AutoConfig does not recognize deepseek_v2_moe",
     "ernie4_5": "HF ernie4_5 model requires special fields not in our standard test infra",
-    # GPT-OSS: HF gpt_oss uses a non-standard packed expert weight layout
-    # (gate_proj stored as [moe_inter_per_expert, hidden * num_experts]) that differs
-    # from our per-expert Linear format. Requires custom preprocess_weights mapping.
-    "gptoss": "GPT-OSS expert weight layout mismatch: needs preprocess_weights for packed expert format",
-    "gpt_oss": "GPT-OSS expert weight layout mismatch: needs preprocess_weights for packed expert format",
     # Mamba2 standalone model: HF creates different architecture
     "mamba2": "HF Mamba2 standalone is not a causal LM model",
     # VLM-wrapper models: their text-only config class is not registered with
     # AutoModelForCausalLM so we cannot create a reference HF model for comparison.
-    "glm4v_moe_text": "Glm4vMoeTextConfig not registered with AutoModelForCausalLM",
     "qwen3_omni_moe": "Qwen3OmniMoeConfig not registered with AutoModelForCausalLM",
     "qwen3_vl_moe": "Qwen3VLMoeTextConfig not registered with AutoModelForCausalLM",
     # Non-standard config format: DbrxConfig uses d_model/n_heads/n_layers/attn_config
@@ -91,7 +83,6 @@ _SKIP_REASONS: dict[str, str] = {
     # implements 2 LayerNorms + separate gate/up projections — architecturally incompatible.
     "glm": "GLM: 4 layer norms/layer + fused gate_up_proj incompatible with CausalLMModel",
     "glm4": "GLM4: 4 layer norms/layer + fused gate_up_proj incompatible with CausalLMModel",
-    "glm4v_text": "GLM4v text: 4 layer norms/layer + fused gate_up_proj incompatible with CausalLMModel",
     # Non-CausalLM models: their config class is not registered with AutoModelForCausalLM
     "csm": "CsmConfig not registered with AutoModelForCausalLM (speech model)",
     "evolla": "EvollaConfig not registered with AutoModelForCausalLM (multimodal VLM)",
@@ -100,9 +91,6 @@ _SKIP_REASONS: dict[str, str] = {
     "youtu": "Youtu uses MLA (Multi-head Latent Attention); incompatible weight layout with CausalLMModel",
     "solar_open": "HF solar_open uses MoE with packed experts; ONNX uses dense CausalLMModel",
     "dots1": "HF dots1 (Dots.LLM1) is always MoE; ONNX uses dense CausalLMModel",
-    # qwen3_5_vl_text not in AutoConfig registry; underlying model uses GatedDeltaNet
-    # linear attention (qwen3_5_text), not comparable with standard causal LM.
-    "qwen3_5_vl_text": "qwen3_5_vl_text not in AutoConfig registry; uses GatedDeltaNet linear attention",
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
@@ -209,12 +197,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
-    # Falcon: weight transfer works but outputs diverge — HF new_decoder_architecture=True
-    # uses a different causal mask application than our ORT Attention op.
-    "falcon": "Falcon: HF SDPA vs ORT Attention causal mask divergence with parallel_attn+dual_ln",
-    # Falcon-H1 (ALiBi + MHA): ALiBi bias computation diverges between HF FalconAttention
-    # and ORT's GQA Attention op (different attention_bias shape handling).
-    "falcon_h1": "Falcon-H1: ALiBi + parallel_attn causal mask divergence between HF and ORT",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
