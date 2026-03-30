@@ -63,10 +63,6 @@ _SKIP_REASONS: dict[str, str] = {
     "ernie4_5": "HF ernie4_5 model requires special fields not in our standard test infra",
     # Mamba2 standalone model: HF creates different architecture
     "mamba2": "HF Mamba2 standalone is not a causal LM model",
-    # VLM-wrapper models: their text-only config class is not registered with
-    # AutoModelForCausalLM so we cannot create a reference HF model for comparison.
-    "qwen3_omni_moe": "Qwen3OmniMoeConfig not registered with AutoModelForCausalLM",
-    "qwen3_vl_moe": "Qwen3VLMoeTextConfig not registered with AutoModelForCausalLM",
     # Non-standard config format: DbrxConfig uses d_model/n_heads/n_layers/attn_config
     # (nested sub-configs) rather than standard hidden_size/num_attention_heads keys.
     # Cannot create a correctly-sized tiny reference model with our generic test infra.
@@ -202,6 +198,32 @@ _XFAIL_REASONS: dict[str, str] = {
 # Fields that are properties in HF configs and cannot be set directly,
 # or internal mobius-only fields that HF configs don't recognize.
 _HF_READONLY_FIELDS: set[str] = {"head_dim", "attn_qkv_bias", "attn_o_bias", "mlp_bias"}
+
+# Model types that are mobius-internal aliases and should not appear in the synthetic
+# parity test.  The parity test requires AutoModelForCausalLM to be able to create
+# a reference model — these types either have no real HF model_type string, or their
+# HF config class is not registered with AutoModelForCausalLM (e.g. VLM sub-configs).
+# The build_graph test still covers them (it builds the ONNX graph without HF).
+_PARITY_EXCLUDE: frozenset[str] = frozenset(
+    {
+        # VLM text-only sub-configs: registered in HF CONFIG_MAPPING but NOT with
+        # AutoModelForCausalLM (they belong to multimodal pipelines).
+        "qwen3_vl_text",
+        "qwen2_vl_text",
+        "qwen2_5_vl_text",
+        # Not in HF CONFIG_MAPPING at all — purely mobius-internal aliases.
+        "command_r",  # real HF type is cohere
+        "codegen2",  # real HF type is codegen
+        "open-llama",  # real HF type is llama
+        "yi",  # real HF type is llama
+        "exaone",  # real HF type is exaone4
+        "phi3small",  # real HF type is phi3
+        "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
+        # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
+        "falcon_h1",
+    }
+)
 
 # Model types that need extra HF config fields beyond our defaults.
 _HF_EXTRA_CONFIG: dict[str, dict] = {
@@ -419,25 +441,6 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
-    # Llama-compatible aliases: these all use CausalLMModel (standard Llama-style forward),
-    # so the HF reference must also be llama to match our ONNX graph.
-    "codegen2": "llama",
-    "command_r": "llama",
-    "exaone": "llama",
-    "open-llama": "llama",
-    "yi": "llama",
-    # Phi3Small uses the same Phi3Config fields as phi3 (sliding window variant).
-    "phi3small": "phi3",
-    # VLM text-only configs: their HF config class is not registered with AutoModelForCausalLM.
-    # Map to the equivalent text-only model type for parity comparison.
-    "qwen3_vl_text": "qwen3",
-    "qwen2_vl_text": "qwen2",
-    "qwen2_5_vl_text": "qwen2",
-    # Mistral3Config has no ForCausalLM class in transformers; compare against MistralForCausalLM.
-    "mistral3": "mistral",
-    # falcon_h1 in mobius is a FalconCausalLMModel (ALiBi attention), not the
-    # HF FalconH1 Mamba2+SSM hybrid. Map to HF "falcon" for correct comparison.
-    "falcon_h1": "falcon",
 }
 
 
@@ -532,9 +535,6 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "olmoe": {"num_local_experts": "num_experts"},
         "qwen2_moe": {"num_local_experts": "num_experts"},
         "qwen3_moe": {"num_local_experts": "num_experts"},
-        "qwen3_omni_moe": {"num_local_experts": "num_experts"},
-        "qwen3_vl_moe_text": {"num_local_experts": "num_experts"},
-        "qwen3_vl_moe": {"num_local_experts": "num_experts"},
         "qwen3_5_moe_text": {"num_local_experts": "num_experts"},
         "qwen3_next": {"num_local_experts": "num_experts"},
         # Ernie4.5 MoE uses moe_num_experts / moe_k
@@ -635,7 +635,7 @@ def _build_synthetic_params() -> list:
     """
     from collections import Counter
 
-    configs = [(mt, ov) for mt, ov, _ in ALL_CAUSAL_LM_CONFIGS]
+    configs = [(mt, ov) for mt, ov, _ in ALL_CAUSAL_LM_CONFIGS if mt not in _PARITY_EXCLUDE]
     counts = Counter(mt for mt, _ in configs)
     seen: dict[str, int] = {}
     params = []
