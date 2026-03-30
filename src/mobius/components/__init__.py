@@ -7,6 +7,7 @@ __all__ = [
     "AdaLayerNormZero",
     "BertEmbeddings",
     "CausalConv1d",
+    "CausalConvNd",
     "CausalTransConv1d",
     "CodecDecoderTransformerModel",
     "CodecEncoderTransformerModel",
@@ -32,6 +33,7 @@ __all__ = [
     "InputMixer",
     "LayerNorm",
     "LayerNormNoAffine",
+    "OffsetLayerNorm",
     "LayerScale",
     "Linear",
     "LoRALinear",
@@ -109,6 +111,7 @@ from mobius.components._attention import (
 from mobius.components._audio import ConformerEncoder
 from mobius.components._codec_conv import (
     CausalConv1d,
+    CausalConvNd,
     CausalTransConv1d,
     ConvNeXtBlock,
     DecoderBlock,
@@ -128,6 +131,7 @@ from mobius.components._common import (
     LayerNorm,
     LayerNormNoAffine,
     Linear,
+    OffsetLayerNorm,
     create_attention_bias,
     create_padding_mask,
 )
