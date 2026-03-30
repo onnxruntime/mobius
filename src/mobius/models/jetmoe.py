@@ -17,7 +17,6 @@ HuggingFace reference: ``JetMoeForCausalLM``.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,7 +34,6 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._attention import _apply_attention
-from mobius.components._moe import TopKGate
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
@@ -103,13 +101,19 @@ class _JetMoeAttention(nn.Module):
         # Per-expert Q projections: weight [q_size, hidden]
         # Named q_proj_experts.{i} to match preprocess_weights output keys.
         self.q_proj_experts = nn.ModuleList(
-            [Linear(self.hidden_size, self.q_size, bias=False) for _ in range(self.num_experts)]
+            [
+                Linear(self.hidden_size, self.q_size, bias=False)
+                for _ in range(self.num_experts)
+            ]
         )
 
         # Per-expert O projections: weight [hidden, q_size]
         # Named o_proj_experts.{i} to match preprocess_weights output keys.
         self.o_proj_experts = nn.ModuleList(
-            [Linear(self.q_size, self.hidden_size, bias=False) for _ in range(self.num_experts)]
+            [
+                Linear(self.q_size, self.hidden_size, bias=False)
+                for _ in range(self.num_experts)
+            ]
         )
 
         # Expert router: weight [n_experts, hidden]
@@ -169,9 +173,7 @@ class _JetMoeAttention(nn.Module):
         # Concat → [bsz, seq, top_k, q_size]  where q_size = num_kv_heads * head_dim
         query_4d = op.Concat(*q_slots, axis=2)
         # Expand to 5D: [bsz, seq, top_k, num_kv_heads, head_dim]
-        query_5d = op.Reshape(
-            query_4d, [0, 0, self.top_k, self.num_kv_heads, self.head_dim]
-        )
+        query_5d = op.Reshape(query_4d, [0, 0, self.top_k, self.num_kv_heads, self.head_dim])
         # Transpose from [slot, kv_head] to [kv_head, slot] order.
         # ONNX GQA groups Q heads in contiguous blocks of size top_k and maps each
         # block to one KV head.  Without this transpose the grouping would be
@@ -353,7 +355,9 @@ class _JetMoeTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
         self.layers = nn.ModuleList(
             [JetMoeDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )

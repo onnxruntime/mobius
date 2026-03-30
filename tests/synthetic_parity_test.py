@@ -353,7 +353,7 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "granitemoehybrid": {"layer_types": ["mamba", "attention"]},
     # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
     "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
-    # Llama4Text requires head_dim to match our tiny num_heads × head_dim = hidden_size.
+    # Llama4Text requires head_dim to match our tiny num_heads x head_dim = hidden_size.
     # Disable MoE (we use dense CausalLMModel) and Llama4-specific attention features
     # (QK-norm and temperature tuning) not implemented in CausalLMModel.
     # intermediate_size_mlp is separate from intermediate_size in Llama4 (default 16384).

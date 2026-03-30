@@ -71,7 +71,9 @@ class _LongcatFlashMLA(nn.Module):
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = Linear(
-            self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
         )
         self.o_proj = Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
 
@@ -131,13 +133,21 @@ class _LongcatFlashMLA(nn.Module):
         # --- Apply interleaved RoPE ---
         # q_rope: (B, S, H*rope_dim) — apply to all H heads at once
         q_rope = apply_rotary_pos_emb(
-            op, x=q_rope, position_embeddings=position_embeddings,
-            num_heads=self.num_heads, rotary_embedding_dim=0, interleaved=True,
+            op,
+            x=q_rope,
+            position_embeddings=position_embeddings,
+            num_heads=self.num_heads,
+            rotary_embedding_dim=0,
+            interleaved=True,
         )
         # k_rope is single-head: (B, S, rope_dim)
         k_rope = apply_rotary_pos_emb(
-            op, x=k_rope, position_embeddings=position_embeddings,
-            num_heads=1, rotary_embedding_dim=0, interleaved=True,
+            op,
+            x=k_rope,
+            position_embeddings=position_embeddings,
+            num_heads=1,
+            rotary_embedding_dim=0,
+            interleaved=True,
         )
         # Broadcast k_rope to all heads: (B, S, 1, rope_dim) → (B, S, H, rope_dim)
         k_rope_4d = op.Reshape(k_rope, [0, 0, 1, self.qk_rope_head_dim])
@@ -152,7 +162,10 @@ class _LongcatFlashMLA(nn.Module):
 
         # --- Attention ---
         attn_output, present_key, present_value = op.Attention(
-            query_states, key_states, value_states, attention_bias,
+            query_states,
+            key_states,
+            value_states,
+            attention_bias,
             past_key_value[0] if past_key_value is not None else None,
             past_key_value[1] if past_key_value is not None else None,
             kv_num_heads=self.num_heads,
@@ -224,8 +237,12 @@ class _LongcatFlashMoE(nn.Module):
         total_experts = self.n_routed_experts + self.zero_expert_num
         self.router = _LongcatFlashRouter(config, total_experts)
         # Only real experts have projection weights
-        expert_config = dataclasses.replace(config, intermediate_size=config.moe_intermediate_size)
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.n_routed_experts)])
+        expert_config = dataclasses.replace(
+            config, intermediate_size=config.moe_intermediate_size
+        )
+        self.experts = nn.ModuleList(
+            [MLP(expert_config) for _ in range(self.n_routed_experts)]
+        )
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.router(op, hidden_states)
@@ -273,14 +290,18 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.self_attn = nn.ModuleList([_LongcatFlashMLA(config), _LongcatFlashMLA(config)])
         self.mlps = nn.ModuleList([MLP(config), MLP(config)])
         self.mlp = _LongcatFlashMoE(config)
-        self.input_layernorm = nn.ModuleList([
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-        ])
-        self.post_attention_layernorm = nn.ModuleList([
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-        ])
+        self.input_layernorm = nn.ModuleList(
+            [
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+            ]
+        )
+        self.post_attention_layernorm = nn.ModuleList(
+            [
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+            ]
+        )
 
     def forward(
         self,
@@ -381,7 +402,9 @@ class LongcatFlashTextModel(nn.Module):
 
         # past_key_values has 2 * len(self.layers) entries (2 per physical layer)
         num_virtual_layers = 2 * len(self.layers)
-        past_kvs = past_key_values if past_key_values is not None else [None] * num_virtual_layers
+        past_kvs = (
+            past_key_values if past_key_values is not None else [None] * num_virtual_layers
+        )
 
         present_key_values = []
         for i, layer in enumerate(self.layers):

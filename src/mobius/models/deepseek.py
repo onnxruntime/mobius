@@ -109,7 +109,7 @@ class DeepSeekMoEGate(nn.Module):
         experts_per_group = self.num_experts // self.n_group
 
         # Flatten batch*seq dims: (B, S, n_experts) → (B*S, n_experts)
-        # so group reshaping operates on a 2D tensor (token × expert).
+        # so group reshaping operates on a 2D tensor (token x expert).
         orig_shape = op.Shape(scores_for_choice)
         flat = op.Reshape(scores_for_choice, [-1, self.num_experts])
 
