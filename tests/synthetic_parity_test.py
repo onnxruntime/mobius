@@ -150,13 +150,12 @@ _ATOL_OVERRIDES: dict[str, float] = {
 _XFAIL_REASONS: dict[str, str] = {
     # MoE routing models: those with wider atol in _ATOL_OVERRIDES PASS.
     # Remaining genuine xfails:
-    "qwen3_5_moe": "MoE routing differences",
-    "granitemoehybrid": "MoE routing + Mamba hybrid differences",
+    "granitemoehybrid": "Mamba layers not implemented — ONNX model is missing mamba SSM weights",
     "jetmoe": "JetMoE uses Mixture-of-Attention (MoA) — different attention architecture",
-    "hunyuan_v1_moe": "MoE routing differences",
+    "hunyuan_v1_moe": "Missing QK-norms (query_layernorm, key_layernorm) and shared_mlp — HunyuanMoE has extra components not in our ONNX model",
     "ernie4_5_moe": "Ernie4.5 zero-initializes gate.weight; PyTorch/ONNX TopK break ties differently (PyTorch: higher indices, ONNX: lower), routing to different experts in the synthetic test. Real trained models are unaffected.",
     # HF architecture differences (extra layers/features not in our ONNX)
-    "llama4_text": "HF Llama4 MoE differs from our implementation",
+    "llama4_text": "HF Llama4 uses chunked/interleaved attention + MoE differences not in our implementation",
     # Softcapping/scaling differences
     "shieldgemma2": "ShieldGemma2 HF AutoModelForCausalLM does not support config class",
     # GPT-2 family: imagegpt/gpt-sw3 still differ; the rest are fixed
@@ -257,6 +256,8 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "nemotron": {"norm_eps": 1e-5},
     # Qwen3.5 has head_dim as an explicit config param (default 256)
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
+    # Qwen3.5-MoE uses the same doubled-Q attention as qwen3_5; head_dim defaults to 256 in HF
+    "qwen3_5_moe": {"head_dim": TINY_HEAD_DIM},
     # GPT-NeoX/Pythia use layer_norm_eps (not rms_norm_eps) for their LayerNorms
     "gpt_neox": {"layer_norm_eps": 1e-6},
     # GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; test config matches via rms_norm_eps=1e-5
