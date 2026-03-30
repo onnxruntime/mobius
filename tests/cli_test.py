@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import tempfile
 
+import onnx
 import pytest
 
 from mobius.__main__ import main
@@ -86,22 +87,6 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
-    def test_build_static_cache_with_max_seq_len(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            main(
-                [
-                    "build",
-                    "--model",
-                    "Qwen/Qwen2.5-0.5B",
-                    tmpdir,
-                    "--no-weights",
-                    "--static-cache",
-                    "--max-seq-len",
-                    "512",
-                ]
-            )
-            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
-
     def test_max_seq_len_without_static_cache_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(
@@ -148,7 +133,8 @@ class TestCLIBuild:
             )
 
     def test_static_cache_with_max_seq_len(self):
-        """--max-seq-len is passed through to CausalLMTask."""
+        """--max-seq-len is passed through and sets cache dimensions."""
+        max_seq_len = 256
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
                 [
@@ -159,10 +145,30 @@ class TestCLIBuild:
                     "--no-weights",
                     "--static-cache",
                     "--max-seq-len",
-                    "256",
+                    str(max_seq_len),
                 ]
             )
-            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+            model_path = os.path.join(tmpdir, "model.onnx")
+            assert os.path.isfile(model_path)
+
+            # Verify the cache input has the expected max_seq_len
+            # dimension. Static cache shape: [batch, max_seq_len, kv_hidden]
+            model = onnx.load(model_path)
+            cache_inputs = [
+                inp
+                for inp in model.graph.input
+                if inp.name.startswith("key_cache.")
+            ]
+            assert len(cache_inputs) > 0, "No key_cache inputs found"
+            seq_dim = (
+                cache_inputs[0]
+                .type.tensor_type.shape.dim[1]
+                .dim_value
+            )
+            assert seq_dim == max_seq_len, (
+                f"key_cache.0 seq dimension is {seq_dim}, "
+                f"expected {max_seq_len}"
+            )
 
 
 class TestCLIInfo:
