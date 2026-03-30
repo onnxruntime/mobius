@@ -273,6 +273,8 @@ def _extract_rope_config(config) -> RoPEConfig:
             _nested_rope_theta(rope_scaling, "full_attention"),
             default=10_000.0,
         ),
+        # Some models (e.g. Ministral-3) store YaRN config under
+        # rope_parameters instead of rope_scaling; fall back accordingly.
         rope_scaling=(
             _normalize_rope_scaling(rope_scaling)
             or _normalize_rope_scaling(rope_parameters)
@@ -291,6 +293,7 @@ def _extract_rope_config(config) -> RoPEConfig:
         original_max_position_embeddings=_first_not_none(
             getattr(config, "original_max_position_embeddings", None),
             rope_scaling.get("original_max_position_embeddings", None),
+            # Also check rope_parameters (see rope_scaling comment above).
             rope_parameters.get(
                 "original_max_position_embeddings", None
             ),
