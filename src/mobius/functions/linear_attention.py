@@ -292,7 +292,9 @@ def _build_recurrence_body(
 
     # Only specify dtype, not shape. Shapes can be inferred from Scan op's
     # inputs. Hard-coding locally chosen symbolic dim names is incorrect
-    # since ONNX has a global scope for symbolic dims.
+    # since ONNX has a global scope for symbolic dims. Even the dtype is
+    # optional in that it can be inferred, but specifying it is safe and
+    # can help as long as we know the exact type.
     state_in = ir.Value(name="state", type=dtype)
     q_t = ir.Value(name="q_t", type=dtype)
     k_t = ir.Value(name="k_t", type=dtype)
