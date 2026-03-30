@@ -44,11 +44,13 @@ __all__ = [
     "GemmaCausalLMModel",
     "Glm4MoECausalLMModel",
     "GraniteCausalLMModel",
+    "HunYuanMoEV1CausalLMModel",
     "HunyuanDiT2DModel",
     "IPAdapterModel",
     "InternLM2CausalLMModel",
     "InternVL2Model",
     "JambaCausalLMModel",
+    "Llama4CausalLMModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "MPTCausalLMModel",
@@ -147,6 +149,7 @@ from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
+from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
@@ -154,6 +157,7 @@ from mobius.models.moe import (
     Ernie45MoECausalLMModel,
     Glm4MoECausalLMModel,
     GPTOSSCausalLMModel,
+    HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,

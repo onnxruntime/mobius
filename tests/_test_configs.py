@@ -790,8 +790,13 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "hunyuan_v1_moe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qk_norm": True,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE,
+        },
+        True,
     ),
     (
         "minimax",

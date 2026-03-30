@@ -470,6 +470,49 @@ class Glm4MoECausalLMModel(CausalLMModel):
         return super().preprocess_weights(state_dict)
 
 
+class HunYuanMoEV1CausalLMModel(CausalLMModel):
+    """HunYuan MoE V1 causal language model.
+
+    Extends the generic MoE model with:
+    - QK-norm: per-head RMSNorm on Q and K projections after linear projection.
+    - Ungated shared expert (``shared_mlp``): runs on every token, added to
+      routed expert output without sigmoid gating.
+    - Custom gate naming: HF uses ``gate.wg.weight``; we use ``gate.weight``.
+
+    HuggingFace class: ``HunYuanMoEV1ForCausalLM``
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self.config = config
+        self.model = MoETextModel(config, layer_class=UngatedSharedMoEDecoderLayer)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Preprocess HF weights for HunYuan MoE V1.
+
+        Renames:
+        - ``query_layernorm`` → ``q_norm`` (QK-norm on attention)
+        - ``key_layernorm`` → ``k_norm``
+        - ``gate.wg.weight`` → ``gate.weight`` (routing gate)
+        - ``shared_mlp.*`` → ``shared_expert.*`` (ungated shared expert)
+        """
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = key
+            new_key = new_key.replace(".query_layernorm.", ".q_norm.")
+            new_key = new_key.replace(".key_layernorm.", ".k_norm.")
+            new_key = new_key.replace(".gate.wg.", ".gate.")
+            new_key = new_key.replace(".shared_mlp.", ".shared_expert.")
+            renamed[new_key] = value
+        state_dict = _rename_moe_expert_weights(renamed)
+        return super().preprocess_weights(state_dict)
+
+
 def _rename_moe_expert_weights(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:

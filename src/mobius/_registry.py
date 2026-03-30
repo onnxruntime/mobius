@@ -259,8 +259,10 @@ def _create_default_registry() -> ModelRegistry:
         Glm4MoECausalLMModel,
         GPTOSSCausalLMModel,
         GraniteCausalLMModel,
+        HunYuanMoEV1CausalLMModel,
         InternLM2CausalLMModel,
         LayerNormCausalLMModel,
+        Llama4CausalLMModel,
         MoECausalLMModel,
         NanoChatCausalLMModel,
         NemotronCausalLMModel,
@@ -333,7 +335,6 @@ def _create_default_registry() -> ModelRegistry:
         "helium",
         "hunyuan_v1_dense",
         "llama",
-        "llama4_text",
         "longcat_flash",
         "minicpm",
         "minicpm3",
@@ -383,6 +384,7 @@ def _create_default_registry() -> ModelRegistry:
         "diffllama": DiffLlamaCausalLMModel,
         "doge": DogeCausalLMModel,
         "internlm2": InternLM2CausalLMModel,
+        "llama4_text": Llama4CausalLMModel,
         "modernbert-decoder": ModernBertDecoderModel,
         "nemotron": NemotronCausalLMModel,
         "olmo": OLMoCausalLMModel,
@@ -406,7 +408,6 @@ def _create_default_registry() -> ModelRegistry:
         "granitemoe",
         "granitemoehybrid",
         "granitemoeshared",
-        "hunyuan_v1_moe",
         "jetmoe",
         "mixtral",
         "olmoe",
@@ -417,6 +418,7 @@ def _create_default_registry() -> ModelRegistry:
         reg.register(name, MoECausalLMModel)
     reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
     reg.register("glm4_moe", Glm4MoECausalLMModel)
+    reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
     reg.register("qwen2_moe", Qwen2MoECausalLMModel)
 
     from mobius.models.minimax import MiniMaxCausalLMModel
