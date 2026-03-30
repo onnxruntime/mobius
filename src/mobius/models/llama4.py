@@ -31,7 +31,4 @@ class Llama4CausalLMModel(CausalLMModel):
     ) -> dict[str, torch.Tensor]:
         state_dict = super().preprocess_weights(state_dict)
         # HF uses layers.{i}.feed_forward.*; ONNX uses layers.{i}.mlp.*
-        return {
-            k.replace(".feed_forward.", ".mlp."): v
-            for k, v in state_dict.items()
-        }
+        return {k.replace(".feed_forward.", ".mlp."): v for k, v in state_dict.items()}
