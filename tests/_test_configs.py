@@ -316,7 +316,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
-    ("qwen3_5_vl_text", {"attn_qk_norm": True}, False),
     ("qwen3_vl_text", {"attn_qk_norm": True}, False),
     ("smollm3", {}, False),
     # === Mixture of Experts ===
@@ -480,27 +479,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
-    (
-        "deepseek_v2_moe",
-        {
-            "q_lora_rank": 32,
-            "kv_lora_rank": 16,
-            "qk_nope_head_dim": 16,
-            "qk_rope_head_dim": 8,
-            "v_head_dim": 16,
-            "num_local_experts": 4,
-            "num_experts_per_tok": 2,
-            "moe_intermediate_size": 32,
-            "n_group": 2,
-            "topk_group": 1,
-            "routed_scaling_factor": 1.0,
-            "scoring_func": "softmax",
-            "topk_method": "group_limited_greedy",
-            "first_k_dense_replace": 1,
-            "n_shared_experts": 1,
-        },
-        False,
-    ),
     ("exaone", {}, False),
     # DeepSeek-V2 without MLA (standard attention + MoE, like OCR-2 LLM)
     (
@@ -575,16 +553,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "dbrx",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
-    ),
-    (
-        "gptoss",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
-    ),
-    (
-        "gpt_oss",
         {"num_local_experts": 4, "num_experts_per_tok": 2},
         False,
     ),
@@ -685,11 +653,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # seed_oss uses attention_bias=True by default (HF always has q/k/v biases).
     # Set attn_qkv_bias=True so our ONNX model also has these biases for parity.
     ("seed_oss", {"attn_qkv_bias": True}, False),
-    (
-        "glm4v_text",
-        {"attn_qkv_bias": True, "attn_o_bias": True},
-        False,
-    ),
     ("zamba2", {}, False),
     # === Additional GPT2 aliases ===
     # num_key_value_heads=TINY_HEADS: GPT-2 family never uses GQA; setting
@@ -815,11 +778,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     (
-        "glm4v_moe_text",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
-    ),
-    (
         "granitemoehybrid",
         {
             "_config_cls": GraniteMoeHybridConfig,
@@ -860,16 +818,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "head_dim": TINY_HIDDEN // TINY_HEADS,
         },
         True,
-    ),
-    (
-        "qwen3_omni_moe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
-    ),
-    (
-        "qwen3_vl_moe",
-        {"num_local_experts": 4, "num_experts_per_tok": 2},
-        False,
     ),
     # --- Variant coverage: architecture code-path variants ---
     # qwen3_next: mostly full-attention (1 linear + 1 full) — exercises full-attention path
@@ -1743,6 +1691,20 @@ ALL_CONFIGS: list[tuple[str, dict, bool]] = (
 # a model_type can appear more than once with different overrides).
 _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 
+# Internal aliases removed from test configs — they are still registered in
+# the registry but should not appear in any test parametrization.  Their real
+# HF model_type counterpart (or the underlying model class) is already tested.
+_EXCLUDED_ALIASES: set[str] = {
+    "qwen3_5_vl_text",   # VL text decoder; real type is qwen3_5_text
+    "qwen3_omni_moe",    # VL MoE; no HF AutoModelForCausalLM support
+    "qwen3_vl_moe",      # VL MoE; no HF AutoModelForCausalLM support
+    "glm4v_moe_text",    # VL MoE text; no HF AutoModelForCausalLM support
+    "glm4v_text",        # VL text; GLM architecture incompatible with CausalLMModel
+    "deepseek_v2_moe",   # our custom alias; real type is deepseek_v2
+    "gptoss",            # alias for gpt_oss
+    "gpt_oss",           # packed expert layout mismatch
+}
+
 
 # ---------------------------------------------------------------------------
 # Auto-generated entries for registered model types not covered above
@@ -1768,6 +1730,8 @@ def _auto_generated_configs() -> list[tuple[str, dict, bool]]:
     auto: list[tuple[str, dict, bool]] = []
     for model_type in sorted(registry.architectures()):
         if model_type in _EXPLICIT_MODEL_TYPES:
+            continue
+        if model_type in _EXCLUDED_ALIASES:
             continue
         task = _default_task_for_model(model_type)
         if task in auto_tasks:

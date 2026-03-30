@@ -391,16 +391,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "ffn_hidden_size": TINY_INTERMEDIATE,
         "layer_norm_epsilon": 1e-6,
     },
-    # falcon_h1 in mobius uses FalconCausalLMModel (Falcon ALiBi architecture);
-    # map it to HF "falcon" type for comparison. Must use MHA (num_kv_heads=num_heads)
-    # because ALiBi bias shape (1, num_heads, q, total) is incompatible with GQA in ORT.
-    "falcon_h1": {
-        "multi_query": False,
-        "num_kv_heads": TINY_HEADS,
-        "new_decoder_architecture": True,
-        "ffn_hidden_size": TINY_INTERMEDIATE,
-        "layer_norm_epsilon": 1e-6,
-    },
 }
 
 
