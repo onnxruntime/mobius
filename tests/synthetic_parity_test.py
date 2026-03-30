@@ -178,11 +178,6 @@ _XFAIL_REASONS: dict[str, str] = {
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
-    # Llama4: Llama4CausalLMModel is currently a stub (CausalLMModel base).
-    # HF llama4_text uses chunked/interleaved attention (alternating full/local windows)
-    # which differs from standard causal attention even with moe_layers=[] and
-    # use_qk_norm=False.  Parity requires a proper Llama4-specific attention impl.
-    "llama4_text": "Llama4 chunked/interleaved attention not yet implemented (stub uses standard CausalLMModel)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
