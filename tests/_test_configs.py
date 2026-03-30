@@ -15,7 +15,10 @@ are simple aliases of a base class with ``{}`` overrides are marked
 
 from __future__ import annotations
 
+import dataclasses
+
 from mobius._configs import (
+    ArchitectureConfig,
     BambaConfig,
     DepthAnythingConfig,
     Gemma2Config,
@@ -45,6 +48,42 @@ TINY_LAYERS = 2
 TINY_VOCAB = 256
 
 LONGROPE_FACTORS = [1.0] * (int(TINY_HEAD_DIM * 0.5) // 2)
+
+
+def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
+    """Create a tiny ArchitectureConfig for graph-build and parity tests.
+
+    Applies a set of small defaults (hidden_size=64, 2 layers, etc.) and
+    merges caller-supplied *overrides*.  Unknown fields are filtered out for
+    dataclass-based config classes so that specialised configs (e.g.
+    MambaConfig) that lack ``rope_*`` fields don't fail on construction.
+    """
+    if config_cls is None:
+        config_cls = overrides.pop("_config_cls", ArchitectureConfig)
+    else:
+        overrides.pop("_config_cls", None)
+    defaults = dict(
+        hidden_size=TINY_HIDDEN,
+        intermediate_size=TINY_INTERMEDIATE,
+        num_attention_heads=TINY_HEADS,
+        num_key_value_heads=TINY_KV_HEADS,
+        head_dim=TINY_HEAD_DIM,
+        num_hidden_layers=TINY_LAYERS,
+        vocab_size=TINY_VOCAB,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10_000.0,
+        pad_token_id=0,
+    )
+    defaults.update(overrides)
+    # Filter out fields not accepted by the config class (e.g. MambaConfig
+    # doesn't have max_position_embeddings or rope_* fields).
+    if dataclasses.is_dataclass(config_cls):
+        valid_fields = {f.name for f in dataclasses.fields(config_cls)}
+        defaults = {k: v for k, v in defaults.items() if k in valid_fields}
+    return config_cls(**defaults)
 
 
 # ---------------------------------------------------------------------------

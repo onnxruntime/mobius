@@ -33,6 +33,7 @@ from _test_configs import (
     TINY_KV_HEADS,
     TINY_LAYERS,
     TINY_VOCAB,
+    _base_config,
 )
 
 from mobius._config_resolver import _default_task_for_model
@@ -397,31 +398,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "layer_types": ["sliding_attention", "full_attention"],
     },
 }
-
-
-def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
-    """Create a tiny config.  Mirrors build_graph_test._base_config."""
-    if config_cls is None:
-        config_cls = overrides.pop("_config_cls", ArchitectureConfig)
-    else:
-        overrides.pop("_config_cls", None)
-    defaults = dict(
-        hidden_size=TINY_HIDDEN,
-        intermediate_size=TINY_INTERMEDIATE,
-        num_attention_heads=TINY_HEADS,
-        num_key_value_heads=TINY_KV_HEADS,
-        head_dim=TINY_HEAD_DIM,
-        num_hidden_layers=TINY_LAYERS,
-        vocab_size=TINY_VOCAB,
-        max_position_embeddings=128,
-        hidden_act="silu",
-        rms_norm_eps=1e-6,
-        rope_type="default",
-        rope_theta=10_000.0,
-        pad_token_id=0,
-    )
-    defaults.update(overrides)
-    return config_cls(**defaults)
 
 
 # Some mobius model_types map to a multimodal HF config class that wraps an
