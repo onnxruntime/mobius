@@ -1,4 +1,4 @@
-model_id: "xlm-mlm-en-2048"
+model_id: "FacebookAI/xlm-mlm-en-2048"
 revision: "6eb6401a142611ae90f3d6bc606b97384f1c9961"
 task_type: "text-generation"
 dtype: "float32"
