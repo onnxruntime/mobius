@@ -201,7 +201,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # === Other Llama-compatible ===
-    ("modernbert-decoder", {}, False),
+    # ModernBERT-Decoder uses MHA only (HF sets kv_heads=num_heads internally);
+    # set num_key_value_heads=TINY_HEADS to match.
+    ("modernbert-decoder", {"num_key_value_heads": TINY_HEADS}, False),
     # === Text Generation (architecture-specific) ===
     (
         "gemma",
@@ -394,10 +396,14 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     # === Falcon and Bloom ===
-    ("falcon", {"parallel_attn": True}, True),
+    # dual_ln=True: Falcon with new_decoder_architecture uses separate ln_attn + ln_mlp.
+    ("falcon", {"parallel_attn": True, "dual_ln": True}, True),
     (
         "falcon_h1",
-        {"alibi": True, "attn_qkv_bias": True},
+        # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads
+        # in ORT Attention (GQA is incompatible with ALiBi). Use MHA (kv_heads=num_heads).
+        # dual_ln=True: new_decoder_architecture uses separate ln_attn + ln_mlp.
+        {"alibi": True, "attn_qkv_bias": True, "num_key_value_heads": TINY_HEADS, "dual_ln": True},
         True,
     ),
     (
@@ -671,7 +677,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     ("open-llama", {}, False),
-    ("seed_oss", {}, False),
+    # seed_oss uses attention_bias=True by default (HF always has q/k/v biases).
+    # Set attn_qkv_bias=True so our ONNX model also has these biases for parity.
+    ("seed_oss", {"attn_qkv_bias": True}, False),
     (
         "glm4v_text",
         {"attn_qkv_bias": True, "attn_o_bias": True},
@@ -928,7 +936,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # falcon_h1: ALiBi with parallel attention+MLP
     (
         "falcon_h1",
-        {"alibi": True, "attn_qkv_bias": True, "parallel_attn": True},
+        # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads
+        # in ORT Attention (GQA is incompatible with ALiBi). Use MHA (kv_heads=num_heads).
+        # dual_ln=True: new_decoder_architecture uses separate ln_attn + ln_mlp.
+        {"alibi": True, "attn_qkv_bias": True, "parallel_attn": True, "num_key_value_heads": TINY_HEADS, "dual_ln": True},
         False,
     ),
     # jamba: hybrid Mamba+Attention with MoE (requires JambaConfig)
