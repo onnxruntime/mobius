@@ -32,7 +32,6 @@ from mobius.components import (
     Attention,
     Embedding,
     Linear,
-    OffsetRMSNorm,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -281,15 +280,9 @@ class Gemma3nDecoderLayer(nn.Module):
         self.self_attn = Gemma3nAttention(config)
         self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.altup = Gemma3nAltUp(config)
         self.laurel = Gemma3nLaurelBlock(

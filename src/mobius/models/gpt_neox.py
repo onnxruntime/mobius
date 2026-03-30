@@ -198,7 +198,9 @@ class GPTNeoXCausalLMModel(CausalLMModel):
         """
         # gpt_neox_japanese uses the same architecture but a different top-level
         # module prefix; normalize it so the rest of the renames apply uniformly
-        state_dict = {k.replace("gpt_neox_japanese.", "gpt_neox."): v for k, v in state_dict.items()}
+        state_dict = {
+            k.replace("gpt_neox_japanese.", "gpt_neox."): v for k, v in state_dict.items()
+        }
 
         # Split per-head interleaved QKV: [h0_q, h0_k, h0_v, h1_q, ...]
         state_dict = split_interleaved_qkv_weights(
