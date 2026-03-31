@@ -40,7 +40,6 @@ from mobius._builder import SymbolicShapeInferencePass, build_from_module
 from mobius.models import CausalLMModel
 from mobius.tasks import CausalLMTask
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -325,8 +324,8 @@ def test_op_coverage_comparison():
     graph variant targeting ORT contrib ops directly.
     """
     import onnx
-    import onnx_shape_inference._ops  # trigger registration
     import onnx_shape_inference as osi
+    import onnx_shape_inference._ops  # trigger registration
 
     reg = osi.registry
 
@@ -358,17 +357,17 @@ def test_op_coverage_comparison():
             )
 
     # Summary for human readers (always printed)
-    print(f"\n=== Op Coverage Summary ===")
+    print("\n=== Op Coverage Summary ===")
     print(f"onnx version: {onnx.__version__} (opset {onnx_opset})")
     print(
         f"SymbolicShapeInferencePass: {standard_count} standard ops, "
         f"{ms_contrib_count} com.microsoft contrib ops"
     )
     print(
-        f"ShapeInferencePass (ONNX C++): covers standard ONNX + opset 23, "
-        f"NO com.microsoft contrib ops"
+        "ShapeInferencePass (ONNX C++): covers standard ONNX + opset 23, "
+        "NO com.microsoft contrib ops"
     )
-    print(f"Mobius model ops: all standard ONNX + opset 23 (no contrib ops currently)")
+    print("Mobius model ops: all standard ONNX + opset 23 (no contrib ops currently)")
 
     assert standard_count >= 190, f"Expected 190+ standard ops, got {standard_count}"
     assert ms_contrib_count >= 40, f"Expected 40+ ms contrib ops, got {ms_contrib_count}"
@@ -456,15 +455,12 @@ def test_print_comparison_summary():
     print("\n" + "=" * 70)
     print("SHAPE INFERENCE COMPARISON: SymbolicPass vs onnx_ir ShapeInferencePass")
     print("=" * 70)
-    print(f"\nModel: CausalLMModel (LLaMA-style, tiny config — no weights)")
+    print("\nModel: CausalLMModel (LLaMA-style, tiny config — no weights)")
     print(f"Total intermediate values: {sym_stats.total}")
     print()
     print(f"{'Property':<48} {'Symbolic':>10} {'onnx_ir':>10}")
     print("-" * 70)
-    print(
-        f"{'Starting state required':<48} "
-        f"{'Any':>10} {'Typed model':>10}"
-    )
+    print(f"{'Starting state required':<48} {'Any':>10} {'Typed model':>10}")
     print(
         f"{'Shape coverage (fully stripped model)':<48} "
         f"{sym_stats.with_shape:>9}/{sym_stats.total} "
@@ -480,22 +476,10 @@ def test_print_comparison_summary():
         f"{sym_stats.with_dtype:>9}/{sym_stats.total} "
         f"{onnx_ir_stripped_stats.with_dtype:>9}/{onnx_ir_stripped_stats.total}"
     )
-    print(
-        f"{'Produces symbolic dims (batch, seq_len)':<48} "
-        f"{'Yes':>10} {'No':>10}"
-    )
-    print(
-        f"{'com.microsoft contrib op support':<48} "
-        f"{'Yes (51)':>10} {'No':>10}"
-    )
-    print(
-        f"{'Serialization round-trip required':<48} "
-        f"{'No':>10} {'Yes':>10}"
-    )
-    print(
-        f"{'Can run after optimization pipeline':<48} "
-        f"{'Yes':>10} {'Yes':>10}"
-    )
+    print(f"{'Produces symbolic dims (batch, seq_len)':<48} {'Yes':>10} {'No':>10}")
+    print(f"{'com.microsoft contrib op support':<48} {'Yes (51)':>10} {'No':>10}")
+    print(f"{'Serialization round-trip required':<48} {'No':>10} {'Yes':>10}")
+    print(f"{'Can run after optimization pipeline':<48} {'Yes':>10} {'Yes':>10}")
     print()
     print(f"Symbolic dim names found: {sorted(symbolic_dims)[:8]} ...")
     print()
