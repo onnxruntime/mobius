@@ -486,6 +486,7 @@ class PixtralVisionTower(nn.Module):
             kernel_size=vc.patch_size,
             stride=vc.patch_size,
         )
+        # HuggingFace PixtralVisionModel hardcodes eps=1e-5 (no config field)
         self.ln_pre = RMSNorm(vc.hidden_size, eps=1e-5)
         self.transformer = PixtralTransformerEncoder(
             num_layers=vc.num_hidden_layers,
