@@ -56,16 +56,34 @@ if str(_TESTS_DIR) not in sys.path:
 
 from _test_configs import (  # noqa: E402
     ALL_CAUSAL_LM_CONFIGS,
+    DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
+    SPEECH_CONFIGS,
+    SSM_CONFIGS,
     VISION_CONFIGS,
+    VL_CONFIGS,
 )
 
 
 def _l1_l3_model_types() -> set[str]:
-    """Return model_types that have a test config in _test_configs.py."""
+    """Return model_types that have a test config in _test_configs.py.
+
+    Includes ALL config lists: causal LM, encoder, seq2seq, vision,
+    detection, SSM, vision-language, and speech.
+    """
     types: set[str] = set()
-    for mt, _, _ in ALL_CAUSAL_LM_CONFIGS + ENCODER_CONFIGS + SEQ2SEQ_CONFIGS + VISION_CONFIGS:
+    all_configs = (
+        ALL_CAUSAL_LM_CONFIGS
+        + ENCODER_CONFIGS
+        + SEQ2SEQ_CONFIGS
+        + VISION_CONFIGS
+        + DETECTION_CONFIGS
+        + SSM_CONFIGS
+        + VL_CONFIGS
+        + SPEECH_CONFIGS
+    )
+    for mt, _, _ in all_configs:
         types.add(mt)
     return types
 
@@ -75,14 +93,23 @@ def _l1_l3_model_types() -> set[str]:
 # ---------------------------------------------------------------------------
 
 
+import functools
+
+
+@functools.cache
+def _discovered_cases() -> tuple:
+    """Cache the result of discover_test_cases() to avoid re-parsing YAML."""
+    return tuple(discover_test_cases())
+
+
 def _yaml_model_ids() -> set[str]:
     """Collect all model_ids present in YAML test case files."""
-    return {case.model_id for case in discover_test_cases()}
+    return {case.model_id for case in _discovered_cases()}
 
 
 def _yaml_cases_by_model_id() -> dict[str, object]:
     """Map model_id → GoldenTestCase for JSON golden file lookups."""
-    return {case.model_id: case for case in discover_test_cases()}
+    return {case.model_id: case for case in _discovered_cases()}
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +140,6 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - Vision-language models
 #   - Audio / speech models
 #   - trust_remote_code
-#   - SSM / state-space models
 #   - Very large models
 #   - Models without test_model_id
 #   - CausalLM / other models without YAML
@@ -174,9 +200,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
-    # --- SSM / state-space models ---
-    "mamba": "SSM model — specialised config not yet added",
-    "mamba2": "SSM model — specialised config not yet added",
     # --- Very large models without small public checkpoints ---
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
@@ -245,7 +268,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "openelm": "CausalLM — YAML not yet created",
     "qwen": "CausalLM — YAML not yet created",
     "youtu": "CausalLM — YAML not yet created",
-    "yolos": "Object detection — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
     "zamba2": "CausalLM — YAML not yet created",
 }
@@ -280,8 +302,8 @@ class TestSkipListIntegrity:
 class TestL1L3GraphBuildCoverage:
     """L1 + L3: every model needs a test config in _test_configs.py.
 
-    The config enables ``build_graph_test.py`` and
-    ``synthetic_parity_test.py`` to exercise the model.
+    The config enables ``build_graph_test.py`` to exercise the model.
+    For causal-LM models, it also enables ``synthetic_parity_test.py``.
     """
 
     def test_all_models_have_test_config_or_skip(self):
@@ -383,7 +405,7 @@ class TestL4L5GoldenDataCoverage:
         been run yet.  This test warns but does not fail — the per-model
         test already tracks individual coverage.
         """
-        cases = discover_test_cases()
+        cases = _discovered_cases()
         incomplete = []
         for case in cases:
             if has_golden(case):
@@ -425,7 +447,11 @@ class TestL4L5GoldenDataCoverage:
                 f"Add a YAML file or add '{arch}' to _COVERAGE_SKIP."
             )
 
-        # YAML exists — also check for golden JSON output
+        # YAML exists — also check for golden JSON output.
+        # Note: missing golden JSON is a skip (not a fail) because YAML
+        # test cases are created first and golden generation requires a
+        # GPU run via scripts/generate_golden.py.  L5 enforcement is
+        # tracked by test_all_yaml_cases_have_golden_json_or_skip_reason.
         cases_by_id = _yaml_cases_by_model_id()
         case = cases_by_id.get(model_id)
         if case is not None and not has_golden(case):

@@ -2113,7 +2113,6 @@ _EXCLUDED_ALIASES: set[str] = {
     "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
     "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
     "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
-    "gptoss",  # alias for gpt_oss; real type tested via gpt_oss entry
     # VL text-only submodels (tested via VL parent model)
     "qwen2_vl_text",
     "qwen2_5_vl_text",
