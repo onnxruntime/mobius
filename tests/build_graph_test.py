@@ -1158,6 +1158,70 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
         assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
 
+    def test_pixtral_preprocess_weights_remapping(self):
+        """Verify _preprocess_pixtral_weights remaps HF weight names correctly."""
+        import torch
+
+        from mobius.models.llava import _preprocess_pixtral_weights
+
+        state_dict = {
+            "vision_tower.patch_conv.weight": torch.zeros(1),
+            "multi_modal_projector.norm.weight": torch.zeros(1),
+            "language_model.model.embed_tokens.weight": torch.zeros(1),
+            "language_model.lm_head.weight": torch.zeros(1),
+            "language_model.model.layers.0.self_attn.q_proj.weight": torch.zeros(1),
+        }
+        result = _preprocess_pixtral_weights(
+            state_dict, tie_word_embeddings=False
+        )
+
+        # Vision/projector keys get vision_encoder. prefix
+        assert "vision_encoder.vision_tower.patch_conv.weight" in result
+        assert "vision_encoder.multi_modal_projector.norm.weight" in result
+        # embed_tokens duplicated to decoder and embedding
+        assert "decoder.model.embed_tokens.weight" in result
+        assert "embedding.embed_tokens.weight" in result
+        # lm_head remapped under decoder
+        assert "decoder.lm_head.weight" in result
+        # Other language_model keys remapped under decoder
+        assert "decoder.model.layers.0.self_attn.q_proj.weight" in result
+        # Original keys should not be present
+        for original_key in state_dict:
+            assert original_key not in result
+
+        # tie_word_embeddings=True creates decoder.lm_head.weight from embed_tokens
+        state_dict_tied = {
+            "language_model.model.embed_tokens.weight": torch.zeros(1),
+        }
+        result_tied = _preprocess_pixtral_weights(
+            state_dict_tied, tie_word_embeddings=True
+        )
+        assert "decoder.lm_head.weight" in result_tied
+        assert "decoder.model.embed_tokens.weight" in result_tied
+        assert "embedding.embed_tokens.weight" in result_tied
+
+    def test_pixtral_preprocess_weights_model_prefix_strip(self):
+        """Verify outer model. prefix is stripped (Mistral3ForConditionalGeneration)."""
+        import torch
+
+        from mobius.models.llava import _preprocess_pixtral_weights
+
+        state_dict = {
+            "model.vision_tower.patch_conv.weight": torch.zeros(1),
+            "model.language_model.model.layers.0.mlp.gate_proj.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(1),
+        }
+        result = _preprocess_pixtral_weights(
+            state_dict, tie_word_embeddings=False
+        )
+
+        # model. prefix stripped, then vision gets vision_encoder. prefix
+        assert "vision_encoder.vision_tower.patch_conv.weight" in result
+        # model. prefix stripped, then language_model remapped to decoder
+        assert "decoder.model.layers.0.mlp.gate_proj.weight" in result
+        # bare lm_head gets decoder. prefix
+        assert "decoder.lm_head.weight" in result
+
     def test_mllama_vision_language_graph(self):
         """Build Mllama (Llama 3.2 Vision) with cross-attention decoder."""
         from mobius._configs import MllamaConfig
