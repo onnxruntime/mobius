@@ -3354,7 +3354,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 # These are registered in the registry for production use but removed
 # from test configs because they duplicate existing coverage or
 # cannot be tested with our generic test infrastructure.
-_KNOWN_UNTESTED_MODEL_TYPES: set[str] = set()
+_KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
+    "deepseek_v2_moe",  # Alias for deepseek_v2 — tested via deepseek_v2
+    "qwen3_5_vl_text",  # VL text decoder — tested via parent VL model
+}
 
 
 class TestRegistryCompleteness:

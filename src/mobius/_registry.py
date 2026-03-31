@@ -73,6 +73,7 @@ from mobius.models import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35VL3ModelCausalLMModel,
+    Qwen35VLTextModel,
     QwenCausalLMModel,
     SmolLM3CausalLMModel,
     WhisperForConditionalGeneration,
@@ -446,6 +447,7 @@ def _create_default_registry() -> ModelRegistry:
     # --- DeepSeek (MLA + MoE) ---
     for name in (
         "deepseek_v2",
+        "deepseek_v2_moe",
         "deepseek_v3",
     ):
         reg.register(name, DeepSeekV3CausalLMModel)
@@ -521,6 +523,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("qwen3_vl_text", Qwen3VLTextModel)
     reg.register("qwen3_5", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
     reg.register("qwen3_5_vl", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
+    reg.register("qwen3_5_vl_text", Qwen35VLTextModel)
 
     # --- Speech ---
     reg.register(
@@ -806,6 +809,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- DeepSeek (MLA + MoE) ---
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
+    "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
 
     # --- SSM (Mamba) ---
@@ -997,6 +1001,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
+    "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
@@ -1064,6 +1069,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
 # -- Variant labels for code-path identification --
 _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
+    "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",

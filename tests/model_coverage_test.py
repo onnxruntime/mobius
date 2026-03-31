@@ -122,6 +122,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
+    "deepseek_v2_moe": "Alias for deepseek_v2 — covered by deepseek_v2",
     "gpt_oss": "Internal model — no public HF checkpoint",
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
@@ -133,6 +134,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "glm4v_text": "VL text decoder — tested via glm4v",
     "qwen2_5_vl_text": "VL text decoder — tested via qwen2_5_vl",
     "qwen2_vl_text": "VL text decoder — tested via qwen2_vl",
+    "qwen3_5_vl_text": "VL text decoder — tested via qwen3_5_vl",
     # --- Vision-language models (require image/video inputs) ---
     "blip": "VL model — requires image inputs",
     "blip-2": "VL model — requires image inputs",
