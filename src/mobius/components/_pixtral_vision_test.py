@@ -101,7 +101,7 @@ def test_transformer_encoder_layer_count():
 
 
 def test_patch_merger_builds():
-    """PatchMerger constructs with correct merged dim."""
+    """PatchMerger reduces from merged_dim to hidden_size."""
     merger = Mistral3PatchMerger(hidden_size=32, spatial_merge_size=2)
-    # merged_dim = 32 * 2 * 2 = 128
-    assert list(merger.merging_layer.weight.shape) == [128, 128]
+    # input_dim = 32 * 2 * 2 = 128, output_dim = 32
+    assert list(merger.merging_layer.weight.shape) == [32, 128]

@@ -296,7 +296,10 @@ class Mistral3PatchMerger(nn.Module):
         merged_dim = (
             hidden_size * spatial_merge_size * spatial_merge_size
         )
-        self.merging_layer = Linear(merged_dim, merged_dim, bias=False)
+        # Reduces merged patches back to vision_hidden_size
+        self.merging_layer = Linear(
+            merged_dim, hidden_size, bias=False,
+        )
 
     def forward(
         self,
@@ -313,7 +316,7 @@ class Mistral3PatchMerger(nn.Module):
             grid_w: scalar — patch grid width.
 
         Returns:
-            [batch, (H/ms)*(W/ms), ms^2*D] after merge + linear.
+            [batch, (H/ms)*(W/ms), hidden_size] after merge + linear.
         """
         ms = self._merge_size
         batch = op.Shape(hidden_states, start=0, end=1)
@@ -365,17 +368,13 @@ class Mistral3MultiModalProjector(nn.Module):
         spatial_merge_size: int = 2,
     ):
         super().__init__()
-        merged_dim = (
-            vision_hidden_size
-            * spatial_merge_size
-            * spatial_merge_size
-        )
         self.patch_merger = Mistral3PatchMerger(
             vision_hidden_size, spatial_merge_size,
         )
-        self.norm = RMSNorm(merged_dim, eps=1e-5)
+        # After merging, dims are back to vision_hidden_size
+        self.norm = RMSNorm(vision_hidden_size, eps=1e-5)
         self.linear_1 = Linear(
-            merged_dim, text_hidden_size, bias=False,
+            vision_hidden_size, text_hidden_size, bias=False,
         )
         self.linear_2 = Linear(
             text_hidden_size, text_hidden_size, bias=False,
