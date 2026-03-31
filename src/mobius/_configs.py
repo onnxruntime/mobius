@@ -298,9 +298,7 @@ def _extract_rope_config(config) -> RoPEConfig:
             getattr(config, "original_max_position_embeddings", None),
             rope_scaling.get("original_max_position_embeddings", None),
             # Also check rope_parameters (see rope_scaling comment above).
-            rope_parameters.get(
-                "original_max_position_embeddings", None
-            ),
+            rope_parameters.get("original_max_position_embeddings", None),
         ),
     )
 

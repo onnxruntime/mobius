@@ -1155,12 +1155,8 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
-        assert "logits" in {
-            o.name for o in pkg["decoder"].graph.outputs
-        }
-        assert "pixel_values" in {
-            i.name for i in pkg["vision"].graph.inputs
-        }
+        assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
+        assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
 
     def test_mllama_vision_language_graph(self):
         """Build Mllama (Llama 3.2 Vision) with cross-attention decoder."""

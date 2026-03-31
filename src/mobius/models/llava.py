@@ -156,15 +156,9 @@ class _PixtralVisionEncoderModel(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
         )
 
-    def forward(
-        self, op: builder.OpBuilder, pixel_values: ir.Value
-    ):
-        hidden_states, grid_h, grid_w = self.vision_tower(
-            op, pixel_values
-        )
-        return self.multi_modal_projector(
-            op, hidden_states, grid_h, grid_w
-        )
+    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+        hidden_states, grid_h, grid_w = self.vision_tower(op, pixel_values)
+        return self.multi_modal_projector(op, hidden_states, grid_h, grid_w)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -172,9 +166,7 @@ class _PixtralVisionEncoderModel(nn.Module):
         return {
             key: value
             for key, value in state_dict.items()
-            if key.startswith(
-                ("vision_tower.", "multi_modal_projector.")
-            )
+            if key.startswith(("vision_tower.", "multi_modal_projector."))
         }
 
 
@@ -197,8 +189,7 @@ class LLaVAModel(nn.Module):
         # Dispatch: use Pixtral vision encoder for pixtral-based models,
         # CLIP/SigLIP for everything else.
         self._is_pixtral = (
-            config.vision
-            and getattr(config.vision, "model_type", None) == "pixtral"
+            config.vision and getattr(config.vision, "model_type", None) == "pixtral"
         )
         if self._is_pixtral:
             self.vision_encoder = _PixtralVisionEncoderModel(config)
@@ -219,9 +210,7 @@ class LLaVAModel(nn.Module):
         # ``language_model.`` — strip it so the decoder/embedding
         # sub-models can find their weights.
         if self._is_pixtral:
-            return _preprocess_pixtral_weights(
-                state_dict, self.config.tie_word_embeddings
-            )
+            return _preprocess_pixtral_weights(state_dict, self.config.tie_word_embeddings)
         # Default LLaVA: only handle weight tying
         if self.config.tie_word_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
@@ -244,24 +233,20 @@ def _preprocess_pixtral_weights(
     """
     renamed: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        if key.startswith(
-            ("vision_tower.", "multi_modal_projector.")
-        ):
+        if key.startswith(("vision_tower.", "multi_modal_projector.")):
             # Vision/projector: add vision_encoder. prefix
             renamed[f"vision_encoder.{key}"] = value
-        elif key.startswith(
-            "language_model.model.embed_tokens."
-        ):
+        elif key.startswith("language_model.model.embed_tokens."):
             # Embedding weights go to both decoder and embedding
-            suffix = key[len("language_model.model."):]
+            suffix = key[len("language_model.model.") :]
             renamed[f"decoder.model.{suffix}"] = value
             renamed[f"embedding.{suffix}"] = value
             if tie_word_embeddings:
                 renamed["decoder.lm_head.weight"] = value
         elif key.startswith("language_model.lm_head."):
-            suffix = key[len("language_model."):]
+            suffix = key[len("language_model.") :]
             renamed[f"decoder.{suffix}"] = value
         elif key.startswith("language_model."):
-            suffix = key[len("language_model."):]
+            suffix = key[len("language_model.") :]
             renamed[f"decoder.{suffix}"] = value
     return renamed

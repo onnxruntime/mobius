@@ -53,10 +53,7 @@ class PixtralRoPE2D(nn.Module):
     ):
         super().__init__()
         dim = head_dim
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (np.arange(0, dim, 2, dtype=np.float32) / dim)
-        )
+        inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         # Split into height (even indices) and width (odd indices)
         freq_h = inv_freq[0::2]  # [dim/4]
         freq_w = inv_freq[1::2]  # [dim/4]
@@ -68,9 +65,7 @@ class PixtralRoPE2D(nn.Module):
 
         # Build cache: for (h, w), freqs = concat(h*freq_h, w*freq_w)
         total_positions = max_grid_size * max_grid_size
-        cos_cache = np.zeros(
-            (total_positions, dim // 2), dtype=np.float32
-        )
+        cos_cache = np.zeros((total_positions, dim // 2), dtype=np.float32)
         sin_cache = np.zeros_like(cos_cache)
 
         for h in range(max_grid_size):
@@ -104,9 +99,7 @@ class PixtralRoPE2D(nn.Module):
         Returns:
             (cos_emb, sin_emb) each [batch, seq_len, head_dim/2].
         """
-        return get_rotary_pos_emb(
-            op, position_ids, self.cos_cache, self.sin_cache
-        )
+        return get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
 
 
 class PixtralAttention(nn.Module):
@@ -117,22 +110,33 @@ class PixtralAttention(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, num_heads: int, head_dim: int,
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
     ):
         super().__init__()
         self._num_heads = num_heads
         self._head_dim = head_dim
         self.q_proj = Linear(
-            hidden_size, num_heads * head_dim, bias=False,
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
         )
         self.k_proj = Linear(
-            hidden_size, num_heads * head_dim, bias=False,
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
         )
         self.v_proj = Linear(
-            hidden_size, num_heads * head_dim, bias=False,
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
         )
         self.o_proj = Linear(
-            num_heads * head_dim, hidden_size, bias=False,
+            num_heads * head_dim,
+            hidden_size,
+            bias=False,
         )
 
     def forward(
@@ -153,16 +157,24 @@ class PixtralAttention(nn.Module):
 
         # Apply 2D RoPE to Q and K
         q = apply_rotary_pos_emb(
-            op, q, position_embeddings, num_heads=self._num_heads,
+            op,
+            q,
+            position_embeddings,
+            num_heads=self._num_heads,
         )
         k = apply_rotary_pos_emb(
-            op, k, position_embeddings, num_heads=self._num_heads,
+            op,
+            k,
+            position_embeddings,
+            num_heads=self._num_heads,
         )
 
         # Bidirectional attention (is_causal=0, no KV cache)
         scale = float(1.0 / (self._head_dim**0.5))
         attn_output = op.Attention(
-            q, k, v,
+            q,
+            k,
+            v,
             q_num_heads=self._num_heads,
             kv_num_heads=self._num_heads,
             scale=scale,
@@ -182,13 +194,19 @@ class PixtralGatedMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.gate_proj = Linear(
-            hidden_size, intermediate_size, bias=False,
+            hidden_size,
+            intermediate_size,
+            bias=False,
         )
         self.up_proj = Linear(
-            hidden_size, intermediate_size, bias=False,
+            hidden_size,
+            intermediate_size,
+            bias=False,
         )
         self.down_proj = Linear(
-            intermediate_size, hidden_size, bias=False,
+            intermediate_size,
+            hidden_size,
+            bias=False,
         )
 
     def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
@@ -214,11 +232,14 @@ class PixtralTransformerLayer(nn.Module):
         super().__init__()
         self.attention_norm = RMSNorm(hidden_size, eps)
         self.attention = PixtralAttention(
-            hidden_size, num_heads, head_dim,
+            hidden_size,
+            num_heads,
+            head_dim,
         )
         self.ffn_norm = RMSNorm(hidden_size, eps)
         self.feed_forward = PixtralGatedMLP(
-            hidden_size, intermediate_size,
+            hidden_size,
+            intermediate_size,
         )
 
     def forward(
@@ -230,7 +251,9 @@ class PixtralTransformerLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.attention_norm(op, hidden_states)
         hidden_states = self.attention(
-            op, hidden_states, position_embeddings,
+            op,
+            hidden_states,
+            position_embeddings,
         )
         hidden_states = op.Add(residual, hidden_states)
 
@@ -257,8 +280,11 @@ class PixtralTransformerEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [
                 PixtralTransformerLayer(
-                    hidden_size, intermediate_size,
-                    num_heads, head_dim, eps,
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    head_dim,
+                    eps,
                 )
                 for _ in range(num_layers)
             ]
@@ -272,7 +298,9 @@ class PixtralTransformerEncoder(nn.Module):
     ) -> ir.Value:
         for layer in self.layers:
             hidden_states = layer(
-                op, hidden_states, position_embeddings,
+                op,
+                hidden_states,
+                position_embeddings,
             )
         return hidden_states
 
@@ -293,12 +321,12 @@ class Mistral3PatchMerger(nn.Module):
     ):
         super().__init__()
         self._merge_size = spatial_merge_size
-        merged_dim = (
-            hidden_size * spatial_merge_size * spatial_merge_size
-        )
+        merged_dim = hidden_size * spatial_merge_size * spatial_merge_size
         # Reduces merged patches back to vision_hidden_size
         self.merging_layer = Linear(
-            merged_dim, hidden_size, bias=False,
+            merged_dim,
+            hidden_size,
+            bias=False,
         )
 
     def forward(
@@ -331,7 +359,13 @@ class Mistral3PatchMerger(nn.Module):
         h_m_1d = op.Reshape(h_m, op.Constant(value_ints=[1]))
         w_m_1d = op.Reshape(w_m, op.Constant(value_ints=[1]))
         shape_6d = op.Concat(
-            batch, h_m_1d, ms_1d, w_m_1d, ms_1d, d, axis=0,
+            batch,
+            h_m_1d,
+            ms_1d,
+            w_m_1d,
+            ms_1d,
+            d,
+            axis=0,
         )
         x = op.Reshape(hidden_states, shape_6d)
 
@@ -341,7 +375,9 @@ class Mistral3PatchMerger(nn.Module):
         # Flatten: [batch, (H/ms)*(W/ms), ms*ms*D]
         merged_count = op.Mul(h_m_1d, w_m_1d)
         shape_3d = op.Concat(
-            batch, merged_count, op.Constant(value_ints=[-1]),
+            batch,
+            merged_count,
+            op.Constant(value_ints=[-1]),
             axis=0,
         )
         x = op.Reshape(x, shape_3d)
@@ -369,15 +405,20 @@ class Mistral3MultiModalProjector(nn.Module):
     ):
         super().__init__()
         self.patch_merger = Mistral3PatchMerger(
-            vision_hidden_size, spatial_merge_size,
+            vision_hidden_size,
+            spatial_merge_size,
         )
         # After merging, dims are back to vision_hidden_size
         self.norm = RMSNorm(vision_hidden_size, eps=1e-5)
         self.linear_1 = Linear(
-            vision_hidden_size, text_hidden_size, bias=False,
+            vision_hidden_size,
+            text_hidden_size,
+            bias=False,
         )
         self.linear_2 = Linear(
-            text_hidden_size, text_hidden_size, bias=False,
+            text_hidden_size,
+            text_hidden_size,
+            bias=False,
         )
 
     def forward(
@@ -398,7 +439,10 @@ class Mistral3MultiModalProjector(nn.Module):
             [batch, num_merged_patches, text_hidden_size]
         """
         merged = self.patch_merger(
-            op, vision_features, grid_h, grid_w,
+            op,
+            vision_features,
+            grid_h,
+            grid_w,
         )
         merged = self.norm(op, merged)
         hidden = op.Gelu(self.linear_1(op, merged))
@@ -427,10 +471,7 @@ class PixtralVisionTower(nn.Module):
         assert vc.image_size is not None
         assert vc.patch_size is not None
 
-        head_dim = (
-            vc.head_dim
-            or vc.hidden_size // vc.num_attention_heads
-        )
+        head_dim = vc.head_dim or vc.hidden_size // vc.num_attention_heads
         rope_theta = vc.rope_theta or 10000.0
         max_grid_size = vc.image_size // vc.patch_size
 
@@ -485,8 +526,10 @@ class PixtralVisionTower(nn.Module):
         batch_size = op.Shape(patches_4d, start=0, end=1)
         hidden_dim = op.Shape(patches_4d, start=1, end=2)
         new_shape = op.Concat(
-            batch_size, hidden_dim,
-            op.Constant(value_ints=[-1]), axis=0,
+            batch_size,
+            hidden_dim,
+            op.Constant(value_ints=[-1]),
+            axis=0,
         )
         patches = op.Reshape(patches_4d, new_shape)
         patches = op.Transpose(patches, perm=[0, 2, 1])
@@ -506,13 +549,16 @@ class PixtralVisionTower(nn.Module):
         w_2d = op.Unsqueeze(w_ids, [0])
         pos_grid = op.Add(h_2d, w_2d)
         position_ids = op.Reshape(
-            pos_grid, op.Constant(value_ints=[1, -1]),
+            pos_grid,
+            op.Constant(value_ints=[1, -1]),
         )
 
         # RoPE + transformer
         pos_emb = self.rope(op, position_ids)
         hidden_states = self.transformer(
-            op, hidden_states, pos_emb,
+            op,
+            hidden_states,
+            pos_emb,
         )
 
         return hidden_states, grid_h, grid_w
