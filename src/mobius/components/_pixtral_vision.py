@@ -386,9 +386,9 @@ class Mistral3PatchMerger(nn.Module):
 
 
 class Mistral3MultiModalProjector(nn.Module):
-    """Mistral-3 multimodal projector: merge → norm → MLP.
+    """Mistral-3 multimodal projector: norm → merge → MLP.
 
-    ``patch_merger → norm → linear_1 → GELU → linear_2``
+    ``norm → patch_merger → linear_1 → GELU → linear_2``
 
     HF weights:
     - ``multi_modal_projector.patch_merger.merging_layer.weight``
@@ -404,12 +404,13 @@ class Mistral3MultiModalProjector(nn.Module):
         spatial_merge_size: int = 2,
     ):
         super().__init__()
+        # HF applies norm BEFORE spatial merging
+        self.norm = RMSNorm(vision_hidden_size, eps=1e-5)
         self.patch_merger = Mistral3PatchMerger(
             vision_hidden_size,
             spatial_merge_size,
         )
         # After merging, dims are back to vision_hidden_size
-        self.norm = RMSNorm(vision_hidden_size, eps=1e-5)
         self.linear_1 = Linear(
             vision_hidden_size,
             text_hidden_size,
@@ -438,13 +439,16 @@ class Mistral3MultiModalProjector(nn.Module):
         Returns:
             [batch, num_merged_patches, text_hidden_size]
         """
+        # Step 1: Norm before spatial merge (HF order)
+        normed = self.norm(op, vision_features)
+        # Step 2: Spatial merge
         merged = self.patch_merger(
             op,
-            vision_features,
+            normed,
             grid_h,
             grid_w,
         )
-        merged = self.norm(op, merged)
+        # Step 3: MLP projection
         hidden = op.Gelu(self.linear_1(op, merged))
         return self.linear_2(op, hidden)
 
