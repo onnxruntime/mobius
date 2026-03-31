@@ -52,22 +52,24 @@ class PixtralRoPE2D(nn.Module):
         rope_theta: float = 10000.0,
     ):
         super().__init__()
-        dim = head_dim
-        inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        inv_freq = 1.0 / (
+            rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
+        )
         # Split into height (even indices) and width (odd indices)
-        freq_h = inv_freq[0::2]  # [dim/4]
-        freq_w = inv_freq[1::2]  # [dim/4]
+        freq_h = inv_freq[0::2]  # [head_dim/4]
+        freq_w = inv_freq[1::2]  # [head_dim/4]
 
         # Precompute per-position frequencies
         positions = np.arange(max_grid_size, dtype=np.float32)
-        freqs_h = np.outer(positions, freq_h)  # [max_grid, dim/4]
-        freqs_w = np.outer(positions, freq_w)  # [max_grid, dim/4]
+        freqs_h = np.outer(positions, freq_h)  # [max_grid, head_dim/4]
+        freqs_w = np.outer(positions, freq_w)  # [max_grid, head_dim/4]
 
         # Build cache: for (h, w), freqs = concat(h*freq_h, w*freq_w)
         total_positions = max_grid_size * max_grid_size
-        cos_cache = np.zeros((total_positions, dim // 2), dtype=np.float32)
+        cos_cache = np.zeros((total_positions, head_dim // 2), dtype=np.float32)
         sin_cache = np.zeros_like(cos_cache)
 
+        # Row-major: idx = h * max_grid_size + w, matching forward() meshgrid
         for h in range(max_grid_size):
             for w in range(max_grid_size):
                 freqs = np.concatenate([freqs_h[h], freqs_w[w]])
@@ -265,7 +267,11 @@ class PixtralTransformerLayer(nn.Module):
 
 
 class PixtralTransformerEncoder(nn.Module):
-    """Stack of Pixtral transformer layers."""
+    """Stack of Pixtral transformer layers.
+
+    Processes [batch, seq_len, hidden_size] through N identical
+    pre-norm attention + MLP layers with 2D RoPE position embeddings.
+    """
 
     def __init__(
         self,
@@ -303,6 +309,9 @@ class PixtralTransformerEncoder(nn.Module):
                 position_embeddings,
             )
         return hidden_states
+
+
+# ── Mistral-3 patch merging and projection ────────────────────
 
 
 class Mistral3PatchMerger(nn.Module):
