@@ -73,7 +73,6 @@ _shape_inference = SymbolicShapeInferencePass()
 # (e.g. value_info missing type field for custom ops).
 _CHECKER_SKIP_MODELS: set[str] = {
     "minimax",
-    "mamba2",
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_next",
