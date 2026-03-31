@@ -144,7 +144,7 @@ class _PixtralVisionEncoderModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        from mobius.components._pixtral_vision import (
+        from mobius.components import (
             Mistral3MultiModalProjector,
             PixtralVisionTower,
         )
@@ -154,7 +154,7 @@ class _PixtralVisionEncoderModel(nn.Module):
             vision_hidden_size=config.vision.hidden_size,
             text_hidden_size=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
-            norm_eps=config.rms_norm_eps,
+            norm_eps=config.vision.norm_eps,
         )
 
     def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
