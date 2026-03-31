@@ -10,6 +10,7 @@ authors = [
     { name = "ONNX Contributors", email = "onnx-technical-discuss@lists.lfaidata.foundation" },
 ]
 readme = "README.md"
+# Python 3.10 dropped: onnxruntime no longer supports it.
 requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
