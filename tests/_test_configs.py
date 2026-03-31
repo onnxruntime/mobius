@@ -1779,7 +1779,7 @@ SSM_CONFIGS: list[tuple[str, dict, bool]] = [
 
 
 # ---------------------------------------------------------------------------
-# Shared VL tiny vision sub-config (SigLIP-style: 28×28, patch 14)
+# Shared VL tiny vision sub-config (SigLIP-style: 28x28, patch 14)
 # ---------------------------------------------------------------------------
 _TINY_VISION = VisionConfig(
     hidden_size=32,

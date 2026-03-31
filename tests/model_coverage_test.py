@@ -34,6 +34,7 @@ See ``.github/skills/writing-tests/SKILL.md`` for the full guide.
 
 from __future__ import annotations
 
+import functools
 import sys
 from pathlib import Path
 
@@ -91,9 +92,6 @@ def _l1_l3_model_types() -> set[str]:
 # ---------------------------------------------------------------------------
 # L4/L5 helpers
 # ---------------------------------------------------------------------------
-
-
-import functools
 
 
 @functools.cache
