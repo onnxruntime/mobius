@@ -44,6 +44,7 @@ from onnx_ir.passes.common import CheckerPass
 
 from mobius._builder import (
     DTYPE_MAP,
+    SymbolicShapeInferencePass,
     build_from_module,
 )
 from mobius._config_resolver import _default_task_for_model
@@ -64,6 +65,7 @@ from mobius.tasks import (
 )
 
 _onnx_checker = CheckerPass()
+_shape_inference = SymbolicShapeInferencePass()
 
 # Models where the ONNX checker fails due to upstream onnx-ir issues
 # (e.g. value_info missing type field for custom ops).
@@ -98,6 +100,7 @@ def _run_onnx_checker(pkg: dict[str, ir.Model], model_type: str) -> None:
     """Run ONNX CheckerPass on all models in a package.
 
     Skips models in ``_CHECKER_SKIP_MODELS`` that have known upstream issues.
+    Runs shape inference first since the checker requires output shapes.
     """
     if model_type in _CHECKER_SKIP_MODELS:
         pytest.skip(
@@ -105,6 +108,7 @@ def _run_onnx_checker(pkg: dict[str, ir.Model], model_type: str) -> None:
             "upstream onnx-ir value_info missing type field for custom ops"
         )
     for model in pkg.values():
+        _shape_inference(model)
         _fill_dummy_weights(model)
         _onnx_checker(model)
 
