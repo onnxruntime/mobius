@@ -70,6 +70,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/models/
 docs/dashboard/index.html
 
 # PyBuilder
@@ -220,3 +221,5 @@ cache_dir/**
 
 .flightdeck/shared/**
 .worktrees/
+dashboard_preview.html
+docs/feature-flags.md

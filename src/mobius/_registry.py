@@ -26,6 +26,98 @@ from mobius._configs import (
     BaseModelConfig,
     WhisperConfig,
 )
+from mobius.models import (
+    ApertusCausalLMModel,
+    ArceeCausalLMModel,
+    CausalLMModel,
+    ChatGLMCausalLMModel,
+    DeepSeekOCR2CausalLMModel,
+    DeepSeekV3CausalLMModel,
+    DiffLlamaCausalLMModel,
+    DogeCausalLMModel,
+    Ernie45MoECausalLMModel,
+    ErnieCausalLMModel,
+    ExaOne4CausalLMModel,
+    Gemma2CausalLMModel,
+    Gemma3CausalLMModel,
+    Gemma3MultiModalModel,
+    GemmaCausalLMModel,
+    Glm4CausalLMModel,
+    Glm4MoECausalLMModel,
+    GlmCausalLMModel,
+    GPTOSSCausalLMModel,
+    GraniteCausalLMModel,
+    HunYuanMoEV1CausalLMModel,
+    HunYuanV1DenseCausalLMModel,
+    InternLM2CausalLMModel,
+    LayerNormCausalLMModel,
+    Llama4CausalLMModel,
+    MoECausalLMModel,
+    NanoChatCausalLMModel,
+    NemotronCausalLMModel,
+    OLMo2CausalLMModel,
+    OLMoCausalLMModel,
+    Phi3CausalLMModel,
+    Phi3MoECausalLMModel,
+    Phi3SmallCausalLMModel,
+    Phi4MMMultiModalModel,
+    PhiCausalLMModel,
+    Qwen2MoECausalLMModel,
+    Qwen3CausalLMModel,
+    Qwen3NextCausalLMModel,
+    Qwen3VL3ModelCausalLMModel,
+    Qwen3VLCausalLMModel,
+    Qwen3VLTextModel,
+    Qwen25VLCausalLMModel,
+    Qwen25VLTextModel,
+    Qwen35CausalLMModel,
+    Qwen35MoECausalLMModel,
+    Qwen35VL3ModelCausalLMModel,
+    Qwen35VLTextModel,
+    QwenCausalLMModel,
+    SmolLM3CausalLMModel,
+    WhisperForConditionalGeneration,
+)
+from mobius.models.bamba import BambaCausalLMModel
+from mobius.models.bart import BartForConditionalGeneration
+from mobius.models.bert import BertModel
+from mobius.models.blip import BlipVisionModel
+from mobius.models.blip2 import Blip2Model
+from mobius.models.clip import CLIPTextModel, CLIPVisionModel
+from mobius.models.cohere import CohereCausalLMModel
+from mobius.models.ctrl import CTRLCausalLMModel
+from mobius.models.depth_anything import DepthAnythingForDepthEstimation
+from mobius.models.distilbert import DistilBertModel
+from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel
+from mobius.models.gpt2 import GPT2CausalLMModel
+from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
+from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
+from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
+from mobius.models.internvl import InternVL2Model
+from mobius.models.jamba import JambaCausalLMModel
+from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.layoutlmv3 import LayoutLMv3Model
+from mobius.models.llava import LLaVAModel
+from mobius.models.longcat_flash import LongcatFlashCausalLMModel
+from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.minimax import MiniMaxCausalLMModel
+from mobius.models.mllama import MllamaCausalLMModel
+from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.opt import OPTCausalLMModel
+from mobius.models.persimmon import PersimmonCausalLMModel
+from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
+from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+from mobius.models.sam2 import Sam2VisionModel
+from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.starcoder2 import StarCoder2CausalLMModel
+from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.vit import ViTModel
+from mobius.models.wav2vec2 import Wav2Vec2Model
+from mobius.models.xlm import XLMCausalLMModel
+from mobius.models.yolos import YolosForObjectDetection
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,8 +320,6 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
     if not all(getattr(hf_config, f, 0) > 0 for f in required_fields):
         return None
 
-    from mobius.models import CausalLMModel, MoECausalLMModel
-
     # MoE detection: route to MoE class if experts are present
     num_experts = getattr(hf_config, "num_local_experts", 0)
     if num_experts and num_experts > 1:
@@ -240,110 +330,32 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
 
 def _create_default_registry() -> ModelRegistry:
     """Create the default registry with all built-in architectures."""
-    from mobius.models import (
-        CausalLMModel,
-        ChatGLMCausalLMModel,
-        DeepSeekOCR2CausalLMModel,
-        DeepSeekV3CausalLMModel,
-        ErnieCausalLMModel,
-        Gemma2CausalLMModel,
-        Gemma3CausalLMModel,
-        Gemma3MultiModalModel,
-        GemmaCausalLMModel,
-        GPTOSSCausalLMModel,
-        GraniteCausalLMModel,
-        InternLM2CausalLMModel,
-        MoECausalLMModel,
-        NemotronCausalLMModel,
-        OLMo2CausalLMModel,
-        OLMoCausalLMModel,
-        Phi3CausalLMModel,
-        Phi3MoECausalLMModel,
-        Phi3SmallCausalLMModel,
-        Phi4MMMultiModalModel,
-        PhiCausalLMModel,
-        Qwen3CausalLMModel,
-        Qwen3NextCausalLMModel,
-        Qwen3VL3ModelCausalLMModel,
-        Qwen3VLCausalLMModel,
-        Qwen3VLTextModel,
-        Qwen25VLCausalLMModel,
-        Qwen25VLTextModel,
-        Qwen35CausalLMModel,
-        Qwen35MoECausalLMModel,
-        Qwen35VL3ModelCausalLMModel,
-        Qwen35VLTextModel,
-        QwenCausalLMModel,
-        SmolLM3CausalLMModel,
-        WhisperForConditionalGeneration,
-    )
-    from mobius.models.bart import BartForConditionalGeneration
-    from mobius.models.bert import BertModel
-    from mobius.models.blip import BlipVisionModel
-    from mobius.models.clip import CLIPTextModel, CLIPVisionModel
-    from mobius.models.depth_anything import DepthAnythingForDepthEstimation
-    from mobius.models.distilbert import DistilBertModel
-    from mobius.models.falcon import FalconCausalLMModel
-    from mobius.models.gemma3n import Gemma3nCausalLMModel
-    from mobius.models.gpt2 import GPT2CausalLMModel
-    from mobius.models.layoutlmv3 import LayoutLMv3Model
-    from mobius.models.llava import LLaVAModel
-    from mobius.models.mllama import MllamaCausalLMModel
-    from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
-    from mobius.models.opt import OPTCausalLMModel
-    from mobius.models.sam2 import Sam2VisionModel
-    from mobius.models.segformer import SegformerForSemanticSegmentation
-    from mobius.models.t5 import T5ForConditionalGeneration
-    from mobius.models.trocr import TrOCRForConditionalGeneration
-    from mobius.models.vit import ViTModel
-    from mobius.models.wav2vec2 import Wav2Vec2Model
-    from mobius.models.yolos import YolosForObjectDetection
-
     reg = ModelRegistry()
 
     # --- Text Generation (Llama-compatible) ---
     for name in (
-        "apertus",
-        "arcee",
         "baichuan",
         "code_llama",
-        "codegen",
         "codegen2",
-        "cohere",
-        "cohere2",
         "command_r",
         "csm",
-        "diffllama",
-        "doge",
         "dots1",
         "evolla",
         "exaone",
-        "exaone4",
-        "glm",
-        "glm4",
-        "gpt_neox",
-        "gpt_neox_japanese",
-        "gptj",
         "helium",
-        "hunyuan_v1_dense",
         "llama",
         "llama4_text",
-        "longcat_flash",
         "minicpm",
         "minicpm3",
         "ministral",
         "ministral3",
         "mistral",
         "mistral3",
-        "nanochat",
         "open-llama",
         "openelm",
-        "persimmon",
         "qwen2",
         "seed_oss",
         "solar_open",
-        "stablelm",
-        "starcoder2",
         "yi",
         "youtu",
         "zamba",
@@ -353,19 +365,35 @@ def _create_default_registry() -> ModelRegistry:
 
     # --- Text Generation (architecture-specific) ---
     for name, cls in {
-        "bloom": FalconCausalLMModel,
+        "apertus": ApertusCausalLMModel,
+        "arcee": ArceeCausalLMModel,
+        "bloom": BloomCausalLMModel,
         "chatglm": ChatGLMCausalLMModel,
+        "codegen": CodeGenCausalLMModel,
+        "cohere": CohereCausalLMModel,
+        "cohere2": CohereCausalLMModel,
         "ernie4_5": ErnieCausalLMModel,
+        "exaone4": ExaOne4CausalLMModel,
         "falcon": FalconCausalLMModel,
         "falcon_h1": FalconCausalLMModel,
-        "mpt": FalconCausalLMModel,
+        "gpt_neox": GPTNeoXCausalLMModel,
+        "gpt_neox_japanese": GPTNeoXJapaneseCausalLMModel,
+        "gptj": GPTJCausalLMModel,
+        "mpt": MPTCausalLMModel,
+        "nanochat": NanoChatCausalLMModel,
+        "persimmon": PersimmonCausalLMModel,
+        "stablelm": LayerNormCausalLMModel,
+        "starcoder2": StarCoder2CausalLMModel,
         "gemma": GemmaCausalLMModel,
         "gemma2": Gemma2CausalLMModel,
         "shieldgemma2": Gemma2CausalLMModel,
         "gemma3_text": Gemma3CausalLMModel,
         "gemma3n_text": Gemma3nCausalLMModel,
         "granite": GraniteCausalLMModel,
+        "diffllama": DiffLlamaCausalLMModel,
+        "doge": DogeCausalLMModel,
         "internlm2": InternLM2CausalLMModel,
+        "llama4_text": Llama4CausalLMModel,
         "modernbert-decoder": ModernBertDecoderModel,
         "nemotron": NemotronCausalLMModel,
         "olmo": OLMoCausalLMModel,
@@ -385,23 +413,32 @@ def _create_default_registry() -> ModelRegistry:
     for name in (
         "arctic",
         "dbrx",
-        "ernie4_5_moe",
         "flex_olmo",
-        "glm4_moe",
         "granitemoe",
-        "granitemoehybrid",
         "granitemoeshared",
-        "hunyuan_v1_moe",
-        "jetmoe",
-        "minimax",
         "mixtral",
         "olmoe",
-        "qwen2_moe",
         "qwen3_moe",
         "qwen3_omni_moe",
         "qwen3_vl_moe",
     ):
         reg.register(name, MoECausalLMModel)
+    reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
+    reg.register("glm", GlmCausalLMModel)
+    reg.register("glm4", Glm4CausalLMModel)
+    reg.register("glm4_moe", Glm4MoECausalLMModel)
+
+    reg.register("jetmoe", JetMoeCausalLMModel)
+    reg.register("hunyuan_v1_dense", HunYuanV1DenseCausalLMModel)
+    reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
+    reg.register("qwen2_moe", Qwen2MoECausalLMModel)
+
+    reg.register("longcat_flash", LongcatFlashCausalLMModel)
+
+    # --- GraniteMoeHybrid (Mamba2+Attention hybrid with MoE on all layers) ---
+    reg.register("granitemoehybrid", GraniteMoeHybridCausalLMModel)
+
+    reg.register("minimax", MiniMaxCausalLMModel)
     reg.register("gptoss", GPTOSSCausalLMModel)
     reg.register("gpt_oss", GPTOSSCausalLMModel)
     reg.register("phimoe", Phi3MoECausalLMModel)
@@ -420,24 +457,20 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("deepseek_vl_v2", DeepSeekOCR2CausalLMModel)
 
     # --- SSM (Mamba / Mamba2) ---
-    from mobius.models.mamba import (
-        Mamba2CausalLMModel,
-        MambaCausalLMModel,
-    )
-
     reg.register("mamba", MambaCausalLMModel)
     reg.register("falcon_mamba", MambaCausalLMModel)
     reg.register("mamba2", Mamba2CausalLMModel)
 
     # --- Hybrid SSM+Attention (Jamba) ---
-    from mobius.models.jamba import JambaCausalLMModel
-
     reg.register("jamba", JambaCausalLMModel)
 
     # --- Hybrid Mamba2+Attention (Bamba) ---
-    from mobius.models.bamba import BambaCausalLMModel
-
     reg.register("bamba", BambaCausalLMModel)
+
+    # --- Hybrid Mamba2+Attention+MLP (NemotronH) ---
+    from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+    reg.register("nemotron_h", NemotronHCausalLMModel)
 
     # --- Multimodal ---
     for name in (
@@ -468,8 +501,6 @@ def _create_default_registry() -> ModelRegistry:
     ):
         reg.register(name, LLaVAModel, task="vision-language")
 
-    from mobius.models.internvl import InternVL2Model
-
     for name in ("internvl_chat", "internvl2", "internvl"):
         reg.register(name, InternVL2Model, task="vision-language")
     reg.register("gemma3", Gemma3CausalLMModel)
@@ -480,8 +511,6 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("glm4v_moe_text", MoECausalLMModel)
     reg.register("glm4v_text", CausalLMModel)
     reg.register("mllama", MllamaCausalLMModel, task="mllama-vision-language")
-
-    from mobius.models.blip2 import Blip2Model
 
     reg.register("blip-2", Blip2Model, task="vision-language")
     reg.register("phi4mm", Phi4MMMultiModalModel, task="phi4mm-multimodal")
@@ -505,24 +534,12 @@ def _create_default_registry() -> ModelRegistry:
         config_class=WhisperConfig,
     )
 
-    from mobius.models.qwen3_asr import (
-        Qwen3ASRForConditionalGeneration,
-    )
-
     reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")
     reg.register(
         "qwen3_forced_aligner", Qwen3ASRForConditionalGeneration, task="speech-language"
     )
 
-    from mobius.models.qwen3_tts import (
-        Qwen3TTSForConditionalGeneration,
-    )
-
     reg.register("qwen3_tts", Qwen3TTSForConditionalGeneration)
-
-    from mobius.models.qwen3_tts_tokenizer import (
-        Qwen3TTSTokenizerV2Model,
-    )
 
     reg.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Model, task="codec")
 
@@ -577,16 +594,16 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("gpt2", GPT2CausalLMModel)
     for name in (
         "biogpt",
-        "ctrl",
         "gpt-sw3",
         "gpt_bigcode",
         "gpt_neo",
         "imagegpt",
         "openai-gpt",
         "xglm",
-        "xlm",
     ):
         reg.register(name, GPT2CausalLMModel)
+    reg.register("ctrl", CTRLCausalLMModel)
+    reg.register("xlm", XLMCausalLMModel)
     reg.register("opt", OPTCausalLMModel)
 
     # --- Encoder-decoder ---
@@ -709,6 +726,23 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llama4_text": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "ministral": "mistralai/Ministral-8B-Instruct-2410",
     "baichuan": "baichuan-inc/Baichuan2-7B-Chat",
+    "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
+    "arcee": "arcee-ai/AFM-4.5B-Base",
+    "diffllama": "kajuma/DiffLlama-0.3B-handcut",
+    "doge": "SmallDoge/Doge-20M",
+    "dots1": "rednote-hilab/dots.llm1.inst",
+    "exaone4": "LGAI-EXAONE/EXAONE-4.0-1.2B",
+    "helium": "kyutai/helium-1-preview-2b",
+    "minicpm": "optimum-intel-internal-testing/tiny-random-minicpm",
+    "minicpm3": "openbmb/MiniCPM3-4B",
+    "mistral3": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    "ministral3": "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
+    "nanochat": "nanochat-students/nanochat-d20",
+    "olmo3": "allenai/Olmo-3-7B-Instruct",
+    "openelm": "apple/OpenELM-270M",
+    "youtu": "tencent/Youtu-LLM-2B-Base",
+    "zamba": "Zyphra/Zamba-7B-v1",
+    "zamba2": "Zyphra/Zamba2-1.2B",
 
     # --- CausalLM (architecture-specific) ---
     "falcon": "tiiuae/falcon-7b",
@@ -729,11 +763,29 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "phi3small": "microsoft/Phi-3-small-8k-instruct",
     "qwen": "Qwen/Qwen-1_8B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
-    "qwen3_5_text": "Qwen/Qwen3.5-VL-3B-Instruct",
+    "qwen3_5_text": "Qwen/Qwen3.5-2B",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
     "gpt2": "openai-community/gpt2",
     "opt": "facebook/opt-125m",
     "mpt": "mosaicml/mpt-7b",
+    "biogpt": "microsoft/biogpt",
+    "chatglm": "zai-org/chatglm2-6b",
+    "codegen": "Salesforce/codegen-350M-mono",
+    "ctrl": "Salesforce/ctrl",
+    "ernie4_5": "baidu/ERNIE-4.5-0.3B-PT",
+    "falcon_h1": "tiiuae/Falcon-H1-0.5B-Base",
+    "gpt-sw3": "AI-Sweden-Models/gpt-sw3-356m",
+    "gpt_bigcode": "bigcode/gpt_bigcode-santacoder",
+    "gpt_neo": "EleutherAI/gpt-neo-125m",
+    "gpt_neox_japanese": "abeja/gpt-neox-japanese-2.7b",
+    "gpt_oss": "openai/gpt-oss-20b",
+    "gptoss": "openai/gpt-oss-20b",
+    "hunyuan_v1_dense": "optimum-intel-internal-testing/tiny-random-hunyuan-v1-dense",
+    "hunyuan_v1_moe": "tencent/Hunyuan-A13B-Instruct",
+    "imagegpt": "openai/imagegpt-small",
+    "openai-gpt": "openai-community/openai-gpt",
+    "xglm": "facebook/xglm-564M",
+    "xlm": "FacebookAI/xlm-mlm-en-2048",
 
     # --- Mixture of Experts ---
     "mixtral": "mistralai/Mixtral-8x7B-v0.1",
@@ -747,6 +799,15 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "dbrx": "databricks/dbrx-instruct",
     "arctic": "Snowflake/snowflake-arctic-instruct",
     "jetmoe": "jetmoe/jetmoe-8b",
+    "longcat_flash": "yujiepan/longcat-flash-tiny-random",
+    "minimax": "MiniMaxAI/MiniMax-Text-01",
+    "ernie4_5_moe": "baidu/ERNIE-4.5-21B-A3B-PT",
+    "flex_olmo": "allenai/Flex-reddit-2x7B-1T",
+    "glm4_moe": "zai-org/GLM-4.5-Air",
+    "granitemoehybrid": "ibm-granite/granite-4.0-tiny-preview",
+    "granitemoeshared": "ibm-research/moe-7b-1b-active-shared-experts",
+    "qwen3_omni_moe": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "qwen3_vl_moe": "Qwen/Qwen3-VL-30B-A3B-Instruct",
 
     # --- DeepSeek (MLA + MoE) ---
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
@@ -768,9 +829,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_5_vl_text": "Qwen/Qwen2.5-VL-3B-Instruct",
     "qwen3_vl": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_vl_text": "Qwen/Qwen3-VL-2B-Instruct",
-    "qwen3_5": "Qwen/Qwen3.5-VL-3B-Instruct",
-    "qwen3_5_vl": "Qwen/Qwen3.5-VL-3B-Instruct",
-    "qwen3_5_vl_text": "Qwen/Qwen3.5-VL-3B-Instruct",
+    "qwen3_5": "Qwen/Qwen3.5-2B",
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
@@ -779,10 +838,27 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
     "blip-2": "Salesforce/blip2-opt-2.7b",
+    "florence2": "microsoft/Florence-2-base",
+    "idefics2": "HuggingFaceM4/idefics2-8b",
+    "idefics3": "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "instructblip": "Salesforce/instructblip-flan-t5-xl",
+    "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+    "molmo": "allenai/MolmoE-1B-0924",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
+    "speecht5": "microsoft/speecht5_asr",
+    "sew": "asapp/sew-tiny-100k",
+    "sew-d": "asapp/sew-d-tiny-100k",
+    "unispeech": "optimum-intel-internal-testing/tiny-random-unispeech",
+    "unispeech-sat": "optimum-intel-internal-testing/tiny-random-UnispeechSatModel",
+    "wav2vec2-bert": "facebook/w2v-bert-2.0",
+    "wavlm": "microsoft/wavlm-base-plus",
+    "data2vec-audio": "facebook/data2vec-audio-base-960h",
+    "musicgen": "facebook/musicgen-small",
+    "seamless_m4t": "facebook/hf-seamless-m4t-medium",
+    "seamless_m4t_v2": "facebook/seamless-m4t-v2-large",
 
     # --- Encoder-only ---
     "bert": "google-bert/bert-base-uncased",
@@ -795,6 +871,34 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "xlm-roberta": "FacebookAI/xlm-roberta-base",
     "modernbert": "answerdotai/ModernBERT-base",
     "clip_text_model": "openai/clip-vit-base-patch32",
+    "bros": "naver-clova-ocr/bros-base-uncased",
+    "camembert": "almanach/camembert-base",
+    "data2vec-text": "facebook/data2vec-text-base",
+    "ernie": "nghuyong/ernie-3.0-base-zh",
+    "ernie_m": "Xenova/tiny-random-ErnieMModel",
+    "esm": "facebook/esm2_t6_8M_UR50D",
+    "flaubert": "flaubert/flaubert_base_cased",
+    "ibert": "optimum-intel-internal-testing/tiny-random-ibert",
+    "layoutlm": "microsoft/layoutlm-base-uncased",
+    "layoutlmv2": "microsoft/layoutlmv2-base-uncased",
+    "lilt": "SCUT-DLVCLab/lilt-roberta-en-base",
+    "markuplm": "microsoft/markuplm-base",
+    "mega": "mnaylor/mega-base-wikitext",
+    "mobilebert": "google/mobilebert-uncased",
+    "mpnet": "microsoft/mpnet-base",
+    "mra": "uw-madison/mra-base-512-4",
+    "nezha": "sijunhe/nezha-cn-base",
+    "nystromformer": "optimum-intel-internal-testing/tiny-random-NystromformerModel",
+    "rembert": "google/rembert",
+    "roberta-prelayernorm": "andreasmadsen/efficient_mlm_m0.40",
+    "roc_bert": "weiweishi/roc-bert-base-zh",
+    "roformer": "junnyu/roformer_chinese_small",
+    "splinter": "tau/splinter-base",
+    "squeezebert": "optimum-intel-internal-testing/tiny-random-squeezebert",
+    "xlm-roberta-xl": "facebook/xlm-roberta-xl",
+    "xlnet": "xlnet/xlnet-base-cased",
+    "xmod": "facebook/xmod-base",
+    "yoso": "uw-madison/yoso-4096",
 
     # --- Encoder-decoder ---
     "bart": "facebook/bart-base",
@@ -804,6 +908,20 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mbart": "facebook/mbart-large-cc25",
     "pegasus": "google/pegasus-xsum",
     "trocr": "microsoft/trocr-small-handwritten",
+    "bigbird_pegasus": "google/bigbird-pegasus-large-bigpatent",
+    "blenderbot": "facebook/blenderbot-400M-distill",
+    "blenderbot-small": "facebook/blenderbot_small-90M",
+    "fsmt": "stas/tiny-wmt19-en-de",
+    "led": "allenai/led-base-16384",
+    "longt5": "google/long-t5-tglobal-base",
+    "m2m_100": "facebook/m2m100_418M",
+    "mvp": "RUCAIBox/mvp",
+    "pegasus_x": "google/pegasus-x-base",
+    "plbart": "uclanlp/plbart-base",
+    "prophetnet": "microsoft/prophetnet-large-uncased",
+    "switch_transformers": "google/switch-base-8",
+    "umt5": "IMISLab/GreekT5-umt5-small-greeksum",
+    "xlm-prophetnet": "microsoft/xprophetnet-large-wiki100-cased",
 
     # --- Vision ---
     "vit": "google/vit-base-patch16-224",
@@ -816,6 +934,21 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "depth_anything": "LiheYoung/depth-anything-small-hf",
     "yolos": "hustvl/yolos-tiny",
     "segformer": "nvidia/segformer-b0-finetuned-ade-512-512",
+    "cvt": "microsoft/cvt-13",
+    "data2vec-vision": "facebook/data2vec-vision-base-ft1k",
+    "dinov2_with_registers": "facebook/dinov2-with-registers-base",
+    "hiera": "facebook/hiera-tiny-224-mae-hf",
+    "layoutlmv3": "microsoft/layoutlmv3-base",
+    "mobilevit": "apple/mobilevit-small",
+    "mobilevitv2": "apple/mobilevitv2-1.0-imagenet1k-256",
+    "pvt": "Zetatech/pvt-tiny-224",
+    "pvt_v2": "OpenGVLab/pvt_v2_b0",
+    "siglip_vision_model": "google/siglip-base-patch16-224",
+    "siglip2_vision_model": "google/siglip2-base-patch16-224",
+    "swin2sr": "caidas/swin2SR-classical-sr-x2-64",
+    "swinv2": "microsoft/swinv2-tiny-patch4-window16-256",
+    "vit_mae": "facebook/vit-mae-base",
+    "vit_msn": "facebook/vit-msn-small",
 
     # --- Audio ---
     "wav2vec2": "facebook/wav2vec2-base",

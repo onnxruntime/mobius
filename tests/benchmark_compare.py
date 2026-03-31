@@ -1,14 +1,18 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-r"""Compare benchmark results against baseline for regression detection.
+r"""Compare benchmark results between two commits for regression detection.
 
 Usage::
 
     python tests/benchmark_compare.py \\
-        --current results.json \\
-        --baseline tests/perf_baseline.json \\
+        --baseline baseline.json \\
+        --current current.json \\
         --output comparison.md
+
+In CI this is called dynamically: ``baseline.json`` comes from benchmarking
+the PR base commit (main) and ``current.json`` from the PR head commit.
+Both files are produced by ``benchmark_build.py --json <path>``.
 
 Exit code 0 = no blockers, 1 = blocker regression detected.
 Only deterministic metrics (num_nodes, model_size_bytes) can trigger
@@ -29,6 +33,8 @@ THRESHOLDS: dict[str, tuple[float, float]] = {
     "num_nodes": (0.05, 0.10),
 }
 
+_GITHUB_REPO_URL = "https://github.com/onnxruntime/mobius"
+
 
 def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
     """Compare current vs baseline. Returns (markdown, has_blocker)."""
@@ -39,6 +45,9 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
 
     rows: list[tuple[str, str, str, str, str, str]] = []
     has_blocker = False
+
+    base_sha = baseline.get("_metadata", {}).get("commit", "unknown")
+    head_sha = current.get("_metadata", {}).get("commit", "unknown")
 
     for model, metrics in sorted(current["models"].items()):
         base = baseline.get("models", {}).get(model, {})
@@ -69,7 +78,23 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
                 )
             )
 
+    # Flag models present in baseline but missing from current as removed.
+    removed_models = sorted(
+        set(baseline.get("models", {}).keys()) - set(current["models"].keys())
+    )
+    for model in removed_models:
+        rows.append((model, "(removed)", "—", "—", "—", "\U0001f5d1\ufe0f"))
+
+    # Flag models present in current but absent from baseline as new.
+    new_models = sorted(set(current["models"].keys()) - set(baseline.get("models", {}).keys()))
+    for model in new_models:
+        rows.append((model, "(new)", "—", "—", "NEW", "\U0001f195"))
+
+    def _sha_link(sha: str) -> str:
+        return f"[`{sha}`]({_GITHUB_REPO_URL}/commit/{sha})"
+
     md = "## Performance Comparison\n\n"
+    md += f"Comparing {_sha_link(base_sha)} → {_sha_link(head_sha)}\n\n"
     md += "| Model | Metric | Baseline | Current | Delta | |\n"
     md += "|---|---|---:|---:|---:|---|\n"
     for model, metric, base_s, curr_s, delta_s, status in rows:
@@ -96,10 +121,14 @@ def _fmt(value: float | int, metric: str) -> str:
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser(description="Compare benchmark results against baseline")
-    p.add_argument("--current", required=True)
-    p.add_argument("--baseline", default="tests/perf_baseline.json")
-    p.add_argument("--output", default="comparison.md")
+    p = argparse.ArgumentParser(
+        description="Compare benchmark results between two commits for regression detection."
+    )
+    p.add_argument("--current", required=True, help="Path to current (head) benchmark JSON")
+    p.add_argument(
+        "--baseline", required=True, help="Path to baseline (base branch) benchmark JSON"
+    )
+    p.add_argument("--output", default="comparison.md", help="Output markdown file path")
     args = p.parse_args()
     md, has_blocker = compare(args.current, args.baseline)
     Path(args.output).write_text(md)

@@ -14,7 +14,7 @@ Supports building ONNX models from HuggingFace model IDs with automatic weight
 downloading, dtype casting (including bfloat16 via `ir.LazyTensor`), and
 multi-component export for pipelines.
 
-📖 **[Documentation](https://mobius-ai.readthedocs.io)** · 📦 **[Supported Models](https://mobius-ai.readthedocs.io/en/latest/models/index.html)**
+📖 **[Documentation](https://onnxruntime.github.io/mobius/)** · 📦 **[Supported Models](https://onnxruntime.github.io/mobius/models/index.html)**
 
 ## Highlighted Models
 
@@ -34,7 +34,7 @@ multi-component export for pipelines.
 Supports **130 Transformers model types** and **5 Diffusers component types**
 across **14 task types** and **56+ reusable components**.
 
-See the [model documentation](https://mobius-ai.readthedocs.io/en/latest/models/index.html) for the complete list.
+See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
 
 ## Installation
 
@@ -60,6 +60,17 @@ pkg = build("meta-llama/Llama-3.2-1B")
 pkg.save("output/llama-3.2-1b/")
 ```
 
+**Static cache** (opt-in) pre-allocates fixed-size KV cache buffers, which is
+useful when you know the maximum sequence length up front:
+
+```python
+from mobius import build, CausalLMTask
+
+task = CausalLMTask(static_cache=True, max_seq_len=2048)
+pkg = build("meta-llama/Llama-3.2-1B", task=task)
+pkg.save("output/llama-3.2-1b-static/")
+```
+
 ### CLI
 
 ```bash
@@ -77,14 +88,21 @@ mobius build --model openai/whisper-tiny output_dir/
 
 # Specify dtype
 mobius build --model meta-llama/Llama-3.2-1B output_dir/ --dtype f16
+
+# Build with static KV cache (pre-allocated buffers, uses TensorScatter)
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache
+
+# Static cache with explicit max sequence length
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache --max-seq-len 2048
 ```
 
-See the [CLI reference](https://mobius-ai.readthedocs.io/en/latest/cli.html) for all options.
+See the [CLI reference](https://onnxruntime.github.io/mobius/cli.html) for all options.
 
 ### Examples
 
 - [`examples/build_and_save.py`](examples/build_and_save.py) — Build and save ONNX models (simplest workflow)
 - [`examples/text_generation.py`](examples/text_generation.py) — Greedy text generation with a causal LM
+- [`examples/static_cache_generation.py`](examples/static_cache_generation.py) — Text generation with static KV cache
 - [`examples/multimodal_generation.py`](examples/multimodal_generation.py) — Image captioning with a multimodal model
 
 ## Architecture
@@ -113,7 +131,7 @@ The package is organised into four layers:
 - **Tasks** — Define the ONNX graph I/O contract (inputs, outputs, KV cache)
 - **Registry** — Maps HuggingFace `model_type` strings to model classes
 
-See the [design document](https://mobius-ai.readthedocs.io/en/latest/design.html) for details.
+See the [design document](https://onnxruntime.github.io/mobius/design.html) for details.
 
 ## Development
 
@@ -133,7 +151,7 @@ lintrunner f --all-files
 
 ### Adding a new model
 
-See the [AI-assisted model support strategy](https://mobius-ai.readthedocs.io/en/latest/ai-model-support-strategy.html)
+See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
 and the developer skills in `.github/skills/`:
 
 | Skill | Use when |

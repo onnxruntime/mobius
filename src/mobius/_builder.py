@@ -20,9 +20,12 @@ __all__ = [
     "resolve_dtype",
 ]
 
+import contextlib
 import logging
 
 import onnx_ir as ir
+import onnx_shape_inference
+import onnxscript.optimizer._constant_folding  # TODO(justinchuby): Expose the FoldConstantsPass from onnxscript
 import torch
 from onnx_ir import tensor_adapters
 from onnx_ir.passes import common as common_passes
@@ -31,6 +34,7 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
 )
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
@@ -39,24 +43,90 @@ from mobius.tasks import ModelTask, get_task
 logger = logging.getLogger(__name__)
 
 
+class _SuppressNoConstValueWarning(logging.Filter):
+    """Filter out 'has no constant value' warnings from initializer dedup.
+
+    Mobius runs optimization passes before weight loading, so weight
+    initializers intentionally have no const_value at that point.
+    Other warnings from the pass (e.g. hash collisions) are preserved.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "has no constant value" not in record.getMessage()
+
+
+@contextlib.contextmanager
+def _suppress_dedup_empty_initializer_warnings():
+    """Temporarily suppress 'has no constant value' dedup warnings.
+
+    Scoped to the optimization pass invocation only — the filter is
+    removed when the context exits so it doesn't affect other code.
+    """
+    dedup_logger = logging.getLogger("onnx_ir.passes.common.initializer_deduplication")
+    log_filter = _SuppressNoConstValueWarning()
+    dedup_logger.addFilter(log_filter)
+    try:
+        yield
+    finally:
+        dedup_logger.removeFilter(log_filter)
+
+
 # ---------------------------------------------------------------------------
 # Public build API
 # ---------------------------------------------------------------------------
 
+
+class SymbolicShapeInferencePass(ir.passes.InPlacePass):
+    """ONNX IR pass that applies symbolic shape inference to all nodes."""
+
+    def __init__(self, policy: onnx_shape_inference.ShapeMergePolicy = "refine"):
+        super().__init__()
+        self.policy = policy
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        onnx_shape_inference.infer_symbolic_shapes(model, policy=self.policy)
+        return ir.passes.PassResult(model, modified=True)
+
+
+class CleanupMetadataPass(ir.passes.InPlacePass):
+    """ONNX IR pass that removes redundant metadata from all nodes."""
+
+    def __init__(self):
+        self.keys_to_remove = ["pkg.onnxscript.shape_inference_error"]
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        modified = False
+        for node in model.graph.all_nodes():
+            for key in self.keys_to_remove:
+                if key in node.metadata_props:
+                    modified = True
+                    del node.metadata_props[key]
+        return ir.passes.PassResult(model, modified=modified)
+
+
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
     common_passes.LiftConstantsToInitializersPass(),
-    # common_passes.DeduplicateInitializersPass(),
+    common_passes.DeduplicateInitializersPass(),
     common_passes.CommonSubexpressionEliminationPass(),
     common_passes.RemoveUnusedNodesPass(),
     common_passes.RemoveUnusedOpsetsPass(),
+    SymbolicShapeInferencePass(),
+    onnxscript.optimizer._constant_folding.FoldConstantsPass(
+        shape_inference=False, input_size_limit=8192, output_size_limit=512 * 512
+    ),
+    CleanupMetadataPass(),
 ]
 
 
 def _optimize(model: ir.Model) -> None:
     """Apply default optimization passes to a model in-place."""
     pass_ = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
-    pass_(model)
+    if flags.suppress_dedup_warning:
+        with _suppress_dedup_empty_initializer_warnings():
+            pass_(model)
+    else:
+        pass_(model)
 
 
 # Mapping of short dtype names to ONNX IR dtypes
@@ -224,6 +294,13 @@ def build(
 
         # Access individual models
         model = pkg["model"]
+
+    Example with static cache::
+
+        from mobius import build, CausalLMTask
+
+        task = CausalLMTask(static_cache=True, max_seq_len=2048)
+        pkg = build("meta-llama/Llama-3-8B", task=task)
     """
     import dataclasses
 
@@ -240,8 +317,9 @@ def build(
         hf_config = transformers.AutoConfig.from_pretrained(
             model_id, trust_remote_code=trust_remote_code
         )
-    except (ValueError, OSError):
-        # AutoConfig failed — the model_type may not be in transformers.
+    except (ValueError, KeyError, OSError):
+        # AutoConfig failed — the model_type may not be in transformers,
+        # or the HF config class has a bug (e.g. NemotronH with '-' pattern).
         # Try loading config.json directly if the model is in our registry.
         hf_config = _try_load_config_json(model_id)
         if hf_config is None or hf_config.model_type not in registry:
