@@ -10,7 +10,7 @@ authors = [
     { name = "ONNX Contributors", email = "onnx-technical-discuss@lists.lfaidata.foundation" },
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
     "huggingface_hub",
