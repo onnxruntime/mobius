@@ -360,7 +360,11 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             ),
             image_size=getattr(vc, "image_size", None),
             patch_size=getattr(vc, "patch_size", None),
-            norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
+            norm_eps=_first_not_none(
+                getattr(vc, "layer_norm_eps", None),
+                getattr(vc, "norm_eps", None),
+                default=1e-6,
+            ),
             # Pixtral / Mistral-3 vision fields
             model_type=getattr(vc, "model_type", None),
             head_dim=getattr(vc, "head_dim", None),
