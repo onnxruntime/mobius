@@ -229,7 +229,7 @@ def test_onnx_ir_pass_succeeds_after_symbolic_pass():
     # Full optimization already ran — expect 100% coverage
     assert stats_before.with_shape >= stats_before.total - 1
 
-    result = common_passes.ShapeInferencePass()(model)
+    common_passes.ShapeInferencePass()(model)
 
     stats_after = _count_coverage(model)
     # Coverage must not regress
@@ -399,7 +399,7 @@ def test_symbolic_pass_full_coverage_representative_models(model_type, extra_kwa
         f"{model_type}: Expected ≥99% shape coverage, got {stats.with_shape}/{stats.total}. "
         f"Missing: {_unique_missing_ops(stats)}"
     )
-    assert stats.dtype_pct == 1.0, (
+    assert stats.dtype_pct >= 1.0, (
         f"{model_type}: Expected 100% dtype coverage, got {stats.with_dtype}/{stats.total}"
     )
 
@@ -427,12 +427,12 @@ def test_print_comparison_summary():
     _strip_all_type_info(model_onnx_stripped)
     for init in model_onnx_stripped.graph.initializers.values():
         init.const_value = None
-    result_b_stripped = common_passes.ShapeInferencePass()(model_onnx_stripped)
+    common_passes.ShapeInferencePass()(model_onnx_stripped)
     onnx_ir_stripped_stats = _count_coverage(model_onnx_stripped)
 
     # ---- Pass B: ONNX C++ on raw model (partial shapes from onnxscript) --
     model_onnx_ir = copy.deepcopy(model_raw)
-    result_b = common_passes.ShapeInferencePass()(model_onnx_ir)
+    common_passes.ShapeInferencePass()(model_onnx_ir)
     onnx_ir_stats = _count_coverage(model_onnx_ir)
 
     # ---- Pass B after A --------------------------------------------------
