@@ -46,6 +46,7 @@ class OnnxModelSession:
                     f"single ir.Model or index into the package."
                 )
             model = next(iter(model.values()))
+
         self._tmpdir = tempfile.TemporaryDirectory()
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
         ir.save(model, self._model_path, external_data="model.onnx.data")
@@ -57,6 +58,16 @@ class OnnxModelSession:
     @property
     def input_names(self) -> list[str]:
         return self._input_names
+
+    def get_input_shape(self, name: str) -> list[int | str] | None:
+        """Return the declared shape of an input, or ``None`` if not found.
+
+        Shape elements may be ``int`` (static) or ``str`` (symbolic).
+        """
+        for inp in self._session.get_inputs():
+            if inp.name == name:
+                return list(inp.shape)
+        return None
 
     @property
     def output_names(self) -> list[str]:

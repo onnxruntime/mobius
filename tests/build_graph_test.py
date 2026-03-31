@@ -16,8 +16,7 @@ To run a single model::
 
 from __future__ import annotations
 
-import dataclasses
-
+import numpy as np
 import onnx_ir as ir
 import pytest
 from _test_configs import (
@@ -37,7 +36,11 @@ from _test_configs import (
     TINY_LAYERS,
     TINY_VOCAB,
     VISION_CONFIGS,
+    _base_config,
 )
+
+# --- ONNX Checker infrastructure (merged from onnx_checker_test.py) --------
+from onnx_ir.passes.common import CheckerPass
 
 from mobius._builder import (
     DTYPE_MAP,
@@ -60,37 +63,54 @@ from mobius.tasks import (
     get_task,
 )
 
+_onnx_checker = CheckerPass()
+
+# Models where the ONNX checker fails due to upstream onnx-ir issues
+# (e.g. value_info missing type field for custom ops).
+_CHECKER_SKIP_MODELS: set[str] = {
+    "minimax",
+    "mamba2",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_next",
+}
+
+
+def _fill_dummy_weights(model: ir.Model) -> None:
+    """Fill initializers that have no const_value with zero tensors.
+
+    Models built without weights leave initializers empty. The
+    CheckerPass requires const_value to be set so it can serialize
+    the model for the ONNX C checker.
+    """
+    for initializer in model.graph.initializers.values():
+        if initializer.const_value is not None:
+            continue
+        shape = initializer.shape
+        dims = [d if isinstance(d, int) else 1 for d in shape] if shape else [1]
+        dtype = initializer.dtype or ir.DataType.FLOAT
+        initializer.const_value = ir.Tensor(
+            np.zeros(dims, dtype=dtype.numpy()),
+        )
+
+
+def _run_onnx_checker(pkg: dict[str, ir.Model], model_type: str) -> None:
+    """Run ONNX CheckerPass on all models in a package.
+
+    Skips models in ``_CHECKER_SKIP_MODELS`` that have known upstream issues.
+    """
+    if model_type in _CHECKER_SKIP_MODELS:
+        pytest.skip(
+            f"ONNX checker skipped for {model_type}: "
+            "upstream onnx-ir value_info missing type field for custom ops"
+        )
+    for model in pkg.values():
+        _fill_dummy_weights(model)
+        _onnx_checker(model)
+
+
 # Minimal configs for each architecture. These are hand-crafted small configs
 # that exercise each model class without needing to download from HuggingFace.
-
-
-def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
-    if config_cls is None:
-        config_cls = overrides.pop("_config_cls", ArchitectureConfig)
-    else:
-        overrides.pop("_config_cls", None)
-    defaults = dict(
-        hidden_size=TINY_HIDDEN,
-        intermediate_size=TINY_INTERMEDIATE,
-        num_attention_heads=TINY_HEADS,
-        num_key_value_heads=TINY_KV_HEADS,
-        head_dim=TINY_HEAD_DIM,
-        num_hidden_layers=TINY_LAYERS,
-        vocab_size=TINY_VOCAB,
-        max_position_embeddings=128,
-        hidden_act="silu",
-        rms_norm_eps=1e-6,
-        rope_type="default",
-        rope_theta=10_000.0,
-        pad_token_id=0,
-    )
-    defaults.update(overrides)
-    # Filter out fields not accepted by the config class (e.g. MambaConfig
-    # doesn't have max_position_embeddings or rope_* fields).
-    if dataclasses.is_dataclass(config_cls):
-        valid_fields = {f.name for f in dataclasses.fields(config_cls)}
-        defaults = {k: v for k, v in defaults.items() if k in valid_fields}
-    return config_cls(**defaults)
 
 
 # Semantic test IDs for model_types that intentionally appear more than once
@@ -185,7 +205,14 @@ class TestBuildGraph:
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-            if ltype in ("linear_attention",):
+            if ltype == "mlp":
+                continue  # MLP layers are stateless — no cache outputs
+            if ltype == "lightning_attention":
+                # Lightning Attention: single recurrent state only (no conv_state)
+                assert f"present.{i}.recurrent_state" in output_names, (
+                    f"Missing present.{i}.recurrent_state"
+                )
+            elif ltype in ("linear_attention",):
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"
                 )
@@ -218,7 +245,8 @@ class TestBuildGraph:
 
         # Check for expected parameter patterns (allow model-specific naming)
         has_embed = any(
-            "embed_tokens" in n or "word_embeddings" in n or "wte" in n for n in init_names
+            "embed_tokens" in n or "word_embeddings" in n or "wte" in n or "embed_in" in n
+            for n in init_names
         )
         has_attn = any(
             "self_attn" in n or "self_attention" in n or "attention" in n or ".attn." in n
@@ -228,6 +256,15 @@ class TestBuildGraph:
         assert has_embed, "Should have embedding parameters"
         assert has_attn, "Should have attention parameters"
         assert has_mlp, "Should have MLP parameters"
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
 
 
 # === Encoder-only model configs (imported from _test_configs) ===
@@ -284,6 +321,15 @@ class TestBuildEncoderGraph:
         assert has_attn, "Should have attention parameters"
         assert has_mlp, "Should have MLP parameters"
 
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
+
 
 # === Encoder-decoder model configs (imported from _test_configs) ===
 _SEQ2SEQ_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in SEQ2SEQ_CONFIGS]
@@ -325,6 +371,15 @@ class TestBuildSeq2SeqGraph:
         dec_outputs = {out.name for out in pkg["decoder"].graph.outputs}
         assert "logits" in dec_outputs
 
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
+
 
 # === Vision model configs (imported from _test_configs) ===
 _VISION_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in VISION_CONFIGS]
@@ -351,6 +406,15 @@ class TestBuildVisionGraph:
 
         output_names = {out.name for out in model.graph.outputs}
         assert "last_hidden_state" in output_names
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
 
 
 # === Object detection model configs (imported from _test_configs) ===
@@ -381,6 +445,15 @@ class TestBuildDetectionGraph:
         output_names = {out.name for out in model.graph.outputs}
         assert "logits" in output_names
         assert "pred_boxes" in output_names
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
 
 
 # === SSM (Mamba/Mamba2) configs ===
@@ -431,6 +504,15 @@ class TestBuildSSMGraph:
         assert has_embed, "Should have embedding parameters"
         assert has_mixer, "Should have mixer (SSM) parameters"
         assert has_norm, "Should have norm parameters"
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
 
 
 class TestBuildGraphLoRA:
@@ -2314,7 +2396,6 @@ class TestBuildCodecGraph:
     @staticmethod
     def _codec_config():
         from mobius._configs import (
-            ArchitectureConfig,
             CodecDecoderConfig,
             CodecEncoderConfig,
         )
@@ -2847,6 +2928,117 @@ class TestBuildBambaGraph:
 
 
 # ===========================================================================
+# Hybrid Mamba2+Attention+MLP (NemotronH) model tests
+# ===========================================================================
+
+
+class TestBuildNemotronHGraph:
+    """Verify NemotronH hybrid model weight renaming."""
+
+    def _nemotron_h_config(self):
+        from mobius._configs import NemotronHConfig
+
+        # 4 layers: mamba2, mlp, full_attention, mlp
+        return NemotronHConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=4,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            rms_norm_eps=1e-5,
+            layer_types=["mamba2", "mlp", "full_attention", "mlp"],
+            mamba_n_heads=TINY_KV_HEADS,
+            mamba_d_head=TINY_HEAD_DIM,
+            mamba_d_state=16,
+            mamba_n_groups=1,
+            mamba_d_conv=4,
+            mamba_expand=2,
+            hidden_act="relu2",
+            head_dim=TINY_HEAD_DIM,
+        )
+
+    def test_nemotron_h_preprocess_weights(self):
+        """Verify preprocess_weights routes by layer type and nests SSM params."""
+        import torch
+
+        from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+        config = self._nemotron_h_config()
+        module = NemotronHCausalLMModel(config)
+
+        # Simulate HF NemotronH weight names (backbone.* prefix,
+        # all layer mixers named "mixer.*" regardless of type)
+        state_dict = {
+            # Embeddings & final norm
+            "backbone.embeddings.weight": torch.zeros(1),
+            "backbone.norm_f.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(1),
+            # Layer 0: mamba2 — SSM params + mixer params
+            "backbone.layers.0.norm.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.A_log": torch.zeros(4),
+            "backbone.layers.0.mixer.D": torch.zeros(4),
+            "backbone.layers.0.mixer.dt_bias": torch.zeros(4),
+            "backbone.layers.0.mixer.in_proj.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.conv1d.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.out_proj.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.norm.weight": torch.zeros(1),
+            # Layer 1: mlp
+            "backbone.layers.1.norm.weight": torch.zeros(1),
+            "backbone.layers.1.mixer.up_proj.weight": torch.zeros(1),
+            "backbone.layers.1.mixer.down_proj.weight": torch.zeros(1),
+            # Layer 2: full_attention
+            "backbone.layers.2.norm.weight": torch.zeros(1),
+            "backbone.layers.2.mixer.q_proj.weight": torch.zeros(1),
+            "backbone.layers.2.mixer.k_proj.weight": torch.zeros(1),
+            "backbone.layers.2.mixer.v_proj.weight": torch.zeros(1),
+            "backbone.layers.2.mixer.o_proj.weight": torch.zeros(1),
+            # Layer 3: mlp
+            "backbone.layers.3.norm.weight": torch.zeros(1),
+            "backbone.layers.3.mixer.up_proj.weight": torch.zeros(1),
+            "backbone.layers.3.mixer.down_proj.weight": torch.zeros(1),
+        }
+        result = module.preprocess_weights(state_dict)
+
+        # Global renames: backbone.embeddings -> model.embed_tokens,
+        # backbone.norm_f -> model.norm
+        assert "model.embed_tokens.weight" in result
+        assert "model.norm.weight" in result
+
+        # Layer 0 (mamba2): SSM params nested under mamba.ssm
+        assert "model.layers.0.mamba.ssm.A_log" in result
+        assert "model.layers.0.mamba.ssm.D" in result
+        assert "model.layers.0.mamba.ssm.dt_bias" in result
+        # Non-SSM mamba params stay under mamba.*
+        assert "model.layers.0.mamba.in_proj.weight" in result
+        assert "model.layers.0.mamba.conv1d.weight" in result
+        assert "model.layers.0.mamba.out_proj.weight" in result
+        assert "model.layers.0.mamba.norm.weight" in result
+
+        # Layer 1 (mlp): mixer -> mlp
+        assert "model.layers.1.mlp.up_proj.weight" in result
+        assert "model.layers.1.mlp.down_proj.weight" in result
+
+        # Layer 2 (full_attention): mixer -> self_attn
+        assert "model.layers.2.self_attn.q_proj.weight" in result
+        assert "model.layers.2.self_attn.k_proj.weight" in result
+        assert "model.layers.2.self_attn.v_proj.weight" in result
+        assert "model.layers.2.self_attn.o_proj.weight" in result
+
+        # Layer 3 (mlp): mixer -> mlp
+        assert "model.layers.3.mlp.up_proj.weight" in result
+        assert "model.layers.3.mlp.down_proj.weight" in result
+
+        # Per-layer norms keep their names
+        assert "model.layers.0.norm.weight" in result
+        assert "model.layers.2.norm.weight" in result
+
+        # No original backbone.* keys should remain
+        for key in result:
+            assert not key.startswith("backbone."), f"Unrenamed key: {key}"
+
+
+# ===========================================================================
 # Hybrid SSM+Attention (Jamba) model tests
 # ===========================================================================
 
@@ -3060,9 +3252,19 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 
 # Registered model types that truly have no test coverage yet.
 # This set should be empty or near-empty. If a NEW model is registered
-# and is not in any tested set, the completeness test below will
-# fail — forcing the developer to add a test or acknowledge the gap.
-_KNOWN_UNTESTED_MODEL_TYPES: set[str] = set()
+# Internal aliases whose real HF counterpart is already tested.
+# These are registered in the registry for production use but removed
+# from test configs because they duplicate existing coverage or
+# cannot be tested with our generic test infrastructure.
+_KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
+    "qwen3_5_vl_text",  # VL text decoder; real type is qwen3_5_text
+    "qwen3_omni_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "qwen3_vl_moe",  # VL MoE; no HF AutoModelForCausalLM support
+    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
+    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
+    "deepseek_v2_moe",  # our custom alias; real type is deepseek_v2
+    "gptoss",  # alias for gpt_oss; real type tested via gpt_oss entry
+}
 
 
 class TestRegistryCompleteness:
@@ -3108,23 +3310,23 @@ class TestRegistryCompleteness:
 
 
 class TestBuildStaticCacheGraph:
-    """Verify StaticCacheCausalLMTask builds a valid graph."""
+    """Verify CausalLMTask(static_cache=True) builds a valid graph."""
 
     MAX_SEQ_LEN = 128
 
     def _build_static_cache_model(self, model_type: str = "qwen2", **config_overrides):
-        """Build a model with StaticCacheCausalLMTask and return (model, config)."""
-        from mobius.tasks import StaticCacheCausalLMTask
+        """Build a model with CausalLMTask(static_cache=True) and return (model, config)."""
+        from mobius.tasks import CausalLMTask
 
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
-        task = StaticCacheCausalLMTask(max_seq_len=self.MAX_SEQ_LEN)
+        task = CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN)
         pkg = task.build(module, config)
         return pkg["model"], config
 
     def test_static_cache_graph_builds(self):
-        """Build a Qwen2 model with StaticCacheCausalLMTask."""
+        """Build a Qwen2 model with static cache."""
         model, _ = self._build_static_cache_model()
 
         assert model.graph is not None
@@ -3242,12 +3444,13 @@ class TestBuildStaticCacheGraph:
             )
 
     def test_static_cache_moe_graph_builds(self):
-        """Build a MoE model (qwen2_moe) with StaticCacheCausalLMTask."""
+        """Build a MoE model (qwen2_moe) with static cache."""
         model, _config = self._build_static_cache_model(
             model_type="qwen2_moe",
             num_local_experts=4,
             num_experts_per_tok=2,
             attn_qkv_bias=True,
+            shared_expert_intermediate_size=64,
         )
 
         assert model.graph is not None

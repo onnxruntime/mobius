@@ -44,8 +44,10 @@ jobs:
           fetch-depth: 0
       - name: Get changed files
         id: changed
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed_files.txt
+          git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
           echo "Changed files:"
           cat changed_files.txt
       - name: Detect affected models
@@ -144,7 +146,10 @@ jobs:
 
   golden-comparison:
     name: L4 Golden Comparison
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-golden-comparison-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     needs: [detect-affected]
     if: >-
       always() && !cancelled() &&

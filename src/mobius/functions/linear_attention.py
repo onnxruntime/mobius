@@ -4,18 +4,27 @@
 """Reference ir.Function for the proposed LinearAttention operator.
 
 Implements the gated delta-rule linear attention recurrence as a
-self-contained function: GQA head expansion + sequential Scan over
-the time dimension.  The component (GatedDeltaNet) simply calls
-``op.LinearAttention(q, k, v, state, decay, beta)`` — all
-complexity lives here.
+self-contained function: 3D→4D reshape + GQA head expansion + query
+scaling + sequential Scan over the time dimension.  The component
+(GatedDeltaNet) simply calls
+``op.LinearAttention(q, k, v, state, decay, beta)`` — all complexity
+lives here.
 
 The gated-delta variant (used by Qwen3.5 GatedDeltaNet) computes:
 
     S_t = exp(g_t) * S_{t-1} + beta_t * k_t (x) (v_t - exp(g_t) * S_{t-1}^T k_t)
     o_t = q_t^T S_t
 
-GQA support: when Q/K have fewer heads (H_kv) than V/state (H),
-the function expands Q/K heads internally via Tile+Reshape.
+All activations are 3D ``[B, T, H*D]`` (matching the ONNX Attention op
+convention).  ``q_num_heads`` and ``kv_num_heads`` attributes tell
+the function how to reshape to 4D internally.
+
+The function has 6 required inputs:
+  ``(query, key, value, past_state, decay, beta)``
+
+GQA support: when Q/K have fewer heads (q_num_heads) than
+V/state (kv_num_heads), the function expands Q/K heads internally
+via Tile+Reshape.
 
 Op spec: https://github.com/onnx/onnx/issues/7689
 """
@@ -36,32 +45,55 @@ DOMAIN = "com.microsoft"
 
 def linear_attention(
     *,
-    num_k_heads: int,
-    num_v_heads: int,
+    q_num_heads: int,
+    kv_num_heads: int,
     update_rule: str = "gated_delta",
+    scale: float = 1.0,
+    stash_type: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
-    Inputs:
-        query:      (B, H_kv, T, d_k) — query (may have fewer heads
-                    than value for GQA; pre-scaled by 1/sqrt(d_k))
-        key:        (B, H_kv, T, d_k) — key (L2-normalized)
-        value:      (B, H, T, d_v) — value (H >= H_kv)
-        past_state: (B, H, d_k, d_v) — recurrent state
-        decay:      (B, H, T) — exponential decay gate (log-space)
-        beta:       (B, H, T) — update rate (sigmoid output)
+    Inputs (conditional):
+        query:      (B, T, q_num_heads * d_k)
+        key:        (B, T, q_num_heads * d_k)
+        value:      (B, T, kv_num_heads * d_v)
+        past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
+        decay:      (B, T, kv_num_heads * d_k) — required when update_rule in ("gated", "gated_delta")
+        beta:       (B, T, kv_num_heads) — required when update_rule in ("delta", "gated_delta")
 
     Outputs:
-        output:        (B, H, T, d_v) — attention output
-        present_state: (B, H, d_k, d_v) — updated recurrent state
+        output:        (B, T, kv_num_heads * d_v) — attention output (3D)
+        present_state: (B, kv_num_heads, d_k, d_v) — updated state
 
     Args:
-        num_k_heads: Number of key/query heads (H_kv).
-        num_v_heads: Number of value heads (H). Must be >= num_k_heads.
-        update_rule: One of "linear", "gated", "delta", "gated_delta".
+        q_num_heads: Number of heads for Q/K (may be fewer than V
+            for GQA).  Matches ``kv_num_heads`` in the standard
+            Attention op (Q/K are the "key-query" pair here).
+        kv_num_heads: Number of heads for V and the output.  Matches
+            ``q_num_heads`` in the standard Attention op (V determines
+            the output head count).
 
-    The function body handles GQA expansion and uses an ONNX Scan op
-    for the sequential recurrence.  A fused kernel can replace the
+    .. note:: **Naming convention vs standard Attention**
+
+       In standard GQA (``Attention`` op), Q has *more* heads than K/V,
+       so ``q_num_heads >= kv_num_heads``.  In LinearAttention the roles
+       are flipped: Q/K are the *key-query* pair (fewer heads) while V
+       determines the *output* head count (more heads).  The attribute
+       names ``q_num_heads`` and ``kv_num_heads`` therefore map to the
+       *opposite* head counts compared to the standard Attention op.
+       This matches the ONNX LinearAttention op proposal
+       (onnx/onnx#7689) which uses the same naming convention.
+        update_rule: One of "linear", "gated", "delta", "gated_delta".
+        scale: Scalar multiplier applied to query before the recurrence.
+            Per the ONNX LinearAttention op spec, should be set to
+            ``1/sqrt(head_dim)`` for correct scaling.
+        stash_type: Element type for the Scan body's internal
+            computation.  Must match the precision of the inputs
+            passed at the call site.  Defaults to ``FLOAT``.
+
+    The function body handles 3D→4D reshape, GQA expansion, query
+    scaling, and uses an ONNX Scan op for the sequential recurrence.
+    Output is reshaped back to 3D.  A fused kernel can replace the
     entire function for 10-50x speedup.
     """
     valid_rules = ("linear", "gated", "delta", "gated_delta")
@@ -69,45 +101,28 @@ def linear_attention(
         raise ValueError(
             f"Unknown update_rule: {update_rule!r}. Expected one of {valid_rules}."
         )
+    if q_num_heads <= 0:
+        raise ValueError(f"q_num_heads must be > 0; got {q_num_heads}")
+    if kv_num_heads <= 0:
+        raise ValueError(f"kv_num_heads must be > 0; got {kv_num_heads}")
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
 
-    # --- Define function inputs ---
-    # Q/K may have fewer heads (H_kv) than V/state (H) for GQA.
-    query = ir.Value(
-        name="query",
-        shape=ir.Shape(["B", "H_kv", "T", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    key = ir.Value(
-        name="key",
-        shape=ir.Shape(["B", "H_kv", "T", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    value = ir.Value(
-        name="value",
-        shape=ir.Shape(["B", "H", "T", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    past_state = ir.Value(
-        name="past_state",
-        shape=ir.Shape(["B", "H", "d_k", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    # decay/beta are 3D: (B, H, T) — no trailing singleton dim.
-    # The Scan body handles unsqueezing for broadcasting.
-    decay = ir.Value(
-        name="decay",
-        shape=ir.Shape(["B", "H", "T"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    beta = ir.Value(
-        name="beta",
-        shape=ir.Shape(["B", "H", "T"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    inputs = [query, key, value, past_state, decay, beta]
+    # --- Define function inputs (conditional on update_rule) ---
+    query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
+    key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
+    value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
+    past_state = ir.Value(name="past_state")
+    inputs = [query, key, value, past_state]
+    decay: ir.Value | None = None
+    beta: ir.Value | None = None
+    if uses_decay:
+        decay = ir.Value(name="decay")
+        inputs.append(decay)
+    if uses_beta:
+        beta = ir.Value(name="beta")
+        inputs.append(beta)
 
     # --- Build function body graph ---
     graph = ir.Graph(
@@ -120,41 +135,94 @@ def linear_attention(
     gb = builder.GraphBuilder(graph)
     op = gb.op
 
+    # --- Reshape 3D → 4D using head counts ---
+    b_dim = op.Shape(query, start=0, end=1)
+    t_dim = op.Shape(query, start=1, end=2)
+
+    # Q/K: [B, T, q_num_heads*d_k] → [B, T, q_num_heads, d_k]
+    #     → transpose to [B, q_num_heads, T, d_k]
+    qk_4d_shape = op.Concat(
+        b_dim,
+        t_dim,
+        op.Constant(value_ints=[q_num_heads, -1]),
+        axis=0,
+    )
+    query_4d = op.Transpose(
+        op.Reshape(query, qk_4d_shape), perm=[0, 2, 1, 3]
+    )  # [B, q_num_heads, T, d_k]
+    key_4d = op.Transpose(
+        op.Reshape(key, qk_4d_shape), perm=[0, 2, 1, 3]
+    )  # [B, q_num_heads, T, d_k]
+
+    # V: [B, T, kv_num_heads*d_v] → [B, kv_num_heads, T, d_v]
+    # Reuse kv_4d_shape for both V and decay (same [B, T, kv_num_heads, -1]).
+    kv_4d_shape = op.Concat(
+        b_dim,
+        t_dim,
+        op.Constant(value_ints=[kv_num_heads, -1]),
+        axis=0,
+    )
+    value_4d = op.Transpose(
+        op.Reshape(value, kv_4d_shape), perm=[0, 2, 1, 3]
+    )  # [B, kv_num_heads, T, d_v]
+
     # --- GQA: expand Q/K heads to match V head count ---
-    if num_v_heads % num_k_heads != 0:
+    if kv_num_heads % q_num_heads != 0:
         raise ValueError(
-            f"num_v_heads ({num_v_heads}) must be divisible by num_k_heads ({num_k_heads})"
+            f"kv_num_heads ({kv_num_heads}) must be divisible by q_num_heads ({q_num_heads})"
         )
-    gqa_ratio = num_v_heads // num_k_heads
-    query_expanded, key_expanded = _expand_kv_heads(op, query, key, gqa_ratio=gqa_ratio)
+    gqa_ratio = kv_num_heads // q_num_heads
+    query_expanded, key_expanded = _expand_kv_heads(op, query_4d, key_4d, gqa_ratio=gqa_ratio)
+
+    # --- Reshape decay/beta 3D → 4D (only when used) ---
+    # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
+    #     → transpose to (B, kv_num_heads, T, d_k)
+    if uses_decay:
+        decay_4d = op.Transpose(
+            op.Reshape(decay, kv_4d_shape), perm=[0, 2, 1, 3]
+        )  # [B, kv_num_heads, T, d_k]
+    if uses_beta:
+        # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
+        beta_3d = op.Transpose(beta, perm=[0, 2, 1])  # [B, kv_num_heads, T]
+
+    # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
+    # CastLike ensures scale constant matches the input dtype.
+    scaled_query = op.Mul(
+        query_expanded,
+        op.CastLike(op.Constant(value_float=scale), query_expanded),
+    )
 
     # --- Build Scan for sequential recurrence ---
-    scan_body = _build_recurrence_body(uses_decay, uses_beta)
+    scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
 
     # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
-    q_t = op.Transpose(query_expanded, perm=[2, 0, 1, 3])
+    q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
     k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
-    v_t = op.Transpose(value, perm=[2, 0, 1, 3])
-    # decay/beta: (B, H, T) -> (T, B, H)
-    decay_t = op.Transpose(decay, perm=[2, 0, 1])
-    beta_t = op.Transpose(beta, perm=[2, 0, 1])
+    v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
+
+    scan_inputs = [q_t, k_t, v_t]
+    if uses_decay:
+        decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])  # (T, B, H, d_k)
+        scan_inputs.append(decay_t)
+    if uses_beta:
+        beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])  # (T, B, H)
+        scan_inputs.append(beta_t)
 
     present_state, output_t = op.Scan(
         past_state,  # carry: (B, H, d_k, d_v)
-        q_t,  # (T, B, H, d_k)
-        k_t,  # (T, B, H, d_k)
-        v_t,  # (T, B, H, d_v)
-        decay_t,  # (T, B, H)
-        beta_t,  # (T, B, H)
+        *scan_inputs,
         body=scan_body,
-        num_scan_inputs=5,
+        num_scan_inputs=len(scan_inputs),
         _outputs=2,
     )
     # present_state: (B, H, d_k, d_v)
     # output_t: (T, B, H, d_v)
 
-    # Transpose output back: (T, B, H, d_v) -> (B, H, T, d_v)
-    output = op.Transpose(output_t, perm=[1, 2, 0, 3])
+    # --- Reshape output 4D → 3D ---
+    # (T, B, H, d_v) → (B, T, H, d_v) → (B, T, H*d_v)
+    output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
+    out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
+    output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
 
     output.name = "output"
     present_state.name = "present_state"
@@ -167,68 +235,83 @@ def linear_attention(
         update_rule,
         ref_attr_name="update_rule",
     )
+    scale_attr = ir.Attr(
+        "scale",
+        ir.AttributeType.FLOAT,
+        scale,
+        ref_attr_name="scale",
+    )
+    q_heads_attr = ir.Attr(
+        "q_num_heads",
+        ir.AttributeType.INT,
+        q_num_heads,
+        ref_attr_name="q_num_heads",
+    )
+    kv_heads_attr = ir.Attr(
+        "kv_num_heads",
+        ir.AttributeType.INT,
+        kv_num_heads,
+        ref_attr_name="kv_num_heads",
+    )
     return ir.Function(
         domain=DOMAIN,
         name="LinearAttention",
         graph=graph,
-        attributes={"update_rule": update_rule_attr},
+        attributes={
+            "update_rule": update_rule_attr,
+            "scale": scale_attr,
+            "q_num_heads": q_heads_attr,
+            "kv_num_heads": kv_heads_attr,
+        },
     )
 
 
 def _build_recurrence_body(
     uses_decay: bool,
     uses_beta: bool,
+    *,
+    stash_type: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
+
+    The body operates in ``stash_type`` precision.
 
     Body inputs (in order):
         1. state: (B, H, d_k, d_v) [carry]
         2. q_t: (B, H, d_k) [scan input]
         3. k_t: (B, H, d_k) [scan input]
         4. v_t: (B, H, d_v) [scan input]
-        5. decay_t: (B, H) [scan input]
+        5. decay_t: (B, H, d_k) [scan input]
         6. beta_t: (B, H) [scan input]
 
     Body outputs:
         1. new_state: (B, H, d_k, d_v) [carry]
         2. output_t: (B, H, d_v) [scan output]
     """
-    batch = ir.SymbolicDim("B")
+    dtype = ir.TensorType(stash_type)
 
-    state_in = ir.Value(
-        name="state",
-        shape=ir.Shape([batch, "H", "d_k", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    q_t = ir.Value(
-        name="q_t",
-        shape=ir.Shape([batch, "H", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    k_t = ir.Value(
-        name="k_t",
-        shape=ir.Shape([batch, "H", "d_k"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    v_t = ir.Value(
-        name="v_t",
-        shape=ir.Shape([batch, "H", "d_v"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    decay_t = ir.Value(
-        name="decay_t",
-        shape=ir.Shape([batch, "H"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
-    beta_t = ir.Value(
-        name="beta_t",
-        shape=ir.Shape([batch, "H"]),
-        type=ir.TensorType(ir.DataType.FLOAT),
-    )
+    # Only specify dtype, not shape. Shapes can be inferred from Scan op's
+    # inputs. Hard-coding locally chosen symbolic dim names is incorrect
+    # since ONNX has a global scope for symbolic dims. Even the dtype is
+    # optional in that it can be inferred, but specifying it is safe and
+    # can help as long as we know the exact type.
+    state_in = ir.Value(name="state", type=dtype)
+    q_t = ir.Value(name="q_t", type=dtype)
+    k_t = ir.Value(name="k_t", type=dtype)
+    v_t = ir.Value(name="v_t", type=dtype)
+    scan_in_vals = [q_t, k_t, v_t]
+    decay_t: ir.Value | None = None
+    beta_t: ir.Value | None = None
+    if uses_decay:
+        decay_t = ir.Value(name="decay_t", type=dtype)
+        scan_in_vals.append(decay_t)
+    if uses_beta:
+        beta_t = ir.Value(name="beta_t", type=dtype)
+        scan_in_vals.append(beta_t)
 
     body_graph, body_builder = create_body_graph(
         state_inputs=[state_in],
-        scan_inputs=[q_t, k_t, v_t, decay_t, beta_t],
+        scan_inputs=scan_in_vals,
         name="delta_recurrence",
     )
     bop = body_builder.op
@@ -239,9 +322,8 @@ def _build_recurrence_body(
 
     # --- State decay: state = exp(g) * past_state ---
     if uses_decay:
-        # decay_t: (B, H) -> (B, H, 1, 1)
-        axes_23 = bop.Constant(value_ints=[2, 3])
-        g_exp = bop.Exp(bop.Unsqueeze(decay_t, axes_23))
+        # decay_t: (B, H, d_k) -> (B, H, d_k, 1) for broadcasting with state (B, H, d_k, d_v)
+        g_exp = bop.Exp(bop.Unsqueeze(decay_t, axes_neg1))
         state = bop.Mul(state_in, g_exp)
     else:
         state = state_in

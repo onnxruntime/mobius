@@ -31,6 +31,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 
+_GITHUB_REPO_URL = "https://github.com/onnxruntime/mobius"
+
 
 # ------------------------------------------------------------------
 # Model build configs — mirrors the benchmark / test infrastructure
@@ -39,13 +41,13 @@ sys.path.insert(0, str(_PROJECT_ROOT / "tests"))
 #   build_kind is "standard", "whisper", "mamba", or "qwen3_5_vl".
 _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     ("llama", {}, "text-generation", "standard"),
-    ("llama", {}, "static-cache-text-generation", "standard"),
+    ("llama", {}, "static-cache", "standard"),
     ("qwen2", {}, "text-generation", "standard"),
-    ("qwen2", {}, "static-cache-text-generation", "standard"),
+    ("qwen2", {}, "static-cache", "standard"),
     ("qwen", {}, "text-generation", "standard"),
-    ("qwen", {}, "static-cache-text-generation", "standard"),
+    ("qwen", {}, "static-cache", "standard"),
     ("qwen3", {"attn_qk_norm": True}, "text-generation", "standard"),
-    ("qwen3", {"attn_qk_norm": True}, "static-cache-text-generation", "standard"),
+    ("qwen3", {"attn_qk_norm": True}, "static-cache", "standard"),
     (
         "qwen3_5_text",
         {
@@ -112,6 +114,8 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 64,
             "attn_qkv_bias": True,
         },
         "text-generation",
@@ -122,9 +126,11 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 64,
             "attn_qkv_bias": True,
         },
-        "static-cache-text-generation",
+        "static-cache",
         "standard",
     ),
     (
@@ -144,7 +150,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
             "num_experts_per_tok": 2,
             "attn_qk_norm": True,
         },
-        "static-cache-text-generation",
+        "static-cache",
         "standard",
     ),
     (
@@ -156,7 +162,7 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     (
         "phi3",
         {"partial_rotary_factor": 0.5},
-        "static-cache-text-generation",
+        "static-cache",
         "standard",
     ),
     (
@@ -220,6 +226,22 @@ def _display_key(model_type: str, task_name: str) -> str:
 # ------------------------------------------------------------------
 # Detect affected model types from git diff
 # ------------------------------------------------------------------
+
+
+def _resolve_sha(ref: str) -> str:
+    """Return the short SHA for *ref*, or *ref* itself if resolution fails.
+
+    Falls back to the raw string on shallow clones, typos, or other git errors
+    so the rest of the script can continue rather than crashing.
+    """
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", ref],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ref
 
 
 def _changed_files(base_ref: str, head_ref: str) -> list[str]:
@@ -319,7 +341,7 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
 
     def _build_standard():
         from mobius._registry import registry
-        from mobius.tasks import get_task
+        from mobius.tasks import CausalLMTask, get_task
         ov = dict(overrides)
         cls_name = ov.pop("_config_cls", None)
         if cls_name:
@@ -329,7 +351,10 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
             config = _base_config(**ov)
         model_cls = registry.get(model_type)
         module = model_cls(config)
-        task = get_task(task_name)
+        if task_name == "static-cache":
+            task = CausalLMTask(static_cache=True)
+        else:
+            task = get_task(task_name)
         return task.build(module, config)
 
     def _build_whisper():
@@ -572,6 +597,10 @@ def main() -> None:
         render_markdown,
     )
 
+    # Resolve refs to short SHAs for display in the markdown output
+    base_sha = _resolve_sha(args.base_ref)
+    head_sha = _resolve_sha(args.head_ref)
+
     # 1. Detect affected models
     if args.all:
         affected = {m[0] for m in _DIFF_MODELS}
@@ -581,7 +610,9 @@ def main() -> None:
         if not affected:
             print("No model source files changed — nothing to diff.")
             # Write a minimal report
-            md = render_markdown({})
+            md = render_markdown(
+                {}, base_ref=base_sha, head_ref=head_sha, repo_url=_GITHUB_REPO_URL
+            )
             Path(args.output).write_text(md, encoding="utf-8")
             return
 
@@ -645,7 +676,9 @@ def main() -> None:
         all_diffs[display] = sub_models
 
     # 3. Render and write
-    md = render_markdown(all_diffs)
+    md = render_markdown(
+        all_diffs, base_ref=base_sha, head_ref=head_sha, repo_url=_GITHUB_REPO_URL
+    )
     Path(args.output).write_text(md, encoding="utf-8")
     print(f"Wrote {args.output}")
 
