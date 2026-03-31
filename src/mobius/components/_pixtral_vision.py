@@ -402,10 +402,11 @@ class Mistral3MultiModalProjector(nn.Module):
         vision_hidden_size: int,
         text_hidden_size: int,
         spatial_merge_size: int = 2,
+        norm_eps: float = 1e-5,
     ):
         super().__init__()
         # HF applies norm BEFORE spatial merging
-        self.norm = RMSNorm(vision_hidden_size, eps=1e-5)
+        self.norm = RMSNorm(vision_hidden_size, eps=norm_eps)
         self.patch_merger = Mistral3PatchMerger(
             vision_hidden_size,
             spatial_merge_size,

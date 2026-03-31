@@ -154,6 +154,7 @@ class _PixtralVisionEncoderModel(nn.Module):
             vision_hidden_size=config.vision.hidden_size,
             text_hidden_size=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
+            norm_eps=config.rms_norm_eps,
         )
 
     def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
@@ -226,27 +227,30 @@ def _preprocess_pixtral_weights(
 ) -> dict[str, torch.Tensor]:
     """Remap HF Mistral-3/Pixtral weight names to ONNX sub-model names.
 
-    HF prefixes decoder weights with ``language_model.``; vision and
-    projector weights have no extra prefix.  This function adds the
-    ``vision_encoder.`` prefix expected by the ONNX module tree and
-    strips ``language_model.`` for the decoder/embedding sub-models.
+    HF wraps everything under ``model.`` (Mistral3Model) and prefixes
+    decoder weights with ``language_model.``.  This function strips
+    the ``model.`` prefix, adds ``vision_encoder.`` for vision/projector
+    weights, and strips ``language_model.`` for decoder/embedding.
     """
     renamed: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        if key.startswith(("vision_tower.", "multi_modal_projector.")):
-            # Vision/projector: add vision_encoder. prefix
-            renamed[f"vision_encoder.{key}"] = value
-        elif key.startswith("language_model.model.embed_tokens."):
-            # Embedding weights go to both decoder and embedding
-            suffix = key[len("language_model.model.") :]
+        # Strip outer model. prefix (Mistral3ForConditionalGeneration.model)
+        k = key[len("model.") :] if key.startswith("model.") else key
+
+        if k.startswith(("vision_tower.", "multi_modal_projector.")):
+            renamed[f"vision_encoder.{k}"] = value
+        elif k.startswith("language_model.model.embed_tokens."):
+            suffix = k[len("language_model.model.") :]
             renamed[f"decoder.model.{suffix}"] = value
             renamed[f"embedding.{suffix}"] = value
             if tie_word_embeddings:
                 renamed["decoder.lm_head.weight"] = value
-        elif key.startswith("language_model.lm_head."):
-            suffix = key[len("language_model.") :]
+        elif k.startswith("language_model.lm_head."):
+            suffix = k[len("language_model.") :]
             renamed[f"decoder.{suffix}"] = value
-        elif key.startswith("language_model."):
-            suffix = key[len("language_model.") :]
+        elif k.startswith("language_model."):
+            suffix = k[len("language_model.") :]
             renamed[f"decoder.{suffix}"] = value
+        elif k == "lm_head.weight" or k.startswith("lm_head."):
+            renamed[f"decoder.{k}"] = value
     return renamed
