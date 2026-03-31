@@ -350,7 +350,6 @@ def _create_default_registry() -> ModelRegistry:
         "ministral",
         "ministral3",
         "mistral",
-        "mistral3",
         "nanochat",
         "open-llama",
         "openelm",
@@ -845,7 +844,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "instructblip": "Salesforce/instructblip-flan-t5-xl",
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
-    "mistral3": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
