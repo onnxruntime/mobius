@@ -53,6 +53,7 @@ import numpy as np
 import transformers
 
 from mobius import build
+from mobius._flags import flags as mobius_flags
 from mobius._testing.ort_inference import OnnxModelSession
 
 # ---------------------------------------------------------------------------
@@ -510,6 +511,8 @@ def main():
         session = OnnxModelSession(onnx_model, device=args.device)
     else:
         # Step 1 (+ optional inference): build from HuggingFace
+        if args.device == "cuda":
+            mobius_flags.ort_cuda_grouped_rmsnorm_workaround = True
         print(f"Building model for {args.model!r} (dtype={args.dtype}) ...")
         pkg = build(
             args.model,
