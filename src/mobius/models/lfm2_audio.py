@@ -41,8 +41,8 @@ from onnxscript._internal import builder
 from mobius._configs import Lfm2AudioConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
-    MLP,
     FCMLP,
+    MLP,
     Attention,
     ConformerEncoder,
     Embedding,
@@ -131,9 +131,7 @@ class _Lfm2AudioEmbedding(nn.Module):
 
     def __init__(self, config: Lfm2AudioConfig):
         super().__init__()
-        self.text_embed = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.text_embed = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         # Audio codebook embedding: codebooks * audio_vocab_size entries
         audio_vocab = config.audio_vocab_size * config.num_codebooks
         self.audio_embed = Embedding(audio_vocab, config.hidden_size)
@@ -142,17 +140,14 @@ class _Lfm2AudioEmbedding(nn.Module):
         self,
         op: builder.OpBuilder,
         input_ids: ir.Value,
-        audio_features: ir.Value,
     ):
-        """Forward: text_ids + audio_features -> inputs_embeds.
+        """Forward: text_ids -> inputs_embeds.
 
-        For simplicity, returns text embeddings. Audio feature fusion
-        is handled by the runtime at the sequence assembly level.
+        Returns text embeddings only. Audio codebook embeddings are
+        handled separately by the audio_decoder's depth_embeddings.
+        Runtime assembles text + audio at the sequence level.
         """
-        # Text embeddings for the text portion
-        text_embeds = self.text_embed(op, input_ids)
-        # Return text embeddings; runtime fuses with audio_features
-        return text_embeds
+        return self.text_embed(op, input_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +165,8 @@ class _Lfm2AudioDecoderLayer(nn.Module):
     def __init__(self, config: Lfm2AudioConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        self.operator_norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.ffn_norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.operator_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.feed_forward = MLP(config)
 
     def forward(
@@ -213,12 +204,8 @@ class _Lfm2AudioConvLayer(nn.Module):
             kernel_size=config.short_conv_kernel,
             bias=config.short_conv_bias,
         )
-        self.operator_norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.ffn_norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.operator_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.feed_forward = MLP(config)
 
     def forward(
@@ -232,12 +219,8 @@ class _Lfm2AudioConvLayer(nn.Module):
         del attention_bias, position_embeddings
         residual = hidden_states
         hidden_states = self.operator_norm(op, hidden_states)
-        conv_state = (
-            past_key_value[0] if past_key_value is not None else None
-        )
-        conv_out, new_conv_state = self.conv(
-            op, hidden_states, conv_state
-        )
+        conv_state = past_key_value[0] if past_key_value is not None else None
+        conv_out, new_conv_state = self.conv(op, hidden_states, conv_state)
         hidden_states = op.Add(residual, conv_out)
         residual = hidden_states
         hidden_states = self.ffn_norm(op, hidden_states)
@@ -263,11 +246,7 @@ class _Lfm2AudioDecoder(nn.Module):
         layer_types = config.layer_types or []
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            ltype = (
-                layer_types[i]
-                if i < len(layer_types)
-                else "full_attention"
-            )
+            ltype = layer_types[i] if i < len(layer_types) else "full_attention"
             if ltype == "conv":
                 self.layers.append(_Lfm2AudioConvLayer(config))
             else:
@@ -276,9 +255,7 @@ class _Lfm2AudioDecoder(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
         # LM head (tied with lfm.embed_tokens in preprocess_weights)
-        self.lm_head = Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
@@ -321,7 +298,9 @@ class _Lfm2AudioDecoder(nn.Module):
 
 
 class _DepthformerLayer(nn.Module):
-    """Single depthformer layer: RMSNorm -> Attention -> residual ->
+    """Single depthformer layer with RMSNorm, Attention, and SwiGLU MLP.
+
+    Architecture: RMSNorm -> Attention -> residual ->
     RMSNorm -> SwiGLU MLP -> residual.
 
     The depthformer uses the same StandardBlock structure as the LFM2
@@ -423,6 +402,13 @@ class _Lfm2AudioDecoderModule(nn.Module):
                 Linear(depthformer_dim, config.audio_vocab_size, bias=False)
             )
 
+        # Stacked head weights for dynamic codebook selection via Gather.
+        # Shape: (num_codebooks, audio_vocab_size, depthformer_dim)
+        # In preprocess_weights, this is assembled from per-codebook weights.
+        self.stacked_head_weights = nn.Parameter(
+            [config.num_codebooks, config.audio_vocab_size, depthformer_dim]
+        )
+
         self._depthformer_dim = depthformer_dim
         self._num_codebooks = config.num_codebooks
 
@@ -481,13 +467,9 @@ class _Lfm2AudioDecoderModule(nn.Module):
         idx_3d = op.Reshape(codebook_idx, op.Constant(value_ints=[1, 1, 1]))
         idx_expanded = op.Expand(
             idx_3d,
-            op.Constant(
-                value_ints=[1, 1, self._depthformer_dim]
-            ),
+            op.Constant(value_ints=[1, 1, self._depthformer_dim]),
         )
-        depthformer_input = op.GatherElements(
-            projected_3d, idx_expanded, axis=1
-        )
+        depthformer_input = op.GatherElements(projected_3d, idx_expanded, axis=1)
         # (B, 1, depthformer_dim) - unsqueeze back seq dim is already there
 
         # Add previous codebook embedding
@@ -513,9 +495,16 @@ class _Lfm2AudioDecoderModule(nn.Module):
         # Norm + logits for current codebook
         hidden_states = self.embedding_norm(op, hidden_states)
 
-        # Select the codebook head (use first for now - runtime loops)
-        # TODO: dynamic head selection based on codebook_idx
-        logits = self.depth_embeddings[0](op, hidden_states)
+        # Dynamic codebook head selection:
+        # stacked_head_weights: (num_codebooks, audio_vocab_size, dim)
+        # Gather by codebook_idx -> (audio_vocab_size, dim)
+        head_weight = op.Gather(self.stacked_head_weights, codebook_idx, axis=0)
+        # (audio_vocab_size, depthformer_dim)
+        head_weight_3d = op.Unsqueeze(head_weight, [0])
+        # (1, audio_vocab_size, depthformer_dim)
+        # hidden_states: (B, 1, depthformer_dim)
+        # logits = hidden_states @ head_weight^T -> (B, 1, audio_vocab_size)
+        logits = op.MatMul(hidden_states, op.Transpose(head_weight_3d, perm=[0, 2, 1]))
 
         return logits, present_key_values
 
@@ -579,6 +568,20 @@ class Lfm2AudioModel(nn.Module):
             if new_key is not None:
                 new_state_dict[new_key] = value
 
+        # Stack per-codebook head weights into stacked_head_weights
+        # for dynamic codebook selection in the audio_decoder forward.
+        head_weights = []
+        for i in range(self.config.num_codebooks):
+            wkey = f"audio_decoder.depth_embeddings.{i}.weight"
+            if wkey in new_state_dict:
+                head_weights.append(new_state_dict[wkey])
+        if head_weights:
+            import torch
+
+            new_state_dict["audio_decoder.stacked_head_weights"] = torch.stack(
+                head_weights, dim=0
+            )
+
         return new_state_dict
 
 
@@ -595,39 +598,23 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
 
     # LFM backbone layers -> decoder.layers
     if key.startswith("lfm."):
-        rest = key[len("lfm."):]
+        rest = key[len("lfm.") :]
         # model.layers.N patterns
         m = re.match(r"^layers\.(\d+)\.(.+)$", rest)
         if m:
             idx = m.group(1)
             layer_rest = m.group(2)
             # Conv weight nesting
-            layer_rest = layer_rest.replace(
-                "conv.conv.weight", "conv.conv_weight"
-            )
-            layer_rest = layer_rest.replace(
-                "conv.conv.bias", "conv.conv_bias"
-            )
+            layer_rest = layer_rest.replace("conv.conv.weight", "conv.conv_weight")
+            layer_rest = layer_rest.replace("conv.conv.bias", "conv.conv_bias")
             # MLP: w1->gate_proj, w3->up_proj, w2->down_proj
-            layer_rest = layer_rest.replace(
-                "feed_forward.w1.", "feed_forward.gate_proj."
-            )
-            layer_rest = layer_rest.replace(
-                "feed_forward.w3.", "feed_forward.up_proj."
-            )
-            layer_rest = layer_rest.replace(
-                "feed_forward.w2.", "feed_forward.down_proj."
-            )
+            layer_rest = layer_rest.replace("feed_forward.w1.", "feed_forward.gate_proj.")
+            layer_rest = layer_rest.replace("feed_forward.w3.", "feed_forward.up_proj.")
+            layer_rest = layer_rest.replace("feed_forward.w2.", "feed_forward.down_proj.")
             # Attention: out_proj->o_proj, layernorm->norm
-            layer_rest = layer_rest.replace(
-                "self_attn.out_proj.", "self_attn.o_proj."
-            )
-            layer_rest = layer_rest.replace(
-                "self_attn.q_layernorm.", "self_attn.q_norm."
-            )
-            layer_rest = layer_rest.replace(
-                "self_attn.k_layernorm.", "self_attn.k_norm."
-            )
+            layer_rest = layer_rest.replace("self_attn.out_proj.", "self_attn.o_proj.")
+            layer_rest = layer_rest.replace("self_attn.q_layernorm.", "self_attn.q_norm.")
+            layer_rest = layer_rest.replace("self_attn.k_layernorm.", "self_attn.k_norm.")
             return f"decoder.layers.{idx}.{layer_rest}"
 
         # lfm.norm -> decoder.norm
@@ -639,7 +626,7 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
 
     # Audio adapter -> audio_encoder.adapter
     if key.startswith("audio_adapter."):
-        rest = key[len("audio_adapter."):]
+        rest = key[len("audio_adapter.") :]
         # audio_adapter.model.0.* -> adapter.up_proj.*
         rest = rest.replace("model.0.", "up_proj.")
         # audio_adapter.model.3.* -> adapter.down_proj.*
@@ -651,25 +638,21 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
 
     # Audio embedding
     if key.startswith("audio_embedding."):
-        rest = key[len("audio_embedding."):]
+        rest = key[len("audio_embedding.") :]
         rest = rest.replace("embedding.", "audio_embed.")
         return f"embedding.{rest}"
 
     # Depthformer layers
     if key.startswith("depthformer.layers."):
-        rest = key[len("depthformer.layers."):]
+        rest = key[len("depthformer.layers.") :]
         m = re.match(r"^(\d+)\.(.+)$", rest)
         if m:
             idx = m.group(1)
             layer_rest = m.group(2)
             # operator.qkv_proj -> self_attn.qkv_proj (if fused)
             # operator.out_proj -> self_attn.o_proj
-            layer_rest = layer_rest.replace(
-                "operator.", "self_attn."
-            )
-            layer_rest = layer_rest.replace(
-                "self_attn.out_proj.", "self_attn.o_proj."
-            )
+            layer_rest = layer_rest.replace("operator.", "self_attn.")
+            layer_rest = layer_rest.replace("self_attn.out_proj.", "self_attn.o_proj.")
             layer_rest = layer_rest.replace(
                 "self_attn.bounded_attention.q_layernorm.",
                 "self_attn.q_norm.",
@@ -679,15 +662,9 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
                 "self_attn.k_norm.",
             )
             # MLP renames
-            layer_rest = layer_rest.replace(
-                "feed_forward.w1.", "feed_forward.gate_proj."
-            )
-            layer_rest = layer_rest.replace(
-                "feed_forward.w3.", "feed_forward.up_proj."
-            )
-            layer_rest = layer_rest.replace(
-                "feed_forward.w2.", "feed_forward.down_proj."
-            )
+            layer_rest = layer_rest.replace("feed_forward.w1.", "feed_forward.gate_proj.")
+            layer_rest = layer_rest.replace("feed_forward.w3.", "feed_forward.up_proj.")
+            layer_rest = layer_rest.replace("feed_forward.w2.", "feed_forward.down_proj.")
             return f"audio_decoder.layers.{idx}.{layer_rest}"
         return None
 
@@ -697,14 +674,10 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
 
     # Depth embeddings
     if key.startswith("depth_embeddings."):
-        return key.replace(
-            "depth_embeddings.", "audio_decoder.depth_embeddings."
-        )
+        return key.replace("depth_embeddings.", "audio_decoder.depth_embeddings.")
 
     # Embedding norm (for depthformer output)
     if key.startswith("embedding_norm."):
-        return key.replace(
-            "embedding_norm.", "audio_decoder.embedding_norm."
-        )
+        return key.replace("embedding_norm.", "audio_decoder.embedding_norm.")
 
     return key

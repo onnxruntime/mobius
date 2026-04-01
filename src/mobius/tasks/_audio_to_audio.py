@@ -91,32 +91,20 @@ class AudioToAudioTask(ModelTask):
         embedding: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build embedding: text_ids + audio_features -> inputs_embeds."""
+        """Build embedding: text_ids -> inputs_embeds."""
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
-        num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
-        output_dim = (
-            config.audio.output_dim or config.hidden_size
-            if config.audio
-            else config.hidden_size
-        )
 
         input_ids = ir.Value(
             name="input_ids",
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
-        audio_features = ir.Value(
-            name="audio_features",
-            shape=ir.Shape([num_audio_tokens, output_dim]),
-            type=ir.TensorType(config.dtype),
-        )
 
-        graph, builder = _make_graph([input_ids, audio_features], name="embedding")
+        graph, builder = _make_graph([input_ids], name="embedding")
         inputs_embeds = embedding(
             builder.op,
             input_ids=input_ids,
-            audio_features=audio_features,
         )
 
         inputs_embeds.name = "inputs_embeds"
