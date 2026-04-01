@@ -246,6 +246,8 @@ class TestComponentSpec:
         task = NoSpecTask()
         task._validate_components(EmptyModule())  # must not raise
 
+
+class TestCustomModuleWithTask:
     """Test the user story: custom module + standard task."""
 
     def test_custom_module_with_causal_lm_task(self):
