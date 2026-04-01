@@ -115,6 +115,7 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.moshi import MoshiModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
@@ -465,6 +466,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Hybrid Conv+Attention (LFM2) ---
     "lfm2": ModelRegistration(Lfm2CausalLMModel),
     "lfm2_audio": ModelRegistration(Lfm2AudioModel, task="audio-to-audio"),
+    # --- Moshi / PersonaPlex (audio-to-audio) ---
+    "moshi": ModelRegistration(MoshiModel, task="audio-to-audio"),
+    "personaplex": ModelRegistration(MoshiModel, task="audio-to-audio"),
     # --- Hybrid linear-attention ---
     "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
@@ -813,6 +817,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2-1.2B",
     "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
+    "personaplex": "nvidia/personaplex-7b-v1",
+    "moshi": "kyutai/moshiko-pytorch-bf16",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1125,6 +1131,8 @@ _VARIANT_LABELS: dict[str, str] = {
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
     "lfm2_audio": "audio-to-audio",
+    "personaplex": "audio-to-audio",
+    "moshi": "audio-to-audio",
     "qwen3_next": "moe+linear-attn",
 }
 

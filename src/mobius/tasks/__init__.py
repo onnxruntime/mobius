@@ -34,9 +34,11 @@ __all__ = [
     "Gemma4Task",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
+    "MoshiTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
     "ModelTask",
+    "MoshiTask",
     "MllamaVisionLanguageTask",
     "MultiModalTask",
     "OPSET_VERSION",
@@ -65,7 +67,7 @@ from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_ctc import AudioCTCTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
-from mobius.tasks._audio_to_audio import AudioToAudioTask
+from mobius.tasks._audio_to_audio import AudioToAudioTask, MoshiTask
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
@@ -117,6 +119,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
     "audio-to-audio": AudioToAudioTask,
+    "moshi": MoshiTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "ctc-asr": CTCAsrTask,

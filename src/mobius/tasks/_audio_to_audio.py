@@ -255,3 +255,126 @@ class AudioToAudioTask(ModelTask):
         graph.outputs.append(codebook_logits)
         _register_kv_cache_outputs(graph, present_kv)
         return _make_model(graph)
+
+
+class MoshiTask(AudioToAudioTask):
+    """Multi-model split for Moshi/PersonaPlex audio-to-audio models.
+
+    Differs from :class:`AudioToAudioTask`:
+
+    - No ``audio_encoder``: Moshi consumes audio as codec token IDs,
+      not mel spectrograms, so no waveform encoder is needed.
+    - ``embedding`` accepts both ``input_ids`` (text) and ``audio_codes``
+      (shape: batch x seq x num_codebooks) and returns ``inputs_embeds``.
+    - ``audio_decoder`` KV cache is sized with ``head_dim = depformer_dim``
+      (one full-dimensioned head per codebook) rather than
+      ``depformer_dim // depformer_num_heads``.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        models: dict[str, ir.Model] = {}
+
+        # Moshi has no audio encoder — audio input is codec token IDs.
+        models["embedding"] = self._build_embedding(module.embedding, config)
+        models["decoder"] = self._build_decoder(module.decoder, config)
+
+        if hasattr(module, "audio_decoder"):
+            models["audio_decoder"] = self._build_audio_decoder(module.audio_decoder, config)
+
+        return ModelPackage(models, config=config)
+
+    def _build_embedding(
+        self,
+        embedding: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build Moshi embedding: (text_ids, audio_codes) -> inputs_embeds."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        num_codebooks = getattr(config, "num_codebooks", 16)
+
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        audio_codes = ir.Value(
+            name="audio_codes",
+            shape=ir.Shape([batch, seq_len, num_codebooks]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph, builder = _make_graph([input_ids, audio_codes], name="embedding")
+        inputs_embeds = embedding(builder.op, input_ids=input_ids, audio_codes=audio_codes)
+
+        inputs_embeds.name = "inputs_embeds"
+        graph.outputs.append(inputs_embeds)
+        return _make_model(graph)
+
+    def _build_audio_decoder(
+        self,
+        audio_decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build Moshi depformer: backbone_hidden -> codebook_logits.
+
+        Uses ``head_dim = depformer_dim`` (one full-size head per codebook),
+        matching PersonaPlex's packed-QKV depformer attention weights.
+        """
+        depformer_dim = getattr(config, "depformer_dim", 1024)
+        depformer_layers = getattr(config, "depformer_layers", 6)
+        # Each head in the depformer covers one full depformer dimension.
+        depformer_heads = getattr(
+            config, "depformer_num_heads", getattr(config, "num_codebooks", 16)
+        )
+        depformer_head_dim = depformer_dim  # full head_dim = depformer_dim
+
+        batch = ir.SymbolicDim("batch")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        backbone_hidden = ir.Value(
+            name="backbone_hidden",
+            shape=ir.Shape([batch, 1, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        prev_embedding = ir.Value(
+            name="prev_embedding",
+            shape=ir.Shape([batch, 1, depformer_dim]),
+            type=ir.TensorType(config.dtype),
+        )
+        codebook_idx = ir.Value(
+            name="codebook_idx",
+            shape=ir.Shape([]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [backbone_hidden, prev_embedding, codebook_idx]
+
+        kv_inputs, past_key_values = _make_kv_cache_inputs(
+            depformer_layers,
+            depformer_heads,
+            depformer_head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+            prefix="past_key_values",
+        )
+        graph_inputs.extend(kv_inputs)
+
+        graph, builder = _make_graph(graph_inputs, name="audio_decoder")
+        codebook_logits, present_kv = audio_decoder(
+            builder.op,
+            backbone_hidden=backbone_hidden,
+            prev_embedding=prev_embedding,
+            codebook_idx=codebook_idx,
+            past_key_values=past_key_values,
+        )
+
+        codebook_logits.name = "codebook_logits"
+        graph.outputs.append(codebook_logits)
+        _register_kv_cache_outputs(graph, present_kv)
+        return _make_model(graph)
