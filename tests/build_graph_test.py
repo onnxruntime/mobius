@@ -3353,6 +3353,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "jamba",
     # Audio-to-audio dedicated tests
     "lfm2_audio",
+    "moshi",
+    "personaplex",
 }
 
 # Registered model types that truly have no test coverage yet.
@@ -3842,3 +3844,120 @@ class TestBuildLfm2AudioGraph:
         task = AudioToAudioTask()
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, "lfm2_audio")
+
+
+class TestBuildMoshiGraph:
+    """Verify Moshi/PersonaPlex 3-model split builds correctly."""
+
+    def _moshi_config(self):
+        from mobius._configs import MoshiConfig
+
+        return MoshiConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=TINY_LAYERS,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-5,
+            rope_type="default",
+            rope_theta=10000.0,
+            depformer_dim=32,
+            depformer_layers=2,
+            depformer_num_heads=2,
+            depformer_intermediate_size=32,
+            num_codebooks=2,
+            audio_vocab_size=10,
+        )
+
+    def test_3_model_package_structure(self):
+        """Build Moshi and verify 3-model split (no audio_encoder)."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+
+        assert "embedding" in pkg, "Should have embedding model"
+        assert "decoder" in pkg, "Should have decoder model"
+        assert "audio_decoder" in pkg, "Should have audio_decoder model"
+        assert "audio_encoder" not in pkg, "Moshi has no audio_encoder"
+
+    def test_embedding_io(self):
+        """Verify embedding: (input_ids, audio_codes) -> inputs_embeds."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+
+        emb = pkg["embedding"]
+        emb_inputs = {inp.name for inp in emb.graph.inputs}
+        emb_outputs = {out.name for out in emb.graph.outputs}
+        assert "input_ids" in emb_inputs
+        assert "audio_codes" in emb_inputs
+        assert "inputs_embeds" in emb_outputs
+
+    def test_decoder_kv_cache(self):
+        """Verify decoder has standard KV cache."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+
+        dec = pkg["decoder"]
+        dec_inputs = {inp.name for inp in dec.graph.inputs}
+        dec_outputs = {out.name for out in dec.graph.outputs}
+        assert "inputs_embeds" in dec_inputs
+        assert "logits" in dec_outputs
+        assert any("past_key_values" in n for n in dec_inputs)
+
+    def test_audio_decoder_io(self):
+        """Verify audio_decoder: backbone_hidden -> codebook_logits."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+
+        adec = pkg["audio_decoder"]
+        adec_inputs = {inp.name for inp in adec.graph.inputs}
+        adec_outputs = {out.name for out in adec.graph.outputs}
+        assert "backbone_hidden" in adec_inputs
+        assert "prev_embedding" in adec_inputs
+        assert "codebook_idx" in adec_inputs
+        assert "codebook_logits" in adec_outputs
+
+    def test_onnx_checker_passes(self):
+        """Run ONNX checker on all 3 sub-models."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, "moshi")
+
+    def test_outputs_have_shapes_and_dtypes(self):
+        """Verify all sub-model outputs have shape/dtype info."""
+        from mobius.models.moshi import MoshiModel
+        from mobius.tasks._audio_to_audio import MoshiTask
+
+        config = self._moshi_config()
+        module = MoshiModel(config)
+        task = MoshiTask()
+        pkg = task.build(module, config)
+        _assert_outputs_have_shapes_and_dtypes(pkg, "moshi")

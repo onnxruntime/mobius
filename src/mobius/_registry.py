@@ -480,6 +480,12 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("lfm2_audio", Lfm2AudioModel)
 
+    # --- Moshi / PersonaPlex (audio-to-audio) ---
+    from mobius.models.moshi import MoshiModel
+
+    reg.register("personaplex", MoshiModel)
+    reg.register("moshi", MoshiModel)
+
     # --- Multimodal ---
     for name in (
         "chameleon",
@@ -831,6 +837,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2-1.2B",
     "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
+    "personaplex": "nvidia/personaplex-7b-v1",
+    "moshi": "kyutai/moshiko-pytorch-bf16",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1091,6 +1099,8 @@ _VARIANT_LABELS: dict[str, str] = {
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
     "lfm2_audio": "audio-to-audio",
+    "personaplex": "audio-to-audio",
+    "moshi": "audio-to-audio",
     "qwen3_next": "moe+linear-attn",
 }
 

@@ -87,6 +87,10 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # Moshi/PersonaPlex: audio-to-audio models using the 'moshi' library, not transformers.
+    # config.json is minimal (only model_type + version), HF AutoModelForCausalLM cannot load.
+    "personaplex": "PersonaPlex uses moshi library; config.json not compatible with HF AutoConfig",
+    "moshi": "Moshi uses moshi library; config.json not compatible with HF AutoConfig",
 }
 
 # Per-model atol overrides for L3 synthetic parity.

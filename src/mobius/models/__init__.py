@@ -66,6 +66,7 @@ __all__ = [
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
     "MoECausalLMModel",
+    "MoshiModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
@@ -178,6 +179,7 @@ from mobius.models.moe import (
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
 )
+from mobius.models.moshi import MoshiModel
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
