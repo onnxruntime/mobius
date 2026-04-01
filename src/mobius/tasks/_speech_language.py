@@ -19,6 +19,7 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -41,11 +42,18 @@ class SpeechLanguageTask(ModelTask):
     Each sub-module is wired into its own ONNX graph.
     """
 
+    components = ComponentSpec(
+        audio_encoder="audio_tower",
+        embedding="embedding",
+        decoder="decoder",
+    )
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["audio_encoder"] = self._build_audio_encoder(module.audio_tower, config)

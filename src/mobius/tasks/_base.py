@@ -18,6 +18,76 @@ from mobius._constants import OPSET_VERSION
 from mobius._model_package import ModelPackage
 
 
+class ComponentSpec:
+    """Declares which sub-module attributes a multi-component task requires.
+
+    Used by multi-component tasks (e.g. :class:`VisionLanguageTask`) to
+    validate that a module exposes the expected sub-module attributes before
+    building begins.  This produces a clear :exc:`TypeError` instead of the
+    cryptic ``AttributeError`` that would otherwise surface deep inside
+    ``build()``.
+
+    Map output model names to the module attribute that builds each component::
+
+        ComponentSpec(
+            decoder="decoder",
+            vision="vision_encoder",
+            embedding="embedding",
+        )
+
+    The keys are the names used in the output :class:`ModelPackage`; the
+    values are the attribute names on the ``nn.Module`` passed to
+    ``task.build()``.
+
+    Args:
+        **components: Keyword arguments mapping output name → module attribute
+            name.  For example, ``vision="vision_encoder"`` means the task
+            expects ``module.vision_encoder`` and will store the result as
+            ``package["vision"]``.
+    """
+
+    def __init__(self, **components: str) -> None:
+        # output_name -> module attribute name
+        self._components: dict[str, str] = dict(components)
+
+    def validate(self, module: nn.Module, task_name: str) -> None:
+        """Check that all required sub-module attributes exist on *module*.
+
+        Args:
+            module: The module passed to ``task.build()``.
+            task_name: Name of the task class (for the error message).
+
+        Raises:
+            TypeError: If any required attribute is absent from *module*, with
+                a message that lists every missing component and the attribute
+                name expected for each.
+        """
+        missing = [
+            (output_name, attr_name)
+            for output_name, attr_name in self._components.items()
+            if not hasattr(module, attr_name)
+        ]
+        if not missing:
+            return
+        lines = "\n".join(
+            f"  '{output_name}' component expects module.{attr_name}"
+            for output_name, attr_name in missing
+        )
+        raise TypeError(
+            f"{task_name} requires sub-module attribute(s) that are missing "
+            f"from {type(module).__name__}:\n{lines}\n"
+            f"Ensure each attribute is assigned in the module's __init__()."
+        )
+
+    def items(self):
+        """Iterate over ``(output_name, attribute_name)`` pairs."""
+        return self._components.items()
+
+    def __repr__(self) -> str:
+        parts = ", ".join(f"{k}={v!r}" for k, v in self._components.items())
+        return f"ComponentSpec({parts})"
+
+
 def _make_graph(
     inputs: list[ir.Value],
     name: str = "main_graph",
@@ -50,6 +120,16 @@ class ModelTask(ABC):
 
     Subclass this to support new model tasks (e.g. feature extraction,
     sequence classification). Each task defines its own graph I/O contract.
+
+    Multi-component tasks should declare a class-level :class:`ComponentSpec`
+    and call :meth:`_validate_components` at the start of ``build()``::
+
+        class MyMultiModelTask(ModelTask):
+            components = ComponentSpec(decoder="decoder", vision="vision_encoder")
+
+            def build(self, module, config):
+                self._validate_components(module)
+                ...
     """
 
     #: Maps package key → optimization role for each model produced by this task.
@@ -57,6 +137,11 @@ class ModelTask(ABC):
     #: GQA fusion). Override in subclasses that produce non-decoder outputs.
     #: Unrecognised keys default to ``"decoder"``.
     model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}
+
+    #: Optional component spec for multi-component tasks.  When set,
+    #: :meth:`_validate_components` checks that all declared attributes
+    #: exist on the module before building begins.
+    components: ComponentSpec | None = None
 
     @abstractmethod
     def build(
@@ -78,3 +163,18 @@ class ModelTask(ABC):
             A :class:`ModelPackage` containing the built model(s).
         """
         ...
+
+    def _validate_components(self, module: nn.Module) -> None:
+        """Validate that *module* exposes all components declared in ``self.components``.
+
+        No-op when ``self.components`` is ``None``.  Multi-component tasks
+        should call this at the start of ``build()`` so that missing
+        sub-module attributes are caught with a helpful error rather than an
+        ``AttributeError`` deep inside the build.
+
+        Raises:
+            TypeError: If any required sub-module attribute is absent from
+                *module*.
+        """
+        if self.components is not None:
+            self.components.validate(module, type(self).__name__)

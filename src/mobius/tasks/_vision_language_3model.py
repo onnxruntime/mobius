@@ -17,6 +17,7 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig, MllamaConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -45,11 +46,18 @@ class VisionLanguageTask(ModelTask):
     non-standard I/O (e.g. Qwen2.5-VL packed attention with cu_seqlens).
     """
 
+    components = ComponentSpec(
+        decoder="decoder",
+        vision="vision_encoder",
+        embedding="embedding",
+    )
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["decoder"] = self._build_decoder(module.decoder, config)

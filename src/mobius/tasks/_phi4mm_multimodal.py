@@ -25,6 +25,7 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -48,11 +49,19 @@ class Phi4MMMultiModalTask(ModelTask):
     Each sub-module is wired into its own ONNX graph.
     """
 
+    components = ComponentSpec(
+        vision="vision_encoder",
+        speech="speech_encoder",
+        embedding="embedding",
+        model="decoder",
+    )
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["vision"] = self._build_vision(module.vision_encoder, config)

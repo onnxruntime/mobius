@@ -5,7 +5,7 @@
 
 Covers: CausalLM, VisionLanguage, Seq2Seq, Denoising, VAE,
 FeatureExtraction, ImageClassification, SSM, SSM2, AudioFeatureExtraction,
-ObjectDetection, SpeechToText.
+ObjectDetection, SpeechToText, ComponentSpec.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from mobius.tasks import (
     TASK_REGISTRY,
     AudioFeatureExtractionTask,
     CausalLMTask,
+    ComponentSpec,
     DenoisingTask,
     FeatureExtractionTask,
     ImageClassificationTask,
@@ -116,7 +117,135 @@ class TestCustomTask:
         assert pkg["model"].graph.name == "custom"
 
 
-class TestCustomModuleWithTask:
+class TestComponentSpec:
+    """Tests for ComponentSpec: declaration, validation, and error messaging."""
+
+    def test_repr(self):
+        spec = ComponentSpec(decoder="decoder", vision="vision_encoder")
+        assert "decoder" in repr(spec)
+        assert "vision_encoder" in repr(spec)
+
+    def test_items(self):
+        spec = ComponentSpec(decoder="decoder", vision="vision_encoder")
+        pairs = dict(spec.items())
+        assert pairs == {"decoder": "decoder", "vision": "vision_encoder"}
+
+    def test_validate_passes_when_all_present(self):
+        from onnxscript import nn as _nn
+
+        class GoodModule(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = _nn.Module()
+                self.vision_encoder = _nn.Module()
+                self.embedding = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        spec = ComponentSpec(
+            decoder="decoder",
+            vision="vision_encoder",
+            embedding="embedding",
+        )
+        # Should not raise
+        spec.validate(GoodModule(), "MyTask")
+
+    def test_validate_raises_on_missing_single(self):
+        from onnxscript import nn as _nn
+
+        class BadModule(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = _nn.Module()
+                # vision_encoder is missing
+
+            def forward(self, op):
+                pass
+
+        spec = ComponentSpec(decoder="decoder", vision="vision_encoder")
+        with pytest.raises(TypeError, match="vision_encoder"):
+            spec.validate(BadModule(), "MyTask")
+
+    def test_validate_raises_on_multiple_missing(self):
+        from onnxscript import nn as _nn
+
+        class EmptyModule(_nn.Module):
+            def forward(self, op):
+                pass
+
+        spec = ComponentSpec(
+            decoder="decoder",
+            vision="vision_encoder",
+            embedding="embedding",
+        )
+        with pytest.raises(TypeError) as exc_info:
+            spec.validate(EmptyModule(), "MyTask")
+        msg = str(exc_info.value)
+        assert "decoder" in msg
+        assert "vision_encoder" in msg
+        assert "embedding" in msg
+
+    def test_validate_error_includes_task_name(self):
+        from onnxscript import nn as _nn
+
+        class EmptyModule(_nn.Module):
+            def forward(self, op):
+                pass
+
+        spec = ComponentSpec(decoder="decoder")
+        with pytest.raises(TypeError, match="SomeTask"):
+            spec.validate(EmptyModule(), "SomeTask")
+
+    def test_validate_error_includes_module_class_name(self):
+        from onnxscript import nn as _nn
+
+        class MyWeirdModule(_nn.Module):
+            def forward(self, op):
+                pass
+
+        spec = ComponentSpec(decoder="decoder")
+        with pytest.raises(TypeError, match="MyWeirdModule"):
+            spec.validate(MyWeirdModule(), "ATask")
+
+    def test_vision_language_task_validates_on_build(self):
+        """VisionLanguageTask.build() should raise TypeError on missing sub-module."""
+        from onnxscript import nn as _nn
+
+        class IncompleteVLModule(_nn.Module):
+            """Has decoder but is missing vision_encoder and embedding."""
+
+            def __init__(self):
+                super().__init__()
+                self.decoder = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        config = _make_multimodal_config()
+        task = VisionLanguageTask()
+        with pytest.raises(TypeError, match="vision_encoder"):
+            task.build(IncompleteVLModule(), config)
+
+    def test_validate_components_noop_when_no_spec(self):
+        """Tasks without components declared should not raise."""
+
+        class NoSpecTask(ModelTask):
+            # No components declared — inherits None from ModelTask
+            def build(self, module, config):
+                graph = ir.Graph([], [], nodes=[], name="noop")
+                model = ir.Model(graph, ir_version=10)
+                return ModelPackage({"model": model})
+
+        from onnxscript import nn as _nn
+
+        class EmptyModule(_nn.Module):
+            def forward(self, op):
+                pass
+
+        task = NoSpecTask()
+        task._validate_components(EmptyModule())  # must not raise
+
     """Test the user story: custom module + standard task."""
 
     def test_custom_module_with_causal_lm_task(self):
