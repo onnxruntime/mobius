@@ -1,6 +1,6 @@
 # Model Catalog
 
-**mobius** supports 273 registered model types across 10 categories.
+**mobius** supports 275 registered model types across 12 categories.
 This catalog lists every supported architecture with its module class, task type,
 and example HuggingFace model IDs.
 
@@ -95,6 +95,22 @@ Mamba and Mamba2 architectures using selective state-space layers.
 | `mamba` | `MambaCausalLMModel` | `ssm-text-generation` | `state-spaces/mamba-2.8b` |
 | `falcon_mamba` | `MambaCausalLMModel` | `ssm-text-generation` | `tiiuae/falcon-mamba-7b` |
 | `mamba2` | `Mamba2CausalLMModel` | `ssm2-text-generation` | `state-spaces/mamba2-2.7b` |
+
+## Hybrid Conv+Attention
+
+Models with alternating depthwise-conv (ShortConv) and attention layers.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `lfm2` | `Lfm2CausalLMModel` | `hybrid-text-generation` | `LiquidAI/LFM2-1.2B` |
+
+## Audio-to-Audio
+
+End-to-end audio language models: audio and text in, audio and text out.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `lfm2_audio` | `Lfm2AudioModel` | `audio-to-audio` | `LiquidAI/LFM2-Audio-1.5B` |
 
 ## Hybrid SSM+Attention
 
@@ -273,11 +289,13 @@ MatMulNBits ops.
 |---|---|---|
 | Decoder-only LLMs | ~100 | `CausalLMModel`, `GPT2CausalLMModel` |
 | Mixture of Experts | ~25 | `MoECausalLMModel`, `DeepSeekV3CausalLMModel` |
+| Hybrid Conv+Attention | 1 | `Lfm2CausalLMModel` |
 | SSM / Hybrid | 5 | `MambaCausalLMModel`, `JambaCausalLMModel` |
 | Vision-Language | ~40 | `LLaVAModel`, `Qwen25VLCausalLMModel` |
 | Encoder-only | ~40 | `BertModel`, `DistilBertModel` |
 | Encoder-decoder | ~20 | `BartForConditionalGeneration`, `T5ForConditionalGeneration` |
 | Speech & Audio | ~20 | `WhisperForConditionalGeneration`, `Wav2Vec2Model` |
+| Audio-to-Audio | 1 | `Lfm2AudioModel` |
 | Vision | ~25 | `ViTModel`, `CLIPVisionModel` |
 | Diffusion | ~10 | `UNet2DConditionModel`, `FluxTransformer2DModel` |
-| **Total** | **~273** | |
+| **Total** | **~275** | |

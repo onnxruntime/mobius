@@ -26,8 +26,10 @@ MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 _CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "Text Generation": "Standard autoregressive language models (CausalLM).",
     "Mixture of Experts": "Models that route tokens to a subset of expert MLPs.",
+    "Hybrid Conv+Attention": "Hybrid models with alternating conv and attention layers (LFM2).",
     "Multimodal": "Models that process images, audio, or other modalities alongside text.",
     "Speech-to-Text": "Encoder-decoder models for speech recognition.",
+    "Audio-to-Audio": "End-to-end audio language models: audio in, audio + text out (LFM2-Audio, Moshi).",
     "Audio": "Audio encoder models for feature extraction (Wav2Vec2, HuBERT, WavLM).",
     "encoder-only": "Encoder-only models for embeddings and classification (BERT, RoBERTa).",
     "encoder-decoder": "Encoder-decoder sequence-to-sequence models (BART, T5, mBART).",
@@ -42,8 +44,10 @@ _CATEGORY_DESCRIPTIONS: dict[str, str] = {
 _CATEGORY_ORDER = [
     "Text Generation",
     "Mixture of Experts",
+    "Hybrid Conv+Attention",
     "Multimodal",
     "Speech-to-Text",
+    "Audio-to-Audio",
     "Audio",
     "encoder-only",
     "encoder",
