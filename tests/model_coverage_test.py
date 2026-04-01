@@ -181,6 +181,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen3_vl": "VL model — requires image inputs",
     # --- Audio / speech models (require audio inputs) ---
     "data2vec-audio": "Audio model — requires audio inputs",
+    "lfm2_audio": "Multi-model audio architecture — tested via TestBuildLfm2AudioGraph",
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",
