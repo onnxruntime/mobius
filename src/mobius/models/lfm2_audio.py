@@ -48,10 +48,10 @@ from mobius.components import (
     Embedding,
     Linear,
     RMSNorm,
-    ShortConv,
     create_attention_bias,
     initialize_rope,
 )
+from mobius.models.lfm2 import Lfm2AttentionDecoderLayer, Lfm2ConvDecoderLayer
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -155,78 +155,11 @@ class _Lfm2AudioEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class _Lfm2AudioDecoderLayer(nn.Module):
-    """Single LFM2 decoder layer for the audio model backbone.
-
-    Identical to Lfm2AttentionDecoderLayer but placed here to avoid
-    circular imports between lfm2.py and lfm2_audio.py.
-    """
-
-    def __init__(self, config: Lfm2AudioConfig):
-        super().__init__()
-        self.self_attn = Attention(config)
-        self.operator_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.feed_forward = MLP(config)
-
-    def forward(
-        self,
-        op: builder.OpBuilder,
-        hidden_states: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple,
-        past_key_value: tuple | None,
-    ):
-        residual = hidden_states
-        hidden_states = self.operator_norm(op, hidden_states)
-        hidden_states, present_kv = self.self_attn(
-            op,
-            hidden_states=hidden_states,
-            attention_bias=attention_bias,
-            position_embeddings=position_embeddings,
-            past_key_value=past_key_value,
-        )
-        hidden_states = op.Add(residual, hidden_states)
-        residual = hidden_states
-        hidden_states = self.ffn_norm(op, hidden_states)
-        hidden_states = self.feed_forward(op, hidden_states)
-        hidden_states = op.Add(residual, hidden_states)
-        return hidden_states, present_kv
-
-
-class _Lfm2AudioConvLayer(nn.Module):
-    """Single LFM2 ShortConv layer for the audio model backbone."""
-
-    def __init__(self, config: Lfm2AudioConfig):
-        super().__init__()
-        self.conv = ShortConv(
-            hidden_size=config.hidden_size,
-            kernel_size=config.short_conv_kernel,
-            bias=config.short_conv_bias,
-        )
-        self.operator_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.feed_forward = MLP(config)
-
-    def forward(
-        self,
-        op: builder.OpBuilder,
-        hidden_states: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple,
-        past_key_value: tuple | None,
-    ):
-        del attention_bias, position_embeddings
-        residual = hidden_states
-        hidden_states = self.operator_norm(op, hidden_states)
-        conv_state = past_key_value[0] if past_key_value is not None else None
-        conv_out, new_conv_state = self.conv(op, hidden_states, conv_state)
-        hidden_states = op.Add(residual, conv_out)
-        residual = hidden_states
-        hidden_states = self.ffn_norm(op, hidden_states)
-        hidden_states = self.feed_forward(op, hidden_states)
-        hidden_states = op.Add(residual, hidden_states)
-        return hidden_states, (new_conv_state,)
+# Reuse the decoder layers from the base LFM2 model — they are identical
+# for the audio backbone. Lfm2AudioConfig inherits from Lfm2Config, so
+# the constructors accept it directly.
+_Lfm2AudioDecoderLayer = Lfm2AttentionDecoderLayer
+_Lfm2AudioConvLayer = Lfm2ConvDecoderLayer
 
 
 class _Lfm2AudioDecoder(nn.Module):
