@@ -42,10 +42,10 @@ from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig, MoshiConfig
 from mobius.components import (
+    MLP,
     Attention,
     Embedding,
     Linear,
-    MLP,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -84,7 +84,10 @@ class _MoshiEmbedding(nn.Module):
         self.text_emb = Embedding(config.vocab_size + 1, config.hidden_size)
         # Per-codebook audio token embeddings: audio_vocab_size x hidden_size each.
         self.audio_emb = nn.ModuleList(
-            [Embedding(config.audio_vocab_size, config.hidden_size) for _ in range(config.num_codebooks)]
+            [
+                Embedding(config.audio_vocab_size, config.hidden_size)
+                for _ in range(config.num_codebooks)
+            ]
         )
 
     def forward(
@@ -351,7 +354,10 @@ class _MoshiAudioDecoder(nn.Module):
         self.depth_text_emb = Embedding(config.vocab_size + 1, depformer_dim)
         # Audio depth embeddings for codebooks 1..num_codebooks-1
         self.depth_emb = nn.ModuleList(
-            [Embedding(config.audio_vocab_size, depformer_dim) for _ in range(num_codebooks - 1)]
+            [
+                Embedding(config.audio_vocab_size, depformer_dim)
+                for _ in range(num_codebooks - 1)
+            ]
         )
 
         # Per-codebook input projections: (num_codebooks, depformer_dim, hidden_size)
@@ -420,7 +426,9 @@ class _MoshiAudioDecoder(nn.Module):
 
         # Run depformer layers with per-codebook MLP selection
         present_key_values = []
-        past_kvs = past_key_values if past_key_values is not None else [None] * len(self.layers)
+        past_kvs = (
+            past_key_values if past_key_values is not None else [None] * len(self.layers)
+        )
         for layer, past_kv in zip(self.layers, past_kvs):
             hidden_states, present_kv = layer(
                 op,
@@ -484,14 +492,6 @@ class MoshiModel(nn.Module):
         - Per-codebook gating → stacked ``stacked_{gate,up,down}_proj``
         """
         new_sd: dict = {}
-        hidden_size = None
-        depformer_dim = None
-
-        # Detect sizes from weight shapes
-        if "transformer.layers.0.self_attn.in_proj_weight" in state_dict:
-            hidden_size = state_dict["transformer.layers.0.self_attn.in_proj_weight"].shape[1]
-        if "depformer.layers.0.norm1.alpha" in state_dict:
-            depformer_dim = state_dict["depformer.layers.0.norm1.alpha"].shape[-1]
 
         # Count transformer and depformer layers
         num_transformer_layers = sum(
@@ -506,7 +506,9 @@ class MoshiModel(nn.Module):
         )
 
         # Count codebooks from emb.* keys
-        num_codebooks = sum(1 for k in state_dict if k.startswith("emb.") and k.endswith(".weight"))
+        num_codebooks = sum(
+            1 for k in state_dict if k.startswith("emb.") and k.endswith(".weight")
+        )
 
         # ----------------------------------------------------------------
         # Embedding sub-model

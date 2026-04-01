@@ -102,7 +102,8 @@ class _Lfm2AudioEncoder(nn.Module):
 
     def forward(self, op: builder.OpBuilder, input_features: ir.Value):
         """Forward: mel (B, n_mels, T) -> (B, T', hidden_size)."""
-        # ConformerEncoder: (B, n_mels, T) -> (B, T', encoder_dim)
+        # ConformerEncoder expects (B, T, n_mels); transpose from (B, n_mels, T)
+        input_features = op.Transpose(input_features, perm=[0, 2, 1])
         audio_features = self.encoder(op, input_features)
         # Adapter MLP: (B, T', encoder_dim) -> (B, T', hidden_size)
         return self.adapter(op, audio_features)
@@ -398,18 +399,27 @@ class _Lfm2AudioDecoderModule(nn.Module):
         # Gather the codebook_idx slice: (B, 1, depthformer_dim)
         # Reshape idx to (1, 1, 1) then expand to (B, 1, depthformer_dim)
         idx_3d = op.Reshape(codebook_idx, op.Constant(value_ints=[1, 1, 1]))
-        idx_expanded = op.Expand(
-            idx_3d,
-            op.Constant(value_ints=[1, 1, self._depthformer_dim]),
-        )
+        # Build expand shape dynamically to match batch size at runtime
+        batch_dim = op.Shape(projected_3d, start=0, end=1)  # (1,) containing B
+        expand_shape = op.Concat(
+            batch_dim,
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[self._depthformer_dim]),
+            axis=0,
+        )  # (3,) -> [B, 1, depthformer_dim]
+        idx_expanded = op.Expand(idx_3d, expand_shape)
         depthformer_input = op.GatherElements(projected_3d, idx_expanded, axis=1)
         # (B, 1, depthformer_dim) - unsqueeze back seq dim is already there
 
         # Add previous codebook embedding
         hidden_states = op.Add(depthformer_input, prev_embedding)
 
-        # Position IDs for depthformer (single step: just codebook_idx)
-        position_ids = op.Reshape(codebook_idx, [1, 1])
+        # Position IDs for depthformer (single step: just codebook_idx).
+        # Shape (B, 1) — derive batch dim from hidden_states at runtime.
+        batch_dim = op.Shape(hidden_states, start=0, end=1)  # (1,) containing B
+        one_dim = op.Constant(value_ints=[1])
+        position_shape = op.Concat(batch_dim, one_dim, axis=0)  # (2,) -> [B, 1]
+        position_ids = op.Reshape(codebook_idx, position_shape)
         position_embeddings = self.rotary_emb(op, position_ids)
 
         # Run depthformer layers
@@ -492,7 +502,7 @@ class Lfm2AudioModel(nn.Module):
             tie_word_embeddings(
                 state_dict,
                 embed_key="lfm.embed_tokens.weight",
-                head_key="lm_head.weight",
+                head_key="lfm.lm_head.weight",
             )
 
         new_state_dict: dict[str, torch.Tensor] = {}

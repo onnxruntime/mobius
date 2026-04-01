@@ -20,8 +20,9 @@ from mobius._model_package import ModelPackage
 _FUNCTIONS_DOMAIN = "pkg.mobius"
 
 # Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
-# layers.  MLP-only layers are stateless and use (None, None).
-StatePair = tuple[ir.Value, ir.Value] | tuple[None, None]
+# layers.  Single-state layers (conv/lightning) use a 1-tuple.
+# MLP-only layers are stateless and use (None, None).
+StatePair = tuple[ir.Value, ir.Value] | tuple[ir.Value] | tuple[None, None]
 
 
 class LinearAttentionDims(NamedTuple):

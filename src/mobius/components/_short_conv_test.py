@@ -5,11 +5,8 @@
 
 from __future__ import annotations
 
-import onnx_ir as ir
-
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius.components._short_conv import ShortConv
-
 
 _HIDDEN = 32
 _KERNEL = 3
