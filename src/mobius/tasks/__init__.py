@@ -21,6 +21,7 @@ from __future__ import annotations
 __all__ = [
     "AdapterTask",
     "AudioFeatureExtractionTask",
+    "AudioToAudioTask",
     "CausalLMTask",
     "CodecTask",
     "ControlNetTask",
@@ -54,6 +55,7 @@ __all__ = [
 from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
+from mobius.tasks._audio_to_audio import AudioToAudioTask
 from mobius.tasks._base import ModelTask
 from mobius.tasks._causal_lm import (
     CausalLMTask,
@@ -90,6 +92,7 @@ from mobius.tasks._vision_language_3model import (
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "adapter": AdapterTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
+    "audio-to-audio": AudioToAudioTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,

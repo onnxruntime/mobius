@@ -870,6 +870,7 @@ class ArchitectureConfig(BaseModelConfig):
                 in (
                     "gemma3_text",
                     "flex_olmo",
+                    "lfm2",
                     "olmoe",
                     "olmo2",
                     "olmo3",
@@ -1840,6 +1841,51 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2Config(ArchitectureConfig):
+    """Configuration for LFM2 hybrid ShortConv+Attention models.
+
+    LFM2 interleaves ShortConv (gated causal depthwise Conv1d) layers
+    with standard attention layers.  Both layer types include an MLP
+    (SiLU-gated feed-forward).
+
+    ShortConv state per layer: conv_state (batch, hidden_size, kernel-1)
+    Attention state per layer: standard KV cache (key + value)
+
+    Layer types are specified via ``layer_types`` in the HF config:
+        ``"conv"`` = ShortConv layer
+        ``"full_attention"`` = standard attention layer
+    """
+
+    # ShortConv parameters
+    short_conv_kernel: int = 3
+    short_conv_bias: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # LFM2 MLP: adjusted intermediate size with SwiGLU
+        intermediate = base.intermediate_size
+        if getattr(config, "block_auto_adjust_ff_dim", False):
+            intermediate = int(2 * intermediate / 3)
+            multiplier = getattr(config, "block_ffn_dim_multiplier", None)
+            if multiplier is not None:
+                intermediate = int(multiplier * intermediate)
+            multiple_of = getattr(config, "block_multiple_of", 256)
+            intermediate = multiple_of * ((intermediate + multiple_of - 1) // multiple_of)
+
+        base_fields = {
+            k: v for k, v in _shallow_fields(base).items() if k not in ("intermediate_size",)
+        }
+        return cls(
+            **base_fields,
+            intermediate_size=intermediate,
+            short_conv_kernel=getattr(config, "conv_L_cache", 3),
+            short_conv_bias=getattr(config, "conv_bias", False),
         )
 
 

@@ -29,6 +29,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
+    Lfm2Config,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -1077,6 +1078,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_expand": 2,
         },
         True,
+    ),
+    # lfm2: hybrid ShortConv+Attention (requires Lfm2Config)
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+            ],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        True,
+    ),
+    # lfm2: all attention layers (no conv)
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        False,
     ),
     # gemma3n_text: all full attention (no sliding window)
     (

@@ -471,6 +471,11 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("nemotron_h", NemotronHCausalLMModel)
 
+    # --- Hybrid Conv+Attention (LFM2) ---
+    from mobius.models.lfm2 import Lfm2CausalLMModel
+
+    reg.register("lfm2", Lfm2CausalLMModel)
+
     # --- Multimodal ---
     for name in (
         "chameleon",
@@ -820,6 +825,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "lfm2": "LiquidAI/LFM2-1.2B",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1078,6 +1084,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "falcon_mamba": "ssm",
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
+    "lfm2": "hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

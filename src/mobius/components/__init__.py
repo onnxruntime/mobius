@@ -79,6 +79,7 @@ __all__ = [
     "Qwen3VLVisionRotaryEmbedding",
     "RMSNorm",
     "SelectiveScan",
+    "ShortConv",
     "SiLU",
     "SigmoidTopKGate",
     "SnakeBeta",
@@ -225,6 +226,7 @@ from mobius.components._rms_norm import (
     apply_rms_norm,
 )
 from mobius.components._rotary_embedding import initialize_rope
+from mobius.components._short_conv import ShortConv
 from mobius.components._ssm import (
     JambaSelectiveScan,
     Mamba2Scan,
