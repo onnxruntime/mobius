@@ -13,7 +13,7 @@ Qwen2ForCausalLM structure.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import nn
@@ -131,6 +131,13 @@ class CausalLMModel(nn.Module):
     default_task: str = "text-generation"
     category: str = "Text Generation"
     config_class: type = CausalLMConfig
+
+    # HuggingFace weight prefix namespace. When set, the weight loader
+    # automatically filters to keys starting with this prefix and strips
+    # it before ``preprocess_weights`` is called. For example,
+    # ``weight_namespace = "language_model"`` strips ``language_model.``
+    # from all weight keys and drops keys without that prefix.
+    weight_namespace: ClassVar[str | None] = None
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

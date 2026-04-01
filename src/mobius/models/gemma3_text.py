@@ -7,7 +7,6 @@ import copy
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
@@ -176,21 +175,15 @@ class Gemma3TextModel(nn.Module):
 
 
 class Gemma3CausalLMModel(CausalLMModel):
-    """Gemma 3 text model with hybrid attention (global + sliding window), QK-norm, and four-norm decoder layers."""
+    """Gemma 3 text model with hybrid attention (global + sliding window), QK-norm, and four-norm decoder layers.
+
+    ``weight_namespace = "language_model"`` handles prefix stripping for
+    multimodal checkpoints that nest text weights under ``language_model.*``.
+    """
+
+    weight_namespace = "language_model"
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
         # Override the model with Gemma3TextModel
         self.model = Gemma3TextModel(config)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Preprocess weights, handling language_model prefix from multimodal."""
-        for key in list(state_dict.keys()):
-            if "language_model." in key:
-                new_key = key.replace("language_model.", "")
-                state_dict[new_key] = state_dict.pop(key)
-            elif "vision_tower" in key or "multi_modal_projector" in key:
-                state_dict.pop(key)
-        return super().preprocess_weights(state_dict)

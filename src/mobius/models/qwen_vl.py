@@ -29,29 +29,27 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 # Text-only decoders — extract the language model from multimodal weights.
-# These strip ``language_model.`` prefixes and drop ``visual.`` keys.
+# ``weight_namespace = "language_model"`` automatically strips that prefix
+# and drops non-matching keys (e.g. ``visual.*``) during weight loading.
 
 
 class _QwenVLTextMixin:
-    """Shared weight preprocessing for Qwen VL text decoders."""
+    """Shared config for Qwen VL text decoders.
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        for key in list(state_dict.keys()):
-            if "language_model." in key:
-                new_key = key.replace("language_model.", "")
-                state_dict[new_key] = state_dict.pop(key)
-            elif "visual." in key:
-                state_dict.pop(key)
-        return super().preprocess_weights(state_dict)
+    Sets ``weight_namespace`` to ``"language_model"`` so the weight loader
+    automatically filters to ``language_model.*`` keys and strips the
+    prefix. This replaces the manual prefix stripping that was previously
+    done in ``preprocess_weights``.
+    """
+
+    weight_namespace: str = "language_model"
 
 
 class Qwen25VLTextModel(_QwenVLTextMixin, CausalLMModel):
     """Qwen2.5-VL text-only decoder.
 
     Extracts the text backbone from the Qwen2.5-VL multimodal model.
-    Strips ``language_model.`` weight prefixes and drops ``visual.`` keys.
+    ``weight_namespace = "language_model"`` handles prefix stripping.
     For text-only inference the standard 1D RoPE is equivalent to MRoPE
     (all three dimensions are identical for text tokens).
     """

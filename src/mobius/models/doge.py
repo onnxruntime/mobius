@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
@@ -287,14 +286,3 @@ class DogeCausalLMModel(CausalLMModel):
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Handle DOGE-specific weight names.
-
-        DOGE's A parameter is a 1D tensor [num_kv_heads], matching
-        our nn.Parameter shape. No renaming needed for standard
-        Q/K/V/O, norms, MLP — all names match.
-        """
-        return super().preprocess_weights(state_dict)

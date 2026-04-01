@@ -418,7 +418,7 @@ class Qwen35VLTextModel(_QwenVLTextMixin, Qwen35CausalLMModel):
     """Qwen3.5-VL text-only decoder.
 
     Extracts the text backbone from the Qwen3.5-VL multimodal model.
-    Strips ``language_model.`` weight prefixes and drops ``visual.`` keys.
+    ``weight_namespace = "language_model"`` handles prefix stripping.
     """
 
 

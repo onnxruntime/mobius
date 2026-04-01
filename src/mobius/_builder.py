@@ -43,6 +43,29 @@ from mobius.tasks import ModelTask, get_task
 logger = logging.getLogger(__name__)
 
 
+def _strip_weight_namespace(
+    state_dict: dict[str, torch.Tensor],
+    namespace: str,
+) -> dict[str, torch.Tensor]:
+    """Filter and strip a weight namespace prefix from state dict keys.
+
+    Keeps only keys that start with ``namespace.`` and removes the prefix.
+    This is the automatic counterpart to manual ``strip_prefix`` calls
+    in ``preprocess_weights`` methods.
+
+    Args:
+        state_dict: HuggingFace weight dictionary.
+        namespace: Prefix to strip (e.g. ``"language_model"``).
+            A trailing dot is added automatically if absent.
+
+    Returns:
+        New dictionary with only the matching keys, prefix removed.
+    """
+    prefix = namespace if namespace.endswith(".") else namespace + "."
+    prefix_len = len(prefix)
+    return {k[prefix_len:]: v for k, v in state_dict.items() if k.startswith(prefix)}
+
+
 class _SuppressNoConstValueWarning(logging.Filter):
     """Filter out 'has no constant value' warnings from initializer dedup.
 
@@ -387,6 +410,12 @@ def build(
 
     if load_weights:
         state_dict = _download_weights(model_id)
+        # Auto-strip weight_namespace prefix before preprocess_weights.
+        # Models declare weight_namespace to indicate their HF weight
+        # prefix (e.g., "language_model" for VLM text decoders).
+        namespace = getattr(model_module, "weight_namespace", None)
+        if namespace:
+            state_dict = _strip_weight_namespace(state_dict, namespace)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
         prefix_map = getattr(model_module, "weight_prefix_map", None)
