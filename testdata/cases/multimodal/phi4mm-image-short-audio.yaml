@@ -1,0 +1,22 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe what you see in the image and what you hear in the audio."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 40
+  do_sample: false
+
+skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
+notes: "Phi-4-MM text + image + short audio. Full trimodal input: all three encoders active. Tests that vision features and audio features are correctly interleaved by the InputMixer in the embedding model."

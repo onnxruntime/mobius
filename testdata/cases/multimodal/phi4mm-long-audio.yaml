@@ -1,0 +1,23 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Summarize this long audio recording."
+  audio:
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
+notes: "Phi-4-MM text + long audio (4x ~9s clips = ~36s total, >500 tokens after encoding). Tests audio projection in 'long' mode — Phi4MM switches projection MLP based on audio length. The audio_projection_mode input selects between short/long projection heads."

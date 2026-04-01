@@ -45,6 +45,7 @@
         "image-to-image",
         "image-to-text",
         "object-detection",
+        "phi4mm-multimodal",
         "seq2seq",
         "speech-language",
         "speech-to-text",
