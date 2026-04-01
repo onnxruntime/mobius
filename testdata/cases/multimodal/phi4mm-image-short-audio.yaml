@@ -18,5 +18,4 @@ generation:
   max_new_tokens: 40
   do_sample: false
 
-skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
 notes: "Phi-4-MM text + image + short audio. Full trimodal input: all three encoders active. Tests that vision features and audio features are correctly interleaved by the InputMixer in the embedding model."

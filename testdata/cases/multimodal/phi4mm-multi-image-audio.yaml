@@ -19,5 +19,4 @@ generation:
   max_new_tokens: 40
   do_sample: false
 
-skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
 notes: "Phi-4-MM text + multiple images + short audio. Tests multi-image vision processing combined with audio. Ensures InputMixer handles multiple image feature blocks and audio features simultaneously."

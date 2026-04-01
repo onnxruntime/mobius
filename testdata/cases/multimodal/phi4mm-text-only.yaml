@@ -14,5 +14,4 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
 notes: "Phi-4-MM text-only input. No vision or audio — tests pure text path through the 4-model split (embedding + decoder only)."

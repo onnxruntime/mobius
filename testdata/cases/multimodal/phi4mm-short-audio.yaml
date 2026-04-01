@@ -16,5 +16,4 @@ generation:
   max_new_tokens: 50
   do_sample: false
 
-skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
 notes: "Phi-4-MM text + short audio (~9s). Exercises Conformer speech encoder + audio projection + embedding mixer + decoder. Audio is under 500 tokens after encoding."

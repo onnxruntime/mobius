@@ -782,6 +782,153 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
 
+# ---- Phi4MM multimodal generator ----
+
+
+def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for Phi4MM (text + vision + audio).
+
+    Phi4MM is a 4-model-split multimodal model that accepts text, images,
+    and audio in any combination. Uses trust_remote_code for the custom
+    HF model and processor classes.
+    """
+    import torch
+    from PIL import Image
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    import transformers
+
+    # Load model and processor
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=True
+    )
+    # Load in bfloat16 to reduce memory (14B model)
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        case.model_id,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        trust_remote_code=True,
+        _attn_implementation="eager",
+    )
+    model.eval()
+
+    # Build processor inputs based on available modalities
+    call_kwargs: dict = {}
+
+    # Text prompt
+    prompt_text = case.prompts[0] if case.prompts else ""
+
+    # Images
+    images = None
+    if case.images:
+        images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
+
+    # Audio (processor expects list of (audio_array, sample_rate) tuples)
+    audios = None
+    if case.audio:
+        import librosa
+
+        audios = []
+        for audio_path in case.audio:
+            audio_array, _sr = librosa.load(str(Path("testdata") / audio_path), sr=16000)
+            audios.append((audio_array, 16000))
+
+    # Build prompt with special tokens for each modality
+    # Phi4MM uses <|image_N|> and <|audio_N|> placeholders (1-indexed)
+    user_content = ""
+    if images:
+        for i in range(len(images)):
+            user_content += f"<|image_{i + 1}|>\n"
+    if audios:
+        for i in range(len(audios)):
+            user_content += f"<|audio_{i + 1}|>\n"
+    user_content += prompt_text
+
+    messages = [{"role": "user", "content": user_content}]
+    prompt_formatted = processor.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    call_kwargs["text"] = prompt_formatted
+    if images:
+        call_kwargs["images"] = images
+    if audios:
+        call_kwargs["audios"] = audios
+    call_kwargs["return_tensors"] = "pt"
+
+    processed = processor(**call_kwargs).to(device)
+
+    # L4: single forward pass for prefill logits
+    with torch.no_grad():
+        outputs = model(**processed)
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+    input_ids_np = processed["input_ids"].cpu().numpy()
+
+    # L5: manual greedy decode (model.generate() has compatibility issues
+    # with phi4mm's custom modeling code on transformers 4.x)
+    generated_ids = None
+    if "L5" in case.level:
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        gen_ids = []
+        past_kv = None
+        cur_input_ids = processed["input_ids"]
+        input_mode = processed.get("input_mode")
+        # Build initial kwargs (first step uses full processed inputs)
+        fwd_kwargs = dict(processed)
+        fwd_kwargs.pop("input_ids", None)
+        for step in range(max_new_tokens):
+            with torch.no_grad():
+                if step == 0:
+                    out = model(input_ids=cur_input_ids, **fwd_kwargs)
+                else:
+                    out = model(
+                        input_ids=cur_input_ids,
+                        past_key_values=past_kv,
+                        input_mode=input_mode,
+                        attention_mask=torch.ones(
+                            1,
+                            past_kv[0][0].shape[2] + 1,
+                            dtype=torch.long,
+                            device=device,
+                        ),
+                    )
+            next_id = int(out.logits[0, -1, :].argmax())
+            past_kv = out.past_key_values
+            gen_ids.append(next_id)
+            cur_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            # Stop on EOS
+            eos = getattr(model.config, "eos_token_id", None)
+            if eos is not None and next_id == eos:
+                break
+        if gen_ids:
+            generated_ids = np.array(gen_ids)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids_np,
+    )
+
+    if generated_ids is not None:
+        generated_text = processor.tokenizer.decode(
+            generated_ids.tolist(), skip_special_tokens=True
+        )
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0] if case.prompts else "",
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
+
+
 # ---- Dispatcher ----
 
 # Map task_type strings to generator functions.
@@ -799,6 +946,7 @@ _GENERATORS = {
     "image-segmentation": _generate_image_classification,
     "image-to-image": _generate_image_classification,
     "object-detection": _generate_image_classification,
+    "phi4mm-multimodal": _generate_phi4mm_multimodal,
 }
 
 

@@ -19,5 +19,4 @@ generation:
   max_new_tokens: 50
   do_sample: false
 
-skip_reason: "Large model (14B). Requires GPU with >24GB VRAM for golden generation."
 notes: "Phi-4-MM text + long audio (4x ~9s clips = ~36s total, >500 tokens after encoding). Tests audio projection in 'long' mode — Phi4MM switches projection MLP based on audio length. The audio_projection_mode input selects between short/long projection heads."
