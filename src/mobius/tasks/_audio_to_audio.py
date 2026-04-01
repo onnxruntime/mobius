@@ -8,10 +8,10 @@ LFM2-Audio and Moshi/PersonaPlex. These models take audio in and
 produce audio out, with an intermediate language model backbone.
 
 Typical model split:
-1. **audio_encoder**: mel/waveform → audio features (Conformer/encoder)
-2. **decoder**: inputs_embeds → logits + KV cache (hybrid conv+attention LM)
-3. **embedding**: text + audio token fusion → inputs_embeds
-4. **audio_decoder**: codec codes → waveform (optional, for Mimi/codec output)
+1. **audio_encoder**: mel/waveform -> audio features (Conformer/encoder)
+2. **embedding**: text + audio token fusion -> inputs_embeds
+3. **decoder**: inputs_embeds -> logits + KV cache (hybrid conv+attention LM)
+4. **audio_decoder**: backbone hidden -> per-codebook logits (depthformer)
 """
 
 from __future__ import annotations
@@ -24,8 +24,10 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
+    _make_hybrid_cache_inputs,
     _make_kv_cache_inputs,
     _make_model,
+    _register_hybrid_cache_outputs,
     _register_kv_cache_outputs,
 )
 
@@ -38,9 +40,11 @@ class AudioToAudioTask(ModelTask):
     - ``audio_encoder``: audio encoder taking mel/waveform input
     - ``embedding``: embedding model fusing text + audio features
     - ``decoder``: language model backbone with KV cache
-    - ``audio_decoder`` (optional): codec decoder for waveform synthesis
+    - ``audio_decoder`` (optional): depthformer or codec decoder
 
     Each sub-module is wired into its own ONNX graph.
+    Supports both standard KV cache and hybrid (conv+attention) cache
+    for the decoder, selected automatically based on ``config.layer_types``.
     """
 
     def build(
@@ -64,7 +68,7 @@ class AudioToAudioTask(ModelTask):
         audio_encoder: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build audio encoder: mel (batch, n_mels, time) → audio features."""
+        """Build audio encoder: mel (batch, n_mels, time) -> audio features."""
         batch = ir.SymbolicDim("batch")
         mel_seq = ir.SymbolicDim("mel_sequence_len")
         n_mels = config.audio.num_mel_bins or 128 if config.audio else 128
@@ -87,7 +91,7 @@ class AudioToAudioTask(ModelTask):
         embedding: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build embedding: text_ids + audio_features → inputs_embeds."""
+        """Build embedding: text_ids + audio_features -> inputs_embeds."""
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
@@ -124,10 +128,10 @@ class AudioToAudioTask(ModelTask):
         decoder: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build decoder: inputs_embeds → logits + KV cache.
+        """Build decoder: inputs_embeds -> logits + cache.
 
-        Uses 1D position_ids by default. Subclasses can override for
-        MRoPE 3D or other position embedding schemes.
+        Automatically uses hybrid cache (conv+attention) when
+        ``config.layer_types`` is set, otherwise standard KV cache.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -151,15 +155,24 @@ class AudioToAudioTask(ModelTask):
 
         graph_inputs = [inputs_embeds, attention_mask, position_ids]
 
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
-            config.num_hidden_layers,
-            config.num_key_value_heads,
-            config.head_dim,
-            config.dtype,
-            batch,
-            past_seq_len,
+        # Select cache type based on config
+        use_hybrid = config.layer_types is not None and any(
+            lt != "full_attention" for lt in config.layer_types
         )
-        graph_inputs.extend(kv_inputs)
+        if use_hybrid:
+            cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+                config, config.dtype, batch, past_seq_len
+            )
+        else:
+            cache_inputs, past_key_values = _make_kv_cache_inputs(
+                config.num_hidden_layers,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.dtype,
+                batch,
+                past_seq_len,
+            )
+        graph_inputs.extend(cache_inputs)
 
         graph, builder = _make_graph(graph_inputs, name="decoder")
         logits, present_key_values = decoder(
@@ -172,7 +185,14 @@ class AudioToAudioTask(ModelTask):
 
         logits.name = "logits"
         graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        if use_hybrid:
+            _register_hybrid_cache_outputs(
+                graph,
+                present_key_values,
+                config.layer_types or [],
+            )
+        else:
+            _register_kv_cache_outputs(graph, present_key_values)
         return _make_model(graph)
 
     def _build_audio_decoder(
@@ -180,25 +200,70 @@ class AudioToAudioTask(ModelTask):
         audio_decoder: nn.Module,
         config: ArchitectureConfig,
     ) -> ir.Model:
-        """Build audio decoder: codec codes → waveform.
+        """Build audio decoder: backbone hidden -> per-codebook logits.
 
-        Takes discrete codec codes and synthesizes a waveform. This is
-        the output stage for models using Mimi or similar audio codecs.
+        The audio decoder (depthformer) takes a backbone hidden state and
+        produces logits for one codebook at a time. Runtime handles the
+        autoregressive loop over codebooks.
+
+        Inputs:
+            backbone_hidden: (batch, 1, hidden_size) - LM output embedding
+            prev_embedding: (batch, 1, depthformer_dim) - previous codebook
+            codebook_idx: scalar int64 - which codebook to predict
+            past KV cache for depthformer layers
+
+        Outputs:
+            codebook_logits: (batch, 1, audio_vocab_size)
+            present KV cache
         """
-        batch = ir.SymbolicDim("batch")
-        codec_seq = ir.SymbolicDim("codec_sequence_len")
-        # Number of codebooks (e.g. 8 for Mimi, 16 for Qwen3-TTS)
-        num_codebooks = 8  # TODO: get from config
+        depthformer_dim = getattr(config, "depthformer_dim", config.hidden_size)
+        depthformer_layers = getattr(config, "depthformer_layers", 6)
+        depthformer_heads = getattr(config, "depthformer_heads", 16)
+        depthformer_head_dim = depthformer_dim // depthformer_heads
 
-        codes = ir.Value(
-            name="codes",
-            shape=ir.Shape([batch, num_codebooks, codec_seq]),
+        batch = ir.SymbolicDim("batch")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        backbone_hidden = ir.Value(
+            name="backbone_hidden",
+            shape=ir.Shape([batch, 1, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        prev_embedding = ir.Value(
+            name="prev_embedding",
+            shape=ir.Shape([batch, 1, depthformer_dim]),
+            type=ir.TensorType(config.dtype),
+        )
+        codebook_idx = ir.Value(
+            name="codebook_idx",
+            shape=ir.Shape([]),
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, builder = _make_graph([codes], name="audio_decoder")
-        waveform = audio_decoder(builder.op, codes)
+        graph_inputs = [backbone_hidden, prev_embedding, codebook_idx]
 
-        waveform.name = "waveform"
-        graph.outputs.append(waveform)
+        # Depthformer KV cache (all attention layers)
+        kv_inputs, past_key_values = _make_kv_cache_inputs(
+            depthformer_layers,
+            depthformer_heads,
+            depthformer_head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+            prefix="past_key_values",
+        )
+        graph_inputs.extend(kv_inputs)
+
+        graph, builder = _make_graph(graph_inputs, name="audio_decoder")
+        codebook_logits, present_kv = audio_decoder(
+            builder.op,
+            backbone_hidden=backbone_hidden,
+            prev_embedding=prev_embedding,
+            codebook_idx=codebook_idx,
+            past_key_values=past_key_values,
+        )
+
+        codebook_logits.name = "codebook_logits"
+        graph.outputs.append(codebook_logits)
+        _register_kv_cache_outputs(graph, present_kv)
         return _make_model(graph)

@@ -1991,6 +1991,45 @@ class Lfm2Config(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Lfm2AudioConfig(Lfm2Config):
+    """Configuration for LFM2-Audio: audio-to-audio with hybrid backbone.
+
+    Extends Lfm2Config with depthformer and audio codec fields.
+    """
+
+    # Depthformer parameters
+    depthformer_layers: int = 6
+    depthformer_dim: int = 1024
+    depthformer_heads: int = 16
+    depthformer_tie: bool = True
+
+    # Audio codec parameters
+    num_codebooks: int = 8
+    audio_vocab_size: int = 2049
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2AudioConfig:
+        # LFM2-Audio uses a custom config format from liquid-audio,
+        # not a standard HuggingFace config. The base fields come from
+        # the nested 'lfm' sub-config.
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+
+        depthformer = getattr(config, "depthformer", None) or {}
+        if hasattr(depthformer, "__dict__"):
+            depthformer = depthformer.__dict__
+
+        return cls(
+            **base_fields,
+            depthformer_layers=depthformer.get("layers", 6),
+            depthformer_dim=depthformer.get("dim", 1024),
+            depthformer_tie=depthformer.get("tie", True),
+            num_codebooks=getattr(config, "codebooks", 8),
+            audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
+        )
+
+
+@dataclasses.dataclass
 class JetMoeConfig(CausalLMConfig):
     """Configuration for JetMoE: Mixture-of-Attention + MoE FFN model.
 

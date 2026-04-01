@@ -108,6 +108,7 @@ from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.layoutlmv3 import LayoutLMv3Model
 from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2_audio import Lfm2AudioModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
@@ -463,6 +464,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
     # --- Hybrid Conv+Attention (LFM2) ---
     "lfm2": ModelRegistration(Lfm2CausalLMModel),
+    "lfm2_audio": ModelRegistration(Lfm2AudioModel, task="audio-to-audio"),
     # --- Hybrid linear-attention ---
     "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
@@ -810,6 +812,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2-1.2B",
+    "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1121,6 +1124,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
+    "lfm2_audio": "audio-to-audio",
     "qwen3_next": "moe+linear-attn",
 }
 

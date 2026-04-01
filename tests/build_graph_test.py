@@ -4400,6 +4400,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # Hybrid SSM+Attention dedicated tests
     "bamba",
     "jamba",
+    # Audio-to-audio dedicated tests
+    "lfm2_audio",
 }
 
 # Registered model types that truly have no test coverage yet.
@@ -4755,3 +4757,138 @@ class TestBuildSpeechGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+class TestBuildLfm2AudioGraph:
+    """Verify LFM2-Audio 4-model split builds correctly."""
+
+    def _lfm2_audio_config(self):
+        from mobius._configs import AudioConfig, Lfm2AudioConfig
+
+        return Lfm2AudioConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=4,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=1_000_000.0,
+            pad_token_id=0,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            attn_qk_norm=True,
+            short_conv_kernel=3,
+            short_conv_bias=False,
+            depthformer_layers=2,
+            depthformer_dim=TINY_HIDDEN,
+            depthformer_heads=TINY_HEADS,
+            num_codebooks=2,
+            audio_vocab_size=32,
+            audio=AudioConfig(
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                num_blocks=2,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=3,
+                conv_channels=32,
+                t5_bias_max_distance=100,
+                num_mel_bins=16,
+                output_dim=TINY_HIDDEN,
+            ),
+        )
+
+    def test_4_model_package_structure(self):
+        """Build LFM2-Audio and verify 4-model split."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+
+        assert "audio_encoder" in pkg, "Should have audio_encoder model"
+        assert "embedding" in pkg, "Should have embedding model"
+        assert "decoder" in pkg, "Should have decoder model"
+        assert "audio_decoder" in pkg, "Should have audio_decoder model"
+
+    def test_audio_encoder_io(self):
+        """Verify audio_encoder: input_features -> audio_features."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+
+        enc = pkg["audio_encoder"]
+        enc_inputs = {inp.name for inp in enc.graph.inputs}
+        enc_outputs = {out.name for out in enc.graph.outputs}
+        assert "input_features" in enc_inputs
+        assert "audio_features" in enc_outputs
+
+    def test_decoder_hybrid_cache(self):
+        """Verify decoder has hybrid cache (conv_state + KV)."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+
+        dec = pkg["decoder"]
+        dec_inputs = {inp.name for inp in dec.graph.inputs}
+        dec_outputs = {out.name for out in dec.graph.outputs}
+
+        assert "inputs_embeds" in dec_inputs
+        assert "logits" in dec_outputs
+        # Hybrid cache: conv layers have conv_state, attn has key/value
+        assert "past_key_values.0.conv_state" in dec_inputs
+        assert "present.2.key" in dec_outputs
+
+    def test_audio_decoder_io(self):
+        """Verify audio_decoder: backbone_hidden -> codebook_logits."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+
+        adec = pkg["audio_decoder"]
+        adec_inputs = {inp.name for inp in adec.graph.inputs}
+        adec_outputs = {out.name for out in adec.graph.outputs}
+
+        assert "backbone_hidden" in adec_inputs
+        assert "prev_embedding" in adec_inputs
+        assert "codebook_idx" in adec_inputs
+        assert "codebook_logits" in adec_outputs
+
+    def test_onnx_checker_passes(self):
+        """Run ONNX checker on all 4 sub-models."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, "lfm2_audio")
+
+    def test_outputs_have_shapes_and_dtypes(self):
+        """Verify all sub-model outputs have shape/dtype info."""
+        from mobius.models.lfm2_audio import Lfm2AudioModel
+        from mobius.tasks._audio_to_audio import AudioToAudioTask
+
+        config = self._lfm2_audio_config()
+        module = Lfm2AudioModel(config)
+        task = AudioToAudioTask()
+        pkg = task.build(module, config)
+        _assert_outputs_have_shapes_and_dtypes(pkg, "lfm2_audio")
