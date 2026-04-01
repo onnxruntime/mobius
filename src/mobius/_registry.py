@@ -476,6 +476,10 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("lfm2", Lfm2CausalLMModel)
 
+    from mobius.models.lfm2_audio import Lfm2AudioModel
+
+    reg.register("lfm2_audio", Lfm2AudioModel)
+
     # --- Multimodal ---
     for name in (
         "chameleon",
@@ -826,6 +830,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2-1.2B",
+    "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1085,6 +1090,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
+    "lfm2_audio": "audio-to-audio",
     "qwen3_next": "moe+linear-attn",
 }
 

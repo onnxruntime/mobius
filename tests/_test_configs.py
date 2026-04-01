@@ -2117,6 +2117,16 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
 
 
 # ---------------------------------------------------------------------------
+# Audio-to-audio model configs
+# ---------------------------------------------------------------------------
+AUDIO_TO_AUDIO_CONFIGS: list[tuple[str, dict, bool]] = [
+    # Audio-to-audio models are tested via explicit test classes
+    # (TestBuildLfm2AudioGraph etc.) since they produce multi-model
+    # packages with different keys than standard single-model tasks.
+]
+
+
+# ---------------------------------------------------------------------------
 # Aggregate lists
 # ---------------------------------------------------------------------------
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
@@ -2128,6 +2138,7 @@ ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     + SSM_CONFIGS
     + VL_CONFIGS
     + SPEECH_CONFIGS
+    + AUDIO_TO_AUDIO_CONFIGS
 )
 
 # Model types explicitly declared in configs above (may have duplicates —
