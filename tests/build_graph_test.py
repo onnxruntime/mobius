@@ -1269,9 +1269,7 @@ class TestBuildGraphVisionLanguage:
             "language_model.lm_head.weight": torch.zeros(1),
             "language_model.model.layers.0.self_attn.q_proj.weight": torch.zeros(1),
         }
-        result = _preprocess_pixtral_weights(
-            state_dict, tie_word_embeddings=False
-        )
+        result = _preprocess_pixtral_weights(state_dict, tie_word_embeddings=False)
 
         # Vision/projector keys get vision_encoder. prefix
         assert "vision_encoder.vision_tower.patch_conv.weight" in result
@@ -1291,9 +1289,7 @@ class TestBuildGraphVisionLanguage:
         state_dict_tied = {
             "language_model.model.embed_tokens.weight": torch.zeros(1),
         }
-        result_tied = _preprocess_pixtral_weights(
-            state_dict_tied, tie_word_embeddings=True
-        )
+        result_tied = _preprocess_pixtral_weights(state_dict_tied, tie_word_embeddings=True)
         assert "decoder.lm_head.weight" in result_tied
         assert "decoder.model.embed_tokens.weight" in result_tied
         assert "embedding.embed_tokens.weight" in result_tied
@@ -1309,9 +1305,7 @@ class TestBuildGraphVisionLanguage:
             "model.language_model.model.layers.0.mlp.gate_proj.weight": torch.zeros(1),
             "lm_head.weight": torch.zeros(1),
         }
-        result = _preprocess_pixtral_weights(
-            state_dict, tie_word_embeddings=False
-        )
+        result = _preprocess_pixtral_weights(state_dict, tie_word_embeddings=False)
 
         # model. prefix stripped, then vision gets vision_encoder. prefix
         assert "vision_encoder.vision_tower.patch_conv.weight" in result
