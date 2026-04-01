@@ -5,21 +5,10 @@
 
 from __future__ import annotations
 
-import os
-import sys
+import random
 
-# Ensure tests always import mobius from the local src/ tree, not any
-# installed version from a different worktree.  This is critical in
-# multi-worktree environments where `pip install -e .` may point to a
-# different worktree's source.
-_SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
-
-import random  # noqa: E402
-
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import numpy as np
+import pytest
 
 
 # ---------------------------------------------------------------------------
