@@ -71,7 +71,7 @@ class AudioToAudioTask(ModelTask):
         """Build audio encoder: mel (batch, n_mels, time) -> audio features."""
         batch = ir.SymbolicDim("batch")
         mel_seq = ir.SymbolicDim("mel_sequence_len")
-        n_mels = config.audio.num_mel_bins or 128 if config.audio else 128
+        n_mels = (config.audio.num_mel_bins or 128) if config.audio else 128
 
         input_features = ir.Value(
             name="input_features",
