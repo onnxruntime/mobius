@@ -41,7 +41,7 @@ def relu2(op: builder.OpBuilder, x):
 
 def quick_gelu(op: builder.OpBuilder, x):
     """QuickGELU activation: x * sigmoid(1.702 * x)."""
-    return op.Mul(x, op.Sigmoid(op.Mul(op.CastLike(op.Constant(value_float=1.702), x), x)))
+    return op.Mul(x, op.Sigmoid(op.Mul(1.702, x)))
 
 
 def mish(op: builder.OpBuilder, x):

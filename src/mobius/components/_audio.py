@@ -409,10 +409,8 @@ class ConformerEncoderLayer(nn.Module):
         self.layer_norm = LayerNorm(d_model)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
-        half = op.CastLike(op.Constant(value_float=0.5), x)
-
         # Macaron feed-forward in
-        x = op.Add(x, op.Mul(self.feed_forward_in(op, x), half))
+        x = op.Add(x, op.Mul(self.feed_forward_in(op, x), 0.5))
 
         # Multi-head attention with pre-norm
         norm_x = self.layer_norm_att(op, x)
@@ -422,7 +420,7 @@ class ConformerEncoderLayer(nn.Module):
         x = op.Add(x, self.conv(op, x))
 
         # Macaron feed-forward out
-        x = op.Add(x, op.Mul(self.feed_forward_out(op, x), half))
+        x = op.Add(x, op.Mul(self.feed_forward_out(op, x), 0.5))
 
         return self.layer_norm(op, x)
 
