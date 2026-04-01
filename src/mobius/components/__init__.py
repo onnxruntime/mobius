@@ -89,6 +89,7 @@ __all__ = [
     "SANMFFN",
     "RMSNorm",
     "SelectiveScan",
+    "ShortConv",
     "SiLU",
     "SigmoidTopKGate",
     "SnakeBeta",
@@ -249,6 +250,7 @@ from mobius.components._sanm_attention import (
     SANMAttention,
     SANMEncoderLayer,
 )
+from mobius.components._short_conv import ShortConv
 from mobius.components._ssm import (
     JambaSelectiveScan,
     SelectiveScan,

@@ -22,6 +22,7 @@ __all__ = [
     "AdapterTask",
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
+    "AudioToAudioTask",
     "CausalLMTask",
     "CTCAsrTask",
     "CodecTask",
@@ -64,6 +65,7 @@ from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_ctc import AudioCTCTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
+from mobius.tasks._audio_to_audio import AudioToAudioTask
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
@@ -114,9 +116,10 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
-    "ctc-asr": CTCAsrTask,
+    "audio-to-audio": AudioToAudioTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
+    "ctc-asr": CTCAsrTask,
     "denoising": DenoisingTask,
     "feature-extraction": FeatureExtractionTask,
     "image-classification": ImageClassificationTask,
