@@ -587,13 +587,9 @@ class Gemma3nCausalLMModel(CausalLMModel):
     Extends CausalLMModel with the Gemma3n text backbone that includes
     alternating updates, learned augmented residuals, and per-layer
     input gating for mobile efficiency.
-
-    ``weight_namespace = "language_model"`` handles prefix stripping for
-    multimodal checkpoints that nest text weights under ``language_model.*``.
     """
 
     config_class: type = Gemma3nConfig
-    weight_namespace = "language_model"
 
     def __init__(self, config: Gemma3nConfig):
         super().__init__(config)
@@ -602,11 +598,16 @@ class Gemma3nCausalLMModel(CausalLMModel):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Preprocess weights: flatten AltUp submodule nesting.
+        """Preprocess weights, handling language_model prefix from multimodal."""
+        for key in list(state_dict.keys()):
+            if "language_model." in key:
+                new_key = key.replace("language_model.", "")
+                state_dict[new_key] = state_dict.pop(key)
+            elif "vision_tower" in key or "multi_modal_projector" in key:
+                state_dict.pop(key)
+            elif "audio_tower" in key:
+                state_dict.pop(key)
 
-        Prefix stripping (``language_model.*``) and non-text key filtering
-        are handled automatically by ``weight_namespace``.
-        """
         # AltUp submodules (correction_coefs, prediction_coefs, modality_router,
         # router_norm, correct_output_scale) are called via plain methods rather than
         # __call__, so onnxscript registers them on the parent DecoderLayer without the
