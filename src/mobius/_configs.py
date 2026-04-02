@@ -2929,3 +2929,57 @@ class ClapConfig(ArchitectureConfig):
 
         fields["projection_dim"] = getattr(src, "projection_dim", 512)
         return cls(**fields)
+
+
+@dataclasses.dataclass
+class AltCLIPConfig(ArchitectureConfig):
+    """Configuration for AltCLIP contrastive models (model_type: ``altclip``).
+
+    AltCLIP replaces CLIP's text encoder with XLM-RoBERTa (multilingual) while
+    keeping the CLIP ViT vision encoder.  Both sub-encoders share the same
+    ``hidden_size``, ``num_hidden_layers``, and ``num_attention_heads`` in the
+    standard BAAI/AltCLIP checkpoint (ViT-L/14 + XLM-R-Large).
+
+    Base ``ArchitectureConfig`` fields are populated from ``text_config`` so
+    that ``BertModel`` (the XLM-RoBERTa backbone) gets correct ``vocab_size``,
+    ``num_hidden_layers``, etc.  Vision-specific fields (``image_size``,
+    ``patch_size``, ``num_channels``) come from ``vision_config``.
+    ``projection_dim`` is read from the top-level AltCLIP config.
+
+    ``patch_embed_bias=False``: CLIP ViT patch projection has no bias.
+    """
+
+    patch_embed_bias: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> "AltCLIPConfig":
+        src = parent_config or config
+        tc = getattr(src, "text_config", None)
+        vc = getattr(src, "vision_config", None)
+
+        base = ArchitectureConfig.from_transformers(src, parent_config)
+        fields = _shallow_fields(base)
+
+        if tc is not None:
+            fields.update(
+                hidden_size=getattr(tc, "hidden_size", 1024),
+                vocab_size=getattr(tc, "vocab_size", 250002),
+                num_hidden_layers=getattr(tc, "num_hidden_layers", 24),
+                num_attention_heads=getattr(tc, "num_attention_heads", 16),
+                intermediate_size=getattr(tc, "intermediate_size", 4096),
+                hidden_act=getattr(tc, "hidden_act", "gelu"),
+                max_position_embeddings=getattr(tc, "max_position_embeddings", 514),
+                pad_token_id=getattr(tc, "pad_token_id", 1),
+                type_vocab_size=getattr(tc, "type_vocab_size", 1),
+                rms_norm_eps=getattr(tc, "layer_norm_eps", 1e-12),
+            )
+
+        if vc is not None:
+            fields.update(
+                image_size=getattr(vc, "image_size", 224),
+                patch_size=getattr(vc, "patch_size", 14),
+                num_channels=getattr(vc, "num_channels", 3),
+            )
+
+        fields["projection_dim"] = getattr(src, "projection_dim", 768)
+        return cls(**fields)

@@ -23,6 +23,8 @@ import difflib
 from onnxscript import nn
 
 from mobius._configs import (
+    AltCLIPConfig,
+    ArchitectureConfig,
     AriaConfig,
     BaseModelConfig,
     ClapConfig,
@@ -42,6 +44,7 @@ from mobius._configs import (
     SamConfig,
     Speech2TextConfig,
     WhisperConfig,
+    ZoeDepthConfig,
 )
 from mobius.models import (
     ApertusCausalLMModel,
@@ -669,7 +672,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("clip_text_model", CLIPTextModel, task="feature-extraction")
     reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
-    reg.register("longformer", LongformerModel, task="feature-extraction")
+    reg.register("longformer", LongformerModel, task="feature-extraction", config_class=ArchitectureConfig)
     reg.register(
         "clap_text_model", ClapTextModel, task="feature-extraction", config_class=ClapConfig
     )
@@ -681,7 +684,7 @@ def _create_default_registry() -> ModelRegistry:
     )
     reg.register("clap", ClapModel, task="contrastive", config_class=ClapConfig)
     reg.register("clip", CLIPModel, task="contrastive")
-    reg.register("altclip", AltCLIPModel, task="contrastive")
+    reg.register("altclip", AltCLIPModel, task="contrastive", config_class=AltCLIPConfig)
 
     from mobius.models.clipseg import CLIPSegModel
 
@@ -742,7 +745,7 @@ def _create_default_registry() -> ModelRegistry:
         "depth_anything", DepthAnythingForDepthEstimation, task="depth-estimation"
     )
     reg.register("dpt", DPTForDepthEstimation, task="depth-estimation", config_class=DPTConfig)
-    reg.register("zoedepth", ZoeDepthForDepthEstimation, task="depth-estimation")
+    reg.register("zoedepth", ZoeDepthForDepthEstimation, task="depth-estimation", config_class=ZoeDepthConfig)
     for name in (
         "beit",
         "cvt",

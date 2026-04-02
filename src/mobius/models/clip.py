@@ -187,6 +187,10 @@ def _rename_clip_vision_weight(name: str) -> str | None:
 
     # Embeddings
     if name.startswith("embeddings."):
+        # HF's patch_embedding is a bare Conv2d; our _Conv2dPatchEmbed wraps it as .projection
+        if name.startswith("embeddings.patch_embedding."):
+            suffix = name[len("embeddings.patch_embedding."):]
+            return f"embeddings.patch_embedding.projection.{suffix}"
         return name
 
     # Pre/post layer norm

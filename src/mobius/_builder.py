@@ -185,7 +185,7 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
 def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
-    task: str | ModelTask = "text-generation",
+    task: str | ModelTask | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -202,6 +202,9 @@ def build_from_module(
             to catch invalid fields early.
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
+            When ``None`` (the default), the task is auto-detected from the
+            module's ``default_task`` attribute, falling back to
+            ``"text-generation"`` if not set.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -228,6 +231,8 @@ def build_from_module(
         config = ArchitectureConfig(vocab_size=32000, hidden_size=4096, ...)
         pkg = build_from_module(MyModel(config), config)
     """
+    if task is None:
+        task = getattr(module, "default_task", "text-generation")
     if hasattr(config, "validate"):
         config.validate()
     _cast_module_dtype(module, getattr(config, "dtype", ir.DataType.FLOAT))

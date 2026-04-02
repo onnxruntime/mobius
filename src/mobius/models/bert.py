@@ -306,15 +306,6 @@ def _rename_bert_weight(name: str) -> str | None:
     if name.startswith(("pooler.", "cls.")):
         return None
 
-    # Collapse nested HF naming to match flat ONNX paths:
-    #   attention.self.query → attention.query
-    #   attention.output.dense → attention.dense
-    #   layer.N.output.dense → layer.N.dense
-    name = name.replace(".attention.self.", ".attention.")
-    name = name.replace(".attention.output.", ".attention.")
-    name = name.replace(".output.dense.", ".dense.")
-    name = name.replace(".output.LayerNorm.", ".LayerNorm.")
-
     # Rename gamma/beta to weight/bias (old BERT compat)
     parts = name.rsplit(".", 1)
     if len(parts) == 2 and parts[1] in _PARAM_RENAMES:

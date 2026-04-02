@@ -58,6 +58,7 @@ class _BEiTEncoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             bias=True,
+            key_bias=False,  # BEiT key projection has no bias
         )
         # Learnable per-channel scale applied to attn output before residual
         self.layer_scale_1 = nn.Parameter(
@@ -120,8 +121,9 @@ class _ZoeDepthViTBackbone(nn.Module):
         self.encoder = nn.ModuleList(
             [_BEiTEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         # 1-indexed layer indices at which to extract hidden states
+        # Note: HF's ZoeDepth BEiT backbone has no final layernorm at the backbone
+        # level — intermediate features are taken directly from encoder outputs.
         self.out_indices: list[int] = config.backbone_out_indices or []
 
     def forward(self, op: builder.OpBuilder, pixel_values: ir.Value) -> list[ir.Value]:
@@ -137,14 +139,12 @@ class _ZoeDepthViTBackbone(nn.Module):
         # Concat along sequence dim: (B, S+1, hidden)
         hidden_states = op.Concat(cls_tokens, patch_embeds, axis=1)
 
-        # Run encoder, collect hidden states at out_indices
+        # Run encoder, collect hidden states at out_indices (1-indexed: 1 = after layer 0)
         feature_maps: list[ir.Value] = []
         for i, layer in enumerate(self.encoder):
             hidden_states = layer(op, hidden_states)
-            # out_indices are 1-indexed: index 1 = after layer 0
             if (i + 1) in self.out_indices:
-                normed = self.layernorm(op, hidden_states)
-                feature_maps.append(normed)
+                feature_maps.append(hidden_states)
 
         return feature_maps  # each: (B, S+1, hidden)
 
@@ -372,12 +372,13 @@ class _ZoeDepthSeedBinRegressor(nn.Module):
         max_depth: float,
     ):
         super().__init__()
-        self.conv1 = Conv2d(config.bottleneck_features, 256, kernel_size=1, padding=0)
-        self.conv2 = Conv2d(256, n_bins, kernel_size=1, padding=0)
+        # HF uses n_bins as both the intermediate and output channel size
+        self.conv1 = Conv2d(config.bottleneck_features, n_bins, kernel_size=1, padding=0)
+        self.conv2 = Conv2d(n_bins, n_bins, kernel_size=1, padding=0)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value) -> tuple[ir.Value, ir.Value]:
         # x: (B, bottleneck_features, H, W)
-        x = op.Relu(self.conv1(op, x))  # (B, 256, H, W)
+        x = op.Relu(self.conv1(op, x))  # (B, n_bins, H, W)
         x = self.conv2(op, x)  # (B, n_bins, H, W)
         bin_centers = op.Softplus(x)  # (B, n_bins, H, W)  — unbounded
         return bin_centers, bin_centers
@@ -509,7 +510,7 @@ class _ZoeDepthConditionalLogBinomialSoftmax(nn.Module):
         n_classes: int,
     ):
         super().__init__()
-        bottleneck = (in_features + condition_dim) // 2
+        bottleneck = (in_features + condition_dim) // 4
         self.conv1 = Conv2d(in_features + condition_dim, bottleneck, kernel_size=1, padding=0)
         # 4 outputs: 2 for probability normalisation, 2 for temperature normalisation
         self.conv2 = Conv2d(bottleneck, 4, kernel_size=1, padding=0)
@@ -655,18 +656,20 @@ class _ZoeDepthMetricHead(nn.Module):
             kernel_size=1,
             padding=0,
         )
-        # Seed bin regressor initialises per-pixel bin centers
+        # Seed bin regressor: bottleneck → n_bins in two 1x1 convs
         self.seed_bin_regressor = _ZoeDepthSeedBinRegressor(
             config,
             n_bins=n_bins,
             min_depth=min_depth,
             max_depth=max_depth,
         )
-        # Projector from bottleneck to bin embedding
+        # Projector from bottleneck to bin embedding.
+        # conv1: (bottleneck_features → n_bins), conv2: (n_bins → bin_embed_dim).
+        # Final output is bin_embed_dim channels (attractor input size).
         self.seed_projector = _ZoeDepthProjector(
             in_features=config.bottleneck_features,
             out_features=bin_embed_dim,
-            mlp_dim=bin_embed_dim,
+            mlp_dim=n_bins,
         )
         # One projector per attractor stage (map fused features → bin embeddings)
         self.projectors = nn.ModuleList(
@@ -674,26 +677,30 @@ class _ZoeDepthMetricHead(nn.Module):
                 _ZoeDepthProjector(
                     in_features=fusion_hidden,
                     out_features=bin_embed_dim,
-                    mlp_dim=bin_embed_dim,
+                    mlp_dim=n_bins,
                 )
                 for _ in range(4)
             ]
         )
-        # One attractor layer per stage
+        # One attractor layer per stage.
+        # HF's ZoeDepthAttractorLayerUnnormed always uses n_attractors=16 (the default),
+        # independent of config.num_attractors which controls n_bins in the update rule.
         self.attractors = nn.ModuleList(
             [
                 _ZoeDepthAttractorLayer(
                     config,
                     n_bins=n_bins,
-                    n_attractors=n_attractors_list[i],
+                    n_attractors=16,
                     min_depth=min_depth,
                     max_depth=max_depth,
                 )
-                for i in range(4)
+                for _ in range(4)
             ]
         )
-        # Final conditional log-binomial softmax mixing relative+metric features
-        last_in = num_relative_features + 1  # +1 for concatenated relative depth channel
+        # Final conditional log-binomial softmax mixing outconv features with bin embedding.
+        # V1 architecture: condition on outconv_activation only (no relative depth concat).
+        # bottleneck_factor=4 matches ZoeDepthMultipleMetricDepthEstimationHeads in HF.
+        last_in = num_relative_features
         self.conditional_log_binomial = _ZoeDepthConditionalLogBinomialSoftmax(
             config,
             in_features=last_in,
@@ -731,25 +738,13 @@ class _ZoeDepthMetricHead(nn.Module):
             prev_bin_embedding = bin_embedding
 
         # Assemble final depth probability distribution
-        # Resize relative_depth to match outconv_activation spatial dims
+        # V1 architecture: conditional_log_binomial takes outconv_activation directly
+        # (no relative depth concatenation, unlike V2).
         last = outconv_activation  # (B, num_relative_features, H_out, W_out)
         target_h = op.Shape(last, start=2, end=3)
         target_w = op.Shape(last, start=3, end=4)
 
-        # relative_depth: (B, H, W) → (B, 1, H_out, W_out)
-        rel_depth_4d = op.Unsqueeze(relative_depth, op.Constant(value_ints=[1]))
-        rel_depth_resized = op.Resize(
-            rel_depth_4d,
-            None,
-            None,
-            op.Concat(op.Shape(rel_depth_4d, start=0, end=2), target_h, target_w, axis=0),
-            mode="linear",
-            coordinate_transformation_mode="align_corners",
-        )
-        # Concat: (B, num_relative_features+1, H_out, W_out)
-        last_combined = op.Concat(last, rel_depth_resized, axis=1)
-
-        # Resize bin_embedding to match last_combined
+        # Resize bin_embedding to match outconv spatial dims
         bin_embed_resized = op.Resize(
             bin_embedding,
             None,
@@ -760,7 +755,7 @@ class _ZoeDepthMetricHead(nn.Module):
         )
 
         # Log-binomial mixing: (B, n_bins, H_out, W_out)
-        x_probs = self.conditional_log_binomial(op, last_combined, bin_embed_resized)
+        x_probs = self.conditional_log_binomial(op, last, bin_embed_resized)
 
         # Resize bin_centers to match x_probs spatial dims
         x_h = op.Shape(x_probs, start=2, end=3)
@@ -898,10 +893,10 @@ def _rename_zoedepth_weight(name: str, tensor: torch.Tensor) -> str | None:
     if m:
         layer_idx, suffix = m.group(1), m.group(2)
 
-        # Layer scale parameters
-        if suffix == "layer_scale_1.lambda_1":
+        # Layer scale parameters (HF: lambda_1 / lambda_2)
+        if suffix == "lambda_1":
             return f"backbone.encoder.{layer_idx}.layer_scale_1"
-        if suffix == "layer_scale_2.lambda_2":
+        if suffix == "lambda_2":
             return f"backbone.encoder.{layer_idx}.layer_scale_2"
 
         # Attention / MLP renames
@@ -940,13 +935,28 @@ def _rename_zoedepth_weight(name: str, tensor: torch.Tensor) -> str | None:
 
     # ── Metric head ───────────────────────────────────────────────────────
     if name.startswith("metric_head."):
+        # Skip kitti-specific weights (our module only builds the first dataset head)
+        if ".kitti." in name:
+            return None
+        # Skip patch_transformer and mlp_classifier (not in our simplified module)
+        if name.startswith(("metric_head.patch_transformer.", "metric_head.mlp_classifier.")):
+            return None
+
+        # Rename nyu-specific sub-paths to our flat naming:
+        #   attractors.nyu.N.*           → attractors.N.*
+        #   seed_bin_regressors.nyu.*    → seed_bin_regressor.*
+        name = name.replace("metric_head.attractors.nyu.", "metric_head.attractors.")
+        name = name.replace(
+            "metric_head.seed_bin_regressors.nyu.", "metric_head.seed_bin_regressor."
+        )
+
         # mlp.0. and mlp.2. → conv1 and conv2 inside conditional_log_binomial
         name = name.replace(
-            "metric_head.conditional_log_binomial.mlp.0.",
+            "metric_head.conditional_log_binomial.nyu.mlp.0.",
             "metric_head.conditional_log_binomial.conv1.",
         )
         name = name.replace(
-            "metric_head.conditional_log_binomial.mlp.2.",
+            "metric_head.conditional_log_binomial.nyu.mlp.2.",
             "metric_head.conditional_log_binomial.conv2.",
         )
         return name

@@ -29,6 +29,7 @@ class EncoderAttention(nn.Module):
         hidden_size: int,
         num_attention_heads: int,
         bias: bool = True,
+        key_bias: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -36,7 +37,8 @@ class EncoderAttention(nn.Module):
         self.head_dim = hidden_size // num_attention_heads
 
         self.q_proj = Linear(hidden_size, hidden_size, bias=bias)
-        self.k_proj = Linear(hidden_size, hidden_size, bias=bias)
+        # key_bias allows disabling k_proj bias independently (e.g. BEiT has no key bias)
+        self.k_proj = Linear(hidden_size, hidden_size, bias=key_bias)
         self.v_proj = Linear(hidden_size, hidden_size, bias=bias)
         self.out_proj = Linear(hidden_size, hidden_size, bias=bias)
 

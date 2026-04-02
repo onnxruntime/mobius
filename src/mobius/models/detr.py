@@ -597,16 +597,24 @@ def _rename_detr_weight(name: str, value: torch.Tensor) -> tuple[str, torch.Tens
         # HF shape: (num_queries, d_model); our Parameter: same shape
         return "query_position_embeddings", value
 
-    # --- Transformer and detection head weights: pass through unchanged ---
+    # --- Transformer and detection head weights ---
+    # HF uses ``o_proj`` for attention output; our module uses ``out_proj``
     if name.startswith(
         (
             "input_projection.",
-            "encoder.",
-            "decoder.",
             "class_labels_classifier.",
             "bbox_predictor.",
         )
     ):
         return name, value
+
+    if name.startswith("encoder."):
+        new_name = name.replace(".self_attn.o_proj.", ".self_attn.out_proj.")
+        return new_name, value
+
+    if name.startswith("decoder."):
+        new_name = name.replace(".self_attn.o_proj.", ".self_attn.out_proj.")
+        new_name = new_name.replace(".encoder_attn.o_proj.", ".encoder_attn.out_proj.")
+        return new_name, value
 
     return None  # drop unrecognised keys (e.g. backbone.conv_encoder.*)

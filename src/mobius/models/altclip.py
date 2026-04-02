@@ -41,10 +41,11 @@ class _AltCLIPTextEncoder(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.roberta = BertModel(config)
-        self.pre_LN = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.transformation = Linear(config.hidden_size, config.hidden_size, bias=True)
         projection_dim = getattr(config, "projection_dim", config.hidden_size)
-        self.text_projection = Linear(config.hidden_size, projection_dim, bias=False)
+        self.pre_LN = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # transformation: hidden_size → projection_dim (AltCLIP uses projection_dim output)
+        self.transformation = Linear(config.hidden_size, projection_dim, bias=True)
+        self.text_projection = Linear(projection_dim, projection_dim, bias=False)
 
     def forward(
         self,
