@@ -42,13 +42,9 @@ class _AltCLIPTextEncoder(nn.Module):
         super().__init__()
         self.roberta = BertModel(config)
         self.pre_LN = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.transformation = Linear(
-            config.hidden_size, config.hidden_size, bias=True
-        )
+        self.transformation = Linear(config.hidden_size, config.hidden_size, bias=True)
         projection_dim = getattr(config, "projection_dim", config.hidden_size)
-        self.text_projection = Linear(
-            config.hidden_size, projection_dim, bias=False
-        )
+        self.text_projection = Linear(config.hidden_size, projection_dim, bias=False)
 
     def forward(
         self,
@@ -56,9 +52,13 @@ class _AltCLIPTextEncoder(nn.Module):
         input_ids: ir.Value,
         attention_mask: ir.Value,
     ) -> ir.Value:
-        # Encode text with XLM-RoBERTa
+        # Encode text with XLM-RoBERTa (token_type_ids must be zeros;
+        # XLM-RoBERTa has type_vocab_size=1 so any non-zero value OOBs)
+        zero_token_type_ids = op.Expand(
+            op.Constant(value_int=0), op.Shape(input_ids)
+        )
         hidden_states = self.roberta(
-            op, input_ids, attention_mask, token_type_ids=input_ids
+            op, input_ids, attention_mask, token_type_ids=zero_token_type_ids
         )
         # CLS pooling (first token)
         cls_token = op.Gather(hidden_states, op.Constant(value_int=0), axis=1)
@@ -80,17 +80,11 @@ class _AltCLIPVisionEncoder(nn.Module):
         super().__init__()
         self.vision_model = CLIPVisionModel(config)
         projection_dim = getattr(config, "projection_dim", config.hidden_size)
-        self.visual_projection = Linear(
-            config.hidden_size, projection_dim, bias=False
-        )
+        self.visual_projection = Linear(config.hidden_size, projection_dim, bias=False)
 
-    def forward(
-        self, op: builder.OpBuilder, pixel_values: ir.Value
-    ) -> ir.Value:
+    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value) -> ir.Value:
         hidden_states = self.vision_model(op, pixel_values=pixel_values)
-        cls_token = op.Gather(
-            hidden_states, op.Constant(value_int=0), axis=1
-        )
+        cls_token = op.Gather(hidden_states, op.Constant(value_int=0), axis=1)
         return self.visual_projection(op, cls_token)
 
 
@@ -144,12 +138,12 @@ def _rename_altclip_weight(name: str) -> str | None:
         return f"modality_encoder.{name}"
     if name.startswith("text_model.roberta."):
         # Strip text_model. prefix; BertModel handles roberta. prefix
-        inner = name[len("text_model."):]
+        inner = name[len("text_model.") :]
         return f"text_encoder.{inner}"
     if name.startswith("text_model.pre_LN."):
-        return f"text_encoder.{name[len('text_model.'):]}"
+        return f"text_encoder.{name[len('text_model.') :]}"
     if name.startswith("text_model.transformation."):
-        return f"text_encoder.{name[len('text_model.'):]}"
+        return f"text_encoder.{name[len('text_model.') :]}"
     if name.startswith("vision_model."):
         inner = _rename_clip_vision_weight(name)
         return f"modality_encoder.vision_model.{inner}" if inner else None

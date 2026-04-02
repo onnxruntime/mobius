@@ -97,10 +97,10 @@ from mobius.models.blip2 import Blip2Model
 from mobius.models.clap import ClapAudioModel, ClapModel, ClapTextModel
 from mobius.models.clip import CLIPModel, CLIPTextModel, CLIPVisionModel
 from mobius.models.cohere import CohereCausalLMModel
+from mobius.models.conditional_detr import ConditionalDetrForObjectDetection
 from mobius.models.convnext import ConvNextModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
-from mobius.models.conditional_detr import ConditionalDetrForObjectDetection
 from mobius.models.detr import DetrForObjectDetection
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dpt import DPTForDepthEstimation
@@ -125,13 +125,13 @@ from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
 from mobius.models.moondream import MoondreamModel
 from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.opt import OPTCausalLMModel
+from mobius.models.owlv2 import Owlv2ForObjectDetection
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.resnet import ResNetModel
 from mobius.models.rt_detr import RtDetrForObjectDetection
-from mobius.models.owlv2 import Owlv2ForObjectDetection
 from mobius.models.rwkv import RwkvCausalLMModel
 from mobius.models.rwkv6 import Rwkv6CausalLMModel
 from mobius.models.sam2 import Sam2VisionModel

@@ -185,7 +185,7 @@ class _DPTNeck(nn.Module):
         self.reassemble_layers = nn.ModuleList(
             [_ReassembleLayer(hidden_size, ch, f) for ch, f in zip(neck_sizes, factors)]
         )
-        # 1x1 convs mapping reassemble output channels → fusion_size
+        # 3×3 convs mapping reassemble output channels → fusion_size
         self.convs = nn.ModuleList(
             [Conv2dNoBias(ch, fusion_size, kernel_size=3, padding=1) for ch in neck_sizes]
         )
