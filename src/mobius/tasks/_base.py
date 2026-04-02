@@ -139,15 +139,24 @@ def _register_kv_cache_outputs(
     present_key_values: list[tuple[ir.Value, ir.Value]],
     *,
     prefix: str = "present",
+    past_key_values: list[tuple[ir.Value, ir.Value]] | None = None,
 ) -> None:
     """Name and register KV cache outputs on the graph.
 
-    Output shapes and dtypes are inferred by the shape inference pass
-    that runs during model optimization.
+    When ``past_key_values`` is provided, the dtype from each past KV input
+    is propagated to the corresponding present KV output so callers do not
+    need to rely entirely on shape inference for output type information.
     """
     for i, (present_key, present_value) in enumerate(present_key_values):
         present_key.name = f"{prefix}.{i}.key"
         present_value.name = f"{prefix}.{i}.value"
+
+        if past_key_values is not None:
+            past_key, past_value = past_key_values[i]
+            if past_key.type is not None:
+                present_key.type = past_key.type
+            if past_value.type is not None:
+                present_value.type = past_value.type
 
         graph.outputs.append(present_key)
         graph.outputs.append(present_value)

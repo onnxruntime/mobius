@@ -425,6 +425,16 @@ class VibeVoiceAsrAudioTower(nn.Module):
 
     def __init__(self, config: VibeVoiceAsrConfig):
         super().__init__()
+        # Both encoders must downsample at the same rate so their frame counts align.
+        # The projector sums acoustic + semantic features element-wise.
+        acoustic_ratios = config.acoustic_encoder.downsampling_ratios
+        semantic_ratios = config.semantic_encoder.downsampling_ratios
+        if acoustic_ratios != semantic_ratios:
+            raise ValueError(
+                f"acoustic_encoder.downsampling_ratios {acoustic_ratios} must match "
+                f"semantic_encoder.downsampling_ratios {semantic_ratios} so frame "
+                f"counts align for element-wise summation in the projector."
+            )
         self.acoustic_tokenizer_encoder = AudioTokenizerEncoder(config.acoustic_encoder)
         self.semantic_tokenizer_encoder = AudioTokenizerEncoder(config.semantic_encoder)
         self.multi_modal_projector = VibeVoiceAsrMultiModalProjector(config)
