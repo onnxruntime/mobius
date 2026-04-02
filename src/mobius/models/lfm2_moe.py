@@ -17,8 +17,8 @@ Gate: ``_Lfm2MoeGate`` — TopK routing with optional per-expert bias
 (``use_expert_bias=True``) and scaling (``routed_scaling_factor``).
 
 HuggingFace weight renames (on top of base LFM2 renames):
-    feed_forward.router.weight                  → feed_forward.gate.weight
-    feed_forward.router.e_score_correction_bias → feed_forward.gate.e_score_correction_bias
+    feed_forward.gate.weight                    → (unchanged, already matches)
+    feed_forward.expert_bias                    → feed_forward.gate.e_score_correction_bias
     feed_forward.experts.N.w1.weight            → feed_forward.experts.N.gate_proj.weight
     feed_forward.experts.N.w3.weight            → feed_forward.experts.N.up_proj.weight
     feed_forward.experts.N.w2.weight            → feed_forward.experts.N.down_proj.weight
@@ -79,13 +79,27 @@ class _Lfm2MoeGate(nn.Module):
         # hidden_states: (batch, seq, hidden_size)
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)  # (batch, seq, num_experts)
-        if self.use_expert_bias:
-            # Add per-expert bias to routing logits before selection
-            router_logits = op.Add(router_logits, self.e_score_correction_bias)
+
+        # Sigmoid scoring: matches HF Lfm2MoeSparseMoeBlock.route_tokens_to_experts
+        scores = op.Sigmoid(router_logits)  # (batch, seq, num_experts)
+
         k = op.Constant(value_ints=[self.top_k])
-        routing_weights, selected_experts = op.TopK(router_logits, k, axis=-1, _outputs=2)
-        # Normalize selected weights: softmax → sum to 1
-        routing_weights = op.Softmax(routing_weights, axis=-1)
+        if self.use_expert_bias:
+            # Bias is added only for expert selection, not for routing weights.
+            # TopK selects from biased scores; weights are gathered from unbiased scores.
+            scores_for_selection = op.Add(scores, self.e_score_correction_bias)
+            _, selected_experts = op.TopK(scores_for_selection, k, axis=-1, _outputs=2)
+            routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
+        else:
+            routing_weights, selected_experts = op.TopK(scores, k, axis=-1, _outputs=2)
+
+        # L1 normalization so top-k weights sum to 1 (matches HF norm_topk_prob).
+        # Uses sum + eps (not Softmax) to avoid cross-entropy with non-softmax scores.
+        if self.norm_topk_prob:
+            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
+            eps = op.CastLike(op.Constant(value_float=1e-6), weight_sum)
+            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
+
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             scale = op.CastLike(
                 op.Constant(value_float=self.routed_scaling_factor), routing_weights
@@ -306,7 +320,7 @@ class Lfm2MoeCausalLMModel(nn.Module):
         """Map HuggingFace Lfm2MoeForCausalLM weights to ONNX parameters.
 
         Extends base LFM2 renames with MoE-specific mappings:
-        - feed_forward.router.* → feed_forward.gate.*
+        - feed_forward.expert_bias → feed_forward.gate.e_score_correction_bias
         - feed_forward.experts.N.w1 → .gate_proj
         - feed_forward.experts.N.w3 → .up_proj
         - feed_forward.experts.N.w2 → .down_proj
@@ -329,7 +343,7 @@ def _rename_lfm2_moe_weight(key: str) -> str:
     """Rename HF weight keys for LFM2-MoE, extending base LFM2 renames.
 
     Per-layer renames (on top of base LFM2):
-        feed_forward.router.*                → feed_forward.gate.*
+        feed_forward.expert_bias                     → feed_forward.gate.e_score_correction_bias
         feed_forward.experts.N.w1.*          → feed_forward.experts.N.gate_proj.*
         feed_forward.experts.N.w3.*          → feed_forward.experts.N.up_proj.*
         feed_forward.experts.N.w2.*          → feed_forward.experts.N.down_proj.*
@@ -353,8 +367,13 @@ def _rename_lfm2_moe_weight(key: str) -> str:
     rest = rest.replace("feed_forward.w3.", "feed_forward.up_proj.")
     rest = rest.replace("feed_forward.w2.", "feed_forward.down_proj.")
 
-    # MoE gate rename: router → gate
+    # MoE gate rename: router → gate (for checkpoints using old naming convention)
     rest = rest.replace("feed_forward.router.", "feed_forward.gate.")
+
+    # expert_bias is a register_buffer on SparseMoeBlock, map it into the gate sub-module
+    rest = rest.replace(
+        "feed_forward.expert_bias", "feed_forward.gate.e_score_correction_bias"
+    )
 
     # MoE expert MLP renames: w1→gate_proj, w3→up_proj, w2→down_proj
     rest = re.sub(

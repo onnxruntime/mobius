@@ -89,15 +89,6 @@ class _Lfm2VlVisionModel(nn.Module):
         flat_shape = op.Concat(minus_one, text_hidden_size, axis=0)
         return op.Reshape(projected, flat_shape)  # (num_image_tokens, text_hidden)
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return {
-            key: value
-            for key, value in state_dict.items()
-            if key.startswith(("vision_tower.", "projector."))
-        }
-
 
 class _Lfm2VlEmbedding(nn.Module):
     """LFM2-VL embedding model: token lookup + image feature scatter.
@@ -134,11 +125,6 @@ class _Lfm2VlEmbedding(nn.Module):
         gathered = op.Gather(image_features, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return {key: value for key, value in state_dict.items() if "embed_tokens" in key}
-
 
 class _Lfm2VlDecoder(nn.Module):
     """LFM2-VL text decoder: inputs_embeds → logits + hybrid KV cache.
@@ -172,21 +158,6 @@ class _Lfm2VlDecoder(nn.Module):
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            new_key = _rename_lfm2_weight(key)
-            renamed[new_key] = value
-        # Handle weight tying
-        if self.config.tie_word_embeddings:
-            embed_key = "model.embed_tokens.weight"
-            head_key = "lm_head.weight"
-            if head_key not in renamed and embed_key in renamed:
-                renamed[head_key] = renamed[embed_key]
-        return renamed
 
 
 class Lfm2VlModel(nn.Module):
