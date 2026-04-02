@@ -245,6 +245,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "sam2": "Vision model — no test_model_id yet",
     "smolvlm": "VL model — no test_model_id yet",
     "solar_open": "No test_model_id — no suitable public checkpoint",
+    "vibevoice_asr": "ASR model — tested via TestBuildVibeVoiceAsrGraph",
     "video_llava": "VL model — no test_model_id yet",
     "vipllava": "VL model — no test_model_id yet",
     "vit_hybrid": "Vision model — no test_model_id yet",

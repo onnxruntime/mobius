@@ -53,9 +53,11 @@ from mobius._config_resolver import _default_task_for_model
 from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
+    AudioTokenizerEncoderConfig,
     CodePredictorConfig,
     SpeakerEncoderConfig,
     TTSConfig,
+    VibeVoiceAsrConfig,
     VisionConfig,
 )
 from mobius._registry import registry
@@ -1787,6 +1789,181 @@ class TestBuildGraphQwen3ASR:
         assert logits.shape[1] == seq_len
 
 
+class TestBuildVibeVoiceAsrGraph:
+    """Verify VibeVoice ASR 3-model split with VibeVoiceAsrTask."""
+
+    def _vv_config(self) -> VibeVoiceAsrConfig:
+        """Tiny config: hidden_size=64, 2 layers, reduced audio encoders."""
+        return VibeVoiceAsrConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            vocab_size=256,
+            max_position_embeddings=128,
+            head_dim=32,
+            hidden_act="silu",
+            acoustic_encoder=AudioTokenizerEncoderConfig(
+                hidden_size=64,
+                num_filters=4,
+                depths=[1, 1, 1, 1, 1, 1, 1],
+                downsampling_ratios=[2, 2, 2, 2, 2, 2],
+            ),
+            semantic_encoder=AudioTokenizerEncoderConfig(
+                hidden_size=128,
+                num_filters=4,
+                depths=[1, 1, 1, 1, 1, 1, 1],
+                downsampling_ratios=[2, 2, 2, 2, 2, 2],
+            ),
+            audio_token_id=100,
+        )
+
+    def test_package_builds_3_models(self):
+        """Build VibeVoice ASR and verify 3-model package."""
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+        from mobius.tasks import VibeVoiceAsrTask
+
+        config = self._vv_config()
+        module = VibeVoiceAsrModel(config)
+        pkg = build_from_module(module, config, task=VibeVoiceAsrTask())
+
+        assert "audio_encoder" in pkg
+        assert "embedding" in pkg
+        assert "decoder" in pkg
+
+    def test_audio_tower_io(self):
+        """Verify audio tower inputs/outputs."""
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+        from mobius.tasks import VibeVoiceAsrTask
+
+        config = self._vv_config()
+        module = VibeVoiceAsrModel(config)
+        pkg = build_from_module(module, config, task=VibeVoiceAsrTask())
+        audio_tower = pkg["audio_encoder"]
+
+        input_names = {inp.name for inp in audio_tower.graph.inputs}
+        assert "input_values" in input_names
+
+        output_names = {out.name for out in audio_tower.graph.outputs}
+        assert "audio_features" in output_names
+
+    def test_embedding_io(self):
+        """Verify embedding model inputs/outputs."""
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+        from mobius.tasks import VibeVoiceAsrTask
+
+        config = self._vv_config()
+        module = VibeVoiceAsrModel(config)
+        pkg = build_from_module(module, config, task=VibeVoiceAsrTask())
+        embedding = pkg["embedding"]
+
+        input_names = {inp.name for inp in embedding.graph.inputs}
+        assert "input_ids" in input_names
+        assert "audio_features" in input_names
+
+        output_names = {out.name for out in embedding.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_decoder_io(self):
+        """Verify decoder has standard 2D position_ids and KV cache."""
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+        from mobius.tasks import VibeVoiceAsrTask
+
+        config = self._vv_config()
+        module = VibeVoiceAsrModel(config)
+        pkg = build_from_module(module, config, task=VibeVoiceAsrTask())
+        decoder = pkg["decoder"]
+
+        input_names = {inp.name for inp in decoder.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+
+        output_names = {out.name for out in decoder.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+
+    def test_registry_lookup(self):
+        """Verify vibevoice_asr is registered with vibevoice-asr task."""
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+
+        assert registry.get("vibevoice_asr") is VibeVoiceAsrModel
+        assert _default_task_for_model("vibevoice_asr") == "vibevoice-asr"
+
+    def test_3model_pipeline_runs_with_ort(self):
+        """Run audio_tower → embedding → decoder with ORT."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.vibevoice_asr import VibeVoiceAsrModel
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import VibeVoiceAsrTask
+
+        config = self._vv_config()
+        module = VibeVoiceAsrModel(config)
+        pkg = build_from_module(module, config, task=VibeVoiceAsrTask())
+
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        # Step 1: Audio tower — raw waveform (batch=1, channels=1, samples=1024)
+        audio_sess = OnnxModelSession(pkg["audio_encoder"])
+        waveform = np.random.randn(1, 1, 1024).astype(np.float32)
+        audio_out = audio_sess.run({"input_values": waveform})
+        audio_features = audio_out["audio_features"]  # (num_tokens, hidden_size)
+        num_audio_tokens = audio_features.shape[0]
+        audio_sess.close()
+
+        # Step 2: Embedding — text + audio tokens
+        audio_token_id = config.audio_token_id
+        prefix = [1, 2, 3]
+        suffix = [4, 5]
+        input_ids = np.array(
+            [prefix + [audio_token_id] * num_audio_tokens + suffix],
+            dtype=np.int64,
+        )
+
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_out = embed_sess.run({"input_ids": input_ids, "audio_features": audio_features})
+        inputs_embeds = embed_out["inputs_embeds"]
+        embed_sess.close()
+
+        seq_len = inputs_embeds.shape[1]
+        assert seq_len == input_ids.shape[1]
+        assert inputs_embeds.shape[2] == config.hidden_size
+
+        # Step 3: Decoder — 2D position_ids (not MRoPE)
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        past_kv = {}
+        for i in range(config.num_hidden_layers):
+            past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+            past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+
+        position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": position_ids,
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        logits = dec_out["logits"]
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == seq_len
+
+
 class TestBuildGraphQwen3TTS:
     """Verify Qwen3-TTS 4-model split with TTSTask."""
 
@@ -3338,6 +3515,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "qwen3_forced_aligner",
     "qwen3_tts",
     "qwen3_tts_tokenizer_12hz",
+    "vibevoice_asr",
     "whisper",
     # SSM dedicated tests
     "falcon_mamba",

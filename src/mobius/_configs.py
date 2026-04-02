@@ -1923,3 +1923,84 @@ class WhisperConfig(BaseModelConfig):
             options["dtype"] = resolved
 
         return cls(**options)
+
+
+@dataclasses.dataclass
+class AudioTokenizerEncoderConfig:
+    """Configuration for a single VibeVoice causal 1D CNN audio encoder.
+
+    Used for both the acoustic and semantic tokenizer encoders in VibeVoice ASR.
+    Each encoder takes raw waveform ``(batch, 1, num_samples)`` and produces
+    latents ``(batch, num_frames, hidden_size)`` via:
+    - Stem: CausalConv1d + ConvNeXt blocks
+    - 6 encoder layers, each with a strided CausalConv1d + ConvNeXt blocks
+    - Head: CausalConv1d → hidden_size output channels
+    """
+
+    channels: int = 1
+    num_filters: int = 32
+    hidden_size: int = 64
+    depths: list = dataclasses.field(default_factory=lambda: [3, 3, 3, 3, 3, 3, 8])
+    downsampling_ratios: list = dataclasses.field(default_factory=lambda: [2, 2, 4, 5, 5, 8])
+    kernel_size: int = 7
+    ffn_expansion: int = 4
+    rms_norm_eps: float = 1e-5
+    layer_scale_init_value: float = 1e-6
+
+    @classmethod
+    def from_hf(cls, hf_enc_config) -> AudioTokenizerEncoderConfig:
+        """Build from a HuggingFace acoustic/semantic tokenizer encoder config."""
+        return cls(
+            channels=getattr(hf_enc_config, "channels", 1),
+            num_filters=getattr(hf_enc_config, "num_filters", 32),
+            hidden_size=getattr(hf_enc_config, "hidden_size", 64),
+            depths=list(getattr(hf_enc_config, "depths", [3, 3, 3, 3, 3, 3, 8])),
+            downsampling_ratios=list(
+                getattr(hf_enc_config, "downsampling_ratios", [2, 2, 4, 5, 5, 8])
+            ),
+            kernel_size=getattr(hf_enc_config, "kernel_size", 7),
+            ffn_expansion=getattr(hf_enc_config, "ffn_expansion", 4),
+            rms_norm_eps=getattr(hf_enc_config, "rms_norm_eps", 1e-5),
+            layer_scale_init_value=getattr(hf_enc_config, "layer_scale_init_value", 1e-6),
+        )
+
+
+@dataclasses.dataclass
+class VibeVoiceAsrConfig(ArchitectureConfig):
+    """Configuration for VibeVoice ASR (microsoft/VibeVoice-ASR-HF).
+
+    Combines two causal 1D CNN audio encoders (acoustic + semantic) with a
+    Qwen2 language model backbone and an MLP projector:
+
+    - ``acoustic_encoder``: causal CNN tokenizer, outputs dim 64
+    - ``semantic_encoder``: causal CNN tokenizer, outputs dim 128
+    - ``multi_modal_projector``: 2-path MLP, outputs sum → hidden_size
+    - text decoder: standard Qwen2 (28 layers, hidden_size=3584)
+
+    HuggingFace class: ``VibeVoiceAsrForConditionalGeneration``
+    """
+
+    acoustic_encoder: AudioTokenizerEncoderConfig = dataclasses.field(
+        default_factory=AudioTokenizerEncoderConfig
+    )
+    semantic_encoder: AudioTokenizerEncoderConfig = dataclasses.field(
+        default_factory=lambda: AudioTokenizerEncoderConfig(hidden_size=128)
+    )
+    audio_token_id: int = 151648
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> VibeVoiceAsrConfig:
+        """Extract VibeVoiceAsrConfig from a HuggingFace VibeVoiceAsrConfig."""
+        text_cfg = config.text_config
+        base = ArchitectureConfig.from_transformers(text_cfg, parent_config=None)
+        base_fields = _shallow_fields(base)
+        return cls(
+            **base_fields,
+            acoustic_encoder=AudioTokenizerEncoderConfig.from_hf(
+                config.acoustic_tokenizer_encoder_config
+            ),
+            semantic_encoder=AudioTokenizerEncoderConfig.from_hf(
+                config.semantic_tokenizer_encoder_config
+            ),
+            audio_token_id=getattr(config, "audio_token_id", 151648),
+        )

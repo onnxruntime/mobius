@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    VibeVoiceAsrConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -114,6 +115,7 @@ from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.vibevoice_asr import VibeVoiceAsrModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
@@ -538,6 +540,13 @@ def _create_default_registry() -> ModelRegistry:
         "qwen3_forced_aligner", Qwen3ASRForConditionalGeneration, task="speech-language"
     )
 
+    reg.register(
+        "vibevoice_asr",
+        VibeVoiceAsrModel,
+        task="vibevoice-asr",
+        config_class=VibeVoiceAsrConfig,
+    )
+
     reg.register("qwen3_tts", Qwen3TTSForConditionalGeneration)
 
     reg.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Model, task="codec")
@@ -847,6 +856,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
+    "vibevoice_asr": "microsoft/VibeVoice-ASR-HF",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",

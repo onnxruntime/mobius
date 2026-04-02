@@ -114,6 +114,7 @@ __all__ = [
     "T5ForConditionalGeneration",
     "UNet2DConditionModel",
     "ViTModel",
+    "VibeVoiceAsrModel",
     "VideoAutoencoderModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
@@ -234,6 +235,7 @@ from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.unet import UNet2DConditionModel
 from mobius.models.vae import AutoencoderKLModel
+from mobius.models.vibevoice_asr import VibeVoiceAsrModel
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
