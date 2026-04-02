@@ -36,6 +36,7 @@ class _CLIPVisionEmbeddings(nn.Module):
             hidden_size,
             kernel_size=patch_size,
             stride=patch_size,
+            bias=getattr(config, "patch_embed_bias", True),
         )
         num_patches = (image_size // patch_size) ** 2
         self.position_embedding = Embedding(num_patches + 1, hidden_size)
@@ -67,9 +68,17 @@ class _Conv2dPatchEmbed(nn.Module):
         out_channels: int,
         kernel_size: int,
         stride: int,
+        bias: bool = True,
     ):
         super().__init__()
-        self.projection = Conv2d(in_channels, out_channels, kernel_size, stride)
+        if bias:
+            self.projection = Conv2d(in_channels, out_channels, kernel_size, stride)
+        else:
+            from mobius.components._conv import Conv2dNoBias
+
+            self.projection = Conv2dNoBias(
+                in_channels, out_channels, kernel_size, stride
+            )
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
         # Conv2d: [batch, channels, H, W] -> [batch, out_channels, H', W']

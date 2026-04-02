@@ -12,8 +12,8 @@ HuggingFace reference: ``Owlv2ForObjectDetection``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -27,9 +27,6 @@ from mobius.models.clip import (
     _CLIPVisionEmbeddings,
     _CLIPVisionEncoderLayer,
 )
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +196,36 @@ class _Owlv2ObjectnessHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Box bias computation (deterministic — matches HF non-persistent buffer)
+# ---------------------------------------------------------------------------
+
+
+def _compute_box_bias(num_patches_h: int, num_patches_w: int) -> np.ndarray:
+    """Compute grid-based box bias (inverse-sigmoid of normalised coords).
+
+    Replicates ``Owlv2ForObjectDetection.compute_box_bias`` from HF.
+    """
+    # Normalised grid centres: (h*w, 2) in [0, 1]
+    x = np.arange(1, num_patches_w + 1, dtype=np.float32) / num_patches_w
+    y = np.arange(1, num_patches_h + 1, dtype=np.float32) / num_patches_h
+    xx, yy = np.meshgrid(x, y, indexing="xy")
+    box_coords = np.stack((xx, yy), axis=-1).reshape(-1, 2)
+    box_coords = np.clip(box_coords, 0.0, 1.0)
+
+    # Inverse sigmoid (logit): log(p + eps) - log(1 - p + eps)
+    eps = 1e-4
+    coord_bias = np.log(box_coords + eps) - np.log(1.0 - box_coords + eps)
+
+    # Size bias: each patch covers 1/W × 1/H of the image
+    size = np.ones_like(box_coords)
+    size[..., 0] /= num_patches_w
+    size[..., 1] /= num_patches_h
+    size_bias = np.log(size + eps) - np.log(1.0 - size + eps)
+
+    return np.concatenate([coord_bias, size_bias], axis=-1).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
@@ -262,9 +289,14 @@ class Owlv2ForObjectDetection(nn.Module):
         self.box_head = _Owlv2BoxHead(hidden_size)
         self.objectness_head = _Owlv2ObjectnessHead(hidden_size)
 
-        # Box bias: pre-computed (num_patches, 4) registered as parameter
-        num_patches = (config.image_size // config.patch_size) ** 2
-        self.box_bias = nn.Parameter((num_patches, 4))
+        # Box bias: deterministic grid-based init (non-persistent buffer in HF)
+        num_patches_h = config.image_size // config.patch_size
+        num_patches_w = config.image_size // config.patch_size
+        box_bias_data = _compute_box_bias(num_patches_h, num_patches_w)
+        self.box_bias = nn.Parameter(
+            list(box_bias_data.shape),
+            data=ir.tensor(box_bias_data),
+        )
 
     def forward(
         self,
@@ -379,7 +411,7 @@ def _rename_encoder_layer(remainder: str, layer_idx: str) -> str | None:
 
 def _rename_owlv2_weight(name: str) -> str | None:
     """Map a HuggingFace OWLv2 weight name to our module naming."""
-    # ---- Skip unused weights ----
+    # ---- Skip unused / computed weights ----
     if name in ("owlv2.logit_scale",):
         return None
     if name.startswith("owlv2.visual_projection."):
@@ -399,7 +431,7 @@ def _rename_owlv2_weight(name: str) -> str | None:
         inner = name[len("owlv2.text_model.") :]
         return _rename_text(inner)
 
-    # ---- Detection heads + layer_norm + box_bias (no prefix) ----
+    # ---- Detection heads + layer_norm (no prefix) ----
     if name.startswith(
         (
             "class_head.",
@@ -409,8 +441,6 @@ def _rename_owlv2_weight(name: str) -> str | None:
         )
     ):
         return name
-    if name == "box_bias":
-        return "box_bias"
 
     return None
 
@@ -419,7 +449,12 @@ def _rename_vision(name: str) -> str | None:
     """Rename vision encoder weights under ``vision_encoder.``."""
     # Embeddings
     if name.startswith("embeddings."):
-        return f"vision_encoder.{name}"
+        # patch_embedding is a _Conv2dPatchEmbed wrapper with .projection
+        inner = name.replace(
+            "embeddings.patch_embedding.",
+            "embeddings.patch_embedding.projection.",
+        )
+        return f"vision_encoder.{inner}"
 
     # Pre/post layer norm (note: CLIP typo ``pre_layrnorm``)
     if name.startswith("pre_layernorm."):

@@ -2178,6 +2178,7 @@ class Owlv2Config(ArchitectureConfig):
     the CLIP vision encoder.  Text-specific fields are prefixed ``text_``.
     """
 
+    patch_embed_bias: bool = False
     text_hidden_size: int = 512
     text_intermediate_size: int = 2048
     text_num_hidden_layers: int = 12
@@ -2190,8 +2191,9 @@ class Owlv2Config(ArchitectureConfig):
         base = ArchitectureConfig.from_transformers(config, parent_config)
         vc = getattr(config, "vision_config", config)
         tc = getattr(config, "text_config", config)
-        return cls(
-            **_shallow_fields(base),
+        fields = _shallow_fields(base)
+        # Override base fields with vision-specific values
+        fields.update(
             hidden_size=getattr(vc, "hidden_size", base.hidden_size),
             intermediate_size=getattr(vc, "intermediate_size", base.intermediate_size),
             num_hidden_layers=getattr(vc, "num_hidden_layers", base.num_hidden_layers),
@@ -2205,6 +2207,9 @@ class Owlv2Config(ArchitectureConfig):
             hidden_act=getattr(vc, "hidden_act", "quick_gelu"),
             rms_norm_eps=getattr(vc, "layer_norm_eps", 1e-5),
             projection_dim=getattr(config, "projection_dim", 512),
+        )
+        return cls(
+            **fields,
             text_hidden_size=getattr(tc, "hidden_size", 512),
             text_intermediate_size=getattr(tc, "intermediate_size", 2048),
             text_num_hidden_layers=getattr(tc, "num_hidden_layers", 12),
