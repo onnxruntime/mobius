@@ -28,9 +28,6 @@ class TestSkipLayerNormRules:
         """GPT-2 uses LayerNorm → expect Add+LN fusions."""
         pkg = build("openai-community/gpt2", load_weights=False)
         model = pkg["model"]
-        counts_before = count_ops(model)
-        assert counts_before["LayerNormalization"] == 25
-        assert counts_before["Add"] == 97
 
         rewrite(model, pattern_rewrite_rules=skip_layer_norm_rules())
 

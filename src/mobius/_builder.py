@@ -22,6 +22,7 @@ __all__ = [
 
 import contextlib
 import logging
+import warnings
 
 import onnx_ir as ir
 import onnx_shape_inference
@@ -119,16 +120,6 @@ _DEFAULT_PASSES = [
 ]
 
 
-def _optimize(model: ir.Model) -> None:
-    """Apply default optimization passes to a model in-place."""
-    pass_ = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
-    if flags.suppress_dedup_warning:
-        with _suppress_dedup_empty_initializer_warnings():
-            pass_(model)
-    else:
-        pass_(model)
-
-
 # Mapping of short dtype names to ONNX IR dtypes
 DTYPE_MAP: dict[str, ir.DataType] = {
     "f32": ir.DataType.FLOAT,
@@ -138,6 +129,197 @@ DTYPE_MAP: dict[str, ir.DataType] = {
     "bf16": ir.DataType.BFLOAT16,
     "bfloat16": ir.DataType.BFLOAT16,
 }
+
+
+# ---------------------------------------------------------------------------
+# EP capability matrices
+# ---------------------------------------------------------------------------
+
+# EP+dtype combinations where GroupQueryAttention fusion is supported.
+_GQA_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset([
+    ("cpu", ir.DataType.FLOAT),
+    ("cuda", ir.DataType.FLOAT16),
+    ("cuda", ir.DataType.BFLOAT16),
+    ("dml", ir.DataType.FLOAT16),
+    ("webgpu", ir.DataType.FLOAT),
+    ("webgpu", ir.DataType.FLOAT16),
+    ("trt-rtx", ir.DataType.FLOAT16),
+    ("trt-rtx", ir.DataType.BFLOAT16),
+])
+
+# EP+dtype combinations where PackedAttention fusion is supported.
+_PACKED_ATTN_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset([
+    ("cpu", ir.DataType.FLOAT),
+    ("cuda", ir.DataType.FLOAT),
+    ("cuda", ir.DataType.FLOAT16),
+    ("cuda", ir.DataType.BFLOAT16),
+    ("dml", ir.DataType.FLOAT),
+    ("dml", ir.DataType.FLOAT16),
+    ("webgpu", ir.DataType.FLOAT),
+    ("webgpu", ir.DataType.FLOAT16),
+    ("trt-rtx", ir.DataType.FLOAT),
+    ("trt-rtx", ir.DataType.FLOAT16),
+    ("trt-rtx", ir.DataType.BFLOAT16),
+])
+
+# Map ModelPackage entry names to semantic model roles.
+# GQA fusion is only applied to "decoder" role models.
+_MODEL_ROLE_MAP: dict[str, str] = {
+    "model": "decoder",
+    "decoder": "decoder",
+    "vision": "vision",
+    "embedding": "embedding",
+    "encoder": "encoder",
+}
+
+
+def _count_ops(model: ir.Model, op_type: str) -> int:
+    """Count nodes of a given op_type in all model graph nodes."""
+    return sum(1 for node in model.graph.all_nodes() if node.op_type == op_type)
+
+
+def _get_optimization_passes(
+    ep: str,
+    dtype: ir.DataType,
+    model_role: str = "decoder",
+) -> tuple[list, list]:
+    """Return ``(fuse_rules, lower_rules)`` for the given EP, dtype, and role.
+
+    Only fusions the target EP supports are returned. Lowering passes
+    decompose ops the EP does not support. Phase 2 stubs are left as
+    comments for the next implementation phase.
+
+    Args:
+        ep: Target execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``).
+        dtype: Model dtype for support-matrix lookups.
+        model_role: Semantic role of this model component (``"decoder"``,
+            ``"vision"``, ``"embedding"``, ``"encoder"``). GQA fusion is
+            only applied to the decoder role.
+
+    Returns:
+        ``(fuse_rules, lower_rules)`` — each a flat list of rewrite-rule
+        instances suitable for passing to ``onnxscript.rewriter.rewrite()``.
+    """
+    from mobius.rewrite_rules import (
+        gelu_fusion_rules,
+        group_query_attention_rules,
+        skip_layer_norm_rules,
+        skip_norm_rules,
+    )
+
+    fuse: list = []
+    lower: list = []  # Phase 2: populated with lowering rules
+
+    # --- Attention fusion (decoder only) ---
+    if model_role == "decoder" and (ep, dtype) in _GQA_SUPPORT:
+        fuse.extend(group_query_attention_rules())
+
+    # --- Normalization fusions (all roles, all dtypes) ---
+    # TRT-RTX decomposes SkipNorm/SkipLayerNorm rather than fusing them.
+    if ep != "trt-rtx":
+        fuse.extend(skip_norm_rules())
+        fuse.extend(skip_layer_norm_rules())
+
+    # --- Activation fusions (all roles, all dtypes) ---
+    fuse.extend(gelu_fusion_rules())
+
+    # Phase 2 lowering stubs — uncomment when rule implementations land:
+    # if ep == "dml":
+    #     lower.append(separate_rope_rules())   # BP-6: decompose fused RoPE
+    #     lower.append(unpack_qkv_rules())      # BP-7: split packed QKV
+    #     lower.append(decompose_if_rules())    # BP-10: If → Where
+    # elif ep == "webgpu":
+    #     lower.append(decompose_if_rules())    # BP-10: If → Where
+    #     lower.append(eliminate_shape_rules()) # BP-13: Shape → constant
+    #     lower.append(cast_int64_to_int32_rules())  # BP-12: int64 → int32
+    # elif ep == "trt-rtx":
+    #     lower.append(decompose_skip_layer_norm_rules())  # BP-21
+    #     lower.append(split_if_rules())                   # BP-14
+
+    return fuse, lower
+
+
+def _optimize(
+    model: ir.Model,
+    ep: str = "cpu",
+    dtype: ir.DataType = ir.DataType.FLOAT,
+    model_role: str = "decoder",
+) -> None:
+    """Apply EP-aware optimization passes to a model in-place.
+
+    Runs a four-stage pipeline:
+
+    1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
+       folding, shape inference (EP-agnostic; always applied).
+    2. **Fusion** — promote standard ops to EP-supported fused ops
+       (e.g. GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` support
+       matrix and ``model_role``.
+    3. **Lowering** — decompose ops the EP does not support
+       (Phase 2 stubs; currently empty for all EPs).
+    4. **Fold** — final dead-node removal and constant folding after
+       rewrites.
+
+    After the fusion stage, if GQA was expected for this ``(ep, dtype)``
+    combination but zero ``GroupQueryAttention`` nodes were produced while
+    ``Attention`` nodes remain, a warning is emitted. This helps catch
+    silent rule-match failures.
+
+    Args:
+        model: The ONNX IR model to optimize in-place.
+        ep: Target execution provider.
+        dtype: Model dtype for support-matrix lookups.
+        model_role: Semantic role of this model component.
+    """
+    # Stage 1: Base cleanup (EP-agnostic — always applied).
+    pass_ = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
+    if flags.suppress_dedup_warning:
+        with _suppress_dedup_empty_initializer_warnings():
+            pass_(model)
+    else:
+        pass_(model)
+
+    # Stage 2: Fusion — gated by EP support matrix and model_role.
+    # Stage 3: Lowering — Phase 2 stubs; currently empty for all EPs.
+    fuse_rules, lower_rules = _get_optimization_passes(ep, dtype, model_role)
+
+    if fuse_rules:
+        from onnxscript.rewriter import rewrite
+
+        rewrite(model, pattern_rewrite_rules=fuse_rules)
+
+    if lower_rules:
+        from onnxscript.rewriter import rewrite
+
+        rewrite(model, pattern_rewrite_rules=lower_rules)
+
+    # Stage 4: Final dead-node removal and constant folding after rewrites.
+    fold_pass = ir.passes.PassManager(
+        [
+            common_passes.RemoveUnusedNodesPass(),
+            onnxscript.optimizer._constant_folding.FoldConstantsPass(
+                shape_inference=False,
+                input_size_limit=8192,
+                output_size_limit=512 * 512,
+            ),
+        ]
+    )
+    fold_pass(model)
+
+    # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
+    # Only fires when Attention nodes are present — models with no attention
+    # (Mamba, RWKV, etc.) are silently skipped.
+    if model_role == "decoder" and (ep, dtype) in _GQA_SUPPORT:
+        gqa_count = _count_ops(model, "GroupQueryAttention")
+        attn_count = _count_ops(model, "Attention")
+        if gqa_count == 0 and attn_count > 0:
+            warnings.warn(
+                f"GQA fusion expected for ep={ep!r}/dtype={dtype} but found "
+                f"0 GroupQueryAttention and {attn_count} Attention nodes. "
+                f"The model may run slower than expected on this EP. "
+                f"Check that the attention pattern matches the GQA rewrite rule.",
+                stacklevel=4,
+            )
 
 
 def resolve_dtype(dtype: str | ir.DataType | None) -> ir.DataType | None:
@@ -186,6 +368,8 @@ def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
     task: str | ModelTask = "text-generation",
+    *,
+    execution_provider: str = "cpu",
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -202,6 +386,11 @@ def build_from_module(
             to catch invalid fields early.
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
+        execution_provider: Target execution provider for EP-aware
+            optimizations. Accepted values: ``"cpu"`` (default),
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``. Controls
+            which fusion and lowering passes are applied during graph
+            optimization.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -230,11 +419,27 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
-    _cast_module_dtype(module, getattr(config, "dtype", ir.DataType.FLOAT))
+    dtype = getattr(config, "dtype", ir.DataType.FLOAT)
+    _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
-    pkg = resolved_task.build(module, config)
-    for model in pkg.values():
-        _optimize(model)
+
+    # Translate EP string → structural flags for the task layer.
+    # Tasks receive a boolean flag, never an EP string directly.
+    use_concrete_dims = execution_provider == "webgpu"
+
+    # Pass use_concrete_dims only to tasks that accept it (CausalLMTask and
+    # future tasks). Other tasks are called without the kwarg.
+    import inspect
+
+    _build_sig = inspect.signature(resolved_task.build)
+    if "use_concrete_dims" in _build_sig.parameters:
+        pkg = resolved_task.build(module, config, use_concrete_dims=use_concrete_dims)
+    else:
+        pkg = resolved_task.build(module, config)
+
+    for name, model in pkg.items():
+        role = _MODEL_ROLE_MAP.get(name, "decoder")
+        _optimize(model, ep=execution_provider, dtype=dtype, model_role=role)
     return pkg
 
 
@@ -246,6 +451,7 @@ def build(
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     trust_remote_code: bool = False,
+    execution_provider: str = "cpu",
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -278,6 +484,11 @@ def build(
         load_weights: Whether to download and apply weights from HuggingFace.
         trust_remote_code: Whether to trust remote code when loading the
             HuggingFace config.
+        execution_provider: Target execution provider for EP-aware
+            optimizations. Accepted values: ``"cpu"`` (default),
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``. Controls
+            which fusion and lowering passes are applied during graph
+            optimization.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -379,7 +590,7 @@ def build(
         task = _default_task_for_model(model_type)
 
     model_module = module_class(config)
-    pkg = build_from_module(model_module, config, task)
+    pkg = build_from_module(model_module, config, task, execution_provider=execution_provider)
 
     # Set graph names
     for name, model in pkg.items():

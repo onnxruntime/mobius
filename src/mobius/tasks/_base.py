@@ -161,6 +161,39 @@ class ModelTask(ABC):
     sequence classification). Each task defines its own graph I/O contract.
     """
 
+    def _create_dims(
+        self,
+        use_concrete_dims: bool = False,
+        *,
+        batch_size: int = 1,
+        max_seq_len: int = 512,
+    ) -> tuple[ir.SymbolicDim | int, ir.SymbolicDim | int]:
+        """Return ``(batch, seq_len)`` dimensions for graph input shapes.
+
+        When ``use_concrete_dims=False`` (default), returns named
+        :class:`~onnx_ir.SymbolicDim` instances for dynamic-shape graphs
+        (all EPs except WebGPU).
+
+        When ``use_concrete_dims=True``, returns concrete integers so that
+        the graph contains no ``Shape`` operators, satisfying the WebGPU
+        constraint that shape inference must produce concrete values at all
+        nodes.
+
+        Args:
+            use_concrete_dims: Return concrete integers instead of symbolic
+                dims. Set by the builder when ``execution_provider='webgpu'``.
+            batch_size: Concrete batch size to use when ``use_concrete_dims``
+                is ``True``.
+            max_seq_len: Concrete sequence length to use when
+                ``use_concrete_dims`` is ``True``.
+
+        Returns:
+            ``(batch, seq_len)`` — either ``SymbolicDim`` instances or ``int``.
+        """
+        if use_concrete_dims:
+            return batch_size, max_seq_len
+        return ir.SymbolicDim("batch"), ir.SymbolicDim("sequence_len")
+
     @abstractmethod
     def build(
         self,
