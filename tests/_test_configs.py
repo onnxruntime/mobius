@@ -37,6 +37,7 @@ from mobius._configs import (
     NanoChatConfig,
     NemotronHConfig,
     Sam2Config,
+    SeamlessM4Tv2Config,
     SegformerConfig,
     VisionConfig,
     WhisperConfig,
@@ -1455,6 +1456,19 @@ SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
         "umt5",
         {"hidden_act": "gelu_new", "num_decoder_layers": 2, "is_gated_act": True},
         False,
+    ),
+    (
+        "seamless_m4t_v2",
+        {
+            "_config_cls": SeamlessM4Tv2Config,
+            "num_hidden_layers": 2,
+            "num_decoder_layers": 2,
+            "encoder_ffn_dim": TINY_INTERMEDIATE,
+            "decoder_ffn_dim": TINY_INTERMEDIATE,
+            "max_position_embeddings": 64,
+            "hidden_act": "relu",
+        },
+        True,
     ),
 ]
 

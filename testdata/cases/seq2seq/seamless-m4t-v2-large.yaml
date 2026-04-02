@@ -1,0 +1,22 @@
+model_id: "facebook/seamless-m4t-v2-large"
+revision: "main"
+task_type: "seq2seq"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Hello, how are you?"
+  decoder_prompt: ""
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+skip_reason: "SeamlessM4T v2 2.3B — too large for CI golden data generation."
+notes: >
+  SeamlessM4T v2 large. Multilingual text+speech translation model.
+  Text-to-text task uses a scaled BART-like encoder-decoder with sinusoidal
+  positional embeddings, ReLU FFN activations, and separate encoder/decoder
+  FFN dimensions (encoder_ffn_dim=8192, decoder_ffn_dim=8192).

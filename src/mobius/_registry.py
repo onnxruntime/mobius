@@ -110,6 +110,7 @@ from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
+from mobius.models.seamless_m4t_v2 import SeamlessM4Tv2Model
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
@@ -690,7 +691,6 @@ def _create_default_registry() -> ModelRegistry:
         "mctct",
         "musicgen",
         "seamless_m4t",
-        "seamless_m4t_v2",
         "sew",
         "sew-d",
         "speecht5",
@@ -703,6 +703,7 @@ def _create_default_registry() -> ModelRegistry:
         "wavlm",
     ):
         reg.register(name, Wav2Vec2Model, task="audio-feature-extraction")
+    reg.register("seamless_m4t_v2", SeamlessM4Tv2Model, task="seq2seq")
 
     # -----------------------------------------------------------------
     # Test metadata — applied after all registrations

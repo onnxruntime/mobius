@@ -2011,6 +2011,52 @@ class JetMoeConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class SeamlessM4Tv2Config(ArchitectureConfig):
+    """Configuration for SeamlessM4T v2 text encoder-decoder.
+
+    Extends :class:`ArchitectureConfig` with separate FFN dimensions for the
+    encoder and decoder, plus the embedding-scaling flag.  The base class
+    stores ``num_hidden_layers`` (encoder depth), ``num_decoder_layers``
+    (decoder depth), and ``num_attention_heads`` (shared across encoder and
+    decoder for the large model).
+    """
+
+    encoder_ffn_dim: int = 8192
+    decoder_ffn_dim: int = 8192
+    scale_embedding: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> SeamlessM4Tv2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        encoder_attention_heads = getattr(config, "encoder_attention_heads", 16)
+        encoder_ffn_dim = getattr(config, "encoder_ffn_dim", 8192)
+        decoder_ffn_dim = getattr(config, "decoder_ffn_dim", 8192)
+        encoder_layers = getattr(config, "encoder_layers", 24)
+        decoder_layers = getattr(config, "decoder_layers", 24)
+        hidden_size = getattr(config, "hidden_size", 1024)
+
+        # Override fields that ArchitectureConfig.from_transformers may not
+        # extract correctly (HF uses encoder_layers/decoder_layers, not
+        # num_hidden_layers, and encoder_attention_heads, not num_attention_heads).
+        fields = _shallow_fields(base)
+        fields.update(
+            {
+                "num_hidden_layers": encoder_layers,
+                "num_decoder_layers": decoder_layers,
+                "num_attention_heads": encoder_attention_heads,
+                "num_key_value_heads": encoder_attention_heads,
+                "head_dim": hidden_size // encoder_attention_heads,
+                "intermediate_size": encoder_ffn_dim,
+                "hidden_act": "relu",
+                "encoder_ffn_dim": encoder_ffn_dim,
+                "decoder_ffn_dim": decoder_ffn_dim,
+                "scale_embedding": getattr(config, "scale_embedding", True),
+            }
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class WhisperConfig(BaseModelConfig):
     """Configuration for Whisper encoder-decoder models."""
 

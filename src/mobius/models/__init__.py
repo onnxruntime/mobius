@@ -113,6 +113,7 @@ __all__ = [
     "SD3Transformer2DModel",
     "SmolLM3CausalLMModel",
     "StarCoder2CausalLMModel",
+    "SeamlessM4Tv2Model",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
     "UNet2DConditionModel",
@@ -235,6 +236,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
+from mobius.models.seamless_m4t_v2 import SeamlessM4Tv2Model
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration

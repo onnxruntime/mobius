@@ -185,7 +185,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",
-    "seamless_m4t_v2": "Audio model — requires audio inputs",
+    "seamless_m4t_v2": "Too large (2.3B) for CI golden data generation",
     "sew": "Audio model — requires audio inputs",
     "sew-d": "Audio model — requires audio inputs",
     "speecht5": "Audio model — requires audio inputs",
