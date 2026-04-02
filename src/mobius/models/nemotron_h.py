@@ -236,13 +236,21 @@ class _NemotronHTextModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        if inputs_embeds is not None:
+            # VL path: fused image+text embeddings provided externally; skip embed_tokens
+            hidden_states = inputs_embeds
+            seq_shape_source = inputs_embeds  # [B, S, H] — dim 1 is sequence length
+        else:
+            hidden_states = self.embed_tokens(op, input_ids)
+            seq_shape_source = input_ids  # [B, S] — dim 1 is sequence length
+
         position_embeddings = self.rotary_emb(op, position_ids)
 
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=seq_shape_source,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )

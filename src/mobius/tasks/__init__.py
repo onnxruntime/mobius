@@ -21,6 +21,7 @@ from __future__ import annotations
 __all__ = [
     "AdapterTask",
     "AudioFeatureExtractionTask",
+    "AudioLanguageTask",
     "CausalLMTask",
     "CodecTask",
     "ControlNetTask",
@@ -28,6 +29,7 @@ __all__ = [
     "FeatureExtractionTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
+    "HybridVisionLanguageTask",
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
@@ -54,6 +56,7 @@ __all__ = [
 from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
+from mobius.tasks._audio_language import AudioLanguageTask
 from mobius.tasks._base import ModelTask
 from mobius.tasks._causal_lm import (
     CausalLMTask,
@@ -78,6 +81,7 @@ from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,
+    HybridVisionLanguageTask,
     MllamaVisionLanguageTask,
     QwenVLTask,
     VisionLanguageTask,
@@ -90,6 +94,7 @@ from mobius.tasks._vision_language_3model import (
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "adapter": AdapterTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
+    "audio-language": AudioLanguageTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
@@ -105,6 +110,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
+    "hybrid-vision-language": HybridVisionLanguageTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,

@@ -471,6 +471,11 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("nemotron_h", NemotronHCausalLMModel)
 
+    # --- Hybrid GLA+Mamba2+Attention+FFN (NemotronFlash) ---
+    from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+
+    reg.register("nemotron_flash", NemotronFlashCausalLMModel)
+
     # --- Multimodal ---
     for name in (
         "chameleon",
@@ -524,6 +529,36 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("qwen3_5", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
     reg.register("qwen3_5_vl", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
     reg.register("qwen3_5_vl_text", Qwen35VLTextModel)
+
+    # --- NVIDIA VL ---
+    from mobius._configs import LlamaNemotronNanoVLConfig
+    from mobius.models.llama_nemotron_nano_vl import LlamaNemotronNanoVLModel
+
+    reg.register(
+        "Llama_Nemotron_Nano_VL",
+        LlamaNemotronNanoVLModel,
+        task="vision-language",
+        config_class=LlamaNemotronNanoVLConfig,
+    )
+
+    from mobius._configs import NemotronHNanoVLConfig
+    from mobius.models.nemotronh_nano_vl import NemotronHNanoVLModel
+
+    reg.register(
+        "NemotronH_Nano_VL_V2",
+        NemotronHNanoVLModel,
+        task="hybrid-vision-language",
+        config_class=NemotronHNanoVLConfig,
+    )
+
+    # --- NVIDIA Audio ---
+    from mobius.models.audioflamingo3 import (
+        AudioFlamingo3ForConditionalGeneration,
+    )
+
+    reg.register(
+        "audioflamingo3", AudioFlamingo3ForConditionalGeneration, task="audio-language"
+    )
 
     # --- Speech ---
     reg.register(
@@ -820,6 +855,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "nemotron_h": "nvidia/Nemotron-H-47B-Base-8K",
+    "nemotron_flash": "nvidia/nemotron-flash-1b",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -843,6 +880,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "instructblip": "Salesforce/instructblip-flan-t5-xl",
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
+    "Llama_Nemotron_Nano_VL": "nvidia/Llama-Nemotron-Nano-VL-8B-v1",
+    "NemotronH_Nano_VL_V2": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
@@ -858,6 +897,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "musicgen": "facebook/musicgen-small",
     "seamless_m4t": "facebook/hf-seamless-m4t-medium",
     "seamless_m4t_v2": "facebook/seamless-m4t-v2-large",
+    "audioflamingo3": "nvidia/audio-flamingo-3-hf",
 
     # --- Encoder-only ---
     "bert": "google-bert/bert-base-uncased",
@@ -1064,6 +1104,12 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "clip_vision_model": "clip",
     "siglip_vision_model": "clip",
     "siglip2_vision_model": "clip",
+    "nemotron": "nemotron",
+    "nemotron_h": "nemotron",
+    "nemotron_flash": "nemotron",
+    "Llama_Nemotron_Nano_VL": "nemotron",
+    "NemotronH_Nano_VL_V2": "nemotron",
+    "audioflamingo3": "audioflamingo",
 }
 
 # -- Variant labels for code-path identification --

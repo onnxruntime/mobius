@@ -108,6 +108,9 @@ class VisionConfig:
     mrope_section: list[int] | None = None
     # Phi4MM image embedding
     image_crop_size: int | None = None
+    # RADIO vision encoder (Nemotron VL)
+    num_summary_tokens: int = 0
+    projector_hidden_size: int | None = None
     # LoRA config
     lora: dict | None = None
 
@@ -1923,3 +1926,196 @@ class WhisperConfig(BaseModelConfig):
             options["dtype"] = resolved
 
         return cls(**options)
+
+
+@dataclasses.dataclass
+class NemotronFlashConfig(ArchitectureConfig):
+    """Configuration for NemotronFlash hybrid GLA+Mamba2+Attention+FFN models.
+
+    NemotronFlash interleaves four layer types:
+    - GLA (Gated Linear Attention / DeltaNet) for linear-recurrence layers
+    - Mamba2/SSD layers for efficient recurrent processing
+    - Standard GQA attention layers for global context
+    - Dense FFN-only layers for feedforward computation
+
+    Memory tokens (``num_memory_tokens``) are learnable vectors prepended to
+    the input embeddings at every forward step.
+
+    Layer types in HF config (``layer_types`` field):
+        ``"deltanet"`` → mobius ``"deltanet"`` (treated as full_attention KV cache)
+        ``"m2"`` → mobius ``"mamba2"``
+        ``"a"`` → mobius ``"full_attention"``
+        ``"f"`` → mobius ``"mlp"``
+    """
+
+    num_memory_tokens: int = 0
+
+    # Mamba2/SSD params
+    mamba_n_heads: int = 0
+    mamba_d_head: int = 64
+    mamba_d_state: int = 128
+    mamba_n_groups: int = 1
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> NemotronFlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # Compute intermediate_size from ffn_expand_ratio using SwiGLU formula
+        ffn_expand = getattr(config, "ffn_expand_ratio", 3)
+        hidden = base.hidden_size
+        intermediate = hidden * ffn_expand * 2 // 3
+
+        # Map HF layer types to mobius canonical types
+        type_map = {"f": "mlp", "m2": "mamba2", "a": "full_attention", "deltanet": "deltanet"}
+        layer_types_hf = getattr(config, "layer_types", []) or []
+        layer_types = [type_map.get(t, "full_attention") for t in layer_types_hf]
+
+        # Mamba2 head count: total inner dim / head_dim
+        mamba_expand = getattr(config, "mamba_expand", 2)
+        d_inner = hidden * mamba_expand
+        mamba2_headdim = getattr(config, "mamba2_headdim", 64)
+        mamba_n_heads = d_inner // mamba2_headdim
+
+        # Exclude fields we override to avoid duplicate keyword args
+        base_fields = {
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("layer_types", "num_hidden_layers", "intermediate_size")
+        }
+        return cls(
+            **base_fields,
+            intermediate_size=intermediate,
+            layer_types=layer_types,
+            num_hidden_layers=len(layer_types),
+            num_memory_tokens=getattr(config, "num_memory_tokens", 0),
+            mamba_n_heads=mamba_n_heads,
+            mamba_d_head=mamba2_headdim,
+            mamba_d_state=getattr(config, "mamba_d_state", 128),
+            mamba_n_groups=getattr(config, "mamba_n_groups", 1),
+            mamba_d_conv=getattr(config, "mamba_d_conv", 4),
+            mamba_expand=mamba_expand,
+            mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
+            mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class LlamaNemotronNanoVLConfig(ArchitectureConfig):
+    """Configuration for Llama_Nemotron_Nano_VL (RADIO + Llama 3.1 VL model).
+
+    Extracts text parameters from ``llm_config`` and builds a
+    :class:`VisionConfig` from the top-level RADIO ViT-H/16 fields.
+
+    RADIO ViT-H/16 parameters (hardcoded for this architecture):
+    - hidden_size: from ``vit_hidden_size`` (default 1280)
+    - num_hidden_layers: 32 (ViT-H depth)
+    - num_attention_heads: 16 (ViT-H heads)
+    - intermediate_size: 4 * vit_hidden_size
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> LlamaNemotronNanoVLConfig:
+        # Text params come from llm_config (not the standard top-level fields)
+        llm_config = getattr(config, "llm_config", config)
+        base = ArchitectureConfig.from_transformers(llm_config)
+
+        # RADIO ViT-H/16 vision parameters from top-level config fields
+        vit_hidden = getattr(config, "vit_hidden_size", 1280)
+        image_size = getattr(config, "force_image_size", 512)
+        patch_size = getattr(config, "patch_size", 16)
+
+        # Compute RADIO num_summary_tokens = num_cls_tokens + num_registers.
+        # num_cls_tokens = number of unique teachers (when cls_token_per_teacher=True).
+        # num_registers rounds up to the nearest register_multiple.
+        vc_args = getattr(config, "vision_config", None)
+        vc_args = getattr(vc_args, "args", None) or {}
+        teachers = vc_args.get("teachers", [])
+        cls_per_teacher = vc_args.get("cls_token_per_teacher", False)
+        num_cls = (
+            len({t.get("name", t) if isinstance(t, dict) else t for t in teachers})
+            if cls_per_teacher
+            else 1
+        )
+        reg_multiple = vc_args.get("register_multiple", None)
+        num_registers = (reg_multiple - (num_cls % reg_multiple)) if reg_multiple else 0
+        num_summary_tokens = num_cls + num_registers  # 8 for C-RADIOv2-H (4 CLS + 4 registers)
+
+        vision = VisionConfig(
+            hidden_size=vit_hidden,
+            num_hidden_layers=32,  # ViT-H depth
+            num_attention_heads=16,  # ViT-H heads
+            intermediate_size=vit_hidden * 4,  # MLP ratio 4x
+            image_size=image_size,
+            patch_size=patch_size,
+            image_token_id=128256,  # <image> token in Llama tokenizer
+            num_summary_tokens=num_summary_tokens,
+            projector_hidden_size=getattr(config, "projector_hidden_size", None),
+        )
+
+        base_fields = {
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("vision", "image_token_id")
+        }
+        return cls(**base_fields, vision=vision, image_token_id=128256)
+
+
+@dataclasses.dataclass
+class NemotronHNanoVLConfig(NemotronHConfig):
+    """Configuration for NemotronH_Nano_VL_V2 (RADIO + NemotronH VL model).
+
+    Extends :class:`NemotronHConfig` to inherit all NemotronH hybrid fields
+    (Mamba2 heads, layer_types, etc.) and adds RADIO vision encoder config.
+    Same RADIO vision encoder as ``LlamaNemotronNanoVLConfig`` but text decoder
+    is NemotronH hybrid (Mamba2 + Attention + MLP).
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> NemotronHNanoVLConfig:
+        # Text params come from llm_config (NemotronH hybrid model)
+        llm_config = getattr(config, "llm_config", config)
+        base = NemotronHConfig.from_transformers(llm_config)
+
+        # RADIO ViT-H/16 vision parameters (same as LlamaNemotronNanoVLConfig)
+        vit_hidden = getattr(config, "vit_hidden_size", 1280)
+        image_size = getattr(config, "force_image_size", 512)
+        patch_size = getattr(config, "patch_size", 16)
+
+        # Compute RADIO num_summary_tokens (same logic as LlamaNemotronNanoVLConfig)
+        vc_args = getattr(config, "vision_config", None)
+        vc_args = getattr(vc_args, "args", None) or {}
+        teachers = vc_args.get("teachers", [])
+        cls_per_teacher = vc_args.get("cls_token_per_teacher", False)
+        num_cls = (
+            len({t.get("name", t) if isinstance(t, dict) else t for t in teachers})
+            if cls_per_teacher
+            else 1
+        )
+        reg_multiple = vc_args.get("register_multiple", None)
+        num_registers = (reg_multiple - (num_cls % reg_multiple)) if reg_multiple else 0
+        num_summary_tokens = num_cls + num_registers  # 8 for C-RADIOv2-H
+
+        vision = VisionConfig(
+            hidden_size=vit_hidden,
+            num_hidden_layers=32,  # ViT-H depth
+            num_attention_heads=16,  # ViT-H heads
+            intermediate_size=vit_hidden * 4,  # MLP ratio 4x
+            image_size=image_size,
+            patch_size=patch_size,
+            image_token_id=None,  # image token is handled via image_flags in VL pipeline
+            num_summary_tokens=num_summary_tokens,
+            projector_hidden_size=getattr(config, "projector_hidden_size", None),
+        )
+
+        base_fields = {
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("vision", "image_token_id")
+        }
+        return cls(**base_fields, vision=vision, image_token_id=128256)
+
+

@@ -1,0 +1,20 @@
+model_id: "nvidia/audio-flamingo-3-hf"
+revision: "5c47d2de83c3163162586561f3ddba75b4a1194e"
+task_type: "audio-language"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Transcribe the following audio."
+  audio:
+    - "test_audio.wav"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+skip_reason: "AudioFlamingo3 — requires audio preprocessing pipeline not yet integrated; model uses custom AudioLanguageTask."
+notes: "AudioFlamingo3. Whisper audio encoder + projector + Qwen2-7B text decoder. 3-model audio-language split."

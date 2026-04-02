@@ -1,0 +1,20 @@
+model_id: "nvidia/Llama-Nemotron-Nano-VL-8B-v1"
+revision: "437f4e28b989cc2d9a16b6767cc930cdf48797ff"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+skip_reason: "8B model too large for CI. Custom RADIO vision encoder requires trust_remote_code."
+notes: "Llama_Nemotron_Nano_VL 8B. RADIO ViT-H/16 vision encoder + Llama 3.1 8B text decoder. InternVL2-style 3-model split."

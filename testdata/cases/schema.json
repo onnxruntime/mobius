@@ -35,6 +35,7 @@
       "type": "string",
       "enum": [
         "audio-feature-extraction",
+        "audio-language",
         "audio-to-audio",
         "codec",
         "depth-estimation",

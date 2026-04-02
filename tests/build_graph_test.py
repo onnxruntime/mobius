@@ -270,6 +270,11 @@ class TestBuildGraph:
                 assert f"present.{i}.ssm_state" in output_names, (
                     f"Missing present.{i}.ssm_state"
                 )
+            elif ltype == "conv":
+                # ShortConv: single conv_state only
+                assert f"present.{i}.conv_state" in output_names, (
+                    f"Missing present.{i}.conv_state"
+                )
             else:
                 assert f"present.{i}.key" in output_names, f"Missing present.{i}.key"
                 assert f"present.{i}.value" in output_names, f"Missing present.{i}.value"
@@ -1787,6 +1792,158 @@ class TestBuildGraphQwen3ASR:
         assert logits.shape[1] == seq_len
 
 
+class TestBuildGraphAudioFlamingo3:
+    """Verify AudioFlamingo-3 3-model split with AudioLanguageTask."""
+
+    def _af3_config(self):
+        return _base_config(
+            attn_qkv_bias=True,
+            hidden_act="silu",
+            audio=AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=128,
+                max_source_positions=100,
+                audio_token_id=200,
+                projection_hidden_size=TINY_HIDDEN,
+            ),
+        )
+
+    def test_package_builds_3_models(self):
+        """Build AudioFlamingo-3 and verify 3-model package."""
+        from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
+        from mobius.tasks import AudioLanguageTask
+
+        config = self._af3_config()
+        module = AudioFlamingo3ForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=AudioLanguageTask())
+
+        assert "audio_encoder" in pkg
+        assert "embedding" in pkg
+        assert "decoder" in pkg
+
+    def test_decoder_uses_1d_position_ids(self):
+        """Verify decoder uses standard 1D position_ids (not MRoPE 3D)."""
+        from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
+        from mobius.tasks import AudioLanguageTask
+
+        config = self._af3_config()
+        module = AudioFlamingo3ForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=AudioLanguageTask())
+        decoder = pkg["decoder"]
+
+        # position_ids should have shape [batch, seq_len] — 2D rank, not 3D MRoPE
+        pid_input = next(inp for inp in decoder.graph.inputs if inp.name == "position_ids")
+        assert pid_input.shape is not None
+        assert len(pid_input.shape) == 2, (
+            f"Expected 2D position_ids, got shape {pid_input.shape}"
+        )
+
+    def test_audio_encoder_io(self):
+        """Verify audio encoder inputs/outputs."""
+        from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
+        from mobius.tasks import AudioLanguageTask
+
+        config = self._af3_config()
+        module = AudioFlamingo3ForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=AudioLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        input_names = {inp.name for inp in encoder.graph.inputs}
+        assert "input_features" in input_names
+
+        output_names = {out.name for out in encoder.graph.outputs}
+        assert "audio_features" in output_names
+
+    def test_registry_lookup(self):
+        """Verify audioflamingo3 is registered with audio-language task."""
+        from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
+
+        assert registry.get("audioflamingo3") is AudioFlamingo3ForConditionalGeneration
+        assert _default_task_for_model("audioflamingo3") == "audio-language"
+
+    def test_pipeline_runs_with_ort(self):
+        """Run audio_encoder → embedding → decoder with ORT.
+
+        Verifies that:
+        1. Audio encoder produces audio_features of correct shape
+        2. Embedding fuses text tokens with audio features
+        3. Decoder accepts 1D position_ids and returns logits
+        """
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import AudioLanguageTask
+
+        config = self._af3_config()
+        module = AudioFlamingo3ForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=AudioLanguageTask())
+
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        # Step 1: Audio encoder — (1, n_mels, 50) mel → (1, 25, hidden)
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        mel = np.random.randn(1, config.audio.num_mel_bins, 50).astype(np.float32)
+        enc_out = enc_sess.run({"input_features": mel})
+        audio_features = enc_out["audio_features"]
+        num_audio_tokens = audio_features.shape[1]
+        # Flatten batch dim: (1, tokens, hidden) → (tokens, hidden)
+        audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+        enc_sess.close()
+
+        # Step 2: Embedding — text tokens with audio placeholders
+        audio_token_id = config.audio.audio_token_id
+        prefix_ids = [1, 2, 3]
+        suffix_ids = [4, 5]
+        input_ids = np.array(
+            [prefix_ids + [audio_token_id] * num_audio_tokens + suffix_ids],
+            dtype=np.int64,
+        )
+
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_out = embed_sess.run(
+            {"input_ids": input_ids, "audio_features": audio_features_2d}
+        )
+        inputs_embeds = embed_out["inputs_embeds"]
+        embed_sess.close()
+
+        assert inputs_embeds.shape[1] == input_ids.shape[1]
+        assert inputs_embeds.shape[2] == config.hidden_size
+
+        # Step 3: Decoder — standard 1D position_ids [batch, seq_len]
+        seq_len = inputs_embeds.shape[1]
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        past_kv = {}
+        for i in range(config.num_hidden_layers):
+            past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+            past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+
+        # 1D position_ids: (1, seq_len) — not 3D MRoPE
+        position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": position_ids,
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        logits = dec_out["logits"]
+        assert logits.shape == (1, seq_len, config.vocab_size)
+
+
 class TestBuildGraphQwen3TTS:
     """Verify Qwen3-TTS 4-model split with TTSTask."""
 
@@ -3137,6 +3294,153 @@ class TestBuildNemotronHGraph:
 
 
 # ===========================================================================
+# Hybrid GLA+Mamba2+Attention+FFN (NemotronFlash) model tests
+# ===========================================================================
+
+
+class TestBuildNemotronFlashGraph:
+    """Verify NemotronFlash hybrid model builds correctly and has correct structure."""
+
+    def _nemotron_flash_config(self):
+        from mobius._configs import NemotronFlashConfig
+
+        # 4 layers: deltanet, mlp, mamba2, full_attention
+        return NemotronFlashConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=4,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            rms_norm_eps=1e-5,
+            layer_types=["deltanet", "mlp", "mamba2", "full_attention"],
+            num_memory_tokens=2,
+            mamba_n_heads=TINY_KV_HEADS,
+            mamba_d_head=TINY_HEAD_DIM,
+            mamba_d_state=8,
+            mamba_n_groups=1,
+            mamba_d_conv=4,
+            mamba_expand=2,
+            hidden_act="silu",
+        )
+
+    def test_nemotron_flash_builds(self):
+        """Build NemotronFlash model and verify the graph constructs without error."""
+        from mobius._builder import build_from_module
+        from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+
+        config = self._nemotron_flash_config()
+        module = NemotronFlashCausalLMModel(config)
+        pkg = build_from_module(module, config, task="hybrid-text-generation")
+        assert "model" in pkg
+        model = pkg["model"]
+        assert model is not None
+
+    def test_nemotron_flash_layer_dispatch(self):
+        """Verify layers are dispatched to the correct classes by type."""
+        from mobius.models.nemotron_flash import (
+            NemotronFlashAttentionLayer,
+            NemotronFlashFFNLayer,
+            NemotronFlashGLALayer,
+            NemotronFlashMambaLayer,
+        )
+
+        config = self._nemotron_flash_config()
+        from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+
+        module = NemotronFlashCausalLMModel(config)
+        layers = list(module.model.layers)
+        assert len(layers) == 4
+        assert isinstance(layers[0], NemotronFlashGLALayer), (
+            f"Layer 0 should be GLA, got {type(layers[0])}"
+        )
+        assert isinstance(layers[1], NemotronFlashFFNLayer), (
+            f"Layer 1 should be FFN, got {type(layers[1])}"
+        )
+        assert isinstance(layers[2], NemotronFlashMambaLayer), (
+            f"Layer 2 should be Mamba, got {type(layers[2])}"
+        )
+        assert isinstance(layers[3], NemotronFlashAttentionLayer), (
+            f"Layer 3 should be Attention, got {type(layers[3])}"
+        )
+
+    def test_nemotron_flash_weight_names(self):
+        """Verify weight names match HuggingFace nemotron-flash naming convention."""
+        from mobius._builder import build_from_module
+        from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+
+        config = self._nemotron_flash_config()
+        module = NemotronFlashCausalLMModel(config)
+        pkg = build_from_module(module, config, task="hybrid-text-generation")
+        model = pkg["model"]
+        initializer_names = set(model.graph.initializers.keys())
+
+        # Memory tokens parameter
+        assert "model.memory_tokens" in initializer_names
+
+        # Final norm (not 'norm' like NemotronH)
+        assert "model.final_layernorm.weight" in initializer_names
+        assert "model.norm.weight" not in initializer_names
+
+        # Layer 0 (deltanet/GLA): uses 'gla.*' prefix, 'input_layernorm'
+        assert "model.layers.0.gla.q_proj.weight" in initializer_names
+        assert "model.layers.0.gla.k_proj.weight" in initializer_names
+        assert "model.layers.0.gla.v_proj.weight" in initializer_names
+        assert "model.layers.0.gla.o_proj.weight" in initializer_names
+        assert "model.layers.0.input_layernorm.weight" in initializer_names
+
+        # Layer 1 (mlp/FFN): uses 'mlp.*' prefix (ONNX), 'pre_ffn_layernorm'
+        assert "model.layers.1.mlp.gate_proj.weight" in initializer_names
+        assert "model.layers.1.mlp.up_proj.weight" in initializer_names
+        assert "model.layers.1.mlp.down_proj.weight" in initializer_names
+        assert "model.layers.1.pre_ffn_layernorm.weight" in initializer_names
+
+        # Layer 2 (mamba2): uses 'mamba.*' prefix, 'input_layernorm'
+        assert "model.layers.2.mamba.in_proj.weight" in initializer_names
+        assert "model.layers.2.mamba.out_proj.weight" in initializer_names
+        assert "model.layers.2.input_layernorm.weight" in initializer_names
+
+        # Layer 3 (full_attention): uses 'self_attn.*' prefix, 'input_layernorm'
+        assert "model.layers.3.self_attn.q_proj.weight" in initializer_names
+        assert "model.layers.3.self_attn.k_proj.weight" in initializer_names
+        assert "model.layers.3.self_attn.v_proj.weight" in initializer_names
+        assert "model.layers.3.self_attn.o_proj.weight" in initializer_names
+        assert "model.layers.3.input_layernorm.weight" in initializer_names
+
+    def test_nemotron_flash_preprocess_weights(self):
+        """Verify preprocess_weights handles ffn→mlp rename and weight tying."""
+        import torch
+
+        from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+
+        config = self._nemotron_flash_config()
+        config.tie_word_embeddings = True
+        module = NemotronFlashCausalLMModel(config)
+
+        # Real HF checkpoint with tie_word_embeddings=True only stores embed_tokens.weight
+        state_dict = {
+            "model.embed_tokens.weight": torch.ones(TINY_VOCAB, TINY_HIDDEN),
+            # FFN layer uses 'ffn.*' naming in HF
+            "model.layers.1.ffn.gate_proj.weight": torch.zeros(TINY_INTERMEDIATE, TINY_HIDDEN),
+            "model.layers.1.ffn.up_proj.weight": torch.zeros(TINY_INTERMEDIATE, TINY_HIDDEN),
+            "model.layers.1.ffn.down_proj.weight": torch.zeros(TINY_HIDDEN, TINY_INTERMEDIATE),
+        }
+        result = module.preprocess_weights(state_dict)
+
+        # Weight tying: lm_head.weight should be copied from embed_tokens.weight
+        assert "lm_head.weight" in result
+        assert torch.allclose(result["lm_head.weight"], result["model.embed_tokens.weight"])
+
+        # ffn.* should be renamed to mlp.*
+        assert "model.layers.1.mlp.gate_proj.weight" in result
+        assert "model.layers.1.mlp.up_proj.weight" in result
+        assert "model.layers.1.mlp.down_proj.weight" in result
+        # Original ffn.* keys should not remain
+        assert "model.layers.1.ffn.gate_proj.weight" not in result
+
+
+# ===========================================================================
 # Hybrid SSM+Attention (Jamba) model tests
 # ===========================================================================
 
@@ -3700,3 +4004,5 @@ class TestBuildSpeechGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+

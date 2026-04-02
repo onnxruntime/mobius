@@ -8,6 +8,7 @@ __all__ = [
     "ArceeCausalLMModel",
     "AutoencoderKLModel",
     "AutoencoderKLQwenImageModel",
+    "AudioFlamingo3ForConditionalGeneration",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
     "BertModel",
@@ -56,6 +57,7 @@ __all__ = [
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
+    "LlamaNemotronNanoVLModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "LongcatFlashCausalLMModel",
@@ -66,7 +68,9 @@ __all__ = [
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
+    "NemotronFlashCausalLMModel",
     "NemotronHCausalLMModel",
+    "NemotronHNanoVLModel",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
     "OPTCausalLMModel",
@@ -123,6 +127,7 @@ __all__ = [
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
 from mobius.models.apertus import ApertusCausalLMModel
 from mobius.models.arcee import ArceeCausalLMModel
+from mobius.models.audioflamingo3 import AudioFlamingo3ForConditionalGeneration
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
@@ -162,6 +167,7 @@ from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.llama4 import Llama4CausalLMModel
+from mobius.models.llama_nemotron_nano_vl import LlamaNemotronNanoVLModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
@@ -177,6 +183,8 @@ from mobius.models.moe import (
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.nemotron_flash import NemotronFlashCausalLMModel
+from mobius.models.nemotronh_nano_vl import NemotronHNanoVLModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel

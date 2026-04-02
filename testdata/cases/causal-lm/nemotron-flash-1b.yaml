@@ -1,0 +1,18 @@
+model_id: "nvidia/nemotron-flash-1b"
+revision: "da87f707f678b5936e67fdcfe598f76ebcc5fdbc"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+trust_remote_code: true
+skip_reason: "nemotron_flash 1B — trust_remote_code required; GLA layer uses placeholder attention (parity pass deferred)."
+notes: "NemotronFlash 1B. Hybrid GLA+Mamba2+Attention+FFN with 256 learnable memory tokens."

@@ -34,7 +34,9 @@ from mobius._configs import (
     MambaConfig,
     MllamaConfig,
     NanoChatConfig,
+    NemotronFlashConfig,
     NemotronHConfig,
+    NemotronHNanoVLConfig,
     Sam2Config,
     SegformerConfig,
     VisionConfig,
@@ -1113,6 +1115,24 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {"partial_rotary_factor": 0.25},
         False,
     ),
+    # nemotron_flash: hybrid GLA+Mamba2+Attention+FFN (requires NemotronFlashConfig)
+    (
+        "nemotron_flash",
+        {
+            "_config_cls": NemotronFlashConfig,
+            "hidden_act": "silu",
+            "num_hidden_layers": 4,
+            "layer_types": ["deltanet", "mlp", "mamba2", "full_attention"],
+            "num_memory_tokens": 2,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+        },
+        True,
+    ),
 ]
 
 
@@ -1975,12 +1995,55 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- NVIDIA RADIO+Llama VL ---
+    (
+        "Llama_Nemotron_Nano_VL",
+        {
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                # RADIO uses 8 special tokens (4 CLS + 4 registers); use 2 for tiny test
+                num_summary_tokens=2,
+            ),
+            "image_token_id": 128256,
+        },
+        True,
+    ),
+    # --- NVIDIA RADIO+NemotronH VL ---
+    (
+        "NemotronH_Nano_VL_V2",
+        {
+            "_config_cls": NemotronHNanoVLConfig,
+            "hidden_act": "relu2",
+            "layer_types": ["mamba2", "mlp", "full_attention", "mlp"],
+            "num_hidden_layers": 4,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                num_summary_tokens=2,
+                projector_hidden_size=64,
+            ),
+            "image_token_id": 128256,
+        },
+        True,
+    ),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Speech / TTS / Codec configs
-# ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     # --- Whisper (speech-to-text, encoder-decoder) ---
     (
@@ -2078,6 +2141,27 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
                 max_position_embeddings=128,
                 num_quantizers=8,
                 num_semantic_quantizers=1,
+            ),
+        },
+        True,
+    ),
+    # --- AudioFlamingo-3 (audio-language: Whisper encoder + Qwen2 decoder) ---
+    (
+        "audioflamingo3",
+        {
+            # Qwen2 decoder settings (attn_qkv_bias=True is set automatically
+            # for model_type="qwen2", but the test config uses model_type="audioflamingo3"
+            # so we set it explicitly here)
+            "attn_qkv_bias": True,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=128,
+                max_source_positions=100,
+                audio_token_id=200,
+                projection_hidden_size=64,
             ),
         },
         True,

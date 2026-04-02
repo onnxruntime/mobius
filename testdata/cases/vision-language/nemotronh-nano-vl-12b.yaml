@@ -1,0 +1,20 @@
+model_id: "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+revision: "5d250e2e111dc5e1434131bdf3d590c27a878ade"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+skip_reason: "12B NemotronH hybrid model too large for CI. Requires trust_remote_code for RADIO vision encoder."
+notes: "NemotronH_Nano_VL_V2 12B. RADIO ViT-H/16 vision encoder + NemotronH-12B hybrid Mamba2/attention decoder. projector_hidden_size=20480."

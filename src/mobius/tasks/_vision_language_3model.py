@@ -354,6 +354,73 @@ class HybridQwenVLTask(QwenVLTask):
         return model
 
 
+class HybridVisionLanguageTask(VisionLanguageTask):
+    """3-model VL split with hybrid KV + SSM cache for the text decoder.
+
+    Used by models like NemotronH_Nano_VL_V2 that pair a RADIO vision encoder
+    with a hybrid text decoder (Mamba2 + Attention + MLP layers).  Vision and
+    embedding models use the standard :class:`VisionLanguageTask` implementations;
+    only the decoder uses hybrid cache inputs/outputs.
+    """
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build hybrid text decoder: inputs_embeds → logits + hybrid cache."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        inputs_embeds = ir.Value(
+            name="inputs_embeds",
+            shape=ir.Shape([batch, seq_len, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        position_ids = ir.Value(
+            name="position_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [inputs_embeds, attention_mask, position_ids]
+
+        cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+            config,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        graph_inputs.extend(cache_inputs)
+
+        graph, graph_builder = _make_graph(graph_inputs, name="decoder")
+        op = graph_builder.op
+
+        logits, present_key_values = decoder(
+            op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+
+        logits.name = "logits"
+        graph.outputs.append(logits)
+        _register_hybrid_cache_outputs(
+            graph,
+            present_key_values,
+            config.layer_types or [],
+        )
+
+        return _make_model(graph)
+
+
 class MllamaVisionLanguageTask(VisionLanguageTask):
     """Mllama VL task with cross-attention KV caching.
 
