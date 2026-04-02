@@ -30,7 +30,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import GroundingDinoConfig
-from mobius.components import Conv2d, Embedding, GroupNorm, LayerNorm, Linear
+from mobius.components import Conv2d, GroupNorm, LayerNorm, Linear
 
 # --------------------------------------------------------------------------
 # Utility: dict → object adapter for sub-configs (e.g., text_config for BERT)
@@ -76,10 +76,16 @@ def _precompute_relative_position_index(window_size: int) -> np.ndarray:
 def _precompute_shift_attn_mask(
     h: int, w: int, window_size: int, shift_size: int
 ) -> np.ndarray | None:
-    """Compute shifted-window attention mask (nWindows, wH*wW, wH*wW)."""
+    """Compute shifted-window attention mask on PADDED spatial dims.
+
+    Pads to nearest multiple of window_size so reshape is valid.
+    """
     if shift_size == 0:
         return None
-    img_mask = np.zeros((1, h, w, 1), dtype=np.float32)
+    pad_h = (window_size - h % window_size) % window_size
+    pad_w = (window_size - w % window_size) % window_size
+    hp, wp = h + pad_h, w + pad_w
+    img_mask = np.zeros((1, hp, wp, 1), dtype=np.float32)
     h_slices = (
         slice(0, -window_size),
         slice(-window_size, -shift_size),
@@ -95,7 +101,7 @@ def _precompute_shift_attn_mask(
         for ws in w_slices:
             img_mask[:, hs, ws, :] = cnt
             cnt += 1
-    nh, nw = h // window_size, w // window_size
+    nh, nw = hp // window_size, wp // window_size
     mw = img_mask.reshape(1, nh, window_size, nw, window_size, 1)
     mw = mw.transpose(0, 1, 3, 2, 4, 5).reshape(nh * nw, window_size * window_size)
     attn_mask = mw[:, np.newaxis, :] - mw[:, :, np.newaxis]
@@ -244,6 +250,14 @@ class _SwinBlock(nn.Module):
         self._shift_size = shift_size
         self._n_tokens = window_size * window_size
 
+        # Pad spatial dims to nearest multiple of window_size
+        pad_h = (window_size - h % window_size) % window_size
+        pad_w = (window_size - w % window_size) % window_size
+        self._pad_h = pad_h
+        self._pad_w = pad_w
+        self._Hp = h + pad_h  # padded height
+        self._Wp = w + pad_w  # padded width
+
         intermediate_size = int(dim * mlp_ratio)
         self.layernorm_before = LayerNorm(dim, eps=1e-5)
         self.attention = _SwinAttention(dim, num_heads, window_size)
@@ -251,32 +265,37 @@ class _SwinBlock(nn.Module):
         self.intermediate = _SwinIntermediate(dim, intermediate_size)
         self.output = _SwinOutput(intermediate_size, dim)
 
+        # Mask uses padded spatial dims
         self._attn_mask = _precompute_shift_attn_mask(h, w, window_size, shift_size)
 
     def _cyclic_shift(self, op: builder.OpBuilder, x: ir.Value, neg: bool) -> ir.Value:
-        """Cyclic shift of (batch, h, w, c) along h and w."""
+        """Cyclic shift of (batch, hp, wp, c) along h and w.
+
+        Uses PADDED spatial dims (self._Hp, self._Wp).
+        """
         s = self._shift_size
-        h, w = self._H, self._W
+        hp, wp = self._Hp, self._Wp
         if neg:
-            a = op.Slice(x, [s], [h], [1])
+            a = op.Slice(x, [s], [hp], [1])
             b = op.Slice(x, [0], [s], [1])
             x = op.Concat(a, b, axis=1)
-            a = op.Slice(x, [s], [w], [2])
+            a = op.Slice(x, [s], [wp], [2])
             b = op.Slice(x, [0], [s], [2])
             return op.Concat(a, b, axis=2)
         else:
-            a = op.Slice(x, [h - s], [h], [1])
-            b = op.Slice(x, [0], [h - s], [1])
+            a = op.Slice(x, [hp - s], [hp], [1])
+            b = op.Slice(x, [0], [hp - s], [1])
             x = op.Concat(a, b, axis=1)
-            a = op.Slice(x, [w - s], [w], [2])
-            b = op.Slice(x, [0], [w - s], [2])
+            a = op.Slice(x, [wp - s], [wp], [2])
+            b = op.Slice(x, [0], [wp - s], [2])
             return op.Concat(a, b, axis=2)
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # hidden_states: (batch, H*W, C)
         h, w = self._H, self._W
+        hp, wp = self._Hp, self._Wp
         ws = self._window_size
-        nh, nw = h // ws, w // ws
+        nh, nw = hp // ws, wp // ws
         n_tokens = self._n_tokens
         dim = self._dim
 
@@ -286,6 +305,15 @@ class _SwinBlock(nn.Module):
 
         # Reshape to 2D spatial: (batch, h, w, C)
         x = op.Reshape(x, [-1, h, w, dim])
+
+        # Pad to multiple of window_size if needed
+        if self._pad_h > 0 or self._pad_w > 0:
+            # Pad format: [begin_d0,...,begin_dN, end_d0,...,end_dN]
+            x = op.Pad(
+                x,
+                op.Constant(value_ints=[0, 0, 0, 0, 0, self._pad_h, self._pad_w, 0]),
+                op.Constant(value_float=0.0),
+            )
 
         if self._shift_size > 0:
             x = self._cyclic_shift(op, x, neg=True)
@@ -300,10 +328,15 @@ class _SwinBlock(nn.Module):
         # Window unpartition
         x = op.Reshape(x, [-1, nh, nw, ws, ws, dim])
         x = op.Transpose(x, perm=[0, 1, 3, 2, 4, 5])
-        x = op.Reshape(x, [-1, h, w, dim])
+        x = op.Reshape(x, [-1, hp, wp, dim])
 
         if self._shift_size > 0:
             x = self._cyclic_shift(op, x, neg=False)
+
+        # Crop back to original spatial size if padded
+        if self._pad_h > 0 or self._pad_w > 0:
+            x = op.Slice(x, [0], [h], [1])
+            x = op.Slice(x, [0], [w], [2])
 
         x = op.Reshape(x, [-1, h * w, dim])
 
@@ -1502,6 +1535,26 @@ class _DecoderLayer(nn.Module):
         return self.final_layer_norm(op, hidden_states)
 
 
+class _ReferencePointsHead(nn.Module):
+    """2-layer MLP projecting sine embeddings of reference points to query pos.
+
+    HF name: ``decoder.reference_points_head``
+    """
+
+    def __init__(self, input_dim: int, d_model: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                Linear(input_dim, d_model, bias=True),
+                Linear(d_model, d_model, bias=True),
+            ]
+        )
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        x = op.Relu(self.layers[0](op, x))
+        return self.layers[1](op, x)
+
+
 class _MLPPredictionHead(nn.Module):
     """MLP for bounding box regression (3 layers).
 
@@ -1543,25 +1596,15 @@ class _Decoder(nn.Module):
 
         self.layer_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
 
-        # MLP to project sine embeddings of reference points to query pos
-        self.reference_points_head = nn.Module()
-        self.reference_points_head.layers = nn.ModuleList(
-            [
-                Linear(config.d_model, config.d_model, bias=True),
-                Linear(config.d_model, config.d_model, bias=True),
-            ]
-        )
+        # MLP to project sine embeddings of reference points to query pos.
+        # Input dim is d_model*2 (x and y sine embeddings concatenated).
+        self.reference_points_head = _ReferencePointsHead(config.d_model * 2, config.d_model)
 
         # Per-layer bbox prediction for iterative refinement
         bbox_embeds = []
         for _ in range(config.decoder_layers):
             bbox_embeds.append(_MLPPredictionHead(config.d_model, config.d_model, 4))
         self.bbox_embed = nn.ModuleList(bbox_embeds)
-
-    def _reference_points_head_forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
-        """2-layer MLP for reference point position projection."""
-        x = op.Relu(self.reference_points_head.layers[0](op, x))
-        return self.reference_points_head.layers[1](op, x)
 
     def forward(
         self,
@@ -1596,7 +1639,7 @@ class _Decoder(nn.Module):
             query_pos = _get_sine_pos_embed(
                 op, ref_first, self._d_model // 2
             )  # (B, Q, d_model*2) — but we want d_model
-            query_pos = self._reference_points_head_forward(op, query_pos)
+            query_pos = self.reference_points_head(op, query_pos)
 
             hidden_states = decoder_layer(
                 op,
@@ -1696,8 +1739,10 @@ class GroundingDinoForObjectDetection(nn.Module):
         self.text_backbone = BertModel(text_cfg_obj)
         self.text_projection = Linear(text_config["hidden_size"], d)
 
-        # Query embeddings
-        self.query_position_embeddings = Embedding(config.num_queries, d)
+        # Query embeddings — stored as bare parameter (like DETR).
+        # HF stores this as nn.Embedding, so preprocess_weights strips
+        # the trailing ".weight" suffix.
+        self.query_position_embeddings = nn.Parameter([config.num_queries, d])
 
         # Encoder + Decoder
         self.encoder = _Encoder(config)
@@ -1935,7 +1980,7 @@ class GroundingDinoForObjectDetection(nn.Module):
 
         # Target: use learned query embeddings (embedding_init_target=True)
         target = op.Expand(
-            op.Unsqueeze(self.query_position_embeddings.weight, [0]),
+            op.Unsqueeze(self.query_position_embeddings, [0]),
             op.Concat(batch, [config.num_queries, d], axis=0),
         )
 
@@ -2021,7 +2066,20 @@ class GroundingDinoForObjectDetection(nn.Module):
         state_dict: dict[str, Any],
         config: GroundingDinoConfig,
     ) -> dict[str, Any]:
-        """Map HuggingFace weight names to mobius ONNX parameter names."""
+        """Map HuggingFace weight names to mobius ONNX parameter names.
+
+        Key renames:
+        - Strip ``model.`` prefix (ForObjectDetection → inner model)
+        - Swin backbone: strip ``backbone.conv_encoder.`` (onnxscript
+          skips intermediate plain nn.Module containers), also strip
+          ``encoder.`` and ``hidden_states_norms.`` within the backbone
+        - ``query_position_embeddings.weight`` → bare parameter
+        - BERT text backbone: collapse ``attention.self.`` →
+          ``attention.``, etc. (standard BERT renames)
+        - Input projections: ``.0.`` → ``.conv.``, ``.1.`` → ``.norm.``
+        - Skip ``relative_position_index`` (precomputed constant)
+        - Skip ``decoder.bbox_embed.*`` (shared with top-level bbox_embed)
+        """
         new_dict: dict[str, Any] = {}
 
         for key, value in state_dict.items():
@@ -2039,7 +2097,23 @@ class GroundingDinoForObjectDetection(nn.Module):
             if "relative_position_index" in new_key:
                 continue
 
-            # input_proj_vision: Sequential(Conv2d, GroupNorm)
+            # --- Swin backbone renames ---
+            # onnxscript skips plain nn.Module() containers, so:
+            # backbone.conv_encoder.model.X → model.X
+            if new_key.startswith("backbone.conv_encoder."):
+                new_key = new_key[len("backbone.conv_encoder.") :]
+            # Within Swin: model.encoder.layers.N → model.layers.N
+            if new_key.startswith("model.encoder."):
+                new_key = "model." + new_key[len("model.encoder.") :]
+            # Within Swin: model.hidden_states_norms.stageN → model.stageN
+            if "hidden_states_norms." in new_key:
+                new_key = new_key.replace("hidden_states_norms.", "")
+
+            # --- query_position_embeddings: Embedding → bare parameter ---
+            if new_key == "query_position_embeddings.weight":
+                new_key = "query_position_embeddings"
+
+            # --- Input projection renames ---
             # HF: input_proj_vision.{i}.0.{w/b} → .{i}.conv.{w/b}
             # HF: input_proj_vision.{i}.1.{w/b} → .{i}.norm.{w/b}
             if "input_proj_vision" in new_key:
@@ -2048,13 +2122,12 @@ class GroundingDinoForObjectDetection(nn.Module):
                 new_key = new_key.replace(".1.weight", ".norm.weight")
                 new_key = new_key.replace(".1.bias", ".norm.bias")
 
-            # Backbone: strip backbone.conv_encoder.model prefix
-            # is already matching — no change needed
-
-            # Text backbone: BERT weight naming handled by BertModel
-
-            # reference_points_head: HF uses layers.0/1 naming
-            # Our module also uses layers.0/1, matching
+            # --- BERT text backbone renames ---
+            if new_key.startswith("text_backbone."):
+                new_key = new_key.replace(".attention.self.", ".attention.")
+                new_key = new_key.replace(".attention.output.", ".attention.")
+                new_key = new_key.replace(".output.dense.", ".dense.")
+                new_key = new_key.replace(".output.LayerNorm.", ".LayerNorm.")
 
             new_dict[new_key] = value
 
