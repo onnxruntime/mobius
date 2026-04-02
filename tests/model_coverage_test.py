@@ -276,6 +276,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Contrastive models (tested via specialized test classes) ---
     "clip": "Contrastive model — tested via TestBuildCLIPContrastiveGraph",
     "altclip": "Contrastive model — tested via TestBuildAltCLIPContrastiveGraph",
+    # --- New models (YAML not yet created) ---
+    "aria": "VLM — YAML not yet created",
+    "speech_to_text": "Speech seq2seq — YAML not yet created",
 }
 
 

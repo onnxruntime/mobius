@@ -91,6 +91,7 @@ from mobius.models import (
     WhisperForConditionalGeneration,
 )
 from mobius.models.altclip import AltCLIPModel
+from mobius.models.aria import AriaForConditionalGeneration
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.bert import BertModel
@@ -125,7 +126,6 @@ from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.mobilenet_v2 import MobileNetV2Model
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
 from mobius.models.moondream import MoondreamModel
-from mobius.models.aria import AriaForConditionalGeneration
 from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.owlv2 import Owlv2ForObjectDetection
@@ -139,12 +139,12 @@ from mobius.models.rwkv import RwkvCausalLMModel
 from mobius.models.rwkv6 import Rwkv6CausalLMModel
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.speech2text import Speech2TextForConditionalGeneration
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.videollama3 import VideoLLaMA3Model
 from mobius.models.vit import ViTModel
-from mobius.models.speech2text import Speech2TextForConditionalGeneration
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
@@ -989,10 +989,12 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
     "moondream1": "vikhyatk/moondream2",
+    "aria": "rhymes-ai/Aria",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "moonshine": "UsefulSensors/moonshine-tiny",
+    "speech_to_text": "facebook/s2t-small-librispeech-asr",
     "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
