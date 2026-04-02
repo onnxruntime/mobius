@@ -2,6 +2,7 @@ model_id: "openai/clip-vit-base-patch32"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "CLIP AutoModel requires pixel_values — use CLIPTextModel directly; standard feature-extraction pipeline fails without image input."
 
 inputs:
   prompts:

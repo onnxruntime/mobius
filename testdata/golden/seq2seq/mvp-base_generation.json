@@ -1,0 +1,22 @@
+{
+  "model_id": "RUCAIBox/mvp",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    2,
+    0,
+    0,
+    0,
+    32826,
+    108,
+    381,
+    4822,
+    523,
+    7186,
+    10185,
+    7,
+    36593,
+    7472,
+    2
+  ],
+  "generated_text": "Paris' Eiffel Tower rises to 324 metres"
+}

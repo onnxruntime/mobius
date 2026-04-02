@@ -1,0 +1,28 @@
+{
+  "model_id": "IMISLab/GreekT5-umt5-small-greeksum",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    0,
+    1654,
+    273,
+    282,
+    278,
+    285,
+    524,
+    32373,
+    333,
+    312,
+    32373,
+    737,
+    15989,
+    301,
+    2989,
+    275,
+    273,
+    2119,
+    2666,
+    44160,
+    679
+  ],
+  "generated_text": "\u0397 324 m tall and the tallest structure in Paris, \u03b5\u03b9\u0301\u03bd\u03b1\u03b9 \u03c4\u03bf"
+}

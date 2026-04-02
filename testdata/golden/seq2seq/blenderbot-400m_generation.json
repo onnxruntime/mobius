@@ -1,0 +1,28 @@
+{
+  "model_id": "facebook/blenderbot-400M-distill",
+  "prompt": "Hello, how are you?",
+  "generated_tokens": [
+    1,
+    281,
+    476,
+    929,
+    731,
+    19,
+    2828,
+    304,
+    21,
+    855,
+    366,
+    304,
+    381,
+    1435,
+    600,
+    278,
+    38,
+    946,
+    304,
+    360,
+    2
+  ],
+  "generated_text": " I'm doing well, thank you. How are you this fine evening? Do you have"
+}

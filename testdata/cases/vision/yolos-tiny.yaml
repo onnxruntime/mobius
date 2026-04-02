@@ -2,6 +2,7 @@ model_id: "hustvl/yolos-tiny"
 revision: "main"
 task_type: "object-detection"
 dtype: "float32"
+skip_reason: "object-detection task type not supported by generate_golden.py."
 
 inputs:
   images:

@@ -2,6 +2,7 @@ model_id: "microsoft/trocr-small-handwritten"
 revision: "main"
 task_type: "image-to-text"
 dtype: "float32"
+skip_reason: "image-to-text task type not supported by generate_golden.py (requires custom OCR pipeline)."
 
 inputs:
   images:

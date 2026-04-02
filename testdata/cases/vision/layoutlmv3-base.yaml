@@ -2,6 +2,7 @@ model_id: "microsoft/layoutlmv3-base"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "Requires both images and per-token bbox inputs — document VLM not supported by standard text feature-extraction pipeline."
 
 inputs:
   images:

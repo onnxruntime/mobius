@@ -395,12 +395,21 @@ def torch_vision_forward(
 
     Returns:
         last_hidden_state as numpy array [batch, seq_len, hidden_size].
+
+    For CNN-style models that return spatial feature maps [N, C, H, W],
+    the map is transposed and flattened to [N, H*W, C] so the caller can
+    apply the same ``hidden[0, -1, :]`` slice uniformly.
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     pv = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
     outputs = model(pixel_values=pv)
-    return outputs.last_hidden_state.cpu().numpy()
+    hidden = outputs.last_hidden_state  # (N, seq_len, C) or (N, C, H, W)
+    if hidden.ndim == 4:
+        # CNN spatial map: (N, C, H, W) → (N, H*W, C)
+        N, C, H, W = hidden.shape
+        hidden = hidden.permute(0, 2, 3, 1).reshape(N, H * W, C)
+    return hidden.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------

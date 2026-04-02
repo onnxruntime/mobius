@@ -1,0 +1,27 @@
+{
+  "model_id": "google/long-t5-tglobal-base",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    0,
+    21603,
+    10,
+    37,
+    7293,
+    19,
+    220,
+    2266,
+    14604,
+    5065,
+    11,
+    19,
+    8,
+    5065,
+    222,
+    1809,
+    16,
+    1919,
+    5,
+    1
+  ],
+  "generated_text": "summarize: The tower is 324 metres tall and is the tallest structure in Paris."
+}

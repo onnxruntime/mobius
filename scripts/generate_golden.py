@@ -230,6 +230,10 @@ def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
 
     model, tokenizer = load_torch_encoder_model(case.model_id, device=device)
 
+    # XMod requires a language to be set before inference.
+    if hasattr(model, "set_default_language"):
+        model.set_default_language("en_XX")
+
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
@@ -266,8 +270,10 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
 
-    # Prepare decoder input (pad token for autoregressive start)
-    decoder_start = np.array([[model.config.decoder_start_token_id or 0]], dtype=np.int64)
+    # Prepare decoder input (pad token for autoregressive start).
+    # Use getattr to handle configs that lack decoder_start_token_id (e.g. PLBart).
+    decoder_start_id = getattr(model.config, "decoder_start_token_id", None) or 0
+    decoder_start = np.array([[decoder_start_id]], dtype=np.int64)
 
     # L4: single forward pass through full model
     torch_device = next(model.parameters()).device

@@ -2,6 +2,7 @@ model_id: "Xenova/tiny-random-ErnieMModel"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "Tokenizer JSON malformed in this checkpoint — PreTokenizerUntagged parse error."
 
 inputs:
   prompts:

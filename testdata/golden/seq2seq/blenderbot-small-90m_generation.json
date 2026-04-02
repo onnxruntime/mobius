@@ -1,0 +1,28 @@
+{
+  "model_id": "facebook/blenderbot_small-90M",
+  "prompt": "Hello, how are you?",
+  "generated_tokens": [
+    1,
+    14,
+    8,
+    58,
+    123,
+    5,
+    69,
+    119,
+    90,
+    38,
+    12,
+    179,
+    172,
+    32,
+    166,
+    5,
+    102,
+    46,
+    15,
+    20,
+    2
+  ],
+  "generated_text": "i ' m good . just got back from a long day at work . how are you ?"
+}

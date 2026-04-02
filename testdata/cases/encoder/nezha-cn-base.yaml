@@ -2,6 +2,7 @@ model_id: "sijunhe/nezha-cn-base"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "NEZHA architecture not recognized by current transformers version — requires transformers>=4.39."
 
 inputs:
   prompts:

@@ -2,6 +2,7 @@ model_id: "naver-clova-ocr/bros-base-uncased"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "Requires per-token bbox input — not supported by standard text feature-extraction pipeline."
 
 inputs:
   prompts:

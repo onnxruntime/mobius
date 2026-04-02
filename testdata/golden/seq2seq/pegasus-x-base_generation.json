@@ -1,0 +1,28 @@
+{
+  "model_id": "google/pegasus-x-base",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    0,
+    110,
+    105,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    111,
+    1
+  ],
+  "generated_text": " and and and and and and and and and and and and and and and and and"
+}

@@ -2,6 +2,7 @@ model_id: "microsoft/layoutlmv2-base-uncased"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"
+skip_reason: "Requires detectron2 — not installed in standard CI environment."
 
 inputs:
   prompts:
