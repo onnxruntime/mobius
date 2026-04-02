@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    EsmFoldConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -606,7 +607,12 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
 
     # --- Protein (ESM-2 backbone, feature-extraction) ---
-    reg.register("esmfold", EsmFoldModel, task="feature-extraction")
+    reg.register(
+        "esmfold",
+        EsmFoldModel,
+        task="feature-extraction",
+        config_class=EsmFoldConfig,
+    )
 
     # --- Absolute positional embeddings (non-RoPE) ---
     reg.register("gpt2", GPT2CausalLMModel)

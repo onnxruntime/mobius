@@ -10,7 +10,7 @@ from amino-acid sequences.
 Architecture overview:
 
 ```
-input_ids → ESM-2 encoder (36-layer transformer)
+input_ids → ESM-2 encoder (36-layer transformer, rotary position embeddings)
     ↓
   single representations (B, L, 1024)
   + pairwise from outer-product (B, L, L, 128)
@@ -26,8 +26,8 @@ input_ids → ESM-2 encoder (36-layer transformer)
   atom14 coordinates, pLDDT, distogram, pTM
 ```
 
-**Phase 1 (this file)**: ESM-2 backbone reuse from BertModel, config,
-registry, skeleton for trunk placeholders.
+**Phase 1 (this file)**: ESM-2 backbone with RoPE, trunk projection
+(``esm_s_mlp``), LM head, config, registry.
 
 **Phase 2** (future): Folding trunk — triangular attention & multiplicative
 updates, pairwise representations.
@@ -48,18 +48,31 @@ from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Embedding, LayerNorm, Linear
-from mobius.models.bert import _BertEncoder, _rename_bert_weight
+from mobius.components._rotary_embedding import (
+    apply_rotary_pos_emb,
+    initialize_rope,
+)
+from mobius.models.bert import (
+    _BertAttention,
+    _BertIntermediate,
+    _BertOutput,
+    _rename_bert_weight,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-class _EsmEmbeddings(nn.Module):
-    """ESM-2 embeddings: token + positional (rotary applied in attention).
+# ---------------------------------------------------------------------------
+# ESM-2 encoder components (BERT-like + rotary position embeddings)
+# ---------------------------------------------------------------------------
 
-    ESM-2 uses rotary position embeddings in the attention layers rather
-    than learned absolute position embeddings.  The embedding layer only
-    contains the token (word) embedding and an optional layer norm.
+
+class _EsmEmbeddings(nn.Module):
+    """ESM-2 embeddings: token embedding + optional pre-LayerNorm.
+
+    ESM-2 uses rotary position embeddings in the attention layers, so the
+    embedding layer contains only the token (word) embedding.
 
     ``padding_idx`` is set so that pad tokens produce zero embeddings.
     """
@@ -93,14 +106,140 @@ class _EsmEmbeddings(nn.Module):
         return hidden_states
 
 
-class _EsmEncoder(_BertEncoder):
-    """ESM-2 encoder: stack of transformer layers.
+class _EsmAttention(_BertAttention):
+    """ESM-2 attention: BERT-style post-norm attention with RoPE.
 
-    Reuses the BERT encoder implementation.  ESM-2 uses rotary position
-    embeddings which are applied inside each attention layer rather than
-    in the embedding layer, but for the ONNX graph the standard BERT
-    attention pattern with full attention mask is compatible.
+    Extends :class:`_BertAttention` by applying rotary position embeddings
+    to Q and K before the ``op.Attention`` call.  Weight names remain
+    identical to BERT (``attention.query``, ``attention.key``, etc.).
     """
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value,
+        position_embeddings: tuple | None = None,
+    ):
+        self_attn = self.self
+        query = self_attn.query(op, hidden_states)  # (B, L, H)
+        key = self_attn.key(op, hidden_states)  # (B, L, H)
+        value = self_attn.value(op, hidden_states)  # (B, L, H)
+
+        # Apply rotary position embeddings to Q and K
+        if position_embeddings is not None:
+            query = apply_rotary_pos_emb(
+                op,
+                query,
+                position_embeddings,
+                num_heads=self_attn.num_heads,
+                rotary_embedding_dim=0,
+            )
+            key = apply_rotary_pos_emb(
+                op,
+                key,
+                position_embeddings,
+                num_heads=self_attn.num_heads,
+                rotary_embedding_dim=0,
+            )
+
+        attn_out = op.Attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            q_num_heads=self_attn.num_heads,
+            kv_num_heads=self_attn.num_heads,
+            scale=float(self_attn.head_dim**-0.5),
+        )
+
+        attn_out = self.output.dense(op, attn_out)
+        return self.output.LayerNorm(op, op.Add(hidden_states, attn_out))
+
+
+class _EsmEncoderLayer(nn.Module):
+    """ESM-2 encoder layer: post-norm with RoPE-enabled attention.
+
+    Same structure as ``_BertEncoderLayer`` but uses :class:`_EsmAttention`
+    and threads ``position_embeddings`` through.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        intermediate_size: int,
+        hidden_act: str = "gelu",
+        layer_norm_eps: float = 1e-12,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.attention = _EsmAttention(
+            hidden_size, num_attention_heads, layer_norm_eps, bias
+        )
+        self.intermediate = _BertIntermediate(
+            hidden_size, intermediate_size, hidden_act, bias
+        )
+        self.output = _BertOutput(
+            intermediate_size, hidden_size, layer_norm_eps, bias
+        )
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+        position_embeddings: tuple | None = None,
+    ):
+        # Self-attention with post-norm and RoPE
+        hidden_states = self.attention(
+            op, hidden_states, attention_mask, position_embeddings
+        )
+        # MLP with post-norm
+        intermediate = self.intermediate(op, hidden_states)
+        mlp_out = self.output.dense(op, intermediate)
+        hidden_states = self.output.LayerNorm(
+            op, op.Add(hidden_states, mlp_out)
+        )
+        return hidden_states
+
+
+class _EsmEncoder(nn.Module):
+    """ESM-2 encoder: stack of post-norm layers with rotary embeddings."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.layer = nn.ModuleList(
+            [
+                _EsmEncoderLayer(
+                    hidden_size=config.hidden_size,
+                    num_attention_heads=config.num_attention_heads,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    layer_norm_eps=config.rms_norm_eps,
+                    bias=True,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value,
+        position_embeddings: tuple | None = None,
+    ):
+        for layer in self.layer:
+            hidden_states = layer(
+                op, hidden_states, attention_mask, position_embeddings
+            )
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Trunk projection
+# ---------------------------------------------------------------------------
 
 
 class _EsmSMlp(nn.Module):
@@ -137,16 +276,22 @@ class _EsmSMlp(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Top-level model
+# ---------------------------------------------------------------------------
+
+
 class EsmFoldModel(nn.Module):
     """ESMFold protein structure prediction model (Phase 1: backbone only).
 
     This Phase 1 implementation builds the ESM-2 encoder backbone which
-    produces per-residue representations.  The folding trunk and structure
-    module are placeholders for Phase 2/3.
+    produces per-residue representations projected to trunk dimension.
+    The folding trunk and structure module are not yet implemented
+    (Phase 2/3).
 
     Top-level architecture (HuggingFace ``EsmForProteinFolding``):
 
-    - ``esm``: ESM-2 protein language model (encoder)
+    - ``esm``: ESM-2 protein language model (encoder, rotary pos emb)
     - ``esm_s_mlp``: Projects ESM-2 hidden states to trunk sequence dim
     - ``embedding``: Amino-acid embedding for trunk input
     - ``trunk``: Folding trunk (48 triangular self-attention blocks)
@@ -156,35 +301,42 @@ class EsmFoldModel(nn.Module):
     - ``lddt_head``: Predicts per-residue confidence (pLDDT)
 
     Inputs: ``input_ids`` (amino acid token IDs), ``attention_mask``.
-    Outputs: Per-residue hidden states from the ESM-2 backbone.
+    Outputs: Trunk-projected hidden states ``(B, L, trunk_seq_dim)``.
     """
 
-    default_task = "protein-folding"
+    default_task = "feature-extraction"
     category = "Protein Structure"
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
 
-        # ESM-2 backbone (same as BertModel but with ESM embeddings)
+        # ESM-2 backbone with rotary position embeddings
         self.esm_embeddings = _EsmEmbeddings(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
             pad_token_id=config.pad_token_id or 1,
             layer_norm_eps=config.rms_norm_eps,
-            emb_layer_norm_before=getattr(config, "emb_layer_norm_before", False),
+            emb_layer_norm_before=getattr(
+                config, "emb_layer_norm_before", False
+            ),
         )
-        self.esm_encoder = _BertEncoder(config)
+        self.esm_encoder = _EsmEncoder(config)
+        self.rotary_emb = initialize_rope(config)
 
         # Projection from ESM-2 hidden dim to trunk sequence dim
         # HF layout: Sequential(LayerNorm → Linear → ReLU → Linear)
-        trunk_seq_dim = getattr(config, "trunk_sequence_state_dim", 1024)
+        trunk_seq_dim = getattr(
+            config, "trunk_sequence_state_dim", 1024
+        )
         self.esm_s_mlp = _EsmSMlp(
             config.hidden_size, trunk_seq_dim, config.rms_norm_eps
         )
 
         # LM head for masked language modeling (auxiliary objective)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
 
     def forward(
         self,
@@ -193,22 +345,42 @@ class EsmFoldModel(nn.Module):
         attention_mask: ir.Value,
         token_type_ids: ir.Value | None = None,
     ):
-        """Forward pass: ESM-2 backbone → per-residue representations.
+        """Forward pass: ESM-2 backbone → esm_s_mlp → trunk-dim output.
 
-        Phase 1 returns the ESM-2 hidden states and LM logits.
-        Phase 2/3 will add the folding trunk and structure module.
+        Returns trunk-projected per-residue representations.
+        Phase 2/3 will feed these into the folding trunk and structure
+        module.
 
         ``token_type_ids`` is accepted for compatibility with the
         feature-extraction task but is not used by ESM-2.
         """
-        # ESM-2 encoder: (B, L) -> (B, L, hidden_size)
+        # ESM-2 embeddings: (B, L) -> (B, L, hidden_size)
         hidden_states = self.esm_embeddings(op, input_ids)
-        hidden_states = self.esm_encoder(op, hidden_states, attention_mask)
 
-        # LM head: (B, L, vocab_size)
-        logits = self.lm_head(op, hidden_states)
+        # Compute position_ids from sequence length for RoPE
+        # ESM-2 encoder positions are simply [0, 1, ..., L-1]
+        seq_len = op.Shape(input_ids, start=1, end=2)  # [1]
+        position_ids = op.Unsqueeze(
+            op.Range(
+                op.Constant(value_int=0),
+                op.Squeeze(seq_len),
+                op.Constant(value_int=1),
+            ),
+            [0],
+        )  # (1, L)
+        position_embeddings = self.rotary_emb(
+            op, position_ids
+        )  # (cos: (1, L, rotary_dim), sin: (1, L, rotary_dim))
 
-        return logits
+        # ESM-2 encoder: (B, L, hidden_size) -> (B, L, hidden_size)
+        hidden_states = self.esm_encoder(
+            op, hidden_states, attention_mask, position_embeddings
+        )
+
+        # Project to trunk sequence dimension: (B, L, trunk_seq_dim)
+        hidden_states = self.esm_s_mlp(op, hidden_states)
+
+        return hidden_states
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -218,7 +390,7 @@ class EsmFoldModel(nn.Module):
         HuggingFace layout:
         - ``esm.embeddings.*`` → ``esm_embeddings.*``
         - ``esm.encoder.layer.N.*`` → ``esm_encoder.layer.N.*``
-        - ``esm_s_mlp.0/1/2.*`` → ``esm_s_mlp.0/1/2.*``
+        - ``esm_s_mlp.{0,1,3}.*`` → ``esm_s_mlp._{0,1,3}.*``
         - ``lm_head.*`` → ``lm_head.*``
         - Trunk/structure weights are dropped in Phase 1.
         """
@@ -237,7 +409,7 @@ def _rename_esmfold_weight(name: str) -> str | None:
     """
     # ESM-2 embeddings: esm.embeddings.* → esm_embeddings.*
     if name.startswith("esm.embeddings."):
-        suffix = name[len("esm.embeddings.") :]
+        suffix = name[len("esm.embeddings."):]
         # Skip position_ids (buffer, not a parameter)
         if suffix == "position_ids":
             return None
@@ -245,7 +417,10 @@ def _rename_esmfold_weight(name: str) -> str | None:
 
     # ESM-2 encoder: esm.encoder.layer.* → esm_encoder.layer.*
     if name.startswith("esm.encoder."):
-        suffix = name[len("esm.encoder.") :]
+        suffix = name[len("esm.encoder."):]
+        # Drop rotary_embeddings buffers (pre-computed in our model)
+        if "rotary_embeddings" in suffix:
+            return None
         # Reuse BERT weight renaming for the encoder internals
         renamed = _rename_bert_weight(f"bert.encoder.{suffix}")
         if renamed is None:
@@ -254,8 +429,8 @@ def _rename_esmfold_weight(name: str) -> str | None:
         return f"esm_{renamed}"
 
     # ESM MLP projection: esm_s_mlp.{0,1,3}.* → esm_s_mlp._{0,1,3}.*
-    # HF uses Sequential indices; we prefix with _ since Python attrs can't
-    # start with a digit.  Index 2 is ReLU (no parameters).
+    # HF uses Sequential indices; we prefix with _ since Python attrs
+    # can't start with a digit.  Index 2 is ReLU (no parameters).
     if name.startswith("esm_s_mlp."):
         suffix = name[len("esm_s_mlp."):]
         return f"esm_s_mlp._{suffix}"

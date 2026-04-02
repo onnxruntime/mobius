@@ -1249,6 +1249,44 @@ class EncoderConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class EsmFoldConfig(EncoderConfig):
+    """Configuration for ESMFold protein structure prediction models.
+
+    Adds fields specific to ESMFold / ESM-2 that are not present in the
+    generic :class:`ArchitectureConfig`:
+
+    - ``emb_layer_norm_before``: apply LayerNorm before token embeddings
+    - ``trunk_sequence_state_dim``: hidden dim of the folding trunk
+    - ``token_dropout``: ESM-2 training-time token masking
+    - ``is_folding_model``: distinguishes ESMFold from plain ESM-2
+    """
+
+    emb_layer_norm_before: bool = False
+    trunk_sequence_state_dim: int = 1024
+    token_dropout: bool = True
+    is_folding_model: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> EsmFoldConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        esmfold_config = getattr(config, "esmfold_config", None) or {}
+        trunk = (
+            esmfold_config.get("trunk", {})
+            if isinstance(esmfold_config, dict)
+            else {}
+        )
+        return cls(
+            **_shallow_fields(base),
+            emb_layer_norm_before=getattr(
+                config, "emb_layer_norm_before", False
+            ),
+            trunk_sequence_state_dim=trunk.get("sequence_state_dim", 1024),
+            token_dropout=getattr(config, "token_dropout", True),
+            is_folding_model=getattr(config, "is_folding_model", True),
+        )
+
+
+@dataclasses.dataclass
 class VisionLanguageConfig(CausalLMConfig):
     """Configuration for vision-language models (LLaVA, Qwen-VL, etc.).
 
