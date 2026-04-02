@@ -204,17 +204,22 @@ class _Lfm2TextModel(nn.Module):
     def forward(
         self,
         op: builder.OpBuilder,
-        input_ids: ir.Value,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
+        input_ids: ir.Value = None,
+        attention_mask: ir.Value = None,
+        position_ids: ir.Value = None,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        hidden_states = (
+            inputs_embeds if inputs_embeds is not None else self.embed_tokens(op, input_ids)
+        )
         position_embeddings = self.rotary_emb(op, position_ids)
 
+        # When inputs_embeds is provided (VL case), use it for sequence length extraction
+        seq_tensor = input_ids if input_ids is not None else inputs_embeds
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=seq_tensor,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
@@ -257,10 +262,11 @@ class Lfm2CausalLMModel(nn.Module):
     def forward(
         self,
         op: builder.OpBuilder,
-        input_ids: ir.Value,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
+        input_ids: ir.Value = None,
+        attention_mask: ir.Value = None,
+        position_ids: ir.Value = None,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -268,6 +274,7 @@ class Lfm2CausalLMModel(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values

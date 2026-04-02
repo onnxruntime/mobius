@@ -28,6 +28,7 @@ __all__ = [
     "DenoisingTask",
     "FeatureExtractionTask",
     "HybridCausalLMTask",
+    "HybridVisionLanguageTask",
     "MoshiTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
@@ -81,6 +82,7 @@ from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,
+    HybridVisionLanguageTask,
     MllamaVisionLanguageTask,
     QwenVLTask,
     VisionLanguageTask,
@@ -104,6 +106,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "seq2seq": Seq2SeqTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
+    "hybrid-vision-language": HybridVisionLanguageTask,
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,

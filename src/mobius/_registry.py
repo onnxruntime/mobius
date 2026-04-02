@@ -480,6 +480,14 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("lfm2_audio", Lfm2AudioModel)
 
+    from mobius.models.lfm2_moe import Lfm2MoeCausalLMModel
+
+    reg.register("lfm2_moe", Lfm2MoeCausalLMModel)
+
+    from mobius.models.lfm2_vl import Lfm2VlModel
+
+    reg.register("lfm2_vl", Lfm2VlModel, task="hybrid-vision-language")
+
     # --- Moshi / PersonaPlex (audio-to-audio) ---
     from mobius.models.moshi import MoshiModel
 

@@ -460,3 +460,72 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         _register_kv_cache_outputs(graph, present_key_values)
 
         return _make_model(graph)
+
+
+class HybridVisionLanguageTask(VisionLanguageTask):
+    """3-model VL split with hybrid (conv + KV) cache for the text decoder.
+
+    Used by models whose text backbone mixes ``"conv"`` (ShortConv) and
+    ``"full_attention"`` layers -- e.g. LFM2-VL.
+
+    Vision and embedding models are identical to :class:`VisionLanguageTask`.
+    Only the decoder is changed: it uses hybrid cache inputs/outputs instead
+    of standard KV-only cache.
+    """
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build text decoder with hybrid cache (conv_state + KV)."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        inputs_embeds = ir.Value(
+            name="inputs_embeds",
+            shape=ir.Shape([batch, seq_len, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        position_ids = ir.Value(
+            name="position_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [inputs_embeds, attention_mask, position_ids]
+
+        cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+            config,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        graph_inputs.extend(cache_inputs)
+
+        graph, graph_builder = _make_graph(graph_inputs, name="decoder")
+        op = graph_builder.op
+
+        logits, present_key_values = decoder(
+            op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+
+        logits.name = "logits"
+        graph.outputs.append(logits)
+        _register_hybrid_cache_outputs(
+            graph,
+            present_key_values,
+            config.layer_types or [],
+        )
+
+        return _make_model(graph)

@@ -60,6 +60,8 @@ __all__ = [
     "LayerNormCausalLMModel",
     "Lfm2AudioModel",
     "Lfm2CausalLMModel",
+    "Lfm2MoeCausalLMModel",
+    "Lfm2VlModel",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
@@ -166,6 +168,8 @@ from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.lfm2 import Lfm2CausalLMModel
 from mobius.models.lfm2_audio import Lfm2AudioModel
+from mobius.models.lfm2_moe import Lfm2MoeCausalLMModel
+from mobius.models.lfm2_vl import Lfm2VlModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel

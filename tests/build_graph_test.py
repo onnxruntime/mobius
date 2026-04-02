@@ -3961,3 +3961,136 @@ class TestBuildMoshiGraph:
         task = MoshiTask()
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, "moshi")
+
+
+class TestBuildLfm2MoeGraph:
+    """Verify LFM2-MoE hybrid MoE model builds correctly."""
+
+    def test_lfm2_moe_graph_builds(self):
+        """LFM2-MoE: hybrid-text-generation task builds without errors."""
+        from mobius._configs import Lfm2MoeConfig
+        from mobius.models.lfm2_moe import Lfm2MoeCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = _base_config(
+            config_cls=Lfm2MoeConfig,
+            num_hidden_layers=3,
+            layer_types=["conv", "conv", "full_attention"],
+            attn_qk_norm=True,
+            short_conv_kernel=3,
+            short_conv_bias=False,
+            num_dense_layers=1,
+            use_expert_bias=True,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+        module = Lfm2MoeCausalLMModel(config)
+        task = HybridCausalLMTask()
+        pkg = task.build(module, config)
+
+        model = pkg["model"]
+        assert model is not None
+
+        # Verify hybrid cache: conv layers get conv_state, attn layers get key/value
+        output_names = {out.name for out in model.graph.outputs}
+        assert "present.0.conv_state" in output_names
+        assert "present.1.conv_state" in output_names
+        assert "present.2.key" in output_names
+        assert "present.2.value" in output_names
+
+    def test_lfm2_moe_dense_layers_have_mlp(self):
+        """First num_dense_layers should use standard MLP, rest use MoE."""
+        from mobius._configs import Lfm2MoeConfig
+        from mobius.models.lfm2 import Lfm2ConvDecoderLayer
+        from mobius.models.lfm2_moe import Lfm2MoeCausalLMModel, _Lfm2MoeConvDecoderLayer
+
+        config = _base_config(
+            config_cls=Lfm2MoeConfig,
+            num_hidden_layers=3,
+            layer_types=["conv", "conv", "full_attention"],
+            attn_qk_norm=True,
+            short_conv_kernel=3,
+            short_conv_bias=False,
+            num_dense_layers=1,
+            use_expert_bias=True,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+        module = Lfm2MoeCausalLMModel(config)
+
+        # Layer 0 (dense): should be standard conv layer (no MoE)
+        assert isinstance(module.model.layers[0], Lfm2ConvDecoderLayer)
+        assert not isinstance(module.model.layers[0], _Lfm2MoeConvDecoderLayer)
+
+        # Layer 1 (MoE): should be MoE conv layer
+        assert isinstance(module.model.layers[1], _Lfm2MoeConvDecoderLayer)
+
+
+class TestBuildLfm2VlGraph:
+    """Verify LFM2-VL vision-language model builds correctly."""
+
+    def test_lfm2_vl_graph_builds(self):
+        """LFM2-VL: 3-model split builds without errors."""
+        from mobius._configs import Lfm2VlConfig, VisionConfig
+        from mobius.models.lfm2_vl import Lfm2VlModel
+        from mobius.tasks import HybridVisionLanguageTask
+
+        config = _base_config(
+            config_cls=Lfm2VlConfig,
+            num_hidden_layers=3,
+            layer_types=["conv", "conv", "full_attention"],
+            attn_qk_norm=True,
+            short_conv_kernel=3,
+            short_conv_bias=False,
+            image_token_id=396,
+            projector_hidden_size=TINY_HIDDEN,
+            projector_bias=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+        )
+        module = Lfm2VlModel(config)
+        task = HybridVisionLanguageTask()
+        pkg = task.build(module, config)
+
+        assert "decoder" in pkg
+        assert "vision" in pkg
+        assert "embedding" in pkg
+
+        # Decoder: inputs_embeds → logits + hybrid cache
+        decoder = pkg["decoder"]
+        d_inputs = {inp.name for inp in decoder.graph.inputs}
+        d_outputs = {out.name for out in decoder.graph.outputs}
+        assert "inputs_embeds" in d_inputs
+        assert "attention_mask" in d_inputs
+        assert "position_ids" in d_inputs
+        assert "logits" in d_outputs
+
+        # Hybrid cache outputs: conv layers get conv_state, attn gets key/value
+        assert "present.0.conv_state" in d_outputs
+        assert "present.1.conv_state" in d_outputs
+        assert "present.2.key" in d_outputs
+        assert "present.2.value" in d_outputs
+
+        # Vision: pixel_values → image_features
+        vision = pkg["vision"]
+        v_inputs = {inp.name for inp in vision.graph.inputs}
+        v_outputs = {out.name for out in vision.graph.outputs}
+        assert "pixel_values" in v_inputs
+        assert "image_features" in v_outputs
+
+        # Embedding: input_ids + image_features → inputs_embeds
+        emb = pkg["embedding"]
+        e_inputs = {inp.name for inp in emb.graph.inputs}
+        e_outputs = {out.name for out in emb.graph.outputs}
+        assert "input_ids" in e_inputs
+        assert "image_features" in e_inputs
+        assert "inputs_embeds" in e_outputs

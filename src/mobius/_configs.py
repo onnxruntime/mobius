@@ -1929,6 +1929,67 @@ class Lfm2AudioConfig(Lfm2Config):
 
 
 @dataclasses.dataclass
+class Lfm2MoeConfig(Lfm2Config):
+    """Configuration for LFM2-MoE: hybrid ShortConv+Attention with MoE FFN.
+
+    Extends Lfm2Config with Mixture-of-Experts FFN layers. The first
+    ``num_dense_layers`` layers use a standard MLP; remaining layers use
+    MoELayer with TopK routing.
+
+    MoE fields (inherited from ArchitectureConfig): num_local_experts,
+    num_experts_per_tok, moe_intermediate_size, norm_topk_prob,
+    routed_scaling_factor.
+
+    HuggingFace reference: ``Lfm2MoeForCausalLM``.
+    """
+
+    num_dense_layers: int = 2
+    use_expert_bias: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2MoeConfig:
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+        return cls(
+            **base_fields,
+            num_dense_layers=getattr(config, "num_dense_layers", 2),
+            use_expert_bias=getattr(config, "use_expert_bias", True),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2VlConfig(Lfm2Config):
+    """Configuration for LFM2-VL: vision-language with LFM2 hybrid backbone.
+
+    Extends Lfm2Config with SigLIP2 vision encoder and MLP projector fields.
+    Vision encoder fields are in the inherited ``vision`` attribute (VisionConfig).
+
+    HuggingFace reference: ``Lfm2VlForConditionalGeneration``.
+    """
+
+    image_token_id: int = 396
+    projector_hidden_size: int = 2048
+    projector_bias: bool = True
+    downsample_factor: int = 2
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2VlConfig:
+        # ArchitectureConfig.from_transformers auto-extracts text_config
+        # and vision_config via _extract_vision_config
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+        # VL-specific fields from top-level config
+        vl_source = parent_config if parent_config is not None else config
+        return cls(
+            **base_fields,
+            image_token_id=getattr(vl_source, "image_token_id", 396),
+            projector_hidden_size=getattr(vl_source, "projector_hidden_size", 2048),
+            projector_bias=getattr(vl_source, "projector_bias", True),
+            downsample_factor=getattr(vl_source, "downsample_factor", 2),
+        )
+
+
+@dataclasses.dataclass
 class MoshiConfig(ArchitectureConfig):
     """Configuration for Moshi/PersonaPlex audio-to-audio models.
 
@@ -2063,3 +2124,127 @@ class WhisperConfig(BaseModelConfig):
             options["dtype"] = resolved
 
         return cls(**options)
+
+
+@dataclasses.dataclass
+class AudioTokenizerEncoderConfig:
+    """Configuration for a causal ConvNeXt audio tokenizer encoder.
+
+    Used by both the acoustic and semantic tokenizer encoders in
+    VibeVoice ASR (``VibeVoiceAcousticTokenizerEncoderModel``).
+
+    Fields:
+        channels:              Number of input audio channels (1 for mono).
+        num_filters:           Base channel count for stem conv output.
+        depths:                Number of ConvNeXt blocks per stage (stem + N encoder layers).
+        downsampling_ratios:   Stride for each encoder layer's strided conv.
+        kernel_size:           Conv kernel size used throughout.
+        ffn_expansion:         FFN hidden_size multiplier (hidden_size * ffn_expansion).
+        rms_norm_eps:          Epsilon for RMSNorm layers.
+        layer_scale_init_value: Initial value for per-channel layer scale (gamma).
+        hidden_size:           Output latent dimension (head conv output channels).
+    """
+
+    channels: int = 1
+    num_filters: int = 32
+    depths: list[int] = dataclasses.field(default_factory=lambda: [1, 1, 1, 1, 1, 1, 1])
+    downsampling_ratios: list[int] = dataclasses.field(
+        default_factory=lambda: [8, 8, 4, 2, 2, 2]
+    )
+    kernel_size: int = 7
+    ffn_expansion: int = 4
+    rms_norm_eps: float = 1e-6
+    layer_scale_init_value: float = 1e-6
+    hidden_size: int = 64
+
+    @classmethod
+    def from_dict(cls, d: dict) -> AudioTokenizerEncoderConfig:
+        """Construct from a plain dict (e.g., from a HuggingFace sub-config)."""
+        return cls(
+            channels=d.get("channels", 1),
+            num_filters=d.get("num_filters", 32),
+            depths=d.get("depths", [1, 1, 1, 1, 1, 1, 1]),
+            downsampling_ratios=d.get("downsampling_ratios", [8, 8, 4, 2, 2, 2]),
+            kernel_size=d.get("kernel_size", 7),
+            ffn_expansion=d.get("ffn_expansion", 4),
+            rms_norm_eps=d.get("rms_norm_eps", 1e-6),
+            layer_scale_init_value=d.get("layer_scale_init_value", 1e-6),
+            hidden_size=d.get("hidden_size", 64),
+        )
+
+
+@dataclasses.dataclass
+class VibeVoiceAsrConfig(ArchitectureConfig):
+    """Configuration for VibeVoice ASR (microsoft/VibeVoice-ASR-HF).
+
+    Extends :class:`ArchitectureConfig` with sub-configs for the two causal
+    ConvNeXt audio encoders (acoustic + semantic tokenizers).
+
+    The language model backbone is Qwen2-style (hidden_size=3584, 28 layers).
+    Both audio encoders share the same architecture but differ in
+    ``hidden_size`` (acoustic=64, semantic=128).
+    """
+
+    acoustic_encoder: AudioTokenizerEncoderConfig = dataclasses.field(
+        default_factory=AudioTokenizerEncoderConfig
+    )
+    semantic_encoder: AudioTokenizerEncoderConfig = dataclasses.field(
+        default_factory=lambda: AudioTokenizerEncoderConfig(hidden_size=128)
+    )
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> VibeVoiceAsrConfig:
+        """Build from a HuggingFace config object.
+
+        Reads the top-level language model fields from ``config`` (or
+        ``parent_config`` if provided) and constructs sub-configs for the
+        acoustic and semantic tokenizer encoders from the nested
+        ``acoustic_tokenizer_config`` / ``semantic_tokenizer_config`` dicts.
+        """
+        src = parent_config if parent_config is not None else config
+        lm_config = getattr(src, "language_model_config", None) or src
+
+        hidden_size = getattr(lm_config, "hidden_size", 3584)
+        num_heads = getattr(lm_config, "num_attention_heads", 28)
+        head_dim = getattr(lm_config, "head_dim", hidden_size // num_heads)
+
+        options: dict = dict(
+            model_type=getattr(src, "model_type", "vibevoice_asr"),
+            vocab_size=getattr(lm_config, "vocab_size", 151936),
+            hidden_size=hidden_size,
+            intermediate_size=getattr(lm_config, "intermediate_size", 18944),
+            num_hidden_layers=getattr(lm_config, "num_hidden_layers", 28),
+            num_attention_heads=num_heads,
+            num_key_value_heads=getattr(lm_config, "num_key_value_heads", 4),
+            head_dim=head_dim,
+            rms_norm_eps=getattr(lm_config, "rms_norm_eps", 1e-6),
+            rope_theta=getattr(lm_config, "rope_theta", 1_000_000.0),
+            hidden_act=getattr(lm_config, "hidden_act", "silu"),
+            tie_word_embeddings=getattr(lm_config, "tie_word_embeddings", False),
+            audio_token_id=getattr(src, "audio_token_id", None),
+        )
+
+        resolved = _resolve_dtype(src) or _resolve_dtype(lm_config)
+        if resolved is not None:
+            options["dtype"] = resolved
+
+        # Build sub-configs for the two audio tokenizer encoders
+        ac_dict = getattr(src, "acoustic_tokenizer_config", None)
+        sem_dict = getattr(src, "semantic_tokenizer_config", None)
+
+        acoustic_enc = (
+            AudioTokenizerEncoderConfig.from_dict(
+                ac_dict if isinstance(ac_dict, dict) else vars(ac_dict)
+            )
+            if ac_dict is not None
+            else AudioTokenizerEncoderConfig()
+        )
+        semantic_enc = (
+            AudioTokenizerEncoderConfig.from_dict(
+                sem_dict if isinstance(sem_dict, dict) else vars(sem_dict)
+            )
+            if sem_dict is not None
+            else AudioTokenizerEncoderConfig(hidden_size=128)
+        )
+
+        return cls(**options, acoustic_encoder=acoustic_enc, semantic_encoder=semantic_enc)
