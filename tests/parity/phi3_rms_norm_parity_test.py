@@ -72,7 +72,7 @@ def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: in
     b.push_module("norm")
     # Register parameters as initializers using the public API instead of
     # relying on internal `_parameters` / `_realize` behavior.
-    for name, param in norm.named_parameters():
+    for _name, param in norm.named_parameters():
         graph.register_initializer(param)
     out = norm.forward(op, x_val)
     b.pop_module()
