@@ -10,17 +10,17 @@ decoder-only fusions from applying to vision or embedding models.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-import pytest
 import onnx_ir as ir
-from _test_configs import _base_config, TINY_HIDDEN, TINY_HEADS, TINY_KV_HEADS
+import pytest
+from _test_configs import _base_config
 
 from mobius._builder import _count_ops, build_from_module
 from mobius._registry import registry
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -162,3 +162,86 @@ def test_cuda_float16_has_gqa_qwen2():
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count > 0, f"CUDA+FLOAT16 Qwen2 should have GQA, got {gqa_count}"
+
+
+# ---------------------------------------------------------------------------
+# Trace optimization
+# ---------------------------------------------------------------------------
+
+
+def test_trace_optimization_produces_output(caplog):
+    """trace_optimization=True emits INFO logs with stage headers and rule names."""
+    config = _base_config(dtype=ir.DataType.FLOAT)
+    module_cls = registry.get("llama")
+    module = module_cls(config)
+
+    with caplog.at_level(logging.INFO, logger="mobius._builder"):
+        build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
+
+    messages = [r.message for r in caplog.records]
+
+    # Header line identifies target/dtype/role
+    assert any("[EP Trace] Target:" in m for m in messages), (
+        "Expected '[EP Trace] Target:' header in trace output"
+    )
+    # Stage labels are present
+    assert any("Stage 2: Fusion" in m for m in messages), (
+        "Expected 'Stage 2: Fusion' in trace output"
+    )
+    assert any("Stage 3: Lowering" in m for m in messages), (
+        "Expected 'Stage 3: Lowering' in trace output"
+    )
+    # At least one rule name is logged
+    assert any("GQAFusion" in m for m in messages), (
+        "Expected 'GQAFusion' rule name in trace output (cpu+FLOAT runs GQA fusion)"
+    )
+    # Summary table is emitted
+    assert any("Summary" in m for m in messages), "Expected 'Summary' table in trace output"
+
+
+def test_trace_optimization_no_matches_shows_zero(caplog):
+    """When a rule has no matches, trace output says 'no matches (0 nodes affected)'."""
+    # CPU+FLOAT16 skips GQA fusion — GQAFusion should show no matches.
+    config = _base_config(dtype=ir.DataType.FLOAT16)
+    module_cls = registry.get("llama")
+    module = module_cls(config)
+
+    with caplog.at_level(logging.INFO, logger="mobius._builder"):
+        build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
+
+    messages = [r.message for r in caplog.records]
+    # CPU+FLOAT16 has no GQA fusion in the support matrix, so GQAFusion should
+    # NOT appear at all in the trace (it's not added to the stage list).
+    # But SkipLayerNorm or BiasGelu may show zero matches depending on the model.
+    # Verify that the "no matches" format appears at least once (BiasGelu won't match Llama).
+    assert any("no matches (0 nodes affected)" in m for m in messages), (
+        "Expected at least one 'no matches' entry — BiasGelu should not match Llama (uses SiLU)"
+    )
+
+
+def test_trace_optimization_is_noop_without_flag():
+    """Without trace_optimization, build_from_module logs nothing at EP Trace level."""
+    import logging as _logging
+
+    config = _base_config(dtype=ir.DataType.FLOAT)
+    module_cls = registry.get("llama")
+    module = module_cls(config)
+
+    captured: list[str] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    builder_logger = _logging.getLogger("mobius._builder")
+    handler = _Capture()
+    handler.setLevel(_logging.INFO)
+    builder_logger.addHandler(handler)
+    try:
+        build_from_module(module, config, execution_provider="cpu", trace_optimization=False)
+    finally:
+        builder_logger.removeHandler(handler)
+
+    assert not any("[EP Trace]" in m for m in captured), (
+        "Expected no '[EP Trace]' log output when trace_optimization=False"
+    )

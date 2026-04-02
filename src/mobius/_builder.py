@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 import contextlib
+import dataclasses
 import logging
 import warnings
 
@@ -182,16 +183,100 @@ def _count_ops(model: ir.Model, op_type: str) -> int:
     return sum(1 for node in model.graph.all_nodes() if node.op_type == op_type)
 
 
+def _count_all_ops(model: ir.Model) -> dict[str, int]:
+    """Count all op types present in the model graph (including subgraphs)."""
+    counts: dict[str, int] = {}
+    for node in model.graph.all_nodes():
+        counts[node.op_type] = counts.get(node.op_type, 0) + 1
+    return counts
+
+
+@dataclasses.dataclass
+class _TraceEntry:
+    """Per-stage diagnostic data collected during traced optimization."""
+
+    name: str
+    added: dict[str, int]  # op_type → count added
+    removed: dict[str, int]  # op_type → count removed (positive values)
+
+    @property
+    def nodes_added(self) -> int:
+        return sum(self.added.values())
+
+    @property
+    def nodes_removed(self) -> int:
+        return sum(self.removed.values())
+
+    @property
+    def matched(self) -> int:
+        """Nodes consumed/replaced by this stage (proxy for 'rules matched')."""
+        return self.nodes_removed
+
+
+def _make_trace_entry(name: str, before: dict[str, int], after: dict[str, int]) -> _TraceEntry:
+    all_ops = set(before) | set(after)
+    added = {
+        op: after.get(op, 0) - before.get(op, 0)
+        for op in all_ops
+        if after.get(op, 0) > before.get(op, 0)
+    }
+    removed = {
+        op: before.get(op, 0) - after.get(op, 0)
+        for op in all_ops
+        if before.get(op, 0) > after.get(op, 0)
+    }
+    return _TraceEntry(name=name, added=added, removed=removed)
+
+
+def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -> None:
+    """Apply a single optimization stage — either a rewrite-rule list or an IR pass."""
+    if isinstance(rules_or_pass, ir.passes.InPlacePass):
+        rules_or_pass(model)
+    elif rules_or_pass:
+        from onnxscript.rewriter import rewrite
+
+        rewrite(model, pattern_rewrite_rules=rules_or_pass)
+
+
+def _log_trace_entry(entry: _TraceEntry) -> None:
+    if not entry.added and not entry.removed:
+        logger.info("[EP Trace]   %-25s: no matches (0 nodes affected)", entry.name)
+        return
+    parts = [f"+{count} {op}" for op, count in sorted(entry.added.items())]
+    parts += [f"-{count} {op}" for op, count in sorted(entry.removed.items())]
+    logger.info("[EP Trace]   %-25s: %s", entry.name, ", ".join(parts))
+
+
+def _log_trace_summary(entries: list[_TraceEntry]) -> None:
+    if not entries:
+        return
+    logger.info("[EP Trace] Summary:")
+    logger.info("[EP Trace]   %-25s | %7s | %6s | %6s", "Rule", "Matched", "+Nodes", "-Nodes")
+    logger.info("[EP Trace]   %s", "-" * 57)
+    for e in entries:
+        logger.info(
+            "[EP Trace]   %-25s | %7d | %6d | %6d",
+            e.name,
+            e.matched,
+            e.nodes_added,
+            e.nodes_removed,
+        )
+
+
 def _get_optimization_passes(
     ep: str,
     dtype: ir.DataType,
     model_role: str = "decoder",
-) -> tuple[list, list]:
-    """Return ``(fuse_rules, lower_rules)`` for the given EP, dtype, and role.
+) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
+    """Return ``(fuse_stages, lower_stages)`` for the given EP, dtype, and role.
 
-    Only fusions the target EP supports are returned. Lowering passes
-    decompose ops the EP does not support. Phase 2 stubs are left as
-    comments for the next implementation phase.
+    Each stage is a ``(name, rules_or_pass)`` pair where ``rules_or_pass``
+    is either a list of onnxscript rewrite rules or an
+    :class:`ir.passes.InPlacePass` instance (for IR-level passes that cannot
+    be expressed as pattern rewrite rules).
+
+    Only fusions the target EP supports are returned. Lowering stages
+    decompose ops the EP does not support.
 
     Args:
         ep: Target execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
@@ -202,11 +287,13 @@ def _get_optimization_passes(
             only applied to the decoder role.
 
     Returns:
-        ``(fuse_rules, lower_rules)`` — each a flat list of rewrite-rule
-        instances suitable for passing to ``onnxscript.rewriter.rewrite()``.
+        ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
+        tuples. The payload is either a list of rewrite rules or an
+        :class:`ir.passes.InPlacePass`.
     """
     from mobius.rewrite_rules import (
         cast_int64_to_int32_rules,
+        decompose_if_pass,
         decompose_skip_layer_norm_rules,
         eliminate_shape_rules,
         gelu_fusion_rules,
@@ -217,32 +304,36 @@ def _get_optimization_passes(
         unpack_qkv_rules,
     )
 
-    fuse: list = []
-    lower: list = []
+    fuse: list[tuple[str, list]] = []
+    lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and (ep, dtype) in _GQA_SUPPORT:
-        fuse.extend(group_query_attention_rules())
+        fuse.append(("GQAFusion", list(group_query_attention_rules())))
 
     # --- Normalization fusions (all roles, all dtypes) ---
     # TRT-RTX decomposes SkipNorm/SkipLayerNorm rather than fusing them.
     if ep != "trt-rtx":
-        fuse.extend(skip_norm_rules())
-        fuse.extend(skip_layer_norm_rules())
+        fuse.append(("SkipNorm", list(skip_norm_rules())))
+        fuse.append(("SkipLayerNorm", list(skip_layer_norm_rules())))
 
     # --- Activation fusions (all roles, all dtypes) ---
-    fuse.extend(gelu_fusion_rules())
+    fuse.append(("BiasGelu", list(gelu_fusion_rules())))
 
     # --- TRT-RTX lowering: decompose fused skip-norm ops ---
     if ep == "trt-rtx":
-        lower.extend(decompose_skip_layer_norm_rules())
+        lower.append(("DecomposeSkipLayerNorm", list(decompose_skip_layer_norm_rules())))
 
     if ep == "dml":
-        lower.extend(separate_rope_rules())  # BP-6: decompose fused RoPE
-        lower.extend(unpack_qkv_rules())  # BP-7: split packed QKV
+        lower.append(
+            ("SeparateRoPE", list(separate_rope_rules()))
+        )  # BP-6: decompose fused RoPE
+        lower.append(("UnpackQKV", list(unpack_qkv_rules())))  # BP-7: split packed QKV
+        lower.append(("DecomposeIf", decompose_if_pass()))  # BP-10: If→Where for DML
     elif ep == "webgpu":
-        lower.extend(eliminate_shape_rules())  # BP-13: Shape → ReduceSum+ReduceMax
-        lower.extend(cast_int64_to_int32_rules())  # BP-12: INT64 → INT32 for Gather indices
+        lower.append(("EliminateShape", list(eliminate_shape_rules())))  # BP-13
+        lower.append(("CastInt64ToInt32", list(cast_int64_to_int32_rules())))  # BP-12
+        lower.append(("DecomposeIf", decompose_if_pass()))  # BP-10: If→Where for WebGPU
 
     return fuse, lower
 
@@ -252,6 +343,7 @@ def _optimize(
     ep: str = "cpu",
     dtype: ir.DataType = ir.DataType.FLOAT,
     model_role: str = "decoder",
+    trace: bool = False,
 ) -> None:
     """Apply EP-aware optimization passes to a model in-place.
 
@@ -263,7 +355,7 @@ def _optimize(
        (e.g. GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` support
        matrix and ``model_role``.
     3. **Lowering** — decompose ops the EP does not support
-       (Phase 2 stubs; currently empty for all EPs).
+       (e.g. SeparateRoPE, UnpackQKV, DecomposeIf for DML/WebGPU).
     4. **Fold** — final dead-node removal and constant folding after
        rewrites.
 
@@ -277,30 +369,81 @@ def _optimize(
         ep: Target execution provider.
         dtype: Model dtype for support-matrix lookups.
         model_role: Semantic role of this model component.
+        trace: When ``True``, emit per-stage diagnostic logs at INFO level
+            showing which rules matched, how many nodes were added/removed,
+            and a final summary table. Useful for debugging EP configuration.
     """
     # Stage 1: Base cleanup (EP-agnostic — always applied).
-    pass_ = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
+    if trace:
+        before_total = sum(_count_all_ops(model).values())
+        logger.info("[EP Trace] Target: %s, dtype: %s, role: %s", ep, dtype, model_role)
+        logger.info("[EP Trace] Stage 1: Cleanup (%d passes)", len(_DEFAULT_PASSES))
+
+    cleanup_pass = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
     if flags.suppress_dedup_warning:
         with _suppress_dedup_empty_initializer_warnings():
-            pass_(model)
+            cleanup_pass(model)
     else:
-        pass_(model)
+        cleanup_pass(model)
 
-    # Stage 2: Fusion — gated by EP support matrix and model_role.
-    # Stage 3: Lowering — Phase 2 stubs; currently empty for all EPs.
-    fuse_rules, lower_rules = _get_optimization_passes(ep, dtype, model_role)
+    if trace:
+        after_total = sum(_count_all_ops(model).values())
+        logger.info(
+            "[EP Trace]   Cleanup: %d → %d nodes (%+d)",
+            before_total,
+            after_total,
+            after_total - before_total,
+        )
 
-    if fuse_rules:
-        from onnxscript.rewriter import rewrite
+    # Stage 2: Fusion / Stage 3: Lowering — gated by EP support matrix.
+    fuse_stages, lower_stages = _get_optimization_passes(ep, dtype, model_role)
 
-        rewrite(model, pattern_rewrite_rules=fuse_rules)
+    trace_entries: list[_TraceEntry] = []
 
-    if lower_rules:
-        from onnxscript.rewriter import rewrite
+    if trace:
+        logger.info("[EP Trace] Stage 2: Fusion (%d rule groups)", len(fuse_stages))
+        for name, rules_or_pass in fuse_stages:
+            before = _count_all_ops(model)
+            _apply_stage(model, rules_or_pass)
+            after = _count_all_ops(model)
+            entry = _make_trace_entry(name, before, after)
+            trace_entries.append(entry)
+            _log_trace_entry(entry)
 
-        rewrite(model, pattern_rewrite_rules=lower_rules)
+        logger.info(
+            "[EP Trace] Stage 3: Lowering (%d rule groups for %s)", len(lower_stages), ep
+        )
+        for name, rules_or_pass in lower_stages:
+            before = _count_all_ops(model)
+            _apply_stage(model, rules_or_pass)
+            after = _count_all_ops(model)
+            entry = _make_trace_entry(name, before, after)
+            trace_entries.append(entry)
+            _log_trace_entry(entry)
+    else:
+        # Batch all rewrite rules for efficiency; apply IR passes separately.
+        all_fuse_rules = [r for _, rp in fuse_stages if isinstance(rp, list) for r in rp]
+        all_lower_rules = [r for _, rp in lower_stages if isinstance(rp, list) for r in rp]
+        lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
+
+        if all_fuse_rules:
+            from onnxscript.rewriter import rewrite
+
+            rewrite(model, pattern_rewrite_rules=all_fuse_rules)
+
+        if all_lower_rules:
+            from onnxscript.rewriter import rewrite
+
+            rewrite(model, pattern_rewrite_rules=all_lower_rules)
+
+        for _, ir_pass in lower_ir_passes:
+            ir_pass(model)
 
     # Stage 4: Final dead-node removal and constant folding after rewrites.
+    if trace:
+        before_fold = sum(_count_all_ops(model).values())
+        logger.info("[EP Trace] Stage 4: Constant folding")
+
     fold_pass = ir.passes.PassManager(
         [
             common_passes.RemoveUnusedNodesPass(),
@@ -312,6 +455,16 @@ def _optimize(
         ]
     )
     fold_pass(model)
+
+    if trace:
+        after_fold = sum(_count_all_ops(model).values())
+        logger.info(
+            "[EP Trace]   Fold: %d → %d nodes (%+d)",
+            before_fold,
+            after_fold,
+            after_fold - before_fold,
+        )
+        _log_trace_summary(trace_entries)
 
     # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
     # Only fires when Attention nodes are present — models with no attention
@@ -377,6 +530,7 @@ def build_from_module(
     task: str | ModelTask = "text-generation",
     *,
     execution_provider: str = "cpu",
+    trace_optimization: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -398,6 +552,10 @@ def build_from_module(
             ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``. Controls
             which fusion and lowering passes are applied during graph
             optimization.
+        trace_optimization: When ``True``, log step-by-step diagnostic
+            output at INFO level for each optimization stage, showing which
+            rules matched and how many nodes were added/removed. Useful for
+            debugging EP configuration and rule coverage.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -446,7 +604,13 @@ def build_from_module(
 
     for name, model in pkg.items():
         role = _MODEL_ROLE_MAP.get(name, "decoder")
-        _optimize(model, ep=execution_provider, dtype=dtype, model_role=role)
+        _optimize(
+            model,
+            ep=execution_provider,
+            dtype=dtype,
+            model_role=role,
+            trace=trace_optimization,
+        )
     return pkg
 
 
@@ -459,6 +623,7 @@ def build(
     load_weights: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "cpu",
+    trace_optimization: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -496,6 +661,9 @@ def build(
             ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``. Controls
             which fusion and lowering passes are applied during graph
             optimization.
+        trace_optimization: When ``True``, log step-by-step diagnostic
+            output at INFO level for each optimization stage. See
+            :func:`build_from_module` for details.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -520,8 +688,6 @@ def build(
         task = CausalLMTask(static_cache=True, max_seq_len=2048)
         pkg = build("meta-llama/Llama-3-8B", task=task)
     """
-    import dataclasses
-
     import transformers
 
     from mobius._config_resolver import (
@@ -552,6 +718,7 @@ def build(
 
     # Validate model/EP compatibility before graph construction
     from mobius._ep_validation import validate_ep_support
+
     validate_ep_support(model_type, execution_provider)
 
     parent_config = hf_config
@@ -602,7 +769,13 @@ def build(
         task = _default_task_for_model(model_type)
 
     model_module = module_class(config)
-    pkg = build_from_module(model_module, config, task, execution_provider=execution_provider)
+    pkg = build_from_module(
+        model_module,
+        config,
+        task,
+        execution_provider=execution_provider,
+        trace_optimization=trace_optimization,
+    )
 
     # Set graph names
     for name, model in pkg.items():
