@@ -61,6 +61,19 @@ class BitNetAttention(Attention):
         key_states = self.k_proj(op, hidden_states)
         value_states = self.v_proj(op, hidden_states)
 
+        # Optional Q/K normalization (inherited from base Attention)
+        if self.q_norm is not None and self.k_norm is not None:
+            if self._qk_norm_full:
+                query_states = self.q_norm(op, query_states)
+                key_states = self.k_norm(op, key_states)
+            else:
+                query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+                key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+                query_states = self.q_norm(op, query_states)
+                key_states = self.k_norm(op, key_states)
+                query_states = op.Reshape(query_states, [0, 0, -1])
+                key_states = op.Reshape(key_states, [0, 0, -1])
+
         # RoPE
         if position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
