@@ -182,6 +182,8 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Audio / speech models (require audio inputs) ---
     "data2vec-audio": "Audio model — requires audio inputs",
     "lfm2_audio": "Multi-model audio architecture — tested via TestBuildLfm2AudioGraph",
+    "moshi": "Multi-model audio-to-audio — tested via TestBuildMoshiGraph",
+    "personaplex": "Multi-model audio-to-audio — tested via TestBuildMoshiGraph",
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",
