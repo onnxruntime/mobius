@@ -219,9 +219,13 @@ class _Phi3VEmbeddingModel(nn.Module):
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         # (batch, seq_len, hidden_size)
-        text_embeds = self.embed_tokens(op, input_ids)
-
         image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        # Replace image token positions with index 0 before the Gather so that
+        # negative or out-of-range image token IDs don't cause undefined behavior.
+        # These positions will be overwritten by image features via op.Where below.
+        safe_ids = op.Where(image_mask, op.Constant(value_int=0), input_ids)
+        text_embeds = self.embed_tokens(op, safe_ids)
+
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
         mask_int = op.Cast(image_mask, to=7)  # INT64
