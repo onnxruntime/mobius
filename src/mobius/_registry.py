@@ -23,6 +23,7 @@ import difflib
 from onnxscript import nn
 
 from mobius._configs import (
+    AriaConfig,
     BaseModelConfig,
     ConvNextConfig,
     DetrConfig,
@@ -34,6 +35,7 @@ from mobius._configs import (
     RtDetrConfig,
     Rwkv6Config,
     RwkvConfig,
+    Speech2TextConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -123,6 +125,7 @@ from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.mobilenet_v2 import MobileNetV2Model
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
 from mobius.models.moondream import MoondreamModel
+from mobius.models.aria import AriaForConditionalGeneration
 from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.owlv2 import Owlv2ForObjectDetection
@@ -141,6 +144,7 @@ from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.videollama3 import VideoLLaMA3Model
 from mobius.models.vit import ViTModel
+from mobius.models.speech2text import Speech2TextForConditionalGeneration
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
@@ -550,6 +554,12 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("blip-2", Blip2Model, task="vision-language")
     reg.register(
+        "aria",
+        AriaForConditionalGeneration,
+        task="vision-language",
+        config_class=AriaConfig,
+    )
+    reg.register(
         "moondream1",
         MoondreamModel,
         task="vision-language",
@@ -580,6 +590,12 @@ def _create_default_registry() -> ModelRegistry:
         MoonshineForConditionalGeneration,
         task="moonshine-speech-to-text",
         config_class=MoonshineConfig,
+    )
+    reg.register(
+        "speech_to_text",
+        Speech2TextForConditionalGeneration,
+        task="speech2text-seq2seq",
+        config_class=Speech2TextConfig,
     )
 
     reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")

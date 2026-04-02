@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 
 from mobius._configs import (
+    AriaConfig,
     ArchitectureConfig,
     AudioConfig,
     BambaConfig,
@@ -48,6 +49,7 @@ from mobius._configs import (
     RwkvConfig,
     Sam2Config,
     SegformerConfig,
+    Speech2TextConfig,
     VisionConfig,
     WhisperConfig,
     YolosConfig,
@@ -2365,6 +2367,20 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- Aria (Rhymes AI: SigLIP ViT + perceiver projector + AriaText MoE decoder) ---
+    (
+        "aria",
+        {
+            "_config_cls": AriaConfig,
+            "vision": _TINY_VISION,
+            "image_token_id": 9,
+            "moe_num_experts": 4,
+            "moe_topk": 2,
+            "moe_num_shared_experts": 1,
+            "max_query_tokens": 4,
+        },
+        True,
+    ),
 ]
 
 
@@ -2403,6 +2419,24 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "partial_rotary_factor": 0.9,
             "rope_theta": 10000.0,
             "max_position_embeddings": 64,
+        },
+        True,
+    ),
+    # --- Facebook Speech2Text (Conv1d subsampler + transformer, ASR) ---
+    (
+        "speech_to_text",
+        {
+            "_config_cls": Speech2TextConfig,
+            "input_feat_per_channel": 16,
+            "input_channels": 1,
+            "conv_channels": 64,
+            "conv_kernel_sizes": [3, 3],
+            "num_conv_layers": 2,
+            "max_source_positions": 64,
+            "max_target_positions": 32,
+            "num_decoder_layers": 2,
+            "scale_embedding": True,
+            "rms_norm_eps": 1e-5,
         },
         True,
     ),

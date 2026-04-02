@@ -8,6 +8,7 @@ __all__ = [
     "ArceeCausalLMModel",
     "AutoencoderKLModel",
     "AltCLIPModel",
+    "AriaForConditionalGeneration",
     "AutoencoderKLQwenImageModel",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
@@ -136,6 +137,7 @@ __all__ = [
     "ViTModel",
     "VideoAutoencoderModel",
     "Wav2Vec2Model",
+    "Speech2TextForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "XLMCausalLMModel",
     "ZoeDepthForDepthEstimation",
@@ -144,6 +146,7 @@ __all__ = [
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
 from mobius.models.altclip import AltCLIPModel
+from mobius.models.aria import AriaForConditionalGeneration
 from mobius.models.apertus import ApertusCausalLMModel
 from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
@@ -276,6 +279,7 @@ from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.videollama3 import VideoLLaMA3Model
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
+from mobius.models.speech2text import Speech2TextForConditionalGeneration
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.zoedepth import ZoeDepthForDepthEstimation

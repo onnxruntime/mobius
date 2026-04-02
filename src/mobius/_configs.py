@@ -1906,9 +1906,7 @@ class MoonshineConfig(ArchitectureConfig):
     encoder_hidden_act: str = "gelu"
 
     @classmethod
-    def from_transformers(
-        cls, config, parent_config=None
-    ) -> MoonshineConfig:
+    def from_transformers(cls, config, parent_config=None) -> MoonshineConfig:
         dec_heads = getattr(config, "decoder_num_attention_heads", config.num_attention_heads)
         dec_kv_heads = getattr(config, "decoder_num_key_value_heads", dec_heads)
         head_dim = config.hidden_size // dec_heads
@@ -2536,3 +2534,123 @@ class Rwkv6Config(ArchitectureConfig):
             options["dtype"] = resolved
 
         return cls(**options)
+
+
+@dataclasses.dataclass
+class Speech2TextConfig(ArchitectureConfig):
+    """Configuration for Facebook Speech2Text (S2T) encoder-decoder ASR models.
+
+    Key fields:
+        input_feat_per_channel: Number of mel-spectrogram bins (default 80).
+        input_channels:         Number of audio input channels (default 1).
+        conv_channels:          Inner channel count for Conv1d subsampler.
+        conv_kernel_sizes:      Kernel sizes for each subsampling conv layer.
+        num_conv_layers:        Number of Conv1d+GLU subsampling stages.
+        max_source_positions:   Maximum encoder positional embedding entries.
+        max_target_positions:   Maximum decoder positional embedding entries.
+        scale_embedding:        Whether to scale embeddings by sqrt(d_model).
+
+    ``num_hidden_layers`` is the **encoder** transformer depth.
+    ``num_decoder_layers`` is the **decoder** transformer depth.
+    ``num_attention_heads`` is used for both encoder and decoder attention.
+    """
+
+    input_feat_per_channel: int = 80
+    input_channels: int = 1
+    conv_channels: int = 1024
+    conv_kernel_sizes: list = dataclasses.field(default_factory=lambda: [5, 5])
+    num_conv_layers: int = 2
+    max_source_positions: int = 6000
+    max_target_positions: int = 1024
+    scale_embedding: bool = True
+
+    @classmethod
+    def from_transformers(cls, config) -> "Speech2TextConfig":
+        if config.model_type != "speech_to_text":
+            raise ValueError(
+                f"Speech2TextConfig expects model_type='speech_to_text', got '{config.model_type}'"
+            )
+
+        d_model = getattr(config, "d_model", 256)
+        num_heads = getattr(config, "decoder_attention_heads", 4)
+        head_dim = d_model // num_heads
+        encoder_layers = getattr(config, "encoder_layers", 12)
+        decoder_layers = getattr(config, "decoder_layers", 6)
+        intermediate_size = getattr(config, "encoder_ffn_dim", 2048)
+
+        options: dict = dict(
+            vocab_size=config.vocab_size,
+            hidden_size=d_model,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=encoder_layers,
+            num_decoder_layers=decoder_layers,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            head_dim=head_dim,
+            hidden_act=getattr(config, "activation_function", "relu"),
+            rms_norm_eps=1e-5,
+            input_feat_per_channel=getattr(config, "input_feat_per_channel", 80),
+            input_channels=getattr(config, "input_channels", 1),
+            conv_channels=getattr(config, "conv_channels", 1024),
+            conv_kernel_sizes=list(getattr(config, "conv_kernel_sizes", [5, 5])),
+            num_conv_layers=getattr(config, "num_conv_layers", 2),
+            max_source_positions=getattr(config, "max_source_positions", 6000),
+            max_target_positions=getattr(config, "max_target_positions", 1024),
+            scale_embedding=getattr(config, "scale_embedding", True),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", True),
+        )
+
+        resolved = _resolve_dtype(config)
+        if resolved is not None:
+            options["dtype"] = resolved
+
+        return cls(**options)
+
+
+@dataclasses.dataclass
+class AriaConfig(VisionLanguageConfig):
+    """Configuration for Aria multimodal MoE model (Rhymes AI).
+
+    Text decoder: AriaText — LLaMA-style RoPE attention + MoE FFN.
+    Vision encoder: SigLIP ViT (idefics3_vision, image_size=980, patch=14).
+    Projector: perceiver-style cross-attention resampler to text query tokens.
+
+    MoE fields:
+        moe_num_experts:       Total expert count (64 for Aria-3.6B).
+        moe_topk:              Active experts per token (6).
+        moe_num_shared_experts: Always-active shared experts (2).
+        max_query_tokens:      Fixed query count from projector (256 max).
+    """
+
+    moe_num_experts: int = 64
+    moe_topk: int = 6
+    moe_num_shared_experts: int = 2
+    max_query_tokens: int = 256
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> "AriaConfig":
+        # config = aria_text sub-config (model_type="aria_text")
+        # parent_config = full aria config (has vision_config and projector fields)
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # image_token_index is at the top level of the Aria config (not image_token_id)
+        image_tok = 9
+        if parent_config is not None:
+            image_tok = getattr(parent_config, "image_token_index", 9) or 9
+
+        # max_query_tokens from projector_patch_to_query_dict
+        patch_to_query = {}
+        if parent_config is not None:
+            pq = getattr(parent_config, "projector_patch_to_query_dict", {}) or {}
+            if isinstance(pq, dict):
+                patch_to_query = {int(k): int(v) for k, v in pq.items()}
+        max_query = max(patch_to_query.values()) if patch_to_query else 256
+
+        return cls(
+            **_shallow_fields(base),
+            moe_num_experts=getattr(config, "moe_num_experts", 64),
+            moe_topk=getattr(config, "moe_topk", 6),
+            moe_num_shared_experts=getattr(config, "moe_num_shared_experts", 2),
+            max_query_tokens=max_query,
+            image_token_id=image_tok,
+        )
