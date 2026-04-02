@@ -590,12 +590,12 @@ def build_lfm2_models(model_id: str, save_dir: Path | None = None) -> dict:
     pkg = build(model_id)
 
     if save_dir is not None:
-        import onnx
+        import onnx_ir
 
         save_dir.mkdir(parents=True, exist_ok=True)
         for name, model in pkg.items():
             out_path = save_dir / f"{name}.onnx"
-            onnx.save(model, str(out_path))
+            onnx_ir.save(model, out_path)
             print(f"[lfm2]   Saved {name} → {out_path}")
 
     return pkg
@@ -679,12 +679,12 @@ def main() -> None:
         # Save to a temp dir so ORT can load from file paths
         _tmp = tempfile.mkdtemp(prefix="lfm2_onnx_")
         tmp_dir = Path(_tmp)
-        import onnx
+        import onnx_ir
 
         model_paths = {}
         for name, model in onnx_models.items():
             out = tmp_dir / f"{name}.onnx"
-            onnx.save(model, str(out))
+            onnx_ir.save(model, out)
             model_paths[name] = str(out)
         print(f"[lfm2] Temporary ONNX models saved to {tmp_dir}")
 

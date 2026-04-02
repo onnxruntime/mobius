@@ -20,7 +20,7 @@ The pipeline runs in a dual-stream configuration:
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice numpy onnxruntime moshi
+    pip install mobius-ai[transformers] sounddevice numpy onnxruntime moshi huggingface_hub
 
 Usage::
 
@@ -41,7 +41,7 @@ Notes:
       license to download PersonaPlex weights.
     - The model runs at 12.5 Hz (80ms per frame) — one transformer step
       produces 1 text token + 16 audio codec tokens per step.
-    - Audio sample rate: 24 kHz (Moshi's EnCodec codec).
+    - Audio sample rate: 24 kHz (Mimi codec).
     - This example uses a simplified single-stream mode for clarity.
       Production use would run listener and speaker in parallel threads.
 """
@@ -64,9 +64,10 @@ import numpy as np
 DEFAULT_MODEL = "nvidia/personaplex-7b-v1"
 
 # Moshi audio parameters
-SAMPLE_RATE = 24_000  # EnCodec sample rate (Hz)
+SAMPLE_RATE = 24_000  # Mimi codec sample rate (Hz)
 FRAME_SAMPLES = 1920  # 80ms at 24kHz (one model step)
-NUM_CODEBOOKS = 16  # RVQ codebook count
+NUM_CODEBOOKS = 16  # Total codebooks in Moshi's depformer
+CODEC_CODEBOOKS = 8  # Codebooks used by Mimi codec for encode/decode
 AUDIO_VOCAB_SIZE = 2048  # per-codebook vocabulary size
 TEXT_VOCAB_SIZE = 32_000  # text token vocabulary
 
@@ -248,9 +249,13 @@ class MoshiOnnxPipeline:
         next_text_token = int(np.argmax(logits[0, 0]))
 
         # 4. Audio decoder: generate num_codebooks audio tokens autoregressively
-        # backbone_hidden = decoder's last hidden state (approximated from logits for demo).
-        # In production, expose the pre-projection hidden state from the decoder.
-        backbone_hidden = inputs_embeds  # shape: (1, 1, hidden_size) — simplified
+        # NOTE: backbone_hidden should be the decoder's last hidden state
+        # (after transformer layers + norm, before lm_head projection).
+        # The current ONNX decoder only exposes logits, not hidden states.
+        # TODO: Modify the decoder ONNX graph to also output pre-lm_head
+        # hidden states for correct audio generation. Using inputs_embeds
+        # as a placeholder produces degraded audio quality.
+        backbone_hidden = inputs_embeds  # shape: (1, 1, hidden_size) — PLACEHOLDER
 
         output_codes = np.zeros(self._num_codebooks, dtype=np.int64)
         prev_embedding = np.zeros((1, 1, self._depformer_dim), dtype=self._dtype)
@@ -286,39 +291,37 @@ class MoshiOnnxPipeline:
 
 
 # ---------------------------------------------------------------------------
-# Audio codec (EnCodec) placeholder
+# Audio codec (Mimi) helpers
 # ---------------------------------------------------------------------------
 
 
 def encode_audio_frame(audio_frame: np.ndarray, codec) -> np.ndarray:
-    """Encode a PCM audio frame to RVQ codec codes.
+    """Encode a PCM audio frame to RVQ codec codes using Mimi.
 
     Args:
         audio_frame: (frame_samples,) float32 PCM at SAMPLE_RATE Hz
-        codec: EnCodec model (from moshi or encodec package)
+        codec: Mimi codec model (from moshi.models)
 
     Returns:
-        codes: (num_codebooks,) int64
+        codes: (CODEC_CODEBOOKS,) int64
     """
     import torch
 
     with torch.no_grad():
-        # EnCodec expects (batch, channels, samples)
+        # Mimi expects (batch, channels, samples)
         wav = torch.from_numpy(audio_frame).float().unsqueeze(0).unsqueeze(0)
-        encoded = codec.encode(wav)  # returns EncodedFrame list
-        # Extract first frame, first batch: shape (num_codebooks, time)
-        codes = encoded[0][0].squeeze(0).numpy()  # (num_codebooks, 1) or (num_codebooks,)
-        if codes.ndim == 2:
-            codes = codes[:, 0]
+        codes = codec.encode(wav)  # (1, K, T) where K=CODEC_CODEBOOKS
+        # Extract first batch, all codebooks, first time step
+        codes = codes[0, :, 0].numpy()  # (K,)
     return codes.astype(np.int64)
 
 
 def decode_audio_codes(codes: np.ndarray, codec) -> np.ndarray:
-    """Decode RVQ codec codes back to PCM waveform.
+    """Decode RVQ codec codes back to PCM waveform using Mimi.
 
     Args:
-        codes: (num_codebooks,) int64
-        codec: EnCodec model
+        codes: (CODEC_CODEBOOKS,) int64
+        codec: Mimi codec model (from moshi.models)
 
     Returns:
         audio_frame: (frame_samples,) float32 PCM
@@ -326,9 +329,9 @@ def decode_audio_codes(codes: np.ndarray, codec) -> np.ndarray:
     import torch
 
     with torch.no_grad():
-        # codes: (num_codebooks,) → (1, num_codebooks, 1) for batch/time dims
+        # codes: (K,) → (1, K, 1) for (batch, codebooks, time)
         codes_t = torch.from_numpy(codes).long().unsqueeze(0).unsqueeze(-1)
-        wav = codec.decode([(codes_t, None)])  # (1, 1, samples)
+        wav = codec.decode(codes_t)  # (1, 1, samples)
         return wav.squeeze().numpy()
 
 
@@ -363,20 +366,20 @@ class MoshiStreamer:
         self._text_token = 0  # start with pad token
 
     def _record_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        """Sounddevice input callback — encodes incoming mic audio."""
+        """Sounddevice input callback — queues raw audio for encoding.
+
+        Encoding is done in the inference thread to avoid calling PyTorch
+        from the sounddevice C callback thread (not thread-safe).
+        """
         if status:
             print(f"[audio] Input status: {status}", file=sys.stderr)
 
-        audio_frame = indata[:, 0].astype(np.float32)  # take first channel
-        try:
-            codes = encode_audio_frame(audio_frame, self._codec)
-            with self._lock:
-                self._input_queue.append(codes)
-        except Exception as e:
-            print(f"[audio] Encode error: {e}", file=sys.stderr)
+        audio_frame = indata[:, 0].copy().astype(np.float32)
+        with self._lock:
+            self._input_queue.append(audio_frame)
 
     def _play_callback(self, outdata: np.ndarray, frames: int, time_info, status) -> None:
-        """Sounddevice output callback — decodes and plays generated audio."""
+        """Sounddevice output callback — plays generated audio."""
         if status:
             print(f"[audio] Output status: {status}", file=sys.stderr)
 
@@ -384,31 +387,49 @@ class MoshiStreamer:
             if self._output_queue:
                 audio_frame = self._output_queue.pop(0)
             else:
-                audio_frame = np.zeros(frames, dtype=np.float32)
+                audio_frame = None
 
-        outdata[:, 0] = audio_frame[:frames]
+        if audio_frame is not None:
+            # Pad or truncate to match requested frame size
+            n = min(len(audio_frame), frames)
+            outdata[:n, 0] = audio_frame[:n]
+            if n < frames:
+                outdata[n:, 0] = 0.0
+        else:
+            outdata[:, 0] = 0.0
 
     def _inference_loop(self) -> None:
-        """Main inference loop: consume input codes, run model, enqueue output."""
+        """Main inference loop: encode audio, run model, decode output."""
         print("[moshi] Inference loop started — speak into the microphone.")
+        step_interval = 1.0 / STEPS_PER_SECOND
+        next_step_time = time.monotonic()
 
         while self._running:
             with self._lock:
                 if not self._input_queue:
-                    codes_in = None
+                    audio_in = None
                 else:
-                    codes_in = self._input_queue.pop(0)
+                    audio_in = self._input_queue.pop(0)
 
-            if codes_in is None:
-                # No input yet; feed silence (all-zero codes)
+            # Encode mic audio to codec codes (or use silence)
+            if audio_in is not None:
+                try:
+                    codes_in = encode_audio_frame(audio_in, self._codec)
+                    # Pad from CODEC_CODEBOOKS to NUM_CODEBOOKS with zeros
+                    if len(codes_in) < NUM_CODEBOOKS:
+                        codes_in = np.pad(codes_in, (0, NUM_CODEBOOKS - len(codes_in)))
+                except Exception as e:
+                    print(f"[moshi] Encode error: {e}", file=sys.stderr)
+                    codes_in = np.zeros(NUM_CODEBOOKS, dtype=np.int64)
+            else:
                 codes_in = np.zeros(NUM_CODEBOOKS, dtype=np.int64)
 
             try:
                 next_token, output_codes = self._pipeline.step(self._text_token, codes_in)
                 self._text_token = next_token
 
-                # Decode output codes to waveform
-                audio_out = decode_audio_codes(output_codes, self._codec)
+                # Decode first CODEC_CODEBOOKS output codes to waveform
+                audio_out = decode_audio_codes(output_codes[:CODEC_CODEBOOKS], self._codec)
 
                 with self._lock:
                     self._output_queue.append(audio_out)
@@ -416,8 +437,13 @@ class MoshiStreamer:
             except Exception as e:
                 print(f"[moshi] Inference error: {e}", file=sys.stderr)
 
-            # Pace the inference loop to match model step rate (12.5 Hz)
-            time.sleep(1.0 / STEPS_PER_SECOND)
+            # Pace to model step rate, accounting for inference time
+            next_step_time += step_interval
+            sleep_time = next_step_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_step_time = time.monotonic()
 
     def run(self) -> None:
         """Start real-time streaming. Blocks until Ctrl+C."""
@@ -485,12 +511,12 @@ def build_moshi_models(model_id: str, save_dir: Path | None = None) -> dict:
     pkg = build(model_id)
 
     if save_dir is not None:
-        import onnx
+        import onnx_ir
 
         save_dir.mkdir(parents=True, exist_ok=True)
         for name, model in pkg.items():
             out_path = save_dir / f"{name}.onnx"
-            onnx.save(model, str(out_path))
+            onnx_ir.save(model, out_path)
             print(f"[moshi]   Saved {name} → {out_path}")
 
     return pkg
@@ -569,24 +595,28 @@ def main() -> None:
         # Save to a temp dir so we can pass file paths to ORT
         _tmp = tempfile.mkdtemp(prefix="moshi_onnx_")
         tmp_dir = Path(_tmp)
-        import onnx
+        import onnx_ir
 
         model_paths = {}
         for name, model in onnx_models.items():
             out = tmp_dir / f"{name}.onnx"
-            onnx.save(model, str(out))
+            onnx_ir.save(model, out)
             model_paths[name] = str(out)
         print(f"[moshi] Temporary ONNX models saved to {tmp_dir}")
 
     # ------------------------------------------------------------------
-    # Step 2: Load EnCodec / Moshi codec for audio encode/decode
+    # Step 2: Load Mimi codec for audio encode/decode
     # ------------------------------------------------------------------
     try:
-        import moshi.models  # type: ignore[import]
+        from huggingface_hub import hf_hub_download as _hf_download
+        from moshi.models import loaders as _moshi_loaders  # type: ignore[import]
 
-        print("[moshi] Loading EnCodec codec ...")
-        codec = moshi.models.get_encodec(sample_rate=SAMPLE_RATE)
+        print("[moshi] Loading Mimi codec ...")
+        mimi_weight = _hf_download(_moshi_loaders.DEFAULT_REPO, _moshi_loaders.MIMI_NAME)
+        codec = _moshi_loaders.get_mimi(mimi_weight, device="cpu")
+        codec.set_num_codebooks(CODEC_CODEBOOKS)
         codec.eval()
+        print(f"[moshi] Mimi codec loaded ({CODEC_CODEBOOKS} codebooks)")
     except ImportError:
         print(
             "[moshi] 'moshi' package not found. Install with: pip install moshi\n"
