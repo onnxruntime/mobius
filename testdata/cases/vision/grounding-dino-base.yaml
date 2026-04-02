@@ -1,0 +1,13 @@
+model_id: "IDEA-Research/grounding-dino-base"
+revision: "7ede26b14a5244e2b5a15f4d46c73f5f0c8a50cb"
+task_type: "object-detection"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+  text: "cat"
+
+level: "L4"
+
+notes: "Grounding DINO: text-guided open-set object detection. Swin backbone + BERT text encoder + multi-scale deformable attention + bidirectional vision-text fusion."
