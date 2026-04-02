@@ -70,12 +70,16 @@ def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: in
 
     norm = RMSNorm(hidden_size, eps=eps)
     b.push_module("norm")
-    for p in norm._parameters.values():
-        p._realize(b)
+    # Register parameters as initializers using the public API instead of
+    # relying on internal `_parameters` / `_realize` behavior.
+    for name, param in norm.named_parameters():
+        graph.register_initializer(param)
     out = norm.forward(op, x_val)
     b.pop_module()
 
-    graph.outputs.append(out)
+    # Explicitly name the model output to avoid relying on implicit output ordering.
+    y = op.Identity(out, name="y")
+    graph.outputs.append(y)
 
     model = ir.Model(graph, ir_version=10)
 
