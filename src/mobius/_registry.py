@@ -25,6 +25,7 @@ from onnxscript import nn
 from mobius._configs import (
     AriaConfig,
     BaseModelConfig,
+    ClapConfig,
     ConvNextConfig,
     DetrConfig,
     GroundingDinoConfig,
@@ -34,10 +35,10 @@ from mobius._configs import (
     Owlv2Config,
     RecurrentGemmaConfig,
     ResNetConfig,
-    SamConfig,
     RtDetrConfig,
-    Rwkv6Config,
     RwkvConfig,
+    Rwkv6Config,
+    SamConfig,
     Speech2TextConfig,
     WhisperConfig,
 )
@@ -668,9 +669,16 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
     reg.register("longformer", LongformerModel, task="feature-extraction")
-    reg.register("clap_text_model", ClapTextModel, task="feature-extraction")
-    reg.register("clap_audio_model", ClapAudioModel, task="clap-audio-feature-extraction")
-    reg.register("clap", ClapModel, task="contrastive")
+    reg.register(
+        "clap_text_model", ClapTextModel, task="feature-extraction", config_class=ClapConfig
+    )
+    reg.register(
+        "clap_audio_model",
+        ClapAudioModel,
+        task="clap-audio-feature-extraction",
+        config_class=ClapConfig,
+    )
+    reg.register("clap", ClapModel, task="contrastive", config_class=ClapConfig)
     reg.register("clip", CLIPModel, task="contrastive")
     reg.register("altclip", AltCLIPModel, task="contrastive")
 

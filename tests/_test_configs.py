@@ -22,6 +22,7 @@ from mobius._configs import (
     AriaConfig,
     AudioConfig,
     BambaConfig,
+    ClapConfig,
     CodecDecoderConfig,
     CodecEncoderConfig,
     ConvNextConfig,
@@ -1928,6 +1929,32 @@ VISION_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    (
+        "segformer",
+        {
+            "_config_cls": SegformerConfig,
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "num_channels": 3,
+            "segformer_hidden_sizes": [16, 32],
+            "segformer_num_attention_heads": [1, 2],
+            "segformer_depths": [1, 1],
+            "segformer_sr_ratios": [2, 1],
+            "segformer_mlp_ratios": [4, 4],
+            "segformer_patch_sizes": [3, 3],
+            "segformer_strides": [2, 2],
+            "decoder_hidden_size": 16,
+            "num_labels": 5,
+        },
+        True,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# SAM (Segment Anything) configs — two-model output (vision_encoder + decoder)
+# ---------------------------------------------------------------------------
+SAM_CONFIGS: list[tuple[str, dict, bool]] = [
     # --- SAM (Segment Anything Model, ViT encoder + prompt/mask decoder) ---
     (
         "sam",
@@ -1953,25 +1980,6 @@ VISION_CONFIGS: list[tuple[str, dict, bool]] = [
             "num_multimask_outputs": 3,
             "iou_head_depth": 3,
             "iou_head_hidden_dim": 16,
-        },
-        True,
-    ),
-    (
-        "segformer",
-        {
-            "_config_cls": SegformerConfig,
-            "hidden_act": "gelu",
-            "image_size": 32,
-            "num_channels": 3,
-            "segformer_hidden_sizes": [16, 32],
-            "segformer_num_attention_heads": [1, 2],
-            "segformer_depths": [1, 1],
-            "segformer_sr_ratios": [2, 1],
-            "segformer_mlp_ratios": [4, 4],
-            "segformer_patch_sizes": [3, 3],
-            "segformer_strides": [2, 2],
-            "decoder_hidden_size": 16,
-            "num_labels": 5,
         },
         True,
     ),
@@ -2621,6 +2629,8 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "clap_audio_model",
         {
+            "_config_cls": ClapConfig,
+            "hidden_act": "gelu",
             "projection_dim": 8,
             "audio": AudioConfig(
                 spec_size=16,
@@ -2638,6 +2648,8 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "clap",
         {
+            "_config_cls": ClapConfig,
+            "hidden_act": "gelu",
             "projection_dim": 8,
             "audio": AudioConfig(
                 spec_size=16,
@@ -2664,6 +2676,7 @@ ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     + VISION_CONFIGS
     + DETECTION_CONFIGS
     + SEGMENTATION_CONFIGS
+    + SAM_CONFIGS
     + SSM_CONFIGS
     + LINEAR_RNN_CONFIGS
     + VL_CONFIGS

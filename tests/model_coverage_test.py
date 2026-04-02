@@ -60,6 +60,7 @@ from _test_configs import (  # noqa: E402
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     LINEAR_RNN_CONFIGS,
+    SAM_CONFIGS,
     SEGMENTATION_CONFIGS,
     SEQ2SEQ_CONFIGS,
     SPEECH_CONFIGS,
@@ -83,6 +84,7 @@ def _l1_l3_model_types() -> set[str]:
         + VISION_CONFIGS
         + DETECTION_CONFIGS
         + SEGMENTATION_CONFIGS
+        + SAM_CONFIGS
         + SSM_CONFIGS
         + LINEAR_RNN_CONFIGS
         + VL_CONFIGS

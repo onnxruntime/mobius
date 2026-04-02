@@ -28,6 +28,7 @@ __all__ = [
     "ControlNetTask",
     "DenoisingTask",
     "FeatureExtractionTask",
+    "GroundingDinoDetectionTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
@@ -45,6 +46,7 @@ __all__ = [
     "Rwkv6CausalLMTask",
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
+    "SamSegmentationTask",
     "MoonshineSpeechToTextTask",
     "Seq2SeqTask",
     "Speech2TextSeq2SeqTask",
@@ -74,6 +76,7 @@ from mobius.tasks._contrastive import ContrastiveTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
+from mobius.tasks._grounding_dino_detection import GroundingDinoDetectionTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._image_segmentation import ImageSegmentationTask
 from mobius.tasks._moonshine_speech_to_text import MoonshineSpeechToTextTask
@@ -84,10 +87,11 @@ from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._rwkv6_causal_lm import Rwkv6CausalLMTask
 from mobius.tasks._rwkv_causal_lm import RwkvCausalLMTask
+from mobius.tasks._sam_segmentation import SamSegmentationTask
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._speech2text_seq2seq import Speech2TextSeq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
-from mobius.tasks._speech2text_seq2seq import Speech2TextSeq2SeqTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
@@ -116,7 +120,9 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "image-classification": ImageClassificationTask,
     "image-segmentation": ImageSegmentationTask,
     "object-detection": ObjectDetectionTask,
+    "grounding-dino-detection": GroundingDinoDetectionTask,
     "owlv2-object-detection": Owlv2ObjectDetectionTask,
+    "sam-segmentation": SamSegmentationTask,
     "seq2seq": Seq2SeqTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,

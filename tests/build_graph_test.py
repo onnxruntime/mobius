@@ -26,6 +26,7 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     LONGROPE_FACTORS,
+    SAM_CONFIGS,
     SEGMENTATION_CONFIGS,
     SEQ2SEQ_CONFIGS,
     SPEECH_CONFIGS,
@@ -85,6 +86,8 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "qwen3_vl_single",
     "qwen3_5_vl",
     "qwen3_tts_tokenizer_12hz",
+    # GroupNormalization op doesn't propagate shapes with symbolic batch dim
+    "grounding-dino",
 }
 
 
@@ -598,7 +601,68 @@ class TestBuildSegmentationGraph:
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
 
 
-# === SSM (Mamba/Mamba2) configs ===
+# === SAM (Segment Anything) configs — two-model output ===
+_SAM_MODEL_PARAMS = _make_params(SAM_CONFIGS)
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _SAM_MODEL_PARAMS)
+class TestBuildSAMGraph:
+    """Verify SAM models build valid two-model ONNX packages."""
+
+    def test_package_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task_name = _default_task_for_model(model_type)
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert "vision_encoder" in pkg
+        assert "decoder" in pkg
+
+        vision = pkg["vision_encoder"]
+        assert vision.graph is not None
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_embeddings" in {o.name for o in vision.graph.outputs}
+
+        decoder = pkg["decoder"]
+        assert decoder.graph is not None
+        decoder_inputs = {i.name for i in decoder.graph.inputs}
+        assert "image_embeddings" in decoder_inputs
+        assert "input_points" in decoder_inputs
+        assert "input_labels" in decoder_inputs
+        decoder_outputs = {o.name for o in decoder.graph.outputs}
+        assert "pred_masks" in decoder_outputs
+        assert "iou_predictions" in decoder_outputs
+
+    def test_has_initializers(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        for name, model in pkg.items():
+            assert len(list(model.graph.initializers)) > 0, (
+                f"{model_type}/{name} should have initializers"
+            )
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
+
+    def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
 _SSM_MODEL_PARAMS = _make_params(SSM_CONFIGS)
 
 

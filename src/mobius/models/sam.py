@@ -383,12 +383,14 @@ class _SamPromptEncoder(nn.Module):
         # ── Type embeddings ──
         # Stack: [not_a_point, point_embed.0, .1, .2, .3]  (5, hidden)
         # Labels shifted by +1 so -1 → index 0 (not_a_point)
+        # Use Embedding.forward() to trigger parameter realization
+        idx_0 = op.Constant(value_ints=[0])
         all_type_weights = op.Concat(
-            self.not_a_point_embed.weight,  # (1, hidden)
-            self.point_embed[0].weight,  # (1, hidden)
-            self.point_embed[1].weight,
-            self.point_embed[2].weight,
-            self.point_embed[3].weight,
+            self.not_a_point_embed(op, idx_0),  # (1, hidden)
+            self.point_embed[0](op, idx_0),
+            self.point_embed[1](op, idx_0),
+            self.point_embed[2](op, idx_0),
+            self.point_embed[3](op, idx_0),
             axis=0,
         )  # (5, hidden)
 
@@ -402,18 +404,18 @@ class _SamPromptEncoder(nn.Module):
         # Expand no_mask_embed to (B, hidden, H_emb, W_emb)
         batch_dim = op.Shape(input_points, start=0, end=1)
         emb_size = self._image_embedding_size
-        # no_mask_embed.weight: (1, hidden) → (1, 1, hidden, 1, 1)
+        # no_mask_embed(op, 0): (hidden,) → reshape to (1, hidden, 1, 1)
         no_mask = op.Reshape(
-            self.no_mask_embed.weight,
-            op.Constant(value_ints=[1, 1, self._hidden_size, 1, 1]),
-        )  # broadcast-ready
+            self.no_mask_embed(op, idx_0),
+            op.Constant(value_ints=[1, self._hidden_size, 1, 1]),
+        )
         target_shape = op.Concat(
             batch_dim,
             op.Constant(value_ints=[self._hidden_size, emb_size, emb_size]),
             axis=0,
         )
         dense_embeddings = op.Expand(
-            op.Reshape(no_mask, op.Constant(value_ints=[1, self._hidden_size, 1, 1])),
+            no_mask,
             target_shape,
         )  # (B, hidden, H_emb, W_emb)
 
@@ -710,10 +712,16 @@ class SamMaskDecoder(nn.Module):
         dense_prompt_embeddings: ir.Value,
     ):
         # ── Prepare tokens ──
-        # output_tokens: (num_mask_tokens + 1, C) = concat(iou_token, mask_tokens)
+        # output_tokens: (1 + num_mask_tokens, C)
+        # Use forward() to trigger parameter realization
+        idx_0 = op.Constant(value_ints=[0])
+        # iou_token(op, [0]) → Gather → (1, C) shape since index is 1-D
+        iou_token_weight = self.iou_token(op, idx_0)  # (1, C)
+        mask_range = op.Constant(value_ints=list(range(self._num_mask_tokens)))
+        mask_tokens_weight = self.mask_tokens(op, mask_range)  # (num_mask_tokens, C)
         output_tokens = op.Concat(
-            self.iou_token.weight,
-            self.mask_tokens.weight,
+            iou_token_weight,
+            mask_tokens_weight,
             axis=0,
         )  # (1 + num_mask_tokens, C)
 

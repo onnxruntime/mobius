@@ -1,0 +1,12 @@
+model_id: "facebook/sam-vit-base"
+revision: "main"
+task_type: "sam-segmentation"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4"
+
+notes: "SAM (Segment Anything Model, ViT-Base). Two-model output: vision_encoder + decoder with prompt/mask prediction."
