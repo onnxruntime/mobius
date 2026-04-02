@@ -29,6 +29,7 @@ from mobius._configs import (
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
+    BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
@@ -391,6 +392,7 @@ def _create_default_registry() -> ModelRegistry:
         "gemma3n_text": Gemma3nCausalLMModel,
         "granite": GraniteCausalLMModel,
         "diffllama": DiffLlamaCausalLMModel,
+        "bitnet": BitNetCausalLMModel,
         "doge": DogeCausalLMModel,
         "internlm2": InternLM2CausalLMModel,
         "llama4_text": Llama4CausalLMModel,
@@ -743,6 +745,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "arcee": "arcee-ai/AFM-4.5B-Base",
     "diffllama": "kajuma/DiffLlama-0.3B-handcut",
+    "bitnet": "microsoft/bitnet-b1.58-2B-4T",
     "doge": "SmallDoge/Doge-20M",
     "dots1": "rednote-hilab/dots.llm1.inst",
     "exaone4": "LGAI-EXAONE/EXAONE-4.0-1.2B",

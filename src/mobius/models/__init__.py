@@ -24,6 +24,7 @@ __all__ = [
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "DiTTransformer2DModel",
+    "BitNetCausalLMModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
     "DogeCausalLMModel",
@@ -130,6 +131,7 @@ from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
 from mobius.models.bert import BertModel
+from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel

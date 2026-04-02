@@ -101,6 +101,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("llama", {}, True),
     ("mistral", {}, False),
     ("qwen2", {}, True),
+    ("bitnet", {"hidden_act": "relu2", "tie_word_embeddings": True}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
     ("diffllama", {}, False),
