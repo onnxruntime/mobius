@@ -85,9 +85,6 @@ class TestUnpackQKVRules:
             # Not packed — skip
             return
 
-        num_heads = gqa_node.attributes.get_int("num_heads")
-        kv_num_heads = gqa_node.attributes.get_int("kv_num_heads")
-
         rewrite(model, pattern_rewrite_rules=unpack_qkv_rules())
 
         gqa_after = next(n for n in model.graph if n.op_type == "GroupQueryAttention")

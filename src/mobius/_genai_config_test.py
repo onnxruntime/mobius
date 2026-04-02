@@ -82,7 +82,9 @@ class TestMakeKvCacheDimName:
 
     def test_trt_non_sliding_unchanged(self):
         assert (
-            make_kv_cache_dim_name("past_sequence_length", ep="trt-rtx", is_sliding_layer=False)
+            make_kv_cache_dim_name(
+                "past_sequence_length", ep="trt-rtx", is_sliding_layer=False
+            )
             == "past_sequence_length"
         )
 
@@ -94,7 +96,9 @@ class TestMakeKvCacheDimName:
 
     def test_trt_total_sequence(self):
         assert (
-            make_kv_cache_dim_name("total_sequence_length", ep="trt-rtx", is_sliding_layer=True)
+            make_kv_cache_dim_name(
+                "total_sequence_length", ep="trt-rtx", is_sliding_layer=True
+            )
             == "total_sliding_length"
         )
 

@@ -26,7 +26,7 @@ The rule is intentionally conservative — it only fires when the input value:
 
 1. Has dtype INT64 (attention masks are always INT64 in mobius)
 2. Is a direct graph input, not an intermediate result
-3. Is 2D (batch × sequence)
+3. Is 2D (batch x sequence)
 4. Has a name containing ``"mask"`` (e.g. ``attention_mask``,
    ``encoder_attention_mask``) to avoid replacing shape extraction on
    ``input_ids``, where ``ReduceSum`` would produce vocabulary-ID sums

@@ -55,7 +55,7 @@ class TestValidateEpSupport:
 
     def test_known_eps_frozenset(self):
         """KNOWN_EPS should contain the canonical EP set."""
-        assert KNOWN_EPS == {"cpu", "cuda", "dml", "webgpu", "trt-rtx"}
+        assert {"cpu", "cuda", "dml", "webgpu", "trt-rtx"} == KNOWN_EPS
 
     def test_moe_on_cuda_allowed(self):
         """MoE models should work fine on CUDA."""

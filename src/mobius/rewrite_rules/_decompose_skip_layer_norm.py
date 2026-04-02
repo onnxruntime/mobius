@@ -70,9 +70,7 @@ class DecomposeSkipLayerNorm(RewriteRuleClassBase):
         epsilon = node.attributes.get_float("epsilon")
 
         add_out = op.Add(skip_a, skip_b)
-        new_norm = op.LayerNormalization(
-            add_out, gamma, beta, epsilon=epsilon, axis=-1
-        )
+        new_norm = op.LayerNormalization(add_out, gamma, beta, epsilon=epsilon, axis=-1)
 
         # Return 4 outputs: norm, mean(unused), inv_std(unused), skip
         return new_norm, _zero_scalar(op), _zero_scalar(op), add_out
@@ -112,9 +110,7 @@ class DecomposeSkipLayerNormNoBias(RewriteRuleClassBase):
         epsilon = node.attributes.get_float("epsilon")
 
         add_out = op.Add(skip_a, skip_b)
-        new_norm = op.LayerNormalization(
-            add_out, gamma, epsilon=epsilon, axis=-1
-        )
+        new_norm = op.LayerNormalization(add_out, gamma, epsilon=epsilon, axis=-1)
 
         # Return 4 outputs: norm, mean(unused), inv_std(unused), skip
         return new_norm, _zero_scalar(op), _zero_scalar(op), add_out
@@ -152,9 +148,7 @@ class DecomposeSkipSimplifiedLayerNorm(RewriteRuleClassBase):
         epsilon = node.attributes.get_float("epsilon")
 
         add_out = op.Add(skip_a, skip_b)
-        new_norm = op.RMSNormalization(
-            add_out, weight, epsilon=epsilon, axis=-1
-        )
+        new_norm = op.RMSNormalization(add_out, weight, epsilon=epsilon, axis=-1)
 
         # Return 4 outputs: norm, dummy(unused), dummy(unused), skip
         return new_norm, _zero_scalar(op), _zero_scalar(op), add_out

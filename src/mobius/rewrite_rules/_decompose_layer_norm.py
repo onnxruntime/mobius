@@ -67,13 +67,9 @@ class DecomposeSimplifiedLayerNorm(RewriteRuleClassBase):
         # RMSNorm: out = x / sqrt(mean(x^2) + eps) * weight
         two = op.Constant(value=ir.Tensor(np.array(2.0, dtype=np.float32)))
         x_sq = op.Pow(x, two)
-        axes = op.Constant(
-            value=ir.Tensor(np.array([-1], dtype=np.int64))
-        )
+        axes = op.Constant(value=ir.Tensor(np.array([-1], dtype=np.int64)))
         mean_sq = op.ReduceMean(x_sq, axes, keepdims=True)
-        eps_const = op.Constant(
-            value=ir.Tensor(np.array(epsilon, dtype=np.float32))
-        )
+        eps_const = op.Constant(value=ir.Tensor(np.array(epsilon, dtype=np.float32)))
         rms_sq = op.Add(mean_sq, eps_const)
         rms = op.Sqrt(rms_sq)
         x_norm = op.Div(x, rms)
@@ -90,6 +86,4 @@ def decompose_simplified_layer_norm_rules() -> RewriteRuleSet:
     Returns:
         :class:`RewriteRuleSet` containing the decomposition rule.
     """
-    return RewriteRuleSet(
-        [DecomposeSimplifiedLayerNorm().rule()]
-    )
+    return RewriteRuleSet([DecomposeSimplifiedLayerNorm().rule()])

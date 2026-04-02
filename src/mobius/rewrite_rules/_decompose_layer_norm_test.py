@@ -10,7 +10,6 @@ Sqrt, Div, Mul).
 
 from __future__ import annotations
 
-import numpy as np
 import onnx_ir as ir
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet

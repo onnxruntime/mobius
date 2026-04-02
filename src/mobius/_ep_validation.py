@@ -37,7 +37,10 @@ _UNSUPPORTED_COMBOS: dict[tuple[str, str], str] = {
     ("jamba", "webgpu"): "Jamba (MoE + Mamba) is unsupported by WebGPU",
     ("jetmoe", "webgpu"): "JetMoE uses dynamic expert routing unsupported by WebGPU",
     ("olmoe", "webgpu"): "OLMoE uses dynamic expert routing unsupported by WebGPU",
-    ("deepseek_v3", "webgpu"): "DeepSeek-V3 (MoE) uses dynamic expert routing unsupported by WebGPU",
+    (
+        "deepseek_v3",
+        "webgpu",
+    ): "DeepSeek-V3 (MoE) uses dynamic expert routing unsupported by WebGPU",
     # SSM/hybrid models on WebGPU (Mamba layers need Scan/Loop)
     ("mamba", "webgpu"): "Mamba SSM layers use Scan op unsupported by WebGPU",
     ("mamba2", "webgpu"): "Mamba2 SSM layers use Scan op unsupported by WebGPU",
@@ -45,9 +48,7 @@ _UNSUPPORTED_COMBOS: dict[tuple[str, str], str] = {
 }
 
 # Canonical set of known EPs for input validation
-KNOWN_EPS: frozenset[str] = frozenset(
-    {"cpu", "cuda", "dml", "webgpu", "trt-rtx"}
-)
+KNOWN_EPS: frozenset[str] = frozenset({"cpu", "cuda", "dml", "webgpu", "trt-rtx"})
 
 
 def validate_ep_support(model_type: str, ep: str) -> None:
@@ -59,10 +60,7 @@ def validate_ep_support(model_type: str, ep: str) -> None:
         ValueError: If *ep* is not a recognised execution provider.
     """
     if ep not in KNOWN_EPS:
-        raise ValueError(
-            f"Unknown execution provider {ep!r}. "
-            f"Supported: {sorted(KNOWN_EPS)}"
-        )
+        raise ValueError(f"Unknown execution provider {ep!r}. Supported: {sorted(KNOWN_EPS)}")
 
     key = (model_type, ep)
     if key in _UNSUPPORTED_COMBOS:

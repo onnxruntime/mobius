@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
@@ -14,7 +13,11 @@ from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import eliminate_shape_rules
-from mobius.rewrite_rules._testing_utils import count_ops, fill_random_weights, make_prefill_feeds
+from mobius.rewrite_rules._testing_utils import (
+    count_ops,
+    fill_random_weights,
+    make_prefill_feeds,
+)
 
 
 def _tiny_qwen3_config() -> ArchitectureConfig:
@@ -47,8 +50,6 @@ class TestEliminateShapeRules:
         pkg = build_from_module(model_module, config)
         model = pkg["model"]
 
-        ops_before = count_ops(model)
-        shape_before = ops_before["Shape"]
         # The model may use Shape(x, start=1, end=2) or Shape(x)+Gather(x,1);
         # both patterns should be matched.
         mask_shapes = sum(
@@ -152,6 +153,9 @@ class TestEliminateShapeRules:
         logits_rewritten = session_rewritten.run(feeds)["logits"]
 
         np.testing.assert_allclose(
-            logits_orig, logits_rewritten, atol=1e-5, rtol=1e-4,
+            logits_orig,
+            logits_rewritten,
+            atol=1e-5,
+            rtol=1e-4,
             err_msg="Logits differ after Shape elimination — replacement is not equivalent",
         )

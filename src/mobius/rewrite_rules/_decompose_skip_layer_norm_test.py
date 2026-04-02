@@ -16,6 +16,7 @@ from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import skip_layer_norm_rules, skip_norm_rules
 from mobius.rewrite_rules._decompose_skip_layer_norm import (
     decompose_skip_layer_norm_rules,
@@ -25,7 +26,6 @@ from mobius.rewrite_rules._testing_utils import (
     fill_random_weights,
     make_prefill_feeds,
 )
-from mobius._testing.ort_inference import OnnxModelSession
 
 
 class TestDecomposeSkipLayerNormRules:
@@ -215,7 +215,6 @@ class TestDecomposeSkipLayerNormRules:
             ),
         )
         model = pkg["model"]
-        counts_before = count_ops(model)
 
         rewrite(model, pattern_rewrite_rules=decompose_skip_layer_norm_rules())
 

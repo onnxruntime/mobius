@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
@@ -14,7 +13,11 @@ from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import cast_int64_to_int32_rules
-from mobius.rewrite_rules._testing_utils import count_ops, fill_random_weights, make_prefill_feeds
+from mobius.rewrite_rules._testing_utils import (
+    count_ops,
+    fill_random_weights,
+    make_prefill_feeds,
+)
 
 
 def _tiny_qwen3_config() -> ArchitectureConfig:
@@ -137,6 +140,9 @@ class TestCastInt64ToInt32Rules:
         logits_rewritten = session_rewritten.run(feeds)["logits"]
 
         np.testing.assert_allclose(
-            logits_orig, logits_rewritten, atol=1e-5, rtol=1e-4,
+            logits_orig,
+            logits_rewritten,
+            atol=1e-5,
+            rtol=1e-4,
             err_msg="Logits differ after INT64→INT32 cast — replacement is not equivalent",
         )

@@ -11,7 +11,7 @@ This rule inserts ``Cast(indices, to=INT32)`` before any ``Gather`` node
 whose index input has dtype ``INT64``.  The transformation is always safe
 for embedding-table lookups because token IDs, position IDs, and vocabulary
 indices are small non-negative integers that fit comfortably in ``INT32``
-(max value ~2 billion vs. typical vocab sizes of 32 K–256 K).
+(max value ~2 billion vs. typical vocab sizes of 32K-256K).
 
 .. code-block:: text
 
