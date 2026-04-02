@@ -478,6 +478,10 @@ def _rename_masked_lm_weight(name: str) -> str | None:
     if name.startswith("lm_head."):
         return name
 
+    # Skip other cls.* heads (e.g. cls.seq_relationship for NSP)
+    if name.startswith("cls."):
+        return None
+
     # Encoder weights: delegate to shared rename logic.
     # Prefix is already stripped, so pass directly to the encoder
     # rename which handles HF naming collapse + gamma/beta compat.
