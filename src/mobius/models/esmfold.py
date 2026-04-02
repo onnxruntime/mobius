@@ -205,7 +205,13 @@ class _EsmEncoderLayer(nn.Module):
 
 
 class _EsmEncoder(nn.Module):
-    """ESM-2 encoder: stack of post-norm layers with rotary embeddings."""
+    """ESM-2 encoder: post-norm layers + rotary embeddings + final LayerNorm.
+
+    HuggingFace ``EsmEncoder`` optionally applies ``emb_layer_norm_after``
+    (a LayerNorm) after the last encoder layer.  For ESMFold this norm is
+    always present (``emb_layer_norm_before=False`` but the *after* norm
+    is unconditionally created in the HF checkpoint).
+    """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -222,6 +228,10 @@ class _EsmEncoder(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
+        # Post-encoder LayerNorm (HF: esm.encoder.emb_layer_norm_after)
+        self.emb_layer_norm_after = LayerNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -234,6 +244,8 @@ class _EsmEncoder(nn.Module):
             hidden_states = layer(
                 op, hidden_states, attention_mask, position_embeddings
             )
+        # Post-encoder LayerNorm
+        hidden_states = self.emb_layer_norm_after(op, hidden_states)
         return hidden_states
 
 
