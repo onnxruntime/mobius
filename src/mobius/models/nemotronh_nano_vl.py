@@ -86,15 +86,6 @@ class _NemotronHVLDecoderModel(nn.Module):
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return {
-            key: value
-            for key, value in state_dict.items()
-            if key.startswith(("model.", "lm_head."))
-        }
-
 
 # ---------------------------------------------------------------------------
 # Three-model split
