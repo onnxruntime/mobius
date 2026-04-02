@@ -3651,6 +3651,7 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
+    "speech2speech": {"speech_encoder", "decoder", "t2u", "vocoder_dur", "vocoder_hifigan"},
 }
 
 

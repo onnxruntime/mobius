@@ -2127,6 +2127,47 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- SeamlessM4T v2 speech-to-speech (speech2speech, 5-model split) ---
+    (
+        "seamless_m4t_v2_s2s",
+        {
+            "_config_cls": SeamlessM4Tv2Config,
+            # Text model
+            "num_hidden_layers": 2,
+            "num_decoder_layers": 2,
+            "encoder_ffn_dim": TINY_INTERMEDIATE,
+            "decoder_ffn_dim": TINY_INTERMEDIATE,
+            "max_position_embeddings": 64,
+            "hidden_act": "relu",
+            # Speech encoder (Conformer)
+            "speech_encoder_layers": 2,
+            "speech_encoder_attention_heads": TINY_HEADS,
+            "speech_encoder_intermediate_size": TINY_INTERMEDIATE,
+            "conv_depthwise_kernel_size": 5,
+            "feature_projection_input_dim": 16,
+            "num_adapter_layers": 1,
+            # T2U
+            "t2u_encoder_layers": 2,
+            "t2u_decoder_layers": 2,
+            "t2u_encoder_ffn_dim": TINY_INTERMEDIATE,
+            "t2u_decoder_ffn_dim": TINY_INTERMEDIATE,
+            "t2u_vocab_size": TINY_VOCAB,
+            # Vocoder
+            "unit_hifi_gan_vocab_size": 16,
+            "unit_embed_dim": 16,
+            "upsample_initial_channel": 8,
+            "upsample_rates": [2, 2],
+            "upsample_kernel_sizes": [4, 4],
+            "resblock_kernel_sizes": [3],
+            "resblock_dilation_sizes": [[1, 3]],
+            "vocoder_num_spkrs": 4,
+            "vocoder_num_langs": 4,
+            "spkr_embed_dim": 8,
+            "lang_embed_dim": 8,
+            "t2u_variance_predictor_hidden_dim": TINY_INTERMEDIATE,
+        },
+        True,
+    ),
 ]
 
 

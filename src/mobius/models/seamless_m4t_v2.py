@@ -1164,16 +1164,31 @@ class _VariancePredictor(nn.Module):
         return op.Squeeze(out, [-1])  # (B, T)
 
 
-class SeamlessM4Tv2VocoderModel(nn.Module):
-    """SeamlessM4T v2 vocoder: acoustic unit tokens → waveform.
+class _DurHead(nn.Module):
+    """Duration-prediction head: unit_embedding + dur_predictor.
 
-    Provides two entry points used by Speech2SpeechTask:
+    Exposed as ``SeamlessM4Tv2VocoderModel.dur_head`` to give this path
+    its own parameter scope, preventing parameter sharing conflicts when
+    Speech2SpeechTask builds the ``vocoder_dur`` and ``vocoder_hifigan``
+    ONNX graphs from the same module instance.
+    """
 
-    * ``forward_dur(unit_ids)`` → log-duration predictions ``(B, T)``
-    * ``forward_hifigan(unit_ids, speaker_id, lang_id)`` → waveform ``(B, T_audio)``
+    def __init__(self, config: SeamlessM4Tv2Config):
+        super().__init__()
+        self.unit_embedding = Embedding(config.unit_hifi_gan_vocab_size, config.unit_embed_dim)
+        self.dur_predictor = _VariancePredictor(config)
 
-    HuggingFace: ``SeamlessM4Tv2CodeHifiGan``
-    (``vocoder`` in ``SeamlessM4Tv2ForSpeechToSpeech``)
+    def forward(self, op: builder.OpBuilder, unit_ids: ir.Value) -> ir.Value:
+        # unit_ids: (B, T) int64
+        hidden = self.unit_embedding(op, unit_ids)  # (B, T, unit_embed_dim)
+        return self.dur_predictor(op, hidden)  # (B, T)
+
+
+class _HifiGanHead(nn.Module):
+    """HiFi-GAN synthesis head: unit_embedding + conditioning embeddings + generator.
+
+    Exposed as ``SeamlessM4Tv2VocoderModel.hifigan_head`` so this path
+    has its own parameter scope independent from :class:`_DurHead`.
     """
 
     def __init__(self, config: SeamlessM4Tv2Config):
@@ -1183,36 +1198,23 @@ class SeamlessM4Tv2VocoderModel(nn.Module):
         self.unit_embedding = Embedding(config.unit_hifi_gan_vocab_size, config.unit_embed_dim)
         self.speaker_embedding = Embedding(config.vocoder_num_spkrs, config.spkr_embed_dim)
         self.language_embedding = Embedding(config.vocoder_num_langs, config.lang_embed_dim)
-        self.dur_predictor = _VariancePredictor(config)
         self.hifi_gan = _HifiGan(config)
 
-    def forward(self, op: builder.OpBuilder, unit_ids: ir.Value) -> ir.Value:
-        """Default forward: duration prediction path."""
-        return self.forward_dur(op, unit_ids)
-
-    def forward_dur(self, op: builder.OpBuilder, unit_ids: ir.Value) -> ir.Value:
-        """Duration predictor: unit_ids (B, T) → log_dur (B, T)."""
-        hidden = self.unit_embedding(op, unit_ids)  # (B, T, unit_embed_dim)
-        return self.dur_predictor(op, hidden)
-
-    def forward_hifigan(
+    def forward(
         self,
         op: builder.OpBuilder,
         unit_ids: ir.Value,
         speaker_id: ir.Value,
         lang_id: ir.Value,
     ) -> ir.Value:
-        """HiFi-GAN synthesis path: tokens + conditioning → waveform."""
         hidden = self.unit_embedding(op, unit_ids)  # (B, T, unit_embed_dim)
         spkr = self.speaker_embedding(op, speaker_id)  # (B, 1, spkr_embed_dim)
         lang = self.language_embedding(op, lang_id)  # (B, 1, lang_embed_dim)
 
-        # Transpose to (B, C, T) layout for concatenation
         hidden_t = op.Transpose(hidden, perm=[0, 2, 1])  # (B, unit_embed_dim, T)
         spkr_t = op.Transpose(spkr, perm=[0, 2, 1])  # (B, spkr_embed_dim, 1)
         lang_t = op.Transpose(lang, perm=[0, 2, 1])  # (B, lang_embed_dim, 1)
 
-        # Broadcast speaker and language embeddings across the time dimension
         B = op.Shape(hidden_t, start=0, end=1)  # noqa: N806
         T = op.Shape(hidden_t, start=2, end=3)  # noqa: N806
         spkr_exp = op.Expand(
@@ -1222,9 +1224,34 @@ class SeamlessM4Tv2VocoderModel(nn.Module):
             lang_t, op.Concat(B, [self._lang_embed_dim], T, axis=0)
         )  # (B, lang_embed_dim, T)
 
-        # Concatenate: (B, lang_embed_dim + unit_embed_dim + spkr_embed_dim, T)
-        combined = op.Concat(lang_exp, hidden_t, spkr_exp, axis=1)
+        combined = op.Concat(lang_exp, hidden_t, spkr_exp, axis=1)  # (B, model_in, T)
         return self.hifi_gan(op, combined)  # (B, T_audio)
+
+
+class SeamlessM4Tv2VocoderModel(nn.Module):
+    """SeamlessM4T v2 vocoder: acoustic unit tokens → waveform.
+
+    Wraps two independently-scoped sub-modules used by Speech2SpeechTask:
+
+    * ``dur_head``    — Duration predictor path (``unit_embedding`` + ``dur_predictor``)
+    * ``hifigan_head``— HiFi-GAN synthesis path (``unit_embedding`` + conditioning + generator)
+
+    Each path carries its own ``unit_embedding`` copy so that
+    Speech2SpeechTask can build ``vocoder_dur`` and ``vocoder_hifigan``
+    as separate ONNX models without cross-graph parameter conflicts.
+
+    HuggingFace: ``SeamlessM4Tv2CodeHifiGan``
+    (``vocoder`` in ``SeamlessM4Tv2ForSpeechToSpeech``)
+    """
+
+    def __init__(self, config: SeamlessM4Tv2Config):
+        super().__init__()
+        self.dur_head = _DurHead(config)
+        self.hifigan_head = _HifiGanHead(config)
+
+    def forward(self, op: builder.OpBuilder, unit_ids: ir.Value) -> ir.Value:
+        """Default forward: duration prediction path."""
+        return self.dur_head(op, unit_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -1352,10 +1379,25 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
                     new_dict[new_name] = tensor
                 continue
 
-            # Vocoder: vocoder.* → vocoder.*
-            # (no renaming needed — HF and ONNX paths align)
+            # Vocoder weights: remap to the split dur_head / hifigan_head sub-modules.
+            # HF:    vocoder.unit_embedding.*     →  both dur_head and hifigan_head
+            # HF:    vocoder.speaker_embedding.*  →  hifigan_head.speaker_embedding.*
+            # HF:    vocoder.language_embedding.* →  hifigan_head.language_embedding.*
+            # HF:    vocoder.dur_predictor.*      →  dur_head.dur_predictor.*
+            # HF:    vocoder.hifi_gan.*            →  hifigan_head.hifi_gan.*
             if name.startswith("vocoder."):
-                new_dict[name] = tensor
+                sub = name[len("vocoder."):]
+                if sub.startswith("unit_embedding."):
+                    new_dict["vocoder.dur_head." + sub] = tensor
+                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                elif sub.startswith("speaker_embedding."):
+                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                elif sub.startswith("language_embedding."):
+                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                elif sub.startswith("dur_predictor."):
+                    new_dict["vocoder.dur_head." + sub] = tensor
+                elif sub.startswith("hifi_gan."):
+                    new_dict["vocoder.hifigan_head." + sub] = tensor
                 continue
 
         # Populate decoder token embedding and tied lm_head from shared weight

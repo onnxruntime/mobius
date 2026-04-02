@@ -130,9 +130,7 @@ def run_encoder(
 
     Returns last_hidden_state shaped (1, enc_seq_len, hidden_size).
     """
-    outputs = enc_session.run(
-        {"input_ids": input_ids, "attention_mask": attention_mask}
-    )
+    outputs = enc_session.run({"input_ids": input_ids, "attention_mask": attention_mask})
     return outputs["last_hidden_state"]
 
 
@@ -244,7 +242,10 @@ def translate_onnx(
 
         if stream:
             # Will be decoded outside; yield timing info to stderr
-            print(f"  step {step+1:3d}: token={next_token_id} ({dt*1000:.1f} ms)", file=sys.stderr)
+            print(
+                f"  step {step + 1:3d}: token={next_token_id} ({dt * 1000:.1f} ms)",
+                file=sys.stderr,
+            )
 
     return generated
 
@@ -292,7 +293,7 @@ def text_to_text(
     elapsed = time.perf_counter() - t_start
     translation = processor.tokenizer.decode(token_ids, skip_special_tokens=True)
     print(f"Translation: {translation}")
-    print(f"({len(token_ids)} tokens in {elapsed:.2f}s, {len(token_ids)/elapsed:.1f} tok/s)")
+    print(f"({len(token_ids)} tokens in {elapsed:.2f}s, {len(token_ids) / elapsed:.1f} tok/s)")
     return translation
 
 
@@ -312,7 +313,9 @@ def interactive_text_to_text(
     enc_session = OnnxModelSession(pkg["encoder"])
     dec_session = OnnxModelSession(pkg["decoder"])
 
-    print(f"Interactive mode ({args.src_lang} → {args.tgt_lang}). Ctrl+C or blank line to exit.")
+    print(
+        f"Interactive mode ({args.src_lang} → {args.tgt_lang}). Ctrl+C or blank line to exit."
+    )
     while True:
         try:
             text = input("\nSource: ").strip()
@@ -363,7 +366,9 @@ def interactive_text_to_text(
         elapsed = time.perf_counter() - t_start
         final = processor.tokenizer.decode(partial_ids, skip_special_tokens=True)
         print(f"\rTranslation: {final}")
-        print(f"  ({len(partial_ids)} tokens, {elapsed:.2f}s, {len(partial_ids)/max(elapsed,1e-6):.1f} tok/s)")
+        print(
+            f"  ({len(partial_ids)} tokens, {elapsed:.2f}s, {len(partial_ids) / max(elapsed, 1e-6):.1f} tok/s)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +404,9 @@ def speech_to_speech(
         audio_array = audio_array[:, 0]  # take first channel
     audio_array = audio_array.astype(np.float32)
 
-    print(f"Loaded audio: {args.audio} ({len(audio_array)/sample_rate:.1f}s @ {sample_rate} Hz)")
+    print(
+        f"Loaded audio: {args.audio} ({len(audio_array) / sample_rate:.1f}s @ {sample_rate} Hz)"
+    )
     print(f"Translating speech: {args.src_lang} → {args.tgt_lang}")
 
     # --- TODO (agent 8d99cf75): Replace with ONNX speech_encoder session ---
@@ -463,7 +470,9 @@ def speech_to_speech(
             sd.wait()
         except ImportError:
             print("Install sounddevice to play audio: pip install sounddevice")
-            print(f"Waveform shape: {waveform.shape}, duration: {len(waveform)/output_sr:.1f}s")
+            print(
+                f"Waveform shape: {waveform.shape}, duration: {len(waveform) / output_sr:.1f}s"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    SeamlessM4Tv2Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -110,7 +111,7 @@ from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
-from mobius.models.seamless_m4t_v2 import SeamlessM4Tv2Model
+from mobius.models.seamless_m4t_v2 import SeamlessM4Tv2Model, SeamlessM4Tv2SpeechToSpeechModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
@@ -704,6 +705,12 @@ def _create_default_registry() -> ModelRegistry:
     ):
         reg.register(name, Wav2Vec2Model, task="audio-feature-extraction")
     reg.register("seamless_m4t_v2", SeamlessM4Tv2Model, task="seq2seq")
+    reg.register(
+        "seamless_m4t_v2_s2s",
+        SeamlessM4Tv2SpeechToSpeechModel,
+        task="speech2speech",
+        config_class=SeamlessM4Tv2Config,
+    )
 
     # -----------------------------------------------------------------
     # Test metadata — applied after all registrations

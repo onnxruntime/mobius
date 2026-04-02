@@ -20,6 +20,7 @@ from __future__ import annotations
 
 __all__ = [
     "AdapterTask",
+    "Speech2SpeechTask",
     "AudioFeatureExtractionTask",
     "AudioToAudioTask",
     "CausalLMTask",
@@ -72,6 +73,7 @@ from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._speech2speech import Speech2SpeechTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
@@ -102,6 +104,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
+    "speech2speech": Speech2SpeechTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
     "vae": VAETask,

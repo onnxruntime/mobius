@@ -114,6 +114,10 @@ __all__ = [
     "SmolLM3CausalLMModel",
     "StarCoder2CausalLMModel",
     "SeamlessM4Tv2Model",
+    "SeamlessM4Tv2SpeechEncoderModel",
+    "SeamlessM4Tv2SpeechToSpeechModel",
+    "SeamlessM4Tv2T2UModel",
+    "SeamlessM4Tv2VocoderModel",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
     "UNet2DConditionModel",
@@ -236,7 +240,13 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
-from mobius.models.seamless_m4t_v2 import SeamlessM4Tv2Model
+from mobius.models.seamless_m4t_v2 import (
+    SeamlessM4Tv2Model,
+    SeamlessM4Tv2SpeechEncoderModel,
+    SeamlessM4Tv2SpeechToSpeechModel,
+    SeamlessM4Tv2T2UModel,
+    SeamlessM4Tv2VocoderModel,
+)
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
