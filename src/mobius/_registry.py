@@ -37,6 +37,7 @@ from mobius.models import (
     DogeCausalLMModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
+    EsmFoldModel,
     ExaOne4CausalLMModel,
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
@@ -604,6 +605,9 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
 
+    # --- Protein structure prediction ---
+    reg.register("esmfold", EsmFoldModel, task="feature-extraction")
+
     # --- Absolute positional embeddings (non-RoPE) ---
     reg.register("gpt2", GPT2CausalLMModel)
     for name in (
@@ -895,6 +899,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "ernie": "nghuyong/ernie-3.0-base-zh",
     "ernie_m": "Xenova/tiny-random-ErnieMModel",
     "esm": "facebook/esm2_t6_8M_UR50D",
+    "esmfold": "facebook/esmfold_v1",
     "flaubert": "flaubert/flaubert_base_cased",
     "ibert": "optimum-intel-internal-testing/tiny-random-ibert",
     "layoutlm": "microsoft/layoutlm-base-uncased",

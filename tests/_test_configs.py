@@ -1187,6 +1187,15 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
     ("ernie", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ernie_m", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "esmfold",
+        {
+            "hidden_act": "gelu",
+            "type_vocab_size": 0,
+            "pad_token_id": 1,
+        },
+        True,
+    ),
     ("flaubert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("ibert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     (
