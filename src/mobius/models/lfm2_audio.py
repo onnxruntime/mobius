@@ -21,7 +21,6 @@ HuggingFace weight name prefixes::
     lfm.              -> decoder sub-model (LFM2 backbone)
     conformer.        -> audio_encoder.encoder (ConformerEncoder)
     audio_adapter.    -> audio_encoder.adapter (projection MLP)
-    audio_embedding.  -> embedding.audio_embedding
     depthformer.      -> audio_decoder.depthformer
     depth_linear.     -> audio_decoder.depth_linear
     depth_embeddings. -> audio_decoder.depth_embeddings
@@ -117,25 +116,17 @@ class _Lfm2AudioEncoder(nn.Module):
 class _Lfm2AudioEmbedding(nn.Module):
     """Embedding model for LFM2-Audio.
 
-    Combines text token embeddings with audio feature embeddings.
-    In the actual model, a modality_flag tensor controls which positions
-    get text embeddings vs audio-in vs audio-out embeddings.
-
-    For ONNX export, this takes pre-computed audio features and text_ids,
-    returning the combined inputs_embeds sequence.
+    Returns text token embeddings for the backbone. Audio codebook embeddings
+    are handled by the ``audio_decoder``'s ``depth_embeddings`` — not here.
 
     Weight names (HF)::
 
         lfm.embed_tokens.weight -> text_embed.weight
-        audio_embedding.embedding.weight -> audio_embed.weight
     """
 
     def __init__(self, config: Lfm2AudioConfig):
         super().__init__()
         self.text_embed = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        # Audio codebook embedding: codebooks * audio_vocab_size entries
-        audio_vocab = config.audio_vocab_size * config.num_codebooks
-        self.audio_embed = Embedding(audio_vocab, config.hidden_size)
 
     def forward(
         self,
@@ -492,7 +483,8 @@ class Lfm2AudioModel(nn.Module):
             lfm.* -> decoder.* (backbone layers)
             conformer.* -> audio_encoder.encoder.*
             audio_adapter.* -> audio_encoder.adapter.*
-            audio_embedding.* -> embedding.audio_embed.*
+            audio_embedding.* -> skipped (audio codebook embeddings live in
+                                  audio_decoder.depth_embeddings, not the embedding sub-model)
             depthformer.* -> audio_decoder.depthformer.*
             depth_linear.* -> audio_decoder.depth_linear.*
             depth_embeddings.* -> audio_decoder.depth_embeddings.*
@@ -579,11 +571,10 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
             return None
         return f"audio_encoder.adapter.{rest}"
 
-    # Audio embedding
+    # Audio embedding weights live in audio_decoder.depth_embeddings at runtime.
+    # The embedding sub-model only handles text tokens — skip these.
     if key.startswith("audio_embedding."):
-        rest = key[len("audio_embedding.") :]
-        rest = rest.replace("embedding.", "audio_embed.")
-        return f"embedding.{rest}"
+        return None
 
     # Depthformer layers
     if key.startswith("depthformer.layers."):

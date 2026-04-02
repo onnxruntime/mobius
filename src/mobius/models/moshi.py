@@ -185,6 +185,7 @@ class _MoshiDecoder(nn.Module):
 
     def __init__(self, config: MoshiConfig):
         super().__init__()
+        self._dtype = config.dtype
         self.layers = nn.ModuleList(
             [_MoshiDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -203,8 +204,13 @@ class _MoshiDecoder(nn.Module):
         hidden_states = inputs_embeds
         # RoPE position embeddings
         position_embeddings = self.rotary_emb(op, position_ids)
-        # Causal attention bias from the attention mask
-        attention_bias = create_attention_bias(op, attention_mask, hidden_states, position_ids)
+        # Causal attention bias from the attention mask and position ids
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=position_ids,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
 
         present_key_values = []
         for i, layer in enumerate(self.layers):
