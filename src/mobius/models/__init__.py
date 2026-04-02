@@ -112,6 +112,7 @@ __all__ = [
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
+    "T5GemmaForConditionalGeneration",
     "UNet2DConditionModel",
     "ViTModel",
     "VideoAutoencoderModel",
@@ -232,6 +233,7 @@ from mobius.models.qwen_vl import (
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5gemma import T5GemmaForConditionalGeneration
 from mobius.models.unet import UNet2DConditionModel
 from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel

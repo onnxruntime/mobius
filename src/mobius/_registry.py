@@ -113,6 +113,7 @@ from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5gemma import T5GemmaForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
@@ -629,6 +630,7 @@ def _create_default_registry() -> ModelRegistry:
         reg.register(name, BartForConditionalGeneration, task="seq2seq")
     for name in ("longt5", "mt5", "switch_transformers", "t5", "umt5"):
         reg.register(name, T5ForConditionalGeneration, task="seq2seq")
+    reg.register("t5gemma", T5GemmaForConditionalGeneration, task="seq2seq")
     reg.register("trocr", TrOCRForConditionalGeneration, task="seq2seq")
 
     # --- Vision ---
@@ -905,6 +907,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bart": "facebook/bart-base",
     "t5": "google-t5/t5-small",
     "mt5": "google/mt5-small",
+    "t5gemma": "google/t5gemma-2b-2b-prefixlm",
     "marian": "Helsinki-NLP/opus-mt-en-de",
     "mbart": "facebook/mbart-large-cc25",
     "pegasus": "google/pegasus-xsum",
@@ -1039,6 +1042,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "longt5": "t5",
     "umt5": "t5",
     "switch_transformers": "t5",
+    "t5gemma": "t5",
     "bert": "bert",
     "albert": "bert",
     "roberta": "bert",

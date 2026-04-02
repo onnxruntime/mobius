@@ -1393,6 +1393,21 @@ SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "t5gemma",
+        {
+            # T5Gemma encoder-decoder using Gemma2-style attention with GQA.
+            "_config_cls": Gemma2Config,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "attn_logit_softcapping": 50.0,
+            "query_pre_attn_scalar": TINY_HEAD_DIM,
+            "num_key_value_heads": 2,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+        },
+        True,
+    ),
+    (
         "switch_transformers",
         {"hidden_act": "relu", "num_decoder_layers": 2},
         True,

@@ -101,13 +101,14 @@ class Seq2SeqTask(ModelTask):
         graph_inputs = [input_ids, encoder_hidden_states, attention_mask]
 
         num_heads = config.num_attention_heads
+        num_kv_heads = getattr(config, "num_key_value_heads", None) or num_heads
         head_dim = config.head_dim
-        num_decoder_layers = getattr(config, "num_decoder_layers", config.num_hidden_layers)
+        num_decoder_layers = config.num_decoder_layers or config.num_hidden_layers
 
         # Self-attention KV cache
         self_kv_inputs, past_self_kvs = _make_kv_cache_inputs(
             num_decoder_layers,
-            num_heads,
+            num_kv_heads,
             head_dim,
             config.dtype,
             batch,
@@ -124,7 +125,7 @@ class Seq2SeqTask(ModelTask):
         # Cross-attention KV cache
         cross_kv_inputs, cross_past_kvs = _make_kv_cache_inputs(
             num_decoder_layers,
-            num_heads,
+            num_kv_heads,
             head_dim,
             config.dtype,
             batch,
