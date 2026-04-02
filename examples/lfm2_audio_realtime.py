@@ -72,17 +72,12 @@ STEPS_PER_SECOND = SAMPLE_RATE // FRAME_SAMPLES  # 12.5 Hz
 
 # LFM2-Audio-1.5B architecture defaults (used for cache initialization)
 # These match the released LiquidAI/LFM2-Audio-1.5B checkpoint.
-_DEFAULT_HIDDEN_SIZE = 2048
-_DEFAULT_NUM_LAYERS = 24
-_DEFAULT_NUM_KV_HEADS = 8
-_DEFAULT_HEAD_DIM = 128
-_DEFAULT_SHORT_CONV_KERNEL = 3  # conv_state width = kernel - 1 = 2
+_DEFAULT_HIDDEN_SIZE = 2048  # fallback for conv_state shape when dim is symbolic
 
 # Depthformer (audio decoder) defaults
 _DEFAULT_DEPTHFORMER_DIM = 1024
 _DEFAULT_DEPTHFORMER_LAYERS = 6
 _DEFAULT_DEPTHFORMER_HEADS = 16
-_DEFAULT_DEPTHFORMER_HEAD_DIM = _DEFAULT_DEPTHFORMER_DIM // _DEFAULT_DEPTHFORMER_HEADS  # 64
 
 
 # ---------------------------------------------------------------------------
