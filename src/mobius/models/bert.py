@@ -292,6 +292,30 @@ class _BertEncoder(nn.Module):
 _PARAM_RENAMES = {"gamma": "weight", "beta": "bias"}
 
 
+def _rename_bert_encoder_weight(name: str) -> str:
+    """Collapse nested HF naming and handle gamma/beta compat.
+
+    This is the shared encoder-weight rename logic used by both
+    ``_rename_bert_weight`` and ``_rename_masked_lm_weight``.
+    Assumes model prefix (bert./roberta./esm.) is already stripped.
+    """
+    # Collapse nested HF naming to match flat ONNX paths:
+    #   attention.self.query → attention.query
+    #   attention.output.dense → attention.dense
+    #   layer.N.output.dense → layer.N.dense
+    name = name.replace(".attention.self.", ".attention.")
+    name = name.replace(".attention.output.", ".attention.")
+    name = name.replace(".output.dense.", ".dense.")
+    name = name.replace(".output.LayerNorm.", ".LayerNorm.")
+
+    # Rename gamma/beta to weight/bias (old BERT compat)
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2 and parts[1] in _PARAM_RENAMES:
+        name = f"{parts[0]}.{_PARAM_RENAMES[parts[1]]}"
+
+    return name
+
+
 def _rename_bert_weight(name: str) -> str | None:
     """Rename a single HF BERT weight to our convention.
 
@@ -312,21 +336,7 @@ def _rename_bert_weight(name: str) -> str | None:
     if name.startswith(("pooler.", "cls.")):
         return None
 
-    # Collapse nested HF naming to match flat ONNX paths:
-    #   attention.self.query → attention.query
-    #   attention.output.dense → attention.dense
-    #   layer.N.output.dense → layer.N.dense
-    name = name.replace(".attention.self.", ".attention.")
-    name = name.replace(".attention.output.", ".attention.")
-    name = name.replace(".output.dense.", ".dense.")
-    name = name.replace(".output.LayerNorm.", ".LayerNorm.")
-
-    # Rename gamma/beta to weight/bias (old BERT compat)
-    parts = name.rsplit(".", 1)
-    if len(parts) == 2 and parts[1] in _PARAM_RENAMES:
-        name = f"{parts[0]}.{_PARAM_RENAMES[parts[1]]}"
-
-    return name
+    return _rename_bert_encoder_weight(name)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +349,7 @@ _BERT_CLS_TO_LM_HEAD = {
     "cls.predictions.transform.LayerNorm.": "lm_head.layer_norm.",
     "cls.predictions.decoder.": "lm_head.decoder.",
     # Top-level bias on the BERT predictions head
-    "cls.predictions.bias": "lm_head.bias",
+    "cls.predictions.bias": "lm_head.decoder.bias",
 }
 
 
@@ -438,9 +448,9 @@ class BertForMaskedLM(nn.Module):
 def _rename_masked_lm_weight(name: str) -> str | None:
     """Rename a single HF masked LM weight to our convention.
 
-    Handles both the encoder weights (via prefix stripping + HF naming
-    collapse) and the LM head weights (BERT cls.predictions.* -> lm_head.*,
-    ESM/RoBERTa lm_head.* passes through).
+    Handles LM head weights (BERT cls.predictions.* -> lm_head.*,
+    ESM/RoBERTa lm_head.* passes through) and delegates encoder
+    weights to ``_rename_bert_weight``.
     """
     # Strip "bert." / "roberta." / "esm." prefix from encoder weights
     if name.startswith("bert."):
@@ -468,15 +478,7 @@ def _rename_masked_lm_weight(name: str) -> str | None:
     if name.startswith("lm_head."):
         return name
 
-    # Encoder weights: collapse nested HF naming
-    name = name.replace(".attention.self.", ".attention.")
-    name = name.replace(".attention.output.", ".attention.")
-    name = name.replace(".output.dense.", ".dense.")
-    name = name.replace(".output.LayerNorm.", ".LayerNorm.")
-
-    # Rename gamma/beta to weight/bias (old BERT compat)
-    parts = name.rsplit(".", 1)
-    if len(parts) == 2 and parts[1] in _PARAM_RENAMES:
-        name = f"{parts[0]}.{_PARAM_RENAMES[parts[1]]}"
-
-    return name
+    # Encoder weights: delegate to shared rename logic.
+    # Prefix is already stripped, so pass directly to the encoder
+    # rename which handles HF naming collapse + gamma/beta compat.
+    return _rename_bert_encoder_weight(name)

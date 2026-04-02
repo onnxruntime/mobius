@@ -80,7 +80,7 @@ from mobius.models import (
 )
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.bert import BertModel
+from mobius.models.bert import BertForMaskedLM, BertModel
 from mobius.models.blip import BlipVisionModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.clip import CLIPTextModel, CLIPVisionModel
@@ -589,6 +589,14 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
 
+    # --- Masked LM (encoder + prediction head) ---
+    for name in (
+        "bert_masked_lm",
+        "esm_masked_lm",
+        "roberta_masked_lm",
+    ):
+        reg.register(name, BertForMaskedLM, task="masked-lm")
+
     # --- Absolute positional embeddings (non-RoPE) ---
     reg.register("gpt2", GPT2CausalLMModel)
     for name in (
@@ -898,6 +906,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "xlnet": "xlnet/xlnet-base-cased",
     "xmod": "facebook/xmod-base",
     "yoso": "uw-madison/yoso-4096",
+
+    # --- Masked LM (encoder + prediction head) ---
+    "bert_masked_lm": "google-bert/bert-base-uncased",
+    "esm_masked_lm": "facebook/esm2_t6_8M_UR50D",
+    "roberta_masked_lm": "FacebookAI/roberta-base",
 
     # --- Encoder-decoder ---
     "bart": "facebook/bart-base",

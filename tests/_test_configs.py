@@ -1237,9 +1237,9 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
 # Masked LM configs  (task: masked-lm, module: BertForMaskedLM)
 # ---------------------------------------------------------------------------
 MASKED_LM_CONFIGS: list[tuple[str, dict, bool]] = [
-    ("bert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
-    ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
-    ("roberta", {"hidden_act": "gelu", "type_vocab_size": 1}, False),
+    ("bert_masked_lm", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("esm_masked_lm", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("roberta_masked_lm", {"hidden_act": "gelu", "type_vocab_size": 1}, False),
 ]
 
 

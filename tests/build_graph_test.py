@@ -60,7 +60,6 @@ from mobius._configs import (
     VisionConfig,
 )
 from mobius._registry import registry
-from mobius.models.bert import BertForMaskedLM
 from mobius.tasks import (
     CausalLMTask,
     Phi4MMMultiModalTask,
@@ -396,10 +395,6 @@ class TestBuildEncoderGraph:
 
 
 # === Masked LM model configs (imported from _test_configs) ===
-_MASKED_LM_MODEL_CONFIGS: list[tuple[str, dict]] = [
-    (mt, ov) for mt, ov, _ in MASKED_LM_CONFIGS
-]
-
 _MASKED_LM_MODEL_PARAMS = _make_params(MASKED_LM_CONFIGS)
 
 
@@ -409,8 +404,9 @@ class TestBuildMaskedLMGraph:
 
     def test_graph_builds_without_weights(self, model_type: str, config_overrides: dict):
         config = _base_config(**config_overrides)
-        module = BertForMaskedLM(config)
-        task = get_task("masked-lm")
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         model = pkg["model"]
 
@@ -429,8 +425,9 @@ class TestBuildMaskedLMGraph:
 
     def test_graph_has_lm_head_initializers(self, model_type: str, config_overrides: dict):
         config = _base_config(**config_overrides)
-        module = BertForMaskedLM(config)
-        task = get_task("masked-lm")
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         model = pkg["model"]
 
@@ -444,15 +441,17 @@ class TestBuildMaskedLMGraph:
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
         config = _base_config(**config_overrides)
-        module = BertForMaskedLM(config)
-        task = get_task("masked-lm")
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _run_onnx_checker(pkg, model_type)
 
     def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
         config = _base_config(**config_overrides)
-        module = BertForMaskedLM(config)
-        task = get_task("masked-lm")
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
 
