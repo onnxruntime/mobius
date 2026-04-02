@@ -6,10 +6,10 @@
 Architecture:
     encoder: _SeamlessM4Tv2TextEncoder
         Scaled word embedding (x sqrt(hidden_size)) + sinusoidal positional
-        embeddings + N x BART-like EncoderBlock (post-norm, ReLU FFN) + LayerNorm
+        embeddings + N x EncoderBlock (pre-norm, ReLU FFN) + LayerNorm
     decoder: _SeamlessM4Tv2TextDecoder
         Scaled word embedding + sinusoidal positional embeddings + N x
-        DecoderBlock (self-attn + cross-attn + FFN, all post-norm) +
+        DecoderBlock (self-attn + cross-attn + FFN, all pre-norm) +
         LayerNorm + lm_head (tied to encoder embed_tokens)
 
 Differs from BART in:
@@ -54,10 +54,11 @@ if TYPE_CHECKING:
 
 
 class _SeamlessM4Tv2EncoderBlock(nn.Module):
-    """Post-norm encoder block using encoder_ffn_dim for the feed-forward layer.
+    """Pre-norm encoder block using encoder_ffn_dim for the feed-forward layer.
 
-    Identical to BART's encoder block except the FFN hidden dim is taken from
-    config.encoder_ffn_dim rather than config.intermediate_size.
+    Matches HuggingFace SeamlessM4Tv2EncoderLayer: LayerNorm is applied BEFORE
+    attention/FFN (pre-norm), and the residual is added AFTER.  Weight names
+    follow HF exactly: self_attn_layer_norm, ffn_layer_norm.
     """
 
     def __init__(self, config: SeamlessM4Tv2Config):
@@ -66,43 +67,44 @@ class _SeamlessM4Tv2EncoderBlock(nn.Module):
         self.self_attn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc1 = Linear(config.hidden_size, config.encoder_ffn_dim)
         self.fc2 = Linear(config.encoder_ffn_dim, config.hidden_size)
-        self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # Post-norm self-attention
+        # Pre-norm self-attention: norm → attn → add residual
         residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(op, hidden_states)
         hidden_states, _ = self.self_attn(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
-        hidden_states = self.self_attn_layer_norm(op, hidden_states)
 
-        # Post-norm FFN
+        # Pre-norm FFN: norm → ffn → add residual
         residual = hidden_states
+        hidden_states = self.ffn_layer_norm(op, hidden_states)
         hidden_states = self.fc1(op, hidden_states)
         hidden_states = self._act_fn(op, hidden_states)
         hidden_states = self.fc2(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
-        hidden_states = self.final_layer_norm(op, hidden_states)
 
         return hidden_states
 
 
 class _SeamlessM4Tv2DecoderBlock(nn.Module):
-    """Post-norm decoder block (self-attn + cross-attn + FFN) using decoder_ffn_dim.
+    """Pre-norm decoder block (self-attn + cross-attn + FFN) using decoder_ffn_dim.
 
-    Identical to BART's decoder block except the FFN hidden dim is taken from
-    config.decoder_ffn_dim rather than config.intermediate_size.
+    Matches HuggingFace SeamlessM4Tv2DecoderLayer: LayerNorm applied BEFORE each
+    sub-layer (pre-norm).  Weight names follow HF exactly: self_attn_layer_norm,
+    cross_attention, cross_attention_layer_norm, ffn_layer_norm.
     """
 
     def __init__(self, config: SeamlessM4Tv2Config):
         super().__init__()
         self.self_attn = EncoderDecoderAttention(config, is_causal=True)
         self.self_attn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.encoder_attn = EncoderDecoderAttention(config)
-        self.encoder_attn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_attention = EncoderDecoderAttention(config)
+        self.cross_attention_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc1 = Linear(config.hidden_size, config.decoder_ffn_dim)
         self.fc2 = Linear(config.decoder_ffn_dim, config.hidden_size)
-        self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._act_fn = ACT2FN[config.hidden_act]
 
     def forward(
@@ -113,32 +115,32 @@ class _SeamlessM4Tv2DecoderBlock(nn.Module):
         past_key_value: tuple | None = None,
         cross_past_key_value: ir.Value | None = None,
     ):
-        # Post-norm causal self-attention (with KV cache)
+        # Pre-norm causal self-attention (with KV cache)
         residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(op, hidden_states)
         hidden_states, self_kv = self.self_attn(
             op, hidden_states, past_key_value=past_key_value
         )
         hidden_states = op.Add(residual, hidden_states)
-        hidden_states = self.self_attn_layer_norm(op, hidden_states)
 
-        # Post-norm cross-attention to encoder output
+        # Pre-norm cross-attention to encoder output
         residual = hidden_states
-        hidden_states, cross_kv = self.encoder_attn(
+        hidden_states = self.cross_attention_layer_norm(op, hidden_states)
+        hidden_states, cross_kv = self.cross_attention(
             op,
             hidden_states,
             key_value_states=encoder_hidden_states,
             past_key_value=cross_past_key_value,
         )
         hidden_states = op.Add(residual, hidden_states)
-        hidden_states = self.encoder_attn_layer_norm(op, hidden_states)
 
-        # Post-norm FFN
+        # Pre-norm FFN
         residual = hidden_states
+        hidden_states = self.ffn_layer_norm(op, hidden_states)
         hidden_states = self.fc1(op, hidden_states)
         hidden_states = self._act_fn(op, hidden_states)
         hidden_states = self.fc2(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
-        hidden_states = self.final_layer_norm(op, hidden_states)
 
         return hidden_states, self_kv, cross_kv
 
