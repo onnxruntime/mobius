@@ -1,0 +1,13 @@
+model_id: "google/vaultgemma-1b"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4"
+
+skip_reason: "VaultGemma 1B — no public safetensors checkpoint available yet."
+notes: "VaultGemma 1B. Gemma2 variant with all layers using full-attention (no alternating sliding window) and no logit soft-capping."

@@ -1,0 +1,14 @@
+model_id: "google/t5gemma-2b-2b-prefixlm"
+revision: "main"
+task_type: "seq2seq"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "translate English to German: The house is wonderful."
+  decoder_prompt: ""
+
+level: "L4"
+
+skip_reason: "T5Gemma 2B requires 2B-parameter weights — too large for CI golden generation."
+notes: "T5Gemma 2B encoder-decoder. Gemma2-style attention (RoPE, GQA, alternating sliding/full, softcapping) in both encoder and decoder, with cross-attention in decoder layers."
