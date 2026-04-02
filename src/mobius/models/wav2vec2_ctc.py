@@ -17,7 +17,7 @@ The three main sub-graphs share weights with ``Wav2Vec2Model``:
   feature_extractor → feature_projection → encoder → [adapter] → lm_head
 
 Adapter architecture (``add_adapter=True``):
-  optional Linear proj + LayerNorm → N × (Conv1d + GLU)
+  optional Linear proj + LayerNorm → N x (Conv1d + GLU)
 
 Weight name alignment:
   After stripping ``wav2vec2.`` prefix, HF names map to ours with minor renames
@@ -38,7 +38,7 @@ from mobius.models.wav2vec2 import Wav2Vec2Model
 
 
 class _AdapterLayer(nn.Module):
-    """One MMS adapter layer: strided Conv1d(hidden → 2×hidden) → GLU.
+    """One MMS adapter layer: strided Conv1d(hidden → 2x hidden) → GLU.
 
     The Conv1d doubles the channels so GLU can split them in half,
     producing output of the same size as input (per-channel gating).
@@ -54,7 +54,7 @@ class _AdapterLayer(nn.Module):
         super().__init__()
         self._stride = stride
         self._kernel_size = kernel_size
-        # Conv1d: hidden → 2×hidden, stride=stride, pad=1
+        # Conv1d: hidden → 2x hidden, stride=stride, pad=1
         # Bare parameters (no sub-module) to match onnxscript name resolution.
         self.conv = nn.Parameter([2 * hidden_size, hidden_size, kernel_size])
         self.conv_bias = nn.Parameter([2 * hidden_size])
@@ -213,9 +213,7 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
         # CTC head: (B, T'', H) → (B, T'', vocab_size)
         return self.lm_head(op, hidden_states)
 
-    def preprocess_weights(
-        self, state_dict: dict[str, object]
-    ) -> dict[str, object]:
+    def preprocess_weights(self, state_dict: dict[str, object]) -> dict[str, object]:
         """Map HuggingFace weight names to ONNX module names.
 
         HF layout (Wav2Vec2ForCTC):
@@ -236,7 +234,7 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
             # Strip outer model prefix (wav2vec2.*, hubert.*, wavlm.*)
             for prefix in ("wav2vec2.", "hubert.", "wavlm."):
                 if k.startswith(prefix):
-                    k = k[len(prefix):]
+                    k = k[len(prefix) :]
                     break
 
             # FFN weight renames: HF uses intermediate_dense/output_dense, we use up_proj/down_proj

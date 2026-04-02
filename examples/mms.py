@@ -19,14 +19,34 @@ The language-specific adapter (``Wav2Vec2Adapter``) is loaded from the
 checkpoint and baked into the ONNX model.  Switching languages requires
 rebuilding the model with a different ``--lang``.
 
+Modes
+-----
+**Batch** (default): Transcribes the full file in chunks, prints the
+complete transcript when done.
+
+**Streaming** (``--stream``): Processes overlapping windows as they
+arrive and prints partial results to the terminal in real-time, updating
+each line in place.  Works on both file input and microphone input.
+
+**Live microphone** (``--live``): Captures from the default microphone
+and continuously transcribes in the foreground, printing each decoded
+segment as it is ready.  Press Ctrl-C to stop.
+
 Prerequisites::
 
     pip install mobius-ai[transformers] torchaudio
+    pip install sounddevice   # for --mic, --live, or audio playback
 
 Usage::
 
-    # Transcribe an audio file (English, default)
+    # Batch transcription of an audio file (English, default)
     python examples/mms.py --audio speech.wav
+
+    # Streaming display while processing (print partial results)
+    python examples/mms.py --audio speech.wav --stream
+
+    # Play audio while transcribing
+    python examples/mms.py --audio speech.wav --play
 
     # Spanish transcription with the 1B model
     python examples/mms.py --audio habla.wav --lang spa --model facebook/mms-1b-all
@@ -37,15 +57,20 @@ Usage::
     # List some supported languages
     python examples/mms.py --list-langs
 
-    # Record from microphone (requires sounddevice)
+    # Record from microphone (batch, requires sounddevice)
     python examples/mms.py --mic --lang deu
+
+    # Live real-time transcription from microphone
+    python examples/mms.py --live --lang eng
 """
 
 from __future__ import annotations
 
 import argparse
+import queue
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -132,6 +157,197 @@ def record_from_mic(
     audio = np.concatenate(chunks, axis=0).flatten()
     print(f"  Recorded {len(audio) / sample_rate:.1f}s of audio.")
     return audio
+
+
+def play_audio(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
+    """Play audio in a background thread using sounddevice.
+
+    Silently skips if ``sounddevice`` is not installed.
+    """
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return
+
+    def _play() -> None:
+        sd.play(audio, samplerate=sample_rate)
+        sd.wait()
+
+    t = threading.Thread(target=_play, daemon=True)
+    t.start()
+
+
+# ---------------------------------------------------------------------------
+# Streaming / progressive display helpers
+# ---------------------------------------------------------------------------
+
+
+def _clear_line() -> None:
+    """Erase the current terminal line and return cursor to column 0."""
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+def transcribe_streaming(
+    session,
+    tokenizer,
+    audio: np.ndarray,
+    *,
+    chunk_seconds: float = 1.0,
+    overlap_seconds: float = 0.1,
+    lang: str = "eng",
+) -> str:
+    """Stream-decode audio in short windows and print partial results live.
+
+    Processes the audio in small ``chunk_seconds`` windows (with a small
+    ``overlap_seconds`` tail for context at chunk boundaries) and prints
+    each decoded segment to stdout as it is ready, overwriting the previous
+    partial line.
+
+    Args:
+        session: ORT session wrapping the ONNX MMS model.
+        tokenizer: HuggingFace ``Wav2Vec2CTCTokenizer``.
+        audio: Raw waveform at 16 kHz, shape ``(num_samples,)``.
+        chunk_seconds: Window length in seconds (shorter = more responsive).
+        overlap_seconds: Extra context appended to each chunk to reduce
+            boundary artifacts (trimmed from decoded output).
+        lang: ISO-639-3 language code used in the progress prefix.
+
+    Returns:
+        Final full transcript string.
+    """
+    chunk_len = int(chunk_seconds * SAMPLE_RATE)
+    overlap_len = int(overlap_seconds * SAMPLE_RATE)
+    total_samples = len(audio)
+    total_duration = total_samples / SAMPLE_RATE
+
+    segments: list[str] = []
+    print(f"  [stream] {total_duration:.1f}s audio, {chunk_seconds:.1f}s windows\n")
+
+    pos = 0
+    chunk_idx = 0
+    while pos < total_samples:
+        end = min(pos + chunk_len + overlap_len, total_samples)
+        chunk = audio[pos:end]
+
+        input_values = chunk[np.newaxis, :].astype(np.float32)
+        attention_mask = np.ones((1, len(chunk)), dtype=np.int64)
+
+        out = session.run(
+            {"input_values": input_values, "attention_mask": attention_mask}
+        )
+        segment_text = ctc_greedy_decode(out["logits"], tokenizer)
+        segments.append(segment_text)
+
+        # Progress bar + rolling transcript
+        progress = min(end / total_samples, 1.0)
+        bar_width = 20
+        filled = int(bar_width * progress)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        elapsed_s = end / SAMPLE_RATE
+        partial = " ".join(s for s in segments if s.strip())
+
+        _clear_line()
+        sys.stdout.write(
+            f"[{bar}] {elapsed_s:.1f}/{total_duration:.1f}s  📝 {partial!r}"
+        )
+        sys.stdout.flush()
+
+        pos += chunk_len
+        chunk_idx += 1
+
+    # Final newline after streaming output
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    return " ".join(s for s in segments if s.strip())
+
+
+def live_microphone_transcription(
+    session,
+    tokenizer,
+    *,
+    window_seconds: float = 2.0,
+    lang: str = "eng",
+    sample_rate: int = SAMPLE_RATE,
+) -> None:
+    """Transcribe live microphone audio in real time until Ctrl-C.
+
+    Captures audio in ``window_seconds``-length blocks and decodes each
+    block as soon as it is filled, printing the result immediately.
+
+    Args:
+        session: ORT session wrapping the ONNX MMS model.
+        tokenizer: HuggingFace ``Wav2Vec2CTCTokenizer``.
+        window_seconds: How many seconds of audio to buffer before decoding.
+        lang: ISO-639-3 code shown in the output prefix.
+        sample_rate: Input sample rate (must match model, default 16 kHz).
+    """
+    try:
+        import sounddevice as sd
+    except ImportError:
+        print(
+            "ERROR: sounddevice is required for --live.  "
+            "Install with: pip install sounddevice",
+            file=sys.stderr,
+        )
+        return
+
+    window_samples = int(window_seconds * sample_rate)
+    audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+    buffer: list[np.ndarray] = []
+    buffer_len = 0
+
+    def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
+        if status:
+            print(f"\n  [live] {status}", file=sys.stderr)
+        chunk = indata[:, 0].copy()  # mono
+        audio_queue.put(chunk)
+
+    stream = sd.InputStream(
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        callback=_callback,
+        blocksize=int(sample_rate * 0.05),  # 50 ms callback blocks
+    )
+
+    print(f"🎙  Live transcription  [{lang}]  —  Ctrl-C to stop\n")
+    stream.start()
+    t0 = time.time()
+
+    try:
+        while True:
+            try:
+                chunk = audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+
+            buffer.append(chunk)
+            buffer_len += len(chunk)
+
+            if buffer_len >= window_samples:
+                audio_window = np.concatenate(buffer).astype(np.float32)
+                buffer.clear()
+                buffer_len = 0
+
+                input_values = audio_window[np.newaxis, :]
+                attention_mask = np.ones((1, len(audio_window)), dtype=np.int64)
+                out = session.run(
+                    {"input_values": input_values, "attention_mask": attention_mask}
+                )
+                text = ctc_greedy_decode(out["logits"], tokenizer)
+                elapsed = time.time() - t0
+                if text.strip():
+                    print(f"[{elapsed:6.1f}s] {text}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.stop()
+        stream.close()
+        print("\n  [live] stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -302,14 +518,45 @@ def main() -> None:
     parser.add_argument(
         "--mic",
         action="store_true",
-        help="Record from the default microphone.",
+        help="Record from the default microphone (batch mode).",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Capture from the microphone and transcribe in real time "
+            "(requires sounddevice).  Press Ctrl-C to stop."
+        ),
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Stream-decode audio with progressive terminal display. "
+            "Shows partial transcript as each short window is decoded."
+        ),
+    )
+    parser.add_argument(
+        "--play",
+        action="store_true",
+        help=(
+            "Play audio through the default output device while transcribing "
+            "(requires sounddevice)."
+        ),
+    )
+    parser.add_argument(
+        "--window",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Window size for --stream and --live modes.",
     )
     parser.add_argument(
         "--chunk",
         type=float,
         default=30.0,
         metavar="SECONDS",
-        help="Audio chunk size for long recordings.",
+        help="Audio chunk size for batch transcription of long files.",
     )
     parser.add_argument(
         "--save-to",
@@ -358,7 +605,19 @@ def main() -> None:
     print("Ready.\n")
 
     # ------------------------------------------------------------------
-    # Get audio
+    # Live real-time microphone mode (--live)
+    # ------------------------------------------------------------------
+    if args.live:
+        live_microphone_transcription(
+            session,
+            tokenizer,
+            window_seconds=args.window,
+            lang=args.lang,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Get audio (file / mic / synthetic fallback)
     # ------------------------------------------------------------------
     if args.audio:
         print(f"Loading audio: {args.audio}")
@@ -376,10 +635,28 @@ def main() -> None:
         audio = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Transcribe
+    # Optional audio playback (--play)
     # ------------------------------------------------------------------
-    print("Transcribing …")
-    text = transcribe(session, tokenizer, audio, chunk_seconds=args.chunk)
+    if args.play:
+        print("▶ Playing audio …")
+        play_audio(audio)
+
+    # ------------------------------------------------------------------
+    # Transcribe: streaming (--stream) or batch (default)
+    # ------------------------------------------------------------------
+    if args.stream:
+        print("Streaming transcription …")
+        text = transcribe_streaming(
+            session,
+            tokenizer,
+            audio,
+            chunk_seconds=args.window,
+            lang=args.lang,
+        )
+    else:
+        print("Transcribing …")
+        text = transcribe(session, tokenizer, audio, chunk_seconds=args.chunk)
+
     print(f"\n📝 Transcript [{args.lang}]: {text!r}")
 
 

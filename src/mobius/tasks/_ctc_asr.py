@@ -39,23 +39,19 @@ class CTCAsrTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         time = ir.SymbolicDim("time")
 
-        input_values = ir.Value(
-            name="input_values",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape([batch, time]),
+        graph, builder = _make_graph(name="ctc_asr")
+        input_values = builder.input(
+            "input_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, time],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            type=ir.TensorType(ir.DataType.INT64),
-            shape=ir.Shape([batch, time]),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, time],
         )
 
-        graph, builder = _make_graph([input_values, attention_mask], name="ctc_asr")
-        op = builder.op
-
-        logits = module(op, input_values=input_values, attention_mask=attention_mask)
-
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        logits = module(builder.op, input_values=input_values, attention_mask=attention_mask)
+        builder.add_output(logits, "logits")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
