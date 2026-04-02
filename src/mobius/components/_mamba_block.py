@@ -29,6 +29,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 from onnxscript.onnx_types import FLOAT
 
+from mobius._flags import flags
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
@@ -307,6 +308,71 @@ class Mamba2Block(nn.Module):
 
         return new_conv_state, new_ssm, y_flat
 
+    def _forward_single_token(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        conv_state: ir.Value,
+        ssm_state: ir.Value,
+    ):
+        """Single-token forward pass (no Scan, seq_len must be 1).
+
+        This is the original implementation before the Scan-based
+        multi-token support.  Useful for debugging.
+        """
+        # Step 1: Input projection -> gate, xBC, dt
+        projected = self.in_proj(op, hidden_states)  # (B, 1, proj_size)
+        gate, x_bc, dt = op.Split(
+            projected,
+            [self.d_inner, self.conv_dim, self.num_heads],
+            axis=-1,
+            _outputs=3,
+        )
+
+        # Step 2: Causal Conv1D with state update
+        # x_bc: (B, 1, conv_dim) → (B, conv_dim, 1)
+        x_bc_t = op.Transpose(x_bc, perm=[0, 2, 1])
+        conv_input = op.Concat(conv_state, x_bc_t, axis=2)
+        new_conv_state = op.Slice(
+            conv_input, starts=[1], ends=[INT64_MAX], axes=[2],
+        )
+        conv_out = self.conv1d(op, conv_input)
+
+        # Step 3: SiLU activation
+        conv_out = op.Mul(conv_out, op.Sigmoid(conv_out))
+        # (B, conv_dim, 1) → (B, 1, conv_dim) → squeeze → (B, conv_dim)
+        x_bc_activated = op.Transpose(conv_out, perm=[0, 2, 1])
+
+        # Step 4: Split xBC -> hidden, B, C
+        gs = self.n_groups * self.d_state
+        hidden_x, b_mat, c_mat = op.Split(
+            x_bc_activated,
+            [self.d_inner, gs, gs],
+            axis=-1,
+            _outputs=3,
+        )
+
+        # Squeeze seq dim for SSM: (B, 1, D) → (B, D)
+        hidden_flat = op.Squeeze(hidden_x, [1])
+        dt_flat = op.Squeeze(dt, [1])
+        b_flat = op.Squeeze(b_mat, [1])
+        c_flat = op.Squeeze(c_mat, [1])
+
+        # Step 5: Multi-head selective scan
+        y, new_ssm_state = self.ssm(op, hidden_flat, dt_flat, b_flat, c_flat, ssm_state)
+
+        # Step 6: Gated RMSNorm
+        gate_flat = op.Squeeze(gate, [1])
+        y_normed = self.norm(op, y, gate_flat)
+
+        # Restore seq dim: (B, d_inner) → (B, 1, d_inner)
+        y_3d = op.Unsqueeze(y_normed, [1])
+
+        # Step 7: Output projection
+        output = self.out_proj(op, y_3d)  # (B, 1, d_model)
+
+        return output, new_conv_state, new_ssm_state
+
     def forward(
         self,
         op: builder.OpBuilder,
@@ -315,6 +381,10 @@ class Mamba2Block(nn.Module):
         ssm_state: ir.Value,
     ):
         """Forward pass supporting arbitrary sequence length.
+
+        When ``flags.mamba_scan`` is True (default), uses an ONNX Scan
+        to iterate token-by-token, supporting multi-token sequences.
+        When False, falls back to a single-token path (seq_len must be 1).
 
         Args:
             op: ONNX op builder.
@@ -327,6 +397,10 @@ class Mamba2Block(nn.Module):
             new_conv_state: (batch, conv_dim, conv_kernel-1)
             new_ssm_state: (batch, num_heads, d_head, d_state)
         """
+        if not flags.mamba_scan:
+            return self._forward_single_token(
+                op, hidden_states, conv_state, ssm_state,
+            )
         # Realize conv1d and ssm parameters in the parent graph so they
         # are visible as implicit inputs to the Scan body.  _realize is
         # idempotent, so the re-call inside subgraph is a no-op.
