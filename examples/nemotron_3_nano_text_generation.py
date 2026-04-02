@@ -73,6 +73,59 @@ DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 # ---------------------------------------------------------------------------
 
 
+def _fix_nemotron_h_dt_bias(model) -> None:
+    """Reload dt_bias from the checkpoint to work around an HF initialization bug.
+
+    HuggingFace's ``_init_weights`` unconditionally overwrites ``dt_bias``
+    with ``torch.rand(...)`` *after* loading checkpoint weights, so every
+    ``from_pretrained`` call produces different (wrong) dt_bias values.
+
+    This reloads the correct values directly from safetensors.
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    from huggingface_hub import HfApi
+
+    model_id = model.config._name_or_path
+    api = HfApi()
+    shard_files = [
+        f.rfilename
+        for f in api.model_info(model_id).siblings
+        if f.rfilename.endswith(".safetensors")
+    ]
+    repo_dir = os.path.dirname(
+        transformers.utils.cached_file(model_id, shard_files[0])
+    )
+
+    sd = model.state_dict()
+    # HF built-in uses "model." prefix while checkpoint may use "backbone."
+    sd_dt_keys = [k for k in sd if "dt_bias" in k]
+    if not sd_dt_keys:
+        return
+
+    patched = 0
+    for shard_name in shard_files:
+        shard_path = os.path.join(repo_dir, shard_name)
+        shard_weights = load_file(shard_path)
+        for key, value in shard_weights.items():
+            if "dt_bias" not in key:
+                continue
+            # Try direct match first, then backbone. <-> model. remap
+            sd_key = key
+            if sd_key not in sd:
+                if key.startswith("backbone."):
+                    sd_key = "model." + key[len("backbone."):]
+                elif key.startswith("model."):
+                    sd_key = "backbone." + key[len("model."):]
+            if sd_key in sd:
+                sd[sd_key] = value
+                patched += 1
+    if patched:
+        model.load_state_dict(sd)
+        print(f"  Fixed {patched} dt_bias parameters from checkpoint")
+
+
 def _apply_nemotron_h_patch():
     """Monkey-patch HuggingFace NemotronH bugs.
 
@@ -405,6 +458,7 @@ def generate_hf(
         .to(device)
         .eval()
     )
+    _fix_nemotron_h_dt_bias(model)
 
     input_ids = tokenize_prompt(tokenizer, prompt, use_chat)
     ids_tensor = torch.tensor([input_ids], device=device)
