@@ -343,6 +343,42 @@ class _VideoLLaMA3EmbeddingModel(nn.Module):
         return vlm_embedding_weights(state_dict, keyword="embed_tokens", prefixes=("model.",))
 
 
+def _rename_videollama3_vision_weight(key: str) -> str | None:
+    """Map a HF VideoLLaMA3 vision encoder key (after stripping ``model.vision_encoder.``)
+    to the ONNX path relative to ``vision_tower``.
+
+    HF structure (SigLIP-based):
+    - ``embeddings.patch_embedding.*``      → ``patch_embed.proj.*``
+    - ``encoder.layers.{i}.self_attn.*``    → ``blocks.{i}.attn.*``
+    - ``encoder.layers.{i}.mlp.*``          → ``blocks.{i}.mlp.*``
+    - ``encoder.layers.{i}.layer_norm1.*``  → ``blocks.{i}.norm1.*``
+    - ``encoder.layers.{i}.layer_norm2.*``  → ``blocks.{i}.norm2.*``
+    - ``post_layernorm.*``                  → ``norm.*``
+    """
+    if key.startswith("embeddings.patch_embedding."):
+        suffix = key[len("embeddings.patch_embedding."):]
+        return f"patch_embed.proj.{suffix}"
+
+    if key.startswith("post_layernorm."):
+        suffix = key[len("post_layernorm."):]
+        return f"norm.{suffix}"
+
+    if key.startswith("encoder.layers."):
+        # encoder.layers.{i}.{rest}
+        parts = key.split(".", 3)  # ["encoder", "layers", i, rest]
+        if len(parts) < 4:
+            return None
+        idx = parts[2]
+        rest = parts[3]
+
+        rest = rest.replace("self_attn.", "attn.")
+        rest = rest.replace("layer_norm1.", "norm1.")
+        rest = rest.replace("layer_norm2.", "norm2.")
+        return f"blocks.{idx}.{rest}"
+
+    return None
+
+
 class VideoLLaMA3Model(nn.Module):
     """VideoLLaMA3 vision-language model (3-model split).
 
@@ -376,10 +412,51 @@ class VideoLLaMA3Model(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        # Handle tied word embeddings: copy embed_tokens → lm_head if absent
+        """Map HuggingFace VideoLLaMA3 weight names to ONNX parameter names.
+
+        HF nests everything under ``model.*``:
+        - ``model.layers.*``           → ``decoder.model.layers.*``
+        - ``model.norm.*``             → ``decoder.model.norm.*``
+        - ``model.lm_head.*``          → ``decoder.lm_head.*``
+        - ``model.embed_tokens.*``     → ``embedding.embed_tokens.*``
+        - ``model.mm_projector.*``     → ``vision_encoder.mm_projector.*``
+        - ``model.vision_encoder.*``   → ``vision_encoder.vision_encoder.vision_tower.*``
+          with additional structural renames (encoder.layers → blocks, etc.)
+        """
+        result: dict[str, torch.Tensor] = {}
+
+        # Handle tied word embeddings
         if self.config.tie_word_embeddings:
             embed_key = "model.embed_tokens.weight"
-            head_key = "lm_head.weight"
+            head_key = "model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
+                state_dict = dict(state_dict)
                 state_dict[head_key] = state_dict[embed_key]
-        return state_dict
+
+        for k, v in state_dict.items():
+            if not k.startswith("model."):
+                continue
+            rest = k[len("model."):]
+
+            # --- Text decoder ---
+            if rest.startswith("lm_head."):
+                result[f"decoder.{rest}"] = v
+            elif rest.startswith(("layers.", "norm.")):
+                result[f"decoder.model.{rest}"] = v
+            elif rest == "embed_tokens.weight":
+                result["embedding.embed_tokens.weight"] = v
+
+            # --- Projector ---
+            elif rest.startswith("mm_projector."):
+                # HF Sequential: skip GELU module at index 1 → readout.2 → readout.1
+                new_rest = rest.replace("mm_projector.readout.2.", "mm_projector.readout.1.")
+                result[f"vision_encoder.{new_rest}"] = v
+
+            # --- Vision encoder ---
+            elif rest.startswith("vision_encoder."):
+                ve_rest = rest[len("vision_encoder."):]
+                new_key = _rename_videollama3_vision_weight(ve_rest)
+                if new_key is not None:
+                    result[f"vision_encoder.vision_encoder.vision_tower.{new_key}"] = v
+
+        return result
