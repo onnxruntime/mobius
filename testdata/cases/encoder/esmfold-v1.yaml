@@ -1,0 +1,17 @@
+model_id: "facebook/esmfold_v1"
+revision: "75a3841ee059df2bf4d56688166c8fb459ddd97a"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "MLKFQTLSDGSTF"
+
+level: "L4+L5"
+
+skip_reason: "Folding trunk and structure module not yet implemented (Phase 2/3)."
+notes: >
+  ESMFold v1. Protein structure prediction from amino-acid sequence.
+  ESM-2 3B backbone (36-layer transformer) + 48-block folding trunk
+  with triangular attention + IPA structure module.
+  Phase 1 implements ESM-2 backbone only.
