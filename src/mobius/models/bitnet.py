@@ -196,6 +196,8 @@ def _unpack_ternary_weights(packed: torch.Tensor) -> torch.Tensor:
         Float tensor of shape ``[out_features, in_features]`` with values
         in {-1, 0, +1}.
     """
+    if packed.ndim < 2:
+        raise ValueError(f"Expected packed tensor with ≥2 dims, got shape {packed.shape}")
     # Extract 4 two-bit values per byte
     v0 = (packed >> 0) & 0x03  # bits 0-1
     v1 = (packed >> 2) & 0x03  # bits 2-3
