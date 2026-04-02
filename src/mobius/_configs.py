@@ -2043,6 +2043,7 @@ class SeamlessM4Tv2Config(ArchitectureConfig):
     t2u_decoder_ffn_dim: int = 8192
     t2u_vocab_size: int = 10082
     t2u_max_position_embeddings: int = 4096
+    t2u_pad_token_id: int = 1
 
     # Vocoder embeddings and conditioning
     unit_embed_dim: int = 1280
@@ -2126,6 +2127,7 @@ class SeamlessM4Tv2Config(ArchitectureConfig):
                 "t2u_max_position_embeddings": getattr(
                     config, "t2u_max_position_embeddings", 4096
                 ),
+                "t2u_pad_token_id": getattr(config, "t2u_pad_token_id", 1),
                 # Vocoder
                 "unit_embed_dim": getattr(config, "unit_embed_dim", 1280),
                 "unit_hifi_gan_vocab_size": getattr(config, "unit_hifi_gan_vocab_size", 10000),

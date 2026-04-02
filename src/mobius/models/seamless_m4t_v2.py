@@ -944,7 +944,7 @@ class SeamlessM4Tv2T2UModel(nn.Module):
         )
         self.t2u_decoder_layer_norm = LayerNorm(D)
 
-        self.t2u_lm_head = Linear(D, config.t2u_vocab_size, bias=True)
+        self.t2u_lm_head = Linear(D, config.t2u_vocab_size, bias=False)
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value) -> ir.Value:
         # input_ids: (B, T) int64
@@ -1255,6 +1255,31 @@ class SeamlessM4Tv2VocoderModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_sinusoidal_embeddings(
+    num_embeddings: int, embedding_dim: int, padding_idx: int | None = None
+) -> torch.Tensor:
+    """Compute sinusoidal positional embeddings (same formula as HF SeamlessM4Tv2).
+
+    HF stores these as ``persistent=False`` buffers, so they are absent from
+    saved checkpoints and must be re-computed at weight-loading time.
+    """
+    half_dim = embedding_dim // 2
+    scale = math.log(10000) / (half_dim - 1)
+    freqs = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -scale)
+    positions = torch.arange(num_embeddings, dtype=torch.float32)
+    emb = positions.unsqueeze(1) * freqs.unsqueeze(0)  # (N, half_dim)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)  # (N, embedding_dim)
+    if embedding_dim % 2 == 1:
+        emb = torch.cat([emb, torch.zeros(num_embeddings, 1)], dim=1)
+    if padding_idx is not None:
+        emb[padding_idx, :] = 0.0
+    return emb
+
+
 # T2U weight name remapper (module-level helper)
 # ---------------------------------------------------------------------------
 
@@ -1365,8 +1390,10 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
             # Also strip the nested 'ffn.' wrapper around fc1/fc2 to align
             # with _SeamlessM4Tv2DecoderBlock which exposes fc1/fc2 directly.
             if name.startswith("text_decoder."):
-                sub = name[len("text_decoder.") :]
-                sub = sub.replace(".embed_positions.weights", ".embed_positions.weight")
+                sub = name[len("text_decoder."):]
+                # sub starts at the segment *after* "text_decoder." so there's no
+                # leading dot — use bare "embed_positions.weights" pattern.
+                sub = sub.replace("embed_positions.weights", "embed_positions.weight")
                 sub = sub.replace(".ffn.fc1.", ".fc1.")
                 sub = sub.replace(".ffn.fc2.", ".fc2.")
                 new_dict["decoder." + sub] = tensor
@@ -1380,24 +1407,23 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
                 continue
 
             # Vocoder weights: remap to the split dur_head / hifigan_head sub-modules.
-            # HF:    vocoder.unit_embedding.*     →  both dur_head and hifigan_head
-            # HF:    vocoder.speaker_embedding.*  →  hifigan_head.speaker_embedding.*
-            # HF:    vocoder.language_embedding.* →  hifigan_head.language_embedding.*
-            # HF:    vocoder.dur_predictor.*      →  dur_head.dur_predictor.*
-            # HF:    vocoder.hifi_gan.*            →  hifigan_head.hifi_gan.*
+            # The task builds vocoder_dur and vocoder_hifigan models by calling
+            # module.vocoder.dur_head.forward() and module.vocoder.hifigan_head.forward().
+            # onnxscript resolves initializer names relative to the sub-module, so
+            # ONNX params are "dur_head.*" and "hifigan_head.*" (no "vocoder." prefix).
             if name.startswith("vocoder."):
                 sub = name[len("vocoder."):]
                 if sub.startswith("unit_embedding."):
-                    new_dict["vocoder.dur_head." + sub] = tensor
-                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                    new_dict["dur_head." + sub] = tensor
+                    new_dict["hifigan_head." + sub] = tensor
                 elif sub.startswith("speaker_embedding."):
-                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                    new_dict["hifigan_head." + sub] = tensor
                 elif sub.startswith("language_embedding."):
-                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                    new_dict["hifigan_head." + sub] = tensor
                 elif sub.startswith("dur_predictor."):
-                    new_dict["vocoder.dur_head." + sub] = tensor
+                    new_dict["dur_head." + sub] = tensor
                 elif sub.startswith("hifi_gan."):
-                    new_dict["vocoder.hifigan_head." + sub] = tensor
+                    new_dict["hifigan_head." + sub] = tensor
                 continue
 
         # Populate decoder token embedding and tied lm_head from shared weight
@@ -1406,5 +1432,22 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
         embed = new_dict.get("decoder.embed_tokens.weight")
         if embed is not None:
             new_dict.setdefault("decoder.lm_head.weight", embed)
+
+        # Sinusoidal positional embeddings are stored as persistent=False buffers
+        # in HF, so they are absent from the checkpoint.  Compute and inject them.
+        cfg = self.config
+        # Text decoder: max_position_embeddings + 2 (SeamlessM4T uses offset=2)
+        dec_sin = _make_sinusoidal_embeddings(
+            cfg.max_position_embeddings + 2, cfg.hidden_size, padding_idx=cfg.pad_token_id
+        )
+        new_dict.setdefault("decoder.embed_positions.weight", dec_sin)
+
+        # T2U encoder embed_positions (same formula, own max/pad config)
+        t2u_sin = _make_sinusoidal_embeddings(
+            cfg.t2u_max_position_embeddings + 2,
+            cfg.hidden_size,
+            padding_idx=cfg.t2u_pad_token_id,
+        )
+        new_dict.setdefault("t2u.t2u_embed_positions.weight", t2u_sin)
 
         return new_dict
