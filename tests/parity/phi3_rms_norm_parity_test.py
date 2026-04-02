@@ -328,7 +328,7 @@ class TestPhi3RMSNormParityFloat16:
     Phi3RMSNorm always promotes to float32 for the variance computation and
     then casts the result back to float16. The ONNX ``RMSNormalization`` op
     may follow a similar promotion strategy internally, so both paths should
-    agree to within a loose float16 tolerance (atol ≤ 1e-3).
+    agree to within a loose float16 tolerance (atol ≤ 2e-3).
     """
 
     def _run_onnx_fp16(
