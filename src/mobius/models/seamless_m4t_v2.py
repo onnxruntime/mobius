@@ -33,8 +33,8 @@ Weight prefixes:
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -43,10 +43,6 @@ from mobius._configs import SeamlessM4Tv2Config
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, LayerNorm, Linear
 from mobius.components._encoder_decoder_attention import EncoderDecoderAttention
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
-
 
 # ---------------------------------------------------------------------------
 # Encoder and Decoder Blocks
@@ -115,7 +111,7 @@ class _SeamlessM4Tv2DecoderBlock(nn.Module):
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         past_key_value: tuple | None = None,
-        cross_past_key_value: ir.Value | None = None,
+        cross_past_key_value: tuple[ir.Value, ir.Value] | None = None,
     ):
         # Pre-norm causal self-attention (with KV cache)
         residual = hidden_states
@@ -164,10 +160,10 @@ class _SeamlessM4Tv2TextEncoder(nn.Module):
     def __init__(self, config: SeamlessM4Tv2Config):
         super().__init__()
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        # Sinusoidal positional embeddings: size is (max_position_embeddings + 2)
-        # to accommodate the HF offset of 2 (positions start at index 2).
-        self.embed_positions = Embedding(
-            config.max_position_embeddings + 2, config.hidden_size
+        # Sinusoidal positional embeddings: pre-initialized at construction time
+        # (HF stores these as persistent=False buffers, absent from state_dict).
+        self.embed_positions = _SinusoidalPositionEmbedding(
+            config.max_position_embeddings, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
             [_SeamlessM4Tv2EncoderBlock(config) for _ in range(config.num_hidden_layers)]
@@ -220,8 +216,9 @@ class _SeamlessM4Tv2TextDecoder(nn.Module):
         super().__init__()
         num_decoder_layers = config.num_decoder_layers or config.num_hidden_layers
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        self.embed_positions = Embedding(
-            config.max_position_embeddings + 2, config.hidden_size
+        # Sinusoidal positional embeddings: pre-initialized at construction time.
+        self.embed_positions = _SinusoidalPositionEmbedding(
+            config.max_position_embeddings, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
             [_SeamlessM4Tv2DecoderBlock(config) for _ in range(num_decoder_layers)]
@@ -239,7 +236,7 @@ class _SeamlessM4Tv2TextDecoder(nn.Module):
         position_ids: ir.Value | None = None,
         attention_mask: ir.Value | None = None,
         past_key_values: list | None = None,
-        cross_past_key_values: ir.Value | None = None,
+        cross_past_key_values: list[tuple[ir.Value, ir.Value] | None] | None = None,
     ):
         # (batch, seq_len, hidden_size) — scaled
         inputs_embeds = self.embed_tokens(op, input_ids)
@@ -931,8 +928,10 @@ class SeamlessM4Tv2T2UModel(nn.Module):
         D = config.hidden_size  # noqa: N806
 
         self.t2u_embed_tokens = Embedding(config.t2u_vocab_size, D)
-        # Positional embeddings with HF-style offset of 2
-        self.t2u_embed_positions = Embedding(config.t2u_max_position_embeddings + 2, D)
+        # Positional embeddings pre-initialized with sinusoidal values.
+        self.t2u_embed_positions = _SinusoidalPositionEmbedding(
+            config.t2u_max_position_embeddings, D, config.t2u_pad_token_id
+        )
 
         self.t2u_encoder = nn.ModuleList(
             [_T2UEncoderLayer(config) for _ in range(config.t2u_encoder_layers)]
@@ -1278,6 +1277,30 @@ def _make_sinusoidal_embeddings(
     if padding_idx is not None:
         emb[padding_idx, :] = 0.0
     return emb
+
+
+class _SinusoidalPositionEmbedding(Embedding):
+    """Position embedding pre-initialized with sinusoidal values at construction.
+
+    HF ``SeamlessM4Tv2SinusoidalPositionalEmbedding`` registers its weights as a
+    ``persistent=False`` buffer, so they are absent from saved checkpoints.
+    Pre-computing at construction time ensures the ONNX graph carries correct
+    values even when no HF checkpoint is loaded.
+
+    ``num_positions`` is the *logical* length; the HF ``offset=2`` is added here,
+    making the actual embedding table ``num_positions + 2`` rows tall.
+
+    Args:
+        num_positions: Logical number of positions (``max_position_embeddings``).
+        embedding_dim: Feature dimension.
+        padding_idx: Row to zero out (typically ``pad_token_id``).
+    """
+
+    def __init__(self, num_positions: int, embedding_dim: int, padding_idx: int | None = None):
+        num_embeddings = num_positions + 2  # HF offset=2
+        super().__init__(num_embeddings, embedding_dim, padding_idx)
+        sin_data = _make_sinusoidal_embeddings(num_embeddings, embedding_dim, padding_idx)
+        self.weight = nn.Parameter([num_embeddings, embedding_dim], data=ir.tensor(sin_data))
 
 
 # T2U weight name remapper (module-level helper)

@@ -383,10 +383,9 @@ def speech_to_speech(
 ) -> None:
     """Speech-to-speech translation pipeline.
 
-    Currently stubs out the ONNX components and falls back to the HuggingFace
-    reference implementation.  When agent 8d99cf75 delivers the speech encoder
-    and vocoder ONNX models, replace each TODO block with the corresponding
-    OnnxModelSession call.
+    Currently falls back to the HuggingFace reference implementation.
+    Replace each TODO block with the corresponding OnnxModelSession call
+    once ORT GenAI sessions are wired up.
 
     Pipeline:
         audio → speech_encoder → encoder_hidden_states
@@ -394,8 +393,8 @@ def speech_to_speech(
              → t2u             → acoustic_unit_ids
              → vocoder         → waveform
     """
-    import soundfile as sf
     import numpy as np
+    import soundfile as sf
     from transformers import SeamlessM4Tv2Model
 
     # Load audio
@@ -409,7 +408,7 @@ def speech_to_speech(
     )
     print(f"Translating speech: {args.src_lang} → {args.tgt_lang}")
 
-    # --- TODO (agent 8d99cf75): Replace with ONNX speech_encoder session ---
+    # --- TODO: Replace with ONNX speech_encoder session ---
     # When pkg["speech_encoder"] is available:
     #   mel = processor(audios=audio_array, sampling_rate=sample_rate, return_tensors="np")
     #   speech_enc_session = OnnxModelSession(pkg["speech_encoder"])
@@ -417,7 +416,7 @@ def speech_to_speech(
     #   encoder_hidden_states = encoder_hidden_states["last_hidden_state"]
     # --- END TODO ---
 
-    # --- TODO (agent 8d99cf75): Replace with ONNX decoder + T2U session ---
+    # --- TODO: Replace with ONNX decoder + T2U session ---
     # When pkg["decoder"] and pkg["t2u"] are available:
     #   tgt_bos = get_lang_token_id(processor, args.tgt_lang)
     #   cfg = pkg.config
@@ -427,9 +426,9 @@ def speech_to_speech(
     #   unit_ids = t2u_session.run({"input_ids": np.array([text_ids], dtype=np.int64)})
     # --- END TODO ---
 
-    # --- TODO (agent 8d99cf75): Replace with ONNX vocoder session ---
-    # When pkg["vocoder"] is available:
-    #   vocoder_session = OnnxModelSession(pkg["vocoder"])
+    # --- TODO: Replace with ONNX vocoder session ---
+    # When pkg["vocoder_dur"] and pkg["vocoder_hifigan"] are available:
+    #   vocoder_session = OnnxModelSession(pkg["vocoder_hifigan"])
     #   waveform = vocoder_session.run({"unit_ids": unit_ids["unit_ids"]})
     #   waveform = waveform["waveform"][0]  # (samples,)
     # --- END TODO ---
@@ -546,8 +545,9 @@ def main() -> None:
     print(f"Build complete ({time.perf_counter() - t0:.1f}s)")
 
     if args.save_to:
-        import onnx_ir as ir
         from pathlib import Path
+
+        import onnx_ir as ir
 
         save_dir = Path(args.save_to)
         save_dir.mkdir(parents=True, exist_ok=True)
