@@ -1,0 +1,12 @@
+model_id: "allenai/longformer-base-4096"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+
+notes: "Longformer base. Uses full bidirectional attention (global projections dropped)."
