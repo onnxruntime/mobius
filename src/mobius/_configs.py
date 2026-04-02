@@ -1952,8 +1952,12 @@ class GroundingDinoConfig(ArchitectureConfig):
             else {}
         )
 
+        base_fields = _shallow_fields(base)
+        # Grounding DINO is designed for 800x800 inputs; this ensures Swin
+        # window_size=12 is not clamped in the last stage (which needs h>=12).
+        base_fields["image_size"] = getattr(config, "image_size", 800)
         return cls(
-            **_shallow_fields(base),
+            **base_fields,
             d_model=getattr(config, "d_model", 256),
             num_queries=getattr(config, "num_queries", 900),
             encoder_layers=getattr(config, "encoder_layers", 6),

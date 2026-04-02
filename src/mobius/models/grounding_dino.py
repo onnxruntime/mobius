@@ -2089,25 +2089,9 @@ class GroundingDinoForObjectDetection(nn.Module):
             if new_key.startswith("model."):
                 new_key = new_key[6:]
 
-            # Skip decoder.bbox_embed (shared with top-level bbox_embed)
-            if new_key.startswith("decoder.bbox_embed."):
-                continue
-
             # Skip relative_position_index (precomputed constant)
             if "relative_position_index" in new_key:
                 continue
-
-            # --- Swin backbone renames ---
-            # onnxscript skips plain nn.Module() containers, so:
-            # backbone.conv_encoder.model.X → model.X
-            if new_key.startswith("backbone.conv_encoder."):
-                new_key = new_key[len("backbone.conv_encoder.") :]
-            # Within Swin: model.encoder.layers.N → model.layers.N
-            if new_key.startswith("model.encoder."):
-                new_key = "model." + new_key[len("model.encoder.") :]
-            # Within Swin: model.hidden_states_norms.stageN → model.stageN
-            if "hidden_states_norms." in new_key:
-                new_key = new_key.replace("hidden_states_norms.", "")
 
             # --- query_position_embeddings: Embedding → bare parameter ---
             if new_key == "query_position_embeddings.weight":
@@ -2121,13 +2105,6 @@ class GroundingDinoForObjectDetection(nn.Module):
                 new_key = new_key.replace(".0.bias", ".conv.bias")
                 new_key = new_key.replace(".1.weight", ".norm.weight")
                 new_key = new_key.replace(".1.bias", ".norm.bias")
-
-            # --- BERT text backbone renames ---
-            if new_key.startswith("text_backbone."):
-                new_key = new_key.replace(".attention.self.", ".attention.")
-                new_key = new_key.replace(".attention.output.", ".attention.")
-                new_key = new_key.replace(".output.dense.", ".dense.")
-                new_key = new_key.replace(".output.LayerNorm.", ".LayerNorm.")
 
             new_dict[new_key] = value
 
