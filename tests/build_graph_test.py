@@ -3443,6 +3443,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "gemma3_multimodal",
     "llava",
     "mllama",
+    "phi3_v",
+    "phi4-siglip",
     "phi4_multimodal",
     "phi4mm",
     "qwen2_5_vl",

@@ -123,7 +123,8 @@ __all__ = [
     "VideoAutoencoderModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
-    "XLMCausalLMModel", "T5GemmaForConditionalGeneration",
+    "XLMCausalLMModel",
+    "T5GemmaForConditionalGeneration",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel

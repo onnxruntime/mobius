@@ -404,6 +404,30 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             image_token_id=getattr(config, "special_image_token_id", 200010),
         )
 
+    # phi3_v stores vision configuration in `img_processor` (a dict), not
+    # `vision_config`. Extract CLIP ViT-L/14-336 parameters from that dict.
+    if model_type == "phi3_v":
+        img_proc = getattr(vision_source, "img_processor", None) or {}
+        if isinstance(img_proc, dict):
+            vision_fields.update(
+                hidden_size=img_proc.get("image_dim_out", 1024),
+                intermediate_size=4096,  # CLIP ViT-L/14 FFN dim
+                num_hidden_layers=24,
+                num_attention_heads=16,
+                image_size=336,
+                patch_size=14,
+                norm_eps=1e-5,
+            )
+        vision_fields.setdefault("image_token_id", 32044)  # <|image|> token
+
+    # phi4-siglip vision_config exists but omits image_size and patch_size —
+    # supply SigLIP-2 defaults from the preprocessor spec (patch_size=16,
+    # image_size=384 fixed resolution).
+    if model_type == "phi4-siglip":
+        vision_fields.setdefault("image_size", 384)
+        vision_fields.setdefault("patch_size", 16)
+        vision_fields.setdefault("image_token_id", -200)
+
     # InternVL2 doesn't expose image_token_id in its config — default to
     # the Qwen2 <IMG_CONTEXT> token id used by InternVL2-* models.
     parent_model_type = getattr(vision_source, "model_type", None)
@@ -1925,6 +1949,67 @@ class Lfm2AudioConfig(Lfm2Config):
             depthformer_tie=depthformer.get("tie", True),
             num_codebooks=getattr(config, "codebooks", 8),
             audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2MoeConfig(Lfm2Config):
+    """Configuration for LFM2-MoE: hybrid ShortConv+Attention with MoE FFN.
+
+    Extends Lfm2Config with Mixture-of-Experts FFN layers. The first
+    ``num_dense_layers`` layers use a standard MLP; remaining layers use
+    MoELayer with TopK routing.
+
+    MoE fields (inherited from ArchitectureConfig): num_local_experts,
+    num_experts_per_tok, moe_intermediate_size, norm_topk_prob,
+    routed_scaling_factor.
+
+    HuggingFace reference: ``Lfm2MoeForCausalLM``.
+    """
+
+    num_dense_layers: int = 2
+    use_expert_bias: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2MoeConfig:
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+        return cls(
+            **base_fields,
+            num_dense_layers=getattr(config, "num_dense_layers", 2),
+            use_expert_bias=getattr(config, "use_expert_bias", True),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2VlConfig(Lfm2Config):
+    """Configuration for LFM2-VL: vision-language with LFM2 hybrid backbone.
+
+    Extends Lfm2Config with SigLIP2 vision encoder and MLP projector fields.
+    Vision encoder fields are in the inherited ``vision`` attribute (VisionConfig).
+
+    HuggingFace reference: ``Lfm2VlForConditionalGeneration``.
+    """
+
+    image_token_id: int = 396
+    projector_hidden_size: int = 2048
+    projector_bias: bool = True
+    downsample_factor: int = 2
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2VlConfig:
+        # ArchitectureConfig.from_transformers auto-extracts text_config
+        # and vision_config via _extract_vision_config
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+        # VL-specific fields from top-level config
+        vl_source = parent_config if parent_config is not None else config
+        return cls(
+            **base_fields,
+            image_token_id=getattr(vl_source, "image_token_id", 396),
+            projector_hidden_size=getattr(vl_source, "projector_hidden_size", 2048),
+            projector_bias=getattr(vl_source, "projector_bias", True),
+            downsample_factor=getattr(vl_source, "downsample_factor", 2),
         )
 
 

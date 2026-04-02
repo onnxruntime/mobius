@@ -60,7 +60,9 @@ from mobius.models import (
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
+    Phi3VModel,
     Phi4MMMultiModalModel,
+    Phi4SigLIPModel,
     PhiCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen3CausalLMModel,
@@ -113,6 +115,7 @@ from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5gemma import T5GemmaForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
@@ -480,6 +483,14 @@ def _create_default_registry() -> ModelRegistry:
 
     reg.register("lfm2_audio", Lfm2AudioModel)
 
+    from mobius.models.lfm2_moe import Lfm2MoeCausalLMModel
+
+    reg.register("lfm2_moe", Lfm2MoeCausalLMModel)
+
+    from mobius.models.lfm2_vl import Lfm2VlModel
+
+    reg.register("lfm2_vl", Lfm2VlModel, task="hybrid-vision-language")
+
     # --- Moshi / PersonaPlex (audio-to-audio) ---
     from mobius.models.moshi import MoshiModel
 
@@ -527,6 +538,8 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("mllama", MllamaCausalLMModel, task="mllama-vision-language")
 
     reg.register("blip-2", Blip2Model, task="vision-language")
+    reg.register("phi3_v", Phi3VModel, task="vision-language")
+    reg.register("phi4-siglip", Phi4SigLIPModel, task="vision-language")
     reg.register("phi4mm", Phi4MMMultiModalModel, task="phi4mm-multimodal")
     reg.register("phi4_multimodal", Phi4MMMultiModalModel, task="phi4mm-multimodal")
     reg.register("qwen2_vl", Qwen25VLCausalLMModel, task="qwen-vl")
@@ -643,6 +656,7 @@ def _create_default_registry() -> ModelRegistry:
         reg.register(name, BartForConditionalGeneration, task="seq2seq")
     for name in ("longt5", "mt5", "switch_transformers", "t5", "umt5"):
         reg.register(name, T5ForConditionalGeneration, task="seq2seq")
+    reg.register("t5gemma", T5GemmaForConditionalGeneration, task="seq2seq")
     reg.register("trocr", TrOCRForConditionalGeneration, task="seq2seq")
 
     # --- Vision ---
@@ -855,6 +869,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
+    "phi3_v": "microsoft/Phi-3.5-vision-instruct",
+    "phi4-siglip": "microsoft/Phi-4-reasoning-vision-15B",
     "blip-2": "Salesforce/blip2-opt-2.7b",
     "florence2": "microsoft/Florence-2-base",
     "idefics2": "HuggingFaceM4/idefics2-8b",
@@ -921,6 +937,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Encoder-decoder ---
     "bart": "facebook/bart-base",
     "t5": "google-t5/t5-small",
+    "t5gemma": "google/t5gemma-2b-2b-prefixlm",
     "mt5": "google/mt5-small",
     "marian": "Helsinki-NLP/opus-mt-en-de",
     "mbart": "facebook/mbart-large-cc25",
@@ -984,6 +1001,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "phimoe": "phi",
     "phi4mm": "phi",
     "phi4_multimodal": "phi",
+    "phi3_v": "phi",
+    "phi4-siglip": "phi",
     "gemma": "gemma",
     "gemma2": "gemma",
     "shieldgemma2": "gemma",
@@ -1051,6 +1070,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "bart": "bart",
     "mbart": "bart",
     "t5": "t5",
+    "t5gemma": "t5",
     "mt5": "t5",
     "longt5": "t5",
     "umt5": "t5",
