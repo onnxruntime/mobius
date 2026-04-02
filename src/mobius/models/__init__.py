@@ -57,6 +57,7 @@ __all__ = [
     "GlmCausalLMModel",
     "GraniteCausalLMModel",
     "GraniteMoeHybridCausalLMModel",
+    "GroundingDinoForObjectDetection",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
     "HunyuanDiT2DModel",
@@ -87,6 +88,7 @@ __all__ = [
     "OPTCausalLMModel",
     "Owlv2ForObjectDetection",
     "PersimmonCausalLMModel",
+    "SamModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
     "Phi3SmallCausalLMModel",
@@ -125,6 +127,7 @@ __all__ = [
     "QwenImageTransformer2DModel",
     "MobileNetV2Model",
     "ConvNextModel",
+    "RecurrentGemmaCausalLMModel",
     "ResNetModel",
     "RtDetrForObjectDetection",
     "Rwkv6CausalLMModel",
@@ -186,6 +189,7 @@ from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.gptoss import GPTOSSCausalLMModel
 from mobius.models.granite import GraniteCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
+from mobius.models.grounding_dino import GroundingDinoForObjectDetection
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.hunyuan_v1 import HunYuanV1DenseCausalLMModel
 from mobius.models.internlm import InternLM2CausalLMModel
@@ -218,6 +222,7 @@ from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.owlv2 import Owlv2ForObjectDetection
 from mobius.models.persimmon import PersimmonCausalLMModel
+from mobius.models.sam import SamModel
 from mobius.models.phi import (
     Phi3SmallCausalLMModel,
     Phi4MMCausalLMModel,
@@ -268,6 +273,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLVisionEncoderModel,
 )
 from mobius.models.resnet import ResNetModel
+from mobius.models.recurrent_gemma import RecurrentGemmaCausalLMModel
 from mobius.models.rt_detr import RtDetrForObjectDetection
 from mobius.models.rwkv6 import Rwkv6CausalLMModel
 from mobius.models.smollm import SmolLM3CausalLMModel

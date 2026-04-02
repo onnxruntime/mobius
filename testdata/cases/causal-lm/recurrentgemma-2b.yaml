@@ -1,0 +1,18 @@
+model_id: "google/recurrentgemma-2b"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+skip_reason: "Model is ~4GB; too large for CI golden generation."
+
+inputs:
+  prompts:
+    - "The Griffin architecture combines"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "RecurrentGemma 2B (Griffin). Hybrid RG-LRU recurrent + local sliding-window GQA attention. 26 layers with pattern [recurrent, recurrent, attention]. Embeddings scaled by sqrt(hidden_size). Logits soft-capped at 30.0."

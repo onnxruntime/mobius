@@ -27,11 +27,14 @@ from mobius._configs import (
     BaseModelConfig,
     ConvNextConfig,
     DetrConfig,
+    GroundingDinoConfig,
     MobileNetV2Config,
     MoondreamConfig,
     MoonshineConfig,
     Owlv2Config,
+    RecurrentGemmaConfig,
     ResNetConfig,
+    SamConfig,
     RtDetrConfig,
     Rwkv6Config,
     RwkvConfig,
@@ -113,6 +116,7 @@ from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
+from mobius.models.grounding_dino import GroundingDinoForObjectDetection
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
@@ -133,10 +137,12 @@ from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+from mobius.models.recurrent_gemma import RecurrentGemmaCausalLMModel
 from mobius.models.resnet import ResNetModel
 from mobius.models.rt_detr import RtDetrForObjectDetection
 from mobius.models.rwkv import RwkvCausalLMModel
 from mobius.models.rwkv6 import Rwkv6CausalLMModel
+from mobius.models.sam import SamModel
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.speech2text import Speech2TextForConditionalGeneration
@@ -500,6 +506,14 @@ def _create_default_registry() -> ModelRegistry:
         "rwkv6", Rwkv6CausalLMModel, task="rwkv6-text-generation", config_class=Rwkv6Config
     )
 
+    # --- RecurrentGemma (Griffin hybrid RG-LRU + attention) ---
+    reg.register(
+        "recurrent_gemma",
+        RecurrentGemmaCausalLMModel,
+        task="hybrid-text-generation",
+        config_class=RecurrentGemmaConfig,
+    )
+
     # --- Hybrid SSM+Attention (Jamba) ---
     reg.register("jamba", JambaCausalLMModel)
 
@@ -797,6 +811,12 @@ def _create_default_registry() -> ModelRegistry:
         config_class=RtDetrConfig,
     )
     reg.register(
+        "grounding-dino",
+        GroundingDinoForObjectDetection,
+        task="grounding-dino-detection",
+        config_class=GroundingDinoConfig,
+    )
+    reg.register(
         "owlv2",
         Owlv2ForObjectDetection,
         task="owlv2-object-detection",
@@ -804,6 +824,12 @@ def _create_default_registry() -> ModelRegistry:
     )
 
     # --- Segmentation ---
+    reg.register(
+        "sam",
+        SamModel,
+        task="sam-segmentation",
+        config_class=SamConfig,
+    )
     reg.register("sam2", Sam2VisionModel, task="image-classification")
     reg.register("segformer", SegformerForSemanticSegmentation, task="image-classification")
 
@@ -1096,7 +1122,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "detr": "facebook/detr-resnet-50",
     "table-transformer": "microsoft/table-transformer-detection",
     "rt_detr": "PekingU/rtdetr_r50vd",
+    "grounding-dino": "IDEA-Research/grounding-dino-base",
     "owlv2": "google/owlv2-base-patch16-ensemble",
+    "sam": "facebook/sam-vit-base",
     "segformer": "nvidia/segformer-b0-finetuned-ade-512-512",
     "cvt": "microsoft/cvt-13",
     "data2vec-vision": "facebook/data2vec-vision-base-ft1k",

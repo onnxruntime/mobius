@@ -265,6 +265,23 @@ def _make_hybrid_cache_inputs(
         elif ltype == "mlp":
             # MLP-only layers are stateless — no cache inputs needed
             pairs.append((None, None))
+        elif ltype == "recurrent":
+            # RecurrentGemma RG-LRU: conv prefix buffer + LRU hidden state
+            # rg_lru_state is always fp32 for numerical stability
+            rg_lru_width = getattr(config, "lru_width", config.hidden_size)
+            rg_conv1d_width = getattr(config, "conv1d_width", 4)
+            conv_state = ir.Value(
+                name=f"{prefix}.{i}.conv_state",
+                shape=ir.Shape([batch, rg_lru_width, rg_conv1d_width - 1]),
+                type=ir.TensorType(ir.DataType.FLOAT),
+            )
+            rg_lru_state = ir.Value(
+                name=f"{prefix}.{i}.rg_lru_state",
+                shape=ir.Shape([batch, rg_lru_width]),
+                type=ir.TensorType(ir.DataType.FLOAT),
+            )
+            flat.extend([conv_state, rg_lru_state])
+            pairs.append((conv_state, rg_lru_state))
         elif ltype == "mamba":
             conv_state = ir.Value(
                 name=f"{prefix}.{i}.conv_state",
@@ -346,6 +363,9 @@ def _register_hybrid_cache_outputs(
             elif ltype in ("mamba", "mamba2"):
                 state_a.name = f"{prefix}.{i}.conv_state"
                 state_b.name = f"{prefix}.{i}.ssm_state"
+            elif ltype == "recurrent":
+                state_a.name = f"{prefix}.{i}.conv_state"
+                state_b.name = f"{prefix}.{i}.rg_lru_state"
             else:
                 state_a.name = f"{prefix}.{i}.key"
                 state_b.name = f"{prefix}.{i}.value"

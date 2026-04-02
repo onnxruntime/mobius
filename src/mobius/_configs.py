@@ -1576,6 +1576,47 @@ class DPTConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class RecurrentGemmaConfig(ArchitectureConfig):
+    """Configuration for RecurrentGemma (Griffin) hybrid causal LM.
+
+    Adds RG-LRU specific fields (``lru_width``, ``conv1d_width``) on top of
+    the standard transformer fields. ``layer_types`` is auto-populated from
+    ``layers_block_type`` in ``from_transformers``.
+    """
+
+    lru_width: int = 2560
+    conv1d_width: int = 4
+    logits_soft_cap: float = 30.0
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> RecurrentGemmaConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+
+        # Map HF block types to mobius layer_types:
+        #   "recurrent" → "recurrent"  (RG-LRU)
+        #   "attention"  → "full_attention"  (standard KV-cache GQA)
+        block_types = getattr(config, "layers_block_type", []) or []
+        fields["layer_types"] = [
+            "full_attention" if t == "attention" else t for t in block_types
+        ]
+
+        # RecurrentGemma always uses bias on o_proj and MLP projections
+        fields["attn_o_bias"] = True
+        fields["mlp_bias"] = True
+
+        # HF stores intermediate_size as 2× the actual gating dimension
+        fields["intermediate_size"] = getattr(config, "intermediate_size", 0) // 2
+
+        return cls(
+            **fields,
+            lru_width=getattr(config, "lru_width", fields["hidden_size"]),
+            conv1d_width=getattr(config, "conv1d_width", 4),
+            logits_soft_cap=getattr(config, "logits_soft_cap", 30.0),
+        )
+
+
+@dataclasses.dataclass
 class SegformerConfig(EncoderConfig):
     """Configuration for Segformer hierarchical vision transformers.
 
@@ -1634,6 +1675,71 @@ class Sam2Config(ArchitectureConfig):
             sam2_num_heads_per_stage=getattr(config, "sam2_num_heads_per_stage", None),
             sam2_mlp_ratio=getattr(config, "sam2_mlp_ratio", None),
             sam2_fpn_hidden_size=getattr(config, "sam2_fpn_hidden_size", None),
+        )
+
+
+@dataclasses.dataclass
+class SamConfig(ArchitectureConfig):
+    """Configuration for Segment Anything Model (SAM).
+
+    Flattens the three nested HF configs (vision, prompt_encoder,
+    mask_decoder) into a single config.
+    """
+
+    # ── Vision encoder ──
+    image_size: int = 1024
+    patch_size: int = 16
+    hidden_size: int = 768
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 12
+    intermediate_size: int = 3072
+    output_channels: int = 256
+    qkv_bias: bool = True
+    layer_norm_eps: float = 1e-6
+    image_embedding_size: int = 64  # image_size // patch_size
+
+    # ── Prompt encoder ──
+    num_pos_feats: int = 128
+    mask_input_channels: int = 16
+    num_point_embeddings: int = 4
+
+    # ── Mask decoder ──
+    mask_num_attention_heads: int = 8
+    mask_num_hidden_layers: int = 2
+    mask_intermediate_size: int = 2048
+    attention_downsample_rate: int = 2
+    num_multimask_outputs: int = 3
+    iou_head_depth: int = 3
+    iou_head_hidden_dim: int = 256
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> SamConfig:
+        vc = config.vision_config
+        pc = config.prompt_encoder_config
+        mc = config.mask_decoder_config
+        base = ArchitectureConfig.from_transformers(vc, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            image_size=getattr(vc, "image_size", 1024),
+            patch_size=getattr(vc, "patch_size", 16),
+            hidden_size=getattr(vc, "hidden_size", 768),
+            num_hidden_layers=getattr(vc, "num_hidden_layers", 12),
+            num_attention_heads=getattr(vc, "num_attention_heads", 12),
+            intermediate_size=getattr(vc, "mlp_dim", 3072),
+            output_channels=getattr(vc, "output_channels", 256),
+            qkv_bias=getattr(vc, "qkv_bias", True),
+            layer_norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
+            image_embedding_size=getattr(pc, "image_embedding_size", 64),
+            num_pos_feats=getattr(vc, "num_pos_feats", 128),
+            mask_input_channels=getattr(pc, "mask_input_channels", 16),
+            num_point_embeddings=getattr(pc, "num_point_embeddings", 4),
+            mask_num_attention_heads=getattr(mc, "num_attention_heads", 8),
+            mask_num_hidden_layers=getattr(mc, "num_hidden_layers", 2),
+            mask_intermediate_size=getattr(mc, "mlp_dim", 2048),
+            attention_downsample_rate=getattr(mc, "attention_downsample_rate", 2),
+            num_multimask_outputs=getattr(mc, "num_multimask_outputs", 3),
+            iou_head_depth=getattr(mc, "iou_head_depth", 3),
+            iou_head_hidden_dim=getattr(mc, "iou_head_hidden_dim", 256),
         )
 
 
@@ -1755,6 +1861,111 @@ class RtDetrConfig(ArchitectureConfig):
                 getattr(config, "encoder_in_channels", [512, 1024, 2048])
             ),
             feat_strides=list(getattr(config, "feat_strides", [8, 16, 32])),
+        )
+
+
+@dataclasses.dataclass
+class GroundingDinoConfig(ArchitectureConfig):
+    """Configuration for Grounding DINO open-set object detection.
+
+    Swin Transformer backbone + BERT text encoder + multi-scale deformable
+    encoder/decoder with text-vision fusion and contrastive classification.
+    """
+
+    d_model: int = 256
+    num_queries: int = 900
+    encoder_layers: int = 6
+    decoder_layers: int = 6
+    encoder_attention_heads: int = 8
+    decoder_attention_heads: int = 8
+    encoder_ffn_dim: int = 2048
+    decoder_ffn_dim: int = 2048
+    encoder_n_points: int = 4
+    decoder_n_points: int = 4
+    num_feature_levels: int = 4
+    positional_embedding_temperature: float = 20.0
+    layer_norm_eps: float = 1e-5
+    max_text_len: int = 256
+    # Backbone config (Swin) — stored as dict for flexibility
+    backbone_config: dict = dataclasses.field(
+        default_factory=lambda: {
+            "embed_dim": 128,
+            "depths": [2, 2, 18, 2],
+            "num_heads": [4, 8, 16, 32],
+            "window_size": 12,
+            "patch_size": 4,
+            "num_channels": 3,
+            "out_indices": [2, 3, 4],
+            "mlp_ratio": 4.0,
+        }
+    )
+    # Text config (BERT) — stored as dict
+    text_config: dict = dataclasses.field(
+        default_factory=lambda: {
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "vocab_size": 30522,
+            "max_position_embeddings": 512,
+            "type_vocab_size": 2,
+        }
+    )
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GroundingDinoConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        bc = getattr(config, "backbone_config", None)
+        backbone_dict = (
+            {
+                "embed_dim": getattr(bc, "embed_dim", 128),
+                "depths": list(getattr(bc, "depths", [2, 2, 18, 2])),
+                "num_heads": list(getattr(bc, "num_heads", [4, 8, 16, 32])),
+                "window_size": getattr(bc, "window_size", 12),
+                "patch_size": getattr(bc, "patch_size", 4),
+                "num_channels": getattr(bc, "num_channels", 3),
+                "out_indices": list(getattr(bc, "out_indices", [2, 3, 4])),
+                "mlp_ratio": getattr(bc, "mlp_ratio", 4.0),
+            }
+            if bc is not None
+            else {}
+        )
+
+        tc = getattr(config, "text_config", None)
+        text_dict = (
+            {
+                "hidden_size": getattr(tc, "hidden_size", 768),
+                "num_hidden_layers": getattr(tc, "num_hidden_layers", 12),
+                "num_attention_heads": getattr(tc, "num_attention_heads", 12),
+                "intermediate_size": getattr(tc, "intermediate_size", 3072),
+                "vocab_size": getattr(tc, "vocab_size", 30522),
+                "max_position_embeddings": getattr(tc, "max_position_embeddings", 512),
+                "type_vocab_size": getattr(tc, "type_vocab_size", 2),
+            }
+            if tc is not None
+            else {}
+        )
+
+        return cls(
+            **_shallow_fields(base),
+            d_model=getattr(config, "d_model", 256),
+            num_queries=getattr(config, "num_queries", 900),
+            encoder_layers=getattr(config, "encoder_layers", 6),
+            decoder_layers=getattr(config, "decoder_layers", 6),
+            encoder_attention_heads=getattr(config, "encoder_attention_heads", 8),
+            decoder_attention_heads=getattr(config, "decoder_attention_heads", 8),
+            encoder_ffn_dim=getattr(config, "encoder_ffn_dim", 2048),
+            decoder_ffn_dim=getattr(config, "decoder_ffn_dim", 2048),
+            encoder_n_points=getattr(config, "encoder_n_points", 4),
+            decoder_n_points=getattr(config, "decoder_n_points", 4),
+            num_feature_levels=getattr(config, "num_feature_levels", 4),
+            positional_embedding_temperature=getattr(
+                config, "positional_embedding_temperature", 20.0
+            ),
+            layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
+            max_text_len=getattr(config, "max_text_len", 256),
+            backbone_config=backbone_dict,
+            text_config=text_dict,
         )
 
 
@@ -2565,7 +2776,7 @@ class Speech2TextConfig(ArchitectureConfig):
     scale_embedding: bool = True
 
     @classmethod
-    def from_transformers(cls, config) -> "Speech2TextConfig":
+    def from_transformers(cls, config) -> Speech2TextConfig:
         if config.model_type != "speech_to_text":
             raise ValueError(
                 f"Speech2TextConfig expects model_type='speech_to_text', got '{config.model_type}'"
@@ -2628,7 +2839,7 @@ class AriaConfig(VisionLanguageConfig):
     max_query_tokens: int = 256
 
     @classmethod
-    def from_transformers(cls, config, parent_config=None) -> "AriaConfig":
+    def from_transformers(cls, config, parent_config=None) -> AriaConfig:
         # config = aria_text sub-config (model_type="aria_text")
         # parent_config = full aria config (has vision_config and projector fields)
         base = ArchitectureConfig.from_transformers(config, parent_config)
