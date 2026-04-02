@@ -12,6 +12,17 @@ description: >
 
 # Skill: Audio-to-Audio Models
 
+## Related skills
+
+- **`adding-a-new-model`** -- General mobius model onboarding checklist (config
+  extraction, registry, build-graph test). Read first if you're new to mobius.
+- **`phi4mm-component-parity`** -- Debugging multimodal output parity; includes
+  the ConformerEncoder (audio encoder for speech-to-text, not speech-to-speech).
+- **`reusable-components`** -- How to create new building-block components like
+  `ShortConv`, `DepformerLayer`, etc.
+
+---
+
 ## When to use
 
 Use this skill when adding a model that takes audio in and produces audio
