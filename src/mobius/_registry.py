@@ -27,6 +27,7 @@ from mobius._configs import (
     BaseModelConfig,
     ClapConfig,
     ConvNextConfig,
+    DPTConfig,
     DetrConfig,
     GroundingDinoConfig,
     MobileNetV2Config,
@@ -740,7 +741,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register(
         "depth_anything", DepthAnythingForDepthEstimation, task="depth-estimation"
     )
-    reg.register("dpt", DPTForDepthEstimation, task="depth-estimation")
+    reg.register("dpt", DPTForDepthEstimation, task="depth-estimation", config_class=DPTConfig)
     reg.register("zoedepth", ZoeDepthForDepthEstimation, task="depth-estimation")
     for name in (
         "beit",

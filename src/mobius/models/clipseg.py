@@ -39,7 +39,7 @@ from onnxscript._internal import builder
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
 from mobius.components._common import Embedding, LayerNorm, Linear
-from mobius.components._conv import Conv2d, ConvTranspose2d
+from mobius.components._conv import Conv2d, Conv2dNoBias, ConvTranspose2d
 from mobius.components._encoder import EncoderAttention
 
 if TYPE_CHECKING:
@@ -56,7 +56,8 @@ class _CLIPSegPatchEmbedding(nn.Module):
 
     def __init__(self, in_channels: int, hidden_size: int, patch_size: int):
         super().__init__()
-        self.projection = Conv2d(
+        # CLIP uses bias=False for patch embedding (matches HF CLIPVisionEmbeddings)
+        self.projection = Conv2dNoBias(
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
         )
 
@@ -553,26 +554,35 @@ def _rename_clipseg_weight(name: str) -> str | None:
     if "position_ids" in name:
         return None
 
-    # --- CLIP vision weights: clip.vision_model.* ---
+    # --- CLIP vision weights: clip.vision_model.* → vision_model.* ---
+    # ONNX params are named without the ``clip.`` wrapper because
+    # CLIPSegModel.forward calls self.clip.vision_model(op, ...) directly,
+    # skipping the intermediate ``clip`` naming scope.
     if name.startswith("clip.vision_model."):
         suffix = name[len("clip.vision_model.") :]
 
         if suffix.startswith("embeddings."):
-            return f"clip.vision_model.{suffix}"
+            # HF patch_embedding is a bare Conv2d; our ONNX uses
+            # patch_embedding.projection (a Conv2dNoBias).
+            suffix = suffix.replace(
+                "embeddings.patch_embedding.weight",
+                "embeddings.patch_embedding.projection.weight",
+            )
+            return f"vision_model.{suffix}"
 
         if suffix.startswith(("pre_layrnorm.", "post_layernorm.")):
-            return f"clip.vision_model.{suffix}"
+            return f"vision_model.{suffix}"
 
         if suffix.startswith("encoder.layers."):
             parts = suffix.split(".", 3)  # encoder, layers, idx, rest
             if len(parts) < 4:
                 return None
             renamed = _rename_encoder_layer(parts[3], parts[2])
-            return f"clip.vision_model.{renamed}" if renamed else None
+            return f"vision_model.{renamed}" if renamed else None
 
         return None
 
-    # --- CLIP text weights: clip.text_model.* ---
+    # --- CLIP text weights: clip.text_model.* → text_model.* ---
     if name.startswith("clip.text_model."):
         suffix = name[len("clip.text_model.") :]
 
@@ -581,17 +591,17 @@ def _rename_clipseg_weight(name: str) -> str | None:
             suffix = suffix.replace(
                 "embeddings.token_embedding.", "embeddings.word_embeddings."
             )
-            return f"clip.text_model.{suffix}"
+            return f"text_model.{suffix}"
 
         if suffix.startswith("final_layer_norm."):
-            return f"clip.text_model.{suffix}"
+            return f"text_model.{suffix}"
 
         if suffix.startswith("encoder.layers."):
             parts = suffix.split(".", 3)
             if len(parts) < 4:
                 return None
             renamed = _rename_encoder_layer(parts[3], parts[2])
-            return f"clip.text_model.{renamed}" if renamed else None
+            return f"text_model.{renamed}" if renamed else None
 
         return None
 

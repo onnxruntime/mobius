@@ -421,7 +421,8 @@ _PARAM_RENAMES = {"gamma": "weight", "beta": "bias"}
 # Prefixes to skip entirely
 _SKIP_PREFIXES = (
     "cls.",  # Classification head (not used for embeddings)
-    "bert.pooler.",  # Pooler layer
+    "bert.pooler.",  # Pooler layer (with bert. prefix)
+    "pooler.",  # Pooler layer (without prefix)
 )
 
 # Exact names to skip
@@ -447,6 +448,12 @@ def _rename_jina_bert_weight(name: str) -> str | None:
 
     # Strip model prefix: bert. or jina_bert.
     new_name = re.sub(r"^(bert|jina_bert)\.", "", name)
+
+    # BERT → Jina structural renames
+    # attention.self.{q,k,v} → attention.{q,k,v}
+    new_name = new_name.replace(".attention.self.", ".attention.")
+    # attention.output.{dense,LayerNorm} → attention.{dense,LayerNorm}
+    new_name = new_name.replace(".attention.output.", ".attention.")
 
     # Rename gamma/beta → weight/bias
     parts = new_name.rsplit(".", 1)

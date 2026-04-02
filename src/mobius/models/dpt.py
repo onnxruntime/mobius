@@ -377,20 +377,24 @@ _ENCODER_LAYER_PATTERN = re.compile(r"^dpt\.encoder\.layer\.(\d+)\.(.+)$")
 
 
 def _rename_dpt_weight(name: str) -> str | None:
-    """Map HuggingFace DPT weight names to our module naming convention."""
+    """Map HuggingFace DPT weight names to our module naming convention.
+
+    DPTForDepthEstimation uses ``dpt.`` prefix for backbone but NOT for
+    neck/head.  DPTModel uses ``dpt.`` for everything.  Handle both.
+    """
     # Backbone embeddings -------------------------------------------------
     if name == "dpt.embeddings.cls_token":
         return "backbone.cls_token"
     if name == "dpt.embeddings.position_embeddings":
         return "backbone.position_embeddings"
     if name.startswith("dpt.embeddings.patch_embeddings.projection."):
-        suffix = name[len("dpt.embeddings.patch_embeddings.projection.") :]
+        suffix = name[len("dpt.embeddings.patch_embeddings.projection."):]
         return f"backbone.patch_embeddings.projection.{suffix}"
 
-    # Backbone final layernorm (stored but not applied to features) -------
+    # Backbone final layernorm — used only for feature extraction; our
+    # model doesn't include a separate layernorm after the backbone.
     if name.startswith("dpt.layernorm."):
-        suffix = name[len("dpt.layernorm.") :]
-        return f"backbone.layernorm.{suffix}"
+        return None
 
     # Backbone encoder layers ---------------------------------------------
     m = _ENCODER_LAYER_PATTERN.match(name)
@@ -400,45 +404,49 @@ def _rename_dpt_weight(name: str) -> str | None:
             return f"backbone.encoder.{layer_idx}.{suffix}"
         for old, new in _ENCODER_LAYER_RENAMES.items():
             if suffix.startswith(old):
-                remainder = suffix[len(old) :]
+                remainder = suffix[len(old):]
                 return f"backbone.encoder.{layer_idx}.{new}{remainder}"
         return None
 
+    # Strip optional dpt.neck. or dpt. prefix for neck weights
+    neck_name = name
+    if neck_name.startswith("dpt.neck."):
+        neck_name = neck_name[len("dpt."):]
+    elif neck_name.startswith("dpt."):
+        neck_name = neck_name[len("dpt."):]
+
     # Neck: readout projections -------------------------------------------
-    # HF: dpt.neck.reassemble_stage.readout_projects.N.0.weight/bias
+    # HF: neck.reassemble_stage.readout_projects.N.0.weight/bias
     # Ours: neck.readout_projections.N.projection.weight/bias
     m_ro = re.match(
-        r"^dpt\.neck\.reassemble_stage\.readout_projects\.(\d+)\.0\.(weight|bias)$",
-        name,
+        r"^neck\.reassemble_stage\.readout_projects\.(\d+)\.0\.(weight|bias)$",
+        neck_name,
     )
     if m_ro:
         idx, param = m_ro.group(1), m_ro.group(2)
         return f"neck.readout_projections.{idx}.projection.{param}"
 
     # Neck: reassemble layers projection and resize -----------------------
-    # HF: dpt.neck.reassemble_stage.layers.N.projection.weight/bias
-    # Ours: neck.reassemble_layers.N.projection.weight/bias
-    if name.startswith("dpt.neck.reassemble_stage.layers."):
-        suffix = name[len("dpt.neck.reassemble_stage.layers.") :]
+    if neck_name.startswith("neck.reassemble_stage.layers."):
+        suffix = neck_name[len("neck.reassemble_stage.layers."):]
         return f"neck.reassemble_layers.{suffix}"
 
     # Neck: channel alignment convs (Conv2dNoBias — no bias) --------------
-    # HF: dpt.neck.convs.N.weight
-    # Ours: neck.convs.N.weight
-    if name.startswith("dpt.neck.convs."):
-        suffix = name[len("dpt.neck.") :]
-        return f"neck.{suffix}"
+    if neck_name.startswith("neck.convs."):
+        return neck_name
 
     # Neck: feature fusion stage ------------------------------------------
-    # HF: dpt.neck.fusion_stage.layers.N.{projection,residual_layer1,residual_layer2}.*
+    # HF: neck.fusion_stage.layers.N.{projection,residual_layer1,residual_layer2}.*
     # Ours: neck.fusion_layers.N.*
-    if name.startswith("dpt.neck.fusion_stage.layers."):
-        suffix = name[len("dpt.neck.fusion_stage.layers.") :]
+    # Note: Layer 0 has no residual_layer1 (no input from previous layer);
+    # HF creates it but fills with random values (MISSING in load report).
+    if neck_name.startswith("neck.fusion_stage.layers."):
+        if "layers.0.residual_layer1." in neck_name:
+            return None  # Skip randomly-initialized unused weights
+        suffix = neck_name[len("neck.fusion_stage.layers."):]
         return f"neck.fusion_layers.{suffix}"
 
     # Head ----------------------------------------------------------------
-    # HF: head.head.0.* / head.head.2.* / head.head.4.*
-    # Ours: head.head.conv1.* / head.head.conv2.* / head.head.conv3.*
     head_map = {"0": "conv1", "2": "conv2", "4": "conv3"}
     m_head = re.match(r"^head\.head\.(\d+)\.(.+)$", name)
     if m_head:

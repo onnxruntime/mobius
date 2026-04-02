@@ -433,7 +433,20 @@ class MoondreamModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return state_dict
+        """Map HuggingFace ``vikhyatk/moondream2`` weight names to ONNX names.
+
+        The HF checkpoint uses ``model.text.*`` / ``model.vision.*`` prefixes
+        with fused QKV tensors.  We split QKV and prefix each sub-model with
+        its ONNX module path (``decoder.``, ``vision_encoder.``, ``embedding.``).
+        """
+        result: dict[str, torch.Tensor] = {}
+        for k, v in _rename_decoder_weights(state_dict, self.config).items():
+            result[f"decoder.{k}"] = v
+        for k, v in _rename_vision_weights(state_dict).items():
+            result[f"vision_encoder.{k}"] = v
+        for k, v in _rename_embedding_weights(state_dict).items():
+            result[f"embedding.{k}"] = v
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -470,10 +483,14 @@ def _rename_decoder_weights(
     state_dict: dict[str, torch.Tensor],
     config: ArchitectureConfig,
 ) -> dict[str, torch.Tensor]:
-    """Rename HF moondream text weights to match ONNX parameter names.
+    """Rename HF moondream text weights to ONNX parameter names relative to
+    ``_MoondreamDecoderModel``.
 
     HF: ``model.text.blocks.N.attn.qkv.weight``
-    ONNX: ``model.blocks.N.self_attn.q_proj.weight``
+    ONNX (relative to decoder root): ``model.blocks.N.self_attn.q_proj.weight``
+
+    ``lm_head`` is a direct child of ``_MoondreamDecoderModel`` (not inside
+    ``model``), so it is NOT prefixed with ``model.``.
     """
     result: dict[str, torch.Tensor] = {}
     n_heads = config.num_attention_heads
@@ -483,17 +500,22 @@ def _rename_decoder_weights(
         if not name.startswith("model.text."):
             continue
         # Strip "model.text." prefix
-        key = name[len("model.text.") :]
+        key = name[len("model.text."):]
 
-        # Skip embedding (goes to embedding model)
+        # Skip embedding weight (routed to embedding sub-model separately)
         if key == "wte":
+            continue
+
+        # lm_head is a direct child of the decoder root (not inside model)
+        if key.startswith("lm_head."):
+            result[key] = tensor
             continue
 
         # Fused QKV → split into separate Q, K, V
         if ".attn.qkv." in key:
             # Find the layer prefix: "blocks.N."
             prefix = key[: key.index(".attn.qkv.")]
-            suffix = key[key.index(".attn.qkv.") + len(".attn.qkv.") :]
+            suffix = key[key.index(".attn.qkv.") + len(".attn.qkv."):]
             if suffix == "weight":
                 bias_key = f"model.text.{prefix}.attn.qkv.bias"
                 bias = state_dict.get(bias_key)
@@ -505,10 +527,7 @@ def _rename_decoder_weights(
 
         # attn.proj → self_attn.o_proj
         key = key.replace(".attn.proj.", ".self_attn.o_proj.")
-        # ln → ln (matches attribute name)
-        # mlp.fc1/fc2 → mlp.fc1/fc2 (matches)
-        # post_ln → post_ln (matches)
-        # lm_head → lm_head (matches)
+        # ln, mlp.fc1/fc2, post_ln all match ONNX names
         result[f"model.{key}"] = tensor
 
     return result

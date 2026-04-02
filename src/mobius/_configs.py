@@ -1997,14 +1997,17 @@ class MobileNetV2Config(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> MobileNetV2Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields.update(
+            num_labels=getattr(config, "num_labels", 1001),
+        )
         return cls(
-            **_shallow_fields(base),
+            **fields,
             depth_multiplier=getattr(config, "depth_multiplier", 1.0),
             expand_ratio=getattr(config, "expand_ratio", 6),
             first_layer_is_expansion=getattr(config, "first_layer_is_expansion", True),
             layer_norm_eps=getattr(config, "layer_norm_eps", 0.001),
             output_stride=getattr(config, "output_stride", 32),
-            num_labels=getattr(config, "num_labels", 1001),
         )
 
 
