@@ -10,6 +10,7 @@ __all__ = [
     "AutoencoderKLQwenImageModel",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
+    "BertForMaskedLM",
     "BertModel",
     "Blip2Model",
     "BloomCausalLMModel",
@@ -77,8 +78,10 @@ __all__ = [
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
     "Phi3SmallCausalLMModel",
+    "Phi3VModel",
     "Phi4MMCausalLMModel",
     "Phi4MMMultiModalModel",
+    "Phi4SigLIPModel",
     "PhiCausalLMModel",
     "Qwen25VLCausalLMModel",
     "Qwen25VLDecoderModel",
@@ -120,7 +123,7 @@ __all__ = [
     "VideoAutoencoderModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
-    "XLMCausalLMModel",
+    "XLMCausalLMModel", "T5GemmaForConditionalGeneration",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -129,7 +132,7 @@ from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
-from mobius.models.bert import BertModel
+from mobius.models.bert import BertForMaskedLM, BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel
@@ -193,6 +196,8 @@ from mobius.models.phi import (
     PhiCausalLMModel,
 )
 from mobius.models.phi3 import Phi3CausalLMModel
+from mobius.models.phi3_v import Phi3VModel
+from mobius.models.phi4_siglip import Phi4SigLIPModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,
@@ -238,6 +243,7 @@ from mobius.models.qwen_vl import (
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5gemma import T5GemmaForConditionalGeneration
 from mobius.models.unet import UNet2DConditionModel
 from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel

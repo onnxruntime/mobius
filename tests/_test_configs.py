@@ -101,6 +101,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("llama", {}, True),
     ("mistral", {}, False),
     ("qwen2", {}, True),
+    ("bitnet", {"hidden_act": "relu2", "tie_word_embeddings": True}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
     ("diffllama", {}, False),
@@ -1265,6 +1266,16 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
 
 
 # ---------------------------------------------------------------------------
+# Masked LM configs  (task: masked-lm, module: BertForMaskedLM)
+# ---------------------------------------------------------------------------
+MASKED_LM_CONFIGS: list[tuple[str, dict, bool]] = [
+    ("bert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("roberta", {"hidden_act": "gelu", "type_vocab_size": 1}, False),
+]
+
+
+# ---------------------------------------------------------------------------
 # Seq2Seq (encoder-decoder) configs  (task: seq2seq)
 # ---------------------------------------------------------------------------
 SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
@@ -1407,6 +1418,23 @@ SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "t5",
         {"hidden_act": "relu", "num_decoder_layers": 2},
+        True,
+    ),
+    (
+        "t5gemma",
+        {
+            # T5Gemma: Gemma2 architecture for both encoder and decoder, with
+            # cross-attention in the decoder. Alternating sliding/full attention,
+            # Gemma2-style soft-capping, and query_pre_attn_scalar.
+            "_config_cls": Gemma2Config,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": TINY_HEAD_DIM,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+        },
         True,
     ),
     (
@@ -2132,6 +2160,7 @@ AUDIO_TO_AUDIO_CONFIGS: list[tuple[str, dict, bool]] = [
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS
     + ENCODER_CONFIGS
+    + MASKED_LM_CONFIGS
     + SEQ2SEQ_CONFIGS
     + VISION_CONFIGS
     + DETECTION_CONFIGS

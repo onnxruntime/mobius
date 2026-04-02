@@ -32,6 +32,7 @@ __all__ = [
     "HybridQwenVLTask",
     "ImageClassificationTask",
     "ModelTask",
+    "MaskedLMTask",
     "MllamaVisionLanguageTask",
     "MultiModalTask",
     "OPSET_VERSION",
@@ -67,6 +68,7 @@ from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._masked_lm import MaskedLMTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
@@ -100,6 +102,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "denoising": DenoisingTask,
     "feature-extraction": FeatureExtractionTask,
     "image-classification": ImageClassificationTask,
+    "masked-lm": MaskedLMTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
     "text-generation": CausalLMTask,

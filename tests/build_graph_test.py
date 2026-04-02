@@ -26,6 +26,7 @@ from _test_configs import (
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     LONGROPE_FACTORS,
+    MASKED_LM_CONFIGS,
     SEQ2SEQ_CONFIGS,
     SPEECH_CONFIGS,
     SSM_CONFIGS,
@@ -59,6 +60,7 @@ from mobius._configs import (
     VisionConfig,
 )
 from mobius._registry import registry
+from mobius.models.bert import BertForMaskedLM
 from mobius.tasks import (
     CausalLMTask,
     Phi4MMMultiModalTask,
@@ -394,6 +396,68 @@ class TestBuildEncoderGraph:
         model_cls = registry.get(model_type)
         module = model_cls(config)
         task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+# === Masked LM model configs (imported from _test_configs) ===
+_MASKED_LM_MODEL_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, _ in MASKED_LM_CONFIGS
+]
+
+_MASKED_LM_MODEL_PARAMS = _make_params(MASKED_LM_CONFIGS)
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _MASKED_LM_MODEL_PARAMS)
+class TestBuildMaskedLMGraph:
+    """Verify that encoder-only models build valid masked LM ONNX graphs."""
+
+    def test_graph_builds_without_weights(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        module = BertForMaskedLM(config)
+        task = get_task("masked-lm")
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "attention_mask" in input_names
+        assert "token_type_ids" in input_names
+
+        output_names = {out.name for out in model.graph.outputs}
+        assert "logits" in output_names
+        # No KV cache outputs for masked LM
+        assert not any(n.startswith("present.") for n in output_names)
+        # No hidden_state output (that's feature-extraction, not masked-lm)
+        assert "last_hidden_state" not in output_names
+
+    def test_graph_has_lm_head_initializers(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        module = BertForMaskedLM(config)
+        task = get_task("masked-lm")
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        init_names = list(model.graph.initializers)
+        assert len(init_names) > 0
+        has_lm_head = any("lm_head" in n for n in init_names)
+        has_encoder = any("encoder" in n for n in init_names)
+        assert has_lm_head, "Should have LM head parameters"
+        assert has_encoder, "Should have encoder parameters"
+
+    def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
+        """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        config = _base_config(**config_overrides)
+        module = BertForMaskedLM(config)
+        task = get_task("masked-lm")
+        pkg = task.build(module, config)
+        _run_onnx_checker(pkg, model_type)
+
+    def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        module = BertForMaskedLM(config)
+        task = get_task("masked-lm")
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
 
@@ -1450,6 +1514,74 @@ class TestBuildGraphMultiModal:
         assert registry.get("phi4_multimodal") is Phi4MMMultiModalModel
         assert registry.get("phi4_multimodal") is registry.get("phi4mm")
         assert _default_task_for_model("phi4_multimodal") == "phi4mm-multimodal"
+
+    def test_phi3_v_vision_language_graph(self):
+        """Build Phi-3-Vision with 3-model split and verify all components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-5,
+            ),
+            image_token_id=32044,
+        )
+        model_cls = registry.get("phi3_v")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi3_v")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
+
+    def test_phi4_siglip_vision_language_graph(self):
+        """Build Phi-4-Reasoning-Vision (phi4-siglip) with 3-model split and verify components."""
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=-200,
+        )
+        model_cls = registry.get("phi4-siglip")
+        module = model_cls(config)
+        task_name = _default_task_for_model("phi4-siglip")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+
+        vision = pkg["vision"]
+        assert "pixel_values" in {i.name for i in vision.graph.inputs}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        embed = pkg["embedding"]
+        assert "input_ids" in {i.name for i in embed.graph.inputs}
+        assert "inputs_embeds" in {o.name for o in embed.graph.outputs}
 
 
 class TestBuildGraphWhisper:
