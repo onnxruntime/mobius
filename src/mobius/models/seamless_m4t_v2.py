@@ -1390,7 +1390,7 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
             # Also strip the nested 'ffn.' wrapper around fc1/fc2 to align
             # with _SeamlessM4Tv2DecoderBlock which exposes fc1/fc2 directly.
             if name.startswith("text_decoder."):
-                sub = name[len("text_decoder."):]
+                sub = name[len("text_decoder.") :]
                 # sub starts at the segment *after* "text_decoder." so there's no
                 # leading dot — use bare "embed_positions.weights" pattern.
                 sub = sub.replace("embed_positions.weights", "embed_positions.weight")
@@ -1412,7 +1412,7 @@ class SeamlessM4Tv2SpeechToSpeechModel(nn.Module):
             # onnxscript resolves initializer names relative to the sub-module, so
             # ONNX params are "dur_head.*" and "hifigan_head.*" (no "vocoder." prefix).
             if name.startswith("vocoder."):
-                sub = name[len("vocoder."):]
+                sub = name[len("vocoder.") :]
                 if sub.startswith("unit_embedding."):
                     new_dict["dur_head." + sub] = tensor
                     new_dict["hifigan_head." + sub] = tensor
