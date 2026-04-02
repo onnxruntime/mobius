@@ -10,6 +10,16 @@ description: >
 
 # Skill: Multimodal (Vision + Language) Models
 
+## Related skills
+
+- **`adding-vl-models`** — Use when the model uses the **3-model ONNX split**
+  (separate `decoder`, `vision_encoder`, `embedding` ONNX files via
+  `VisionLanguageTask`). Covers task variants, `vlm_decoder_weights`,
+  InternViT/RADIO encoders, Mllama, BLIP-2, and `image_token_id` reference.
+- **`ort-genai-config`** — Complete reference for `genai_config.json` and
+  `processor_config.json` formats for ORT GenAI deployment.
+- **`debugging-vl-pipeline`** — Systematic debugging of VL model output parity.
+
 ## When to use
 
 Use this skill when adding a model that processes both images and text — such
