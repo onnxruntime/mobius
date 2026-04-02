@@ -143,7 +143,7 @@ class ClapTextModel(nn.Module):
         self.text_model = _ClapTextEncoder(config)
         self.projection = _ClapProjectionLayer(
             config.hidden_size,
-            config.hidden_size,
+            config.projection_dim,
             config.projection_dim,
         )
 
@@ -769,7 +769,7 @@ class ClapAudioModel(nn.Module):
         self.audio_encoder = _ClapAudioEncoder(config)
         projection_dim = config.projection_dim
         hidden_size = config.hidden_size
-        self.projection = _ClapProjectionLayer(hidden_size, hidden_size, projection_dim)
+        self.projection = _ClapProjectionLayer(hidden_size, projection_dim, projection_dim)
 
     def forward(
         self,
@@ -815,7 +815,7 @@ class _ClapContrastiveTextEncoder(nn.Module):
         self.text_model = _ClapTextEncoder(config)
         self.projection = _ClapProjectionLayer(
             config.hidden_size,
-            config.hidden_size,
+            config.projection_dim,
             config.projection_dim,
         )
 
@@ -835,7 +835,7 @@ class _ClapContrastiveAudioEncoder(nn.Module):
         self.audio_encoder = _ClapAudioEncoder(config)
         self.projection = _ClapProjectionLayer(
             config.hidden_size,
-            config.hidden_size,
+            config.projection_dim,
             config.projection_dim,
         )
 

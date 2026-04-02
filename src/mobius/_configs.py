@@ -2893,27 +2893,27 @@ class ClapConfig(ArchitectureConfig):
     def from_transformers(cls, config, parent_config=None) -> "ClapConfig":
         src = parent_config or config
         text_cfg = getattr(src, "text_config", None)
-        if text_cfg is None:
-            # Called directly on text or audio sub-config
-            return cls(
-                **_shallow_fields(ArchitectureConfig.from_transformers(config, parent_config))
+
+        # Call from_transformers on the TOP-LEVEL config (model_type="clap") so
+        # that _extract_audio_config fires and populates AudioConfig correctly.
+        base = ArchitectureConfig.from_transformers(src, parent_config)
+        fields = _shallow_fields(base)
+
+        if text_cfg is not None:
+            # Override text-encoder fields from the BERT/RoBERTa text sub-config.
+            # ArchitectureConfig.from_transformers on the top-level CLAP config
+            # does not have direct access to these fields.
+            fields.update(
+                hidden_act=getattr(text_cfg, "hidden_act", "gelu"),
+                hidden_size=getattr(text_cfg, "hidden_size", 768),
+                num_hidden_layers=getattr(text_cfg, "num_hidden_layers", 12),
+                num_attention_heads=getattr(text_cfg, "num_attention_heads", 12),
+                intermediate_size=getattr(text_cfg, "intermediate_size", 3072),
+                vocab_size=getattr(text_cfg, "vocab_size", 50265),
+                max_position_embeddings=getattr(text_cfg, "max_position_embeddings", 514),
+                pad_token_id=getattr(text_cfg, "pad_token_id", 1),
+                rms_norm_eps=getattr(text_cfg, "layer_norm_eps", 1e-12),
             )
 
-        # Build base from text sub-config so text-encoder fields are correct
-        base = ArchitectureConfig.from_transformers(text_cfg, src)
-
-        # Override text-specific fields that ArchitectureConfig may miss
-        fields = _shallow_fields(base)
-        fields.update(
-            hidden_act=getattr(text_cfg, "hidden_act", "gelu"),
-            hidden_size=getattr(text_cfg, "hidden_size", 768),
-            num_hidden_layers=getattr(text_cfg, "num_hidden_layers", 12),
-            num_attention_heads=getattr(text_cfg, "num_attention_heads", 12),
-            intermediate_size=getattr(text_cfg, "intermediate_size", 3072),
-            vocab_size=getattr(text_cfg, "vocab_size", 50265),
-            max_position_embeddings=getattr(text_cfg, "max_position_embeddings", 514),
-            pad_token_id=getattr(text_cfg, "pad_token_id", 1),
-            rms_norm_eps=getattr(text_cfg, "layer_norm_eps", 1e-12),
-            projection_dim=getattr(src, "projection_dim", 512),
-        )
+        fields["projection_dim"] = getattr(src, "projection_dim", 512)
         return cls(**fields)

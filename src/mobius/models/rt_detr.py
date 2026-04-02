@@ -1290,10 +1290,11 @@ def _rename_rt_detr_weight(name: str, value: torch.Tensor) -> tuple[str, torch.T
             suffix = rest[len("embedder.embedder.") :]
             return f"backbone.embedder.{suffix}", value
 
-        # Encoder stages
+        # Encoder stages: HF names use backbone.model.encoder.stages.*
+        # but our _RtDetrResNetBackbone has self.stages (no encoder sub-module).
         if rest.startswith("encoder."):
             suffix = rest[len("encoder.") :]
-            new_name = f"backbone.encoder.{suffix}"
+            new_name = f"backbone.{suffix}"
             # Handle stride-2 shortcut naming:
             # HF: shortcut.1.convolution → our: shortcut.convolution
             new_name = re.sub(
