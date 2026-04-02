@@ -151,6 +151,7 @@ _GQA_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset(
 )
 
 # EP+dtype combinations where PackedAttention fusion is supported.
+# Used by Phase 2 PackedAttention rule activation.
 _PACKED_ATTN_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset(
     [
         ("cpu", ir.DataType.FLOAT),
@@ -592,8 +593,10 @@ def build_from_module(
     # Tasks receive a boolean flag, never an EP string directly.
     use_concrete_dims = execution_provider == "webgpu"
 
-    # Pass use_concrete_dims only to tasks that accept it (CausalLMTask and
-    # future tasks). Other tasks are called without the kwarg.
+    # Introspect the task's build() signature to pass use_concrete_dims only
+    # to tasks that already accept it. This preserves backward compatibility
+    # with the ~25 existing task classes that have not yet been updated to
+    # accept the WebGPU structural flag — they continue to work unchanged.
     import inspect
 
     _build_sig = inspect.signature(resolved_task.build)
@@ -603,6 +606,7 @@ def build_from_module(
         pkg = resolved_task.build(module, config)
 
     for name, model in pkg.items():
+        # Unknown model names default to decoder role for fusion purposes.
         role = _MODEL_ROLE_MAP.get(name, "decoder")
         _optimize(
             model,
