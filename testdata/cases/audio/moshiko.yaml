@@ -1,0 +1,9 @@
+model_id: "kyutai/moshiko-pytorch-bf16"
+revision: "main"
+task_type: "audio-to-audio"
+dtype: "float32"
+
+level: "L4"
+
+skip_reason: "Moshi requires real-time streaming audio pipeline — not suitable for CI golden generation."
+notes: "Moshi (moshiko-pytorch-bf16). Real-time audio-to-audio model combining a depth transformer decoder, inner monologue, and Mimi audio codec."

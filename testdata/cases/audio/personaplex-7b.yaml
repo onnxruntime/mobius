@@ -1,0 +1,9 @@
+model_id: "nvidia/personaplex-7b-v1"
+revision: "main"
+task_type: "audio-to-audio"
+dtype: "float32"
+
+level: "L4"
+
+skip_reason: "PersonaPlex 7B — large model requiring trust_remote_code and audio streaming pipeline; not suitable for CI golden generation."
+notes: "PersonaPlex 7B v1. NVIDIA real-time conversational audio model built on the Moshi architecture with persona conditioning."
