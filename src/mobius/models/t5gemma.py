@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -40,7 +41,77 @@ from mobius.components._common import Linear
 from mobius.models.gemma import Gemma2Attention, GemmaScaledWordEmbedding
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass  # ir imported unconditionally above for use in function signatures
+
+
+# ---------------------------------------------------------------------------
+# Encoder attention bias (bidirectional)
+# ---------------------------------------------------------------------------
+
+
+def _create_encoder_attention_bias(
+    op: builder.OpBuilder,
+    input_ids: ir.Value,
+    attention_mask: ir.Value,
+    sliding_window: int | None = None,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> ir.Value:
+    """Create a bidirectional attention bias for the T5Gemma encoder.
+
+    Unlike ``create_attention_bias`` (which is causal), this function creates
+    a symmetric bias suitable for bidirectional encoder attention:
+
+    - Full attention: only the padding mask is applied (all non-padding
+      positions can attend to each other freely in both directions).
+    - Sliding attention: a symmetric window constraint (|q_pos - kv_pos| <
+      sliding_window) is applied on top of the padding mask.
+
+    Args:
+        op: ONNX op builder.
+        input_ids: ``(batch, query_len)`` int64 input token IDs.
+        attention_mask: ``(batch, total_len)`` int64 mask (1=valid, 0=padding).
+        sliding_window: If given, only positions within this many steps in
+            either direction are attended to.
+        dtype: Float dtype for the output bias values.
+
+    Returns:
+        ``(batch, 1, query_len, total_len)`` float bias: 0.0 where attended,
+        ``dtype.min`` where masked out.
+    """
+    # Position indices (handles padding gaps): (batch, total_len)
+    all_indices = op.CumSum(attention_mask, 1)
+
+    # KV indices: (batch, 1, total_len)
+    kv_indices = op.Unsqueeze(all_indices, [1])
+
+    # Q indices for the query portion: (batch, query_len, 1)
+    query_length = op.Shape(input_ids, start=1, end=2)
+    total_length = op.Shape(attention_mask, start=1, end=2)
+    start = op.Sub(total_length, query_length)
+    q_indices = op.Unsqueeze(
+        op.Slice(all_indices, start, total_length, [1]),
+        [2],
+    )
+
+    if sliding_window is not None:
+        # Symmetric window: attend within sliding_window steps in either direction
+        abs_dist = op.Abs(op.Sub(q_indices, kv_indices))
+        full_mask = op.Less(abs_dist, sliding_window)
+    else:
+        # Full bidirectional attention: all positions are reachable
+        full_mask = op.GreaterOrEqual(kv_indices, op.Constant(value_int=0))
+
+    # Apply padding mask: mask out padding KV positions
+    attn_mask_bool = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
+    full_mask = op.And(attn_mask_bool, full_mask)
+
+    # Convert to float additive bias: 0 where attended, dtype.min where masked
+    mask_value = float(dtype.min)
+    attention_bias = op.Where(full_mask, 0.0, mask_value)
+    attention_bias = op.Cast(attention_bias, to=dtype)
+
+    # (batch, query_len, total_len) → (batch, 1, query_len, total_len)
+    return op.Unsqueeze(attention_bias, [1])
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +223,7 @@ class T5GemmaEncoderLayer(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
+        attention_bias: ir.Value | None,
         position_embeddings: tuple,
     ):
         # Self-attention (bidirectional — no causal mask in encoder)
@@ -322,15 +393,17 @@ class T5GemmaEncoder(nn.Module):
         )
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        # Encoder attention biases: bidirectional for full_attention layers,
-        # bidirectional sliding window for sliding_attention layers.
-        # create_attention_bias produces a causal mask; for the encoder we
-        # pass attention_bias=None for full attention (no causal constraint).
-        # Sliding-window encoder attention uses a causal bias as an
-        # approximation — the window limits context but is one-directional.
-        # TODO: implement proper bidirectional sliding window for encoder.
-        full_attn_bias = None  # bidirectional full attention (no masking)
-        sliding_attn_bias = create_attention_bias(
+        # Attention biases: bidirectional for encoder (no causal masking).
+        # Full-attention layers use a padding-only bias; sliding-attention layers
+        # use a symmetric window constraint (|q_pos - kv_pos| < sliding_window).
+        full_attn_bias = _create_encoder_attention_bias(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            sliding_window=None,
+            dtype=self._dtype,
+        )
+        sliding_attn_bias = _create_encoder_attention_bias(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -549,7 +622,7 @@ def _rename_t5gemma_weight(name: str) -> str | None:
 
     # Strip HF's top-level "model." prefix (e.g. model.encoder.* → encoder.*)
     if name.startswith("model."):
-        name = name[len("model."):]
+        name = name[len("model.") :]
 
     # Encoder and decoder layers follow Gemma2 naming conventions.
     for prefix in ("encoder.", "decoder."):
