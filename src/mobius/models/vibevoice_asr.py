@@ -25,12 +25,11 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 from onnxscript import nn
-
 from onnxscript._internal import builder
 
 from mobius._configs import AudioTokenizerEncoderConfig, VibeVoiceAsrConfig
 from mobius.components import Embedding, Linear, RMSNorm
-from mobius.components._common import create_attention_bias
+from mobius.components._common import create_padding_mask
 from mobius.components._decoder import DecoderLayer
 from mobius.components._rotary_embedding import initialize_rope
 
@@ -106,8 +105,11 @@ class _FeedForward(nn.Module):
         self.linear2 = Linear(ffn_hidden, hidden_size, bias=True)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
-        """Args:
+        """Apply linear1 → GELU → linear2.
+
+        Args:
             x: (batch, seq_len, hidden_size)
+
         Returns:
             (batch, seq_len, hidden_size)
         """
@@ -130,7 +132,7 @@ class _ConvNeXt1DBlock(nn.Module):
     Matches HF ``VibeVoiceAcousticTokenizerConvNext1dLayer``.
 
     Weight names:
-      norm.weight, mixer.conv.weight, mixer.bias,
+      norm.weight, mixer.conv.weight, mixer.conv.bias,
       gamma, ffn_norm.weight, ffn.linear1.weight, ffn.linear1.bias,
       ffn.linear2.weight, ffn.linear2.bias, ffn_gamma
     """
@@ -214,7 +216,7 @@ class _AudioEncoderStem(nn.Module):
 
     Matches HF ``VibeVoiceAcousticTokenizerEncoderStem``.
     Weight names:
-      conv.conv.weight, conv.bias
+      conv.conv.weight, conv.conv.bias
       stage.0.{norm,mixer,gamma,ffn_norm,ffn,ffn_gamma}
     """
 
@@ -235,8 +237,11 @@ class _AudioEncoderStem(nn.Module):
         )
 
     def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
-        """Args:
+        """Apply stem conv then ConvNeXt blocks.
+
+        Args:
             x: (batch, channels=1, num_samples)
+
         Returns:
             (batch, num_filters, num_samples)
         """
@@ -253,7 +258,7 @@ class _AudioEncoderLayer(nn.Module):
 
     Matches HF ``VibeVoiceAcousticTokenizerEncoderLayer``.
     Weight names:
-      conv.conv.weight, conv.bias
+      conv.conv.weight, conv.conv.bias
       stage.0.{…}, stage.1.{…}, …
     """
 
@@ -282,8 +287,11 @@ class _AudioEncoderLayer(nn.Module):
         )
 
     def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
-        """Args:
+        """Apply strided downsampling conv then ConvNeXt blocks.
+
+        Args:
             x: (batch, in_channels, seq_len)
+
         Returns:
             (batch, out_channels, seq_len // stride)
         """
@@ -306,11 +314,11 @@ class AudioTokenizerEncoder(nn.Module):
     Matches HF ``VibeVoiceAcousticTokenizerEncoderModel``.
 
     Weight names:
-      stem.conv.conv.weight, stem.conv.bias
+      stem.conv.conv.weight, stem.conv.conv.bias
       stem.stage.{0..N-1}.*
-      conv_layers.{0..5}.conv.conv.weight, conv_layers.{0..5}.conv.bias
+      conv_layers.{0..5}.conv.conv.weight, conv_layers.{0..5}.conv.conv.bias
       conv_layers.{0..5}.stage.{0..M-1}.*
-      head.conv.weight, head.bias
+      head.conv.weight, head.conv.bias
     """
 
     def __init__(self, enc_config: AudioTokenizerEncoderConfig):
@@ -428,7 +436,7 @@ class VibeVoiceAsrAudioTower(nn.Module):
             input_values: (batch, 1, num_samples) raw audio at 24 kHz
 
         Returns:
-            (num_audio_tokens, lm_hidden) — flattened batch×time
+            (num_audio_tokens, lm_hidden) — flattened batch*time
         """
         # Each encoder: (B, 1, T) → (B, num_frames, hidden_size)
         acoustic_latents = self.acoustic_tokenizer_encoder(op, input_values)
@@ -437,7 +445,7 @@ class VibeVoiceAsrAudioTower(nn.Module):
         # Project to LM dimension: (B, num_frames, lm_hidden)
         features = self.multi_modal_projector(op, acoustic_latents, semantic_latents)
 
-        # Flatten batch × time → (N_audio_tokens, lm_hidden) for embedding injection
+        # Flatten batch * time → (N_audio_tokens, lm_hidden) for embedding injection
         batch_time = op.Shape(features, start=0, end=2)
         feat_dim = op.Shape(features, start=2, end=3)
         # keepdims=1: result shape (1,) so Concat with feat_dim works on axis=0
@@ -526,8 +534,6 @@ class VibeVoiceAsrDecoderModel(nn.Module):
 
     def __init__(self, config: VibeVoiceAsrConfig):
         super().__init__()
-        self._dtype = config.dtype
-
         self.layers = nn.ModuleList(
             [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -556,11 +562,12 @@ class VibeVoiceAsrDecoderModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        attention_bias = create_attention_bias(
+        # Causal masking is handled by is_causal=1 on the Attention op;
+        # create_padding_mask provides only the padding mask for Flash Attention eligibility.
+        padding_mask = create_padding_mask(
             op,
             input_ids=inputs_embeds,
             attention_mask=attention_mask,
-            dtype=self._dtype,
         )
 
         present_key_values = []
@@ -569,7 +576,7 @@ class VibeVoiceAsrDecoderModel(nn.Module):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
-                attention_bias=attention_bias,
+                attention_bias=padding_mask,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
@@ -627,9 +634,7 @@ class VibeVoiceAsrModel(nn.Module):
             past_key_values=past_key_values,
         )
 
-    def preprocess_weights(
-        self, state_dict: dict[str, object]
-    ) -> dict[str, object]:
+    def preprocess_weights(self, state_dict: dict[str, object]) -> dict[str, object]:
         """Map HuggingFace weight names to ONNX module structure.
 
         HF layout:
@@ -645,24 +650,26 @@ class VibeVoiceAsrModel(nn.Module):
         cleaned: dict[str, object] = {}
         for key, value in state_dict.items():
             # Audio tower sub-modules
-            if key.startswith((
-                "acoustic_tokenizer_encoder.",
-                "semantic_tokenizer_encoder.",
-                "multi_modal_projector.",
-            )):
+            if key.startswith(
+                (
+                    "acoustic_tokenizer_encoder.",
+                    "semantic_tokenizer_encoder.",
+                    "multi_modal_projector.",
+                )
+            ):
                 cleaned[f"audio_tower.{key}"] = value
                 continue
 
             # Language model → decoder / embedding split
             if key.startswith("language_model."):
-                rest = key[len("language_model."):]
+                rest = key[len("language_model.") :]
 
                 if rest.startswith("lm_head."):
                     cleaned[f"decoder.{rest}"] = value
                     continue
 
                 if rest.startswith("model."):
-                    inner = rest[len("model."):]
+                    inner = rest[len("model.") :]
                     if inner.startswith("embed_tokens."):
                         cleaned[f"embedding.{inner}"] = value
                     elif inner.startswith(("layers.", "norm.", "rotary_emb.")):
