@@ -90,7 +90,7 @@ class T5GemmaCrossAttention(nn.Module):
         op: builder.OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
-        past_key_value: tuple | None = None,
+        past_key_value: tuple | None = None,  # unused: kept for API uniformity with self-attention
     ):
         # Q from decoder
         query_states = self.q_proj(op, hidden_states)  # (batch, dec_len, q_heads * head_dim)
@@ -395,17 +395,6 @@ class T5GemmaDecoder(nn.Module):
         cross_past_key_values: list | None = None,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
-        position_ids = op.Cast(
-            op.Unsqueeze(
-                op.Range(
-                    op.Shape(attention_mask, start=1, end=2),  # seq_len before query
-                    op.Shape(attention_mask, start=1, end=2),  # same point (placeholder)
-                    op.Constant(value_int=1),
-                ),
-                [0],
-            ),
-            to=7,
-        )
         # Position IDs for current query tokens, accounting for past KV length
         query_length = op.Shape(input_ids, start=1, end=2)  # scalar
         total_length = op.Shape(attention_mask, start=1, end=2)  # scalar
@@ -537,8 +526,8 @@ class T5GemmaForConditionalGeneration(nn.Module):
 def _rename_t5gemma_weight(name: str) -> str | None:
     """Rename a HF T5Gemma weight to our naming convention.
 
-    HF T5Gemma uses Gemma2-style naming within encoder/decoder stacks.
-    Our module attributes match HF conventions so most renames are identity.
+    HF T5Gemma stores weights under ``model.encoder.*`` and ``model.decoder.*``.
+    We strip the leading ``model.`` prefix so names match our module paths.
     """
     # Top-level lm_head
     if name == "lm_head.weight":
@@ -547,10 +536,13 @@ def _rename_t5gemma_weight(name: str) -> str | None:
     if name in ("model.embed_tokens.weight", "shared.weight"):
         return name
 
-    # Encoder and decoder layers already follow Gemma2 naming conventions.
-    # Pass through names that match our module structure directly.
+    # Strip HF's top-level "model." prefix (e.g. model.encoder.* → encoder.*)
+    if name.startswith("model."):
+        name = name[len("model."):]
+
+    # Encoder and decoder layers follow Gemma2 naming conventions.
     for prefix in ("encoder.", "decoder."):
         if name.startswith(prefix):
-            return name  # Names already match our module attribute paths
+            return name
 
     return None
