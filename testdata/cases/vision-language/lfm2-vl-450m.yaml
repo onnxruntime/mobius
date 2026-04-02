@@ -1,5 +1,5 @@
 model_id: "LiquidAI/LFM2-VL-450M"
-revision: "main"
+revision: "667c603189cc70080c2ea5e48ecac0a4f1fca83f"
 task_type: "image-text-to-text"
 dtype: "float32"
 

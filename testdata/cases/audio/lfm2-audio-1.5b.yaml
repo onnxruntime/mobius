@@ -1,5 +1,5 @@
 model_id: "LiquidAI/LFM2-Audio-1.5B"
-revision: "main"
+revision: "c798aad30dc3cd72e72970beab51326b8443bd94"
 task_type: "audio-to-audio"
 dtype: "float32"
 

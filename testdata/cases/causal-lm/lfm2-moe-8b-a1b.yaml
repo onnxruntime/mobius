@@ -1,5 +1,5 @@
 model_id: "LiquidAI/LFM2-8B-A1B"
-revision: "main"
+revision: "13eb3eb81f6529c10b576a9a4047b28370804a61"
 task_type: "text-generation"
 dtype: "float32"
 
