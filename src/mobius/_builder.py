@@ -136,31 +136,35 @@ DTYPE_MAP: dict[str, ir.DataType] = {
 # ---------------------------------------------------------------------------
 
 # EP+dtype combinations where GroupQueryAttention fusion is supported.
-_GQA_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset([
-    ("cpu", ir.DataType.FLOAT),
-    ("cuda", ir.DataType.FLOAT16),
-    ("cuda", ir.DataType.BFLOAT16),
-    ("dml", ir.DataType.FLOAT16),
-    ("webgpu", ir.DataType.FLOAT),
-    ("webgpu", ir.DataType.FLOAT16),
-    ("trt-rtx", ir.DataType.FLOAT16),
-    ("trt-rtx", ir.DataType.BFLOAT16),
-])
+_GQA_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset(
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
+        ("cuda", ir.DataType.BFLOAT16),
+        ("dml", ir.DataType.FLOAT16),
+        ("webgpu", ir.DataType.FLOAT),
+        ("webgpu", ir.DataType.FLOAT16),
+        ("trt-rtx", ir.DataType.FLOAT16),
+        ("trt-rtx", ir.DataType.BFLOAT16),
+    ]
+)
 
 # EP+dtype combinations where PackedAttention fusion is supported.
-_PACKED_ATTN_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset([
-    ("cpu", ir.DataType.FLOAT),
-    ("cuda", ir.DataType.FLOAT),
-    ("cuda", ir.DataType.FLOAT16),
-    ("cuda", ir.DataType.BFLOAT16),
-    ("dml", ir.DataType.FLOAT),
-    ("dml", ir.DataType.FLOAT16),
-    ("webgpu", ir.DataType.FLOAT),
-    ("webgpu", ir.DataType.FLOAT16),
-    ("trt-rtx", ir.DataType.FLOAT),
-    ("trt-rtx", ir.DataType.FLOAT16),
-    ("trt-rtx", ir.DataType.BFLOAT16),
-])
+_PACKED_ATTN_SUPPORT: frozenset[tuple[str, ir.DataType]] = frozenset(
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
+        ("cuda", ir.DataType.BFLOAT16),
+        ("dml", ir.DataType.FLOAT),
+        ("dml", ir.DataType.FLOAT16),
+        ("webgpu", ir.DataType.FLOAT),
+        ("webgpu", ir.DataType.FLOAT16),
+        ("trt-rtx", ir.DataType.FLOAT),
+        ("trt-rtx", ir.DataType.FLOAT16),
+        ("trt-rtx", ir.DataType.BFLOAT16),
+    ]
+)
 
 # Map ModelPackage entry names to semantic model roles.
 # GQA fusion is only applied to "decoder" role models.
@@ -202,6 +206,7 @@ def _get_optimization_passes(
         instances suitable for passing to ``onnxscript.rewriter.rewrite()``.
     """
     from mobius.rewrite_rules import (
+        decompose_skip_layer_norm_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
         skip_layer_norm_rules,
@@ -209,7 +214,7 @@ def _get_optimization_passes(
     )
 
     fuse: list = []
-    lower: list = []  # Phase 2: populated with lowering rules
+    lower: list = []
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and (ep, dtype) in _GQA_SUPPORT:
@@ -224,18 +229,17 @@ def _get_optimization_passes(
     # --- Activation fusions (all roles, all dtypes) ---
     fuse.extend(gelu_fusion_rules())
 
+    # --- TRT-RTX lowering: decompose fused skip-norm ops ---
+    if ep == "trt-rtx":
+        lower.extend(decompose_skip_layer_norm_rules())
+
     # Phase 2 lowering stubs — uncomment when rule implementations land:
     # if ep == "dml":
-    #     lower.append(separate_rope_rules())   # BP-6: decompose fused RoPE
-    #     lower.append(unpack_qkv_rules())      # BP-7: split packed QKV
-    #     lower.append(decompose_if_rules())    # BP-10: If → Where
+    #     lower.extend(separate_rope_rules())   # BP-6: decompose fused RoPE
+    #     lower.extend(unpack_qkv_rules())      # BP-7: split packed QKV
     # elif ep == "webgpu":
-    #     lower.append(decompose_if_rules())    # BP-10: If → Where
-    #     lower.append(eliminate_shape_rules()) # BP-13: Shape → constant
-    #     lower.append(cast_int64_to_int32_rules())  # BP-12: int64 → int32
-    # elif ep == "trt-rtx":
-    #     lower.append(decompose_skip_layer_norm_rules())  # BP-21
-    #     lower.append(split_if_rules())                   # BP-14
+    #     lower.extend(eliminate_shape_rules()) # BP-13: Shape → constant
+    #     lower.extend(cast_int64_to_int32_rules())  # BP-12: int64 → int32
 
     return fuse, lower
 
@@ -542,6 +546,11 @@ def build(
             )
 
     model_type = hf_config.model_type
+
+    # Validate model/EP compatibility before graph construction
+    from mobius._ep_validation import validate_ep_support
+    validate_ep_support(model_type, execution_provider)
+
     parent_config = hf_config
     if hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
