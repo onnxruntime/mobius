@@ -1886,14 +1886,13 @@ class TestBuildGraphAudioFlamingo3:
         for model in pkg.values():
             fill_random_weights(model)
 
-        # Step 1: Audio encoder — (1, n_mels, 50) mel → (1, 25, hidden)
+        # Step 1: Audio encoder — (1, n_mels, 50) mel → (25, hidden) flattened 2D
         enc_sess = OnnxModelSession(pkg["audio_encoder"])
         mel = np.random.randn(1, config.audio.num_mel_bins, 50).astype(np.float32)
         enc_out = enc_sess.run({"input_features": mel})
         audio_features = enc_out["audio_features"]
-        num_audio_tokens = audio_features.shape[1]
-        # Flatten batch dim: (1, tokens, hidden) → (tokens, hidden)
-        audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+        # Encoder already returns 2D (num_audio_tokens, hidden_size)
+        num_audio_tokens = audio_features.shape[0]
         enc_sess.close()
 
         # Step 2: Embedding — text tokens with audio placeholders
@@ -1907,7 +1906,7 @@ class TestBuildGraphAudioFlamingo3:
 
         embed_sess = OnnxModelSession(pkg["embedding"])
         embed_out = embed_sess.run(
-            {"input_ids": input_ids, "audio_features": audio_features_2d}
+            {"input_ids": input_ids, "audio_features": audio_features}
         )
         inputs_embeds = embed_out["inputs_embeds"]
         embed_sess.close()

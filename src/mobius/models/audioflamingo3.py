@@ -90,7 +90,8 @@ class AudioFlamingo3Encoder(nn.Module):
         input_features: ``(batch, num_mel_bins, audio_seq_len)`` mel spectrogram
 
     Output:
-        audio_features: ``(batch, audio_seq_len // 2, text_hidden_size)``
+        audio_features: ``(batch * audio_seq_len // 2, text_hidden_size)``
+        Flattened to 2D to match SpeechLanguageTask embedding contract.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -163,6 +164,13 @@ class AudioFlamingo3Encoder(nn.Module):
         # 2-layer MLP projector: (batch, audio_seq_len // 2, text_hidden)
         hidden_states = self.projector(op, hidden_states)
 
+        # Flatten to 2D (batch * audio_seq_len // 2, text_hidden) to match
+        # SpeechLanguageTask._build_embedding which expects (num_audio_tokens, hidden)
+        hidden_dim = op.Shape(hidden_states, start=2, end=3)
+        hidden_states = op.Reshape(
+            hidden_states, op.Concat(op.Constant(value_ints=[-1]), hidden_dim, axis=0)
+        )
+
         return hidden_states
 
 
@@ -174,7 +182,7 @@ class AudioFlamingo3EmbeddingModel(nn.Module):
 
     Inputs:
         input_ids:      ``(batch, seq_len)`` token IDs
-        audio_features: ``(batch, audio_tokens, text_hidden_size)`` projected features
+        audio_features: ``(num_audio_tokens, text_hidden_size)`` projected features (2D)
 
     Output:
         inputs_embeds: ``(batch, seq_len, hidden_size)``
@@ -185,6 +193,7 @@ class AudioFlamingo3EmbeddingModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
+        # 151669 is the default audio_token_id in Qwen2's tokenizer for AudioFlamingo3
         self._audio_token_id = config.audio.audio_token_id if config.audio else 151669
 
     def forward(
