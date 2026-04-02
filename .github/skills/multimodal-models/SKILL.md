@@ -1,24 +1,22 @@
 ---
 name: multimodal-models
 description: >
-  How to add multimodal (vision + language) models to mobius.
-  Covers projector variants (Gemma3, MLP, Linear), the VisionModel encoder,
-  InputMixer, VisionLanguageTask, image token handling, and weight name
-  mappings. Use this skill when adding a model that processes both images and
-  text.
+  How to add multimodal (vision + language) models to mobius.  Covers
+  projector variants (Gemma3, MLP, Linear), VisionModel encoder,
+  InputMixer, VisionLanguageTask, the 3-model ONNX split, task variants,
+  vlm weight helpers, InternViT/RADIO encoders, Mllama cross-attention,
+  BLIP-2 Q-Former, image_token_id reference, and weight name mappings.
+  Use this skill when adding a model that processes both images and text.
 ---
 
 # Skill: Multimodal (Vision + Language) Models
 
 ## Related skills
 
-- **`adding-vl-models`** — Use when the model uses the **3-model ONNX split**
-  (separate `decoder`, `vision_encoder`, `embedding` ONNX files via
-  `VisionLanguageTask`). Covers task variants, `vlm_decoder_weights`,
-  InternViT/RADIO encoders, Mllama, BLIP-2, and `image_token_id` reference.
 - **`ort-genai-config`** — Complete reference for `genai_config.json` and
   `processor_config.json` formats for ORT GenAI deployment.
 - **`debugging-vl-pipeline`** — Systematic debugging of VL model output parity.
+- **`scan-and-multi-image`** — Multi-image support via ONNX Scan op.
 
 ## When to use
 
@@ -540,3 +538,240 @@ gathered = op.Gather(padded, indices, axis=0)
 # Where mask selects only real features; padding row is never used
 result = op.Where(image_mask, gathered, text_embeddings)
 ```
+
+## Task variants
+
+Different VL architectures need different task wiring:
+
+| Task | `TASK_REGISTRY` key | Models | Key difference |
+|------|---------------------|--------|----------------|
+| `VisionLanguageTask` | `"vision-language"` | LLaVA, LLaVA-NeXT, PaliGemma, Pixtral, Molmo, InternVL2, Gemma3, GLM4V | Standard split |
+| `QwenVLTask` | `"qwen-vl"` | Qwen2.5-VL, Qwen3-VL | MRoPE + packed vision input |
+| `HybridQwenVLTask` | `"hybrid-qwen-vl"` | Qwen3.5-VL | MRoPE + DeltaNet hybrid cache |
+| `HybridVisionLanguageTask` | `"hybrid-vision-language"` | LFM2-VL | Hybrid (conv+KV) cache in decoder |
+| `Qwen3VLVisionLanguageTask` | `"qwen3-vl-vision-language"` | Qwen3-VL single-model variant | Single model (uses `InputMixer`) |
+| `MllamaVisionLanguageTask` | `"mllama-vision-language"` | Mllama (Llama 3.2 Vision) | Cross-attention layers in decoder |
+| `MultiModalTask` | `"multimodal"` | Phi4-MM | Audio + vision + text (4 models) |
+| *(standard + Q-Former)* | `"vision-language"` | BLIP-2 | Q-Former between vision and embedding |
+
+**Default for new models**: `VisionLanguageTask` unless MRoPE, hybrid cache,
+cross-attention, or audio are involved.
+
+## Vision encoder summary
+
+| Encoder | Used by | mobius component | Notes |
+|---------|---------|-----------------|-------|
+| SigLIP (ViT-SO/400M) | LLaVA, PaliGemma, InternVL2, Gemma3 | `VisionModel` | Standard encoder |
+| CLIP ViT-L/14 | LLaVA-1.5, Phi-3-Vision | `VisionModel` | Standard encoder |
+| SigLIP-2 | Phi-4-MM, Phi-4-SigLIP | `VisionModel` (+ S2 tiling) | Standard encoder |
+| InternViT | InternVL2 family | `_InternViT*` in `internvl.py` | Fused QKV, layer scale, CLS |
+| Qwen2.5-VL ViT | Qwen2.5-VL | `Qwen25VLVisionModel` | Conv3D, 2D-RoPE |
+| Qwen3-VL ViT | Qwen3-VL | `Qwen3VLVisionModel` | Similar to Qwen2.5 |
+| RADIO (ViT-H/16 + CPE) | NemotronH VL | Not yet in mobius | See RADIO section |
+
+## `VisionConfig` fields reference
+
+`VisionConfig` is extracted from `hf_config.vision_config` by
+`ArchitectureConfig.from_transformers`. Available fields:
+
+| Field | Type | HF key | Default |
+|-------|------|--------|---------|
+| `hidden_size` | `int` | `hidden_size` | 1152 |
+| `image_size` | `int` | `image_size` | 224 |
+| `patch_size` | `int` | `patch_size` | 14 |
+| `num_hidden_layers` | `int` | `num_hidden_layers` | 27 |
+| `num_attention_heads` | `int` | `num_attention_heads` | 16 |
+| `intermediate_size` | `int` | `intermediate_size` | 4304 |
+| `num_channels` | `int` | `num_channels` | 3 |
+| `model_type` | `str` | `model_type` | `""` |
+
+Always set `vision` in build-graph test configs:
+
+```python
+from mobius._configs import VisionConfig, VisionLanguageConfig
+
+"my_vlm": VisionLanguageConfig(
+    hidden_size=64, num_hidden_layers=2, num_attention_heads=2,
+    intermediate_size=128, vocab_size=256,
+    vision=VisionConfig(hidden_size=64, patch_size=14, image_size=56,
+                        num_hidden_layers=2, num_attention_heads=2,
+                        intermediate_size=128),
+),
+```
+
+## Weight mapping with vlm helpers
+
+### `vlm_decoder_weights` and `vlm_embedding_weights`
+
+`_weight_utils.py` exports two helpers to strip the `"language_model."` prefix
+that HuggingFace wraps the text backbone in for VL models:
+
+```python
+from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+
+class MyVLModel(nn.Module):
+    def preprocess_weights(self, weights):
+        # Fix lm_head weight tying BEFORE stripping "language_model." prefix
+        if "language_model.lm_head.weight" not in weights:
+            weights["language_model.lm_head.weight"] = weights[
+                "language_model.model.embed_tokens.weight"
+            ]
+        return {
+            "decoder": vlm_decoder_weights(weights),
+            "vision_encoder": _vision_encoder_weights(weights),
+            "embedding": vlm_embedding_weights(weights),
+        }
+```
+
+### Weight-tying pitfall
+
+Many VL models share `embed_tokens.weight` with `lm_head.weight`
+(`tie_word_embeddings=True`). HuggingFace does not save `lm_head.weight`.
+You **must** inject it at the **top-level** `preprocess_weights` before
+`vlm_decoder_weights` strips the prefix:
+
+```python
+# CORRECT — inject at top level, before prefix strip
+def preprocess_weights(self, weights):
+    if "language_model.lm_head.weight" not in weights:
+        weights["language_model.lm_head.weight"] = weights[
+            "language_model.model.embed_tokens.weight"
+        ]
+    return {"decoder": vlm_decoder_weights(weights), ...}
+```
+
+```python
+# WRONG — inject inside _DecoderModel.preprocess_weights is too late;
+# by then the key is "model.embed_tokens.weight" and the decoder
+# module cannot see "language_model.*" keys anymore.
+```
+
+### Non-standard prefixes
+
+| Model | HF prefix | Helper |
+|-------|-----------|--------|
+| LLaVA, InternVL2, Gemma3, Mllama, PaliGemma | `language_model.` | `vlm_decoder_weights` |
+| BLIP-2 | `language_model.` | `vlm_decoder_weights` |
+| Phi-3-Vision | `model.language_model.` | custom strip |
+
+## InternViT encoder (InternVL2)
+
+InternViT differs from standard SigLIP/CLIP in three ways:
+
+1. **Fused QKV**: single `qkv` linear (3*hidden) instead of separate Q/K/V
+2. **Layer scale**: learnable scalar vectors `ls1`/`ls2` that multiply
+   sub-layer output before residual add
+3. **CLS token**: prepended before patch tokens (total = num_patches + 1)
+
+InternVL2 also uses **pixel shuffle downsampling** (`downsample_ratio=0.5`)
+before the MLP projector, halving spatial resolution. The projector is
+4-layer: `LayerNorm -> Linear -> GELU -> Linear`.
+
+See `src/mobius/models/internvl.py` for `_InternViT*` implementations.
+
+**Key weight name mappings:**
+
+| HF key | mobius path |
+|--------|------------|
+| `vision_model.embeddings.class_embedding` | `vision_encoder.encoder.cls_token` |
+| `vision_model.encoder.layers.N.attn.qkv.weight` | `vision_encoder.encoder.layers.N.attn.qkv.weight` |
+| `vision_model.encoder.layers.N.layer_scale1.weight` | `vision_encoder.encoder.layers.N.ls1` |
+
+## RADIO encoder (NemotronH VL — not yet in mobius)
+
+RADIO (nvidia/RADIO-L) is a ViT-H/16 with **conditional position encoding
+(CPE)**: a depthwise Conv2d that injects adaptive position information into
+each patch feature, enabling dynamic-resolution images without re-scaling.
+
+Architecture: standard ViT-H encoder + CPE modules inserted per-layer.
+New component needed: `ConditionalPositionEncoding` (~40 LOC depthwise Conv2d).
+
+## Non-standard tasks
+
+### Mllama / Llama 3.2 Vision (cross-attention)
+
+Mllama uses **cross-attention layers** in the decoder that attend to vision
+features directly — unlike standard VL where vision features are only injected
+at the embedding step.
+
+Key details:
+- `MllamaVisionLanguageTask` creates a decoder that accepts both
+  `inputs_embeds` and `cross_attention_states` (vision features)
+- Decoder has two KV caches: one for self-attention, one for cross-attention
+- Cross-attention layer indices come from `config.cross_attention_layers`
+
+### BLIP-2 (Q-Former)
+
+BLIP-2 inserts a **Q-Former** (Querying Transformer) between the vision
+encoder and the LLM. Q-Former uses learned query vectors that attend to
+vision features, producing a fixed-length sequence (32 tokens) regardless
+of image resolution. Q-Former is part of the `vision_encoder` sub-model.
+
+### Phi4-MM (audio + vision + text)
+
+Uses `MultiModalTask` (4 ONNX models: embedding, speech_encoder,
+vision_encoder, decoder). See `tasks/_multi_modal.py` and `models/phi4mm.py`.
+For debugging, see the `phi4mm-component-parity` skill.
+
+## `image_token_id` reference
+
+| Model family | `image_token_id` | Source in HF config |
+|-------------|-----------------|---------------------|
+| LLaVA-1.5 (Vicuna) | 32000 | `image_token_index` |
+| LLaVA-OneVision (Qwen2) | 151655 | `image_token_index` |
+| Gemma3 | 262144 | `image_token_id` |
+| InternVL2 | 151667 | `img_context_token_id` |
+| Mllama | 128256 | `image_token_id` |
+| BLIP-2 | 50265 | `image_token_id` |
+| PaliGemma | 257152 | `image_token_id` |
+| Qwen2.5-VL / Qwen3-VL | 151655 | `vision_start_token_id` |
+| Phi-3-Vision | 32044 | `image_token_id` |
+
+Always read `image_token_id` from `hf_config` — never hardcode.
+
+## Common pitfalls
+
+### Wrong sub-module attribute names
+
+`VisionLanguageTask` accesses `module.decoder`, `module.vision_encoder`, and
+`module.embedding` by name. Using different names silently produces a
+`ModelPackage` missing those models.
+
+### lm_head weight missing in decoder
+
+If `tie_word_embeddings=True`, `lm_head.weight` is absent from the HF
+checkpoint. Inject it at the top-level `preprocess_weights` **before**
+calling `vlm_decoder_weights()`. See the vlm helpers section.
+
+### `forward()` called on top-level module
+
+`VisionLanguageTask` calls sub-modules directly. The top-level `forward()`
+should raise `NotImplementedError` to catch accidental calls.
+
+### Missing `vision` in build-graph test config
+
+`VisionLanguageTask._build_vision` uses `config.vision.image_size`. Always
+set `vision=VisionConfig(...)` in your test config entry.
+
+### Projector dim mismatch
+
+The projector output dim must equal the text decoder hidden size:
+`MLPMultiModalProjector(vision_hidden_size=config.vision.hidden_size,
+text_hidden_size=config.hidden_size)`.
+
+## Quick reference: file locations
+
+| File | Purpose |
+|------|---------|
+| `src/mobius/models/llava.py` | Reference 3-split implementation |
+| `src/mobius/models/gemma3.py` | Gemma3 (AvgPool projector, OffsetRMSNorm) |
+| `src/mobius/models/internvl.py` | InternVL2 (fused QKV, pixel shuffle, CLS) |
+| `src/mobius/models/mllama.py` | Mllama (cross-attention, dual KV cache) |
+| `src/mobius/models/blip2.py` | BLIP-2 (Q-Former) |
+| `src/mobius/tasks/_vision_language_3model.py` | All task variants |
+| `src/mobius/components/_vision.py` | `VisionModel`, SigLIP encoder |
+| `src/mobius/components/_multimodal.py` | Projectors, `InputMixer` |
+| `src/mobius/_weight_utils.py` | `vlm_decoder_weights`, `vlm_embedding_weights` |
+| `src/mobius/_configs.py` | `VisionConfig`, `VisionLanguageConfig`, `MllamaConfig` |
+| `src/mobius/_registry.py` | All VL model registrations |
+| `tests/_test_configs.py` | VL tiny test config entries |
