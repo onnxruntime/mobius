@@ -1269,18 +1269,25 @@ class EsmFoldConfig(EncoderConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> EsmFoldConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        # Extract nested trunk config.  HF stores it as a dict inside
+        # esmfold_config; fall back to getattr for non-dict configs.
         esmfold_config = getattr(config, "esmfold_config", None) or {}
         trunk = (
             esmfold_config.get("trunk", {})
             if isinstance(esmfold_config, dict)
-            else {}
+            else getattr(esmfold_config, "trunk", {})
+        )
+        trunk_seq_dim = (
+            trunk.get("sequence_state_dim", 1024)
+            if isinstance(trunk, dict)
+            else getattr(trunk, "sequence_state_dim", 1024)
         )
         return cls(
             **_shallow_fields(base),
             emb_layer_norm_before=getattr(
                 config, "emb_layer_norm_before", False
             ),
-            trunk_sequence_state_dim=trunk.get("sequence_state_dim", 1024),
+            trunk_sequence_state_dim=trunk_seq_dim,
             token_dropout=getattr(config, "token_dropout", True),
             is_folding_model=getattr(config, "is_folding_model", True),
         )

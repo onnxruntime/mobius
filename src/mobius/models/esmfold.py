@@ -228,7 +228,10 @@ class _EsmEncoder(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        # Post-encoder LayerNorm (HF: esm.encoder.emb_layer_norm_after)
+        # Post-encoder LayerNorm (HF: esm.encoder.emb_layer_norm_after).
+        # Always present in ESM-2 / ESMFold.
+        # TODO: For ESM-1 compat, gate on config flag (ESM-1 may not
+        # have this norm).
         self.emb_layer_norm_after = LayerNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -323,7 +326,10 @@ class EsmFoldModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # ESM-2 backbone with rotary position embeddings
+        # ESM-2 backbone with rotary position embeddings.
+        # RoPE uses full head_dim rotation (partial_rotary_factor=1.0).
+        # inv_freq has head_dim/2 entries (32 frequency pairs for 64-dim
+        # heads), each pair rotating 2 dims → all 64 dims are rotated.
         self.esm_embeddings = _EsmEmbeddings(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
@@ -345,7 +351,9 @@ class EsmFoldModel(nn.Module):
             config.hidden_size, trunk_seq_dim, config.rms_norm_eps
         )
 
-        # LM head for masked language modeling (auxiliary objective)
+        # LM head for masked language modeling (auxiliary objective).
+        # Not used in Phase 1 forward pass; weights loaded for Phase 2
+        # where the trunk consumes both esm_s_mlp output and lm logits.
         self.lm_head = Linear(
             config.hidden_size, config.vocab_size, bias=False
         )
