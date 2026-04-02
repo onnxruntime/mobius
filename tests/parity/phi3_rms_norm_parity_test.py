@@ -25,7 +25,7 @@ import torch
 
 from mobius._constants import OPSET_VERSION
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.components._rms_norm import RMSNorm
+from mobius.components import RMSNorm
 
 # ---------------------------------------------------------------------------
 # Helpers
