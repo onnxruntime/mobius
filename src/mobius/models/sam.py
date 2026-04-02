@@ -864,10 +864,34 @@ class SamModel(nn.Module):
         self,
         state_dict: dict[str, object],
     ) -> dict[str, object]:
-        """Drop windowed-attention relative position biases (not used)."""
+        """Rename and filter HF SAM weights to match ONNX parameter names.
+
+        Drops:
+        - ``rel_pos_h`` / ``rel_pos_w``: windowed-attention relative position
+          biases (we use global attention only, no windowed).
+        - ``prompt_encoder.shared_embedding.*``: duplicate of the top-level
+          ``shared_image_embedding`` (same tensor referenced twice in HF).
+        - ``prompt_encoder.mask_embed.*``: mask downscaler weights — the mask
+          input branch is not exercised (we use the no-mask path).
+
+        Renames:
+        - ``shared_image_embedding.*`` →
+          ``prompt_encoder.shared_image_embedding.*``: the ONNX decoder graph
+          realizes this parameter under the prompt_encoder calling context.
+        """
         new: dict[str, object] = {}
         for key, value in state_dict.items():
+            # Skip windowed-attention relative position biases
             if "rel_pos_h" in key or "rel_pos_w" in key:
                 continue
+            # Skip duplicate shared embedding reference
+            if key.startswith("prompt_encoder.shared_embedding."):
+                continue
+            # Skip mask embedding weights (not used in point-only path)
+            if ".mask_embed." in key and ".no_mask_embed." not in key:
+                continue
+            # Rename top-level shared_image_embedding to decoder scope
+            if key.startswith("shared_image_embedding."):
+                key = "prompt_encoder." + key
             new[key] = value
         return new

@@ -1718,14 +1718,18 @@ class SamConfig(ArchitectureConfig):
         pc = config.prompt_encoder_config
         mc = config.mask_decoder_config
         base = ArchitectureConfig.from_transformers(vc, parent_config)
-        return cls(
-            **_shallow_fields(base),
+        fields = _shallow_fields(base)
+        # Override base fields that also exist on SamConfig
+        fields.update(
             image_size=getattr(vc, "image_size", 1024),
             patch_size=getattr(vc, "patch_size", 16),
             hidden_size=getattr(vc, "hidden_size", 768),
             num_hidden_layers=getattr(vc, "num_hidden_layers", 12),
             num_attention_heads=getattr(vc, "num_attention_heads", 12),
             intermediate_size=getattr(vc, "mlp_dim", 3072),
+        )
+        return cls(
+            **fields,
             output_channels=getattr(vc, "output_channels", 256),
             qkv_bias=getattr(vc, "qkv_bias", True),
             layer_norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
