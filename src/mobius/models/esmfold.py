@@ -1,3 +1,6 @@
+# Copyright (c) ONNX Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
 """ESMFold — protein structure prediction from sequence.
 
 ESMFold combines an ESM-2 protein language model backbone with an
@@ -44,7 +47,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius.components._common import Embedding, Linear
+from mobius.components._common import Embedding, LayerNorm, Linear
 from mobius.models.bert import _BertEncoder, _rename_bert_weight
 
 if TYPE_CHECKING:
@@ -73,8 +76,6 @@ class _EsmEmbeddings(nn.Module):
         self.word_embeddings = Embedding(vocab_size, hidden_size)
         self._emb_layer_norm_before = emb_layer_norm_before
         if emb_layer_norm_before:
-            from mobius.components._common import LayerNorm
-
             self.layer_norm = LayerNorm(hidden_size, eps=layer_norm_eps)
         self._pad_token_id = pad_token_id
 
@@ -100,6 +101,40 @@ class _EsmEncoder(_BertEncoder):
     in the embedding layer, but for the ONNX graph the standard BERT
     attention pattern with full attention mask is compatible.
     """
+
+
+class _EsmSMlp(nn.Module):
+    """ESM-2 → trunk projection: LayerNorm → Linear → ReLU → Linear.
+
+    Maps ESM-2 hidden states (dim ``hidden_size``) to the folding trunk
+    sequence dimension (``trunk_seq_dim``).  The intermediate dimension
+    equals ``trunk_seq_dim``.
+
+    HuggingFace layout::
+
+        esm_s_mlp = Sequential(
+            LayerNorm(hidden_size),
+            Linear(hidden_size, trunk_seq_dim),
+            ReLU(),
+            Linear(trunk_seq_dim, trunk_seq_dim),
+        )
+    """
+
+    def __init__(
+        self, hidden_size: int, trunk_seq_dim: int, layer_norm_eps: float
+    ):
+        super().__init__()
+        # Indexed 0..3 to match HF Sequential indices for weight alignment
+        self._0 = LayerNorm(hidden_size, eps=layer_norm_eps)
+        self._1 = Linear(hidden_size, trunk_seq_dim, bias=True)
+        self._3 = Linear(trunk_seq_dim, trunk_seq_dim, bias=True)
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        x = self._0(op, x)
+        x = self._1(op, x)
+        x = op.Relu(x)
+        x = self._3(op, x)
+        return x
 
 
 class EsmFoldModel(nn.Module):
@@ -142,11 +177,10 @@ class EsmFoldModel(nn.Module):
         self.esm_encoder = _BertEncoder(config)
 
         # Projection from ESM-2 hidden dim to trunk sequence dim
+        # HF layout: Sequential(LayerNorm → Linear → ReLU → Linear)
         trunk_seq_dim = getattr(config, "trunk_sequence_state_dim", 1024)
-        self.esm_s_mlp = nn.Sequential(
-            Linear(config.hidden_size, config.hidden_size, bias=True),
-            Linear(config.hidden_size, config.hidden_size, bias=True),
-            Linear(config.hidden_size, trunk_seq_dim, bias=True),
+        self.esm_s_mlp = _EsmSMlp(
+            config.hidden_size, trunk_seq_dim, config.rms_norm_eps
         )
 
         # LM head for masked language modeling (auxiliary objective)
@@ -219,9 +253,12 @@ def _rename_esmfold_weight(name: str) -> str | None:
         # Strip "encoder." prefix that _rename_bert_weight produces
         return f"esm_{renamed}"
 
-    # ESM MLP projection: esm_s_mlp.* → esm_s_mlp.*
+    # ESM MLP projection: esm_s_mlp.{0,1,3}.* → esm_s_mlp._{0,1,3}.*
+    # HF uses Sequential indices; we prefix with _ since Python attrs can't
+    # start with a digit.  Index 2 is ReLU (no parameters).
     if name.startswith("esm_s_mlp."):
-        return name
+        suffix = name[len("esm_s_mlp."):]
+        return f"esm_s_mlp._{suffix}"
 
     # LM head
     if name.startswith("lm_head."):

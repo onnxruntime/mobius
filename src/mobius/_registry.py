@@ -605,7 +605,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
     reg.register("modernbert", ModernBertModel, task="feature-extraction")
 
-    # --- Protein structure prediction ---
+    # --- Protein (ESM-2 backbone, feature-extraction) ---
     reg.register("esmfold", EsmFoldModel, task="feature-extraction")
 
     # --- Absolute positional embeddings (non-RoPE) ---
