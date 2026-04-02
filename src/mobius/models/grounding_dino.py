@@ -1,3 +1,5 @@
+# Copyright (c) ONNX Project Contributors. All rights reserved.
+# Licensed under the MIT License.
 """Grounding DINO: text-guided open-set object detection.
 
 Architecture: Swin Transformer backbone + BERT text encoder +
