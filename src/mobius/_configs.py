@@ -2012,18 +2012,61 @@ class JetMoeConfig(CausalLMConfig):
 
 @dataclasses.dataclass
 class SeamlessM4Tv2Config(ArchitectureConfig):
-    """Configuration for SeamlessM4T v2 text encoder-decoder.
+    """Configuration for SeamlessM4T v2 models (text-to-text and speech-to-speech).
 
     Extends :class:`ArchitectureConfig` with separate FFN dimensions for the
-    encoder and decoder, plus the embedding-scaling flag.  The base class
-    stores ``num_hidden_layers`` (encoder depth), ``num_decoder_layers``
-    (decoder depth), and ``num_attention_heads`` (shared across encoder and
-    decoder for the large model).
+    encoder and decoder, plus fields for the speech encoder (Conformer),
+    T2U non-autoregressive model, and HiFi-GAN vocoder.
     """
 
+    # Text encoder/decoder
     encoder_ffn_dim: int = 8192
     decoder_ffn_dim: int = 8192
     scale_embedding: bool = True
+
+    # Speech encoder (Conformer)
+    speech_encoder_layers: int = 24
+    speech_encoder_attention_heads: int = 16
+    speech_encoder_intermediate_size: int = 4096
+    feature_projection_input_dim: int = 160
+    conv_depthwise_kernel_size: int = 31
+    left_max_position_embeddings: int = 64
+    right_max_position_embeddings: int = 8
+    num_adapter_layers: int = 1
+    adaptor_kernel_size: int = 8
+    adaptor_stride: int = 8
+
+    # T2U model
+    t2u_encoder_layers: int = 6
+    t2u_decoder_layers: int = 6
+    t2u_encoder_ffn_dim: int = 8192
+    t2u_decoder_ffn_dim: int = 8192
+    t2u_vocab_size: int = 10082
+    t2u_max_position_embeddings: int = 4096
+
+    # Vocoder embeddings and conditioning
+    unit_embed_dim: int = 1280
+    unit_hifi_gan_vocab_size: int = 10000
+    spkr_embed_dim: int = 256
+    lang_embed_dim: int = 256
+    vocoder_num_spkrs: int = 200
+    vocoder_num_langs: int = 36
+
+    # HiFi-GAN generator
+    upsample_initial_channel: int = 512
+    upsample_rates: list[int] = dataclasses.field(default_factory=lambda: [5, 4, 4, 2, 2])
+    upsample_kernel_sizes: list[int] = dataclasses.field(
+        default_factory=lambda: [11, 8, 8, 4, 4]
+    )
+    resblock_kernel_sizes: list[int] = dataclasses.field(default_factory=lambda: [3, 7, 11])
+    resblock_dilation_sizes: list[list[int]] = dataclasses.field(
+        default_factory=lambda: [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+    )
+    leaky_relu_slope: float = 0.1
+
+    # Duration predictor
+    t2u_variance_predictor_hidden_dim: int = 256
+    t2u_variance_predictor_kernel_size: int = 3
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> SeamlessM4Tv2Config:
@@ -2051,6 +2094,64 @@ class SeamlessM4Tv2Config(ArchitectureConfig):
                 "encoder_ffn_dim": encoder_ffn_dim,
                 "decoder_ffn_dim": decoder_ffn_dim,
                 "scale_embedding": getattr(config, "scale_embedding", True),
+                # Speech encoder
+                "speech_encoder_layers": getattr(config, "speech_encoder_layers", 24),
+                "speech_encoder_attention_heads": getattr(
+                    config, "speech_encoder_attention_heads", 16
+                ),
+                "speech_encoder_intermediate_size": getattr(
+                    config, "speech_encoder_intermediate_size", 4096
+                ),
+                "feature_projection_input_dim": getattr(
+                    config, "feature_projection_input_dim", 160
+                ),
+                "conv_depthwise_kernel_size": getattr(
+                    config, "conv_depthwise_kernel_size", 31
+                ),
+                "left_max_position_embeddings": getattr(
+                    config, "left_max_position_embeddings", 64
+                ),
+                "right_max_position_embeddings": getattr(
+                    config, "right_max_position_embeddings", 8
+                ),
+                "num_adapter_layers": getattr(config, "num_adapter_layers", 1),
+                "adaptor_kernel_size": getattr(config, "adaptor_kernel_size", 8),
+                "adaptor_stride": getattr(config, "adaptor_stride", 8),
+                # T2U
+                "t2u_encoder_layers": getattr(config, "t2u_encoder_layers", 6),
+                "t2u_decoder_layers": getattr(config, "t2u_decoder_layers", 6),
+                "t2u_encoder_ffn_dim": getattr(config, "t2u_encoder_ffn_dim", 8192),
+                "t2u_decoder_ffn_dim": getattr(config, "t2u_decoder_ffn_dim", 8192),
+                "t2u_vocab_size": getattr(config, "t2u_vocab_size", 10082),
+                "t2u_max_position_embeddings": getattr(
+                    config, "t2u_max_position_embeddings", 4096
+                ),
+                # Vocoder
+                "unit_embed_dim": getattr(config, "unit_embed_dim", 1280),
+                "unit_hifi_gan_vocab_size": getattr(config, "unit_hifi_gan_vocab_size", 10000),
+                "spkr_embed_dim": getattr(config, "spkr_embed_dim", 256),
+                "lang_embed_dim": getattr(config, "lang_embed_dim", 256),
+                "vocoder_num_spkrs": getattr(config, "vocoder_num_spkrs", 200),
+                "vocoder_num_langs": getattr(config, "vocoder_num_langs", 36),
+                "upsample_initial_channel": getattr(config, "upsample_initial_channel", 512),
+                "upsample_rates": list(getattr(config, "upsample_rates", [5, 4, 4, 2, 2])),
+                "upsample_kernel_sizes": list(
+                    getattr(config, "upsample_kernel_sizes", [11, 8, 8, 4, 4])
+                ),
+                "resblock_kernel_sizes": list(
+                    getattr(config, "resblock_kernel_sizes", [3, 7, 11])
+                ),
+                "resblock_dilation_sizes": [
+                    list(d)
+                    for d in getattr(config, "resblock_dilation_sizes", [[1, 3, 5]] * 3)
+                ],
+                "leaky_relu_slope": getattr(config, "leaky_relu_slope", 0.1),
+                "t2u_variance_predictor_hidden_dim": getattr(
+                    config, "t2u_variance_predictor_hidden_dim", 256
+                ),
+                "t2u_variance_predictor_kernel_size": getattr(
+                    config, "t2u_variance_predictor_kernel_size", 3
+                ),
             }
         )
         return cls(**fields)
