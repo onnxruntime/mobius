@@ -27,7 +27,6 @@ Weight name alignment:
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -36,9 +35,6 @@ from onnxscript._internal import builder
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import LayerNorm, Linear
 from mobius.models.wav2vec2 import Wav2Vec2Model
-
-if TYPE_CHECKING:
-    pass
 
 
 class _AdapterLayer(nn.Module):
@@ -198,8 +194,11 @@ class Wav2Vec2ForCTCModel(Wav2Vec2Model):
         """Encode audio to CTC logits.
 
         Args:
-            input_values: (batch, num_samples) raw audio waveform
-            attention_mask: (batch, num_samples) optional padding mask
+            input_values: (batch, num_samples) raw audio waveform float32.
+            attention_mask: (batch, num_samples) INT64 padding mask, where
+                1 = valid sample and 0 = padding.  For non-padded inputs
+                (all samples are real audio) pass all-ones:
+                ``np.ones((batch, num_samples), dtype=np.int64)``.
 
         Returns:
             logits: (batch, num_frames, vocab_size) CTC log scores

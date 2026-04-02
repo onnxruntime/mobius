@@ -49,7 +49,8 @@ import threading
 
 import numpy as np
 
-from mobius import build
+from mobius import build_from_module
+from mobius._configs import MMSConfig
 from mobius._testing.ort_inference import OnnxModelSession
 
 # ---------------------------------------------------------------------------
@@ -220,9 +221,10 @@ def transcribe(
 def load_mms_model_and_tokenizer(model_id: str, lang: str):
     """Load HuggingFace MMS processor and set the language adapter.
 
-    Returns ``(hf_model, tokenizer)`` with the correct adapter loaded.
-    Callers pass the ``hf_model`` config to ``build()`` via ``model_id``
-    but we also return it so the adapter weights are baked in.
+    Returns ``(hf_model, tokenizer)`` with the correct language adapter
+    already loaded into the model's state.  The caller should pass
+    ``hf_model.state_dict()`` to :func:`build_mms_package` so the adapter
+    weights are baked into the ONNX graph.
     """
     from transformers import AutoProcessor, Wav2Vec2ForCTC
 
@@ -234,6 +236,40 @@ def load_mms_model_and_tokenizer(model_id: str, lang: str):
     hf_model.load_adapter(lang)
 
     return hf_model, processor.tokenizer
+
+
+def build_mms_package(hf_model, model_id: str):
+    """Build an ONNX :class:`ModelPackage` from a weight-loaded HF MMS model.
+
+    This is the correct way to build MMS with a specific language adapter.
+    Because adapter weights are loaded into ``hf_model`` via
+    ``hf_model.load_adapter(lang)``, we must use :func:`build_from_module`
+    with the model's current state dict rather than :func:`build` (which
+    re-downloads weights from HuggingFace Hub and would reset the adapter).
+
+    Args:
+        hf_model: A ``Wav2Vec2ForCTC`` instance with adapter already loaded.
+        model_id: The HuggingFace model ID, used only for graph naming.
+
+    Returns:
+        A :class:`ModelPackage` with the single ``"model"`` ONNX graph.
+    """
+    from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+
+    config = MMSConfig.from_transformers(hf_model.config)
+    module = Wav2Vec2ForCTCModel(config)
+    pkg = build_from_module(module, config, task="ctc-asr")
+
+    # Name the graph after the model ID for easier debugging
+    pkg["model"].graph.name = f"{model_id}/model"
+
+    # Apply the HF model weights (including the language adapter that was
+    # loaded via hf_model.load_adapter(lang)).
+    state_dict = hf_model.state_dict()
+    state_dict = module.preprocess_weights(state_dict)
+    pkg.apply_weights(state_dict)
+
+    return pkg
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +343,7 @@ def main() -> None:
     # Build ONNX model from the weight-loaded HF model
     # ------------------------------------------------------------------
     print("Building ONNX model …")
-    pkg = build(hf_model, load_weights=not args.save_to)
+    pkg = build_mms_package(hf_model, model_id=args.model)
 
     if args.save_to:
         pkg.save(args.save_to)
