@@ -101,7 +101,9 @@ class _SeamlessM4Tv2DecoderBlock(nn.Module):
         self.self_attn = EncoderDecoderAttention(config, is_causal=True)
         self.self_attn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.cross_attention = EncoderDecoderAttention(config)
-        self.cross_attention_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_attention_layer_norm = LayerNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.fc1 = Linear(config.hidden_size, config.decoder_ffn_dim)
         self.fc2 = Linear(config.decoder_ffn_dim, config.hidden_size)
         self.ffn_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -250,10 +252,10 @@ class _SeamlessM4Tv2TextDecoder(nn.Module):
                 # past_key shape: (batch, num_heads, past_seq_len, head_dim)
                 past_len = op.Shape(past_key_values[0][0], start=2, end=3)
             else:
-                past_len = op.Constant(value_ints=[0])
-            start = op.Add(past_len, op.Constant(value_ints=[2]))
+                past_len = op.Constant(value_int=0)
+            start = op.Add(past_len, op.Constant(value_int=2))
             end = op.Add(start, seq_len)
-            position_ids = op.Range(start, end, op.Constant(value_ints=[1]))
+            position_ids = op.Range(start, end, op.Constant(value_int=1))
             position_ids = op.Cast(position_ids, to=7)  # INT64
             position_ids = op.Unsqueeze(position_ids, [0])
 
@@ -316,7 +318,7 @@ class SeamlessM4Tv2Model(nn.Module):
         for name, tensor in state_dict.items():
             # Strip "model." prefix present in SeamlessM4Tv2ForTextToText state dict
             if name.startswith("model."):
-                name = name[len("model."):]
+                name = name[len("model.") :]
 
             if name == "shared.weight":
                 shared = tensor
@@ -324,9 +326,9 @@ class SeamlessM4Tv2Model(nn.Module):
 
             # Remap text_encoder.* → encoder.* and text_decoder.* → decoder.*
             if name.startswith("text_encoder."):
-                name = "encoder." + name[len("text_encoder."):]
+                name = "encoder." + name[len("text_encoder.") :]
             elif name.startswith("text_decoder."):
-                name = "decoder." + name[len("text_decoder."):]
+                name = "decoder." + name[len("text_decoder.") :]
 
             # Sinusoidal positional embedding buffer is named "weights" in HF
             # (SeamlessM4Tv2SinusoidalPositionalEmbedding registers a buffer called
