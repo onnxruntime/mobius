@@ -10,6 +10,7 @@ __all__ = [
     "AutoencoderKLQwenImageModel",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
+    "BertForMaskedLM",
     "BertModel",
     "Blip2Model",
     "BloomCausalLMModel",
@@ -126,7 +127,7 @@ from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
-from mobius.models.bert import BertModel
+from mobius.models.bert import BertForMaskedLM, BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel

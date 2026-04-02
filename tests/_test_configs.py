@@ -1234,6 +1234,16 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
 
 
 # ---------------------------------------------------------------------------
+# Masked LM configs  (task: masked-lm, module: BertForMaskedLM)
+# ---------------------------------------------------------------------------
+MASKED_LM_CONFIGS: list[tuple[str, dict, bool]] = [
+    ("bert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("esm", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("roberta", {"hidden_act": "gelu", "type_vocab_size": 1}, False),
+]
+
+
+# ---------------------------------------------------------------------------
 # Seq2Seq (encoder-decoder) configs  (task: seq2seq)
 # ---------------------------------------------------------------------------
 SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
@@ -2091,6 +2101,7 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS
     + ENCODER_CONFIGS
+    + MASKED_LM_CONFIGS
     + SEQ2SEQ_CONFIGS
     + VISION_CONFIGS
     + DETECTION_CONFIGS

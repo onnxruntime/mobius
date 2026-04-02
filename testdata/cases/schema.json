@@ -44,6 +44,7 @@
         "image-text-to-text",
         "image-to-image",
         "image-to-text",
+        "masked-lm",
         "object-detection",
         "seq2seq",
         "speech-language",

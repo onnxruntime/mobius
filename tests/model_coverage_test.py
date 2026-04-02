@@ -59,6 +59,7 @@ from _test_configs import (  # noqa: E402
     ALL_CAUSAL_LM_CONFIGS,
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
+    MASKED_LM_CONFIGS,
     SEQ2SEQ_CONFIGS,
     SPEECH_CONFIGS,
     SSM_CONFIGS,
@@ -77,6 +78,7 @@ def _l1_l3_model_types() -> set[str]:
     all_configs = (
         ALL_CAUSAL_LM_CONFIGS
         + ENCODER_CONFIGS
+        + MASKED_LM_CONFIGS
         + SEQ2SEQ_CONFIGS
         + VISION_CONFIGS
         + DETECTION_CONFIGS

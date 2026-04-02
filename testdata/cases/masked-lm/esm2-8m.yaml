@@ -1,0 +1,12 @@
+model_id: "facebook/esm2_t6_8M_UR50D"
+revision: "main"
+task_type: "masked-lm"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG"
+
+level: "L4"
+
+notes: "ESM-2 8M with masked LM head. Protein language model for predicting masked amino acids."
