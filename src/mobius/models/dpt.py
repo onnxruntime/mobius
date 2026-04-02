@@ -324,9 +324,7 @@ class DPTForDepthEstimation(nn.Module):
     Reference: Intel/dpt-large, Intel/dpt-hybrid-midas
     """
 
-    default_task = "image-classification"
-    category = "Depth Estimation"
-    config_class: type = DPTConfig
+    default_task = "depth-estimation"
 
     def __init__(self, config: DPTConfig):
         super().__init__()

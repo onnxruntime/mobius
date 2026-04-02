@@ -27,6 +27,7 @@ __all__ = [
     "ContrastiveTask",
     "ControlNetTask",
     "DenoisingTask",
+    "DepthEstimationTask",
     "FeatureExtractionTask",
     "GroundingDinoDetectionTask",
     "HybridCausalLMTask",
@@ -75,6 +76,7 @@ from mobius.tasks._codec import CodecTask
 from mobius.tasks._contrastive import ContrastiveTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
+from mobius.tasks._depth_estimation import DepthEstimationTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._grounding_dino_detection import GroundingDinoDetectionTask
 from mobius.tasks._image_classification import ImageClassificationTask
@@ -116,6 +118,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "contrastive": ContrastiveTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
+    "depth-estimation": DepthEstimationTask,
     "feature-extraction": FeatureExtractionTask,
     "image-classification": ImageClassificationTask,
     "image-segmentation": ImageSegmentationTask,

@@ -347,7 +347,7 @@ class DepthAnythingForDepthEstimation(nn.Module):
     Uses a DINOv2 (ViT) backbone with a DPT decoder for dense depth prediction.
     """
 
-    default_task = "image-classification"
+    default_task = "depth-estimation"
     category = "Depth Estimation"
     config_class: type = DepthAnythingConfig
 

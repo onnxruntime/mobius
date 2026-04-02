@@ -738,10 +738,10 @@ def _create_default_registry() -> ModelRegistry:
     # --- Vision ---
     reg.register("blip", BlipVisionModel, task="image-classification")
     reg.register(
-        "depth_anything", DepthAnythingForDepthEstimation, task="image-classification"
+        "depth_anything", DepthAnythingForDepthEstimation, task="depth-estimation"
     )
-    reg.register("dpt", DPTForDepthEstimation, task="image-classification")
-    reg.register("zoedepth", ZoeDepthForDepthEstimation, task="image-classification")
+    reg.register("dpt", DPTForDepthEstimation, task="depth-estimation")
+    reg.register("zoedepth", ZoeDepthForDepthEstimation, task="depth-estimation")
     for name in (
         "beit",
         "cvt",

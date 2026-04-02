@@ -487,7 +487,10 @@ class TestBuildVisionGraph:
         assert "pixel_values" in input_names
 
         output_names = {out.name for out in model.graph.outputs}
-        assert "last_hidden_state" in output_names
+        # Depth estimation models output predicted_depth; other vision models output last_hidden_state
+        assert "last_hidden_state" in output_names or "predicted_depth" in output_names, (
+            f"Expected 'last_hidden_state' or 'predicted_depth' in outputs, got {output_names}"
+        )
 
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""

@@ -798,7 +798,7 @@ class ZoeDepthForDepthEstimation(nn.Module):
     bin configuration (e.g. 0.001-10 m for NYU or 0.001-80 m for KITTI).
     """
 
-    default_task = "image-classification"
+    default_task = "depth-estimation"
     category = "Depth Estimation"
     config_class: type = ZoeDepthConfig
 
