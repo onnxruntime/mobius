@@ -160,6 +160,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen2_vl_text": "VL text decoder — tested via qwen2_vl",
     "qwen3_5_vl_text": "VL text decoder — tested via qwen3_5_vl",
     # --- Vision-language models (require image/video inputs) ---
+    "lfm2_vl": "VL model — requires image inputs",
     "blip": "VL model — requires image inputs",
     "blip-2": "VL model — requires image inputs",
     "florence2": "VL model — requires image inputs",
@@ -200,6 +201,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
     # --- Very large models without small public checkpoints ---
+    "lfm2_moe": "MoE model (8B active 1B) — too large for CI golden data generation",
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",

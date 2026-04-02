@@ -845,6 +845,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2-1.2B",
     "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
+    "lfm2_moe": "LiquidAI/LFM2-8B-A1B",
+    "lfm2_vl": "LiquidAI/LFM2-VL-450M",
     "personaplex": "nvidia/personaplex-7b-v1",
     "moshi": "kyutai/moshiko-pytorch-bf16",
 

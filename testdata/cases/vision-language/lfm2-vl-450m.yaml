@@ -1,0 +1,19 @@
+model_id: "LiquidAI/LFM2-VL-450M"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe the image."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+skip_reason: "LFM2-VL 450M — vision-language model requires image input pipeline."
+notes: "LFM2-VL 450M. SigLIP2 vision encoder + MLP projector + LFM2 hybrid decoder from Liquid AI."
