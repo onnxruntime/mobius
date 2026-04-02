@@ -45,6 +45,7 @@ __all__ = [
     "Rwkv6CausalLMTask",
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
+    "MoonshineSpeechToTextTask",
     "Seq2SeqTask",
     "SpeechLanguageTask",
     "SpeechToTextTask",
@@ -81,6 +82,7 @@ from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._rwkv6_causal_lm import Rwkv6CausalLMTask
 from mobius.tasks._rwkv_causal_lm import RwkvCausalLMTask
+from mobius.tasks._moonshine_speech_to_text import MoonshineSpeechToTextTask
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
@@ -127,6 +129,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
+    "moonshine-speech-to-text": MoonshineSpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,
     "ssm2-text-generation": SSM2CausalLMTask,
     "rwkv-text-generation": RwkvCausalLMTask,

@@ -28,6 +28,7 @@ from mobius._configs import (
     DetrConfig,
     MobileNetV2Config,
     MoondreamConfig,
+    MoonshineConfig,
     Owlv2Config,
     ResNetConfig,
     RtDetrConfig,
@@ -122,6 +123,7 @@ from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.mobilenet_v2 import MobileNetV2Model
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
 from mobius.models.moondream import MoondreamModel
+from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -573,6 +575,12 @@ def _create_default_registry() -> ModelRegistry:
         task="speech-to-text",
         config_class=WhisperConfig,
     )
+    reg.register(
+        "moonshine",
+        MoonshineForConditionalGeneration,
+        task="moonshine-speech-to-text",
+        config_class=MoonshineConfig,
+    )
 
     reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")
     reg.register(
@@ -968,6 +976,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
+    "moonshine": "UsefulSensors/moonshine-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",

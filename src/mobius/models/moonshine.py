@@ -262,8 +262,8 @@ class _MoonshineEncoderLayer(nn.Module):
     def __init__(self, config: MoonshineConfig):
         super().__init__()
         hidden_size = config.hidden_size
-        num_heads = config.num_attention_heads
-        head_dim = config.head_dim
+        num_heads = config.encoder_num_attention_heads
+        head_dim = hidden_size // num_heads
         rotary_dim = int(head_dim * config.partial_rotary_factor)
         intermediate_size = config.intermediate_size
         eps = config.rms_norm_eps
@@ -395,7 +395,7 @@ class MoonshineEncoder(nn.Module):
     def __init__(self, config: MoonshineConfig):
         super().__init__()
         hidden_size = config.hidden_size
-        encoder_layers = config.encoder_layers or config.num_hidden_layers
+        encoder_layers = config.encoder_num_hidden_layers
         eps = config.rms_norm_eps
 
         # Conv frontend
@@ -432,7 +432,7 @@ class MoonshineEncoder(nn.Module):
         seq_len = op.Shape(x, start=1, end=2)
         position_ids = op.Range(
             op.Constant(value_int=0),
-            seq_len,
+            op.Squeeze(seq_len),
             op.Constant(value_int=1),
         )
         position_ids = op.Cast(position_ids, to=7)  # INT64

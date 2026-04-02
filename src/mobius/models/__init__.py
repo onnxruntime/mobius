@@ -76,6 +76,7 @@ __all__ = [
     "MiniMaxCausalLMModel",
     "MoECausalLMModel",
     "MoondreamModel",
+    "MoonshineForConditionalGeneration",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
@@ -205,6 +206,7 @@ from mobius.models.moe import (
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moondream import MoondreamModel
+from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel

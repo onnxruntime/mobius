@@ -1890,6 +1890,72 @@ class MoondreamConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class MoonshineConfig(ArchitectureConfig):
+    """Configuration for Moonshine lightweight ASR encoder-decoder models.
+
+    Moonshine uses a shared ``hidden_size`` / ``intermediate_size`` for both
+    encoder and decoder, with separate layer/head counts.  The decoder
+    fields are stored in the base-class attributes (``num_hidden_layers``,
+    ``num_attention_heads``, etc.) while encoder-specific counts use the
+    ``encoder_*`` prefix.
+    """
+
+    encoder_num_hidden_layers: int = DEFAULT_INT
+    encoder_num_attention_heads: int = DEFAULT_INT
+    encoder_num_key_value_heads: int = DEFAULT_INT
+    encoder_hidden_act: str = "gelu"
+
+    @classmethod
+    def from_transformers(
+        cls, config, parent_config=None
+    ) -> MoonshineConfig:
+        dec_heads = getattr(config, "decoder_num_attention_heads", config.num_attention_heads)
+        dec_kv_heads = getattr(config, "decoder_num_key_value_heads", dec_heads)
+        head_dim = config.hidden_size // dec_heads
+
+        enc_heads = getattr(config, "encoder_num_attention_heads", dec_heads)
+        enc_kv_heads = getattr(config, "encoder_num_key_value_heads", enc_heads)
+
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        rope_theta = (
+            rope_params.get("rope_theta", 10_000.0)
+            if isinstance(rope_params, dict)
+            else 10_000.0
+        )
+
+        resolved = _resolve_dtype(config)
+        return cls(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            # Decoder params → base fields
+            num_hidden_layers=getattr(
+                config, "decoder_num_hidden_layers", config.num_hidden_layers
+            ),
+            num_attention_heads=dec_heads,
+            num_key_value_heads=dec_kv_heads,
+            head_dim=head_dim,
+            hidden_act=getattr(config, "decoder_hidden_act", "silu"),
+            attn_qkv_bias=getattr(config, "attention_bias", False),
+            # Encoder params
+            encoder_num_hidden_layers=getattr(
+                config, "encoder_num_hidden_layers", config.num_hidden_layers
+            ),
+            encoder_num_attention_heads=enc_heads,
+            encoder_num_key_value_heads=enc_kv_heads,
+            encoder_hidden_act=getattr(config, "encoder_hidden_act", "gelu"),
+            # RoPE
+            max_position_embeddings=config.max_position_embeddings,
+            partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+            rope_theta=rope_theta,
+            rope_type="default",
+            # Other
+            pad_token_id=getattr(config, "pad_token_id", None),
+            dtype=resolved,
+        )
+
+
+@dataclasses.dataclass
 class Owlv2Config(ArchitectureConfig):
     """Configuration for OWLv2 open-vocabulary object detection.
 

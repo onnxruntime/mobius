@@ -1,0 +1,17 @@
+model_id: "UsefulSensors/moonshine-tiny"
+revision: "main"
+task_type: "moonshine-speech-to-text"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+level: "L4+L5"
+
+skip_reason: "Requires audio preprocessing pipeline not yet supported in test harness."
+notes: "Moonshine lightweight ASR. Conv1d frontend + RoPE encoder-decoder. 2-model split: encoder + decoder."
