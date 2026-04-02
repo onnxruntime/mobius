@@ -1,0 +1,12 @@
+model_id: "microsoft/conditional-detr-resnet-50"
+revision: "8f8795fb7c319c7862d4f4cd699e76bb09cf2593"
+task_type: "object-detection"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4"
+
+notes: "Conditional DETR with ResNet-50 backbone. Extends DETR with learned reference points and conditional cross-attention for faster convergence. COCO object detection (91 classes)."

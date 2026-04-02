@@ -1960,6 +1960,25 @@ DETECTION_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "conditional_detr",
+        {
+            "_config_cls": DetrConfig,
+            "d_model": 32,
+            "num_queries": 8,
+            "encoder_layers": 1,
+            "decoder_layers": 2,
+            "encoder_attention_heads": 2,
+            "decoder_attention_heads": 2,
+            "encoder_ffn_dim": 64,
+            "decoder_ffn_dim": 64,
+            "num_labels": 5,
+            "image_size": 64,
+            "backbone_hidden_sizes": [32],
+            "backbone_depths": [1],
+        },
+        True,
+    ),
+    (
         "table-transformer",
         {
             "_config_cls": DetrConfig,
