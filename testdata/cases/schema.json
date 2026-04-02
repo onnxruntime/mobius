@@ -48,7 +48,8 @@
         "seq2seq",
         "speech-language",
         "speech-to-text",
-        "text-generation"
+        "text-generation",
+        "vibevoice-asr"
       ],
       "description": "Task type string matching the mobius registry."
     },

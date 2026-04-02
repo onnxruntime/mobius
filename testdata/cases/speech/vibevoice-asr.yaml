@@ -1,0 +1,17 @@
+model_id: "microsoft/VibeVoice-ASR-HF"
+revision: "f22241c2062b3b25272bf117397e03d73381037a"
+task_type: "vibevoice-asr"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+level: "L4+L5"
+
+skip_reason: "Requires raw waveform audio preprocessing not yet supported in test harness."
+notes: "VibeVoice ASR speech recognition. 3-model split: audio_encoder + embedding + decoder. Raw waveform input (not mel spectrogram)."
