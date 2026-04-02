@@ -206,11 +206,15 @@ def _get_optimization_passes(
         instances suitable for passing to ``onnxscript.rewriter.rewrite()``.
     """
     from mobius.rewrite_rules import (
+        cast_int64_to_int32_rules,
         decompose_skip_layer_norm_rules,
+        eliminate_shape_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
+        separate_rope_rules,
         skip_layer_norm_rules,
         skip_norm_rules,
+        unpack_qkv_rules,
     )
 
     fuse: list = []
@@ -233,13 +237,12 @@ def _get_optimization_passes(
     if ep == "trt-rtx":
         lower.extend(decompose_skip_layer_norm_rules())
 
-    # Phase 2 lowering stubs — uncomment when rule implementations land:
-    # if ep == "dml":
-    #     lower.extend(separate_rope_rules())   # BP-6: decompose fused RoPE
-    #     lower.extend(unpack_qkv_rules())      # BP-7: split packed QKV
-    # elif ep == "webgpu":
-    #     lower.extend(eliminate_shape_rules()) # BP-13: Shape → constant
-    #     lower.extend(cast_int64_to_int32_rules())  # BP-12: int64 → int32
+    if ep == "dml":
+        lower.extend(separate_rope_rules())  # BP-6: decompose fused RoPE
+        lower.extend(unpack_qkv_rules())  # BP-7: split packed QKV
+    elif ep == "webgpu":
+        lower.extend(eliminate_shape_rules())  # BP-13: Shape → ReduceSum+ReduceMax
+        lower.extend(cast_int64_to_int32_rules())  # BP-12: INT64 → INT32 for Gather indices
 
     return fuse, lower
 
