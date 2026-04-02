@@ -253,7 +253,12 @@ class Gemma2DecoderLayer(nn.Module):
 
 
 class Gemma2TextModel(nn.Module):
-    """Gemma2 text model with alternating local/global attention."""
+    """Gemma2 text model with alternating local/global attention.
+
+    Supports an explicit ``layer_types`` list (e.g. all-``full_attention``
+    for VaultGemma). When absent, falls back to the Gemma2 default:
+    even layers are global, odd layers are local (sliding-window).
+    """
 
     def __init__(self, config: Gemma2Config):
         super().__init__()
@@ -271,9 +276,19 @@ class Gemma2TextModel(nn.Module):
         self.sliding_window = config.sliding_window
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+        # Optional per-layer attention type list from config (e.g. VaultGemma)
+        self._layer_types = config.layer_types
 
     def _is_local(self, layer_id: int) -> bool:
-        """Gemma2 uses alternating attention: even=global, odd=local."""
+        """Return True if layer uses local (sliding-window) attention.
+
+        When ``layer_types`` is provided, any type other than
+        ``"full_attention"`` is treated as local.  Otherwise falls back
+        to the Gemma2 default alternating pattern (odd layers are local).
+        """
+        if self._layer_types is not None:
+            return self._layer_types[layer_id] != "full_attention"
+        # Gemma2 default: even=global, odd=local
         return layer_id % 2 == 1
 
     def forward(

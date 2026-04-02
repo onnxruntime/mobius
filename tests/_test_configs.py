@@ -281,6 +281,20 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     (
+        "vaultgemma",
+        {
+            # VaultGemma uses Gemma2 architecture with all full-attention layers
+            # (no alternating sliding-window) and no logit soft-capping.
+            "_config_cls": Gemma2Config,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "query_pre_attn_scalar": TINY_HEAD_DIM,
+            "sliding_window": 8,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+        },
+        True,
+    ),
+    (
         "gemma3_text",
         {
             "attn_qk_norm": True,
