@@ -1539,6 +1539,45 @@ class ZoeDepthConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class DPTConfig(ArchitectureConfig):
+    """Configuration for DPT dense prediction transformer.
+
+    Adds DPT-specific neck and head parameters on top of the ViT backbone
+    fields (``hidden_size``, ``num_hidden_layers``, ``num_attention_heads``,
+    ``intermediate_size``, ``patch_size``, ``image_size``, ``hidden_act``).
+    """
+
+    backbone_out_indices: list[int] | None = None
+    neck_hidden_sizes: list[int] | None = None
+    reassemble_factors: list[float] | None = None
+    fusion_hidden_size: int = 256
+    readout_type: str = "project"
+    use_batch_norm_in_fusion_residual: bool = False
+    use_bias_in_fusion_residual: bool | None = None
+    head_in_index: int = -1
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> DPTConfig:
+        # DPT keeps all fields directly on the root config (not nested).
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            backbone_out_indices=getattr(config, "backbone_out_indices", None),
+            neck_hidden_sizes=getattr(config, "neck_hidden_sizes", None),
+            reassemble_factors=getattr(config, "reassemble_factors", None),
+            fusion_hidden_size=getattr(config, "fusion_hidden_size", 256),
+            readout_type=getattr(config, "readout_type", "project"),
+            use_batch_norm_in_fusion_residual=getattr(
+                config, "use_batch_norm_in_fusion_residual", False
+            ),
+            use_bias_in_fusion_residual=getattr(
+                config, "use_bias_in_fusion_residual", None
+            ),
+            head_in_index=getattr(config, "head_in_index", -1),
+        )
+
+
+@dataclasses.dataclass
 class SegformerConfig(EncoderConfig):
     """Configuration for Segformer hierarchical vision transformers.
 
@@ -1849,6 +1888,60 @@ class MoondreamConfig(ArchitectureConfig):
                 patch_size=patch_size,
                 norm_eps=1e-6,
             ),
+        )
+
+
+@dataclasses.dataclass
+class Owlv2Config(ArchitectureConfig):
+    """Configuration for OWLv2 open-vocabulary object detection.
+
+    Vision fields (``hidden_size``, ``intermediate_size``, etc.) describe
+    the CLIP vision encoder.  Text-specific fields are prefixed ``text_``.
+    """
+
+    text_hidden_size: int = 512
+    text_intermediate_size: int = 2048
+    text_num_hidden_layers: int = 12
+    text_num_attention_heads: int = 8
+    text_max_position_embeddings: int = 16
+    text_vocab_size: int = 49408
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Owlv2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        vc = getattr(config, "vision_config", config)
+        tc = getattr(config, "text_config", config)
+        return cls(
+            **_shallow_fields(base),
+            hidden_size=getattr(vc, "hidden_size", base.hidden_size),
+            intermediate_size=getattr(
+                vc, "intermediate_size", base.intermediate_size
+            ),
+            num_hidden_layers=getattr(
+                vc, "num_hidden_layers", base.num_hidden_layers
+            ),
+            num_attention_heads=getattr(
+                vc, "num_attention_heads", base.num_attention_heads
+            ),
+            num_key_value_heads=getattr(
+                vc, "num_attention_heads", base.num_attention_heads
+            ),
+            head_dim=getattr(vc, "hidden_size", base.hidden_size)
+            // getattr(vc, "num_attention_heads", base.num_attention_heads),
+            image_size=getattr(vc, "image_size", 960),
+            patch_size=getattr(vc, "patch_size", 16),
+            num_channels=getattr(vc, "num_channels", 3),
+            hidden_act=getattr(vc, "hidden_act", "quick_gelu"),
+            rms_norm_eps=getattr(vc, "layer_norm_eps", 1e-5),
+            projection_dim=getattr(config, "projection_dim", 512),
+            text_hidden_size=getattr(tc, "hidden_size", 512),
+            text_intermediate_size=getattr(tc, "intermediate_size", 2048),
+            text_num_hidden_layers=getattr(tc, "num_hidden_layers", 12),
+            text_num_attention_heads=getattr(tc, "num_attention_heads", 8),
+            text_max_position_embeddings=getattr(
+                tc, "max_position_embeddings", 16
+            ),
+            text_vocab_size=getattr(tc, "vocab_size", 49408),
         )
 
 

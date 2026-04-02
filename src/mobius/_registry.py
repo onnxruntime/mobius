@@ -32,7 +32,6 @@ from mobius._configs import (
     ResNetConfig,
     RtDetrConfig,
     Rwkv6Config,
-    Speech2TextConfig,
     RwkvConfig,
     WhisperConfig,
 )
@@ -102,6 +101,7 @@ from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.detr import DetrForObjectDetection
 from mobius.models.distilbert import DistilBertModel
+from mobius.models.dpt import DPTForDepthEstimation
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
 from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
@@ -128,9 +128,9 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.resnet import ResNetModel
 from mobius.models.rt_detr import RtDetrForObjectDetection
+from mobius.models.owlv2 import Owlv2ForObjectDetection
 from mobius.models.rwkv import RwkvCausalLMModel
 from mobius.models.rwkv6 import Rwkv6CausalLMModel
-from mobius.models.speech2text import Speech2TextForConditionalGeneration
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
@@ -572,12 +572,6 @@ def _create_default_registry() -> ModelRegistry:
         task="speech-to-text",
         config_class=WhisperConfig,
     )
-    reg.register(
-        "speech_to_text",
-        Speech2TextForConditionalGeneration,
-        task="speech2text-seq2seq",
-        config_class=Speech2TextConfig,
-    )
 
     reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")
     reg.register(
@@ -699,6 +693,7 @@ def _create_default_registry() -> ModelRegistry:
     reg.register(
         "depth_anything", DepthAnythingForDepthEstimation, task="image-classification"
     )
+    reg.register("dpt", DPTForDepthEstimation, task="image-classification")
     reg.register("zoedepth", ZoeDepthForDepthEstimation, task="image-classification")
     for name in (
         "beit",
@@ -769,6 +764,12 @@ def _create_default_registry() -> ModelRegistry:
         RtDetrForObjectDetection,
         task="object-detection",
         config_class=RtDetrConfig,
+    )
+    reg.register(
+        "owlv2",
+        Owlv2ForObjectDetection,
+        task="owlv2-object-detection",
+        config_class=Owlv2Config,
     )
 
     # --- Segmentation ---
@@ -960,7 +961,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
-    "speech_to_text": "facebook/s2t-small-librispeech-asr",
     "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
@@ -1055,11 +1055,13 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deit": "facebook/deit-small-patch16-224",
     "blip": "Salesforce/blip-image-captioning-base",
     "depth_anything": "LiheYoung/depth-anything-small-hf",
+    "dpt": "Intel/dpt-large",
     "zoedepth": "Intel/zoedepth-nyu-kitti",
     "yolos": "hustvl/yolos-tiny",
     "detr": "facebook/detr-resnet-50",
     "table-transformer": "microsoft/table-transformer-detection",
     "rt_detr": "PekingU/rtdetr_r50vd",
+    "owlv2": "google/owlv2-base-patch16-ensemble",
     "segformer": "nvidia/segformer-b0-finetuned-ade-512-512",
     "cvt": "microsoft/cvt-13",
     "data2vec-vision": "facebook/data2vec-vision-base-ft1k",

@@ -39,13 +39,13 @@ from mobius._configs import (
     MoondreamConfig,
     NanoChatConfig,
     NemotronHConfig,
+    Owlv2Config,
     ResNetConfig,
     RtDetrConfig,
     Rwkv6Config,
     RwkvConfig,
     Sam2Config,
     SegformerConfig,
-    Speech2TextConfig,
     VisionConfig,
     WhisperConfig,
     YolosConfig,
@@ -1580,6 +1580,25 @@ VISION_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "dpt",
+        {
+            "_config_cls": DPTConfig,
+            "hidden_act": "gelu",
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "intermediate_size": 64,
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+            "backbone_out_indices": [1, 2, 3, 4],
+            "neck_hidden_sizes": [16, 32, 64, 64],
+            "reassemble_factors": [4.0, 2.0, 1.0, 0.5],
+            "fusion_hidden_size": 16,
+        },
+        True,
+    ),
+    (
         "zoedepth",
         {
             "_config_cls": ZoeDepthConfig,
@@ -1984,6 +2003,22 @@ DETECTION_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- OWLv2 (open-vocabulary object detection with CLIP backbone) ---
+    (
+        "owlv2",
+        {
+            "_config_cls": Owlv2Config,
+            "text_hidden_size": 64,
+            "text_intermediate_size": 128,
+            "text_num_hidden_layers": 2,
+            "text_num_attention_heads": 4,
+            "text_max_position_embeddings": 16,
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
 ]
 
 
@@ -2331,24 +2366,6 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "max_source_positions": 100,
             "max_target_positions": 50,
             "scale_embedding": True,
-        },
-        True,
-    ),
-    # --- Facebook Speech2Text (Conv1d subsampler + transformer, ASR) ---
-    (
-        "speech_to_text",
-        {
-            "_config_cls": Speech2TextConfig,
-            "input_feat_per_channel": 16,
-            "input_channels": 1,
-            "conv_channels": TINY_HIDDEN,  # 64; GLU → 32, matches hidden_size*2→hidden_size
-            "conv_kernel_sizes": [3, 3],
-            "num_conv_layers": 2,
-            "max_source_positions": 64,
-            "max_target_positions": 32,
-            "num_decoder_layers": TINY_LAYERS,
-            "scale_embedding": True,
-            "rms_norm_eps": 1e-5,
         },
         True,
     ),

@@ -1,0 +1,12 @@
+model_id: "google/owlv2-base-patch16-ensemble"
+revision: "main"
+task_type: "owlv2-object-detection"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4"
+
+notes: "OWLv2 open-vocabulary object detection (base, patch16, ensemble). CLIP vision+text encoder with detection heads."

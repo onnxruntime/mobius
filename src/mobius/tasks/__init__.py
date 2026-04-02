@@ -76,6 +76,7 @@ from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._image_segmentation import ImageSegmentationTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
+from mobius.tasks._owlv2_detection import Owlv2ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
 from mobius.tasks._rwkv6_causal_lm import Rwkv6CausalLMTask
@@ -111,6 +112,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "image-classification": ImageClassificationTask,
     "image-segmentation": ImageSegmentationTask,
     "object-detection": ObjectDetectionTask,
+    "owlv2-object-detection": Owlv2ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
