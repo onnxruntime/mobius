@@ -327,6 +327,12 @@ class SeamlessM4Tv2Model(nn.Module):
             elif name.startswith("text_decoder."):
                 name = "decoder." + name[len("text_decoder.") :]
 
+            # HF wraps fc1/fc2 in an 'ffn' sub-module:
+            #   encoder.layers.N.ffn.fc1.weight → encoder.layers.N.fc1.weight
+            #   decoder.layers.N.ffn.fc1.weight → decoder.layers.N.fc1.weight
+            name = name.replace(".ffn.fc1.", ".fc1.")
+            name = name.replace(".ffn.fc2.", ".fc2.")
+
             # Sinusoidal positional embedding buffer is named "weights" in HF
             # (SeamlessM4Tv2SinusoidalPositionalEmbedding registers a buffer called
             # "weights"), but our Embedding stores it as "weight" (nn.Parameter).
