@@ -25,6 +25,7 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
     Gemma4Config,
+    MMSConfig,
     WhisperConfig,
 )
 from mobius.models import (
@@ -126,6 +127,7 @@ from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
+from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
 from mobius.models.zamba2 import Zamba2CausalLMModel
@@ -661,8 +663,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wav2vec2-bert": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
 }
-
 
 def _create_default_registry() -> ModelRegistry:
     """Create the default registry with all built-in architectures."""
@@ -862,6 +864,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
+    "mms": "facebook/mms-300m",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -1080,6 +1083,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "wav2vec2-conformer": "wav2vec2",
     "hubert": "wav2vec2",
     "wavlm": "wav2vec2",
+    "mms": "wav2vec2",
     "vit": "vit",
     "vit_hybrid": "vit",
     "vit_mae": "vit",
