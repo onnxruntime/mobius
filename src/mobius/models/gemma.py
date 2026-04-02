@@ -278,6 +278,11 @@ class Gemma2TextModel(nn.Module):
         self.rotary_emb = initialize_rope(config)
         # Optional per-layer attention type list from config (e.g. VaultGemma)
         self._layer_types = config.layer_types
+        if self._layer_types is not None:
+            assert len(self._layer_types) == config.num_hidden_layers, (
+                f"len(layer_types)={len(self._layer_types)} != "
+                f"num_hidden_layers={config.num_hidden_layers}"
+            )
 
     def _is_local(self, layer_id: int) -> bool:
         """Return True if layer uses local (sliding-window) attention.

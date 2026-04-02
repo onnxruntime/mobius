@@ -58,9 +58,11 @@ class T5GemmaCrossAttention(nn.Module):
     Uses Gemma2-style scaling (``query_pre_attn_scalar``) and attention
     logit soft-capping (``attn_logit_softcapping``).
 
-    Encoder hidden states are re-projected each decode step. This keeps the
-    ONNX graph unconditional; the runtime is responsible for caching the
-    projected K/V via the ``present_cross_kvs`` outputs.
+    Encoder hidden states are re-projected each decode step. This is correct
+    because the encoder output is constant per sequence — concatenating with a
+    growing KV cache would incorrectly expand the cross-attention sequence
+    length. The runtime may cache the projected K/V externally via the
+    ``present_cross_kvs`` outputs, but the ONNX graph is unconditional.
     """
 
     def __init__(self, config: Gemma2Config):
@@ -90,13 +92,13 @@ class T5GemmaCrossAttention(nn.Module):
         op: builder.OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
-        past_key_value: tuple | None = None,  # unused: kept for API uniformity with self-attention
     ):
         # Q from decoder
         query_states = self.q_proj(op, hidden_states)  # (batch, dec_len, q_heads * head_dim)
 
         # K/V always projected from encoder hidden states (constant per sequence).
-        # The runtime caches the output K/V via present_cross_kvs.
+        # Do NOT concatenate with a KV cache: encoder output never grows, so
+        # accumulating past K/V would incorrectly double the sequence length.
         key_states = self.k_proj(op, encoder_hidden_states)
         value_states = self.v_proj(op, encoder_hidden_states)
 
@@ -105,7 +107,7 @@ class T5GemmaCrossAttention(nn.Module):
             key_states,
             value_states,
             None,  # no attention bias — cross-attention is full bidirectional
-            None,  # no past_key — encoder K/V is always recomputed
+            None,  # no past_key
             None,  # no past_value
             q_num_heads=self._num_q_heads,
             kv_num_heads=self._num_kv_heads,
@@ -243,7 +245,6 @@ class T5GemmaDecoderLayer(nn.Module):
             op,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            past_key_value=cross_past_key_value,
         )
         hidden_states = self.post_cross_attn_layernorm(op, cross_output)
         hidden_states = op.Add(residual, hidden_states)
@@ -289,6 +290,11 @@ class T5GemmaEncoder(nn.Module):
         self.rotary_emb = initialize_rope(config)
         self.sliding_window = config.sliding_window
         self._layer_types = config.layer_types
+        if self._layer_types is not None:
+            assert len(self._layer_types) == config.num_hidden_layers, (
+                f"len(layer_types)={len(self._layer_types)} != "
+                f"num_hidden_layers={config.num_hidden_layers}"
+            )
 
     def _is_local(self, layer_id: int) -> bool:
         """Return True if layer uses sliding-window attention."""
@@ -378,6 +384,11 @@ class T5GemmaDecoder(nn.Module):
         self.sliding_window = config.sliding_window
         self._layer_types = config.layer_types
         self._final_logit_softcapping = config.final_logit_softcapping
+        if self._layer_types is not None:
+            assert len(self._layer_types) == config.num_hidden_layers, (
+                f"len(layer_types)={len(self._layer_types)} != "
+                f"num_hidden_layers={config.num_hidden_layers}"
+            )
 
     def _is_local(self, layer_id: int) -> bool:
         """Return True if this decoder layer uses sliding-window self-attention."""

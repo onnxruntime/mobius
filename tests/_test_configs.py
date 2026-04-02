@@ -1396,12 +1396,14 @@ SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
         "t5gemma",
         {
             # T5Gemma encoder-decoder using Gemma2-style attention with GQA.
+            # num_key_value_heads=1 (< num_attention_heads=4) exercises the
+            # GQA fix in Seq2SeqTask (_seq2seq.py).
             "_config_cls": Gemma2Config,
             "attn_qkv_bias": False,
             "attn_o_bias": False,
             "attn_logit_softcapping": 50.0,
             "query_pre_attn_scalar": TINY_HEAD_DIM,
-            "num_key_value_heads": 2,
+            "num_key_value_heads": 1,
             "layer_types": ["sliding_attention", "full_attention"],
             "sliding_window": 8,
         },
