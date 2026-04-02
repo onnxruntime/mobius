@@ -19,37 +19,46 @@ implementations across dtypes and shapes.
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 import pytest
 import torch
 
 from mobius._constants import OPSET_VERSION
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.components import RMSNorm
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: int):
-    """Build and return a minimal ``ir.Model`` containing a single RMSNorm.
+@functools.cache
+def _get_cached_rms_norm_session(
+    hidden_size: int, eps: float, batch: int, seq: int
+) -> OnnxModelSession:
+    """Build and cache an ORT session for a single-RMSNorm ONNX model.
 
-    The model has one input ``x`` of shape ``(batch, seq, hidden_size)``
-    (float32) and one output of the same shape.
+    Weight is exposed as a named graph input (not an initializer) so that
+    the same session can be reused across tests that differ only in weight
+    values.  Sessions are cached by ``(hidden_size, eps, batch, seq)``; the
+    cache is module-scoped and cleaned up at process exit.
 
     Args:
-        hidden_size: Feature dimension for the norm weight.
+        hidden_size: Feature dimension.
         eps: Variance epsilon.
-        batch: Batch dimension.
-        seq: Sequence dimension.
+        batch: Batch dimension of the ``x`` input.
+        seq: Sequence dimension of the ``x`` input.
 
     Returns:
-        Tuple of (``ir.Model``, weight initializer for ``norm.weight`` whose data
-        has shape ``(hidden_size,)``).
+        A ready-to-use :class:`OnnxModelSession` whose inputs are
+        ``"x"`` (shape ``[batch, seq, hidden_size]``) and
+        ``"weight"`` (shape ``[hidden_size]``), both float32.
     """
     import onnx_ir as ir
     from onnxscript._internal.builder import GraphBuilder
+
+    from mobius.components._rms_norm import apply_rms_norm
 
     graph = ir.Graph(
         [],
@@ -61,34 +70,25 @@ def _build_rms_norm_onnx_model(hidden_size: int, eps: float, batch: int, seq: in
     b = GraphBuilder(graph)
     op = b.op
 
+    # Both x and weight are graph inputs so a single session serves all tests
+    # with the same shape config, regardless of the weight values used.
     x_val = ir.Value(
         name="x",
         shape=ir.Shape([batch, seq, hidden_size]),
         type=ir.TensorType(ir.DataType.FLOAT),
     )
-    graph.inputs.append(x_val)
+    weight_val = ir.Value(
+        name="weight",
+        shape=ir.Shape([hidden_size]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    graph.inputs.extend([x_val, weight_val])
 
-    norm = RMSNorm(hidden_size, eps=eps)
-    b.push_module("norm")
-    # Register parameters as initializers using the public API instead of
-    # relying on internal `_parameters` / `_realize` behavior.
-    for name, param in norm.named_parameters():
-        graph.register_initializer(param)
-    out = norm.forward(op, x_val)
-    b.pop_module()
-
-    # Explicitly name the model output to avoid relying on implicit output ordering.
-    y = op.Identity(out, name="y")
-    graph.outputs.append(y)
+    out = apply_rms_norm(op, x_val, weight_val, eps)
+    graph.outputs.append(out)
 
     model = ir.Model(graph, ir_version=10)
-
-    # Initialize weight to ones (will be overwritten with real weights below)
-    weight_np = np.ones(hidden_size, dtype=np.float32)
-    init = model.graph.initializers["norm.weight"]
-    init.const_value = ir.Tensor(weight_np)
-
-    return model, init
+    return OnnxModelSession(model)
 
 
 def _run_phi3_rms_norm(
@@ -128,29 +128,38 @@ def _run_phi3_rms_norm(
 
 
 def _run_mobius_rms_norm(
-    model,
-    weight_init,
+    hidden_size: int,
+    eps: float,
+    batch: int,
+    seq: int,
     weight_np: np.ndarray,
     x_np: np.ndarray,
 ) -> np.ndarray:
-    """Run the ONNX model via ORT with ``weight_np`` and input ``x_np``.
+    """Run mobius RMSNorm via a cached ORT session.
+
+    Reuses the session cached by :func:`_get_cached_rms_norm_session` for the
+    given ``(hidden_size, eps, batch, seq)`` configuration.  Weight and input
+    are passed as feeds on every call, so different weight values can be used
+    without rebuilding the session.
 
     Args:
-        model: ``ir.Model`` returned by ``_build_rms_norm_onnx_model``.
-        weight_init: The initializer reference for the norm weight.
+        hidden_size: Feature dimension.
+        eps: Variance epsilon.
+        batch: Batch dimension.
+        seq: Sequence dimension.
         weight_np: Float32 weight array of shape ``(hidden_size,)``.
-        x_np: Float32 input array.
+        x_np: Input array; converted to float32 before feeding.
 
     Returns:
-        Output numpy array of the same shape as ``x_np``.
+        Float32 output array of shape ``(batch, seq, hidden_size)``.
     """
-    import onnx_ir as ir
-
-    weight_init.const_value = ir.Tensor(weight_np.astype(np.float32))
-
-    session = OnnxModelSession(model)
-    result = session.run({"x": x_np.astype(np.float32)})
-    session.close()
+    session = _get_cached_rms_norm_session(hidden_size, eps, batch, seq)
+    result = session.run(
+        {
+            "x": x_np.astype(np.float32),
+            "weight": weight_np.astype(np.float32),
+        }
+    )
     return result[next(iter(result.keys()))]
 
 
@@ -176,8 +185,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = rng.standard_normal((batch, seq, hidden_size)).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -197,8 +205,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = rng.standard_normal((batch, seq, hidden_size)).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -218,8 +225,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = rng.standard_normal((batch, seq, hidden_size)).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -239,8 +245,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = rng.standard_normal((batch, seq, hidden_size)).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -266,8 +271,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = rng.standard_normal((batch, seq, hidden_size)).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -288,8 +292,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = (rng.standard_normal((batch, seq, hidden_size)) * 1e-4).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -309,8 +312,7 @@ class TestPhi3RMSNormParityFloat32:
         x_np = (rng.standard_normal((batch, seq, hidden_size)) * 100.0).astype(np.float32)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        onnx_out = _run_mobius_rms_norm(model, weight_init, weight_np, x_np)
+        onnx_out = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_np)
         hf_out = _run_phi3_rms_norm(weight_np, x_np, eps)
 
         np.testing.assert_allclose(
@@ -330,38 +332,6 @@ class TestPhi3RMSNormParityFloat16:
     may follow a similar promotion strategy internally, so both paths should
     agree to within a loose float16 tolerance (atol ≤ 2e-3).
     """
-
-    def _run_onnx_fp16(
-        self,
-        hidden_size: int,
-        eps: float,
-        batch: int,
-        seq: int,
-        weight_np: np.ndarray,
-        x_fp16: np.ndarray,
-    ) -> np.ndarray:
-        """Run the float32 ONNX RMSNorm model on float16 data promoted to float32.
-
-        The underlying ONNX graph is built with float32 weights and a float32
-        input ``x`` (ORT does not natively support float16 graph inputs in all
-        configurations). For this float16 parity test, we:
-
-        * start from float16 inputs ``x_fp16`` and float32 weights ``weight_np``,
-        * cast both to float32 when populating the ONNX initializers and inputs,
-        * run the float32 ONNX model, and
-        * compare its float32 output against Phi3RMSNorm's output, also viewed
-          as float32 for numerical comparison purposes.
-        """
-        import onnx_ir as ir
-
-        model, weight_init = _build_rms_norm_onnx_model(hidden_size, eps, batch, seq)
-        weight_init.const_value = ir.Tensor(weight_np.astype(np.float32))
-
-        session = OnnxModelSession(model)
-        # Feed the float16 values promoted to float32; the ONNX model computes in float32.
-        result = session.run({"x": x_fp16.astype(np.float32)})
-        session.close()
-        return result[next(iter(result.keys()))]
 
     def test_float16_parity_within_loose_tolerance(self):
         """float16 inputs: mobius (float32 ONNX) agrees with Phi3RMSNorm within fp16 tolerance.
@@ -387,7 +357,8 @@ class TestPhi3RMSNormParityFloat16:
         x_fp16 = rng.standard_normal((batch, seq, hidden_size)).astype(np.float16)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        onnx_out_f32 = self._run_onnx_fp16(hidden_size, eps, batch, seq, weight_np, x_fp16)
+        # Feed float16 values promoted to float32; the ONNX model computes in float32.
+        onnx_out_f32 = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_fp16)
 
         # Phi3RMSNorm returns float32 because weight (float32) * norm_f16 → float32
         hf_out = _run_phi3_rms_norm(weight_np, x_fp16, eps)
@@ -414,7 +385,8 @@ class TestPhi3RMSNormParityFloat16:
         x_fp16 = rng.standard_normal((batch, seq, hidden_size)).astype(np.float16)
         weight_np = rng.standard_normal(hidden_size).astype(np.float32)
 
-        onnx_out_f32 = self._run_onnx_fp16(hidden_size, eps, batch, seq, weight_np, x_fp16)
+        # Feed float16 values promoted to float32; the ONNX model computes in float32.
+        onnx_out_f32 = _run_mobius_rms_norm(hidden_size, eps, batch, seq, weight_np, x_fp16)
 
         hf_out_f32_internal = _run_phi3_rms_norm(weight_np, x_fp16, eps)
         hf_out_f32 = hf_out_f32_internal.astype(np.float32)
