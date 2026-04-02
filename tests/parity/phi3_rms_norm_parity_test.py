@@ -162,8 +162,9 @@ def _run_mobius_rms_norm(
 class TestPhi3RMSNormParityFloat32:
     """Numerical parity between Phi3RMSNorm and mobius RMSNorm for float32 inputs.
 
-    For float32 inputs the two implementations should agree to within the
-    tolerance of the ONNX ``RMSNormalization`` op (atol ≤ 1e-6).
+    For float32 inputs the two implementations should agree within a small
+    absolute tolerance (atol up to 5e-6 in these tests), matching the expected
+    behavior of the ONNX ``RMSNormalization`` op.
     """
 
     def test_basic_float32_parity(self):
