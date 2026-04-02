@@ -90,5 +90,5 @@ class AudioLanguageTask(SpeechLanguageTask):
 
         logits.name = "logits"
         graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        _register_kv_cache_outputs(graph, present_key_values=present_key_values)
         return _make_model(graph)

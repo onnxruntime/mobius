@@ -66,7 +66,8 @@ class NemotronFlashGLALayer(nn.Module):
 
     Weight prefix: ``gla.`` (q_proj, k_proj, v_proj, o_proj).
     For graph construction, uses standard GQA Attention as a placeholder.
-    The actual GLA recurrence will be implemented for parity later.
+    TODO(#92): Replace placeholder GQA with actual GLA linear recurrence
+    for numerical parity with HuggingFace.
 
     Layer type: ``"deltanet"`` — treated as full KV cache in the task.
 

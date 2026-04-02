@@ -281,6 +281,7 @@ class _LlamaNemotronNanoVLVisionEncoderModel(nn.Module):
         channels = op.Shape(x, start=2, end=3)
 
         # Compute H = W = sqrt(num_patches). Tiles are always square.
+        # to=1 is ONNX TensorProto.FLOAT, to=7 is TensorProto.INT64
         h = op.Cast(op.Sqrt(op.Cast(seq_len, to=1)), to=7)  # float sqrt → int64
         w = h
 
