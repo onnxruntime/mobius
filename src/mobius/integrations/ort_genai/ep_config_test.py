@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from mobius._genai_config import (
+from mobius.integrations.ort_genai.ep_config import (
     make_genai_decoder_config,
     make_kv_cache_dim_name,
     make_provider_options,
