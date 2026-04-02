@@ -28,6 +28,7 @@ __all__ = [
     "CodeGenCausalLMModel",
     "CogVideoXTransformer3DModel",
     "CohereCausalLMModel",
+    "ConditionalDetrForObjectDetection",
     "ControlNetModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
@@ -155,6 +156,7 @@ from mobius.models.clip import CLIPModel, CLIPTextModel, CLIPVisionModel
 from mobius.models.clipseg import CLIPSegModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cohere import CohereCausalLMModel
+from mobius.models.conditional_detr import ConditionalDetrForObjectDetection
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.convnext import ConvNextModel
 from mobius.models.ctrl import CTRLCausalLMModel

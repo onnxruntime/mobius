@@ -26,6 +26,7 @@ from mobius._configs import (
     ConvNextConfig,
     DepthAnythingConfig,
     DetrConfig,
+    DPTConfig,
     Gemma2Config,
     Gemma3nConfig,
     GraniteMoeHybridConfig,

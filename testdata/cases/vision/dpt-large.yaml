@@ -1,0 +1,13 @@
+model_id: "Intel/dpt-large"
+revision: "main"
+task_type: "depth-estimation"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4"
+skip_reason: "Model is 1.3GB — too large for CI"
+
+notes: "DPT (Dense Prediction Transformer) for monocular depth estimation. ViT-Large backbone with DPT decoder."

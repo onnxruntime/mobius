@@ -99,6 +99,7 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.convnext import ConvNextModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
+from mobius.models.conditional_detr import ConditionalDetrForObjectDetection
 from mobius.models.detr import DetrForObjectDetection
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dpt import DPTForDepthEstimation
@@ -748,6 +749,12 @@ def _create_default_registry() -> ModelRegistry:
     # --- Object detection ---
     reg.register("yolos", YolosForObjectDetection, task="object-detection")
     reg.register(
+        "conditional_detr",
+        ConditionalDetrForObjectDetection,
+        task="object-detection",
+        config_class=DetrConfig,
+    )
+    reg.register(
         "detr",
         DetrForObjectDetection,
         task="object-detection",
@@ -1058,6 +1065,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "dpt": "Intel/dpt-large",
     "zoedepth": "Intel/zoedepth-nyu-kitti",
     "yolos": "hustvl/yolos-tiny",
+    "conditional_detr": "microsoft/conditional-detr-resnet-50",
     "detr": "facebook/detr-resnet-50",
     "table-transformer": "microsoft/table-transformer-detection",
     "rt_detr": "PekingU/rtdetr_r50vd",

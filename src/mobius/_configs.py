@@ -1570,9 +1570,7 @@ class DPTConfig(ArchitectureConfig):
             use_batch_norm_in_fusion_residual=getattr(
                 config, "use_batch_norm_in_fusion_residual", False
             ),
-            use_bias_in_fusion_residual=getattr(
-                config, "use_bias_in_fusion_residual", None
-            ),
+            use_bias_in_fusion_residual=getattr(config, "use_bias_in_fusion_residual", None),
             head_in_index=getattr(config, "head_in_index", -1),
         )
 
@@ -1914,18 +1912,10 @@ class Owlv2Config(ArchitectureConfig):
         return cls(
             **_shallow_fields(base),
             hidden_size=getattr(vc, "hidden_size", base.hidden_size),
-            intermediate_size=getattr(
-                vc, "intermediate_size", base.intermediate_size
-            ),
-            num_hidden_layers=getattr(
-                vc, "num_hidden_layers", base.num_hidden_layers
-            ),
-            num_attention_heads=getattr(
-                vc, "num_attention_heads", base.num_attention_heads
-            ),
-            num_key_value_heads=getattr(
-                vc, "num_attention_heads", base.num_attention_heads
-            ),
+            intermediate_size=getattr(vc, "intermediate_size", base.intermediate_size),
+            num_hidden_layers=getattr(vc, "num_hidden_layers", base.num_hidden_layers),
+            num_attention_heads=getattr(vc, "num_attention_heads", base.num_attention_heads),
+            num_key_value_heads=getattr(vc, "num_attention_heads", base.num_attention_heads),
             head_dim=getattr(vc, "hidden_size", base.hidden_size)
             // getattr(vc, "num_attention_heads", base.num_attention_heads),
             image_size=getattr(vc, "image_size", 960),
@@ -1938,9 +1928,7 @@ class Owlv2Config(ArchitectureConfig):
             text_intermediate_size=getattr(tc, "intermediate_size", 2048),
             text_num_hidden_layers=getattr(tc, "num_hidden_layers", 12),
             text_num_attention_heads=getattr(tc, "num_attention_heads", 8),
-            text_max_position_embeddings=getattr(
-                tc, "max_position_embeddings", 16
-            ),
+            text_max_position_embeddings=getattr(tc, "max_position_embeddings", 16),
             text_vocab_size=getattr(tc, "vocab_size", 49408),
         )
 
