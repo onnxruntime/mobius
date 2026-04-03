@@ -25,12 +25,17 @@ class TestSkipLayerNormRules:
         assert isinstance(rules, RewriteRuleSet)
 
     def test_fuses_add_layernorm(self):
-        """GPT-2 uses LayerNorm → expect Add+LN fusions."""
+        """GPT-2 uses LayerNorm → expect Add+LN fusions.
+
+        Note: the default EP optimization pipeline fuses 24 Add+LayerNorm pairs
+        during build(). The remaining 1 LayerNorm (final norm, single consumer)
+        and skip_layer_norm_rules() is a no-op on the already-fused graph.
+        """
         pkg = build("openai-community/gpt2", load_weights=False)
         model = pkg["model"]
         counts_before = count_ops(model)
-        assert counts_before["LayerNormalization"] == 25
-        assert counts_before["Add"] == 97
+        assert counts_before["LayerNormalization"] == 1
+        assert counts_before["Add"] == 73
 
         rewrite(model, pattern_rewrite_rules=skip_layer_norm_rules())
 

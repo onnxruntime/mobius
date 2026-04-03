@@ -25,11 +25,15 @@ class TestSkipNormRules:
         assert isinstance(rules, RewriteRuleSet)
 
     def test_fuses_add_rmsnorm(self):
+        """Note: the default EP optimization pipeline fuses 55 Add+RMSNorm pairs
+        during build(). The remaining 58 RMSNorms (QK norms + final norm)
+        cannot be fused, so skip_norm_rules() is a no-op on the already-fused graph.
+        """
         pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
         model = pkg["model"]
         counts_before = count_ops(model)
-        assert counts_before["RMSNormalization"] == 113
-        assert counts_before["Add"] == 56
+        assert counts_before["RMSNormalization"] == 58
+        assert counts_before["Add"] == 1
 
         rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 
