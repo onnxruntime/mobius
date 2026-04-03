@@ -355,7 +355,7 @@ def optimize_model(
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
-    from mobius._op_function_bodies import register_function_bodies
+    from mobius.functions._op_function_bodies import register_function_bodies
 
     register_function_bodies(model)
 

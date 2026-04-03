@@ -23,6 +23,10 @@ Naming convention:
 
 from __future__ import annotations
 
+from mobius.functions._op_function_bodies import (
+    get_function,
+    register_function_bodies,
+)
 from mobius.functions.causal_conv import (
     CausalConvWithState,
     causal_conv1d_with_state,
@@ -37,4 +41,6 @@ __all__ = [
     "causal_conv1d_with_state",
     "causal_conv_nd_with_state",
     "linear_attention",
+    "get_function",
+    "register_function_bodies",
 ]

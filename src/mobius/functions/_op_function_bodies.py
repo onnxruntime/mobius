@@ -202,8 +202,16 @@ def _build_simplified_layer_norm_function() -> ir.Function:
 # Lazy-built singletons keyed by (domain, name, overload).
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, object] = {
     ("com.microsoft", "SkipLayerNormalization", ""): _build_skip_layer_norm_function,
-    ("com.microsoft", "SkipSimplifiedLayerNormalization", ""): _build_skip_simplified_layer_norm_function,
-    ("com.microsoft", "SimplifiedLayerNormalization", ""): _build_simplified_layer_norm_function,
+    (
+        "com.microsoft",
+        "SkipSimplifiedLayerNormalization",
+        "",
+    ): _build_skip_simplified_layer_norm_function,
+    (
+        "com.microsoft",
+        "SimplifiedLayerNormalization",
+        "",
+    ): _build_simplified_layer_norm_function,
 }
 
 _cache: dict[ir.OperatorIdentifier, ir.Function] = {}
