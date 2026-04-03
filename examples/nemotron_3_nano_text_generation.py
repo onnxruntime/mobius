@@ -22,14 +22,14 @@ The model is instruction-tuned and uses a ChatML template with a
 
 Usage::
 
-    # Text-only generation (default model):
-    python examples/nemotron_3_nano_text_generation.py
+    # Interactive mode (no --prompt → prompts you for queries):
+    python examples/nemotron_3_nano_text_generation.py --device cuda
 
-    # Custom prompt:
+    # Single prompt:
     python examples/nemotron_3_nano_text_generation.py --prompt "What is 2+3?"
 
-    # Compare output with HuggingFace transformers:
-    python examples/nemotron_3_nano_text_generation.py --compare-hf
+    # Interactive mode with HF comparison (runs HF after all queries):
+    python examples/nemotron_3_nano_text_generation.py --device cuda --compare-hf
 
     # Run on GPU:
     python examples/nemotron_3_nano_text_generation.py --device cuda
@@ -505,7 +505,10 @@ def main():
     parser.add_argument(
         "--prompt",
         default=None,
-        help="Text prompt. If omitted, a built-in default prompt is used.",
+        help=(
+            "Text prompt. If omitted, enters interactive mode "
+            "(type queries, 'quit' or Ctrl-D to stop)."
+        ),
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -550,10 +553,8 @@ def main():
     args = parser.parse_args()
 
     use_chat = not args.no_chat
-    prompt = args.prompt or DEFAULT_PROMPT
 
     if args.load_from:
-        # Step 2: load pre-built ONNX model from disk
         import onnx_ir as ir
 
         from mobius._configs import NemotronHConfig
@@ -567,7 +568,6 @@ def main():
         config = NemotronHConfig.from_transformers(hf_config)
         session = OnnxModelSession(onnx_model, device=args.device)
     else:
-        # Step 1 (+ optional inference): build from HuggingFace
         build_flags = {}
         if args.device == "cuda":
             build_flags["ort_cuda_grouped_rmsnorm_workaround"] = True
@@ -589,46 +589,73 @@ def main():
         session = OnnxModelSession(pkg["model"], device=args.device)
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
 
-    print(f"\nPrompt: {prompt}")
-    if use_chat:
-        print("(chat template enabled)")
-    print("-" * 40)
+    # Collect prompts: either single --prompt or interactive loop
+    if args.prompt:
+        prompts = [args.prompt]
+    else:
+        prompts = []
+        print("\nInteractive mode — enter prompts (type 'quit' or Ctrl-D to stop).")
 
-    onnx_output = generate(
-        session,
-        tokenizer,
-        prompt,
-        config,
-        dtype=DTYPE_MAP[args.dtype],
-        max_new_tokens=args.max_new_tokens,
-        use_chat=use_chat,
-    )
-    print("-" * 40)
-
-    if args.compare_hf:
-        print("\n" + "=" * 60)
-        print("HuggingFace Transformers")
-        print("=" * 60)
-        hf_output = generate_hf(
-            args.model,
-            prompt,
-            tokenizer,
-            args.max_new_tokens,
-            device=args.device,
+    # Run ONNX generation for each prompt
+    results: list[tuple[str, str]] = []  # (prompt, onnx_output)
+    for prompt in prompts:
+        print(f"\nPrompt: {prompt}")
+        if use_chat:
+            print("(chat template enabled)")
+        print("-" * 40)
+        onnx_output = generate(
+            session, tokenizer, prompt, config,
+            dtype=DTYPE_MAP[args.dtype],
+            max_new_tokens=args.max_new_tokens,
             use_chat=use_chat,
         )
-        _, answer_onnx = parse_think_output(onnx_output)
-        _, answer_hf = parse_think_output(hf_output)
+        print("-" * 40)
+        results.append((prompt, onnx_output))
 
+    if not args.prompt:
+        # Interactive loop
+        while True:
+            try:
+                prompt = input("\n> ").strip()
+            except EOFError:
+                print()
+                break
+            if not prompt or prompt.lower() == "quit":
+                break
+            print(f"\nPrompt: {prompt}")
+            if use_chat:
+                print("(chat template enabled)")
+            print("-" * 40)
+            onnx_output = generate(
+                session, tokenizer, prompt, config,
+                dtype=DTYPE_MAP[args.dtype],
+                max_new_tokens=args.max_new_tokens,
+                use_chat=use_chat,
+            )
+            print("-" * 40)
+            results.append((prompt, onnx_output))
+
+    if args.compare_hf and results:
         print("\n" + "=" * 60)
-        print("Comparison")
+        print("HuggingFace Transformers Comparison")
         print("=" * 60)
-        if answer_onnx == answer_hf:
-            print("✓ Answers match exactly!")
-        else:
-            print("✗ Answers differ:")
-            print(f"  ONNX: {answer_onnx!r}")
-            print(f"  HF:   {answer_hf!r}")
+        for prompt, onnx_output in results:
+            hf_output = generate_hf(
+                args.model, prompt, tokenizer,
+                args.max_new_tokens,
+                device=args.device,
+                use_chat=use_chat,
+            )
+            _, answer_onnx = parse_think_output(onnx_output)
+            _, answer_hf = parse_think_output(hf_output)
+
+            print(f"\nPrompt: {prompt!r}")
+            if answer_onnx == answer_hf:
+                print("  ✓ Answers match exactly!")
+            else:
+                print("  ✗ Answers differ:")
+                print(f"    ONNX: {answer_onnx!r}")
+                print(f"    HF:   {answer_hf!r}")
 
 
 if __name__ == "__main__":
