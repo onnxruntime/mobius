@@ -54,6 +54,27 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     return default
 
+def _env_str(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """Read a string from an environment variable.
+
+    Returns *default* if the variable is unset or has an unrecognised value.
+    For backwards compatibility, ``"1"``/``"true"``/``"yes"`` map to the
+    first choice, and ``"0"``/``"false"``/``"no"`` map to the last choice.
+    """
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    # Direct match against choices
+    for c in choices:
+        if val == c.lower():
+            return c
+    # Boolean-style aliases: truthy → first choice, falsy → last choice
+    if val in ("1", "true", "yes"):
+        return choices[0]
+    if val in ("0", "false", "no"):
+        return choices[-1]
+    return default
+
 
 @dataclasses.dataclass
 class _Flags:
@@ -98,17 +119,26 @@ class _Flags:
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
     """
 
-    mamba_scan: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_MAMBA_SCAN", True)
+    mamba_scan: str = dataclasses.field(
+        default_factory=lambda: _env_str(
+            "MOBIUS_MAMBA_SCAN",
+            "chunked_ssd",
+            ("chunked_ssd", "scan", "single"),
+        )
     )
-    """Use chunked SSD multi-token Mamba2 forward pass.
+    """Multi-token Mamba2 forward strategy.
 
-    When True (default), Mamba2Block uses the chunked SSD algorithm
-    to process the full sequence in parallel within chunks, allowing
-    multi-token prefill.  When False, falls back to a single-token-only
-    forward pass (seq_len must be 1) using the per-token SSM recurrence.
-    Useful for debugging numerical issues.
-    Set ``MOBIUS_MAMBA_SCAN=0`` to disable.
+    - ``"chunked_ssd"`` (default): chunked SSD algorithm — processes
+      the full sequence in parallel within chunks, with cross-chunk
+      state propagation.  Matches HF ``torch_forward``.
+    - ``"scan"``: ONNX Scan op that iterates token-by-token.  Supports
+      arbitrary seq_len but is sequential.
+    - ``"single"``: single-token-only path (seq_len must be 1).
+      Useful for debugging numerical issues.
+
+    Set via ``MOBIUS_MAMBA_SCAN=chunked_ssd|scan|single``.
+    For backwards compatibility, ``1``/``true`` → ``chunked_ssd``,
+    ``0``/``false`` → ``single``.
     """
 
 
