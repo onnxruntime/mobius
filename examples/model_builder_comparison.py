@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import os
+import platform as _platform
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,19 @@ from pathlib import Path
 from typing import NamedTuple
 
 import onnx_ir as ir
+from onnx_ir.traversal import RecursiveGraphIterator
+
+DEFAULT_MODEL = "meta-llama/Llama-3.2-1B"
+
+STANDARD_SUITE = [
+    "meta-llama/Llama-3.2-1B",
+    "Qwen/Qwen2.5-1.5B",
+    "Qwen/Qwen3-0.6B",
+    "google/gemma-2-2b",
+    "google/gemma-3-1b-pt",
+    "mistralai/Mistral-7B-v0.3",
+    "microsoft/Phi-3-mini-4k-instruct",
+]
 
 # ---------------------------------------------------------------------------
 # Tracked ops and their descriptions
@@ -91,6 +105,10 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
         "SkipLayerNorm",
         "Add + LayerNorm fused. Absent for RMSNorm-only models.",
     ),
+    # NOTE: ORT GenAI uses the name "SimplifiedLayerNormalization" for unfused RMSNorm
+    # and "SkipSimplifiedLayerNormalization" for the fused Skip+RMSNorm.
+    # Mobius uses the standard ONNX opset-23 name "RMSNormalization".
+    # These represent the same mathematical operation.
     (
         "SkipSimplifiedLayerNormalization",
         "SkipSimplifiedLayerNorm",
@@ -105,9 +123,8 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "RMSNormalization",
         "RMSNorm (ONNX)",
-        "Standard ONNX opset-23 RMSNorm. "
-        "Mobius emits this for norms not covered by SkipSimplifiedLayerNorm fusion "
-        "(e.g. embedding norm, final pre-lm-head norm).",
+        "Standard ONNX opset-23 RMSNorm. ORT GenAI uses 'SimplifiedLayerNormalization' for the same op. "
+        "Mobius emits this for norms not covered by SkipSimplifiedLayerNorm fusion (embedding norm, final norm).",
     ),
     (
         "BiasGelu",
@@ -245,6 +262,20 @@ def _qk_norm_checks(report: ModelReport) -> list[str]:
             "QK norm must use separate Q/K/V projections."
         )
 
+    # For QK-norm models, expect 3 separate QKV MatMuls per attention layer.
+    # Total expected QKV MatMuls: 3 * num_layers
+    if mob_mm > 0 and mob_mm < 3 * est_layers:
+        issues.append(
+            f"Unexpectedly low MatMul count ({mob_mm}) for {est_layers} layers. "
+            "Expected at least 3 separate Q/K/V projections per layer."
+        )
+    # Check that ORT GenAI also has >= 3 * layers MatMuls (no packing)
+    if ort_mm > 0 and ort_mm < 3 * est_layers:
+        issues.append(
+            f"ORT GenAI MatMul count ({ort_mm}) suggests packed QKV for {est_layers} layers. "
+            "QK-norm models should use separate Q/K/V MatMuls (use_packed_matmul=False)."
+        )
+
     return issues
 
 
@@ -265,12 +296,13 @@ class ModelReport:
     model_id: str
     ep: str
     columns: list[OpCounts]
-    verdict: str = ""  # "PASS" | "PARTIAL" | "FAIL" | "MOBIUS-ONLY"
+    verdict: str = ""  # "PASS" | "KNOWN_DIFF" | "FAIL" | "MOBIUS-ONLY"
     verdict_reason: str = ""
     differences: list[str] = field(default_factory=list)
     qk_norm_issues: list[str] = field(
         default_factory=list
     )  # Non-empty → QK-norm invariant violated
+    expected_counts: dict[str, int] | None = None
 
 
 @dataclass
@@ -279,6 +311,8 @@ class ComparisonReport:
     mobius_version: str
     ort_genai_version: str
     python_version: str
+    git_sha: str = ""  # mobius git SHA (short)
+    platform_info: str = ""  # platform.platform(terse=True)
     models: list[ModelReport] = field(default_factory=list)
 
     @property
@@ -286,8 +320,8 @@ class ComparisonReport:
         return sum(1 for m in self.models if m.verdict == "PASS")
 
     @property
-    def partial_count(self) -> int:
-        return sum(1 for m in self.models if m.verdict == "PARTIAL")
+    def known_diff_count(self) -> int:
+        return sum(1 for m in self.models if m.verdict == "KNOWN_DIFF")
 
     @property
     def fail_count(self) -> int:
@@ -301,8 +335,11 @@ class ComparisonReport:
 
 def _count_ops(model: ir.Model) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for node in model.graph:
-        counts[node.op_type] = counts.get(node.op_type, 0) + 1
+    for node in RecursiveGraphIterator(model.graph):
+        op = node.op_type
+        if op not in counts:
+            counts[op] = 0
+        counts[op] += 1
     return counts
 
 
@@ -427,10 +464,12 @@ def _compute_verdict(
             + ")."
         )
     elif differences:
-        verdict = "PARTIAL"
+        verdict = "KNOWN_DIFF"
         reason = (
-            "Key fused ops (GQA/Attention) match. Differences in norm fusion "
-            "strategy, MatMul packing, and Cast/Shape count are expected between builders."
+            "Key fused ops (GQA/Attention) match. Known differences: "
+            "RMSNormalization vs SimplifiedLayerNormalization (same math, different name), "
+            "RotaryEmbedding absent when fused into GQA (do_rotary=1), "
+            "MatMul count differs for packed-QKV models."
         )
     else:
         verdict = "PASS"
@@ -443,10 +482,10 @@ def _compute_verdict(
 # Console rendering
 # ---------------------------------------------------------------------------
 
-_VERDICT_ICON = {"PASS": "✅", "PARTIAL": "🟡", "FAIL": "❌", "MOBIUS-ONLY": "\u2139\ufe0f"}
+_VERDICT_ICON = {"PASS": "✅", "KNOWN_DIFF": "🟡", "FAIL": "❌", "MOBIUS-ONLY": "\u2139\ufe0f"}
 _VERDICT_COLOR = {
     "PASS": "\033[92m",  # green
-    "PARTIAL": "\033[93m",  # yellow
+    "KNOWN_DIFF": "\033[93m",  # yellow
     "FAIL": "\033[91m",  # red
     "MOBIUS-ONLY": "\033[94m",  # blue
 }
@@ -493,8 +532,9 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
         "  ONNX MODEL BUILDER PARITY REPORT",
         "═" * 72,
         f"  Generated:     {report.generated_at}",
+        f"  Platform:      {report.platform_info}",
         f"  Python:        {report.python_version}",
-        f"  mobius:        {report.mobius_version}",
+        f"  mobius:        {report.mobius_version}  ({report.git_sha})",
         f"  ORT GenAI:     {report.ort_genai_version}",
         f"  Models:        {len(report.models)}",
         "═" * 72,
@@ -513,6 +553,19 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
         for line in _console_table(mr, use_color).splitlines():
             lines.append("│  " + line)
         lines.append("│")
+        if mr.expected_counts:
+            lines.append("│  Expected counts (from HF config):")
+            for op, expected_n in mr.expected_counts.items():
+                lbl = OP_LABEL.get(op, op)
+                # Sum actual across all columns (use first mobius column if available)
+                mob_cols_ec = [c for c in mr.columns if c.source == "mobius"]
+                actual_col = (
+                    mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
+                )
+                actual_n = actual_col.counts.get(op, 0) if actual_col else 0
+                ok = "✓" if actual_n == expected_n else "✗"
+                lines.append(f"│    {ok} {lbl}: Expected={expected_n}  Actual={actual_n}")
+            lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
             for diff in mr.differences:
@@ -548,13 +601,13 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
     ]
     if any(m.verdict != "MOBIUS-ONLY" for m in report.models):
         vc_p = _VERDICT_COLOR["PASS"] if use_color else ""
-        vc_pa = _VERDICT_COLOR["PARTIAL"] if use_color else ""
+        vc_kd = _VERDICT_COLOR["KNOWN_DIFF"] if use_color else ""
         vc_f = _VERDICT_COLOR["FAIL"] if use_color else ""
         rc = _RESET if use_color else ""
         lines += [
-            f"  {vc_p}✅ PASS{rc}:    {report.pass_count}/{total}",
-            f"  {vc_pa}🟡 PARTIAL{rc}: {report.partial_count}/{total}",
-            f"  {vc_f}❌ FAIL{rc}:    {report.fail_count}/{total}",
+            f"  {vc_p}✅ PASS{rc}:       {report.pass_count}/{total}",
+            f"  {vc_kd}🟡 KNOWN_DIFF{rc}: {report.known_diff_count}/{total}",
+            f"  {vc_f}❌ FAIL{rc}:       {report.fail_count}/{total}",
         ]
     else:
         lines.append(f"  {total} mobius-only comparison(s) — no cross-builder parity check.")
@@ -569,14 +622,30 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
 
 def render_markdown(report: ComparisonReport) -> str:
     lines: list[str] = []
+    pass_count = report.pass_count
+    known_diff_count = report.known_diff_count
+    fail_count = report.fail_count
     lines += [
+        "---",
+        'title: "ONNX Model Builder Parity Report"',
+        f'date: "{report.generated_at}"',
+        f'mobius: "{report.mobius_version} ({report.git_sha})"',
+        f'ort_genai: "{report.ort_genai_version}"',
+        f'platform: "{report.platform_info}"',
+        f"models_compared: {len(report.models)}",
+        f"verdict_pass: {pass_count}",
+        f"verdict_known_diff: {known_diff_count}",
+        f"verdict_fail: {fail_count}",
+        "---",
+        "",
         "# ONNX Model Builder Parity Report",
         "",
         "| Attribute | Value |",
         "|-----------|-------|",
         f"| Generated | {report.generated_at} |",
+        f"| Platform | {report.platform_info} |",
         f"| Python | {report.python_version} |",
-        f"| mobius | `{report.mobius_version}` |",
+        f"| mobius | `{report.mobius_version}` ({report.git_sha}) |",
         f"| ORT GenAI | `{report.ort_genai_version}` |",
         f"| Models compared | {len(report.models)} |",
         "",
@@ -622,6 +691,23 @@ def render_markdown(report: ComparisonReport) -> str:
                 lines.append(f"- {diff}")
             lines += [""]
 
+        if mr.expected_counts:
+            lines += ["### Expected Counts (from HF config)", ""]
+            lines += [
+                "| Op | Expected | Actual | Status |",
+                "|-----|----------|--------|--------|",
+            ]
+            mob_cols_ec = [c for c in mr.columns if c.source == "mobius"]
+            actual_col_ec = (
+                mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
+            )
+            for op, expected_n in mr.expected_counts.items():
+                lbl = OP_LABEL.get(op, op)
+                actual_n = actual_col_ec.counts.get(op, 0) if actual_col_ec else 0
+                ok = "✓" if actual_n == expected_n else "✗"
+                lines.append(f"| `{lbl}` | {expected_n} | {actual_n} | {ok} |")
+            lines += [""]
+
         # QK-norm invariant section
         if _is_qk_norm_model(mr.model_id):
             lines += ["### QK-Norm Invariant Check", ""]
@@ -652,7 +738,7 @@ def render_markdown(report: ComparisonReport) -> str:
         "| Verdict | Count |",
         "|---------|-------|",
         f"| ✅ PASS | {report.pass_count} |",
-        f"| 🟡 PARTIAL | {report.partial_count} |",
+        f"| 🟡 KNOWN_DIFF | {report.known_diff_count} |",
         f"| ❌ FAIL | {report.fail_count} |",
         f"| \u2139\ufe0f MOBIUS-ONLY | {sum(1 for m in report.models if m.verdict == 'MOBIUS-ONLY')} |",
         "",
@@ -677,6 +763,25 @@ def render_markdown(report: ComparisonReport) -> str:
 # ---------------------------------------------------------------------------
 # Version detection
 # ---------------------------------------------------------------------------
+
+
+def _expected_counts(model_id: str) -> dict[str, int] | None:
+    """Load HuggingFace config and compute expected op counts for validation."""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+        text_cfg = getattr(cfg, "text_config", cfg)
+        num_layers = getattr(text_cfg, "num_hidden_layers", None)
+        if num_layers is None:
+            return None
+        return {
+            "GroupQueryAttention": num_layers,
+            "SkipSimplifiedLayerNormalization": num_layers * 2,
+            "SkipLayerNormalization": num_layers * 2,
+        }
+    except Exception:
+        return None
 
 
 def _mobius_version() -> str:
@@ -709,6 +814,20 @@ def _ort_genai_version(repo: str | None) -> str:
         return "not installed"
 
 
+def _mobius_git_sha() -> str:
+    try:
+        import importlib.resources
+
+        mobius_src = Path(importlib.resources.files("mobius").__str__()).parent
+        return subprocess.check_output(
+            ["git", "-C", str(mobius_src), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -725,11 +844,22 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
+        "--models",
+        dest="models_csv",
+        metavar="MODEL_ID[,MODEL_ID,...]",
+        help="Comma-separated HuggingFace model IDs to compare.",
+    )
+    parser.add_argument(
         "--model",
         action="append",
-        dest="models",
+        dest="model_list",
         metavar="MODEL_ID",
-        help="HuggingFace model ID to compare. Repeat for multiple models.",
+        help="HuggingFace model ID (repeat for multiple). Kept for backward compat.",
+    )
+    parser.add_argument(
+        "--suite",
+        action="store_true",
+        help="Run the standard suite of models (STANDARD_SUITE).",
     )
     parser.add_argument(
         "--ep",
@@ -758,10 +888,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--ort-genai-repo",
-        default="/home/justinchu/dev/onnxruntime-genai",
+        default=os.environ.get("ORT_GENAI_REPO"),
         metavar="REPO_PATH",
-        help="Path to onnxruntime-genai checkout for in-process building "
-        "(default: %(default)s).",
+        help="Path to onnxruntime-genai checkout for in-process building. "
+        "Defaults to $ORT_GENAI_REPO env var.",
     )
     parser.add_argument(
         "--ort-precision",
@@ -775,10 +905,30 @@ def main() -> None:
         help="Download and apply weights when building with mobius (slower).",
     )
     parser.add_argument(
-        "--save-report",
+        "--format",
+        choices=["console", "markdown"],
+        default="console",
+        help="Output format (default: console).",
+    )
+    parser.add_argument(
+        "--output",
+        dest="output_file",
         default=None,
         metavar="FILE",
-        help="Save Markdown report to FILE (e.g. report.md).",
+        help="Save output to file.",
+    )
+    parser.add_argument(
+        "--save-report",
+        dest="output_file",
+        default=None,
+        metavar="FILE",
+        help="[Deprecated] Alias for --output.",
+    )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress per-model build progress output.",
     )
     parser.add_argument(
         "--no-color",
@@ -787,8 +937,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.models:
-        args.models = ["meta-llama/Llama-3.2-1B"]
+    if args.suite:
+        models = STANDARD_SUITE
+    elif args.models_csv:
+        models = [m.strip() for m in args.models_csv.split(",")]
+    elif args.model_list:
+        models = args.model_list
+    else:
+        models = [DEFAULT_MODEL]
 
     eps: list[str] = args.ep_list.split(",") if args.ep_list else [args.ep]
     no_ort = args.no_ort or bool(args.ep_list)
@@ -798,20 +954,25 @@ def main() -> None:
         mobius_version=_mobius_version(),
         ort_genai_version=_ort_genai_version(args.ort_genai_repo if not no_ort else None),
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        git_sha=_mobius_git_sha(),
+        platform_info=_platform.platform(terse=True),
     )
 
-    for i, model_id in enumerate(args.models):
+    for i, model_id in enumerate(models):
         if args.ep_list:
             # Multi-EP mode: one ModelReport per model, one column per EP.
-            print(f"\n→ {model_id}  (multi-EP: {', '.join(eps)})", flush=True)
+            if not args.quiet:
+                print(f"\n→ {model_id}  (multi-EP: {', '.join(eps)})", flush=True)
             columns: list[OpCounts] = []
             for ep_target in eps:
-                print(f"  Building with mobius/{ep_target} ...", end="", flush=True)
+                if not args.quiet:
+                    print(f"  Building with mobius/{ep_target} ...", end="", flush=True)
                 try:
                     columns.append(
                         build_mobius(model_id, ep=ep_target, load_weights=args.load_weights)
                     )
-                    print(" done.")
+                    if not args.quiet:
+                        print(" done.")
                 except Exception as e:
                     print(f"\n  ERROR: {e}")
                     import traceback
@@ -831,12 +992,14 @@ def main() -> None:
                             "by design — each EP applies different fusions and lowerings."
                         ),
                         differences=_ep_differences(columns),
+                        expected_counts=_expected_counts(model_id),
                     )
                 )
         else:
             # Cross-builder mode: one ModelReport per (model, ep).
             for ep in eps:
-                print(f"\n→ {model_id}  EP: {ep}", flush=True)
+                if not args.quiet:
+                    print(f"\n→ {model_id}  EP: {ep}", flush=True)
                 columns_: list[OpCounts] = []
 
                 # --- ORT GenAI column ---
@@ -862,12 +1025,13 @@ def main() -> None:
                                 columns_.append(_op_counts_from_file(p))
                             except Exception as e:
                                 print(f"  WARNING: {e}")
-                    elif os.path.isdir(args.ort_genai_repo):
-                        print(
-                            f"  Building with ORT GenAI ({args.ort_precision}/{ep}) ...",
-                            end="",
-                            flush=True,
-                        )
+                    elif args.ort_genai_repo and os.path.isdir(args.ort_genai_repo):
+                        if not args.quiet:
+                            print(
+                                f"  Building with ORT GenAI ({args.ort_precision}/{ep}) ...",
+                                end="",
+                                flush=True,
+                            )
                         try:
                             columns_.append(
                                 build_ort_genai(
@@ -877,23 +1041,28 @@ def main() -> None:
                                     ort_genai_repo=args.ort_genai_repo,
                                 )
                             )
-                            print(" done.")
+                            if not args.quiet:
+                                print(" done.")
                         except Exception as e:
                             print(f"\n  WARNING: ORT GenAI build failed: {e}")
                             print("  Use --ort-model or --no-ort to proceed without it.")
                     else:
+                        repo_note = args.ort_genai_repo or "(not set)"
                         print(
-                            f"  NOTE: ORT GenAI repo not at {args.ort_genai_repo}. "
-                            "Use --ort-genai-repo to specify. Skipping ORT GenAI column."
+                            f"  NOTE: ORT GenAI repo not found ({repo_note}). "
+                            "Use --ort-genai-repo or set $ORT_GENAI_REPO. "
+                            "Skipping ORT GenAI column."
                         )
 
                 # --- mobius column ---
-                print(f"  Building with mobius/{ep} ...", end="", flush=True)
+                if not args.quiet:
+                    print(f"  Building with mobius/{ep} ...", end="", flush=True)
                 try:
                     columns_.append(
                         build_mobius(model_id, ep=ep, load_weights=args.load_weights)
                     )
-                    print(" done.")
+                    if not args.quiet:
+                        print(" done.")
                 except Exception as e:
                     print(f"\n  ERROR: {e}")
                     import traceback
@@ -915,6 +1084,7 @@ def main() -> None:
                         verdict_reason=reason,
                         differences=diffs,
                         qk_norm_issues=qk_issues,
+                        expected_counts=_expected_counts(model_id),
                     )
                 )
 
@@ -922,17 +1092,26 @@ def main() -> None:
         print("No models built successfully.")
         sys.exit(1)
 
-    # Console output
-    print(render_console(report, color=not args.no_color))
+    output_format = getattr(args, "format", "console")
+    output_file = getattr(args, "output_file", None)
 
-    # Markdown output
-    md = render_markdown(report)
-    save_path = args.save_report
-    if save_path is None:
-        save_path = f"parity_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.md"
-    with open(save_path, "w") as f:
-        f.write(md)
-    print(f"  Markdown report saved to: {save_path}\n")
+    if output_format == "markdown":
+        md = render_markdown(report)
+        if output_file:
+            with open(output_file, "w") as f:
+                f.write(md)
+            print(f"  Markdown report saved to: {output_file}\n")
+        else:
+            print(md)
+    else:
+        # Console output (default)
+        print(render_console(report, color=not args.no_color))
+        # Also save markdown if --output specified
+        if output_file:
+            md = render_markdown(report)
+            with open(output_file, "w") as f:
+                f.write(md)
+            print(f"  Markdown report saved to: {output_file}\n")
 
 
 if __name__ == "__main__":
