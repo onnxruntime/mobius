@@ -133,12 +133,12 @@ jobs:
           python-version: "3.12"
 
       - name: Download baseline
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: benchmark-baseline
 
       - name: Download current
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: benchmark-current
 
