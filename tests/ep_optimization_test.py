@@ -19,7 +19,8 @@ import onnx_ir as ir
 import pytest
 from _test_configs import _base_config
 
-from mobius._builder import _count_ops, build_from_module
+from mobius._builder import build_from_module
+from mobius._optimizations import _count_ops
 from mobius._optimizations import optimize_model as _optimize
 from mobius._registry import registry
 

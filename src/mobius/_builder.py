@@ -22,13 +22,6 @@ __all__ = [
     "build",
     "build_from_module",
     "resolve_dtype",
-    # Backward-compat re-exports (originally defined here; now in sub-modules)
-    "EpCapabilities",
-    "_EP_REGISTRY",
-    "CleanupMetadataPass",
-    "SymbolicShapeInferencePass",
-    "_count_all_ops",
-    "_count_ops",
 ]
 
 import dataclasses
@@ -42,35 +35,14 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
 )
-from mobius._execution_providers import (
-    EpCapabilities,
-    ep_registry,
-)
+from mobius._execution_providers import ep_registry
 from mobius._model_package import ModelPackage
-from mobius._optimizations import (
-    CleanupMetadataPass,
-    SymbolicShapeInferencePass,
-    _count_all_ops,
-    _count_ops,
-)
-from mobius._optimizations import (
-    optimize_model as _optimize,
-)
+from mobius._optimizations import optimize_model as _optimize
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Backward-compatibility re-exports
-# ---------------------------------------------------------------------------
-# These names were previously defined here and may be imported by tests or
-# third-party code. They now live in the dedicated sub-modules above.
-
-# _EP_REGISTRY is kept as a shim backed by ep_registry so that existing code
-# using ``_EP_REGISTRY.get(ep)`` / ``frozenset(_EP_REGISTRY)`` continues to work.
-_EP_REGISTRY = ep_registry
 
 
 # ---------------------------------------------------------------------------

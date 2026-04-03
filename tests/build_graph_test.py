@@ -46,7 +46,6 @@ from onnx_ir.passes.common import CheckerPass
 
 from mobius._builder import (
     DTYPE_MAP,
-    SymbolicShapeInferencePass,
     build_from_module,
 )
 from mobius._config_resolver import _default_task_for_model
@@ -58,6 +57,7 @@ from mobius._configs import (
     TTSConfig,
     VisionConfig,
 )
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._registry import registry
 from mobius.tasks import (
     CausalLMTask,
