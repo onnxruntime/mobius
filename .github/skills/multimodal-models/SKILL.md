@@ -29,9 +29,11 @@ input_ids ──────► Embedding ────────────�
 | Component | File | Purpose |
 |-----------|------|---------|
 | `VisionModel` | `components/_vision.py` | SigLIP-style patch embedding + transformer encoder |
+| `PixtralVisionTower` | `components/_pixtral_vision.py` | Pixtral 2D RoPE vision encoder (bidirectional attention) |
 | `PatchEmbedding` | `components/_vision.py` | Conv2d → positional embedding |
 | `Gemma3MultiModalProjector` | `components/_multimodal.py` | AvgPool2d → RMSNorm → MatMul |
 | `MLPMultiModalProjector` | `components/_multimodal.py` | Linear → GELU → Linear |
+| `Mistral3MultiModalProjector` | `components/_pixtral_vision.py` | RMSNorm → spatial merge → Linear → GELU → Linear |
 | `LinearMultiModalProjector` | `components/_multimodal.py` | Single Linear |
 | `InputMixer` | `components/_multimodal.py` | Scatter vision embeddings at image-token positions |
 | `VisionLanguageTask` | `tasks/__init__.py` | ONNX I/O contract with `pixel_values` input |
@@ -44,7 +46,8 @@ embedding spaces.  Choose the one that matches the HuggingFace implementation:
 | Projector | Architecture | Models |
 |-----------|-------------|--------|
 | `Gemma3MultiModalProjector` | AvgPool2d → RMSNorm → MatMul | Gemma3 |
-| `MLPMultiModalProjector` | Linear → GELU → Linear | LLaVA, LLaVA-NeXT, VipLLaVA, Phi-4-MM, InternVL2, Pixtral, Molmo |
+| `MLPMultiModalProjector` | Linear → GELU → Linear | LLaVA, LLaVA-NeXT, VipLLaVA, Phi-4-MM, InternVL2, Molmo |
+| `Mistral3MultiModalProjector` | RMSNorm → spatial merge → Linear → GELU → Linear | Mistral-3, Pixtral |
 | `LinearMultiModalProjector` | Single Linear | PaliGemma, Qwen2-Audio, Idefics2, Florence2 |
 
 ### Gemma3MultiModalProjector

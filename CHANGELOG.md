@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Mistral-3 / Pixtral VLM Support
+
+#### Added
+
+- Support for Mistral-3 / Pixtral vision-language models (`mistral3` model type)
+  - Pixtral vision encoder with 2D RoPE, bidirectional attention, and spatial patch merging
+  - `Mistral3MultiModalProjector` for vision-to-text projection (RMSNorm → merge → MLP)
+  - `PixtralVisionTower` with precomputed 2D rotary caches
+  - Moved `mistral3` from CausalLM to VLM (LLaVA-style 3-model split: decoder, vision, embedding)
+  - FP8 quantization config handling (skip block quantization for fp8)
+  - Integration tests for `ministral3` (text-only) and `mistral3` (VLM)
+  - Config extraction for `PixtralVisionConfig.norm_eps` and `rope_parameters` fallback
+
 ### Static Cache Support
 
 #### Added
