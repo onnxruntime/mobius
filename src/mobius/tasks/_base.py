@@ -161,16 +161,6 @@ class ModelTask(ABC):
     sequence classification). Each task defines its own graph I/O contract.
     """
 
-    def _create_dims(
-        self,
-        *,
-        batch_size: int = 1,
-        max_seq_len: int = 512,
-    ) -> tuple[ir.SymbolicDim, ir.SymbolicDim]:
-        """Return ``(batch, seq_len)`` symbolic dimensions for graph input shapes."""
-        del batch_size, max_seq_len  # reserved for future subclass overrides
-        return ir.SymbolicDim("batch"), ir.SymbolicDim("sequence_len")
-
     @abstractmethod
     def build(
         self,
