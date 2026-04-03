@@ -2,7 +2,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare ONNX model graph structure between ORT GenAI's model builder and mobius.
+r"""Compare ONNX model graph structure between ORT GenAI's model builder and mobius.
 
 Produces a presentation-quality report showing op-count parity, PASS/FAIL/PARTIAL
 verdicts, and plain-English explanations for any observed differences.  Outputs both
@@ -557,14 +557,24 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
             lines.append("│  Expected counts (from HF config):")
             for op, expected_n in mr.expected_counts.items():
                 lbl = OP_LABEL.get(op, op)
-                # Sum actual across all columns (use first mobius column if available)
                 mob_cols_ec = [c for c in mr.columns if c.source == "mobius"]
                 actual_col = (
                     mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
                 )
                 actual_n = actual_col.counts.get(op, 0) if actual_col else 0
-                ok = "✓" if actual_n == expected_n else "✗"
-                lines.append(f"│    {ok} {lbl}: Expected={expected_n}  Actual={actual_n}")
+                # Allow ±1 for norm ops: mobius keeps final/embedding norm as
+                # ONNX RMSNormalization rather than fusing into SkipSimplifiedLayerNorm.
+                norm_ops = {"SkipSimplifiedLayerNormalization", "SkipLayerNormalization"}
+                tolerance = 1 if op in norm_ops else 0
+                ok = "✓" if abs(actual_n - expected_n) <= tolerance else "✗"
+                note = (
+                    " (±1 ok: final norm kept as ONNX RMSNorm)"
+                    if ok == "✓" and actual_n != expected_n
+                    else ""
+                )
+                lines.append(
+                    f"│    {ok} {lbl}: Expected={expected_n}  Actual={actual_n}{note}"
+                )
             lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
@@ -701,11 +711,18 @@ def render_markdown(report: ComparisonReport) -> str:
             actual_col_ec = (
                 mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
             )
+            norm_ops = {"SkipSimplifiedLayerNormalization", "SkipLayerNormalization"}
             for op, expected_n in mr.expected_counts.items():
                 lbl = OP_LABEL.get(op, op)
                 actual_n = actual_col_ec.counts.get(op, 0) if actual_col_ec else 0
-                ok = "✓" if actual_n == expected_n else "✗"
-                lines.append(f"| `{lbl}` | {expected_n} | {actual_n} | {ok} |")
+                tolerance = 1 if op in norm_ops else 0
+                ok = "✓" if abs(actual_n - expected_n) <= tolerance else "✗"
+                note = (
+                    " *(±1: final norm as ONNX RMSNorm)*"
+                    if ok == "✓" and actual_n != expected_n
+                    else ""
+                )
+                lines.append(f"| `{lbl}` | {expected_n} | {actual_n} | {ok}{note} |")
             lines += [""]
 
         # QK-norm invariant section
@@ -766,7 +783,12 @@ def render_markdown(report: ComparisonReport) -> str:
 
 
 def _expected_counts(model_id: str) -> dict[str, int] | None:
-    """Load HuggingFace config and compute expected op counts for validation."""
+    """Load HuggingFace config and compute expected op counts for validation.
+
+    Returns a dict of {op_type: expected_count}. Only includes the norm op
+    type that the model actually uses (RMSNorm models → SkipSimplifiedLayerNorm,
+    LayerNorm models → SkipLayerNorm).
+    """
     try:
         from transformers import AutoConfig
 
@@ -775,13 +797,27 @@ def _expected_counts(model_id: str) -> dict[str, int] | None:
         num_layers = getattr(text_cfg, "num_hidden_layers", None)
         if num_layers is None:
             return None
-        return {
-            "GroupQueryAttention": num_layers,
-            "SkipSimplifiedLayerNormalization": num_layers * 2,
-            "SkipLayerNormalization": num_layers * 2,
-        }
+
+        expected: dict[str, int] = {"GroupQueryAttention": num_layers}
+
+        # Detect norm type from config: models with rms_norm_eps use
+        # SkipSimplifiedLayerNorm; models with layer_norm_eps use SkipLayerNorm.
+        rms = getattr(text_cfg, "rms_norm_eps", None)
+        layer_norm = getattr(text_cfg, "layer_norm_eps", None)
+        norm_type = getattr(text_cfg, "norm_type", "")
+
+        if rms is not None or "rms" in norm_type.lower():
+            # RMSNorm model (Llama, Qwen, Gemma, Mistral, etc.)
+            # 2 skip norms per layer; final + embedding norms are ONNX RMSNormalization
+            expected["SkipSimplifiedLayerNormalization"] = num_layers * 2
+        elif layer_norm is not None:
+            # LayerNorm model (BERT, GPT-2, Falcon, etc.)
+            expected["SkipLayerNormalization"] = num_layers * 2
     except Exception:
         return None
+    else:
+        return expected
+    return None
 
 
 def _mobius_version() -> str:

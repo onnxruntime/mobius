@@ -76,7 +76,7 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
                 "expected at least 2 (LayerNorm + downstream residual)"
             )
 
-        # Verify LayerNormalization has epsilon attribute
+        # Verify LayerNormalization has epsilon attribute and correct axis
         ln = norm_out.producer()
         if ln.attributes.get_float("epsilon", None) is None:
             return result.fail("Missing epsilon attribute on LayerNormalization")
