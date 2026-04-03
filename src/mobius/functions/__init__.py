@@ -28,17 +28,13 @@ from collections.abc import Callable
 import onnx_ir as ir
 
 from mobius.functions.causal_conv import (
-    CausalConvWithState,
     causal_conv1d_with_state,
     causal_conv_nd_with_state,
 )
 from mobius.functions.linear_attention import (
-    LinearAttention,
     linear_attention,
 )
 from mobius.functions.skip_layer_normalization import (
-    SkipLayerNormalization,
-    SkipSimplifiedLayerNormalization,
     skip_layer_normalization,
     skip_simplified_layer_normalization,
 )
@@ -89,10 +85,6 @@ def register_function_bodies(model: ir.Model) -> None:
 
 
 __all__ = [
-    "CausalConvWithState",
-    "LinearAttention",
-    "SkipLayerNormalization",
-    "SkipSimplifiedLayerNormalization",
     "causal_conv1d_with_state",
     "causal_conv_nd_with_state",
     "get_function",

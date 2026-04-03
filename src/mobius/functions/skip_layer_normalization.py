@@ -100,10 +100,6 @@ def skip_layer_normalization() -> ir.Function:
     )
 
 
-# PascalCase alias — matches the ONNX op type name for discoverability.
-SkipLayerNormalization = skip_layer_normalization
-
-
 def skip_simplified_layer_normalization() -> ir.Function:
     """Build an ``ir.Function`` for ``SkipSimplifiedLayerNormalization``.
 
@@ -160,7 +156,3 @@ def skip_simplified_layer_normalization() -> ir.Function:
             "epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
         },
     )
-
-
-# PascalCase alias — matches the ONNX op type name for discoverability.
-SkipSimplifiedLayerNormalization = skip_simplified_layer_normalization

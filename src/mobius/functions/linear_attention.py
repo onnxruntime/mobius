@@ -266,10 +266,6 @@ def linear_attention(
     )
 
 
-# PascalCase alias — matches the ONNX op type name for discoverability.
-LinearAttention = linear_attention
-
-
 def _build_recurrence_body(
     uses_decay: bool,
     uses_beta: bool,
