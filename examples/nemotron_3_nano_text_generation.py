@@ -64,6 +64,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 DEFAULT_PROMPT = "What is the capital of France?"
 MAX_NEW_TOKENS = 300
+REPETITION_PENALTY = 1.2
 
 DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 
@@ -349,6 +350,28 @@ def display_output(tokenizer, generated_ids: list[int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _apply_repetition_penalty(
+    logits: np.ndarray,
+    token_ids: list[int],
+    penalty: float,
+) -> np.ndarray:
+    """Apply repetition penalty to logits for previously generated tokens.
+
+    For each token in ``token_ids``, the corresponding logit is divided
+    by ``penalty`` if positive, or multiplied by ``penalty`` if negative.
+    This matches the HuggingFace ``RepetitionPenaltyLogitsProcessor``.
+    """
+    if penalty == 1.0 or not token_ids:
+        return logits
+    logits = logits.copy()
+    for tid in set(token_ids):
+        if logits[tid] > 0:
+            logits[tid] /= penalty
+        else:
+            logits[tid] *= penalty
+    return logits
+
+
 def generate(
     session: OnnxModelSession,
     tokenizer,
@@ -357,6 +380,7 @@ def generate(
     *,
     dtype: np.dtype = np.float32,
     max_new_tokens: int = MAX_NEW_TOKENS,
+    repetition_penalty: float = REPETITION_PENALTY,
     use_chat: bool = True,
 ) -> str:
     """Greedy autoregressive generation with the hybrid architecture.
@@ -376,6 +400,8 @@ def generate(
     states = init_hybrid_states(config, dtype=dtype)
     past_seq_len = 0
     generated_ids: list[int] = []
+    # Track all token IDs (prompt + generated) for repetition penalty
+    all_token_ids: list[int] = list(input_ids)
 
     t0 = time.time()
 
@@ -399,12 +425,16 @@ def generate(
     print(f"  Prefill: {prompt_len} tokens in {prefill_time:.2f}s")
 
     # Generate new tokens, streaming each to stdout
-    logits = outputs["logits"]
-    next_token_id = int(np.argmax(logits[:, -1, :]))
+    raw_logits = outputs["logits"][0, -1, :]
+    penalized = _apply_repetition_penalty(
+        raw_logits, all_token_ids, repetition_penalty
+    )
+    next_token_id = int(np.argmax(penalized))
     t0 = time.time()
 
     for _ in range(max_new_tokens):
         generated_ids.append(next_token_id)
+        all_token_ids.append(next_token_id)
 
         # Stream: decode and print the new token immediately
         token_str = tokenizer.decode(
@@ -432,8 +462,11 @@ def generate(
         states = update_states(states, outputs, config)
         past_seq_len = total_seq_len
 
-        logits = outputs["logits"]
-        next_token_id = int(np.argmax(logits[:, -1, :]))
+        raw_logits = outputs["logits"][0, -1, :]
+        penalized = _apply_repetition_penalty(
+            raw_logits, all_token_ids, repetition_penalty
+        )
+        next_token_id = int(np.argmax(penalized))
 
     # End the streamed output line
     print()
@@ -458,6 +491,7 @@ def generate_hf(
     max_new_tokens: int,
     device: str = "cpu",
     use_chat: bool = True,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> str:
     """Run text-only generation with HuggingFace transformers."""
     import torch
@@ -487,6 +521,7 @@ def generate_hf(
             ids_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            repetition_penalty=repetition_penalty,
             eos_token_id=tokenizer.eos_token_id,
         )
     elapsed = time.time() - t0
@@ -563,6 +598,12 @@ def main():
         action="store_true",
         help="Disable chat template (send raw text).",
     )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=REPETITION_PENALTY,
+        help="Repetition penalty (1.0 = none, default: %(default)s).",
+    )
     args = parser.parse_args()
 
     use_chat = not args.no_chat
@@ -620,6 +661,7 @@ def main():
             session, tokenizer, prompt, config,
             dtype=DTYPE_MAP[args.dtype],
             max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
             use_chat=use_chat,
         )
         print("-" * 40)
@@ -643,6 +685,7 @@ def main():
                 session, tokenizer, prompt, config,
                 dtype=DTYPE_MAP[args.dtype],
                 max_new_tokens=args.max_new_tokens,
+                repetition_penalty=args.repetition_penalty,
                 use_chat=use_chat,
             )
             print("-" * 40)
@@ -658,6 +701,7 @@ def main():
                 args.max_new_tokens,
                 device=args.device,
                 use_chat=use_chat,
+                repetition_penalty=args.repetition_penalty,
             )
             _, answer_onnx = parse_think_output(onnx_output)
             _, answer_hf = parse_think_output(hf_output)
