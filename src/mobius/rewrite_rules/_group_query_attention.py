@@ -206,7 +206,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
             "do_rotary": 1,
             "rotary_interleaved": rotary_interleaved,
         }
-        if softcap != 0.0:
+        if softcap:
             gqa_attrs["softcap"] = softcap
         outputs = op.op_multi_out(
             "GroupQueryAttention",
