@@ -18,9 +18,19 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from transformers.models.mamba2.modeling_mamba2 import (  # requires transformers>=5.3.0
-    Mamba2Cache,
-)
+try:
+    # transformers < 5.4: Mamba2Cache was a standalone class in the mamba2 module
+    from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache as _Mamba2CacheLegacy
+
+    def _make_mamba2_cache(config, batch_size: int):  # type: ignore[misc]
+        return _Mamba2CacheLegacy(config, batch_size=batch_size)
+
+except ImportError:
+    # transformers >= 5.4 (HF PR #44950): Mamba2Cache replaced by DynamicCache(config=...)
+    from transformers import DynamicCache as _DynamicCache
+
+    def _make_mamba2_cache(config, batch_size: int):  # type: ignore[misc]
+        return _DynamicCache(config=config)
 
 from mobius import build_from_module
 from mobius._configs import Mamba2Config
@@ -110,7 +120,7 @@ def _run_hf_steps(
     tokens: list[int],
 ) -> np.ndarray:
     """Run HF Mamba2 one token at a time, returning last-step logits."""
-    cache = Mamba2Cache(_HF_CONFIG, batch_size=1)
+    cache = _make_mamba2_cache(_HF_CONFIG, batch_size=1)
     for pos, tok in enumerate(tokens):
         with torch.no_grad():
             hf_out = model(
