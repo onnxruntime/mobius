@@ -366,17 +366,72 @@ get_ep("rocm")   # → ValueError: Unknown execution provider 'rocm'. ...
 
 ## Design Decisions
 
-### Why ONNX functions for fusions, not rewrite rules?
+### Direct emission vs. rewrite rules
 
-Some custom ops (`LinearAttention`, future `GroupQueryAttention`) are emitted
-as `ir.Function` values with a fallback body. This gives silent portability:
-runtimes that recognise the kernel use it; others expand the body. Pattern
-fragility is eliminated for these ops — there is no pattern to match.
+Mobius uses two strategies for custom ops, chosen based on whether the pattern
+is **self-contained** or **cross-component**:
 
-Rewrite rules are used when the transformation is structural (changing the
-graph topology) rather than semantic substitution. See
-[GitHub issue #100](https://github.com/onnxruntime/mobius/issues/100) for the
-full design discussion.
+| Strategy | When to use | Examples |
+|---|---|---|
+| **Direct emission** (component emits custom op with `ir.Function` body) | Op is self-contained within a single component — no cross-layer dependencies | `LinearAttention`, `CausalConvWithState` |
+| **Rewrite rule** (post-export graph transformation) | Pattern spans multiple components or crosses layer boundaries | `SkipSimplifiedLayerNormalization`, `SkipLayerNormalization`, `GroupQueryAttention`, `BiasGelu` |
+
+**Direct emission** gives silent portability: runtimes that recognise the
+kernel use it; others expand the function body. Pattern fragility is
+eliminated — there is no pattern to match.
+
+**Rewrite rules** are necessary when the fusion spans graph regions that no
+single component can see. The key examples:
+
+#### SkipNorm is a cross-layer pattern
+
+In the standard pre-norm decoder layer, the residual Add + Norm pattern occurs
+twice per layer — but one of them **crosses the layer boundary**:
+
+```
+Layer N forward():
+  residual = hidden_states
+  hidden_states = input_layernorm(hidden_states)     ← Norm (start of layer)
+  hidden_states = attention(hidden_states, ...)
+  hidden_states = Add(residual, hidden_states)       ← Add #1
+  residual = hidden_states                            ↘ consumer 1
+  hidden_states = post_attn_layernorm(hidden_states)  ↘ consumer 2 → INTRA-LAYER SkipNorm ✓
+  hidden_states = mlp(hidden_states)
+  hidden_states = Add(residual, hidden_states)       ← Add #2 (output of layer)
+
+Layer N+1 forward():
+  residual = hidden_states                            ↘ consumer 1 of Add #2
+  hidden_states = input_layernorm(hidden_states)      ↘ consumer 2 → CROSS-LAYER SkipNorm ✓
+  ...
+```
+
+Add #1 → `post_attn_layernorm` is intra-layer (both in the same `forward()`).
+Add #2 → next layer's `input_layernorm` is cross-layer — the `Add` is at the
+end of layer N, but the `Norm` consuming it is at the start of layer N+1.
+
+A component emitting SkipNorm directly can only capture the **intra-layer**
+pattern (~50% of opportunities). Rewrite rules operate on the flattened ONNX
+graph where layer boundaries don't exist, so they catch **both** patterns.
+For a 28-layer model, this means 56 SkipNorm fusions (2 per layer) instead
+of 28.
+
+#### GQA fusion requires graph-level visibility
+
+`GroupQueryAttention` replaces the standard `Attention` op plus its
+surrounding `RotaryEmbedding`, `MatMul` projections, and KV cache handling.
+This spans the Attention component, the RoPE component, and the KV cache
+plumbing in the task layer — no single component owns the full pattern.
+
+#### BiasGelu has narrow applicability
+
+`BiasGelu` fuses `Add(x, bias) + Gelu(approximate="tanh")` into a single
+kernel. It only matches models that use:
+- `FCMLP` (not gated MLP — most modern LLMs use SiLU-gated MLPs)
+- Bias enabled (`bias=True` in linear layers)
+- Tanh-approximate GELU (`gelu_new`, `gelu_fast` — not standard `gelu`)
+
+In practice this covers ~2–5 model families (GPT-2, possibly Falcon, GPT-NeoX,
+GPTJ, Phi). The rewrite rule handles these without requiring component changes.
 
 ### Why do components stay EP-agnostic?
 
