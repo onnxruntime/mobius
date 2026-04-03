@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 import transformers
+
 try:
     # transformers < 5.4: Mamba2Cache was a standalone class in the mamba2 module
     from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache as _Mamba2CacheLegacy
@@ -31,6 +32,7 @@ except ImportError:
 
     def _make_mamba2_cache(config, batch_size: int):  # type: ignore[misc]
         return _DynamicCache(config=config)
+
 
 from mobius import build_from_module
 from mobius._configs import Mamba2Config
