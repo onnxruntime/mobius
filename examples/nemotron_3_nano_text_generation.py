@@ -73,11 +73,15 @@ DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 
 
 def _fix_nemotron_h_dt_bias(model) -> None:
-    """Reload dt_bias from the checkpoint to work around an HF initialization bug.
+    """Reload dt_bias and out_proj.weight from the checkpoint.
 
-    HuggingFace's ``_init_weights`` unconditionally overwrites ``dt_bias``
-    with ``torch.rand(...)`` *after* loading checkpoint weights, so every
-    ``from_pretrained`` call produces different (wrong) dt_bias values.
+    HuggingFace's ``_init_weights`` unconditionally overwrites these
+    parameters *after* loading checkpoint weights:
+
+    - ``dt_bias``: reinitialized with ``torch.rand(...)``
+    - ``out_proj.weight``: reinitialized with ``kaiming_uniform_`` then
+      scaled by ``1/sqrt(num_hidden_layers)``
+      (when ``config.rescale_prenorm_residual`` is True)
 
     This reloads the correct values directly from safetensors.
     """
@@ -85,6 +89,9 @@ def _fix_nemotron_h_dt_bias(model) -> None:
     from safetensors.torch import load_file
 
     from huggingface_hub import HfApi
+
+    # Keys that _init_weights corrupts and must be reloaded
+    _CORRUPTED_KEYS = {"dt_bias", "out_proj.weight"}
 
     model_id = model.config._name_or_path
     api = HfApi()
@@ -98,17 +105,13 @@ def _fix_nemotron_h_dt_bias(model) -> None:
     )
 
     sd = model.state_dict()
-    # HF built-in uses "model." prefix while checkpoint may use "backbone."
-    sd_dt_keys = [k for k in sd if "dt_bias" in k]
-    if not sd_dt_keys:
-        return
 
     patched = 0
     for shard_name in shard_files:
         shard_path = os.path.join(repo_dir, shard_name)
         shard_weights = load_file(shard_path)
         for key, value in shard_weights.items():
-            if "dt_bias" not in key:
+            if not any(c in key for c in _CORRUPTED_KEYS):
                 continue
             # Try direct match first, then backbone. <-> model. remap
             sd_key = key
@@ -122,7 +125,7 @@ def _fix_nemotron_h_dt_bias(model) -> None:
                 patched += 1
     if patched:
         model.load_state_dict(sd)
-        print(f"  Fixed {patched} dt_bias parameters from checkpoint")
+        print(f"  Fixed {patched} corrupted parameters from checkpoint")
 
 
 def _apply_nemotron_h_patch():
