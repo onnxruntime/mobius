@@ -68,13 +68,12 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
 
-        # The Add output must have multiple consumers (LayerNorm + residual)
-        uses = list(add_out.uses())
-        if len(uses) < 2:
-            return result.fail(
-                f"Add output has only {len(uses)} consumer(s), "
-                "expected at least 2 (LayerNorm + downstream residual)"
-            )
+        # Don't fuse if add_out is itself a graph output — that indicates we're inside
+        # an ONNX function body where replace_all_uses_with would fail or produce
+        # nested fusion.
+        graph = producer.graph
+        if graph is not None and add_out in graph.outputs:
+            return result.fail("Add output is a graph output — skip to avoid nested fusion")
 
         # Verify LayerNormalization has epsilon attribute and correct axis
         ln = norm_out.producer()
@@ -141,12 +140,12 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
 
-        uses = list(add_out.uses())
-        if len(uses) < 2:
-            return result.fail(
-                f"Add output has only {len(uses)} consumer(s), "
-                "expected at least 2 (LayerNorm + downstream residual)"
-            )
+        # Don't fuse if add_out is itself a graph output — that indicates we're inside
+        # an ONNX function body where replace_all_uses_with would fail or produce
+        # nested fusion.
+        graph = producer.graph
+        if graph is not None and add_out in graph.outputs:
+            return result.fail("Add output is a graph output — skip to avoid nested fusion")
 
         ln = norm_out.producer()
         if ln.attributes.get_float("epsilon", None) is None:
