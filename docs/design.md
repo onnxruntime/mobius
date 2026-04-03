@@ -81,7 +81,8 @@ Key components:
 | `DecoderLayer` | Pre-norm residual: LayerNorm → Attention → LayerNorm → MLP |
 | `MoELayer` | Mixture-of-Experts with pluggable gate |
 | `VisionModel` | SigLIP-style patch embedding + transformer encoder |
-| Projectors | `Gemma3MultiModalProjector`, `MLPMultiModalProjector`, `LinearMultiModalProjector` |
+| `PixtralVisionTower` | Pixtral 2D RoPE vision encoder with bidirectional attention |
+| Projectors | `Gemma3MultiModalProjector`, `MLPMultiModalProjector`, `Mistral3MultiModalProjector`, `LinearMultiModalProjector` |
 | `InputMixer` | Scatter vision embeddings into text positions |
 | RoPE variants | `DefaultRope`, `LinearRope`, `DynamicNTKRope`, `Llama3Rope`, `InterleavedMRope` |
 | `ALiBiAttention` | Attention with linear biases (Falcon, Bloom) |
@@ -229,8 +230,10 @@ the correct gate variant per layer.
 3. `InputMixer` — scatter vision embeddings at image-token positions
 4. `Gemma3CausalLMModel` — standard text decoder
 
-`LLaVAModel` follows a similar pattern with MLPMultiModalProjector.
-Many VL models (InternVL2, Pixtral, Idefics, Molmo, etc.) reuse the LLaVA
+`LLaVAModel` follows a similar pattern with `MLPMultiModalProjector`.
+Mistral-3 / Pixtral uses `Mistral3MultiModalProjector` with a dedicated
+`PixtralVisionTower` (2D RoPE, bidirectional attention) instead of CLIP/SigLIP.
+Many other VL models (InternVL2, Idefics, Molmo, etc.) reuse the LLaVA
 pattern with CLIP/SigLIP vision encoder + projector + LLM.
 
 Uses `VisionLanguageTask` which adds `pixel_values` to the ONNX graph inputs.
@@ -241,6 +244,7 @@ Three projector variants are available for different model families:
 |-----------|-------------|---------|
 | `Gemma3MultiModalProjector` | AvgPool2d → RMSNorm → MatMul | Gemma3 |
 | `MLPMultiModalProjector` | Linear → GELU → Linear | LLaVA, Phi4MM |
+| `Mistral3MultiModalProjector` | RMSNorm → spatial merge → Linear → GELU → Linear | Mistral-3, Pixtral |
 | `LinearMultiModalProjector` | Single Linear | PaliGemma |
 
 ### Encoder-only models (BERT, RoBERTa)

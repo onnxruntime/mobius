@@ -350,7 +350,7 @@ def _create_default_registry() -> ModelRegistry:
         "ministral",
         "ministral3",
         "mistral",
-        "mistral3",
+        "nanochat",
         "open-llama",
         "openelm",
         "qwen2",
@@ -485,6 +485,7 @@ def _create_default_registry() -> ModelRegistry:
         "llava_next",
         "llava_next_video",
         "llava_onevision",
+        "mistral3",
         "molmo",
         "paligemma",
         "pixtral",
@@ -734,7 +735,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "helium": "kyutai/helium-1-preview-2b",
     "minicpm": "optimum-intel-internal-testing/tiny-random-minicpm",
     "minicpm3": "openbmb/MiniCPM3-4B",
-    "mistral3": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
     "ministral3": "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
     "nanochat": "nanochat-students/nanochat-d20",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
@@ -843,6 +843,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "instructblip": "Salesforce/instructblip-flan-t5-xl",
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
+    "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",

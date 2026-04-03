@@ -628,6 +628,15 @@ class TestQuantizationConfig:
         hf = type("HFConfig", (), {"quantization_config": {"quant_method": "none"}})()
         assert QuantizationConfig.from_transformers(hf) is None
 
+    def test_from_transformers_fp8_returns_none(self):
+        """FP8 per-tensor quantization is not block quantization; returns None."""
+        hf = type(
+            "HFConfig",
+            (),
+            {"quantization_config": {"quant_method": "fp8", "bits": 8}},
+        )()
+        assert QuantizationConfig.from_transformers(hf) is None
+
     def test_from_transformers_to_dict_object(self):
         """HF QuantizationConfig objects have a to_dict() method."""
         inner = type(

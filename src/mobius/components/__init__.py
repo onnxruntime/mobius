@@ -46,6 +46,7 @@ __all__ = [
     "LinearMultiModalProjector",
     "LoRALinear",
     "MLP",
+    "Mistral3MultiModalProjector",
     "MLPMultiModalProjector",
     "Mamba2Block",
     "Mamba2Scan",
@@ -54,6 +55,7 @@ __all__ = [
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
+    "PixtralVisionTower",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
     "QFormer",
@@ -185,6 +187,10 @@ from mobius.components._multimodal import (
     InputMixer,
     LinearMultiModalProjector,
     MLPMultiModalProjector,
+)
+from mobius.components._pixtral_vision import (
+    Mistral3MultiModalProjector,
+    PixtralVisionTower,
 )
 from mobius.components._qformer import (
     QFormer,
