@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -160,6 +160,12 @@ class ModelTask(ABC):
     Subclass this to support new model tasks (e.g. feature extraction,
     sequence classification). Each task defines its own graph I/O contract.
     """
+
+    #: Maps package key → optimization role for each model produced by this task.
+    #: The role controls which fusion passes run (e.g. only ``"decoder"`` gets
+    #: GQA fusion). Override in subclasses that produce non-decoder outputs.
+    #: Unrecognised keys default to ``"decoder"``.
+    model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}
 
     @abstractmethod
     def build(

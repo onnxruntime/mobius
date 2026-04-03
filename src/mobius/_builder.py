@@ -185,8 +185,9 @@ def build_from_module(
     pkg = resolved_task.build(module, config)
 
     for name, model in pkg.items():
-        # Unknown model names default to decoder role for fusion purposes.
-        role = _MODEL_ROLE_MAP.get(name, "decoder")
+        # Resolve role from the task first, then fall back to the global name map.
+        # This ensures encoder-only tasks (e.g. ViT, BERT) don't get GQA fusion.
+        role = resolved_task.model_roles.get(name) or _MODEL_ROLE_MAP.get(name, "decoder")
         optimize_model(
             model,
             ep=execution_provider,

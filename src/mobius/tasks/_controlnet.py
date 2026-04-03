@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._model_package import ModelPackage
@@ -20,6 +22,7 @@ class ControlNetTask(ModelTask):
     """Build ONNX graph for ControlNet residual generation."""
 
     name = "controlnet"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
