@@ -386,34 +386,48 @@ single component can see. The key examples:
 #### SkipNorm is a cross-layer pattern
 
 In the standard pre-norm decoder layer, the residual Add + Norm pattern occurs
-twice per layer — but one of them **crosses the layer boundary**:
+twice per layer — but one of them **crosses the layer boundary**.
 
+The concrete code is in `DecoderLayer._forward_pre_norm()` at
+`src/mobius/components/_decoder.py` (lines 118–151):
+
+```python
+def _forward_pre_norm(self, op, hidden_states, ...):
+    residual = hidden_states
+    hidden_states = self.input_layernorm(op, hidden_states)      # L128: Norm
+
+    attn_output, present_key_value = self.self_attn(op, ...)     # L130-137
+
+    hidden_states = op.Add(residual, attn_output)                # L141: Add #1
+
+    residual = hidden_states                                     # L143: consumer 1 of Add #1
+    hidden_states = self.post_attention_layernorm(op, hidden_states)  # L144: consumer 2 → SkipNorm ✓ INTRA-LAYER
+    hidden_states = self.mlp(op, hidden_states)                  # L145
+
+    hidden_states = op.Add(residual, hidden_states)              # L149: Add #2 (returned to caller)
+
+    return hidden_states, present_key_value
 ```
-Layer N forward():
-  residual = hidden_states
-  hidden_states = input_layernorm(hidden_states)     ← Norm (start of layer)
-  hidden_states = attention(hidden_states, ...)
-  hidden_states = Add(residual, hidden_states)       ← Add #1
-  residual = hidden_states                            ↘ consumer 1
-  hidden_states = post_attn_layernorm(hidden_states)  ↘ consumer 2 → INTRA-LAYER SkipNorm ✓
-  hidden_states = mlp(hidden_states)
-  hidden_states = Add(residual, hidden_states)       ← Add #2 (output of layer)
 
-Layer N+1 forward():
-  residual = hidden_states                            ↘ consumer 1 of Add #2
-  hidden_states = input_layernorm(hidden_states)      ↘ consumer 2 → CROSS-LAYER SkipNorm ✓
-  ...
-```
+**Add #1** (line 141) has two consumers within the same `forward()` call:
+the residual save (line 143) and `post_attention_layernorm` (line 144).
+The rewrite rule fuses this into `SkipSimplifiedLayerNormalization` — this is
+the **intra-layer** pattern.
 
-Add #1 → `post_attn_layernorm` is intra-layer (both in the same `forward()`).
-Add #2 → next layer's `input_layernorm` is cross-layer — the `Add` is at the
-end of layer N, but the `Norm` consuming it is at the start of layer N+1.
+**Add #2** (line 149) is returned as the layer output. In the model's layer
+loop, the next layer receives it as `hidden_states`. When layer N+1's
+`_forward_pre_norm()` runs, the same value flows to line 127 (`residual =
+hidden_states`) and line 128 (`self.input_layernorm(op, hidden_states)`).
+In the flattened ONNX graph, Add #2 has two consumers — the next layer's
+residual path and its `input_layernorm` — exactly the same pattern the
+rewrite rule matches. This is the **cross-layer** pattern.
 
-A component emitting SkipNorm directly can only capture the **intra-layer**
-pattern (~50% of opportunities). Rewrite rules operate on the flattened ONNX
-graph where layer boundaries don't exist, so they catch **both** patterns.
-For a 28-layer model, this means 56 SkipNorm fusions (2 per layer) instead
-of 28.
+A component emitting SkipNorm directly can only capture Add #1 → line 144
+(intra-layer, ~50% of opportunities). It cannot fuse Add #2 → next layer's
+`input_layernorm` because that `Norm` call is in a different `forward()`
+invocation. Rewrite rules operate on the flattened ONNX graph where layer
+boundaries don't exist, so they catch **both** patterns. For a 28-layer
+model, this means 56 SkipNorm fusions (2 per layer) instead of 28.
 
 #### GQA fusion requires graph-level visibility
 
