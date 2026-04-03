@@ -48,10 +48,14 @@ import os
 import re
 import sys
 import time
+import warnings
 
 import ml_dtypes
 import numpy as np
 import transformers
+
+# Suppress harmless HF warning about trust_remote_code model_type mismatch
+warnings.filterwarnings("ignore", message="You are using a model of type")
 
 from mobius import build
 from mobius._flags import override_flags
