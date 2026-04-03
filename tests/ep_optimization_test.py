@@ -20,8 +20,7 @@ import pytest
 from _test_configs import _base_config
 
 from mobius._builder import build_from_module
-from mobius._optimizations import _count_ops
-from mobius._optimizations import optimize_model as _optimize
+from mobius._optimizations import _count_ops, optimize_model
 from mobius._registry import registry
 
 # ---------------------------------------------------------------------------
@@ -325,7 +324,7 @@ def test_encoder_role_no_gqa():
     )
 
     # Now re-optimize as encoder role with cuda — GQA should still not be added.
-    _optimize(model, ep="cuda", dtype=ir.DataType.FLOAT16, model_role="encoder")
+    optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16, model_role="encoder")
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count == 0, (
         f"encoder role should produce no GQA even on cuda+FLOAT16, got {gqa_count}"

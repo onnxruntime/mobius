@@ -3,7 +3,7 @@
 
 """EP-aware model optimization pipeline.
 
-Exposes :func:`optimize_model` (public alias: ``_optimize``) which applies a
+Exposes :func:`optimize_model` which applies a
 four-stage pass pipeline to an ONNX IR model:
 
 1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
@@ -460,7 +460,3 @@ def optimize_model(
                 f"Check that the attention pattern matches the GQA rewrite rule.",
                 stacklevel=4,
             )
-
-
-#: Backward-compatible alias — internal callers use ``_optimize``.
-_optimize = optimize_model

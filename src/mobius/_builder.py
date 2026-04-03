@@ -37,7 +37,7 @@ from mobius._configs import (
 )
 from mobius._execution_providers import ep_registry
 from mobius._model_package import ModelPackage
-from mobius._optimizations import optimize_model as _optimize
+from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
 from mobius.tasks import ModelTask, get_task
@@ -182,7 +182,7 @@ def build_from_module(
     resolved_task = get_task(task)
 
     # Derive structural flags from EP capabilities.
-    # Unknown EPs fall back to no structural constraints (validated later in _optimize()).
+    # Unknown EPs fall back to no structural constraints (validated in optimize_model()).
     _caps = ep_registry.get(execution_provider)
     use_concrete_dims = _caps is not None and not _caps.supports_shape
 
@@ -201,7 +201,7 @@ def build_from_module(
     for name, model in pkg.items():
         # Unknown model names default to decoder role for fusion purposes.
         role = _MODEL_ROLE_MAP.get(name, "decoder")
-        _optimize(
+        optimize_model(
             model,
             ep=execution_provider,
             dtype=dtype,
