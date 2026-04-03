@@ -97,10 +97,11 @@ Within the `components/` package itself, private cross-imports
 **Never use `onnx.helper`, `onnx.TensorProto`, `onnx.ModelProto`, or any
 `onnx_proto` / protobuf construction APIs anywhere in this codebase.**
 
-Always use `onnxscript.ir` to construct ONNX models:
+Always use `onnx_ir` to construct ONNX models (`onnxscript.ir` is a
+deprecated alias — do not use it):
 
 ```python
-# Good — onnxscript.ir APIs
+# Good — onnx_ir APIs
 import onnx_ir as ir
 
 graph = ir.Graph(...)
