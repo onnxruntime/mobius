@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 import time
 
 import ml_dtypes
@@ -363,6 +364,7 @@ def generate(
     Uses a single ONNX model built with ``NemotronHCausalLMModel``.
     Because Mamba2 layers only support single-token decode, every
     token (including the prompt) is processed one at a time.
+    Tokens are streamed to stdout as they are generated.
     """
     input_ids = tokenize_prompt(tokenizer, prompt, use_chat)
     batch_size = 1
@@ -396,13 +398,22 @@ def generate(
     prefill_time = time.time() - t0
     print(f"  Prefill: {prompt_len} tokens in {prefill_time:.2f}s")
 
-    # Generate new tokens
+    # Generate new tokens, streaming each to stdout
     logits = outputs["logits"]
     next_token_id = int(np.argmax(logits[:, -1, :]))
     t0 = time.time()
 
     for _ in range(max_new_tokens):
         generated_ids.append(next_token_id)
+
+        # Stream: decode and print the new token immediately
+        token_str = tokenizer.decode(
+            [next_token_id], skip_special_tokens=False
+        )
+        # Suppress common end-of-sequence markers from display
+        if token_str not in ("<|im_end|>", "</s>", "<|endoftext|>"):
+            sys.stdout.write(token_str)
+            sys.stdout.flush()
 
         if next_token_id == tokenizer.eos_token_id:
             break
@@ -424,12 +435,14 @@ def generate(
         logits = outputs["logits"]
         next_token_id = int(np.argmax(logits[:, -1, :]))
 
+    # End the streamed output line
+    print()
+
     gen_time = time.time() - t0
     if generated_ids:
         tps = len(generated_ids) / gen_time if gen_time > 0 else 0
-        print(f"  Generated: {len(generated_ids)} tokens in {gen_time:.1f}s ({tps:.1f} tok/s)")
+        print(f"  [{len(generated_ids)} tokens in {gen_time:.1f}s ({tps:.1f} tok/s)]")
 
-    display_output(tokenizer, generated_ids)
     return format_output(tokenizer, generated_ids)
 
 
