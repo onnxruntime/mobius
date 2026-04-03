@@ -58,7 +58,6 @@ class EpCapabilities:
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
-        supports_int64: ``False`` triggers CastInt64ToInt32 lowering (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
         supports_fused_moe: ``False`` decomposes fused MoE ops.
@@ -73,7 +72,6 @@ class EpCapabilities:
     packed_attn_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
     supports_shape: bool = True
-    supports_int64: bool = True
     supports_skip_layer_norm: bool = True
     supports_fused_moe: bool = True
     default_int4_accuracy_level: int = 0
@@ -202,7 +200,6 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             supports_shape=False,
-            supports_int64=False,
             default_int4_accuracy_level=4,
             provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
         ),

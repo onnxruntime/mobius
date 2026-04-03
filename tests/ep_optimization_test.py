@@ -288,24 +288,6 @@ def test_webgpu_no_shape_nodes():
     )
 
 
-def test_webgpu_casts_gather_indices_to_int32():
-    """WebGPU: CastInt64ToInt32 inserts Cast before INT64 Gather indices."""
-    pkg = _make_llama_pkg(ep="webgpu", dtype=ir.DataType.FLOAT16)
-    model = pkg["model"]
-    # After lowering, no Gather node should have an INT64 index input directly.
-    int64_gather_indices = [
-        node
-        for node in model.graph
-        if node.op_type == "Gather"
-        and len(node.inputs) > 1
-        and node.inputs[1] is not None
-        and node.inputs[1].dtype == ir.DataType.INT64
-    ]
-    assert len(int64_gather_indices) == 0, (
-        f"WebGPU: {len(int64_gather_indices)} Gather node(s) still have INT64 indices"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Encoder / embedding role gating
 # ---------------------------------------------------------------------------

@@ -100,7 +100,6 @@ rules** in Stage 3:
 | No fused RoPE inside GQA | DML | `SeparateRoPE`: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
 | No packed QKV in GQA | DML | `UnpackQKV`: packed GQA → 3 separate `MatMul` projections |
 | No `Shape` operator | WebGPU | `EliminateShape`: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
-| INT64 Gather indices | WebGPU | `CastInt64ToInt32`: INT64 gather indices cast to INT32 |
 | No `SkipLayerNorm` kernel | TRT-RTX | `DecomposeSkipLayerNorm`: fused ops → primitives |
 
 ---
@@ -154,8 +153,7 @@ Stage 2: Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
            (each only fires if the EP's capabilities support it)
 
 Stage 3: Lowering     EP-gated. Decomposes ops the EP cannot handle.
-         ↓ SeparateRoPE, UnpackQKV, EliminateShape,
-           CastInt64ToInt32, DecomposeSkipLayerNorm
+         ↓ SeparateRoPE, UnpackQKV, EliminateShape, DecomposeSkipLayerNorm
            (each only fires if the EP's capabilities require it)
 
 Stage 4: Fold         EP-agnostic. Always applied.
