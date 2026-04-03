@@ -17,12 +17,18 @@ The optimization pipeline lives in :mod:`mobius._optimizations`.
 from __future__ import annotations
 
 __all__ = [
+    # Public build API
     "DTYPE_MAP",
-    "EpCapabilities",
-    "_EP_REGISTRY",
     "build",
     "build_from_module",
     "resolve_dtype",
+    # Backward-compat re-exports (originally defined here; now in sub-modules)
+    "EpCapabilities",
+    "_EP_REGISTRY",
+    "CleanupMetadataPass",
+    "SymbolicShapeInferencePass",
+    "_count_all_ops",
+    "_count_ops",
 ]
 
 import dataclasses
@@ -61,13 +67,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # These names were previously defined here and may be imported by tests or
 # third-party code. They now live in the dedicated sub-modules above.
-
-__all__ += [
-    "CleanupMetadataPass",
-    "SymbolicShapeInferencePass",
-    "_count_all_ops",
-    "_count_ops",
-]
 
 # _EP_REGISTRY is kept as a shim backed by ep_registry so that existing code
 # using ``_EP_REGISTRY.get(ep)`` / ``frozenset(_EP_REGISTRY)`` continues to work.

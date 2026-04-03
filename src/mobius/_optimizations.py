@@ -21,6 +21,17 @@ support requires only a new registry entry — no changes to this module.
 
 from __future__ import annotations
 
+__all__ = [
+    # Public API
+    "optimize_model",
+    # Passes (used by tests and _builder re-exports)
+    "CleanupMetadataPass",
+    "SymbolicShapeInferencePass",
+    # Diagnostic helpers
+    "_count_all_ops",
+    "_count_ops",
+]
+
 import contextlib
 import dataclasses
 import logging

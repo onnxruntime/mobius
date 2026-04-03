@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 class EpCapabilities:
     """All EP-specific capability flags in one place.
 
-    Adding EP #6 means adding a single :class:`EpCapabilities` entry to
+    Adding a new EP = adding a single :class:`EpCapabilities` entry to
     :func:`_register_builtins`. No other code needs to change.
 
     The ``supports_X`` flags mean "don't decompose X". When ``True``, the
@@ -166,7 +166,7 @@ def get_ep(name: str) -> EpCapabilities:
 def _register_builtins() -> None:
     """Populate the global registry with the six built-in EPs.
 
-    Called once at module import. Adding EP #7 = adding one entry here.
+    Called once at module import. Adding a new EP = adding one entry here.
     """
     _builtins = [
         # Generic ONNX-conformant runtime — no vendor-specific kernel fusions.
