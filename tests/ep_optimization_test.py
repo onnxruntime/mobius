@@ -19,7 +19,8 @@ import onnx_ir as ir
 import pytest
 from _test_configs import _base_config
 
-from mobius._builder import _count_ops, _optimize, build_from_module
+from mobius._builder import _count_ops, build_from_module
+from mobius._optimizations import optimize_model as _optimize
 from mobius._registry import registry
 
 # ---------------------------------------------------------------------------
@@ -186,7 +187,7 @@ def test_trace_optimization_produces_output(caplog):
     module_cls = registry.get("llama")
     module = module_cls(config)
 
-    with caplog.at_level(logging.INFO, logger="mobius._builder"):
+    with caplog.at_level(logging.INFO, logger="mobius._optimizations"):
         build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
 
     messages = [r.message for r in caplog.records]
@@ -217,7 +218,7 @@ def test_trace_optimization_no_matches_shows_zero(caplog):
     module_cls = registry.get("llama")
     module = module_cls(config)
 
-    with caplog.at_level(logging.INFO, logger="mobius._builder"):
+    with caplog.at_level(logging.INFO, logger="mobius._optimizations"):
         build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
 
     messages = [r.message for r in caplog.records]
@@ -244,7 +245,7 @@ def test_trace_optimization_is_noop_without_flag():
         def emit(self, record: _logging.LogRecord) -> None:
             captured.append(record.getMessage())
 
-    builder_logger = _logging.getLogger("mobius._builder")
+    builder_logger = _logging.getLogger("mobius._optimizations")
     handler = _Capture()
     handler.setLevel(_logging.INFO)
     builder_logger.addHandler(handler)

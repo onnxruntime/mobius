@@ -9,6 +9,9 @@ This module provides the core functions for constructing ONNX models from
 - :func:`build_from_module` — Build from a module instance and config.
 - :func:`build` — Build from a HuggingFace model ID.
 - :func:`resolve_dtype` — Resolve dtype strings to ``ir.DataType``.
+
+EP capabilities are defined in :mod:`mobius._execution_providers`.
+The optimization pipeline lives in :mod:`mobius._optimizations`.
 """
 
 from __future__ import annotations
@@ -22,106 +25,58 @@ __all__ = [
     "resolve_dtype",
 ]
 
-import contextlib
 import dataclasses
 import logging
-import warnings
 
 import onnx_ir as ir
-import onnx_shape_inference
-import onnxscript.optimizer._constant_folding  # TODO(justinchuby): Expose the FoldConstantsPass from onnxscript
 import torch
 from onnx_ir import tensor_adapters
-from onnx_ir.passes import common as common_passes
 from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
 )
-from mobius._flags import flags
+from mobius._execution_providers import (
+    EpCapabilities,
+    ep_registry,
+)
 from mobius._model_package import ModelPackage
+from mobius._optimizations import (
+    CleanupMetadataPass,
+    SymbolicShapeInferencePass,
+    _count_all_ops,
+    _count_ops,
+)
+from mobius._optimizations import (
+    optimize_model as _optimize,
+)
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
 
-
-class _SuppressNoConstValueWarning(logging.Filter):
-    """Filter out 'has no constant value' warnings from initializer dedup.
-
-    Mobius runs optimization passes before weight loading, so weight
-    initializers intentionally have no const_value at that point.
-    Other warnings from the pass (e.g. hash collisions) are preserved.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "has no constant value" not in record.getMessage()
-
-
-@contextlib.contextmanager
-def _suppress_dedup_empty_initializer_warnings():
-    """Temporarily suppress 'has no constant value' dedup warnings.
-
-    Scoped to the optimization pass invocation only — the filter is
-    removed when the context exits so it doesn't affect other code.
-    """
-    dedup_logger = logging.getLogger("onnx_ir.passes.common.initializer_deduplication")
-    log_filter = _SuppressNoConstValueWarning()
-    dedup_logger.addFilter(log_filter)
-    try:
-        yield
-    finally:
-        dedup_logger.removeFilter(log_filter)
-
-
 # ---------------------------------------------------------------------------
-# Public build API
+# Backward-compatibility re-exports
 # ---------------------------------------------------------------------------
+# These names were previously defined here and may be imported by tests or
+# third-party code. They now live in the dedicated sub-modules above.
 
-
-class SymbolicShapeInferencePass(ir.passes.InPlacePass):
-    """ONNX IR pass that applies symbolic shape inference to all nodes."""
-
-    def __init__(self, policy: onnx_shape_inference.ShapeMergePolicy = "refine"):
-        super().__init__()
-        self.policy = policy
-
-    def call(self, model: ir.Model) -> ir.passes.PassResult:
-        onnx_shape_inference.infer_symbolic_shapes(model, policy=self.policy)
-        return ir.passes.PassResult(model, modified=True)
-
-
-class CleanupMetadataPass(ir.passes.InPlacePass):
-    """ONNX IR pass that removes redundant metadata from all nodes."""
-
-    def __init__(self):
-        self.keys_to_remove = ["pkg.onnxscript.shape_inference_error"]
-
-    def call(self, model: ir.Model) -> ir.passes.PassResult:
-        modified = False
-        for node in model.graph.all_nodes():
-            for key in self.keys_to_remove:
-                if key in node.metadata_props:
-                    modified = True
-                    del node.metadata_props[key]
-        return ir.passes.PassResult(model, modified=modified)
-
-
-_DEFAULT_PASSES = [
-    common_passes.IdentityEliminationPass(),
-    common_passes.LiftConstantsToInitializersPass(),
-    common_passes.DeduplicateInitializersPass(),
-    common_passes.CommonSubexpressionEliminationPass(),
-    common_passes.RemoveUnusedNodesPass(),
-    common_passes.RemoveUnusedOpsetsPass(),
-    SymbolicShapeInferencePass(),
-    onnxscript.optimizer._constant_folding.FoldConstantsPass(
-        shape_inference=False, input_size_limit=8192, output_size_limit=512 * 512
-    ),
-    CleanupMetadataPass(),
+__all__ += [
+    "CleanupMetadataPass",
+    "SymbolicShapeInferencePass",
+    "_count_all_ops",
+    "_count_ops",
 ]
 
+# _EP_REGISTRY is kept as a shim backed by ep_registry so that existing code
+# using ``_EP_REGISTRY.get(ep)`` / ``frozenset(_EP_REGISTRY)`` continues to work.
+_EP_REGISTRY = ep_registry
+
+
+# ---------------------------------------------------------------------------
+# Dtype helpers
+# ---------------------------------------------------------------------------
 
 # Mapping of short dtype names to ONNX IR dtypes
 DTYPE_MAP: dict[str, ir.DataType] = {
@@ -132,472 +87,6 @@ DTYPE_MAP: dict[str, ir.DataType] = {
     "bf16": ir.DataType.BFLOAT16,
     "bfloat16": ir.DataType.BFLOAT16,
 }
-
-
-# ---------------------------------------------------------------------------
-# EP capability descriptors
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class EpCapabilities:
-    """All EP-specific capability flags in one place.
-
-    Adding EP #6 means adding a single :class:`EpCapabilities` entry to
-    :data:`_EP_REGISTRY`. No other code needs to change.
-
-    Attributes:
-        name: Canonical EP name (e.g. ``"cuda"``).
-        gqa_dtypes: dtypes for which GroupQueryAttention fusion is supported.
-        packed_attn_dtypes: dtypes for which PackedAttention fusion is
-            supported. Used by Phase 2 PackedAttention rule activation.
-        supports_fused_rope: Whether fused RotaryEmbedding (inside GQA)
-            is supported. ``False`` for DML — triggers SeparateRoPE lowering.
-        supports_if: Whether the ONNX ``If`` operator is supported.
-            ``False`` for DML and WebGPU — triggers DecomposeIf lowering.
-        supports_shape: Whether the ONNX ``Shape`` operator is supported.
-            ``False`` for WebGPU — triggers EliminateShape lowering.
-        supports_int64: Whether INT64 graph inputs are supported.
-            ``False`` for WebGPU — triggers CastInt64ToInt32 lowering.
-        supports_skip_layer_norm: When ``False``, expand
-            ``com.microsoft::SkipLayerNormalization`` and
-            ``com.microsoft::SkipSimplifiedLayerNormalization`` via
-            :class:`~onnx_ir.passes.common.InlinePass` using their
-            registered standard-ONNX function bodies.
-            Set to ``False`` only when the runtime cannot execute the custom
-            op even via function-body expansion (e.g. TRT-RTX).
-            ``True`` for all other EPs: the function body is the portable
-            fallback, so no expansion is needed.
-        supports_simplified_layer_norm: When ``False``, expand
-            ``com.microsoft::SimplifiedLayerNormalization`` via InlinePass.
-            Same rationale as ``supports_skip_layer_norm``.
-        supports_fused_moe: When ``False``, decompose fused MoE ops.
-        default_int4_accuracy_level: Default accuracy level for INT4
-            quantization (0 = highest accuracy, 4 = fastest).
-        provider_options: Default ORT GenAI provider options dict for this EP.
-            Consumed by ``_genai_config.make_provider_options()``.
-        enable_graph_capture: Whether this EP defaults to CUDA/GPU graph
-            capture enabled. Used by ``_genai_config`` to set the default
-            graph capture state.
-    """
-
-    name: str
-    gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
-    packed_attn_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
-    supports_fused_rope: bool = True
-    supports_if: bool = True
-    supports_shape: bool = True
-    supports_int64: bool = True
-    supports_skip_layer_norm: bool = True
-    supports_simplified_layer_norm: bool = True
-    supports_fused_moe: bool = True
-    default_int4_accuracy_level: int = 0
-    provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
-    enable_graph_capture: bool = False
-
-
-# Central registry mapping EP name → capability descriptor.
-# To add EP #6: add one EpCapabilities entry here. Nothing else changes.
-_EP_REGISTRY: dict[str, EpCapabilities] = {
-    # Generic ONNX-conformant runtime — no vendor-specific kernel fusions.
-    # All custom ops with ONNX function bodies are portable (the function body
-    # is the executable fallback). Only cleanup + constant folding are applied.
-    # supports_X = True means "don't decompose X" — function bodies make them
-    # portable, so decomposition would be counterproductive.
-    "default": EpCapabilities(
-        name="default",
-        gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
-        packed_attn_dtypes=frozenset(),  # no packed attention fusion
-    ),
-    "cpu": EpCapabilities(
-        name="cpu",
-        gqa_dtypes=frozenset({ir.DataType.FLOAT}),
-        packed_attn_dtypes=frozenset({ir.DataType.FLOAT}),
-        default_int4_accuracy_level=4,
-    ),
-    "cuda": EpCapabilities(
-        name="cuda",
-        gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
-        packed_attn_dtypes=frozenset(
-            {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
-        ),
-        provider_options={
-            "enable_cuda_graph": "0",
-            "enable_skip_layer_norm_strict_mode": "1",
-        },
-    ),
-    "dml": EpCapabilities(
-        name="dml",
-        gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
-        packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-        supports_fused_rope=False,
-        supports_if=False,
-    ),
-    "webgpu": EpCapabilities(
-        name="webgpu",
-        gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-        packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-        supports_if=False,
-        supports_shape=False,
-        supports_int64=False,
-        default_int4_accuracy_level=4,
-        provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
-    ),
-    "trt-rtx": EpCapabilities(
-        name="trt-rtx",
-        gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
-        packed_attn_dtypes=frozenset(
-            {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
-        ),
-        supports_skip_layer_norm=False,
-        supports_simplified_layer_norm=False,
-        enable_graph_capture=True,
-        provider_options={"enable_cuda_graph": "1"},
-    ),
-}
-
-# Map ModelPackage entry names to semantic model roles.
-# GQA fusion is only applied to "decoder" role models.
-_MODEL_ROLE_MAP: dict[str, str] = {
-    "model": "decoder",
-    "decoder": "decoder",
-    "vision": "vision",
-    "embedding": "embedding",
-    "encoder": "encoder",
-}
-
-
-def _count_ops(model: ir.Model, op_type: str) -> int:
-    """Count nodes of a given op_type in all model graph nodes."""
-    return sum(1 for node in model.graph.all_nodes() if node.op_type == op_type)
-
-
-def _count_all_ops(model: ir.Model) -> dict[str, int]:
-    """Count all op types present in the model graph (including subgraphs)."""
-    counts: dict[str, int] = {}
-    for node in model.graph.all_nodes():
-        counts[node.op_type] = counts.get(node.op_type, 0) + 1
-    return counts
-
-
-@dataclasses.dataclass
-class _TraceEntry:
-    """Per-stage diagnostic data collected during traced optimization."""
-
-    name: str
-    added: dict[str, int]  # op_type → count added
-    removed: dict[str, int]  # op_type → count removed (positive values)
-
-    @property
-    def nodes_added(self) -> int:
-        return sum(self.added.values())
-
-    @property
-    def nodes_removed(self) -> int:
-        return sum(self.removed.values())
-
-    @property
-    def matched(self) -> int:
-        """Nodes consumed/replaced by this stage (proxy for 'rules matched')."""
-        return self.nodes_removed
-
-
-def _make_trace_entry(name: str, before: dict[str, int], after: dict[str, int]) -> _TraceEntry:
-    all_ops = set(before) | set(after)
-    added = {
-        op: after.get(op, 0) - before.get(op, 0)
-        for op in all_ops
-        if after.get(op, 0) > before.get(op, 0)
-    }
-    removed = {
-        op: before.get(op, 0) - after.get(op, 0)
-        for op in all_ops
-        if before.get(op, 0) > after.get(op, 0)
-    }
-    return _TraceEntry(name=name, added=added, removed=removed)
-
-
-def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -> None:
-    """Apply a single optimization stage — either a rewrite-rule list or an IR pass."""
-    if isinstance(rules_or_pass, ir.passes.InPlacePass):
-        rules_or_pass(model)
-    elif rules_or_pass:
-        from onnxscript.rewriter import rewrite
-
-        rewrite(model, pattern_rewrite_rules=rules_or_pass)
-
-
-def _log_trace_entry(entry: _TraceEntry) -> None:
-    if not entry.added and not entry.removed:
-        logger.info("[EP Trace]   %-25s: no matches (0 nodes affected)", entry.name)
-        return
-    parts = [f"+{count} {op}" for op, count in sorted(entry.added.items())]
-    parts += [f"-{count} {op}" for op, count in sorted(entry.removed.items())]
-    logger.info("[EP Trace]   %-25s: %s", entry.name, ", ".join(parts))
-
-
-def _log_trace_summary(entries: list[_TraceEntry]) -> None:
-    if not entries:
-        return
-    logger.info("[EP Trace] Summary:")
-    logger.info("[EP Trace]   %-25s | %7s | %6s | %6s", "Rule", "Matched", "+Nodes", "-Nodes")
-    logger.info("[EP Trace]   %s", "-" * 57)
-    for e in entries:
-        logger.info(
-            "[EP Trace]   %-25s | %7d | %6d | %6d",
-            e.name,
-            e.matched,
-            e.nodes_added,
-            e.nodes_removed,
-        )
-
-
-def _get_optimization_passes(
-    caps: EpCapabilities,
-    dtype: ir.DataType,
-    model_role: str = "decoder",
-) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
-    """Return ``(fuse_stages, lower_stages)`` for the given capabilities, dtype, and role.
-
-    Queries the :class:`EpCapabilities` object rather than branching on EP
-    name strings. Adding a new EP requires only a new :data:`_EP_REGISTRY`
-    entry — no changes to this function.
-
-    Args:
-        caps: EP capability descriptor from :data:`_EP_REGISTRY`.
-        dtype: Model dtype for GQA/PackedAttn support checks.
-        model_role: Semantic role. GQA fusion only applies to ``"decoder"``.
-
-    Returns:
-        ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
-        tuples where payload is a rule list or IR pass.
-    """
-    from mobius.rewrite_rules import (
-        cast_int64_to_int32_rules,
-        decompose_if_pass,
-        eliminate_shape_rules,
-        gelu_fusion_rules,
-        group_query_attention_rules,
-        separate_rope_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-        unpack_qkv_rules,
-    )
-
-    fuse: list[tuple[str, list]] = []
-    lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
-
-    # --- Attention fusion (decoder only) ---
-    if model_role == "decoder" and dtype in caps.gqa_dtypes:
-        fuse.append(("GQAFusion", list(group_query_attention_rules())))
-
-    # --- Normalization fusions (all roles, all dtypes) ---
-    # When supports_skip_layer_norm=False (e.g. trt-rtx), fusion is skipped here;
-    # InlinePass in _optimize() expands any pre-existing SkipLayerNorm nodes instead.
-    if caps.supports_skip_layer_norm:
-        fuse.append(("SkipNorm", list(skip_norm_rules())))
-        fuse.append(("SkipLayerNorm", list(skip_layer_norm_rules())))
-
-    # --- Activation fusions (all roles, all dtypes) ---
-    fuse.append(("BiasGelu", list(gelu_fusion_rules())))
-
-    # --- Lowering passes (graph-structural — rewrite rules only) ---
-    # SkipLayerNorm/SimplifiedLayerNorm decomposition is handled by InlinePass
-    # in _optimize() using registered ir.Function bodies, not rewrite rules.
-    if not caps.supports_fused_rope:
-        lower.append(("SeparateRoPE", list(separate_rope_rules())))
-        lower.append(("UnpackQKV", list(unpack_qkv_rules())))
-
-    if not caps.supports_shape:
-        lower.append(("EliminateShape", list(eliminate_shape_rules())))  # BP-13
-
-    if not caps.supports_int64:
-        lower.append(("CastInt64ToInt32", list(cast_int64_to_int32_rules())))  # BP-12
-
-    if not caps.supports_if:
-        lower.append(("DecomposeIf", decompose_if_pass()))  # BP-10: If→Where
-
-    return fuse, lower
-
-
-def _optimize(
-    model: ir.Model,
-    ep: str = "cpu",
-    dtype: ir.DataType = ir.DataType.FLOAT,
-    model_role: str = "decoder",
-    trace: bool = False,
-) -> None:
-    """Apply EP-aware optimization passes to a model in-place.
-
-    Runs a four-stage pipeline:
-
-    1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
-       folding, shape inference (EP-agnostic; always applied).
-    2. **Fusion** — promote standard ops to EP-supported fused ops
-       (e.g. GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` support
-       matrix and ``model_role``.
-    3. **Lowering** — decompose ops the EP does not support
-       (e.g. SeparateRoPE, UnpackQKV, DecomposeIf for DML/WebGPU).
-    4. **Fold** — final dead-node removal and constant folding after
-       rewrites.
-
-    After the fusion stage, if GQA was expected for this ``(ep, dtype)``
-    combination but zero ``GroupQueryAttention`` nodes were produced while
-    ``Attention`` nodes remain, a warning is emitted. This helps catch
-    silent rule-match failures.
-
-    Args:
-        model: The ONNX IR model to optimize in-place.
-        ep: Target execution provider.
-        dtype: Model dtype for support-matrix lookups.
-        model_role: Semantic role of this model component.
-        trace: When ``True``, emit per-stage diagnostic logs at INFO level
-            showing which rules matched, how many nodes were added/removed,
-            and a final summary table. Useful for debugging EP configuration.
-    """
-    # Stage 1: Base cleanup (EP-agnostic — always applied).
-    if trace:
-        before_total = sum(_count_all_ops(model).values())
-        logger.info("[EP Trace] Target: %s, dtype: %s, role: %s", ep, dtype, model_role)
-        logger.info("[EP Trace] Stage 1: Cleanup (%d passes)", len(_DEFAULT_PASSES))
-
-    cleanup_pass = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
-    if flags.suppress_dedup_warning:
-        with _suppress_dedup_empty_initializer_warnings():
-            cleanup_pass(model)
-    else:
-        cleanup_pass(model)
-
-    if trace:
-        after_total = sum(_count_all_ops(model).values())
-        logger.info(
-            "[EP Trace]   Cleanup: %d → %d nodes (%+d)",
-            before_total,
-            after_total,
-            after_total - before_total,
-        )
-
-    # Stage 2: Fusion / Stage 3: InlinePass + Lowering — gated by EP capabilities.
-    # Look up EP capabilities from the central registry.
-    caps = _EP_REGISTRY.get(ep)
-    if caps is None:
-        raise ValueError(
-            f"Unknown execution provider {ep!r}. Supported: {sorted(_EP_REGISTRY)}"
-        )
-
-    fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
-
-    # Register standard-ONNX ir.Function bodies for all known custom ops.
-    # InlinePass below uses these to expand ops the EP cannot execute.
-    from mobius._op_function_bodies import register_function_bodies
-
-    register_function_bodies(model)
-
-    # Build InlinePass criteria: expand custom ops that this EP doesn't support.
-    def _should_inline(func: ir.Function) -> bool:
-        if func.domain == "com.microsoft" and func.name in (
-            "SkipLayerNormalization",
-            "SkipSimplifiedLayerNormalization",
-        ):
-            return not caps.supports_skip_layer_norm
-        if func.domain == "com.microsoft" and func.name == "SimplifiedLayerNormalization":
-            return not caps.supports_simplified_layer_norm
-        return False
-
-    inline_pass = common_passes.InlinePass(criteria=_should_inline)
-
-    trace_entries: list[_TraceEntry] = []
-
-    if trace:
-        logger.info("[EP Trace] Stage 2: Fusion (%d rule groups)", len(fuse_stages))
-        for name, rules_or_pass in fuse_stages:
-            before = _count_all_ops(model)
-            _apply_stage(model, rules_or_pass)
-            after = _count_all_ops(model)
-            entry = _make_trace_entry(name, before, after)
-            trace_entries.append(entry)
-            _log_trace_entry(entry)
-
-        logger.info("[EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)")
-        before = _count_all_ops(model)
-        inline_pass(model)
-        after = _count_all_ops(model)
-        trace_entries.append(_make_trace_entry("InlinePass", before, after))
-        _log_trace_entry(trace_entries[-1])
-
-        logger.info(
-            "[EP Trace] Stage 3: Lowering (%d rule groups for %s)", len(lower_stages), ep
-        )
-        for name, rules_or_pass in lower_stages:
-            before = _count_all_ops(model)
-            _apply_stage(model, rules_or_pass)
-            after = _count_all_ops(model)
-            entry = _make_trace_entry(name, before, after)
-            trace_entries.append(entry)
-            _log_trace_entry(entry)
-    else:
-        # Batch all rewrite rules for efficiency; apply IR passes separately.
-        all_fuse_rules = [r for _, rp in fuse_stages if isinstance(rp, list) for r in rp]
-        all_lower_rules = [r for _, rp in lower_stages if isinstance(rp, list) for r in rp]
-        lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
-
-        if all_fuse_rules:
-            from onnxscript.rewriter import rewrite
-
-            rewrite(model, pattern_rewrite_rules=all_fuse_rules)
-
-        # Expand unsupported custom ops via registered ir.Function bodies.
-        inline_pass(model)
-
-        if all_lower_rules:
-            from onnxscript.rewriter import rewrite
-
-            rewrite(model, pattern_rewrite_rules=all_lower_rules)
-
-        for _, ir_pass in lower_ir_passes:
-            ir_pass(model)
-
-    # Stage 4: Final dead-node removal and constant folding after rewrites.
-    if trace:
-        before_fold = sum(_count_all_ops(model).values())
-        logger.info("[EP Trace] Stage 4: Constant folding")
-
-    fold_pass = ir.passes.PassManager(
-        [
-            common_passes.RemoveUnusedNodesPass(),
-            onnxscript.optimizer._constant_folding.FoldConstantsPass(
-                shape_inference=False,
-                input_size_limit=8192,
-                output_size_limit=512 * 512,
-            ),
-        ]
-    )
-    fold_pass(model)
-
-    if trace:
-        after_fold = sum(_count_all_ops(model).values())
-        logger.info(
-            "[EP Trace]   Fold: %d → %d nodes (%+d)",
-            before_fold,
-            after_fold,
-            after_fold - before_fold,
-        )
-        _log_trace_summary(trace_entries)
-
-    # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
-    # Only fires when Attention nodes are present — models with no attention
-    # (Mamba, RWKV, etc.) are silently skipped.
-    if model_role == "decoder" and dtype in caps.gqa_dtypes:
-        gqa_count = _count_ops(model, "GroupQueryAttention")
-        attn_count = _count_ops(model, "Attention")
-        if gqa_count == 0 and attn_count > 0:
-            warnings.warn(
-                f"GQA fusion expected for ep={ep!r}/dtype={dtype} but found "
-                f"0 GroupQueryAttention and {attn_count} Attention nodes. "
-                f"The model may run slower than expected on this EP. "
-                f"Check that the attention pattern matches the GQA rewrite rule.",
-                stacklevel=4,
-            )
 
 
 def resolve_dtype(dtype: str | ir.DataType | None) -> ir.DataType | None:
@@ -642,6 +131,22 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
             param.const_value = tensor_adapters.TorchTensor(cast_tensor)
 
 
+# Map ModelPackage entry names to semantic model roles.
+# GQA fusion is only applied to "decoder" role models.
+_MODEL_ROLE_MAP: dict[str, str] = {
+    "model": "decoder",
+    "decoder": "decoder",
+    "vision": "vision",
+    "embedding": "embedding",
+    "encoder": "encoder",
+}
+
+
+# ---------------------------------------------------------------------------
+# Build API
+# ---------------------------------------------------------------------------
+
+
 def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
@@ -672,8 +177,7 @@ def build_from_module(
             ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``.
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage, showing which
-            rules matched and how many nodes were added/removed. Useful for
-            debugging EP configuration and rule coverage.
+            rules matched and how many nodes were added/removed.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -708,13 +212,13 @@ def build_from_module(
 
     # Derive structural flags from EP capabilities.
     # Unknown EPs fall back to no structural constraints (validated later in _optimize()).
-    _caps = _EP_REGISTRY.get(execution_provider)
+    _caps = ep_registry.get(execution_provider)
     use_concrete_dims = _caps is not None and not _caps.supports_shape
 
     # Introspect the task's build() signature to pass use_concrete_dims only
     # to tasks that already accept it. This preserves backward compatibility
     # with the ~25 existing task classes that have not yet been updated to
-    # accept the WebGPU structural flag — they continue to work unchanged.
+    # accept the WebGPU structural flag.
     import inspect
 
     _build_sig = inspect.signature(resolved_task.build)
@@ -852,7 +356,6 @@ def build(
         if hasattr(thinker, "text_config"):
             hf_config = thinker.text_config
     elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
-        # Codec tokenizer: use decoder_config as the primary config source
         dc = hf_config.decoder_config
         if isinstance(dc, dict):
             dc = type("DC", (), {**dc, "model_type": model_type})()
@@ -879,7 +382,6 @@ def build(
                 if task is None and fallback.task is not None:
                     task = fallback.task
             else:
-                # No compatible fallback — raise the original error
                 registry.get(model_type)  # raises KeyError
 
     config = _config_from_hf(hf_config, parent_config=parent_config, module_class=module_class)
@@ -900,7 +402,6 @@ def build(
         trace_optimization=trace_optimization,
     )
 
-    # Set graph names
     for name, model in pkg.items():
         model.graph.name = f"{model_id}/{name}"
 

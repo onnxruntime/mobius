@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mobius._builder import _EP_REGISTRY
+from mobius._execution_providers import ep_registry
 
 # ORT GenAI provider name mapping (internal name → ORT GenAI provider string)
 _ORT_PROVIDER_NAMES: dict[str, str] = {
@@ -50,7 +50,7 @@ def make_provider_options(
 
     ep_name = _ORT_PROVIDER_NAMES.get(ep, ep)
     # Start from EP's registered defaults; fall back to empty if EP unknown.
-    caps = _EP_REGISTRY.get(ep)
+    caps = ep_registry.get(ep)
     options = dict(caps.provider_options) if caps else {}
 
     if ep == "cuda" and enable_cuda_graph:

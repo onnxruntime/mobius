@@ -11,7 +11,7 @@ check that fails fast before graph construction begins.
 
 from __future__ import annotations
 
-from mobius._builder import _EP_REGISTRY
+from mobius._execution_providers import ep_registry
 
 # Known incompatible (model_type, ep) pairs with explanation.
 # This is intentionally a simple allow-list/deny-list rather than
@@ -50,7 +50,16 @@ _UNSUPPORTED_COMBOS: dict[tuple[str, str], str] = {
 }
 
 # Derive known EPs from the central registry — no separate maintenance needed.
-KNOWN_EPS: frozenset[str] = frozenset(_EP_REGISTRY)
+KNOWN_EPS: frozenset[str] = frozenset(ep_registry)
+
+
+def register_unsupported_combo(model_type: str, ep: str, reason: str) -> None:
+    """Register an additional unsupported (model_type, ep) combination.
+
+    Intended for third-party use when adding new model types or EPs that
+    are incompatible with existing providers.
+    """
+    _UNSUPPORTED_COMBOS[(model_type, ep)] = reason
 
 
 def validate_ep_support(model_type: str, ep: str) -> None:
@@ -61,8 +70,10 @@ def validate_ep_support(model_type: str, ep: str) -> None:
             to be unsupported, with an explanation of why.
         ValueError: If *ep* is not a recognised execution provider.
     """
-    if ep not in KNOWN_EPS:
-        raise ValueError(f"Unknown execution provider {ep!r}. Supported: {sorted(KNOWN_EPS)}")
+    if ep not in ep_registry:
+        raise ValueError(
+            f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
+        )
 
     key = (model_type, ep)
     if key in _UNSUPPORTED_COMBOS:
