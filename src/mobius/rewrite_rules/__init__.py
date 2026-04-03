@@ -30,7 +30,6 @@ Example::
 __all__ = [
     "bias_gelu_rules",
     "cast_int64_to_int32_rules",
-    "decompose_if_pass",
     "eliminate_shape_rules",
     "fused_matmul_rules",
     "gelu_fusion_rules",
@@ -45,7 +44,6 @@ __all__ = [
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
 from mobius.rewrite_rules._cast_int64_to_int32 import cast_int64_to_int32_rules
-from mobius.rewrite_rules._decompose_if import decompose_if_pass
 from mobius.rewrite_rules._eliminate_shape import eliminate_shape_rules
 from mobius.rewrite_rules._fused_matmul import fused_matmul_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules

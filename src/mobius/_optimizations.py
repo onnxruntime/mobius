@@ -11,7 +11,7 @@ four-stage pass pipeline to an ONNX IR model:
 2. **Fusion** — promote standard ops to EP-supported fused ops
    (GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` and ``model_role``.
 3. **Lowering** — decompose ops the EP cannot execute
-   (SeparateRoPE, DecomposeIf, EliminateShape, CastInt64ToInt32).
+   (SeparateRoPE, EliminateShape, CastInt64ToInt32).
 4. **Fold** — final dead-node removal and constant folding.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
@@ -241,7 +241,6 @@ def _get_optimization_passes(
     """
     from mobius.rewrite_rules import (
         cast_int64_to_int32_rules,
-        decompose_if_pass,
         eliminate_shape_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
@@ -281,9 +280,6 @@ def _get_optimization_passes(
     if not caps.supports_int64:
         lower.append(("CastInt64ToInt32", list(cast_int64_to_int32_rules())))
 
-    if not caps.supports_if:
-        lower.append(("DecomposeIf", decompose_if_pass()))
-
     return fuse, lower
 
 
@@ -308,7 +304,7 @@ def optimize_model(
     2. **Fusion** — promote standard ops to EP-supported fused ops
        (e.g. GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` and role.
     3. **Lowering** — decompose ops the EP cannot execute
-       (e.g. SeparateRoPE, DecomposeIf for DML/WebGPU).
+       (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
     4. **Fold** — final dead-node removal and constant folding.
 
     After fusion, if GQA was expected for ``(ep, dtype)`` but zero

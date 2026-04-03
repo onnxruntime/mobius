@@ -57,7 +57,6 @@ class EpCapabilities:
             supported.
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
-        supports_if: ``False`` triggers DecomposeIf lowering (DML, WebGPU).
         supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
         supports_int64: ``False`` triggers CastInt64ToInt32 lowering (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -75,7 +74,6 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     packed_attn_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
-    supports_if: bool = True
     supports_shape: bool = True
     supports_int64: bool = True
     supports_skip_layer_norm: bool = True
@@ -201,13 +199,11 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
             packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             supports_fused_rope=False,
-            supports_if=False,
         ),
         EpCapabilities(
             name="webgpu",
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-            supports_if=False,
             supports_shape=False,
             supports_int64=False,
             default_int4_accuracy_level=4,

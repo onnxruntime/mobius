@@ -53,8 +53,8 @@ pkg = build_from_module(
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
 | **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. PackedAttention for FP32/FP16/BF16. CUDA graph support. |
-| **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. `If` nodes decomposed to `Where`. |
-| **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated, INT64→INT32 for gather indices. `If` nodes decomposed. |
+| **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
+| **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated, INT64→INT32 for gather indices. |
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` decomposed (TRT handles these primitives natively). |
 
 > **Note:** Passing an unknown EP name raises `ValueError` before graph
@@ -99,7 +99,6 @@ rules** in Stage 3:
 |---|---|---|
 | No fused RoPE inside GQA | DML | `SeparateRoPE`: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
 | No packed QKV in GQA | DML | `UnpackQKV`: packed GQA → 3 separate `MatMul` projections |
-| No `If` operator | DML, WebGPU | `DecomposeIf`: `If` → inline both branches + `Where` |
 | No `Shape` operator | WebGPU | `EliminateShape`: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
 | INT64 Gather indices | WebGPU | `CastInt64ToInt32`: INT64 gather indices cast to INT32 |
 | No `SkipLayerNorm` kernel | TRT-RTX | `DecomposeSkipLayerNorm`: fused ops → primitives |
@@ -118,7 +117,6 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType]        # dtypes where GQA fusion fires
     packed_attn_dtypes: frozenset[ir.DataType] # dtypes where PackedAttention fires
     supports_fused_rope: bool = True           # False → SeparateRoPE lowering
-    supports_if: bool = True                   # False → DecomposeIf lowering
     supports_shape: bool = True                # False → EliminateShape lowering
     supports_skip_layer_norm: bool = True      # False → DecomposeSkipLayerNorm
     default_int4_accuracy_level: int = 0       # 0 = no INT4; 4 = INT4 w/ accuracy
@@ -132,9 +130,9 @@ _EP_REGISTRY = {
     "cpu":     EpCapabilities(name="cpu",     gqa_dtypes={FLOAT}, ...),
     "cuda":    EpCapabilities(name="cuda",    gqa_dtypes={FLOAT16, BFLOAT16}, ...),
     "dml":     EpCapabilities(name="dml",     gqa_dtypes={FLOAT16},
-                               supports_fused_rope=False, supports_if=False, ...),
+                               supports_fused_rope=False, ...),
     "webgpu":  EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
-                               supports_if=False, supports_shape=False, ...),
+                               supports_shape=False, ...),
     "trt-rtx": EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                                supports_skip_layer_norm=False, ...),
 }
@@ -156,7 +154,7 @@ Stage 2: Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
            (each only fires if the EP's capabilities support it)
 
 Stage 3: Lowering     EP-gated. Decomposes ops the EP cannot handle.
-         ↓ SeparateRoPE, UnpackQKV, DecomposeIf, EliminateShape,
+         ↓ SeparateRoPE, UnpackQKV, EliminateShape,
            CastInt64ToInt32, DecomposeSkipLayerNorm
            (each only fires if the EP's capabilities require it)
 
@@ -212,14 +210,13 @@ _EP_REGISTRY["my-ep"] = EpCapabilities(
     name="my-ep",
     gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
     packed_attn_dtypes=frozenset({ir.DataType.FLOAT16}),
-    supports_if=False,   # my-ep has no If support
 )
 ```
 
 **Step 2:** If the EP has hard constraints not expressible via existing
 `EpCapabilities` fields, add a new boolean field and a corresponding lowering
-rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_decompose_if.py`
-(for IR-level passes) or `_separate_rope.py` (for pattern rewrite rules).
+rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
+(for pattern rewrite rules) or `_eliminate_shape.py` (for shape-related passes).
 
 **Step 3:** Add the EP to `KNOWN_EPS` in `src/mobius/_ep_validation.py` and
 add any deny-list entries for incompatible model types.
