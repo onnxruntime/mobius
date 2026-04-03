@@ -16,7 +16,7 @@ import mobius
 # Default: portable ONNX — runs on any conformant runtime
 pkg = mobius.build("Qwen/Qwen2.5-7B")
 
-# CUDA-optimized: GQA fusion, SkipLayerNorm, PackedAttention
+# CUDA-optimized: GQA fusion, SkipLayerNorm
 pkg = mobius.build("Qwen/Qwen2.5-7B", execution_provider="cuda")
 
 # With trace output: see exactly what each rule changed
@@ -52,14 +52,14 @@ pkg = build_from_module(
 |---|---|---|
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
-| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. PackedAttention for FP32/FP16/BF16. CUDA graph support. |
+| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. SkipLayerNorm fusion. |
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
-| **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated, INT64→INT32 for gather indices. |
-| **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` decomposed (TRT handles these primitives natively). |
+| **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
+| **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
 
-> **Note:** Passing an unknown EP name raises `ValueError` before graph
-> construction begins. Use `KNOWN_EPS` from `mobius._ep_validation` for the
-> canonical set.
+> **Note:** Passing an unknown EP name raises `ValueError` during
+> optimization. Use `ep_registry` from `mobius._execution_providers` to
+> query registered EPs.
 
 ---
 
@@ -85,79 +85,102 @@ ops to fused equivalents:
 
 - `Attention` → `com.microsoft::GroupQueryAttention` (CUDA, CPU, DML, WebGPU, TRT-RTX)
 - `Add + LayerNorm` → `com.microsoft::SkipLayerNormalization` (all except TRT-RTX)
-- `Add + RMSNorm` → `com.microsoft::SkipSimplifiedLayerNorm` (all except TRT-RTX)
+- `Add + RMSNorm` → `com.microsoft::SkipSimplifiedLayerNormalization` (all except TRT-RTX)
 - `Add + GELU` → `com.microsoft::BiasGelu` (all EPs)
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
 ### Tier 3 — EP-specific constraints (required, correctness)
 
-Some EPs cannot execute certain ONNX ops. These are handled by **lowering
-rules** in Stage 3:
+Some EPs cannot execute certain ops. These are handled by **lowering rules**
+(Stage 3) or **InlinePass expansion** (Stage 2b):
 
-| Constraint | Affected EPs | Rule |
+| Constraint | Affected EPs | Mechanism |
 |---|---|---|
-| No fused RoPE inside GQA | DML | `SeparateRoPE`: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
-| No packed QKV in GQA | DML | `UnpackQKV`: packed GQA → 3 separate `MatMul` projections |
-| No `Shape` operator | WebGPU | `EliminateShape`: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
-| No `SkipLayerNorm` kernel | TRT-RTX | `DecomposeSkipLayerNorm`: fused ops → primitives |
+| No fused RoPE inside GQA | DML | `SeparateRoPE` rewrite: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
+| No packed QKV in GQA | DML | `UnpackQKV` rewrite: packed GQA → 3 separate `MatMul` projections |
+| No `Shape` operator | WebGPU | `EliminateShape` rewrite: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
+| No `SkipLayerNorm` kernel | TRT-RTX | `InlinePass`: expands fused ops using their registered `ir.Function` bodies |
 
 ---
 
 ## The `EpCapabilities` Dataclass
 
-Every EP is fully described by a single `EpCapabilities` entry. To add a new
-EP, you add one entry to `_EP_REGISTRY` — no other code changes.
+Every EP is fully described by a single `EpCapabilities` entry in the
+`EpRegistry`. To add a new EP, you add one entry to `_register_builtins()` in
+`src/mobius/_execution_providers.py` — no other code changes.
 
 ```python
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
     gqa_dtypes: frozenset[ir.DataType]        # dtypes where GQA fusion fires
     packed_attn_dtypes: frozenset[ir.DataType] # dtypes where PackedAttention fires
-    supports_fused_rope: bool = True           # False → SeparateRoPE lowering
+    supports_fused_rope: bool = True           # False → SeparateRoPE + UnpackQKV
     supports_shape: bool = True                # False → EliminateShape lowering
-    supports_skip_layer_norm: bool = True      # False → DecomposeSkipLayerNorm
+    supports_skip_layer_norm: bool = True      # False → InlinePass expansion
+    supports_fused_moe: bool = True            # False → decompose fused MoE ops
     default_int4_accuracy_level: int = 0       # 0 = no INT4; 4 = INT4 w/ accuracy
+    provider_options: dict[str, str]           # Default ORT GenAI provider options
+    enable_graph_capture: bool = False          # GPU graph capture default
 ```
 
 ### Current registry
 
+Built-in EPs are registered by `_register_builtins()` at module import:
+
 ```python
-_EP_REGISTRY = {
-    "default": EpCapabilities(name="default", gqa_dtypes=frozenset(), ...),
-    "cpu":     EpCapabilities(name="cpu",     gqa_dtypes={FLOAT}, ...),
-    "cuda":    EpCapabilities(name="cuda",    gqa_dtypes={FLOAT16, BFLOAT16}, ...),
-    "dml":     EpCapabilities(name="dml",     gqa_dtypes={FLOAT16},
-                               supports_fused_rope=False, ...),
-    "webgpu":  EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
-                               supports_shape=False, ...),
-    "trt-rtx": EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
-                               supports_skip_layer_norm=False, ...),
-}
+EpCapabilities(name="default", gqa_dtypes=frozenset(), ...)
+EpCapabilities(name="cpu",     gqa_dtypes={FLOAT}, default_int4_accuracy_level=4)
+EpCapabilities(name="cuda",    gqa_dtypes={FLOAT16, BFLOAT16},
+               provider_options={"enable_cuda_graph": "0", ...})
+EpCapabilities(name="dml",     gqa_dtypes={FLOAT16},
+               supports_fused_rope=False)
+EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
+               supports_shape=False, default_int4_accuracy_level=4,
+               provider_options={"enableGraphCapture": "0", ...})
+EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
+               supports_skip_layer_norm=False, enable_graph_capture=True,
+               provider_options={"enable_cuda_graph": "1"})
+```
+
+Out-of-tree EPs can register at runtime via `register_ep()`:
+
+```python
+from mobius._execution_providers import EpCapabilities, register_ep
+
+register_ep(EpCapabilities(
+    name="my-ep",
+    gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
+))
 ```
 
 ---
 
 ## The Optimization Pipeline
 
-`_optimize()` runs a four-stage pipeline on each model in the package:
+`optimize_model()` in `_optimizations.py` runs a four-stage pipeline on each
+model in the package:
 
 ```
-Stage 1: Cleanup      EP-agnostic. Always applied.
-         ↓ Identity elimination, CSE, dedup initializers,
-           constant folding, symbolic shape inference, metadata cleanup.
+Stage 1:  Cleanup      EP-agnostic. Always applied.
+          ↓ Identity elimination, CSE, dedup initializers,
+            constant folding, symbolic shape inference, metadata cleanup.
 
-Stage 2: Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
-         ↓ GQAFusion, SkipNorm, SkipLayerNorm, BiasGelu
-           (each only fires if the EP's capabilities support it)
+Stage 2:  Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
+          ↓ GQAFusion, SkipNorm, SkipLayerNorm, BiasGelu
+            (each only fires if the EP's capabilities support it)
 
-Stage 3: Lowering     EP-gated. Decomposes ops the EP cannot handle.
-         ↓ SeparateRoPE, UnpackQKV, EliminateShape, DecomposeSkipLayerNorm
-           (each only fires if the EP's capabilities require it)
+Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute
+          ↓ using their registered ir.Function bodies (e.g. SkipLayerNorm
+            decomposition for TRT-RTX).
 
-Stage 4: Fold         EP-agnostic. Always applied.
-           Dead-node removal + constant folding after rewrites.
+Stage 3:  Lowering     EP-gated. Structural rewrites for EP constraints.
+          ↓ SeparateRoPE, UnpackQKV, EliminateShape
+            (each only fires if the EP's capabilities require it)
+
+Stage 4:  Fold         EP-agnostic. Always applied.
+            Dead-node removal + constant folding after rewrites.
 ```
 
 ### Multi-model packages and `model_role`
@@ -198,28 +221,28 @@ compatibility, minimum performance assumptions.
 ## Adding a New Execution Provider
 
 Because all EP logic is encoded in `EpCapabilities`, adding a new EP is a
-four-step change touching only one file:
+three-step change:
 
-**Step 1:** Add a `EpCapabilities` entry to `_EP_REGISTRY` in
-`src/mobius/_builder.py`:
+**Step 1:** Add an `EpCapabilities` entry to `_register_builtins()` in
+`src/mobius/_execution_providers.py`:
 
 ```python
-_EP_REGISTRY["my-ep"] = EpCapabilities(
+EpCapabilities(
     name="my-ep",
     gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
     packed_attn_dtypes=frozenset({ir.DataType.FLOAT16}),
 )
 ```
 
+The entry is automatically registered at module import. No other registration
+is needed — the `EpRegistry` validates EP names at optimization time.
+
 **Step 2:** If the EP has hard constraints not expressible via existing
 `EpCapabilities` fields, add a new boolean field and a corresponding lowering
 rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
 (for pattern rewrite rules) or `_eliminate_shape.py` (for shape-related passes).
 
-**Step 3:** Add the EP to `KNOWN_EPS` in `src/mobius/_ep_validation.py` and
-add any deny-list entries for incompatible model types.
-
-**Step 4:** Write tests:
+**Step 3:** Write tests:
 - A unit test for each new rewrite rule (graph-level, no ORT required)
 - A `test_ep_produces_expected_ops_*` entry in `tests/ep_optimization_test.py`
 - An ORT execution test (`test_rewritten_model_runs_with_ort`) for each rule
@@ -265,24 +288,27 @@ pkg = mobius.build(
 Sample output:
 
 ```
-INFO mobius._builder: [EP Trace] Target: cuda, dtype: FLOAT16, role: decoder
-INFO mobius._builder: [EP Trace] Stage 1: Cleanup (9 passes)
-INFO mobius._builder: [EP Trace]   Cleanup: 512 → 486 nodes (-26)
-INFO mobius._builder: [EP Trace] Stage 2: Fusion (4 rule groups)
-INFO mobius._builder: [EP Trace]   GQAFusion                 : +28 GroupQueryAttention, -28 Attention
-INFO mobius._builder: [EP Trace]   SkipNorm                  : +28 SkipSimplifiedLayerNorm, -56 Add, -28 SimplifiedLayerNormalization
-INFO mobius._builder: [EP Trace]   SkipLayerNorm             : no matches (0 nodes affected)
-INFO mobius._builder: [EP Trace]   BiasGelu                  : no matches (0 nodes affected)
-INFO mobius._builder: [EP Trace] Stage 3: Lowering (0 rule groups for cuda)
-INFO mobius._builder: [EP Trace] Stage 4: Constant folding
-INFO mobius._builder: [EP Trace]   Fold: 374 → 371 nodes (-3)
-INFO mobius._builder: [EP Trace] Summary:
-INFO mobius._builder: [EP Trace]   Rule                      | Matched | +Nodes | -Nodes
-INFO mobius._builder: [EP Trace]   -------------------------+--------+-------+-------
-INFO mobius._builder: [EP Trace]   GQAFusion                 |      28 |     28 |     28
-INFO mobius._builder: [EP Trace]   SkipNorm                  |      28 |     28 |     84
-INFO mobius._builder: [EP Trace]   SkipLayerNorm             |       0 |      0 |      0
-INFO mobius._builder: [EP Trace]   BiasGelu                  |       0 |      0 |      0
+INFO mobius._optimizations: [EP Trace] Target: cuda, dtype: FLOAT16, role: decoder
+INFO mobius._optimizations: [EP Trace] Stage 1: Cleanup (9 passes)
+INFO mobius._optimizations: [EP Trace]   Cleanup: 512 → 486 nodes (-26)
+INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (4 rule groups)
+INFO mobius._optimizations: [EP Trace]   GQAFusion                 : +28 GroupQueryAttention, -28 Attention
+INFO mobius._optimizations: [EP Trace]   SkipNorm                  : +28 SkipSimplifiedLayerNorm, -56 Add, -28 RMSNormalization
+INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             : no matches (0 nodes affected)
+INFO mobius._optimizations: [EP Trace]   BiasGelu                  : no matches (0 nodes affected)
+INFO mobius._optimizations: [EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)
+INFO mobius._optimizations: [EP Trace]   InlinePass                : no matches (0 nodes affected)
+INFO mobius._optimizations: [EP Trace] Stage 3: Lowering (0 rule groups for cuda)
+INFO mobius._optimizations: [EP Trace] Stage 4: Constant folding
+INFO mobius._optimizations: [EP Trace]   Fold: 374 → 371 nodes (-3)
+INFO mobius._optimizations: [EP Trace] Summary:
+INFO mobius._optimizations: [EP Trace]   Rule                      | Matched | +Nodes | -Nodes
+INFO mobius._optimizations: [EP Trace]   -------------------------+--------+-------+-------
+INFO mobius._optimizations: [EP Trace]   GQAFusion                 |      28 |     28 |     28
+INFO mobius._optimizations: [EP Trace]   SkipNorm                  |      28 |     28 |     84
+INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             |       0 |      0 |      0
+INFO mobius._optimizations: [EP Trace]   BiasGelu                  |       0 |      0 |      0
+INFO mobius._optimizations: [EP Trace]   InlinePass                |       0 |      0 |      0
 ```
 
 ### Reading the trace
@@ -314,26 +340,27 @@ subgraph in your model doesn't match the rewrite rule's pattern — compare your
 
 ---
 
-## EP Compatibility Validation
+## EP Validation
 
-Before graph construction, `validate_ep_support(model_type, ep)` is called
-automatically by `build()`. It rejects known-incompatible combinations:
+Passing an unknown EP name to `optimize_model()` raises `ValueError`:
 
 ```python
-from mobius._ep_validation import validate_ep_support
-
-validate_ep_support("mixtral", "dml")
-# ValueError: Model type 'mixtral' is not compatible with execution provider
-# 'dml': Mixtral (MoE) uses dynamic expert routing unsupported by DML
-
-validate_ep_support("llama", "rocm")
-# ValueError: Unknown execution provider 'rocm'. Supported: [cpu, cuda, dml, ...]
+# In optimize_model():
+caps = ep_registry.get(ep)
+if caps is None:
+    raise ValueError(
+        f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
+    )
 ```
 
-Current deny-list categories:
-- **MoE models on DML/WebGPU** — dynamic Top-K routing + Scatter not supported
-- **Mamba/Mamba2 on WebGPU** — Scan op not supported
-- **Jamba on TRT-RTX** — hybrid MoE+Mamba not supported
+The `EpRegistry` also exposes `require()` for direct lookup:
+
+```python
+from mobius._execution_providers import get_ep
+
+get_ep("cuda")   # → EpCapabilities(name="cuda", ...)
+get_ep("rocm")   # → ValueError: Unknown execution provider 'rocm'. ...
+```
 
 ---
 
