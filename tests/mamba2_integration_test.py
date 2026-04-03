@@ -18,7 +18,9 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache
+from transformers.models.mamba2.modeling_mamba2 import (  # requires transformers>=5.3.0
+    Mamba2Cache,
+)
 
 from mobius import build_from_module
 from mobius._configs import Mamba2Config
