@@ -159,14 +159,17 @@ class EpCapabilities:
             ``False`` for WebGPU — triggers EliminateShape lowering.
         supports_int64: Whether INT64 graph inputs are supported.
             ``False`` for WebGPU — triggers CastInt64ToInt32 lowering.
-        supports_skip_layer_norm: When ``False``, decompose
-            ``com.microsoft::SkipLayerNormalization`` into primitive ops.
+        supports_skip_layer_norm: When ``False``, expand
+            ``com.microsoft::SkipLayerNormalization`` and
+            ``com.microsoft::SkipSimplifiedLayerNormalization`` via
+            :class:`~onnx_ir.passes.common.InlinePass` using their
+            registered standard-ONNX function bodies.
             Set to ``False`` only when the runtime cannot execute the custom
-            op even via function-body expansion (e.g. TRT-RTX). For all
-            other EPs (including 'default') the function body is the
-            portable fallback, so decomposition is unnecessary.
-        supports_simplified_layer_norm: When ``False``, decompose
-            ``com.microsoft::SimplifiedLayerNormalization`` into primitives.
+            op even via function-body expansion (e.g. TRT-RTX).
+            ``True`` for all other EPs: the function body is the portable
+            fallback, so no expansion is needed.
+        supports_simplified_layer_norm: When ``False``, expand
+            ``com.microsoft::SimplifiedLayerNormalization`` via InlinePass.
             Same rationale as ``supports_skip_layer_norm``.
         supports_fused_moe: When ``False``, decompose fused MoE ops.
         default_int4_accuracy_level: Default accuracy level for INT4
@@ -372,8 +375,6 @@ def _get_optimization_passes(
     from mobius.rewrite_rules import (
         cast_int64_to_int32_rules,
         decompose_if_pass,
-        decompose_simplified_layer_norm_rules,
-        decompose_skip_layer_norm_rules,
         eliminate_shape_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
@@ -391,7 +392,8 @@ def _get_optimization_passes(
         fuse.append(("GQAFusion", list(group_query_attention_rules())))
 
     # --- Normalization fusions (all roles, all dtypes) ---
-    # TRT-RTX decomposes SkipNorm/SkipLayerNorm rather than fusing them.
+    # When supports_skip_layer_norm=False (e.g. trt-rtx), fusion is skipped here;
+    # InlinePass in _optimize() expands any pre-existing SkipLayerNorm nodes instead.
     if caps.supports_skip_layer_norm:
         fuse.append(("SkipNorm", list(skip_norm_rules())))
         fuse.append(("SkipLayerNorm", list(skip_layer_norm_rules())))
@@ -399,20 +401,12 @@ def _get_optimization_passes(
     # --- Activation fusions (all roles, all dtypes) ---
     fuse.append(("BiasGelu", list(gelu_fusion_rules())))
 
-    # --- Lowering passes (decompose what the EP does not support) ---
-    if not caps.supports_skip_layer_norm:
-        lower.append(("DecomposeSkipLayerNorm", list(decompose_skip_layer_norm_rules())))
-
-    if not caps.supports_simplified_layer_norm:
-        lower.append(
-            ("DecomposeSimplifiedLayerNorm", list(decompose_simplified_layer_norm_rules()))
-        )
-
+    # --- Lowering passes (graph-structural — rewrite rules only) ---
+    # SkipLayerNorm/SimplifiedLayerNorm decomposition is handled by InlinePass
+    # in _optimize() using registered ir.Function bodies, not rewrite rules.
     if not caps.supports_fused_rope:
-        lower.append(
-            ("SeparateRoPE", list(separate_rope_rules()))
-        )  # BP-6: decompose fused RoPE
-        lower.append(("UnpackQKV", list(unpack_qkv_rules())))  # BP-7: split packed QKV
+        lower.append(("SeparateRoPE", list(separate_rope_rules())))
+        lower.append(("UnpackQKV", list(unpack_qkv_rules())))
 
     if not caps.supports_shape:
         lower.append(("EliminateShape", list(eliminate_shape_rules())))  # BP-13
@@ -483,7 +477,7 @@ def _optimize(
             after_total - before_total,
         )
 
-    # Stage 2: Fusion / Stage 3: Lowering — gated by EP capabilities.
+    # Stage 2: Fusion / Stage 3: InlinePass + Lowering — gated by EP capabilities.
     # Look up EP capabilities from the central registry.
     caps = _EP_REGISTRY.get(ep)
     if caps is None:
@@ -492,6 +486,25 @@ def _optimize(
         )
 
     fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
+
+    # Register standard-ONNX ir.Function bodies for all known custom ops.
+    # InlinePass below uses these to expand ops the EP cannot execute.
+    from mobius._op_function_bodies import register_function_bodies
+
+    register_function_bodies(model)
+
+    # Build InlinePass criteria: expand custom ops that this EP doesn't support.
+    def _should_inline(func: ir.Function) -> bool:
+        if func.domain == "com.microsoft" and func.name in (
+            "SkipLayerNormalization",
+            "SkipSimplifiedLayerNormalization",
+        ):
+            return not caps.supports_skip_layer_norm
+        if func.domain == "com.microsoft" and func.name == "SimplifiedLayerNormalization":
+            return not caps.supports_simplified_layer_norm
+        return False
+
+    inline_pass = common_passes.InlinePass(criteria=_should_inline)
 
     trace_entries: list[_TraceEntry] = []
 
@@ -504,6 +517,13 @@ def _optimize(
             entry = _make_trace_entry(name, before, after)
             trace_entries.append(entry)
             _log_trace_entry(entry)
+
+        logger.info("[EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)")
+        before = _count_all_ops(model)
+        inline_pass(model)
+        after = _count_all_ops(model)
+        trace_entries.append(_make_trace_entry("InlinePass", before, after))
+        _log_trace_entry(trace_entries[-1])
 
         logger.info(
             "[EP Trace] Stage 3: Lowering (%d rule groups for %s)", len(lower_stages), ep
@@ -525,6 +545,9 @@ def _optimize(
             from onnxscript.rewriter import rewrite
 
             rewrite(model, pattern_rewrite_rules=all_fuse_rules)
+
+        # Expand unsupported custom ops via registered ir.Function bodies.
+        inline_pass(model)
 
         if all_lower_rules:
             from onnxscript.rewriter import rewrite
