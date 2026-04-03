@@ -33,6 +33,7 @@ from mobius.functions.causal_conv import (
     causal_conv_nd_with_state,
 )
 from mobius.functions.linear_attention import (
+    LinearAttention,
     linear_attention,
 )
 from mobius.functions.skip_layer_normalization import (
@@ -44,7 +45,15 @@ from mobius.functions.skip_layer_normalization import (
 
 _DOMAIN = "com.microsoft"
 
-# Registry mapping (domain, name, overload) → factory function.
+# Registry mapping (domain, name, overload) → zero-arg factory function.
+#
+# This registry is for **config-independent** function bodies — ops whose
+# standard-ONNX fallback doesn't depend on model shape or head counts.
+# These are attached to every model by ``register_function_bodies()``.
+#
+# ``CausalConvWithState`` and ``LinearAttention`` are **parametric** factories
+# (kernel_size, channels, num_heads are baked into the function body) and are
+# registered per-model by ``tasks._base._register_linear_attention_functions``.
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,
@@ -81,6 +90,7 @@ def register_function_bodies(model: ir.Model) -> None:
 
 __all__ = [
     "CausalConvWithState",
+    "LinearAttention",
     "SkipLayerNormalization",
     "SkipSimplifiedLayerNormalization",
     "causal_conv1d_with_state",
