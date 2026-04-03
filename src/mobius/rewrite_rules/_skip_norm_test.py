@@ -27,6 +27,9 @@ class TestSkipNormRules:
     def test_fuses_add_rmsnorm(self):
         pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
         model = pkg["model"]
+        counts_before = count_ops(model)
+        assert counts_before["RMSNormalization"] == 113
+        assert counts_before["Add"] == 56
 
         rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 
