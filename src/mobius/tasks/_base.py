@@ -161,6 +161,16 @@ class ModelTask(ABC):
     sequence classification). Each task defines its own graph I/O contract.
     """
 
+    #: Set by the builder when the target EP requires concrete (non-symbolic)
+    #: input dimensions. Tasks that read this flag should also set
+    #: ``supports_concrete_dims = True``.
+    use_concrete_dims: bool = False
+
+    #: Set to ``True`` on task subclasses that honour :attr:`use_concrete_dims`.
+    #: The builder emits a warning when concrete dims are requested but the
+    #: task does not support them.
+    supports_concrete_dims: bool = False
+
     def _create_dims(
         self,
         use_concrete_dims: bool = False,

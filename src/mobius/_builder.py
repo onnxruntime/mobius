@@ -26,6 +26,7 @@ __all__ = [
 
 import dataclasses
 import logging
+import warnings
 
 import onnx_ir as ir
 import torch
@@ -144,8 +145,11 @@ def build_from_module(
         execution_provider: Target execution provider for EP-aware
             optimizations. Defaults to ``"default"``, which produces
             portable ONNX with no vendor-specific ops (no GQA, no
-            ``com.microsoft`` ops). Other accepted values: ``"cpu"``,
-            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``.
+            ``com.microsoft`` ops). Accepted values are the names returned
+            by ``ep_registry`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``). Controls which fusion, lowering,
+            and structural passes are applied; in particular, ``"webgpu"``
+            uses concrete (non-symbolic) input dimensions.
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage, showing which
             rules matched and how many nodes were added/removed.
@@ -186,17 +190,14 @@ def build_from_module(
     _caps = ep_registry.get(execution_provider)
     use_concrete_dims = _caps is not None and not _caps.supports_shape
 
-    # Introspect the task's build() signature to pass use_concrete_dims only
-    # to tasks that already accept it. This preserves backward compatibility
-    # with the ~25 existing task classes that have not yet been updated to
-    # accept the WebGPU structural flag.
-    import inspect
-
-    _build_sig = inspect.signature(resolved_task.build)
-    if "use_concrete_dims" in _build_sig.parameters:
-        pkg = resolved_task.build(module, config, use_concrete_dims=use_concrete_dims)
-    else:
-        pkg = resolved_task.build(module, config)
+    if use_concrete_dims and not resolved_task.supports_concrete_dims:
+        warnings.warn(
+            f"{type(resolved_task).__name__} does not support use_concrete_dims; "
+            f"concrete input dimensions requested by EP '{execution_provider}' will be ignored.",
+            stacklevel=3,
+        )
+    resolved_task.use_concrete_dims = use_concrete_dims
+    pkg = resolved_task.build(module, config)
 
     for name, model in pkg.items():
         # Unknown model names default to decoder role for fusion purposes.
@@ -255,10 +256,12 @@ def build(
             HuggingFace config.
         execution_provider: Target execution provider for EP-aware
             optimizations. Defaults to ``"default"``, which produces
-            portable ONNX with no vendor-specific ops. Other accepted
-            values: ``"cpu"``, ``"cuda"``, ``"dml"``, ``"webgpu"``,
-            ``"trt-rtx"``. Controls which fusion and lowering passes are
-            applied during graph optimization.
+            portable ONNX with no vendor-specific ops. Accepted values are
+            the names returned by ``ep_registry`` (e.g. ``"cpu"``,
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``). Controls
+            which fusion and lowering passes are applied during graph
+            optimization; ``"webgpu"`` additionally uses concrete (non-
+            symbolic) input dimensions.
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage. See
             :func:`build_from_module` for details.
