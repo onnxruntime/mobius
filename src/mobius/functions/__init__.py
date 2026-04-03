@@ -24,8 +24,14 @@ Naming convention:
 from __future__ import annotations
 
 from mobius.functions._op_function_bodies import (
+    SimplifiedLayerNormalization,
+    SkipLayerNormalization,
+    SkipSimplifiedLayerNormalization,
     get_function,
     register_function_bodies,
+    simplified_layer_normalization,
+    skip_layer_normalization,
+    skip_simplified_layer_normalization,
 )
 from mobius.functions.causal_conv import (
     CausalConvWithState,
@@ -38,9 +44,15 @@ from mobius.functions.linear_attention import (
 
 __all__ = [
     "CausalConvWithState",
+    "SimplifiedLayerNormalization",
+    "SkipLayerNormalization",
+    "SkipSimplifiedLayerNormalization",
     "causal_conv1d_with_state",
     "causal_conv_nd_with_state",
-    "linear_attention",
     "get_function",
+    "linear_attention",
     "register_function_bodies",
+    "simplified_layer_normalization",
+    "skip_layer_normalization",
+    "skip_simplified_layer_normalization",
 ]
