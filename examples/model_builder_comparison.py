@@ -184,6 +184,71 @@ _KNOWN_BENIGN_OPS = {
 
 
 # ---------------------------------------------------------------------------
+# QK-norm model families
+# ---------------------------------------------------------------------------
+
+# Models in these families use per-head Q and K normalization. This prevents
+# QKV weight packing (ORT GenAI `use_packed_matmul=False`) but does NOT prevent
+# GQA. Both builders should emit the same GQA count AND both should have
+# separate Q/K/V MatMuls (higher total MatMul count vs packed-QKV models).
+_QK_NORM_FAMILIES: tuple[str, ...] = (
+    "Qwen/Qwen3",
+    "Qwen/Qwen3.5",
+    "Qwen3",
+    "Qwen3.5",
+    "qwen3",
+    "qwen3.5",
+)
+
+
+def _is_qk_norm_model(model_id: str) -> bool:
+    """Return True if model_id belongs to a known QK-norm family."""
+    lower = model_id.lower()
+    return any(lower.startswith(f.lower()) or f.lower() in lower for f in _QK_NORM_FAMILIES)
+
+
+def _qk_norm_checks(report: ModelReport) -> list[str]:
+    """Validate QK-norm invariants for a cross-builder report. Returns [] on success."""
+    issues: list[str] = []
+    if not _is_qk_norm_model(report.model_id) or len(report.columns) < 2:
+        return issues
+
+    # Find ORT GenAI and mobius columns
+    ort_cols = [c for c in report.columns if c.source == "ort-genai"]
+    mob_cols = [c for c in report.columns if c.source == "mobius"]
+    if not ort_cols or not mob_cols:
+        return issues
+
+    ort_gqa = ort_cols[0].counts.get("GroupQueryAttention", 0)
+    mob_gqa = mob_cols[0].counts.get("GroupQueryAttention", 0)
+
+    if ort_gqa != mob_gqa:
+        issues.append(
+            f"GQA MISMATCH for QK-norm model: ORT GenAI={ort_gqa}, mobius={mob_gqa}. "
+            "Expected equal counts — QK norm prevents QKV packing but NOT GQA."
+        )
+
+    # PackQKV absent means ORT GenAI uses 3 separate QKV MatMuls per layer,
+    # same as mobius. The MatMul difference should be <= a few global nodes,
+    # not 2x the QKV contribution.
+    ort_mm = ort_cols[0].counts.get("MatMul", 0)
+    mob_mm = mob_cols[0].counts.get("MatMul", 0)
+    # Estimate layers from GQA count (1 GQA = 1 attention layer)
+    est_layers = mob_gqa or 1
+    # If ORT GenAI had packed QKV, matmul diff would be ~2*layers (saving 2 QKV MatMuls/layer).
+    # For QK-norm models, diff should be much smaller.
+    if mob_mm > 0 and (mob_mm - ort_mm) > 2 * est_layers:
+        issues.append(
+            f"Unexpected MatMul gap ({mob_mm} vs {ort_mm} = diff {mob_mm - ort_mm}) "
+            f"for a QK-norm model ({est_layers} layers). "
+            "If ORT GenAI is packing QKV for this model, that is a bug — "
+            "QK norm must use separate Q/K/V projections."
+        )
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -203,6 +268,9 @@ class ModelReport:
     verdict: str = ""  # "PASS" | "PARTIAL" | "FAIL" | "MOBIUS-ONLY"
     verdict_reason: str = ""
     differences: list[str] = field(default_factory=list)
+    qk_norm_issues: list[str] = field(
+        default_factory=list
+    )  # Non-empty → QK-norm invariant violated
 
 
 @dataclass
@@ -316,8 +384,10 @@ def _ep_differences(cols: list[OpCounts]) -> list[str]:
     return diffs
 
 
-def _compute_verdict(cols: list[OpCounts]) -> tuple[str, str, list[str]]:
-    """Return (verdict, reason, differences_list).
+def _compute_verdict(
+    cols: list[OpCounts], model_id: str = ""
+) -> tuple[str, str, list[str], list[str]]:
+    """Return (verdict, reason, differences_list, qk_norm_issues).
 
     Verdicts:
       PASS    — all critical ops match across all columns, no unexplained diff
@@ -326,7 +396,7 @@ def _compute_verdict(cols: list[OpCounts]) -> tuple[str, str, list[str]]:
       MOBIUS-ONLY — only one column, no comparison possible
     """
     if len(cols) < 2:
-        return "MOBIUS-ONLY", "Single builder — no cross-builder comparison.", []
+        return "MOBIUS-ONLY", "Single builder — no cross-builder comparison.", [], []
 
     differences: list[str] = []
     critical_fail = False
@@ -342,9 +412,20 @@ def _compute_verdict(cols: list[OpCounts]) -> tuple[str, str, list[str]]:
         if op in _CRITICAL_OPS:
             critical_fail = True
 
+    # Run QK-norm invariant checks for known QK-norm model families.
+    # Build a temporary ModelReport-like object so _qk_norm_checks can inspect it.
+    _tmp = ModelReport(model_id=model_id, ep="", columns=cols)
+    qk_norm_issues = _qk_norm_checks(_tmp)
+    if qk_norm_issues:
+        critical_fail = True
+
     if critical_fail:
         verdict = "FAIL"
-        reason = "Critical op counts differ (GQA / BiasGelu / MoE count mismatch)."
+        reason = (
+            "Critical op counts differ (GQA / BiasGelu / MoE count mismatch"
+            + ("; QK-norm invariant violated" if qk_norm_issues else "")
+            + ")."
+        )
     elif differences:
         verdict = "PARTIAL"
         reason = (
@@ -355,7 +436,7 @@ def _compute_verdict(cols: list[OpCounts]) -> tuple[str, str, list[str]]:
         verdict = "PASS"
         reason = "All tracked op counts match exactly."
 
-    return verdict, reason, differences
+    return verdict, reason, differences, qk_norm_issues
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +520,19 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
                 plain = diff.replace("**", "").replace("  \n  ↳ ", "\n     ↳ ")
                 for dline in plain.splitlines():
                     lines.append("│    " + dline)
+            lines.append("│")
+        if _is_qk_norm_model(mr.model_id):
+            if mr.qk_norm_issues:
+                lines.append("│  ⚠️  QK-norm invariant VIOLATED:")
+                for issue in mr.qk_norm_issues:
+                    lines.append("│    ✗ " + issue)
+            else:
+                gqa_vals = " | ".join(
+                    f"{c.label}={c.counts.get('GroupQueryAttention', 0)}" for c in mr.columns
+                )
+                lines.append(
+                    f"│  ✓ QK-norm model: GQA match [{gqa_vals}], PackQKV absent (separate QKV MatMuls)"
+                )
             lines.append("│")
         lines += [
             "└" + "─" * 70,
@@ -526,9 +620,30 @@ def render_markdown(report: ComparisonReport) -> str:
             lines += ["### Differences", ""]
             for diff in mr.differences:
                 lines.append(f"- {diff}")
-            lines += ["", "---", ""]
-        else:
-            lines += ["---", ""]
+            lines += [""]
+
+        # QK-norm invariant section
+        if _is_qk_norm_model(mr.model_id):
+            lines += ["### QK-Norm Invariant Check", ""]
+            if mr.qk_norm_issues:
+                lines.append("**⚠️ QK-norm invariant VIOLATED:**")
+                for issue in mr.qk_norm_issues:
+                    lines.append(f"- ✗ {issue}")
+            else:
+                gqa_vals = ", ".join(
+                    f"`{c.label}`={c.counts.get('GroupQueryAttention', 0)}" for c in mr.columns
+                )
+                lines.append(
+                    f"**✓ Invariants satisfied** for this QK-norm model family ({mr.model_id}):"
+                )
+                lines.append(f"- GQA count matches across builders: {gqa_vals}")
+                lines.append(
+                    "- PackQKV absent: both builders use separate Q/K/V MatMul projections "
+                    "(higher MatMul count vs packed-QKV models is expected)."
+                )
+            lines += [""]
+
+        lines += ["---", ""]
 
     # Summary
     lines += [
@@ -788,7 +903,9 @@ def main() -> None:
                 if not columns_:
                     continue
 
-                verdict, reason, diffs = _compute_verdict(columns_)
+                verdict, reason, diffs, qk_issues = _compute_verdict(
+                    columns_, model_id=model_id
+                )
                 report.models.append(
                     ModelReport(
                         model_id=model_id,
@@ -797,6 +914,7 @@ def main() -> None:
                         verdict=verdict,
                         verdict_reason=reason,
                         differences=diffs,
+                        qk_norm_issues=qk_issues,
                     )
                 )
 
