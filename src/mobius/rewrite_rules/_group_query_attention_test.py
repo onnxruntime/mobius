@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
 from mobius import build
 from mobius._builder import build_from_module
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, Gemma2Config
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import group_query_attention_rules
@@ -52,6 +53,42 @@ _QWEN3_CONFIG = ArchitectureConfig(
     rope_theta=10000.0,
     pad_token_id=0,
     attn_qk_norm=True,
+)
+
+# Tiny GLM4 config: interleaved RoPE (rope_interleave=True)
+_GLM4_CONFIG = ArchitectureConfig(
+    hidden_size=64,
+    intermediate_size=128,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=16,
+    num_hidden_layers=2,
+    vocab_size=256,
+    max_position_embeddings=128,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    rope_type="default",
+    rope_theta=10000.0,
+    pad_token_id=0,
+    attn_qkv_bias=True,
+    rope_interleave=True,
+)
+
+# Tiny Gemma2 config: attn_logit_softcapping=50.0 (must survive GQA fusion)
+_GEMMA2_CONFIG = Gemma2Config(
+    hidden_size=64,
+    intermediate_size=128,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=16,
+    num_hidden_layers=2,
+    vocab_size=256,
+    max_position_embeddings=128,
+    hidden_act="gelu_pytorch_tanh",
+    rms_norm_eps=1e-6,
+    query_pre_attn_scalar=16,
+    attn_logit_softcapping=50.0,
+    final_logit_softcapping=30.0,
 )
 
 
@@ -289,3 +326,83 @@ class TestGroupQueryAttentionRules:
         assert "logits" in result
         assert result["logits"].shape == (1, 3, 256)
         session.close()
+
+    def test_rotary_interleaved_attribute_propagated(self):
+        """GQA fusion reads interleaved from RotaryEmbedding, not hardcoded 0.
+
+        GLM4/ChatGLM use interleaved=1. Hardcoding 0 would silently produce
+        incorrect RoPE inside the fused GQA kernel.
+        """
+        model = registry.get("glm4")(_GLM4_CONFIG)
+        pkg = build_from_module(model, _GLM4_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0, "Expected at least one GQA node after fusion"
+
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_interleaved")
+            assert val is not None, "rotary_interleaved attribute missing on GQA node"
+            assert val.value == 1, (
+                f"Expected rotary_interleaved=1 for GLM4 (interleaved RoPE), got {val.value}"
+            )
+
+    def test_rotary_interleaved_default_is_zero(self):
+        """Non-interleaved models (Llama, Qwen) get rotary_interleaved=0."""
+        model = registry.get("qwen3")(_QWEN3_CONFIG)
+        pkg = build_from_module(model, _QWEN3_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0
+
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_interleaved")
+            assert val is not None
+            assert val.value == 0, (
+                f"Expected rotary_interleaved=0 for Qwen3 (half-split RoPE), got {val.value}"
+            )
+
+    def test_softcap_preserved_on_gqa_fusion(self):
+        """Gemma2 softcap attribute on Attention must be forwarded to GQA.
+
+        Without this, the GQA kernel uses its default softcap=0.0 (disabled),
+        silently producing incorrect attention weights for Gemma2 models.
+        """
+        model = registry.get("gemma2")(_GEMMA2_CONFIG)
+        pkg = build_from_module(model, _GEMMA2_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0, "Expected GQA nodes after fusion"
+
+        for node in gqa_nodes:
+            sc = node.attributes.get("softcap")
+            assert sc is not None, (
+                "softcap attribute missing from GQA node — "
+                "Gemma2 attention logit capping will be silently disabled"
+            )
+            assert sc.value == pytest.approx(50.0), (
+                f"Expected softcap=50.0 (from _GEMMA2_CONFIG), got {sc.value}"
+            )
+
+    def test_softcap_absent_for_non_softcap_models(self):
+        """Llama/Qwen (no softcap) must not get a spurious softcap=0 on GQA."""
+        model = registry.get("llama")(_LLAMA_CONFIG)
+        pkg = build_from_module(model, _LLAMA_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0
+
+        for node in gqa_nodes:
+            sc = node.attributes.get("softcap")
+            assert sc is None, f"Unexpected softcap attribute on GQA node for Llama: {sc}"

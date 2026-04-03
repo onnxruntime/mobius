@@ -159,6 +159,13 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         scale = attn.attributes.get_float("scale")
         q_num_heads = attn.attributes.get_int("q_num_heads")
         kv_num_heads = attn.attributes.get_int("kv_num_heads")
+        # Preserve softcap (Gemma2 logit soft-capping). Default 0.0 = disabled.
+        softcap = attn.attributes.get_float("softcap", 0.0)
+
+        # Read interleaved from the Q RotaryEmbedding op (0=half-split, 1=interleaved).
+        # GLM4/ChatGLM use interleaved=1; most models use 0. Must not hardcode.
+        q_rope_node = attn.inputs[0].producer()  # RotaryEmbedding producing q_rot
+        rotary_interleaved = q_rope_node.attributes.get_int("interleaved", 0)
 
         # Trace cos/sin back through Gather to the cache table initializers
         if self._cos_cache is None:
@@ -192,6 +199,15 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
             )
 
         # Create GroupQueryAttention (3 outputs match Attention's 3)
+        gqa_attrs: dict[str, int | float] = {
+            "num_heads": q_num_heads,
+            "kv_num_heads": kv_num_heads,
+            "scale": scale,
+            "do_rotary": 1,
+            "rotary_interleaved": rotary_interleaved,
+        }
+        if softcap != 0.0:
+            gqa_attrs["softcap"] = softcap
         outputs = op.op_multi_out(
             "GroupQueryAttention",
             inputs=[
@@ -206,13 +222,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
                 self._sin_cache,
             ],
             domain="com.microsoft",
-            attributes={
-                "num_heads": q_num_heads,
-                "kv_num_heads": kv_num_heads,
-                "scale": scale,
-                "do_rotary": 1,
-                "rotary_interleaved": 0,
-            },
+            attributes=gqa_attrs,
             num_outputs=3,
         )
 
