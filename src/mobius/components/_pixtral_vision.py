@@ -52,6 +52,9 @@ class PixtralRoPE2D(nn.Module):
         rope_theta: float = 10000.0,
     ):
         super().__init__()
+        assert head_dim % 4 == 0, (
+            f"Pixtral 2D RoPE requires head_dim divisible by 4, got {head_dim}"
+        )
         inv_freq = 1.0 / (
             rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
         )
@@ -563,6 +566,9 @@ class PixtralVisionTower(nn.Module):
         h_2d = op.Unsqueeze(h_scaled, [1])
         w_2d = op.Unsqueeze(w_ids, [0])
         pos_grid = op.Add(h_2d, w_2d)
+        # Reshape to [1, num_patches] — batch=1 is correct here because
+        # the vision encoder processes one image at a time; cos/sin from
+        # RoPE broadcast across the num_heads dimension, not batch.
         position_ids = op.Reshape(
             pos_grid,
             op.Constant(value_ints=[1, -1]),
