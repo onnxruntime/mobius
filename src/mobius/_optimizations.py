@@ -366,8 +366,6 @@ def optimize_model(
             "SkipSimplifiedLayerNormalization",
         ):
             return not caps.supports_skip_layer_norm
-        if func.domain == "com.microsoft" and func.name == "SimplifiedLayerNormalization":
-            return not caps.supports_simplified_layer_norm
         return False
 
     inline_pass = common_passes.InlinePass(criteria=_should_inline)

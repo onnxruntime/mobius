@@ -61,8 +61,6 @@ class EpCapabilities:
         supports_int64: ``False`` triggers CastInt64ToInt32 lowering (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
-        supports_simplified_layer_norm: ``False`` expands
-            SimplifiedLayerNormalization via InlinePass (TRT-RTX).
         supports_fused_moe: ``False`` decomposes fused MoE ops.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
@@ -77,7 +75,6 @@ class EpCapabilities:
     supports_shape: bool = True
     supports_int64: bool = True
     supports_skip_layer_norm: bool = True
-    supports_simplified_layer_norm: bool = True
     supports_fused_moe: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -216,7 +213,6 @@ def _register_builtins() -> None:
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_skip_layer_norm=False,
-            supports_simplified_layer_norm=False,
             enable_graph_capture=True,
             provider_options={"enable_cuda_graph": "1"},
         ),

@@ -35,10 +35,6 @@ from mobius.functions.causal_conv import (
 from mobius.functions.linear_attention import (
     linear_attention,
 )
-from mobius.functions.simplified_layer_normalization import (
-    SimplifiedLayerNormalization,
-    simplified_layer_normalization,
-)
 from mobius.functions.skip_layer_normalization import (
     SkipLayerNormalization,
     SkipSimplifiedLayerNormalization,
@@ -52,7 +48,6 @@ _DOMAIN = "com.microsoft"
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,
-    (_DOMAIN, "SimplifiedLayerNormalization", ""): simplified_layer_normalization,
 }
 
 _cache: dict[ir.OperatorIdentifier, ir.Function] = {}
@@ -86,7 +81,6 @@ def register_function_bodies(model: ir.Model) -> None:
 
 __all__ = [
     "CausalConvWithState",
-    "SimplifiedLayerNormalization",
     "SkipLayerNormalization",
     "SkipSimplifiedLayerNormalization",
     "causal_conv1d_with_state",
@@ -94,7 +88,6 @@ __all__ = [
     "get_function",
     "linear_attention",
     "register_function_bodies",
-    "simplified_layer_normalization",
     "skip_layer_normalization",
     "skip_simplified_layer_normalization",
 ]
