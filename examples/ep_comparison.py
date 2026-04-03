@@ -18,7 +18,7 @@ Usage::
     python examples/ep_comparison.py --ep cuda
 
     # Use a different model
-    python examples/ep_comparison.py --model Qwen/Qwen3.5-2B
+    python examples/ep_comparison.py --model Qwen/Qwen3.5-0.8B
 
     # Register a custom EP, then compare
     python examples/ep_comparison.py --ep my-ep
@@ -145,7 +145,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen3.5-0.6B",
+        default="Qwen/Qwen3.5-0.8B",
         help="HuggingFace model ID (default: %(default)s). "
         "Pass any registered model; no weights are downloaded.",
     )
