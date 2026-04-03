@@ -314,11 +314,6 @@ def build(
 
     model_type = hf_config.model_type
 
-    # Validate model/EP compatibility before graph construction
-    from mobius._ep_validation import validate_ep_support
-
-    validate_ep_support(model_type, execution_provider)
-
     parent_config = hf_config
     if hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
@@ -327,6 +322,7 @@ def build(
         if hasattr(thinker, "text_config"):
             hf_config = thinker.text_config
     elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
+        # Codec tokenizer: use decoder_config as the primary config source
         dc = hf_config.decoder_config
         if isinstance(dc, dict):
             dc = type("DC", (), {**dc, "model_type": model_type})()
@@ -353,6 +349,7 @@ def build(
                 if task is None and fallback.task is not None:
                     task = fallback.task
             else:
+                # No compatible fallback — raise the original error
                 registry.get(model_type)  # raises KeyError
 
     config = _config_from_hf(hf_config, parent_config=parent_config, module_class=module_class)
