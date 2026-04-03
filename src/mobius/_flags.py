@@ -122,19 +122,18 @@ class _Flags:
     mamba_scan: str = dataclasses.field(
         default_factory=lambda: _env_str(
             "MOBIUS_MAMBA_SCAN",
-            "chunked_ssd",
+            "single",
             ("chunked_ssd", "scan", "single"),
         )
     )
     """Multi-token Mamba2 forward strategy.
 
-    - ``"chunked_ssd"`` (default): chunked SSD algorithm — processes
-      the full sequence in parallel within chunks, with cross-chunk
-      state propagation.  Matches HF ``torch_forward``.
+    - ``"chunked_ssd"``: chunked SSD algorithm — processes the full
+      sequence in parallel within chunks, with cross-chunk state
+      propagation.  Matches HF ``torch_forward``.
     - ``"scan"``: ONNX Scan op that iterates token-by-token.  Supports
       arbitrary seq_len but is sequential.
-    - ``"single"``: single-token-only path (seq_len must be 1).
-      Useful for debugging numerical issues.
+    - ``"single"`` (default): single-token-only path (seq_len must be 1).
 
     Set via ``MOBIUS_MAMBA_SCAN=chunked_ssd|scan|single``.
     For backwards compatibility, ``1``/``true`` → ``chunked_ssd``,
