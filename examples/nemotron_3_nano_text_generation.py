@@ -217,15 +217,15 @@ def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.nda
     """
     batch_size = 1
     states: dict[str, np.ndarray] = {}
-    layer_types = config.layer_types or []
+    layer_types = getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
 
-    # Mamba2 dims from NemotronH config
-    n_heads = config.mamba_n_heads
-    d_head = config.mamba_d_head
-    d_state = config.mamba_d_state
-    n_groups = config.mamba_n_groups
+    # Mamba2 dims from NemotronH config (handle both old and new attr names)
+    n_heads = getattr(config, "mamba_n_heads", None) or config.mamba_num_heads
+    d_head = getattr(config, "mamba_d_head", None) or config.mamba_head_dim
+    d_state = getattr(config, "mamba_d_state", None) or config.ssm_state_size
+    n_groups = getattr(config, "mamba_n_groups", None) or config.n_groups
     d_inner = n_heads * d_head
-    d_conv = config.mamba_d_conv
+    d_conv = getattr(config, "mamba_d_conv", None) or config.conv_kernel
     # conv_state covers d_inner + 2 * n_groups * d_state
     conv_dim = d_inner + 2 * n_groups * d_state
 
@@ -271,7 +271,7 @@ def update_states(
     config,
 ) -> dict[str, np.ndarray]:
     """Copy present-state outputs back into the past-state inputs."""
-    layer_types = config.layer_types or []
+    layer_types = getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
     new_states: dict[str, np.ndarray] = {}
 
     for i in range(config.num_hidden_layers):

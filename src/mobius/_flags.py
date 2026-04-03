@@ -101,12 +101,13 @@ class _Flags:
     mamba_scan: bool = dataclasses.field(
         default_factory=lambda: _env_bool("MOBIUS_MAMBA_SCAN", True)
     )
-    """Use Scan-based multi-token Mamba2 forward pass.
+    """Use chunked SSD multi-token Mamba2 forward pass.
 
-    When True (default), Mamba2Block uses an ONNX Scan op to iterate over
-    the full sequence, allowing multi-token prefill.  When False, falls
-    back to a single-token-only forward pass (seq_len must be 1) that
-    avoids the Scan subgraph.  Useful for debugging numerical issues.
+    When True (default), Mamba2Block uses the chunked SSD algorithm
+    to process the full sequence in parallel within chunks, allowing
+    multi-token prefill.  When False, falls back to a single-token-only
+    forward pass (seq_len must be 1) using the per-token SSM recurrence.
+    Useful for debugging numerical issues.
     Set ``MOBIUS_MAMBA_SCAN=0`` to disable.
     """
 
