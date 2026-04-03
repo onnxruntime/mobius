@@ -22,10 +22,10 @@ Compare a single model across all EPs (no weights downloaded — fast):
 
 Compare against ORT GenAI builder (builds on-the-fly, downloads weights):
 
+    ORT_GENAI_REPO=/path/to/onnxruntime-genai \\
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B \\
-        --ep cuda \\
-        --ort-genai-repo /home/justinchu/dev/onnxruntime-genai
+        --ep cuda
 
 Compare against a pre-built ORT GenAI model dir:
 
@@ -180,24 +180,6 @@ OP_EXPLANATION = {op: expl for op, _, expl in _OP_CATALOG}
 
 # Ops whose count mismatch signals a real parity problem
 _CRITICAL_OPS = {"GroupQueryAttention", "BiasGelu", "MoE"}
-
-# Ops whose mismatch is expected / known-benign
-_KNOWN_BENIGN_OPS = {
-    # Norm fusion: ORT GenAI packs the final pre-lm-head RMSNorm into a Skip
-    # fusion; mobius emits it as a standard ONNX RMSNormalization. Total norm
-    # count may differ by ±2. Differences are annotated in the diff section.
-    "SkipLayerNormalization",
-    "SkipSimplifiedLayerNormalization",
-    "RMSNormalization",  # mobius keeps final norm as standard ONNX
-    # GQA/Attention: counts are complementary — when GQA is emitted Attention=0.
-    # The sum GQA+Attention should equal num_layers in both builders.
-    "Attention",
-    "RotaryEmbedding",  # absent when fused into GQA
-    "MatMul",  # ORT GenAI packs Q/K/V into one MatMul
-    "Cast",  # minor seqlen cast differences
-    "Shape",  # webgpu-specific lowering
-    "Gather",  # implementation detail
-}
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +353,34 @@ def build_ort_genai(
     ort_genai_repo: str,
 ) -> OpCounts:
     builders_dir = os.path.join(ort_genai_repo, "src/python/py/models")
-    if builders_dir not in sys.path:
+    builder_file = os.path.join(builders_dir, "builder.py")
+    if not os.path.isfile(builder_file):
+        raise FileNotFoundError(
+            f"ORT GenAI builder not found at {builder_file}. "
+            "Check --ort-genai-repo / $ORT_GENAI_REPO."
+        )
+    # Use spec_from_file_location to avoid polluting sys.path.
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location(
+        "ort_genai_builder",
+        builder_file,
+        submodule_search_locations=[builders_dir],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load ORT GenAI builder from {builder_file}")
+    builder_mod = _ilu.module_from_spec(spec)
+    # The builder module imports sibling modules; temporarily add builders_dir
+    # to sys.path for the duration of the load, then remove it.
+    _added = builders_dir not in sys.path
+    if _added:
         sys.path.insert(0, builders_dir)
-    from builder import create_model  # type: ignore[import]
+    try:
+        spec.loader.exec_module(builder_mod)  # type: ignore[union-attr]
+    finally:
+        if _added and builders_dir in sys.path:
+            sys.path.remove(builders_dir)
+    create_model = builder_mod.create_model
 
     out_dir = tempfile.mkdtemp(prefix="ort_genai_cmp_")
     try:
@@ -1142,12 +1149,13 @@ def main() -> None:
     else:
         # Console output (default)
         print(render_console(report, color=not args.no_color))
-        # Also save markdown if --output specified
         if output_file:
             md = render_markdown(report)
             with open(output_file, "w") as f:
                 f.write(md)
             print(f"  Markdown report saved to: {output_file}\n")
+        else:
+            print("  Tip: use --output report.md to save a markdown report.\n")
 
 
 if __name__ == "__main__":
