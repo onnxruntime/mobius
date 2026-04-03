@@ -43,6 +43,19 @@ from mobius._testing.torch_reference import (
     torch_forward,
 )
 
+
+def _model_accessible(model_id: str) -> bool:
+    """Check if a HuggingFace model is accessible (not gated/private)."""
+    try:
+        from huggingface_hub import model_info
+
+        model_info(model_id)
+    except Exception:
+        return False
+    else:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Model catalogue: small models for each supported architecture
 #
@@ -111,6 +124,12 @@ _TEXT_MODELS = [
         False,
         id="falcon-rw-1b",
         marks=pytest.mark.skip(reason="Model only has pytorch_model.bin, no safetensors"),
+    ),
+    # Ministral3 (YaRN RoPE, text-only extraction of Mistral-3 VLM)
+    pytest.param(
+        "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
+        False,
+        id="ministral3-3b",
     ),
 ]
 
@@ -1291,6 +1310,208 @@ class TestQwen3VL3Model:
         decoder_out = decoder_sess.run(decoder_feeds)
         decoder_sess.close()
 
+        assert_logits_close(
+            decoder_out["logits"],
+            hf_logits,
+            rtol=2e-2,
+            atol=2e-1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Encoder-only models (BERT, DistilBERT, etc.)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Mistral3 (Pixtral) 3-model split — LLaVA-style VLM
+# ---------------------------------------------------------------------------
+
+_VL3_MISTRAL3_MODELS = [
+    pytest.param(
+        "mistralai/Ministral-3-3B-Instruct-2512",
+        id="mistral3-3b-3model",
+        marks=pytest.mark.skipif(
+            not _model_accessible("mistralai/Ministral-3-3B-Instruct-2512"),
+            reason="Model is gated — requires HuggingFace token with access",
+        ),
+    ),
+]
+
+
+def _build_mistral3_3model(model_id: str):
+    """Build Mistral3 (Pixtral) 3-model package with real weights."""
+    pkg = build(model_id, dtype="f32", load_weights=True)
+    return pkg
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.parametrize("model_id", _VL3_MISTRAL3_MODELS)
+class TestMistral3VL3Model:
+    """Integration tests for Mistral3 (Pixtral) 3-model split.
+
+    Mistral3 uses a LLaVA-style architecture:
+    - vision: PixtralVisionTower + Mistral3MultiModalProjector
+    - embedding: token lookup + image feature fusion
+    - decoder: standard CausalLM with 1D RoPE (not MRoPE)
+    """
+
+    def test_all_weights_assigned(self, model_id: str):
+        """Verify every ONNX initializer has weights."""
+        pkg = _build_mistral3_3model(model_id)
+
+        assert "decoder" in pkg
+        assert "vision" in pkg
+        assert "embedding" in pkg
+
+        for name, model in pkg.items():
+            for init_name, init in model.graph.initializers.items():
+                if init_name.startswith("const_"):
+                    continue
+                assert init.const_value is not None, (
+                    f"[{name}] Initializer '{init_name}' has no weights"
+                )
+
+    def test_decoder_prefill_logits_match(self, model_id: str):
+        """Decoder + embedding produce logits matching HF text-only forward."""
+        pkg = _build_mistral3_3model(model_id)
+        config = _get_config(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        torch_model.eval()
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+        prompt = "The capital of France is"
+        tokens = tokenizer(prompt, return_tensors="np")
+        input_ids = tokens["input_ids"].astype(np.int64)
+        attention_mask = tokens["attention_mask"].astype(np.int64)
+        seq_len = input_ids.shape[1]
+        # Mistral3 uses standard 1D position_ids (not MRoPE)
+        position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+        # HF reference (text-only forward, no image)
+        with torch.no_grad():
+            hf_out = torch_model(
+                input_ids=torch.from_numpy(input_ids),
+                attention_mask=torch.from_numpy(attention_mask),
+                position_ids=torch.from_numpy(position_ids),
+            )
+        hf_logits = hf_out.logits.numpy()
+
+        # ONNX: embedding (no image features for text-only)
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        image_features = np.zeros((1, config.hidden_size), dtype=np.float32)
+        embed_out = embed_sess.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+            }
+        )
+        embed_sess.close()
+        inputs_embeds = embed_out["inputs_embeds"]
+
+        # ONNX: decoder
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        decoder_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+            decoder_feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
+            decoder_feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
+
+        decoder_out = decoder_sess.run(decoder_feeds)
+        decoder_sess.close()
+
+        assert_logits_close(
+            decoder_out["logits"],
+            hf_logits,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_3model_vision_pipeline(self, model_id: str):
+        """Run full 3-model pipeline (vision→embedding→decoder) with image.
+
+        Processes a real image through all 3 ONNX models and compares
+        the decoder logits against the HuggingFace single-model forward.
+        """
+        pkg = _build_mistral3_3model(model_id)
+        config = _get_config(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        processor = transformers.AutoProcessor.from_pretrained(model_id)
+
+        image = Image.open("testdata/pipeline-cat-chonk.jpeg")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "What is this?"},
+                ],
+            }
+        ]
+        prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+        hf_inputs = processor(
+            text=prompt,
+            images=[image],
+            return_tensors="pt",
+        )
+
+        with torch.no_grad():
+            hf_out = torch_model(**hf_inputs, use_cache=False)
+        hf_logits = hf_out.logits.cpu().numpy()
+
+        # Step 1: ONNX vision model — pixel_values → image_features
+        pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
+
+        vision_session = OnnxModelSession(pkg["vision"])
+        vision_out = vision_session.run({"pixel_values": pixel_values})
+        vision_session.close()
+        image_features = vision_out["image_features"]
+
+        # Step 2: ONNX embedding model — fuse text + image features
+        input_ids = hf_inputs["input_ids"].numpy().astype(np.int64)
+
+        embedding_session = OnnxModelSession(pkg["embedding"])
+        embed_out = embedding_session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+            }
+        )
+        embedding_session.close()
+        inputs_embeds = embed_out["inputs_embeds"]
+
+        assert inputs_embeds.shape == (
+            1,
+            input_ids.shape[1],
+            config.hidden_size,
+        )
+
+        # Step 3: ONNX decoder with standard 1D position_ids
+        attention_mask = hf_inputs["attention_mask"].numpy().astype(np.int64)
+        seq_len = input_ids.shape[1]
+        position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+            decoder_feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
+            decoder_feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
+
+        decoder_out = decoder_session.run(decoder_feeds)
+        decoder_session.close()
+
+        # Looser tolerance for full VL pipeline (vision + embedding + decoder)
         assert_logits_close(
             decoder_out["logits"],
             hf_logits,
