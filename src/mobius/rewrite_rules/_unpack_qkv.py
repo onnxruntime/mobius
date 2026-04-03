@@ -107,7 +107,7 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         if len(matmul.inputs) < 2:
             return result.fail("MatMul has fewer than 2 inputs")
 
-        # The second MatMul input must be Transpose(W_constant)
+        # The second MatMul input must be Transpose(...)
         w_t = matmul.inputs[1]
         if w_t is None:
             return result.fail("MatMul weight input is None")
@@ -115,14 +115,28 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         if w_transpose is None or w_transpose.op_type != "Transpose":
             return result.fail("MatMul weight not produced by Transpose")
 
-        w_const = w_transpose.inputs[0]
-        if w_const is None:
+        w_inner = w_transpose.inputs[0]
+        if w_inner is None:
             return result.fail("Transpose input is None")
-        w_tensor = ir.convenience.get_const_tensor(w_const)
-        if w_tensor is None:
-            return result.fail("Packed weight is not a constant")
 
-        # Validate we can split: need num_heads + kv_num_heads to be set
+        # Case 1 (new): Transpose(Concat(W_q, W_k, W_v, axis=0))
+        # The Concat node holds individual weight parameters.
+        concat_node = w_inner.producer()
+        if concat_node is not None and concat_node.op_type == "Concat":
+            if len(concat_node.inputs) != 3:
+                return result.fail("Concat does not have exactly 3 inputs")
+            # All Concat inputs must be graph parameters (no producer)
+            for w in concat_node.inputs:
+                if w is None or w.producer() is not None:
+                    return result.fail("Concat input is not a graph parameter")
+            return result
+
+        # Case 2 (legacy): Transpose(W_qkv) where W_qkv is a constant initializer.
+        # Keep this path so models packed with the old numpy-based approach still work.
+        w_tensor = ir.convenience.get_const_tensor(w_inner)
+        if w_tensor is None:
+            return result.fail("Packed weight is neither Concat nor a constant")
+
         num_heads = gqa_node.attributes.get_int("num_heads", None)
         kv_num_heads = gqa_node.attributes.get_int("kv_num_heads", None)
         if num_heads is None or kv_num_heads is None:
@@ -136,12 +150,11 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                 f"not divisible by total_heads={total_heads}"
             )
 
-        # Pre-compute split weights so they're available in rewrite()
+        # Pre-compute split weights for use in rewrite()
         w_np = w_tensor.numpy()  # shape: (total_out, hidden)
         head_dim = total_out // total_heads
         q_size = num_heads * head_dim
         k_size = kv_num_heads * head_dim
-
         self._split_weights = (
             w_np[:q_size, :],
             w_np[q_size : q_size + k_size, :],
@@ -152,27 +165,38 @@ class GQAUnpackQKV(RewriteRuleClassBase):
     # ------------------------------------------------------------------ rewrite
 
     def rewrite(self, op, packed_qkv, gqa_out, present_key, present_value, **_):
-        assert self._split_weights is not None
-        w_q, w_k, w_v = self._split_weights
-        self._split_weights = None
-
         gqa_node = gqa_out.producer()
         matmul = packed_qkv.producer()
         hidden_states = matmul.inputs[0]
 
-        # Store split weights as initializers and project separately.
+        w_transpose = matmul.inputs[1].producer()
+        w_inner = w_transpose.inputs[0]
+        concat_node = w_inner.producer()
+
         self._counter += 1
         suffix = self._counter
 
-        def _proj(w: np.ndarray, name: str) -> ir.Value:
-            init = op.initializer(ir.Tensor(w, name=name), name=name)
-            return op.MatMul(hidden_states, op.Transpose(init, perm=[1, 0]))
+        if concat_node is not None and concat_node.op_type == "Concat":
+            # New graph-level form: Concat(w_q, w_k, w_v) — just rewire directly.
+            w_q, w_k, w_v = concat_node.inputs
+            q = op.MatMul(hidden_states, op.Transpose(w_q, perm=[1, 0]))
+            k = op.MatMul(hidden_states, op.Transpose(w_k, perm=[1, 0]))
+            v = op.MatMul(hidden_states, op.Transpose(w_v, perm=[1, 0]))
+        else:
+            # Legacy form: single constant initializer — split with numpy.
+            assert self._split_weights is not None
+            w_q, w_k, w_v = self._split_weights
+            self._split_weights = None
 
-        q = _proj(w_q, f"unpack_q_weight_{suffix}")
-        k = _proj(w_k, f"unpack_k_weight_{suffix}")
-        v = _proj(w_v, f"unpack_v_weight_{suffix}")
+            def _proj(w: np.ndarray, name: str) -> ir.Value:
+                init = op.initializer(ir.Tensor(w, name=name), name=name)
+                return op.MatMul(hidden_states, op.Transpose(init, perm=[1, 0]))
 
-        # Rebuild GQA with separate Q/K/V — keep all existing attributes
+            q = _proj(w_q, f"unpack_q_weight_{suffix}")
+            k = _proj(w_k, f"unpack_k_weight_{suffix}")
+            v = _proj(w_v, f"unpack_v_weight_{suffix}")
+
+        # Rebuild GQA with separate Q/K/V — preserve all existing attributes
         # and remaining inputs (past_key, past_value, seqlens_k, total_seq, ...).
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
         remaining = list(gqa_node.inputs[3:])  # everything after the packed slot

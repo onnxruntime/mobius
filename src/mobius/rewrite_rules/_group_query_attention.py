@@ -29,7 +29,6 @@ These rules are **not applied by default**.  Apply them post-export::
 
 from __future__ import annotations
 
-import numpy as np
 import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchFailureError, MatchResult
 from onnxscript.rewriter._rewrite_rule import (
@@ -234,33 +233,29 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 # ====================================================================
 
 
-def _get_weight_tensor(weight: ir.Value) -> np.ndarray:
-    """Return a weight as a numpy array with shape ``(out_features, hidden_size)``.
+def _get_underlying_weight(weight: ir.Value) -> ir.Value:
+    """Return the underlying weight parameter (out_features x hidden_size).
 
     Handles two patterns:
 
-    1. ``Transpose(constant, perm=[1,0])`` — the constant already has
-       shape ``(out_features, hidden_size)``, returned as-is.
-    2. Plain constant — shape ``(hidden_size, out_features)``, transposed
-       before returning.
+    1. ``Transpose(W, perm=[1, 0])`` — the input ``W`` has shape
+       ``(out_features, hidden_size)``.  Returns ``W`` directly.
+    2. Plain graph input — assumed to be ``(out_features, hidden_size)``
+       already.  Returns *weight* unchanged.
 
-    Raises:
-        ``MatchFailureError`` if *weight* is not a constant (possibly
-        behind a Transpose).
+    Raises ``MatchFailureError`` if *weight* is produced by something
+    other than a Transpose of a graph parameter.
     """
     producer = weight.producer()
-    if producer is not None and producer.op_type == "Transpose":
-        perm = producer.attributes.get("perm", None)
-        if perm is not None and list(perm.value) == [1, 0]:
-            tensor = ir.convenience.get_const_tensor(producer.inputs[0])
-            if tensor is not None:
-                return tensor.numpy()
-
-    tensor = ir.convenience.get_const_tensor(weight)
-    if tensor is not None:
-        return tensor.numpy().T
-
-    raise MatchFailureError(f"weight {weight.name} is not a constant")
+    if producer is not None:
+        if producer.op_type == "Transpose":
+            underlying = producer.inputs[0]
+            if underlying is not None and underlying.producer() is None:
+                # underlying is a graph input (parameter) — good
+                return underlying
+        raise MatchFailureError(f"weight {weight.name!r} is not a graph parameter")
+    # weight itself is a graph input (no Transpose wrapping)
+    return weight
 
 
 class PackQKVForGQA(RewriteRuleClassBase):
@@ -277,33 +272,37 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
     .. code-block:: text
 
-        q = MatMul(hidden, W_q)
-        k = MatMul(hidden, W_k)
-        v = MatMul(hidden, W_v)
+        q = MatMul(hidden, Transpose(W_q))
+        k = MatMul(hidden, Transpose(W_k))
+        v = MatMul(hidden, Transpose(W_v))
         out, pkey, pval = GroupQueryAttention(q, k, v, ...)
+
+    Where ``W_q``, ``W_k``, ``W_v`` are graph parameters (initializers).
 
     **Replacement:**
 
     .. code-block:: text
 
-        W_qkv = concatenate([W_q, W_k, W_v])  # normalized to (out, hidden)
-        packed = MatMul(hidden, Transpose(W_qkv))
+        W_qkv = Concat(W_q, W_k, W_v, axis=0)   # (q_out+k_out+v_out, hidden)
+        packed  = MatMul(hidden, Transpose(W_qkv))
         out, pkey, pval = GroupQueryAttention(packed, None, None, ...)
 
-    Each weight is independently normalized to ``(out_features,
-    hidden_size)`` before concatenation, so mixed transpose patterns
-    across Q/K/V are handled correctly.  The packed weight is stored as
-    a graph initializer (not a ``Constant`` node attribute) so it can
-    be serialised to external data files for large models.
+    The packed weight is expressed as a ``Concat`` graph node so that
+    the rule fires without requiring actual weight data (weights may be
+    applied to the model after optimization).  A subsequent
+    ``FoldConstantsPass`` collapses the ``Concat`` into a single
+    initializer once weights are loaded.
+
+    Models with QK norm (e.g. Qwen3) are unaffected because the Q/K
+    projections are followed by a normalization op, so the pattern does
+    not match.
     """
 
     _pack_counter: int
-    _qkv_wt_transposed: np.ndarray | None
 
     def __init__(self):
         super().__init__()
         self._pack_counter = 0
-        self._qkv_wt_transposed = None
 
     # ------------------------------------------------------------------ pattern
 
@@ -325,14 +324,11 @@ class PackQKVForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ check
 
     def check(self, context, q_w, k_w, v_w, **_):
-        # Extract weights normalized to (out_features, hidden_size).
-        # Raises MatchFailureError if any weight is not a constant.
-        q_np = _get_weight_tensor(q_w)
-        k_np = _get_weight_tensor(k_w)
-        v_np = _get_weight_tensor(v_w)
-
-        # Concatenate along axis=0: all weights are (out, hidden)
-        self._qkv_wt_transposed = np.concatenate([q_np, k_np, v_np], axis=0)
+        # Verify all three projection weights are traceable to graph parameters.
+        # Raises MatchFailureError if any weight is a computed (non-parameter) value.
+        _get_underlying_weight(q_w)
+        _get_underlying_weight(k_w)
+        _get_underlying_weight(v_w)
         return True
 
     # ------------------------------------------------------------------ rewrite
@@ -341,18 +337,24 @@ class PackQKVForGQA(RewriteRuleClassBase):
         self,
         op,
         hidden,
+        q_w,
+        k_w,
+        v_w,
         gqa_out,
         present_key,
         present_value,
         **_,
     ):
-        # Store packed weight as a graph initializer
-        self._pack_counter += 1
-        w_name = f"packed_qkv_weight_{self._pack_counter}"
-        packed_w = op.initializer(ir.Tensor(self._qkv_wt_transposed, name=w_name), name=w_name)
-        self._qkv_wt_transposed = None
+        # Recover the underlying (out_features, hidden_size) weight parameters.
+        w_q = _get_underlying_weight(q_w)
+        w_k = _get_underlying_weight(k_w)
+        w_v = _get_underlying_weight(v_w)
 
-        # Transpose + MatMul for the packed projection
+        # Concat along output dimension: (q_out + k_out + v_out, hidden)
+        # This is a graph-level op so it works without actual weight data.
+        # A FoldConstantsPass after apply_weights() collapses it to one initializer.
+        self._pack_counter += 1
+        packed_w = op.Concat(w_q, w_k, w_v, axis=0)
         packed_w_t = op.Transpose(packed_w, perm=[1, 0])
         packed_qkv = op.MatMul(hidden, packed_w_t)
 
@@ -379,19 +381,27 @@ class PackQKVForGQA(RewriteRuleClassBase):
 def group_query_attention_rules() -> RewriteRuleSet:
     """Return rules that fuse RotaryEmbedding + Attention into GQA.
 
-    The rule set contains two rules applied in order:
-
-    1. ``RotaryAttentionToGQA`` -- fuses RotaryEmbedding + Attention into
-       ``GroupQueryAttention`` with separate Q, K, V inputs.
-    2. ``PackQKVForGQA`` -- consolidates the three separate Q/K/V
-       projection MatMuls into a single packed MatMul when possible.
+    Contains only the ``RotaryAttentionToGQA`` rule.  QKV packing is a
+    separate optional pass; use :func:`pack_qkv_for_gqa_rules` for that.
 
     Returns:
-        :class:`RewriteRuleSet` containing both rules.
+        :class:`RewriteRuleSet` containing the GQA fusion rule.
     """
-    return RewriteRuleSet(
-        [
-            RotaryAttentionToGQA().rule(),
-            PackQKVForGQA().rule(),
-        ]
-    )
+    return RewriteRuleSet([RotaryAttentionToGQA().rule()])
+
+
+def pack_qkv_for_gqa_rules() -> RewriteRuleSet:
+    """Return rules that pack Q/K/V projections into a single MatMul.
+
+    This rule set runs **after** :func:`group_query_attention_rules` and
+    consolidates the three separate Q/K/V projection MatMuls feeding a
+    ``GroupQueryAttention`` node into a single packed MatMul.
+
+    Only applies when the EP's ``packed_attn_dtypes`` includes the
+    current model dtype.  The caller is responsible for gating on that
+    condition.
+
+    Returns:
+        :class:`RewriteRuleSet` containing the ``PackQKVForGQA`` rule.
+    """
+    return RewriteRuleSet([PackQKVForGQA().rule()])

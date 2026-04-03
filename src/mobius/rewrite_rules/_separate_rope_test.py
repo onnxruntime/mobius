@@ -9,7 +9,7 @@ from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius.models.base import CausalLMModel
-from mobius.rewrite_rules import separate_rope_rules
+from mobius.rewrite_rules import group_query_attention_rules, separate_rope_rules
 from mobius.rewrite_rules._testing_utils import count_ops
 
 # Tiny GQA-friendly config — no QK norm so GQA fusion works
@@ -31,11 +31,19 @@ _CONFIG = ArchitectureConfig(
 
 
 def _build_gqa_model() -> object:
-    """Build a model with GQA fusion applied (do_rotary=1)."""
+    """Build a model with GQA fusion applied (do_rotary=1), without QKV packing.
+
+    SeparateRoPE operates on a GQA-fused model that still has separate Q/K/V
+    projections — not the packed form.  Build with the default EP (no
+    optimization pipeline), then manually apply only the GQA fusion rules so
+    that do_rotary=1 is set but k/v inputs remain non-None.
+    """
     mod = CausalLMModel(_CONFIG)
-    # DML rules operate on a GQA-fused model, so build with cpu EP to get GQA.
-    pkg = build_from_module(mod, _CONFIG, execution_provider="cpu")
-    return pkg["model"]
+    pkg = build_from_module(mod, _CONFIG, execution_provider="default")
+    model = pkg["model"]
+    # Apply only GQA fusion (not PackQKV) so k/v inputs remain non-None.
+    rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
+    return model
 
 
 class TestSeparateRopeRules:

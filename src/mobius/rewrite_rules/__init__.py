@@ -34,6 +34,7 @@ __all__ = [
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "layer_norm_fusion_rules",
+    "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
     "separate_rope_rules",
     "skip_layer_norm_rules",
@@ -47,6 +48,7 @@ from mobius.rewrite_rules._fused_matmul import fused_matmul_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
+    pack_qkv_for_gqa_rules,
 )
 from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,

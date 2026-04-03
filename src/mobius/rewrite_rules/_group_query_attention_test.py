@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
@@ -13,7 +12,7 @@ from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig, Gemma2Config
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.rewrite_rules import group_query_attention_rules
+from mobius.rewrite_rules import group_query_attention_rules, pack_qkv_for_gqa_rules
 from mobius.rewrite_rules._testing_utils import (
     count_ops,
     fill_random_weights,
@@ -206,39 +205,51 @@ class TestGroupQueryAttentionRules:
 
         matmul_before = count_ops(m)["MatMul"]
 
+        # GQA fusion must run first; PackQKV is a separate pass.
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
         matmul_after = count_ops(m)["MatMul"]
         num_layers = _LLAMA_CONFIG.num_hidden_layers
         # 3 separate Q/K/V MatMuls -> 1 packed MatMul per layer = -2 per layer
         assert matmul_after == matmul_before - 2 * num_layers
 
-    def test_packed_weight_shape_is_correct(self):
-        """Packed W_qkv has shape (q_dim + 2*kv_dim, hidden_size)."""
+    def test_packed_weight_uses_concat_node(self):
+        """Packed QKV uses a graph-level Concat(w_q, w_k, w_v).
+
+        Packing must work without weight data since optimization runs
+        before apply_weights.
+        """
         model = registry.get("llama")(_LLAMA_CONFIG)
         pkg = build_from_module(model, _LLAMA_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+
+        # The packed GQA receives MatMul(hidden, Transpose(Concat(W_q, W_k, W_v)))
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == _LLAMA_CONFIG.num_hidden_layers
 
         q_dim = _LLAMA_CONFIG.num_attention_heads * _LLAMA_CONFIG.head_dim
         kv_dim = _LLAMA_CONFIG.num_key_value_heads * _LLAMA_CONFIG.head_dim
         hidden = _LLAMA_CONFIG.hidden_size
-        expected_shape = (q_dim + 2 * kv_dim, hidden)
 
-        # Packed weights are stored as graph initializers
-        found = False
-        for init in m.graph.initializers.values():
-            if init.const_value is None:
-                continue
-            if tuple(init.const_value.shape) == expected_shape:
-                arr = init.const_value.numpy()
-                assert arr.dtype == np.float32
-                assert not np.any(np.isnan(arr))
-                found = True
-                break
-        assert found, f"No packed weight initializer with shape {expected_shape}"
+        for gqa in gqa_nodes:
+            assert gqa.inputs[1] is None, "GQA should be in packed mode (k=None)"
+            assert gqa.inputs[2] is None, "GQA should be in packed mode (v=None)"
+            packed_proj = gqa.inputs[0]
+            matmul = packed_proj.producer()
+            assert matmul is not None and matmul.op_type == "MatMul"
+            concat = matmul.inputs[1].producer().inputs[0].producer()
+            assert concat is not None and concat.op_type == "Concat"
+            w_q, w_k, w_v = concat.inputs
+            # Verify individual weight shapes via const_value (set by fill_random_weights)
+            assert w_q.const_value is not None
+            assert tuple(w_q.const_value.shape) == (q_dim, hidden)
+            assert tuple(w_k.const_value.shape) == (kv_dim, hidden)
+            assert tuple(w_v.const_value.shape) == (kv_dim, hidden)
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
         """Qwen3 (QK norm) falls back; MatMul count unchanged."""
@@ -250,10 +261,11 @@ class TestGroupQueryAttentionRules:
         matmul_before = count_ops(m)["MatMul"]
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
         # GQA should still be applied
         assert count_ops(m)["GroupQueryAttention"] == 2
-        # But MatMul count should not decrease (no packing)
+        # But MatMul count should not decrease (no packing due to QK norm)
         assert count_ops(m)["MatMul"] == matmul_before
 
     def test_packed_model_runs_with_ort(self):
@@ -264,6 +276,7 @@ class TestGroupQueryAttentionRules:
         fill_random_weights(m)
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
         assert count_ops(m)["GroupQueryAttention"] == 2
 
         session = OnnxModelSession(m)
@@ -283,6 +296,7 @@ class TestGroupQueryAttentionRules:
         fill_random_weights(m)
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
         rewrite(m, pattern_rewrite_rules=skip_norm_rules())
 
         counts = count_ops(m)
@@ -308,8 +322,9 @@ class TestGroupQueryAttentionRules:
 
         matmul_before = count_ops(m)["MatMul"]
 
-        # GQA (with packing) runs first — sees plain MatMul nodes
+        # GQA fusion runs first, then QKV packing — sees plain MatMul nodes
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
         counts_after_gqa = count_ops(m)
         assert counts_after_gqa["GroupQueryAttention"] == 2
         num_layers = _LLAMA_CONFIG.num_hidden_layers

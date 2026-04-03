@@ -243,6 +243,7 @@ def _get_optimization_passes(
         eliminate_shape_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
+        pack_qkv_for_gqa_rules,
         separate_rope_rules,
         skip_layer_norm_rules,
         skip_norm_rules,
@@ -255,6 +256,10 @@ def _get_optimization_passes(
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
         fuse.append(("GQAFusion", list(group_query_attention_rules())))
+
+    # --- QKV packing (decoder only, gated by packed_attn_dtypes) ---
+    if model_role == "decoder" and dtype in caps.packed_attn_dtypes:
+        fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
 
     # --- Normalization fusions (all roles, all dtypes) ---
     # When supports_skip_layer_norm=False (e.g. trt-rtx), fusion is skipped;
