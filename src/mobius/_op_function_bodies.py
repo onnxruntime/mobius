@@ -24,26 +24,15 @@ Adding a new custom op with a portable fallback:
   1. Define a ``_build_<name>_function()`` helper below.
   2. Add it to :data:`_FUNCTION_BUILDERS`.
   3. Done — no rewrite rule needed.
+
+All function bodies are built using onnxscript.ir APIs directly (ir.Graph,
+ir.Node, ir.Function) — never through onnx.helper / protobuf helpers.
 """
 
 from __future__ import annotations
 
-import functools
-
-import onnx
-import onnx.helper as helper
 import onnx_ir as ir
-import onnx_ir.serde as serde
-from onnx import AttributeProto
-
-
-def _attr_ref(name: str, attr_type: int) -> AttributeProto:
-    """Return an attribute reference proto for forwarding a function-level attribute."""
-    ref = AttributeProto()
-    ref.name = name
-    ref.type = attr_type
-    ref.ref_attr_name = name
-    return ref
+from onnxscript._internal import builder
 
 
 def _build_skip_layer_norm_function() -> ir.Function:
@@ -53,35 +42,59 @@ def _build_skip_layer_norm_function() -> ir.Function:
 
         add_out  = Add(input, skip)
         norm_out, mean_out, inv_std_out = LayerNormalization(
-            add_out, weight, bias, epsilon=epsilon, axis=-1
+            add_out, weight, bias, axis=-1, epsilon=<forwarded>
         )
-        # add_out is also exposed as skip_out (the unnormalized sum)
+        # add_out is also exposed as the unnormalized residual sum
 
-    Inputs:  ``[input, skip, weight, bias]``  (``bias`` is optional — may be
-             ``None`` at the call site; LayerNormalization accepts optional B).
+    Inputs:  ``[input, skip, weight, bias]``  (``bias`` may be absent at the
+             call site; LayerNormalization accepts optional B).
     Outputs: ``[norm_out, mean_out, inv_std_out, add_out]``
     Attr:    ``epsilon`` (float)
     """
-    add = helper.make_node("Add", inputs=["input", "skip"], outputs=["add_out"])
-    ln = helper.make_node(
+    v_input = ir.Value(name="input")
+    v_skip = ir.Value(name="skip")
+    v_weight = ir.Value(name="weight")
+    v_bias = ir.Value(name="bias")
+
+    graph = ir.Graph(
+        inputs=[v_input, v_skip, v_weight, v_bias],
+        outputs=[],
+        nodes=[],
+        name="SkipLayerNormalization_body",
+        opset_imports={"": 17},
+    )
+    gb = builder.GraphBuilder(graph)
+    op = gb.op
+
+    # add_out = Add(input, skip)  — the unnormalized residual sum
+    add_out = op.Add(v_input, v_skip)
+
+    # LayerNormalization(add_out, weight, bias, axis=-1, epsilon=<from caller>)
+    # Multi-output node — construct ir.Node directly so we can forward epsilon.
+    # LayerNormalization has 3 outputs: Y (required), Mean (optional), InvStdDev (optional).
+    ln_node = ir.Node(
+        "",
         "LayerNormalization",
-        inputs=["add_out", "weight", "bias"],
-        outputs=["norm_out", "mean_out", "inv_std_out"],
+        inputs=[add_out, v_weight, v_bias],
+        attributes=[
+            ir.Attr("axis", ir.AttributeType.INT, -1),
+            # ref_attr_name="epsilon" means InlinePass substitutes the
+            # caller's epsilon value when expanding this function body.
+            ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5, ref_attr_name="epsilon"),
+        ],
+        num_outputs=3,
     )
-    ln.attribute.extend([
-        helper.make_attribute("axis", -1),
-        _attr_ref("epsilon", AttributeProto.FLOAT),
-    ])
-    proto = helper.make_function(
+    graph.append(ln_node)
+    norm_out, mean_out, inv_std_out = ln_node.outputs
+
+    graph.outputs.extend([norm_out, mean_out, inv_std_out, add_out])
+
+    return ir.Function(
         domain="com.microsoft",
-        fname="SkipLayerNormalization",
-        inputs=["input", "skip", "weight", "bias"],
-        outputs=["norm_out", "mean_out", "inv_std_out", "add_out"],
-        nodes=[add, ln],
-        opset_imports=[helper.make_opsetid("", 17)],
-        attributes=["epsilon"],
+        name="SkipLayerNormalization",
+        graph=graph,
+        attributes={"epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5)},
     )
-    return serde.deserialize_function(proto)
 
 
 def _build_skip_simplified_layer_norm_function() -> ir.Function:
@@ -90,29 +103,51 @@ def _build_skip_simplified_layer_norm_function() -> ir.Function:
     Standard-ONNX body::
 
         add_out  = Add(input, skip)
-        norm_out = RMSNormalization(add_out, weight, epsilon=epsilon)
+        norm_out = RMSNormalization(add_out, weight, epsilon=<forwarded>)
 
     Inputs:  ``[input, skip, weight]``
     Outputs: ``[norm_out, add_out]``
     Attr:    ``epsilon`` (float)
     """
-    add = helper.make_node("Add", inputs=["input", "skip"], outputs=["add_out"])
-    rms = helper.make_node(
+    v_input = ir.Value(name="input")
+    v_skip = ir.Value(name="skip")
+    v_weight = ir.Value(name="weight")
+
+    graph = ir.Graph(
+        inputs=[v_input, v_skip, v_weight],
+        outputs=[],
+        nodes=[],
+        name="SkipSimplifiedLayerNormalization_body",
+        opset_imports={"": 23},
+    )
+    gb = builder.GraphBuilder(graph)
+    op = gb.op
+
+    # add_out = Add(input, skip)
+    add_out = op.Add(v_input, v_skip)
+
+    # RMSNormalization(add_out, weight, epsilon=<from caller>)
+    # Schema at opset 23: single output Y only (no InvStdDev).
+    rms_node = ir.Node(
+        "",
         "RMSNormalization",
-        inputs=["add_out", "weight"],
-        outputs=["norm_out"],
+        inputs=[add_out, v_weight],
+        attributes=[
+            ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5, ref_attr_name="epsilon"),
+        ],
+        num_outputs=1,
     )
-    rms.attribute.append(_attr_ref("epsilon", AttributeProto.FLOAT))
-    proto = helper.make_function(
+    graph.append(rms_node)
+    norm_out = rms_node.outputs[0]
+
+    graph.outputs.extend([norm_out, add_out])
+
+    return ir.Function(
         domain="com.microsoft",
-        fname="SkipSimplifiedLayerNormalization",
-        inputs=["input", "skip", "weight"],
-        outputs=["norm_out", "add_out"],
-        nodes=[add, rms],
-        opset_imports=[helper.make_opsetid("", 23)],
-        attributes=["epsilon"],
+        name="SkipSimplifiedLayerNormalization",
+        graph=graph,
+        attributes={"epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5)},
     )
-    return serde.deserialize_function(proto)
 
 
 def _build_simplified_layer_norm_function() -> ir.Function:
@@ -123,28 +158,45 @@ def _build_simplified_layer_norm_function() -> ir.Function:
 
     Standard-ONNX body::
 
-        out = RMSNormalization(x, weight, epsilon=epsilon)
+        out = RMSNormalization(x, weight, epsilon=<forwarded>)
 
     Inputs:  ``[x, weight]``
     Outputs: ``[out]``
     Attr:    ``epsilon`` (float)
     """
-    rms = helper.make_node(
+    v_x = ir.Value(name="x")
+    v_weight = ir.Value(name="weight")
+
+    graph = ir.Graph(
+        inputs=[v_x, v_weight],
+        outputs=[],
+        nodes=[],
+        name="SimplifiedLayerNormalization_body",
+        opset_imports={"": 23},
+    )
+
+    # RMSNormalization(x, weight, epsilon=<from caller>)
+    # Schema at opset 23: single output Y only.
+    rms_node = ir.Node(
+        "",
         "RMSNormalization",
-        inputs=["x", "weight"],
-        outputs=["out"],
+        inputs=[v_x, v_weight],
+        attributes=[
+            ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5, ref_attr_name="epsilon"),
+        ],
+        num_outputs=1,
     )
-    rms.attribute.append(_attr_ref("epsilon", AttributeProto.FLOAT))
-    proto = helper.make_function(
+    graph.append(rms_node)
+    out = rms_node.outputs[0]
+
+    graph.outputs.extend([out])
+
+    return ir.Function(
         domain="com.microsoft",
-        fname="SimplifiedLayerNormalization",
-        inputs=["x", "weight"],
-        outputs=["out"],
-        nodes=[rms],
-        opset_imports=[helper.make_opsetid("", 23)],
-        attributes=["epsilon"],
+        name="SimplifiedLayerNormalization",
+        graph=graph,
+        attributes={"epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5)},
     )
-    return serde.deserialize_function(proto)
 
 
 # Lazy-built singletons keyed by (domain, name, overload).
