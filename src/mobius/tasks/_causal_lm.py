@@ -75,8 +75,6 @@ class CausalLMTask(ModelTask):
             ``config.max_position_embeddings``.
     """
 
-    supports_concrete_dims: bool = True
-
     def __init__(
         self,
         *,
@@ -106,8 +104,8 @@ class CausalLMTask(ModelTask):
                 )
             _validate_static_cache_support(module)
 
-        # --- Graph input dims (symbolic or concrete for WebGPU) ---
-        batch, seq_len = self._create_dims(self.use_concrete_dims)
+        # --- Graph input dims ---
+        batch, seq_len = self._create_dims()
 
         # --- Inputs common to both modes ---
         input_ids = ir.Value(

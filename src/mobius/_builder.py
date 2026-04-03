@@ -26,7 +26,6 @@ __all__ = [
 
 import dataclasses
 import logging
-import warnings
 
 import onnx_ir as ir
 import torch
@@ -36,7 +35,6 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
 )
-from mobius._execution_providers import ep_registry
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
@@ -184,19 +182,6 @@ def build_from_module(
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
-
-    # Derive structural flags from EP capabilities.
-    # Unknown EPs fall back to no structural constraints (validated in optimize_model()).
-    _caps = ep_registry.get(execution_provider)
-    use_concrete_dims = _caps is not None and not _caps.supports_shape
-
-    if use_concrete_dims and not resolved_task.supports_concrete_dims:
-        warnings.warn(
-            f"{type(resolved_task).__name__} does not support use_concrete_dims; "
-            f"concrete input dimensions requested by EP '{execution_provider}' will be ignored.",
-            stacklevel=3,
-        )
-    resolved_task.use_concrete_dims = use_concrete_dims
     pkg = resolved_task.build(module, config)
 
     for name, model in pkg.items():
