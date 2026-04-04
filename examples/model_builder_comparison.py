@@ -20,7 +20,16 @@ Compare a single model across all EPs (no weights downloaded — fast):
         --ep-list default,cuda,dml,webgpu \\
         --no-ort
 
-Compare against ORT GenAI builder (builds on-the-fly, downloads weights):
+Compare against ORT GenAI builder — ALL EPs by default (no --ep needed):
+
+    ORT_GENAI_REPO=/path/to/onnxruntime-genai \\
+    python examples/model_builder_comparison.py \\
+        --model meta-llama/Llama-3.2-1B
+
+  This shows a wide table: Op | ORT GenAI | default | cuda | dml | webgpu | ...
+  with a per-EP verdict row at the bottom.
+
+Compare a single specific EP against ORT GenAI:
 
     ORT_GENAI_REPO=/path/to/onnxruntime-genai \\
     python examples/model_builder_comparison.py \\
@@ -285,6 +294,9 @@ class ModelReport:
         default_factory=list
     )  # Non-empty → QK-norm invariant violated
     expected_counts: dict[str, int] | None = None
+    # Per-mobius-column verdict for ORT-all-EPs mode.
+    # Each entry is (ep_name, verdict, reason) for one mobius column.
+    per_ep_verdicts: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -330,6 +342,22 @@ def _op_counts_from_file(path: str | Path) -> OpCounts:
     counts = _count_ops(model)
     total = sum(counts.values())
     return OpCounts(label="ort-genai (file)", counts=counts, total_nodes=total, source="file")
+
+
+def _detect_model_dtype(model_id: str):
+    """Return the ir.DataType for a HuggingFace model, defaulting to FLOAT."""
+    import onnx_ir as ir
+    import transformers
+
+    from mobius._configs import _resolve_dtype
+
+    try:
+        hf_config = transformers.AutoConfig.from_pretrained(model_id)
+        resolved = _resolve_dtype(hf_config)
+    except Exception:
+        return ir.DataType.FLOAT
+    else:
+        return resolved if resolved is not None else ir.DataType.FLOAT
 
 
 def build_mobius(model_id: str, ep: str, load_weights: bool = False) -> OpCounts:
@@ -429,19 +457,25 @@ def _ep_differences(cols: list[OpCounts]) -> list[str]:
 
 
 def _compute_verdict(
-    cols: list[OpCounts], model_id: str = ""
+    cols: list[OpCounts],
+    model_id: str = "",
+    extra_known_diff_ops: frozenset[str] | None = None,
 ) -> tuple[str, str, list[str], list[str]]:
     """Return (verdict, reason, differences_list, qk_norm_issues).
 
+    extra_known_diff_ops: additional ops to treat as KNOWN_DIFF rather than FAIL,
+        e.g. when an EP is known not to support GQA at the build dtype.
+
     Verdicts:
-      PASS    — all critical ops match across all columns, no unexplained diff
-      PARTIAL — critical ops match but benign ops differ (known acceptable)
-      FAIL    — critical ops differ across columns
-      MOBIUS-ONLY — only one column, no comparison possible
+      PASS         — all critical ops match across all columns
+      KNOWN_DIFF   — critical ops match; benign/explained ops differ
+      FAIL         — critical ops differ unexpectedly
+      MOBIUS-ONLY  — only one column, no cross-builder comparison
     """
     if len(cols) < 2:
         return "MOBIUS-ONLY", "Single builder — no cross-builder comparison.", [], []
 
+    effective_critical = _CRITICAL_OPS - (extra_known_diff_ops or frozenset())
     differences: list[str] = []
     critical_fail = False
 
@@ -453,7 +487,7 @@ def _compute_verdict(
         label = OP_LABEL.get(op, op)
         expl = OP_EXPLANATION.get(op, "")
         differences.append(f"**{label}** ({op}): {vals}  \n  ↳ {expl}")
-        if op in _CRITICAL_OPS:
+        if op in effective_critical:
             critical_fail = True
 
     # Run QK-norm invariant checks for known QK-norm model families.
@@ -525,6 +559,33 @@ def _console_table(report: ModelReport, color: bool) -> str:
     )
     lines.append(total)
     lines.append(sep)
+
+    # Per-EP verdict row for ORT-all-EPs mode.
+    # Columns: first is ORT GenAI (no verdict), rest are per-EP mobius verdicts.
+    if report.per_ep_verdicts:
+        use_color = color and sys.stdout.isatty()
+        # Build per-column verdict cells (ORT GenAI column = blank)
+        ort_cols = [c for c in cols if c.source == "ort-genai"]
+        verdict_cells: list[str] = []
+        if ort_cols:
+            verdict_cells.append(f"{'(reference)':^{col_w}}")
+        mob_ep_idx = 0
+        for c in cols:
+            if c.source != "ort-genai":
+                if mob_ep_idx < len(report.per_ep_verdicts):
+                    _ep_name, v, _reason = report.per_ep_verdicts[mob_ep_idx]
+                    icon = _VERDICT_ICON.get(v, "?")
+                    vc = _VERDICT_COLOR.get(v, "") if use_color else ""
+                    rc = _RESET if use_color else ""
+                    cell = f"{vc}{icon} {v}{rc}"
+                    # Pad to col_w (icons are multi-byte; use label width approximation)
+                    verdict_cells.append(f"{cell:^{col_w}}")
+                    mob_ep_idx += 1
+                else:
+                    verdict_cells.append(f"{'':^{col_w}}")
+        verdict_row = f"  {'Verdict':<{op_w}}  " + "  ".join(verdict_cells)
+        lines += [verdict_row, sep]
+
     return "\n".join(lines)
 
 
@@ -700,6 +761,20 @@ def render_markdown(report: ComparisonReport) -> str:
         # Total row
         total_cells = "".join(f" **{c.total_nodes}** |" for c in cols)
         lines.append(f"| **Total nodes** |{total_cells}  |")
+
+        # Per-EP verdict row for ORT-all-EPs mode
+        if mr.per_ep_verdicts:
+            ort_cols_md = [c for c in cols if c.source == "ort-genai"]
+            verdict_cells_md = ["*(reference)*"] if ort_cols_md else []
+            for _, v, _r in mr.per_ep_verdicts:
+                icon = _VERDICT_ICON.get(v, "?")
+                verdict_cells_md.append(f"{icon} **{v}**")
+            # Pad to match non-ep columns
+            while len(verdict_cells_md) < len(cols):
+                verdict_cells_md.append("")
+            vc_row = "".join(f" {cell} |" for cell in verdict_cells_md)
+            lines.append(f"| **Verdict** |{vc_row}  |")
+
         lines.append("")
 
         if mr.differences:
@@ -906,9 +981,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--ep",
-        default="cuda",
+        default=None,
         metavar="EP",
-        help=f"Target EP for both builders (default: cuda). Available: {', '.join(all_eps)}.",
+        help=(
+            f"Target EP (default: unset). When --ort-genai-repo is provided and --ep is "
+            f"not set, all registered EPs are compared side-by-side. "
+            f"Available: {', '.join(all_eps)}."
+        ),
     )
     parser.add_argument(
         "--ep-list",
@@ -982,8 +1061,23 @@ def main() -> None:
     else:
         models = [DEFAULT_MODEL]
 
-    eps: list[str] = args.ep_list.split(",") if args.ep_list else [args.ep]
+    # Determine operating mode:
+    #   ort_all_eps_mode — --ort-genai-repo set, --ep NOT explicitly given:
+    #       Build ORT GenAI once (cuda) + all mobius EPs → one wide table per model.
+    #   ep_list_mode — --ep-list given: mobius-only multi-EP (no ORT GenAI).
+    #   single_ep_mode — explicit --ep or --no-ort: one (model, ep) pair.
+    has_ort = bool(args.ort_genai_repo and os.path.isdir(args.ort_genai_repo)) or bool(
+        args.ort_models
+    )
+    ort_all_eps_mode = has_ort and args.ep is None and not args.ep_list and not args.no_ort
     no_ort = args.no_ort or bool(args.ep_list)
+
+    if args.ep_list:
+        eps: list[str] = args.ep_list.split(",")
+    elif ort_all_eps_mode:
+        eps = all_eps  # all registered EPs for mobius columns
+    else:
+        eps = [args.ep or "cuda"]  # default to cuda for single-EP mode
 
     report = ComparisonReport(
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -995,7 +1089,130 @@ def main() -> None:
     )
 
     for i, model_id in enumerate(models):
-        if args.ep_list:
+        if ort_all_eps_mode:
+            # ORT-all-EPs mode: build ORT GenAI once (cuda), mobius for every EP.
+            if not args.quiet:
+                print(
+                    f"\n→ {model_id}  (ORT GenAI + all EPs: {', '.join(all_eps)})", flush=True
+                )
+
+            all_columns: list[OpCounts] = []
+
+            # ORT GenAI column (built with cuda — serves as reference)
+            ort_ep = "cuda"
+            ort_models_list = args.ort_models or []
+            ort_path = ort_models_list[i] if i < len(ort_models_list) else None
+            if ort_path:
+                p = Path(ort_path)
+                found = (
+                    list(p.glob("**/*.onnx")) if p.is_dir() else ([p] if p.is_file() else [])
+                )
+                if found:
+                    if not args.quiet:
+                        print(f"  Loading ORT GenAI model: {found[0]}", flush=True)
+                    try:
+                        all_columns.append(_op_counts_from_file(found[0]))
+                    except Exception as e:
+                        print(f"  WARNING: {e}")
+            else:
+                if not args.quiet:
+                    print(
+                        f"  Building with ORT GenAI ({args.ort_precision}/{ort_ep}) ...",
+                        end="",
+                        flush=True,
+                    )
+                try:
+                    all_columns.append(
+                        build_ort_genai(
+                            model_id,
+                            ep=ort_ep,
+                            precision=args.ort_precision,
+                            ort_genai_repo=args.ort_genai_repo,
+                        )
+                    )
+                    if not args.quiet:
+                        print(" done.")
+                except Exception as e:
+                    print(f"\n  WARNING: ORT GenAI build failed: {e}")
+
+            # Mobius columns — one per EP
+            for ep_target in all_eps:
+                if not args.quiet:
+                    print(f"  Building with mobius/{ep_target} ...", end="", flush=True)
+                try:
+                    all_columns.append(
+                        build_mobius(model_id, ep=ep_target, load_weights=args.load_weights)
+                    )
+                    if not args.quiet:
+                        print(" done.")
+                except Exception as e:
+                    print(f"\n  ERROR building mobius/{ep_target}: {e}")
+
+            if not all_columns:
+                continue
+
+            # Compute per-EP verdict: each mobius column vs ORT GenAI column.
+            # GQA is downgraded to KNOWN_DIFF for EPs where the model's dtype
+            # is not in the EP's gqa_dtypes (e.g. cpu doesn't support bf16 GQA,
+            # dml/webgpu don't support bf16 GQA, etc.)
+            from mobius._execution_providers import ep_registry as _ep_reg
+
+            model_dtype = _detect_model_dtype(model_id)
+
+            ort_ref = [c for c in all_columns if c.source == "ort-genai"]
+            per_ep_verdicts: list[tuple[str, str, str]] = []
+            all_diffs: list[str] = []
+            all_qk_issues: list[str] = []
+            overall_verdict = "PASS"
+            for mob_col in [c for c in all_columns if c.source == "mobius"]:
+                ep_name = mob_col.label.removeprefix("mobius/")
+                ep_caps = _ep_reg.get(ep_name)
+                # GQA mismatch vs ORT GenAI/cuda is KNOWN_DIFF when the
+                # model's dtype is not in this EP's gqa_dtypes — the EP
+                # simply doesn't support GQA at that precision.
+                gqa_known_diff: frozenset[str] = frozenset()
+                if ep_caps is None or model_dtype not in ep_caps.gqa_dtypes:
+                    gqa_known_diff = frozenset({"GroupQueryAttention"})
+                pair = [*ort_ref, mob_col] if ort_ref else [mob_col]
+                ep_v, ep_r, ep_diffs, ep_qk = _compute_verdict(
+                    pair, model_id=model_id, extra_known_diff_ops=gqa_known_diff
+                )
+                per_ep_verdicts.append((ep_name, ep_v, ep_r))
+                all_diffs.extend(d for d in ep_diffs if d not in all_diffs)
+                all_qk_issues.extend(q for q in ep_qk if q not in all_qk_issues)
+                if ep_v == "FAIL":
+                    overall_verdict = "FAIL"
+                elif ep_v == "KNOWN_DIFF" and overall_verdict == "PASS":
+                    overall_verdict = "KNOWN_DIFF"
+
+            # Overall report verdict = worst of per-EP verdicts
+            if not ort_ref:
+                overall_verdict = "MOBIUS-ONLY"
+                overall_reason = "No ORT GenAI column — mobius-only multi-EP comparison."
+            else:
+                verdict_counts = {v for _, v, _ in per_ep_verdicts}
+                if "FAIL" in verdict_counts:
+                    overall_reason = "One or more EPs have FAIL verdict."
+                elif "KNOWN_DIFF" in verdict_counts:
+                    overall_reason = "All EPs have KNOWN_DIFF or better."
+                else:
+                    overall_reason = "All EPs PASS."
+
+            report.models.append(
+                ModelReport(
+                    model_id=model_id,
+                    ep="all",
+                    columns=all_columns,
+                    verdict=overall_verdict,
+                    verdict_reason=overall_reason,
+                    differences=all_diffs,
+                    qk_norm_issues=all_qk_issues,
+                    expected_counts=_expected_counts(model_id),
+                    per_ep_verdicts=per_ep_verdicts,
+                )
+            )
+
+        elif args.ep_list:
             # Multi-EP mode: one ModelReport per model, one column per EP.
             if not args.quiet:
                 print(f"\n→ {model_id}  (multi-EP: {', '.join(eps)})", flush=True)
