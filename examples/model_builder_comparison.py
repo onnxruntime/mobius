@@ -13,19 +13,20 @@ with stakeholders.
 Usage examples
 ----------------------------------------------------------------------
 
-Compare a single model across all EPs (no weights downloaded — fast):
+Compare ALL EPs side-by-side (mobius-only, no ORT GenAI required):
 
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B \\
-        --ep-list default,cuda,dml,webgpu \\
         --no-ort
+
+  Shows: Op | default | cuda | dml | webgpu | trt-rtx | ...
 
 Compare against ORT GenAI builder — ALL EPs by default (requires 'pip install onnxruntime-genai'):
 
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B
 
-  This shows a wide table: Op | ORT GenAI | default | cuda | dml | webgpu | ...
+  Shows: Op | ORT GenAI | default | cuda | dml | webgpu | trt-rtx | ...
   with a per-EP verdict row at the bottom.
 
 Compare a single specific EP against ORT GenAI:
@@ -990,8 +991,8 @@ def main() -> None:
         default=None,
         metavar="EP",
         help=(
-            "Target EP (default: unset). When onnxruntime-genai is installed and --ep is "
-            "not set, all registered EPs are compared side-by-side. "
+            "Target EP (default: unset). When --ep is not set, all registered EPs are "
+            "compared side-by-side (with ORT GenAI if installed, mobius-only with --no-ort). "
             f"Available: {', '.join(all_eps)}."
         ),
     )
@@ -999,13 +1000,13 @@ def main() -> None:
         "--ep-list",
         default=None,
         metavar="EP1,EP2,...",
-        help="Compare mobius output across multiple EPs (e.g. default,cuda,dml,webgpu). "
+        help="Compare mobius output across an explicit EP subset (e.g. default,cuda,dml). "
         "Overrides --ep and implies --no-ort.",
     )
     parser.add_argument(
         "--no-ort",
         action="store_true",
-        help="Skip ORT GenAI comparison — only compare mobius across EPs.",
+        help="Skip ORT GenAI comparison. Without --ep, shows all registered EPs side-by-side.",
     )
     parser.add_argument(
         "--ort-model",
@@ -1015,10 +1016,12 @@ def main() -> None:
         help="Pre-built ORT GenAI model dir or .onnx file (repeat to match --model list).",
     )
     parser.add_argument(
+        "--dtype",
         "--ort-precision",
+        dest="ort_precision",
         default="fp16",
         choices=["fp32", "fp16", "bf16", "int4"],
-        help="Precision for ORT GenAI builder (default: fp16).",
+        help="Model dtype / ORT GenAI builder precision (default: fp16).",
     )
     parser.add_argument(
         "--load-weights",
@@ -1062,10 +1065,12 @@ def main() -> None:
         models = [DEFAULT_MODEL]
 
     # Determine operating mode:
-    #   ort_all_eps_mode — --ort-genai-repo set, --ep NOT explicitly given:
-    #       Build ORT GenAI once (cuda) + all mobius EPs → one wide table per model.
-    #   ep_list_mode — --ep-list given: mobius-only multi-EP (no ORT GenAI).
-    #   single_ep_mode — explicit --ep or --no-ort: one (model, ep) pair.
+    #   ort_all_eps_mode — ORT GenAI available/provided, --ep NOT given:
+    #       Build ORT GenAI once (cuda) + all mobius EPs → one wide table.
+    #   no_ort_all_eps_mode — --no-ort and --ep NOT given:
+    #       mobius-only, but still show ALL EPs side-by-side.
+    #   ep_list_mode — --ep-list given: explicit EP set (mobius-only).
+    #   single_ep_mode — explicit --ep: one (model, ep) pair.
     has_ort = bool(args.ort_models) or _ort_genai_available()
     ort_all_eps_mode = has_ort and args.ep is None and not args.ep_list and not args.no_ort
     no_ort = args.no_ort or bool(args.ep_list)
@@ -1074,6 +1079,9 @@ def main() -> None:
         eps: list[str] = args.ep_list.split(",")
     elif ort_all_eps_mode:
         eps = all_eps  # all registered EPs for mobius columns
+    elif args.no_ort and args.ep is None:
+        # --no-ort without an explicit --ep: show all EPs side-by-side (mobius-only)
+        eps = all_eps
     else:
         eps = [args.ep or "cuda"]  # default to cuda for single-EP mode
 
@@ -1209,8 +1217,9 @@ def main() -> None:
                 )
             )
 
-        elif args.ep_list:
-            # Multi-EP mode: one ModelReport per model, one column per EP.
+        elif args.ep_list or (args.no_ort and args.ep is None):
+            # Multi-EP mobius-only mode: one ModelReport per model, one column per EP.
+            # Triggered by --ep-list (explicit EP set) or --no-ort without --ep (all EPs).
             if not args.quiet:
                 print(f"\n→ {model_id}  (multi-EP: {', '.join(eps)})", flush=True)
             columns: list[OpCounts] = []
