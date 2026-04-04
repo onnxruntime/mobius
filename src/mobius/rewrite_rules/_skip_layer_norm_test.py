@@ -27,22 +27,24 @@ class TestSkipLayerNormRules:
     def test_fuses_add_layernorm(self):
         """GPT-2 uses LayerNorm → expect Add+LN fusions.
 
-        Note: the default EP optimization pipeline fuses 24 Add+LayerNorm pairs
-        during build(). The remaining 1 LayerNorm (final norm, single consumer)
-        and skip_layer_norm_rules() is a no-op on the already-fused graph.
+        The default EP optimization pipeline fuses all 25 Add+LayerNorm pairs during
+        build() — 24 within-layer pairs plus the final model norm (previously skipped
+        due to the off-by-1 bug). skip_layer_norm_rules() is then a no-op.
         """
         pkg = build("openai-community/gpt2", load_weights=False)
         model = pkg["model"]
         counts_before = count_ops(model)
-        assert counts_before["LayerNormalization"] == 1
-        assert counts_before["Add"] == 73
+        # All 25 Add+LN pairs already fused (24 within-layer + 1 final norm)
+        assert counts_before.get("LayerNormalization", 0) == 0
+        assert counts_before["SkipLayerNormalization"] == 25
+        assert counts_before["Add"] == 72
 
         rewrite(model, pattern_rewrite_rules=skip_layer_norm_rules())
 
         counts_after = count_ops(model)
-        assert counts_after["SkipLayerNormalization"] == 24
-        # 1 remaining: final LayerNorm (Add has only 1 consumer)
-        assert counts_after["LayerNormalization"] == 1
+        # No-op: all fusible pairs already handled by the build pipeline
+        assert counts_after["SkipLayerNormalization"] == 25
+        assert counts_after.get("LayerNormalization", 0) == 0
 
     def test_preserves_rmsnorm_model(self):
         """Models using RMSNorm (not LayerNorm) are not affected."""
@@ -80,10 +82,13 @@ class TestSkipLayerNormRules:
         fill_random_weights(m)
 
         counts_before = count_ops(m)
-        assert counts_before["LayerNormalization"] > 0
+        # Build pipeline already fused all 5 Add+LN pairs (4 within-layer + 1 final norm)
+        assert counts_before.get("LayerNormalization", 0) == 0
+        assert counts_before["SkipLayerNormalization"] == 5
 
         rewrite(m, pattern_rewrite_rules=skip_layer_norm_rules())
-        assert count_ops(m)["SkipLayerNormalization"] > 0
+        # No-op: pipeline already fused everything; result is unchanged
+        assert count_ops(m)["SkipLayerNormalization"] == 5
 
         session = OnnxModelSession(m)
         feeds = make_prefill_feeds(session)
@@ -93,7 +98,13 @@ class TestSkipLayerNormRules:
         session.close()
 
     def test_fuses_bias_free_layernorm(self):
-        """LayerNorm with 2 inputs (no bias) should also be fused."""
+        """LayerNorm with 2 inputs (no bias) should also be fused.
+
+        Uses the raw task graph (no optimization pipeline) to preserve raw
+        LayerNormalization nodes, so we can verify the bias-free rule directly.
+        """
+        from mobius.tasks._causal_lm import CausalLMTask
+
         config = ArchitectureConfig(
             hidden_size=64,
             intermediate_size=128,
@@ -111,7 +122,8 @@ class TestSkipLayerNormRules:
             tie_word_embeddings=True,
         )
         model = registry.get("gpt2")(config)
-        pkg = build_from_module(model, config)
+        # Build WITHOUT the optimization pipeline to preserve raw LayerNorm nodes
+        pkg = CausalLMTask().build(model, config)
         m = pkg["model"]
 
         # Strip bias from all LayerNorm nodes to simulate bias-free LN
@@ -125,5 +137,5 @@ class TestSkipLayerNormRules:
         rewrite(m, pattern_rewrite_rules=skip_layer_norm_rules())
 
         counts_after = count_ops(m)
-        # Bias-free LN nodes that have Add with 2+ consumers should fuse
+        # Bias-free LN nodes should fuse (including single-consumer final norm)
         assert counts_after.get("SkipLayerNormalization", 0) > 0
