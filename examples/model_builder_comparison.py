@@ -43,13 +43,13 @@ Compare against a pre-built ORT GenAI model dir:
         --ep cuda \\
         --ort-model /path/to/ort-output/
 
-Compare multiple models and save the report:
+Compare multiple models and save the report (auto-saved by default):
 
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B \\
         --model Qwen/Qwen3-0.6B \\
         --ep cuda \\
-        --output report.md
+        --output custom_report.md   # override default parity_report_YYYYMMDD_HHMM.md
 """
 
 from __future__ import annotations
@@ -1065,7 +1065,8 @@ def main() -> None:
         dest="output_file",
         default=None,
         metavar="FILE",
-        help="Save output to file.",
+        help="Override the auto-generated markdown report filename "
+        "(default: parity_report_YYYYMMDD_HHMM.md).",
     )
     parser.add_argument(
         "--quiet",
@@ -1376,24 +1377,23 @@ def main() -> None:
     output_format = getattr(args, "format", "console")
     output_file = getattr(args, "output_file", None)
 
+    # Auto-generate a filename when --output is not explicitly set.
+    if output_file is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = f"parity_report_{ts}.md"
+
     if output_format == "markdown":
         md = render_markdown(report)
-        if output_file:
-            with open(output_file, "w") as f:
-                f.write(md)
-            print(f"  Markdown report saved to: {output_file}\n")
-        else:
-            print(md)
+        with open(output_file, "w") as f:
+            f.write(md)
+        print(f"  Markdown report saved to: {output_file}\n")
     else:
-        # Console output (default)
+        # Console output (default) + always save markdown report
         print(render_console(report, color=not args.no_color))
-        if output_file:
-            md = render_markdown(report)
-            with open(output_file, "w") as f:
-                f.write(md)
-            print(f"  Markdown report saved to: {output_file}\n")
-        else:
-            print("  Tip: use --output report.md to save a markdown report.\n")
+        md = render_markdown(report)
+        with open(output_file, "w") as f:
+            f.write(md)
+        print(f"  Markdown report saved to: {output_file}\n")
 
 
 if __name__ == "__main__":
