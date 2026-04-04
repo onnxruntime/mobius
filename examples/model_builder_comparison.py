@@ -20,9 +20,8 @@ Compare a single model across all EPs (no weights downloaded — fast):
         --ep-list default,cuda,dml,webgpu \\
         --no-ort
 
-Compare against ORT GenAI builder — ALL EPs by default (no --ep needed):
+Compare against ORT GenAI builder — ALL EPs by default (requires 'pip install onnxruntime-genai'):
 
-    ORT_GENAI_REPO=/path/to/onnxruntime-genai \\
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B
 
@@ -31,7 +30,6 @@ Compare against ORT GenAI builder — ALL EPs by default (no --ep needed):
 
 Compare a single specific EP against ORT GenAI:
 
-    ORT_GENAI_REPO=/path/to/onnxruntime-genai \\
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B \\
         --ep cuda
@@ -386,37 +384,18 @@ def build_ort_genai(
     model_id: str,
     ep: str,
     precision: str,
-    ort_genai_repo: str,
 ) -> OpCounts:
-    builders_dir = os.path.join(ort_genai_repo, "src/python/py/models")
-    builder_file = os.path.join(builders_dir, "builder.py")
-    if not os.path.isfile(builder_file):
-        raise FileNotFoundError(
-            f"ORT GenAI builder not found at {builder_file}. "
-            "Check --ort-genai-repo / $ORT_GENAI_REPO."
-        )
-    # Use spec_from_file_location to avoid polluting sys.path.
-    import importlib.util as _ilu
+    """Build an ORT GenAI model using the installed onnxruntime_genai package.
 
-    spec = _ilu.spec_from_file_location(
-        "ort_genai_builder",
-        builder_file,
-        submodule_search_locations=[builders_dir],
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load ORT GenAI builder from {builder_file}")
-    builder_mod = _ilu.module_from_spec(spec)
-    # The builder module imports sibling modules; temporarily add builders_dir
-    # to sys.path for the duration of the load, then remove it.
-    _added = builders_dir not in sys.path
-    if _added:
-        sys.path.insert(0, builders_dir)
+    Requires: pip install onnxruntime-genai
+    """
     try:
-        spec.loader.exec_module(builder_mod)  # type: ignore[union-attr]
-    finally:
-        if _added and builders_dir in sys.path:
-            sys.path.remove(builders_dir)
-    create_model = builder_mod.create_model
+        from onnxruntime_genai.models.builder import create_model
+    except ImportError as exc:
+        raise ImportError(
+            "ORT GenAI comparison requires onnxruntime-genai to be installed.\n"
+            "  pip install onnxruntime-genai"
+        ) from exc
 
     out_dir = tempfile.mkdtemp(prefix="ort_genai_cmp_")
     try:
@@ -942,22 +921,21 @@ def _mobius_version() -> str:
     return "dev"
 
 
-def _ort_genai_version(repo: str | None) -> str:
-    if repo and os.path.isdir(repo):
-        try:
-            sha = subprocess.check_output(
-                ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-        except Exception:
-            pass
-        else:
-            return f"git@{sha}"
+def _ort_genai_version() -> str:
     try:
         return importlib.metadata.version("onnxruntime-genai")
     except importlib.metadata.PackageNotFoundError:
         return "not installed"
+
+
+def _ort_genai_available() -> bool:
+    """Return True if onnxruntime_genai.models.builder can be imported."""
+    try:
+        import importlib as _il
+
+        return _il.util.find_spec("onnxruntime_genai") is not None
+    except Exception:
+        return False
 
 
 def _mobius_git_sha() -> str:
@@ -1012,8 +990,8 @@ def main() -> None:
         default=None,
         metavar="EP",
         help=(
-            f"Target EP (default: unset). When --ort-genai-repo is provided and --ep is "
-            f"not set, all registered EPs are compared side-by-side. "
+            "Target EP (default: unset). When onnxruntime-genai is installed and --ep is "
+            "not set, all registered EPs are compared side-by-side. "
             f"Available: {', '.join(all_eps)}."
         ),
     )
@@ -1035,13 +1013,6 @@ def main() -> None:
         dest="ort_models",
         metavar="DIR_OR_FILE",
         help="Pre-built ORT GenAI model dir or .onnx file (repeat to match --model list).",
-    )
-    parser.add_argument(
-        "--ort-genai-repo",
-        default=os.environ.get("ORT_GENAI_REPO"),
-        metavar="REPO_PATH",
-        help="Path to onnxruntime-genai checkout for in-process building. "
-        "Defaults to $ORT_GENAI_REPO env var.",
     )
     parser.add_argument(
         "--ort-precision",
@@ -1095,9 +1066,7 @@ def main() -> None:
     #       Build ORT GenAI once (cuda) + all mobius EPs → one wide table per model.
     #   ep_list_mode — --ep-list given: mobius-only multi-EP (no ORT GenAI).
     #   single_ep_mode — explicit --ep or --no-ort: one (model, ep) pair.
-    has_ort = bool(args.ort_genai_repo and os.path.isdir(args.ort_genai_repo)) or bool(
-        args.ort_models
-    )
+    has_ort = bool(args.ort_models) or _ort_genai_available()
     ort_all_eps_mode = has_ort and args.ep is None and not args.ep_list and not args.no_ort
     no_ort = args.no_ort or bool(args.ep_list)
 
@@ -1111,7 +1080,7 @@ def main() -> None:
     report = ComparisonReport(
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         mobius_version=_mobius_version(),
-        ort_genai_version=_ort_genai_version(args.ort_genai_repo if not no_ort else None),
+        ort_genai_version=_ort_genai_version() if not no_ort else "n/a",
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         git_sha=_mobius_git_sha(),
         platform_info=_platform.platform(terse=True),
@@ -1156,7 +1125,6 @@ def main() -> None:
                             model_id,
                             ep=ort_ep,
                             precision=args.ort_precision,
-                            ort_genai_repo=args.ort_genai_repo,
                         )
                     )
                     if not args.quiet:
@@ -1307,7 +1275,7 @@ def main() -> None:
                                 columns_.append(_op_counts_from_file(p))
                             except Exception as e:
                                 print(f"  WARNING: {e}")
-                    elif args.ort_genai_repo and os.path.isdir(args.ort_genai_repo):
+                    elif _ort_genai_available():
                         if not args.quiet:
                             print(
                                 f"  Building with ORT GenAI ({args.ort_precision}/{ep}) ...",
@@ -1320,7 +1288,6 @@ def main() -> None:
                                     model_id,
                                     ep=ep,
                                     precision=args.ort_precision,
-                                    ort_genai_repo=args.ort_genai_repo,
                                 )
                             )
                             if not args.quiet:
@@ -1329,10 +1296,9 @@ def main() -> None:
                             print(f"\n  WARNING: ORT GenAI build failed: {e}")
                             print("  Use --ort-model or --no-ort to proceed without it.")
                     else:
-                        repo_note = args.ort_genai_repo or "(not set)"
                         print(
-                            f"  NOTE: ORT GenAI repo not found ({repo_note}). "
-                            "Use --ort-genai-repo or set $ORT_GENAI_REPO. "
+                            "  NOTE: onnxruntime-genai not installed. "
+                            "Run 'pip install onnxruntime-genai' to enable ORT GenAI comparison. "
                             "Skipping ORT GenAI column."
                         )
 
