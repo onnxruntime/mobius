@@ -1,16 +1,24 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rewrite rules for fusing RotaryEmbedding + Attention into GroupQueryAttention.
+"""Rewrite rules for fusing Attention into GroupQueryAttention.
 
-The standard decoder layer pattern applies RotaryEmbedding to Q and K
-before feeding them into the ONNX ``Attention`` op (with KV cache).
-The ``com.microsoft::GroupQueryAttention`` custom op fuses rotary
-embedding into the attention kernel and replaces the explicit attention
-bias with ``seqlens_k`` / ``total_sequence_length`` inputs computed
-from the ``attention_mask`` graph input.
+Two rules are provided, tried in order:
 
-A second rule (``PackQKVForGQA``) runs after the GQA fusion and
+1. **RotaryAttentionToGQA** — the optimal path.  Matches the pattern
+   ``RotaryEmbedding(q) + RotaryEmbedding(k) + Attention`` where cos/sin
+   are gathered from a position-indexed cache table.  Produces GQA with
+   ``do_rotary=1`` so the rotary op is fused into the kernel.
+
+2. **AttentionToGQA** — universal fallback.  Matches any ``Attention``
+   node that has KV-cache inputs (decoder attention), regardless of how
+   Q/K position embeddings are computed.  This covers models with
+   non-standard rotary implementations (e.g. Qwen3.5 3D mRoPE via
+   ``Where`` nodes).  Produces GQA with ``do_rotary=0``; the existing
+   position-embedding nodes remain in the graph and feed directly into
+   the GQA ``query``/``key`` slots.
+
+A third rule (``PackQKVForGQA``) runs after the GQA fusion and
 consolidates separate Q, K, V projection MatMuls into a single packed
 MatMul when they share the same hidden_states input.  The packed QKV
 tensor is passed in the ``query`` slot of ``GroupQueryAttention`` with
@@ -378,16 +386,161 @@ class PackQKVForGQA(RewriteRuleClassBase):
         return outputs[0], outputs[1], outputs[2]
 
 
-def group_query_attention_rules() -> RewriteRuleSet:
-    """Return rules that fuse RotaryEmbedding + Attention into GQA.
+class AttentionToGQA(RewriteRuleClassBase):
+    """Universal fallback: replace Attention with GroupQueryAttention (do_rotary=0).
 
-    Contains only the ``RotaryAttentionToGQA`` rule.  QKV packing is a
-    separate optional pass; use :func:`pack_qkv_for_gqa_rules` for that.
+    This rule matches any decoder ``Attention`` node (past_key/past_value
+    are graph inputs) regardless of how Q/K rotary embeddings are applied.
+    It is tried **after** :class:`RotaryAttentionToGQA`, so it only fires
+    for models where that rule does not match — e.g. Qwen3.5, which uses
+    3D multimodal RoPE implemented with ``Where`` nodes rather than
+    standard ``RotaryEmbedding`` ops.
+
+    **Matched pattern:**
+
+    .. code-block:: text
+
+        attn_out, present_key, present_value = Attention(
+            q, k, v, attention_bias, past_key, past_value,
+        )
+
+    Where ``past_key`` and ``past_value`` are graph inputs.  The Q/K
+    values may already have RoPE applied via any graph ops.
+
+    **Replacement:**
+
+    .. code-block:: text
+
+        seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
+        total_seq_len = Cast(Shape(attention_mask)[1], INT32)
+        attn_out, present_key, present_value = GroupQueryAttention(
+            q, k, v, past_key, past_value, seqlens_k, total_seq_len,
+            num_heads=..., kv_num_heads=..., do_rotary=0,
+        )
+
+    ``do_rotary=0`` means the position embeddings are already baked into
+    the Q/K inputs — the GQA kernel does not apply additional RoPE.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._seqlens_k = None
+        self._total_seq_len = None
+
+    # ------------------------------------------------------------------ pattern
+
+    def pattern(self, op, q, k, v, attention_bias, past_key, past_value):
+        return op.Attention(
+            q,
+            k,
+            v,
+            attention_bias,
+            past_key,
+            past_value,
+            _allow_other_attributes=True,
+            _outputs=["attn_out", "present_key", "present_value"],
+        )
+
+    # ------------------------------------------------------------------ check
+
+    def check(self, context, attn_out, past_key, past_value, **_):
+        result = MatchResult()
+        attn = attn_out.producer()
+
+        if attn.attributes.get_float("scale", None) is None:
+            return result.fail("Missing scale attribute on Attention")
+        if attn.attributes.get_int("q_num_heads", None) is None:
+            return result.fail("Missing q_num_heads on Attention")
+        if attn.attributes.get_int("kv_num_heads", None) is None:
+            return result.fail("Missing kv_num_heads on Attention")
+
+        # past_key/past_value must be graph inputs (decoder attention, not encoder)
+        if past_key is None or past_value is None:
+            return result.fail("No KV cache inputs")
+        if past_key.producer() is not None:
+            return result.fail("past_key is not a graph input")
+        if past_value.producer() is not None:
+            return result.fail("past_value is not a graph input")
+
+        return result
+
+    # ------------------------------------------------------------------ rewrite
+
+    def rewrite(
+        self,
+        op,
+        q,
+        k,
+        v,
+        attention_bias,
+        past_key,
+        past_value,
+        attn_out,
+        present_key,
+        present_value,
+        **_,
+    ):
+        attn = attn_out.producer()
+        scale = attn.attributes.get_float("scale")
+        q_num_heads = attn.attributes.get_int("q_num_heads")
+        kv_num_heads = attn.attributes.get_int("kv_num_heads")
+        softcap = attn.attributes.get_float("softcap", 0.0)
+
+        # Build seqlens_k and total_seq_len from attention_mask (computed once).
+        if self._seqlens_k is None:
+            graph = attn.graph
+            attention_mask = next(
+                (gi for gi in graph.inputs if gi.name == "attention_mask"), None
+            )
+            axis = op.Constant(value_ints=[1])
+            reduce_sum = op.ReduceSum(attention_mask, axis)
+            one = op.Constant(value_ints=[1])
+            self._seqlens_k = op.Cast(op.Sub(reduce_sum, one), to=6)
+            mask_shape = op.Shape(attention_mask)
+            idx_1 = op.Constant(value_int=1)
+            self._total_seq_len = op.Cast(op.Gather(mask_shape, idx_1), to=6)
+
+        # do_rotary=0: Q/K already have position embeddings baked in.
+        gqa_attrs: dict[str, int | float] = {
+            "num_heads": q_num_heads,
+            "kv_num_heads": kv_num_heads,
+            "scale": scale,
+            "do_rotary": 0,
+        }
+        if softcap:
+            gqa_attrs["softcap"] = softcap
+
+        outputs = op.op_multi_out(
+            "GroupQueryAttention",
+            inputs=[q, k, v, past_key, past_value, self._seqlens_k, self._total_seq_len],
+            domain="com.microsoft",
+            attributes=gqa_attrs,
+            num_outputs=3,
+        )
+        return outputs[0], outputs[1], outputs[2]
+
+
+def group_query_attention_rules() -> RewriteRuleSet:
+    """Return rules that fuse Attention (+ optional RotaryEmbedding) into GQA.
+
+    Two rules are included, applied in order:
+
+    1. :class:`RotaryAttentionToGQA` — optimal path (``do_rotary=1``).
+       Matches ``RotaryEmbedding + Attention`` where cos/sin come from
+       Gather nodes.  Fuses rotary into the GQA kernel.
+
+    2. :class:`AttentionToGQA` — universal fallback (``do_rotary=0``).
+       Matches any decoder ``Attention`` node.  Used for models whose
+       position embeddings are not expressed as standard ``RotaryEmbedding``
+       ops (e.g. Qwen3.5 3D mRoPE via ``Where`` nodes).
+
+    QKV packing is a separate optional pass; use
+    :func:`pack_qkv_for_gqa_rules` for that.
 
     Returns:
-        :class:`RewriteRuleSet` containing the GQA fusion rule.
+        :class:`RewriteRuleSet` containing the GQA fusion rules.
     """
-    return RewriteRuleSet([RotaryAttentionToGQA().rule()])
+    return RewriteRuleSet([RotaryAttentionToGQA().rule(), AttentionToGQA().rule()])
 
 
 def pack_qkv_for_gqa_rules() -> RewriteRuleSet:

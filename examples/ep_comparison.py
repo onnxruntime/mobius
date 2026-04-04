@@ -105,12 +105,14 @@ def _print_key_ops(model: ir.Model) -> None:
         print("    (no diagnostic ops found)")
 
 
-def compare_eps(model_id: str, eps: list[str], *, verbose: bool) -> None:
+def compare_eps(model_id: str, eps: list[str], *, dtype: str | None, verbose: bool) -> None:
     """Build *model_id* for each EP in *eps* and print a summary."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(format="  %(message)s", level=level)
 
     print(f"Model: {model_id}")
+    if dtype:
+        print(f"Dtype:  {dtype} (override)")
     print(f"EPs to compare: {eps}\n")
 
     for ep in eps:
@@ -123,6 +125,7 @@ def compare_eps(model_id: str, eps: list[str], *, verbose: bool) -> None:
         pkg = build(
             model_id,
             execution_provider=ep,
+            dtype=dtype,
             load_weights=False,
             trace_optimization=True,
         )
@@ -159,6 +162,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--dtype",
+        default=None,
+        metavar="DTYPE",
+        help=(
+            "Override model dtype (e.g. 'bfloat16', 'float16', 'float32'). "
+            "Without this, dtype is auto-detected from the HuggingFace config. "
+            "Useful when the HF config dtype is fp32 but you want to test "
+            "GPU EP fusions that require fp16/bf16."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -177,7 +191,7 @@ def main() -> None:
                 "Register custom EPs with register_ep() before running."
             )
 
-    compare_eps(args.model, eps, verbose=args.verbose)
+    compare_eps(args.model, eps, dtype=args.dtype, verbose=args.verbose)
 
 
 if __name__ == "__main__":

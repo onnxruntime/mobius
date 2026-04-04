@@ -153,6 +153,71 @@ class TestGroupQueryAttentionRules:
         assert vision_counts.get("Attention", 0) == vision_attn_before
         assert vision_counts.get("GroupQueryAttention", 0) == 0
 
+    def test_fallback_attention_to_gqa_no_rope(self):
+        """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).
+
+        When applied alone (not after RotaryAttentionToGQA), ``AttentionToGQA``
+        should convert any decoder ``Attention`` node to GQA with do_rotary=0.
+        In normal usage it only fires for models like Qwen3.5 VL whose Q/K
+        don't come from standard ``RotaryEmbedding`` ops, because
+        ``RotaryAttentionToGQA`` always takes priority in the combined rule set.
+        """
+        from mobius.rewrite_rules._group_query_attention import AttentionToGQA
+
+        qwen35_model_type = "qwen3_5_text"
+        if qwen35_model_type not in registry:
+            pytest.skip(f"{qwen35_model_type!r} not in registry")
+
+        # Minimal Qwen3.5 config: 4 layers, 1 full_attention layer at index 3.
+        # GatedDeltaNet needs explicit linear_* fields.
+        cfg = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=4,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+        )
+        model = registry.get(qwen35_model_type)(cfg)
+        pkg = build_from_module(model, cfg, execution_provider="default")
+        m = pkg["model"]
+        fill_random_weights(m)
+
+        assert count_ops(m).get("Attention", 0) == 1, (
+            "Expected 1 Attention (full_attention layer)"
+        )
+
+        # Apply ONLY the fallback rule (not combined set).  In practice, the
+        # fallback fires for models whose Q/K come from Where-based 3D mRoPE
+        # (e.g. Qwen3.5 VL text decoder) instead of RotaryEmbedding.
+        fallback_only = RewriteRuleSet([AttentionToGQA().rule()])
+        rewrite(m, pattern_rewrite_rules=fallback_only)
+
+        counts = count_ops(m)
+        assert counts.get("Attention", 0) == 0
+        assert counts.get("GroupQueryAttention", 0) == 1
+        gqa_node = next(n for n in m.graph if n.op_type == "GroupQueryAttention")
+        assert gqa_node.attributes.get_int("do_rotary", -1) == 0, (
+            "AttentionToGQA fallback must set do_rotary=0 (RoPE applied externally)"
+        )
+
     def test_rewritten_model_runs_with_ort(self):
         """GQA-rewritten model can be serialized and run with ORT."""
         model = registry.get("qwen3")(_QWEN3_CONFIG)
