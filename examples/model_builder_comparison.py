@@ -40,7 +40,7 @@ Compare multiple models and save the report:
         --model meta-llama/Llama-3.2-1B \\
         --model Qwen/Qwen3-0.6B \\
         --ep cuda \\
-        --save-report report.md
+        --output report.md
 """
 
 from __future__ import annotations
@@ -959,13 +959,6 @@ def main() -> None:
         default=None,
         metavar="FILE",
         help="Save output to file.",
-    )
-    parser.add_argument(
-        "--save-report",
-        dest="output_file",
-        default=None,
-        metavar="FILE",
-        help="[Deprecated] Alias for --output.",
     )
     parser.add_argument(
         "--quiet",
