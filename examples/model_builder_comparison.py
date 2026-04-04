@@ -595,6 +595,8 @@ def _console_table(report: ModelReport, color: bool) -> str:
 
 
 def render_console(report: ComparisonReport, color: bool = True) -> str:
+    from mobius._execution_providers import ep_registry
+
     use_color = color and sys.stdout.isatty()
     lines: list[str] = []
 
@@ -627,27 +629,34 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
             lines.append("│  " + line)
         lines.append("│")
         if mr.expected_counts:
-            lines.append("│  Expected counts (from HF config):")
-            for op, expected_n in mr.expected_counts.items():
+            lines.append("│  Expected counts (from HF config, per EP):")
+            norm_ops = {"SkipSimplifiedLayerNormalization", "SkipLayerNormalization"}
+            mob_cols = [c for c in mr.columns if c.source == "mobius"]
+            for op, base_expected in mr.expected_counts.items():
                 lbl = OP_LABEL.get(op, op)
-                mob_cols_ec = [c for c in mr.columns if c.source == "mobius"]
-                actual_col = (
-                    mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
-                )
-                actual_n = actual_col.counts.get(op, 0) if actual_col else 0
-                # Allow ±1 for norm ops: mobius keeps final/embedding norm as
-                # ONNX RMSNormalization rather than fusing into SkipSimplifiedLayerNorm.
-                norm_ops = {"SkipSimplifiedLayerNormalization", "SkipLayerNormalization"}
-                tolerance = 1 if op in norm_ops else 0
-                ok = "✓" if abs(actual_n - expected_n) <= tolerance else "✗"
-                note = (
-                    " (±1 ok: final norm kept as ONNX RMSNorm)"
-                    if ok == "✓" and actual_n != expected_n
-                    else ""
-                )
-                lines.append(
-                    f"│    {ok} {lbl}: Expected={expected_n}  Actual={actual_n}{note}"
-                )
+                per_ep_parts = []
+                for col in mob_cols:
+                    ep_name = col.label.removeprefix("mobius/")
+                    ep_caps = ep_registry.get(ep_name)
+                    # GQA expected = num_layers only if EP supports GQA at the model dtype
+                    if op == "GroupQueryAttention":
+                        model_dtype = _detect_model_dtype(mr.model_id)
+                        ep_expected = (
+                            base_expected
+                            if ep_caps is not None and model_dtype in ep_caps.gqa_dtypes
+                            else 0
+                        )
+                    else:
+                        ep_expected = base_expected
+                    actual_n = col.counts.get(op, 0)
+                    tolerance = 1 if op in norm_ops else 0
+                    ok = "✓" if abs(actual_n - ep_expected) <= tolerance else "✗"
+                    note = "\u00b11" if ok == "\u2713" and actual_n != ep_expected else ""
+                    per_ep_parts.append(
+                        f"{ok} {ep_name}: exp={ep_expected} act={actual_n}"
+                        + (f" ({note})" if note else "")
+                    )
+                lines.append(f"│    {lbl}: " + ",  ".join(per_ep_parts))
             lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
@@ -704,6 +713,8 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
 
 
 def render_markdown(report: ComparisonReport) -> str:
+    from mobius._execution_providers import ep_registry
+
     lines: list[str] = []
     pass_count = report.pass_count
     known_diff_count = report.known_diff_count
@@ -792,27 +803,35 @@ def render_markdown(report: ComparisonReport) -> str:
             lines += [""]
 
         if mr.expected_counts:
-            lines += ["### Expected Counts (from HF config)", ""]
-            lines += [
-                "| Op | Expected | Actual | Status |",
-                "|-----|----------|--------|--------|",
-            ]
+            lines += ["### Expected Counts (from HF config, per EP)", ""]
             mob_cols_ec = [c for c in mr.columns if c.source == "mobius"]
-            actual_col_ec = (
-                mob_cols_ec[0] if mob_cols_ec else mr.columns[0] if mr.columns else None
-            )
+            # Build column headers: one column per mobius EP
+            ep_names_ec = [c.label.removeprefix("mobius/") for c in mob_cols_ec]
+            hdr = "| Op |" + "".join(f" {ep} |" for ep in ep_names_ec)
+            sep = "|-----|" + "---|" * len(mob_cols_ec)
+            lines += [hdr, sep]
             norm_ops = {"SkipSimplifiedLayerNormalization", "SkipLayerNormalization"}
-            for op, expected_n in mr.expected_counts.items():
+            for op, base_expected in mr.expected_counts.items():
                 lbl = OP_LABEL.get(op, op)
-                actual_n = actual_col_ec.counts.get(op, 0) if actual_col_ec else 0
-                tolerance = 1 if op in norm_ops else 0
-                ok = "✓" if abs(actual_n - expected_n) <= tolerance else "✗"
-                note = (
-                    " *(±1: final norm as ONNX RMSNorm)*"
-                    if ok == "✓" and actual_n != expected_n
-                    else ""
-                )
-                lines.append(f"| `{lbl}` | {expected_n} | {actual_n} | {ok}{note} |")
+                cells = []
+                for col in mob_cols_ec:
+                    ep_name = col.label.removeprefix("mobius/")
+                    ep_caps = ep_registry.get(ep_name)
+                    if op == "GroupQueryAttention":
+                        model_dtype = _detect_model_dtype(mr.model_id)
+                        ep_expected = (
+                            base_expected
+                            if ep_caps is not None and model_dtype in ep_caps.gqa_dtypes
+                            else 0
+                        )
+                    else:
+                        ep_expected = base_expected
+                    actual_n = col.counts.get(op, 0)
+                    tolerance = 1 if op in norm_ops else 0
+                    ok = "✓" if abs(actual_n - ep_expected) <= tolerance else "✗"
+                    note = " *(±1)*" if ok == "✓" and actual_n != ep_expected else ""
+                    cells.append(f" {ok} exp={ep_expected} act={actual_n}{note} |")
+                lines.append(f"| `{lbl}` |" + "".join(cells))
             lines += [""]
 
         # QK-norm invariant section
@@ -1020,8 +1039,9 @@ def main() -> None:
         "--ort-precision",
         dest="ort_precision",
         default="fp16",
-        choices=["fp32", "fp16", "bf16", "int4"],
-        help="Model dtype / ORT GenAI builder precision (default: fp16).",
+        choices=["fp32", "float32", "fp16", "float16", "bf16", "bfloat16", "int4"],
+        help="Model dtype / ORT GenAI builder precision (default: fp16). "
+        "Accepts both short (fp16, bf16, fp32) and long (float16, bfloat16, float32) forms.",
     )
     parser.add_argument(
         "--load-weights",
@@ -1054,6 +1074,10 @@ def main() -> None:
         help="Disable ANSI color in console output.",
     )
     args = parser.parse_args()
+
+    # Normalize long-form dtype aliases to the short forms that ORT GenAI expects.
+    _dtype_normalize = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
+    args.ort_precision = _dtype_normalize.get(args.ort_precision, args.ort_precision)
 
     if args.suite:
         models = STANDARD_SUITE
