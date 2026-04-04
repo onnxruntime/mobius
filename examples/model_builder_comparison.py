@@ -136,6 +136,14 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
         "Mobius emits this for norms not covered by SkipSimplifiedLayerNorm fusion (embedding norm, final norm).",
     ),
     (
+        "SimplifiedLayerNormalization",
+        "SimplifiedLayerNorm (ORT)",
+        # ORT GenAI uses this com.microsoft op for standalone (unfused) RMSNorm.
+        # Mobius emits the standard ONNX 'RMSNormalization' for the same node.
+        "ORT GenAI uses this for standalone (unfused) RMSNorm. "
+        "Mobius emits 'RMSNormalization' for the same node — same math, different op name.",
+    ),
+    (
         "BiasGelu",
         "BiasGelu",
         "Fused Bias + GELU (com.microsoft). Absent when bias is zero or unfused.",
@@ -442,17 +450,32 @@ def build_ort_genai(
 # ---------------------------------------------------------------------------
 
 
+def _all_ops_in_order(cols: list[OpCounts]) -> list[tuple[str, str]]:
+    """Return (op_type, display_label) for every op that appears in any column.
+
+    Catalogued ops from _OP_CATALOG appear first (in their existing priority
+    order), followed by any uncatalogued ops sorted alphabetically.
+    """
+    all_op_types: set[str] = {op for c in cols for op in c.counts}
+    catalogued_set = set(OP_TYPES)
+    # Catalogued ops first (preserve _OP_CATALOG ordering)
+    result = [(op, OP_LABEL[op]) for op, _, _ in _OP_CATALOG if op in all_op_types]
+    # Uncatalogued ops alphabetically
+    uncatalogued = sorted(all_op_types - catalogued_set)
+    result += [(op, op) for op in uncatalogued]
+    return result
+
+
 def _ep_differences(cols: list[OpCounts]) -> list[str]:
     """Describe the expected per-EP differences for a multi-EP comparison."""
     diffs = []
-    for op in OP_TYPES:
+    for op, lbl in _all_ops_in_order(cols):
         counts = [c.counts.get(op, 0) for c in cols]
         if len(set(counts)) == 1:
             continue
-        label = OP_LABEL.get(op, op)
-        expl = OP_EXPLANATION.get(op, "")
+        expl = OP_EXPLANATION.get(op, "uncatalogued op — count shown for transparency")
         vals = ", ".join(f"{c.label}={c.counts.get(op, 0)}" for c in cols)
-        diffs.append(f"**{label}** ({op}): {vals}  \n  ↳ {expl}")
+        diffs.append(f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}")
     return diffs
 
 
@@ -479,14 +502,17 @@ def _compute_verdict(
     differences: list[str] = []
     critical_fail = False
 
-    for op in OP_TYPES:
+    # Iterate ALL op types that appear in any column — catalogued first (in
+    # priority order), then uncatalogued alphabetically.  Uncatalogued ops are
+    # always benign (never trigger FAIL) but are included in the diff list for
+    # full transparency.
+    for op, lbl in _all_ops_in_order(cols):
         counts_for_op = [c.counts.get(op, 0) for c in cols]
         if len(set(counts_for_op)) == 1:
             continue  # All same — no difference
         vals = ", ".join(f"{c.label}={c.counts.get(op, 0)}" for c in cols)
-        label = OP_LABEL.get(op, op)
-        expl = OP_EXPLANATION.get(op, "")
-        differences.append(f"**{label}** ({op}): {vals}  \n  ↳ {expl}")
+        expl = OP_EXPLANATION.get(op, "uncatalogued op — count shown for transparency")
+        differences.append(f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}")
         if op in effective_critical:
             critical_fail = True
 
@@ -535,8 +561,7 @@ _RESET = "\033[0m"
 
 def _console_table(report: ModelReport, color: bool) -> str:
     cols = report.columns
-    present_ops = {op for c in cols for op in c.counts if op in set(OP_TYPES)}
-    ops_in_order = [(op, OP_LABEL[op]) for op, _, _ in _OP_CATALOG if op in present_ops]
+    ops_in_order = _all_ops_in_order(cols)
 
     op_w = max((len(lbl) for _, lbl in ops_in_order), default=24)
     col_w = max(18, max(len(c.label) for c in cols))
@@ -742,10 +767,9 @@ def render_markdown(report: ComparisonReport) -> str:
             "",
         ]
 
-        # Op count table
+        # Op count table — all ops in union of both models
         cols = mr.columns
-        present_ops = {op for c in cols for op in c.counts if op in set(OP_TYPES)}
-        ops_in_order = [(op, OP_LABEL[op]) for op, _, _ in _OP_CATALOG if op in present_ops]
+        ops_in_order = _all_ops_in_order(cols)
 
         header = "| Op |" + "".join(f" {c.label} |" for c in cols) + " Notes |"
         sep_row = "|" + "---|" * (2 + len(cols))
@@ -754,7 +778,11 @@ def render_markdown(report: ComparisonReport) -> str:
         for op, lbl in ops_in_order:
             counts = [c.counts.get(op, 0) for c in cols]
             differs = len(set(counts)) > 1
-            note = "⚠️ differs" if differs else ""
+            expl = OP_EXPLANATION.get(op, "")
+            if differs:
+                note = f"⚠️ differs — {expl}" if expl else "⚠️ differs"
+            else:
+                note = expl if expl else ""
             count_cells = "".join(f" {n} |" for n in counts)
             lines.append(f"| `{lbl}` |{count_cells} {note} |")
 
