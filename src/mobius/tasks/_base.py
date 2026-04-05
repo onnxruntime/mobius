@@ -20,8 +20,9 @@ from mobius._model_package import ModelPackage
 _FUNCTIONS_DOMAIN = "pkg.mobius"
 
 # Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
-# layers.  MLP-only layers are stateless and use (None, None).
-StatePair = tuple[ir.Value, ir.Value] | tuple[None, None]
+# layers.  Single-state layers (conv/lightning) use a 1-tuple.
+# MLP-only layers are stateless and use (None, None).
+StatePair = tuple[ir.Value, ir.Value] | tuple[ir.Value] | tuple[None, None]
 
 
 class LinearAttentionDims(NamedTuple):
@@ -194,6 +195,7 @@ def _make_hybrid_cache_inputs(
 
     Supported layer types:
         ``"full_attention"`` — standard KV cache (key + value).
+        ``"conv"`` — ShortConv conv_state only.
         ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
         ``"mamba"`` / ``"mamba2"`` — conv_state + ssm_state.
         ``"mlp"`` — stateless, produces ``(None, None)`` pair.
@@ -262,6 +264,17 @@ def _make_hybrid_cache_inputs(
             )
             flat.extend([conv_state, rec_state])
             pairs.append((conv_state, rec_state))
+        elif ltype == "conv":
+            # ShortConv layers: conv_state only (no SSM state)
+            # State: (batch, hidden_size, short_conv_kernel - 1)
+            short_conv_kernel = getattr(config, "short_conv_kernel", 3)
+            conv_state = ir.Value(
+                name=f"{prefix}.{i}.conv_state",
+                shape=ir.Shape([batch, config.hidden_size, short_conv_kernel - 1]),
+                type=ir.TensorType(dtype),
+            )
+            flat.append(conv_state)
+            pairs.append((conv_state,))  # 1-tuple: conv has no second state
         elif ltype == "mlp":
             # MLP-only layers are stateless — no cache inputs needed
             pairs.append((None, None))
@@ -337,6 +350,11 @@ def _register_hybrid_cache_outputs(
             # Single recurrent state only (no conv_state for lightning)
             (state_a,) = states
             state_a.name = f"{prefix}.{i}.recurrent_state"
+            graph.outputs.append(state_a)
+        elif ltype == "conv":
+            # ShortConv: single conv_state only
+            (state_a,) = states
+            state_a.name = f"{prefix}.{i}.conv_state"
             graph.outputs.append(state_a)
         else:
             state_a, state_b = states

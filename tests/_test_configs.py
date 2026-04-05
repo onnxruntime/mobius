@@ -29,6 +29,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
+    Lfm2Config,
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
@@ -100,6 +101,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("llama", {}, True),
     ("mistral", {}, False),
     ("qwen2", {}, True),
+    ("bitnet", {"hidden_act": "relu2", "tie_word_embeddings": True}, True),
     ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
     ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
     ("diffllama", {}, False),
@@ -1076,6 +1078,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_expand": 2,
         },
         True,
+    ),
+    # lfm2: hybrid ShortConv+Attention (requires Lfm2Config)
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+            ],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        True,
+    ),
+    # lfm2: all attention layers (no conv)
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        False,
     ),
     # gemma3n_text: all full attention (no sliding window)
     (
@@ -2085,6 +2117,16 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
 
 
 # ---------------------------------------------------------------------------
+# Audio-to-audio model configs
+# ---------------------------------------------------------------------------
+AUDIO_TO_AUDIO_CONFIGS: list[tuple[str, dict, bool]] = [
+    # Audio-to-audio models are tested via explicit test classes
+    # (TestBuildLfm2AudioGraph etc.) since they produce multi-model
+    # packages with different keys than standard single-model tasks.
+]
+
+
+# ---------------------------------------------------------------------------
 # Aggregate lists
 # ---------------------------------------------------------------------------
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
@@ -2096,6 +2138,7 @@ ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     + SSM_CONFIGS
     + VL_CONFIGS
     + SPEECH_CONFIGS
+    + AUDIO_TO_AUDIO_CONFIGS
 )
 
 # Model types explicitly declared in configs above (may have duplicates —

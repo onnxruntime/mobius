@@ -29,6 +29,7 @@ from mobius._configs import (
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
+    BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
@@ -391,6 +392,7 @@ def _create_default_registry() -> ModelRegistry:
         "gemma3n_text": Gemma3nCausalLMModel,
         "granite": GraniteCausalLMModel,
         "diffllama": DiffLlamaCausalLMModel,
+        "bitnet": BitNetCausalLMModel,
         "doge": DogeCausalLMModel,
         "internlm2": InternLM2CausalLMModel,
         "llama4_text": Llama4CausalLMModel,
@@ -470,6 +472,21 @@ def _create_default_registry() -> ModelRegistry:
     from mobius.models.nemotron_h import NemotronHCausalLMModel
 
     reg.register("nemotron_h", NemotronHCausalLMModel)
+
+    # --- Hybrid Conv+Attention (LFM2) ---
+    from mobius.models.lfm2 import Lfm2CausalLMModel
+
+    reg.register("lfm2", Lfm2CausalLMModel)
+
+    from mobius.models.lfm2_audio import Lfm2AudioModel
+
+    reg.register("lfm2_audio", Lfm2AudioModel)
+
+    # --- Moshi / PersonaPlex (audio-to-audio) ---
+    from mobius.models.moshi import MoshiModel
+
+    reg.register("personaplex", MoshiModel)
+    reg.register("moshi", MoshiModel)
 
     # --- Multimodal ---
     for name in (
@@ -729,6 +746,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "arcee": "arcee-ai/AFM-4.5B-Base",
     "diffllama": "kajuma/DiffLlama-0.3B-handcut",
+    "bitnet": "microsoft/bitnet-b1.58-2B-4T",
     "doge": "SmallDoge/Doge-20M",
     "dots1": "rednote-hilab/dots.llm1.inst",
     "exaone4": "LGAI-EXAONE/EXAONE-4.0-1.2B",
@@ -820,6 +838,10 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "lfm2": "LiquidAI/LFM2-1.2B",
+    "lfm2_audio": "LiquidAI/LFM2-Audio-1.5B",
+    "personaplex": "nvidia/personaplex-7b-v1",
+    "moshi": "kyutai/moshiko-pytorch-bf16",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1079,6 +1101,10 @@ _VARIANT_LABELS: dict[str, str] = {
     "falcon_mamba": "ssm",
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
+    "lfm2": "hybrid-conv+attn",
+    "lfm2_audio": "audio-to-audio",
+    "personaplex": "audio-to-audio",
+    "moshi": "audio-to-audio",
     "qwen3_next": "moe+linear-attn",
 }
 

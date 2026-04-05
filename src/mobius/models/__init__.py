@@ -12,6 +12,7 @@ __all__ = [
     "BartForConditionalGeneration",
     "BertModel",
     "Blip2Model",
+    "BitNetCausalLMModel",
     "BloomCausalLMModel",
     "CLIPVisionModel",
     "CTRLCausalLMModel",
@@ -58,12 +59,15 @@ __all__ = [
     "Llama4CausalLMModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "Lfm2AudioModel",
+    "Lfm2CausalLMModel",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
     "MoECausalLMModel",
+    "MoshiModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
@@ -127,6 +131,7 @@ from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
 from mobius.models.bert import BertModel
+from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel
@@ -161,6 +166,8 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2_audio import Lfm2AudioModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
@@ -174,6 +181,7 @@ from mobius.models.moe import (
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
 )
+from mobius.models.moshi import MoshiModel
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel

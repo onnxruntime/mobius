@@ -896,6 +896,7 @@ class ArchitectureConfig(BaseModelConfig):
                 in (
                     "gemma3_text",
                     "flex_olmo",
+                    "lfm2",
                     "olmoe",
                     "olmo2",
                     "olmo3",
@@ -1866,6 +1867,145 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2Config(ArchitectureConfig):
+    """Configuration for LFM2 hybrid ShortConv+Attention models.
+
+    LFM2 interleaves ShortConv (gated causal depthwise Conv1d) layers
+    with standard attention layers.  Both layer types include an MLP
+    (SiLU-gated feed-forward).
+
+    ShortConv state per layer: conv_state (batch, hidden_size, kernel-1)
+    Attention state per layer: standard KV cache (key + value)
+
+    Layer types are specified via ``layer_types`` in the HF config:
+        ``"conv"`` = ShortConv layer
+        ``"full_attention"`` = standard attention layer
+    """
+
+    # ShortConv parameters
+    short_conv_kernel: int = 3
+    short_conv_bias: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # LFM2 MLP: adjusted intermediate size with SwiGLU
+        intermediate = base.intermediate_size
+        if getattr(config, "block_auto_adjust_ff_dim", False):
+            intermediate = int(2 * intermediate / 3)
+            multiplier = getattr(config, "block_ffn_dim_multiplier", None)
+            if multiplier is not None:
+                intermediate = int(multiplier * intermediate)
+            multiple_of = getattr(config, "block_multiple_of", 256)
+            intermediate = multiple_of * ((intermediate + multiple_of - 1) // multiple_of)
+
+        base_fields = {
+            k: v for k, v in _shallow_fields(base).items() if k not in ("intermediate_size",)
+        }
+        return cls(
+            **base_fields,
+            intermediate_size=intermediate,
+            short_conv_kernel=getattr(config, "conv_L_cache", 3),
+            short_conv_bias=getattr(config, "conv_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class Lfm2AudioConfig(Lfm2Config):
+    """Configuration for LFM2-Audio: audio-to-audio with hybrid backbone.
+
+    Extends Lfm2Config with depthformer and audio codec fields.
+    """
+
+    # Depthformer parameters
+    depthformer_layers: int = 6
+    depthformer_dim: int = 1024
+    depthformer_heads: int = 16
+    depthformer_tie: bool = True
+
+    # Audio codec parameters
+    num_codebooks: int = 8
+    audio_vocab_size: int = 2049
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2AudioConfig:
+        # LFM2-Audio uses a custom config format from liquid-audio,
+        # not a standard HuggingFace config. The base fields come from
+        # the nested 'lfm' sub-config.
+        base = Lfm2Config.from_transformers(config, parent_config)
+        base_fields = _shallow_fields(base)
+
+        depthformer = getattr(config, "depthformer", None) or {}
+        if hasattr(depthformer, "__dict__"):
+            depthformer = depthformer.__dict__
+
+        return cls(
+            **base_fields,
+            depthformer_layers=depthformer.get("layers", 6),
+            depthformer_dim=depthformer.get("dim", 1024),
+            depthformer_tie=depthformer.get("tie", True),
+            num_codebooks=getattr(config, "codebooks", 8),
+            audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
+        )
+
+
+@dataclasses.dataclass
+class MoshiConfig(ArchitectureConfig):
+    """Configuration for Moshi/PersonaPlex audio-to-audio models.
+
+    Moshi (and its fine-tune PersonaPlex) is a full-duplex speech model.
+    It combines a standard causal transformer backbone with a depth
+    transformer ("depformer") that generates audio codec tokens.
+
+    The depformer uses one attention head per codebook (``num_codebooks``
+    heads, each with ``depformer_dim`` head_dim), processing a single
+    codebook token per step with a KV cache over previous codebooks.
+
+    Per-codebook gating MLPs are stored as stacked parameters and selected
+    at runtime using ``codebook_idx``.
+
+    Reference: Défossez et al., "Moshi: a speech-text foundation model
+    for real-time dialogue" (2024), ``kyutai/moshiko-pytorch-bf16``.
+    """
+
+    # Depformer parameters
+    depformer_dim: int = 1024
+    depformer_layers: int = 6
+    depformer_num_heads: int = 16  # must equal num_codebooks
+    depformer_intermediate_size: int = 2816
+
+    # Audio codec parameters
+    num_codebooks: int = 16
+    audio_vocab_size: int = 2049  # 2048 codebook entries + 1 padding
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MoshiConfig:
+        # PersonaPlex config.json only has {"model_type": "personaplex", "version": "7b-v1"}.
+        # All hyperparameters are derived from weight shapes; hardcode v1 defaults here.
+        return cls(
+            model_type=getattr(config, "model_type", "personaplex"),
+            hidden_size=getattr(config, "hidden_size", 4096),
+            num_hidden_layers=getattr(config, "num_hidden_layers", 32),
+            num_attention_heads=getattr(config, "num_attention_heads", 32),
+            num_key_value_heads=getattr(config, "num_key_value_heads", 32),
+            head_dim=getattr(config, "head_dim", 128),
+            intermediate_size=getattr(config, "intermediate_size", 11264),
+            vocab_size=getattr(config, "vocab_size", 32000),
+            hidden_act=getattr(config, "hidden_act", "silu"),
+            rms_norm_eps=getattr(config, "rms_norm_eps", 1e-5),
+            rope_theta=getattr(config, "rope_theta", 10000.0),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
+            depformer_dim=getattr(config, "depformer_dim", 1024),
+            depformer_layers=getattr(config, "depformer_layers", 6),
+            depformer_num_heads=getattr(config, "depformer_num_heads", 16),
+            depformer_intermediate_size=getattr(config, "depformer_intermediate_size", 2816),
+            num_codebooks=getattr(config, "num_codebooks", 16),
+            audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
         )
 
 

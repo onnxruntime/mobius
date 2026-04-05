@@ -1,0 +1,9 @@
+model_id: "LiquidAI/LFM2-Audio-1.5B"
+revision: "main"
+task_type: "audio-to-audio"
+dtype: "float32"
+
+level: "L4"
+
+skip_reason: "LFM2-Audio 1.5B — requires custom audio pipeline and no standard golden generation."
+notes: "LFM2-Audio 1.5B. Hybrid conv+attention backbone with ConformerEncoder for audio-to-audio."

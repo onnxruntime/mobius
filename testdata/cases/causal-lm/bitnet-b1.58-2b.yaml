@@ -1,0 +1,20 @@
+model_id: "microsoft/bitnet-b1.58-2B-4T"
+revision: "04c3b9ad9361b824064a1f25ea60a8be9599b127"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+skip_reason: "Ternary weights require custom unpacking; golden JSON not yet generated."
+notes: >
+  BitNet b1.58 2B-4T. Ternary {-1,0,+1} weight LLM with sub-layer
+  RMSNorms (attn_sub_norm, ffn_sub_norm) and squared ReLU activation.
+  Weights stored as 2-bit packed uint8 with per-tensor weight_scale.
