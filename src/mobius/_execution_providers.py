@@ -60,7 +60,14 @@ class EpCapabilities:
         supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
+        supports_fused_matmul: ``False`` expands ``FusedMatMul`` via InlinePass
+            to ``Transpose + MatMul``.  Leave ``True`` for all ORT-based EPs
+            that support the ``com.microsoft::FusedMatMul`` kernel.
         supports_fused_moe: ``False`` decomposes fused MoE ops.
+        supports_packed_multi_head_attention: ``False`` expands
+            ``PackedMultiHeadAttention`` via InlinePass to a
+            block-diagonal attention bias + standard ``Attention``.
+            Leave ``True`` for CUDA / DML EPs that ship the native kernel.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -73,7 +80,9 @@ class EpCapabilities:
     supports_fused_rope: bool = True
     supports_shape: bool = True
     supports_skip_layer_norm: bool = True
+    supports_fused_matmul: bool = True
     supports_fused_moe: bool = True
+    supports_packed_multi_head_attention: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -184,6 +193,7 @@ def _register_builtins() -> None:
             packed_attn_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
+            supports_packed_multi_head_attention=True,
             provider_options={
                 "enable_cuda_graph": "0",
                 "enable_skip_layer_norm_strict_mode": "1",
@@ -193,6 +203,7 @@ def _register_builtins() -> None:
             name="dml",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
             packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
+            supports_packed_multi_head_attention=True,
             supports_fused_rope=False,
         ),
         EpCapabilities(

@@ -28,6 +28,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities
 from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._scan_utils import (
@@ -177,6 +178,70 @@ class Qwen25VLVisionAttention(nn.Module):
         q = self._apply_rotary(op, q, cos, sin)
         k = self._apply_rotary(op, k, cos, sin)
 
+        capabilities = ep_capabilities()
+        if capabilities.supports_packed_multi_head_attention:
+            attn_out = self._emit_packed_mha(op, q, k, v, cu_seqlens, seq_len_val)
+        else:
+            attn_out = self._emit_standard_attention(op, q, k, v, cu_seqlens, seq_len_val)
+
+        return self.proj(op, attn_out)
+
+    def _emit_packed_mha(self, op, q, k, v, cu_seqlens, seq_len_val):
+        """Emit com.microsoft.PackedMultiHeadAttention.
+
+        Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+
+        Args:
+            q, k, v: (N, num_heads, head_dim) after rotary embedding
+            cu_seqlens: (num_sub_seqs + 1,) INT32
+            seq_len_val: (1,) shape tensor with N
+        """
+        hidden_size = self.num_heads * self.head_dim
+        # Flatten heads: (N, num_heads, head_dim) → (N, hidden_size)
+        query = op.Reshape(q, op.Concat(seq_len_val, [hidden_size], axis=0))
+        key = op.Reshape(k, op.Concat(seq_len_val, [hidden_size], axis=0))
+        value = op.Reshape(v, op.Concat(seq_len_val, [hidden_size], axis=0))
+
+        # token_offset: identity mapping for packed (no-padding) input.
+        # Shape: (1, token_count) — single batch, positions [0..N-1].
+        token_count_scalar = op.Squeeze(seq_len_val, [0])
+        token_offset = op.Unsqueeze(
+            op.Range(
+                op.Constant(value_int=0),
+                token_count_scalar,
+                op.Constant(value_int=1),
+            ),
+            [0],
+        )
+        token_offset = op.Cast(token_offset, to=6)  # INT32
+
+        cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
+
+        # Emit PackedMultiHeadAttention
+        attn_out = op.PackedMultiHeadAttention(
+            query,
+            key,
+            value,
+            token_offset,
+            cu_seqlens_int32,
+            num_heads=self.num_heads,
+            scale=float(1.0 / math.sqrt(self.head_dim)),
+            domain="com.microsoft",
+            _outputs=["packed_attn_out"],
+        )  # (token_count, hidden_size)
+
+        return attn_out
+
+    def _emit_standard_attention(self, op, q, k, v, cu_seqlens, seq_len_val):
+        """Emit standard Attention with block-diagonal bias from cu_seqlens.
+
+        Fallback path for EPs without PackedMultiHeadAttention support.
+
+        Args:
+            q, k, v: (N, num_heads, head_dim) after rotary embedding
+            cu_seqlens: (num_sub_seqs + 1,) cumulative lengths
+            seq_len_val: (1,) shape tensor with N
+        """
         # Reshape for attention: add batch dim
         # (N, num_heads, head_dim) → (1, num_heads, N, head_dim)
         q = op.Transpose(q, perm=[1, 0, 2])  # (num_heads, N, head_dim)
@@ -207,7 +272,7 @@ class Qwen25VLVisionAttention(nn.Module):
             attn_out,
             op.Concat(seq_len_val, [-1], axis=0),
         )
-        return self.proj(op, attn_out)
+        return attn_out
 
     def _apply_rotary(self, op, x, cos, sin):
         """Apply rotary embeddings to (N, num_heads, head_dim)."""
