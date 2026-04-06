@@ -32,9 +32,11 @@ import torch
 from onnx_ir import tensor_adapters
 from onnxscript import nn
 
+from mobius._build_context import build_context
 from mobius._configs import (
     BaseModelConfig,
 )
+from mobius._execution_providers import ep_registry
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
@@ -182,7 +184,9 @@ def build_from_module(
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
-    pkg = resolved_task.build(module, config)
+    capabilities = ep_registry.require(execution_provider)
+    with build_context(capabilities, dtype):
+        pkg = resolved_task.build(module, config)
 
     for name, model in pkg.items():
         # Resolve role from the task first, then fall back to the global name map.

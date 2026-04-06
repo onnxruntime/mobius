@@ -462,3 +462,83 @@ does not — it's for runtimes other than ORT that understand standard ONNX ops
 but not ORT custom ops. The distinction matters for cross-framework export:
 a `"default"` model can be loaded by any ONNX-conformant runtime (TFLite,
 CoreML, ONNX Runtime, etc.), while a `"cpu"` model is ORT-specific.
+
+---
+
+## Build-Time EP Queries
+
+During graph construction, components can query the active EP capabilities
+using the **build context API**. This lets a component branch on the target
+EP without requiring the caller to thread capability objects through every
+layer.
+
+### Reading the active context
+
+```python
+from mobius._build_context import ep_capabilities, get_build_dtype
+import onnx_ir as ir
+
+def forward(self, op, ...):
+    capabilities = ep_capabilities()
+    dtype = get_build_dtype()
+
+    if dtype in capabilities.gqa_dtypes:
+        # Emit a GQA-specific op for this EP
+        ...
+    else:
+        # Fall back to portable ONNX
+        ...
+```
+
+The context is automatically set by `build_from_module()` and `build()` for
+the duration of graph construction. No explicit passing is required.
+
+### Accessing from outside a build
+
+When called outside any active `build_context`, both functions return safe
+defaults: the `"default"` EP capabilities (no fusions) and `ir.DataType.FLOAT`.
+
+### Setting the context manually
+
+Advanced users who build graphs outside the standard pipeline can set the
+context explicitly:
+
+```python
+from mobius._build_context import build_context
+from mobius._execution_providers import ep_registry
+
+capabilities = ep_registry.require("cuda")
+with build_context(capabilities, ir.DataType.FLOAT16):
+    pkg = task.build(module, config)
+```
+
+Contexts nest correctly — an inner `build_context` shadows the outer one
+and restores it on exit, even if an exception is raised.
+
+### Thread and async safety
+
+Each OS thread and asyncio task has its own independent context stack. Two
+concurrent builds with different EPs never interfere:
+
+```python
+import asyncio
+from mobius._build_context import build_context
+from mobius._execution_providers import ep_registry
+
+async def build_cuda():
+    caps = ep_registry.require("cuda")
+    with build_context(caps, ir.DataType.FLOAT16):
+        return task.build(module, config)
+
+async def build_dml():
+    caps = ep_registry.require("dml")
+    with build_context(caps, ir.DataType.FLOAT16):
+        return task.build(module, config)
+
+# These run concurrently without interfering
+cuda_pkg, dml_pkg = await asyncio.gather(build_cuda(), build_dml())
+```
+
+This is implemented using Python's `contextvars` module, which provides
+copy-on-write isolation for threads and coroutines.
+
