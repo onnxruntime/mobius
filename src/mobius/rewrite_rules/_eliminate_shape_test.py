@@ -82,79 +82,28 @@ class TestEliminateShapeRules:
         assert ops_after["ReduceSum"] >= 1, "Expected ReduceSum inserted by rule"
         assert ops_after["ReduceMax"] >= 1, "Expected ReduceMax inserted by rule"
 
-    def test_preserves_input_ids_shape_without_redirect(self):
-        """Shape(input_ids, …) nodes are NOT eliminated by the raw rule alone.
-
-        The redirect pre-processing step (redirect_input_ids_seq_len_shape) must
-        run first to make the Shape node eligible.  Without it, input_ids shapes
-        are preserved — this test verifies the raw rule is intentionally conservative.
+    def test_no_input_ids_seq_len_shape_at_source(self):
+        """create_padding_mask() and create_attention_bias() use attention_mask for
+        the seq-len dimension, so no Shape(input_ids, start=1, end=2) appears in the
+        graph without any redirect pre-processing.
         """
         config = _tiny_qwen3_config()
         model_module = registry.get("qwen3")(config)
         pkg = build_from_module(model_module, config)
         model = pkg["model"]
 
-        # Count Shape nodes whose input is input_ids
-        input_ids_shapes_before = sum(
+        input_ids_seq_len_shapes = sum(
             1
             for n in model.graph
             if n.op_type == "Shape"
             and n.inputs[0] is not None
             and n.inputs[0].name == "input_ids"
+            and n.attributes.get_int("start", 0) == 1
+            and n.attributes.get_int("end", -1) == 2
         )
-
-        rewrite(model, pattern_rewrite_rules=eliminate_shape_rules())
-
-        input_ids_shapes_after = sum(
-            1
-            for n in model.graph
-            if n.op_type == "Shape"
-            and n.inputs[0] is not None
-            and n.inputs[0].name == "input_ids"
-        )
-        assert input_ids_shapes_after == input_ids_shapes_before, (
-            "Shape nodes on input_ids should not be eliminated by the raw rule alone "
-            f"(was {input_ids_shapes_before}, got {input_ids_shapes_after})"
-        )
-
-    def test_redirect_then_eliminate_input_ids_seq_len_shape(self):
-        """Redirect pre-processing + rule eliminates Shape(input_ids, start=1, end=2).
-
-        The full WebGPU optimization path runs redirect_input_ids_seq_len_shape first,
-        then eliminate_shape_rules.  After this, no Shape node should extract seq_len
-        from input_ids — the computation is replaced by ReduceSum+ReduceMax on
-        attention_mask.
-        """
-        from mobius.rewrite_rules import redirect_input_ids_seq_len_shape
-
-        config = _tiny_qwen3_config()
-        model_module = registry.get("qwen3")(config)
-        pkg = build_from_module(model_module, config)
-        model = pkg["model"]
-
-        # Count seq-len Shape nodes on input_ids before redirect
-        def _input_ids_seq_len_shapes(m):
-            return sum(
-                1
-                for n in m.graph
-                if n.op_type == "Shape"
-                and n.inputs[0] is not None
-                and n.inputs[0].name == "input_ids"
-                and n.attributes.get_int("start", 0) == 1
-                and n.attributes.get_int("end", -1) == 2
-            )
-
-        assert _input_ids_seq_len_shapes(model) >= 1, (
-            "Expected at least one Shape(input_ids, start=1, end=2) before redirect"
-        )
-
-        # Step 1: redirect, Step 2: eliminate
-        redirect_input_ids_seq_len_shape(model)
-        rewrite(model, pattern_rewrite_rules=eliminate_shape_rules())
-
-        assert _input_ids_seq_len_shapes(model) == 0, (
-            "Expected all Shape(input_ids, start=1, end=2) nodes to be eliminated "
-            "after redirect + eliminate_shape_rules"
+        assert input_ids_seq_len_shapes == 0, (
+            f"Expected no Shape(input_ids, start=1, end=2) nodes at source, "
+            f"got {input_ids_seq_len_shapes}"
         )
 
     def test_rewritten_model_runs_with_ort(self):

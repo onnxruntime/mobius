@@ -197,52 +197,6 @@ class ShapeGatherToReduceSumMax(RewriteRuleClassBase):
         return op.ReduceMax(counts, axis_0, keepdims=0)
 
 
-def redirect_input_ids_seq_len_shape(model: ir.Model) -> None:
-    """Redirect ``Shape(input_ids, start=1, end=2)`` to use ``attention_mask``.
-
-    Pre-processing for WebGPU: both ``input_ids`` and ``attention_mask`` are 2D INT64
-    graph inputs with the same ``[batch, seq_len]`` shape.  ``Shape(..., start=1, end=2)``
-    extracts the sequence length from both.  After redirecting the ``input_ids`` version
-    to use ``attention_mask``, the existing :class:`ShapeToReduceSumMax` rule can
-    eliminate it.
-
-    This function is called as a pre-processing step before the EliminateShape rewrite
-    rules run in the WebGPU optimization pass — see :func:`mobius._optimizations.optimize_model`.
-
-    Args:
-        model: ONNX IR model to modify in-place.
-    """
-    graph = model.graph
-    # Find the attention_mask graph input (the 0/1 sequence indicator tensor)
-    attention_mask = next(
-        (inp for inp in graph.inputs if inp.name and "mask" in inp.name),
-        None,
-    )
-    if attention_mask is None:
-        return
-
-    for node in graph:
-        if node.op_type != "Shape":
-            continue
-        x = node.inputs[0]
-        if x is None or x.producer() is not None:
-            continue  # not a direct graph input
-        if x.dtype != ir.DataType.INT64:
-            continue
-        if x.shape is None or len(x.shape) != 2:
-            continue
-        if x.name and "mask" in x.name:
-            continue  # already matched by ShapeToReduceSumMax; leave untouched
-        # Only redirect sequence-dimension extraction (start=1, end=2)
-        start = node.attributes.get_int("start", 0)
-        end = node.attributes.get_int("end", -1)
-        if start != 1 or end != 2:
-            continue
-        # Redirect: replace the input_ids source with attention_mask.
-        # Both have the same seq_len dimension, so the Shape output is identical.
-        node.replace_input_with(0, attention_mask)
-
-
 def eliminate_shape_rules() -> RewriteRuleSet:
     """Return rules that replace Shape ops on attention masks with ReduceSum+ReduceMax.
 

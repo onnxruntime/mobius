@@ -354,15 +354,6 @@ def optimize_model(
 
     fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
 
-    # WebGPU pre-processing: redirect Shape(input_ids, start=1, end=2) to use
-    # attention_mask as input so the EliminateShape rule can eliminate it.
-    # Both inputs share the same [batch, seq_len] shape; the output is identical.
-    # Must run before the lowering rules so EliminateShape sees the redirected nodes.
-    if not caps.supports_shape:
-        from mobius.rewrite_rules import redirect_input_ids_seq_len_shape
-
-        redirect_input_ids_seq_len_shape(model)
-
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
     from mobius.functions import register_function_bodies

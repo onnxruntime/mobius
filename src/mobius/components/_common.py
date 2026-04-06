@@ -26,8 +26,14 @@ class Linear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
-        w_t = op.Transpose(self.weight, perm=[1, 0])
-        result = op.MatMul(x, w_t)
+        # FusedMatMul(x, weight, transB=1) computes x @ weight.T in a single
+        # fused kernel on supporting EPs.  The ir.Function body provides a
+        # portable Transpose + MatMul fallback for all other runtimes.
+        result = op.FusedMatMul(x, self.weight, _domain="com.microsoft", transB=1)
+        # FusedMatMul has no ONNX schema; propagate the input dtype so
+        # downstream constant-cache lookups use the correct type key.
+        if x.type is not None:
+            result.type = x.type
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result
@@ -184,8 +190,11 @@ def create_attention_bias(
     # For simplicity, use the full indices and let the Attention op handle masking
     # Actually we need to implement this with shape ops
 
-    # Get query_length and total_length from shapes
-    query_length = op.Shape(input_ids, start=1, end=2)  # 1-D [1]
+    # Get query_length and total_length from shapes.
+    # Both come from attention_mask: total_length is the full sequence length, and
+    # query_length is derived as total_length - past_length.  Using attention_mask
+    # for both means the EliminateShape rule on WebGPU can eliminate these Shape ops.
+    query_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
     total_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
     start = op.Sub(total_length, query_length)
     # q_indices_2d: (batch_size, query_length)
@@ -253,10 +262,12 @@ def create_padding_mask(
     # Unsqueeze to [B, 1, total_len] for broadcasting across q_len.
     mask_3d = op.Unsqueeze(bool_mask, [1])
     # Build target shape [B, q_len, total_len] using explicit slices.
-    # input_ids may be 2D (input_ids) or 3D (hidden_states when
-    # inputs_embeds is used), so we extract dims individually.
+    # input_ids may be 2D (input_ids) or 3D (hidden_states when inputs_embeds is
+    # used), so we extract the batch dimension from it individually.  The sequence
+    # dimension (q_len) is taken from attention_mask so the EliminateShape rule on
+    # WebGPU can eliminate this Shape op along with the total_len one.
     batch_size = op.Shape(input_ids, start=0, end=1)
-    q_len = op.Shape(input_ids, start=1, end=2)
+    q_len = op.Shape(attention_mask, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
     return op.Expand(mask_3d, target_shape)
