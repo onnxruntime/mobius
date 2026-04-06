@@ -410,11 +410,30 @@ _ORT_DEFAULT_PRECISION: dict[str, str] = {
 }
 
 
+def _download_model_once(model_id: str, cache_root: str) -> str:
+    """Download a HuggingFace model to a local cache dir and return the local path.
+
+    Reuses the cached snapshot on subsequent calls — no re-download per EP.
+    Falls back to returning model_id as-is if huggingface_hub is not available.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return model_id  # Let ORT GenAI builder handle download itself
+    local_dir = os.path.join(cache_root, model_id.replace("/", "--"))
+    if os.path.isdir(local_dir) and any(Path(local_dir).iterdir()):
+        return local_dir  # Already cached
+    os.makedirs(local_dir, exist_ok=True)
+    snapshot_download(repo_id=model_id, local_dir=local_dir, local_dir_use_symlinks=False)
+    return local_dir
+
+
 def build_ort_genai(
     model_id: str,
     ep: str,
     precision: str,
     *,
+    input_path: str | None = None,
     mobius_ep_label: str | None = None,
 ) -> OpCounts:
     """Build an ORT GenAI model using the installed onnxruntime_genai package.
@@ -423,6 +442,10 @@ def build_ort_genai(
         model_id: HuggingFace model ID.
         ep: ORT GenAI execution_provider argument (e.g. "cuda", "NvTensorRtRtx").
         precision: ORT GenAI precision argument (e.g. "fp16", "fp32").
+        input_path: Local directory containing the downloaded model weights.
+            When provided, ORT GenAI uses this instead of re-downloading from HF.
+            Pass the same path for every EP build of the same model to avoid
+            repeated downloads.
         mobius_ep_label: Mobius EP name to use in the column label (e.g. "trt-rtx").
             Defaults to ep when not given.
 
@@ -437,14 +460,18 @@ def build_ort_genai(
         ) from exc
 
     label_ep = mobius_ep_label or ep
-    out_dir = tempfile.mkdtemp(prefix="ort_genai_cmp_")
+    # Use a per-(ep, precision) temp dir for ONNX output; the model weights in
+    # input_path are shared and never deleted by this function.
+    out_dir = tempfile.mkdtemp(prefix=f"ort_genai_{label_ep}_")
     try:
         create_model(
             model_name=model_id,
-            input_path=model_id,
+            input_path=input_path or model_id,
             output_dir=out_dir,
             precision=precision,
             execution_provider=ep,
+            # cache_dir is only used when input_path is not a local dir;
+            # point it inside out_dir so it's cleaned up with the ONNX output.
             cache_dir=os.path.join(out_dir, "cache"),
         )
         candidates = list(Path(out_dir).glob("**/*.onnx"))
@@ -1074,6 +1101,14 @@ def main() -> None:
         help="Pre-built ORT GenAI model dir or .onnx file (repeat to match --model list).",
     )
     parser.add_argument(
+        "--cache-dir",
+        default=os.path.join(os.path.expanduser("~"), ".cache", "mobius_comparison"),
+        metavar="DIR",
+        help="Directory for caching downloaded HuggingFace model weights. "
+        "The same weights are reused for every EP build of the same model. "
+        "Default: ~/.cache/mobius_comparison",
+    )
+    parser.add_argument(
         "--dtype",
         "--ort-precision",
         dest="ort_precision",
@@ -1175,6 +1210,28 @@ def main() -> None:
             ort_models_list = args.ort_models or []
             ort_path = ort_models_list[i] if i < len(ort_models_list) else None
 
+            # Download model weights ONCE, reuse across all EP builds.
+            # _download_model_once returns a local path; create_model skips download
+            # when input_path is an existing local directory.
+            if not ort_path and not no_ort:
+                if not args.quiet:
+                    print(
+                        f"  Downloading {model_id} to cache (once for all EPs) ...",
+                        end="",
+                        flush=True,
+                    )
+                try:
+                    cached_model_path: str | None = _download_model_once(
+                        model_id, args.cache_dir
+                    )
+                    if not args.quiet:
+                        print(" done.")
+                except Exception as e:
+                    print(f"\n  WARNING: model download failed: {e} — will retry per EP")
+                    cached_model_path = None
+            else:
+                cached_model_path = None
+
             for ep_target in all_eps:
                 ort_ep_name = _ORT_EP_MAP.get(ep_target)  # None for "default"
                 precision = args.ort_precision or _ORT_DEFAULT_PRECISION.get(
@@ -1211,6 +1268,7 @@ def main() -> None:
                                     model_id,
                                     ep=ort_ep_name,
                                     precision=precision,
+                                    input_path=cached_model_path,
                                     mobius_ep_label=ep_target,
                                 )
                             )
@@ -1295,6 +1353,14 @@ def main() -> None:
                 )
         else:
             # Cross-builder mode: one ModelReport per (model, ep).
+            # Download model weights once for all EP iterations.
+            import contextlib
+
+            _single_ep_cached_path: str | None = None
+            if not no_ort and _ort_genai_available() and not (args.ort_models or []):
+                with contextlib.suppress(Exception):
+                    _single_ep_cached_path = _download_model_once(model_id, args.cache_dir)
+
             for ep in eps:
                 if not args.quiet:
                     print(f"\n→ {model_id}  EP: {ep}", flush=True)
@@ -1341,6 +1407,7 @@ def main() -> None:
                                     model_id,
                                     ep=ort_ep_name,
                                     precision=precision,
+                                    input_path=_single_ep_cached_path,
                                     mobius_ep_label=ep,
                                 )
                             )
