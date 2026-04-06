@@ -561,6 +561,40 @@ def _all_ops_in_order(cols: list[OpCounts]) -> list[tuple[str, str]]:
     return result
 
 
+# Short dtype abbreviations used in column labels and headers.
+_DTYPE_SHORT: dict[str, str] = {
+    "float32": "fp32",
+    "float16": "fp16",
+    "bfloat16": "bf16",
+}
+
+
+def _col_display_label(col: OpCounts) -> str:
+    """Return a human-readable column label, appending the dtype when known.
+
+    Examples:
+        "mobius/cuda"           (dtype=None)       → "mobius/cuda"
+        "mobius/cuda"           (dtype="float16")  → "mobius/cuda (fp16)"
+        "ort-genai/webgpu"      (dtype="float32")  → "ort-genai/webgpu (fp32)"
+    """
+    if col.dtype is None:
+        return col.label
+    short = _DTYPE_SHORT.get(col.dtype, col.dtype)
+    return f"{col.label} ({short})"
+
+
+def _dtype_summary(cols: list[OpCounts]) -> str:
+    """Return a compact per-column dtype summary string for metadata sections.
+
+    Example: "ort-genai/cuda: unknown  |  mobius/cuda: fp16  |  mobius/webgpu: fp32"
+    """
+    parts = []
+    for c in cols:
+        short = _DTYPE_SHORT.get(c.dtype or "", c.dtype or "unknown")
+        parts.append(f"{c.label}: {short}")
+    return "  |  ".join(parts)
+
+
 def _ep_differences(cols: list[OpCounts]) -> list[Difference]:
     """Describe the expected per-EP differences for a multi-EP comparison."""
     diffs = []
@@ -730,12 +764,15 @@ def _console_table(report: ModelReport, color: bool) -> str:
     cols = report.columns
     ops_in_order = _all_ops_in_order(cols)
 
+    # Use display labels (with dtype suffix) for column headers.
+    display_labels = [_col_display_label(c) for c in cols]
+
     op_w = max((len(lbl) for _, lbl in ops_in_order), default=24)
-    col_w = max(18, max(len(c.label) for c in cols))
+    col_w = max(18, max(len(dl) for dl in display_labels))
     row_w = op_w + 4 + (col_w + 4) * len(cols)
 
     sep = "─" * row_w
-    header = f"  {'Op':<{op_w}}  " + "  ".join(f"{c.label:^{col_w}}" for c in cols)
+    header = f"  {'Op':<{op_w}}  " + "  ".join(f"{dl:^{col_w}}" for dl in display_labels)
     lines = [sep, header, sep]
 
     for op, lbl in ops_in_order:
@@ -807,8 +844,10 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
         icon = _VERDICT_ICON.get(mr.verdict, "?")
         vc = _VERDICT_COLOR.get(mr.verdict, "") if use_color else ""
         rc = _RESET if use_color else ""
+        dtype_line = _dtype_summary(mr.columns)
         lines += [
             f"┌─ Model: {mr.model_id}  EP: {mr.ep}",
+            f"│  Dtypes:  {dtype_line}",
             f"│  Verdict: {vc}{icon} {mr.verdict}{rc}  —  {mr.verdict_reason}",
             "│",
         ]
@@ -953,6 +992,7 @@ def render_markdown(report: ComparisonReport) -> str:
 
     for mr in report.models:
         icon = _VERDICT_ICON.get(mr.verdict, "?")
+        dtype_line = _dtype_summary(mr.columns)
         lines += [
             f"## {mr.model_id}  ·  EP: `{mr.ep}`",
             "",
@@ -960,13 +1000,16 @@ def render_markdown(report: ComparisonReport) -> str:
             "",
             f"> {mr.verdict_reason}",
             "",
+            f"**Build dtypes:** {dtype_line}",
+            "",
         ]
 
         # Op count table — all ops in union of both models
         cols = mr.columns
         ops_in_order = _all_ops_in_order(cols)
 
-        header = "| Op |" + "".join(f" {c.label} |" for c in cols) + " Notes |"
+        # Use display labels (with dtype suffix) for column headers.
+        header = "| Op |" + "".join(f" {_col_display_label(c)} |" for c in cols) + " Notes |"
         sep_row = "|" + "---|" * (2 + len(cols))
         lines += [header, sep_row]
 
