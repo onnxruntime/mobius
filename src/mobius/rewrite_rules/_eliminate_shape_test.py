@@ -83,9 +83,10 @@ class TestEliminateShapeRules:
         assert ops_after["ReduceMax"] >= 1, "Expected ReduceMax inserted by rule"
 
     def test_no_input_ids_seq_len_shape_at_source(self):
-        """create_padding_mask() and create_attention_bias() use attention_mask for
-        the seq-len dimension, so no Shape(input_ids, start=1, end=2) appears in the
-        graph without any redirect pre-processing.
+        """create_padding_mask() and create_attention_bias() use attention_mask for seq-len.
+
+        No Shape(input_ids, start=1, end=2) appears in the graph without any
+        redirect pre-processing.
         """
         config = _tiny_qwen3_config()
         model_module = registry.get("qwen3")(config)

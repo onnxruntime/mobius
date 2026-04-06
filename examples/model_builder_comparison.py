@@ -93,8 +93,10 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "GroupQueryAttention",
         "GQA",
-        "GQA is emitted when the EP supports it (cuda, webgpu, dml, cpu). "
-        "Default EP keeps standard Attention + RotaryEmbedding ops.",
+        (
+            "GQA is emitted when the EP supports it (cuda, webgpu, dml, cpu). "
+            "Default EP keeps standard Attention + RotaryEmbedding ops."
+        ),
     ),
     (
         "Attention",
@@ -109,8 +111,10 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "RotaryEmbedding",
         "RotaryEmbedding",
-        "RoPE kept explicit (default EP) or after SeparateRoPE lowering (DML). "
-        "Absent when fused into GQA (cuda).",
+        (
+            "RoPE kept explicit (default EP) or after SeparateRoPE lowering (DML). "
+            "Absent when fused into GQA (cuda)."
+        ),
     ),
     (
         "SkipLayerNormalization",
@@ -124,8 +128,10 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "SkipSimplifiedLayerNormalization",
         "SkipSimplifiedLayerNorm",
-        "Add + RMSNorm fused (com.microsoft custom op). "
-        "One fewer than ORT GenAI if mobius keeps the final norm as standard ONNX.",
+        (
+            "Add + RMSNorm fused (com.microsoft custom op). "
+            "One fewer than ORT GenAI if mobius keeps the final norm as standard ONNX."
+        ),
     ),
     (
         "LayerNormalization",
@@ -135,16 +141,20 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "RMSNormalization",
         "RMSNorm (ONNX)",
-        "Standard ONNX opset-23 RMSNorm. ORT GenAI uses 'SimplifiedLayerNormalization' for the same op. "
-        "Mobius emits this for norms not covered by SkipSimplifiedLayerNorm fusion (embedding norm, final norm).",
+        (
+            "Standard ONNX opset-23 RMSNorm. ORT GenAI uses 'SimplifiedLayerNormalization' for the same op. "
+            "Mobius emits this for norms not covered by SkipSimplifiedLayerNorm fusion (embedding norm, final norm)."
+        ),
     ),
     (
         "SimplifiedLayerNormalization",
         "SimplifiedLayerNorm (ORT)",
         # ORT GenAI uses this com.microsoft op for standalone (unfused) RMSNorm.
         # Mobius emits the standard ONNX 'RMSNormalization' for the same node.
-        "ORT GenAI uses this for standalone (unfused) RMSNorm. "
-        "Mobius emits 'RMSNormalization' for the same node — same math, different op name.",
+        (
+            "ORT GenAI uses this for standalone (unfused) RMSNorm. "
+            "Mobius emits 'RMSNormalization' for the same node — same math, different op name."
+        ),
     ),
     (
         "BiasGelu",
@@ -164,8 +174,10 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "MatMul",
         "MatMul",
-        "Plain matrix multiply. Count differs when QKV projections are packed "
-        "differently (ORT GenAI sometimes packs Q/K/V into one MatMul).",
+        (
+            "Plain matrix multiply. Count differs when QKV projections are packed "
+            "differently (ORT GenAI sometimes packs Q/K/V into one MatMul)."
+        ),
     ),
     (
         "Shape",

@@ -67,8 +67,6 @@ import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchResult
 from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleSet
 
-_counter: int = 0
-
 
 class GQAUnpackQKV(RewriteRuleClassBase):
     """Split packed QKV in GQA into separate Q/K/V MatMul (±Add bias) projections.

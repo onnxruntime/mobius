@@ -24,6 +24,7 @@ from __future__ import annotations
 __all__ = [
     # Public API
     "optimize_model",
+    "fold_constants_after_weights",
     # Passes (used by tests and _builder re-exports)
     "CleanupMetadataPass",
     "SymbolicShapeInferencePass",
@@ -81,6 +82,11 @@ class CleanupMetadataPass(ir.passes.InPlacePass):
         return ir.passes.PassResult(model, modified=modified)
 
 
+# Maximum number of elements allowed in a constant-folded output tensor.
+# Set high enough to fold packed-QKV weights (Llama-3.2-1B packed QKV is
+# ~6.3M elements per layer; 256M gives ample headroom for large models).
+_FOLD_OUTPUT_SIZE_LIMIT = 256 * 1024 * 1024
+
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
     common_passes.LiftConstantsToInitializersPass(),
@@ -90,7 +96,9 @@ _DEFAULT_PASSES = [
     common_passes.RemoveUnusedOpsetsPass(),
     SymbolicShapeInferencePass(),
     onnxscript.optimizer._constant_folding.FoldConstantsPass(
-        shape_inference=False, input_size_limit=8192, output_size_limit=512 * 512
+        shape_inference=False,
+        input_size_limit=8192,
+        output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
     ),
     CleanupMetadataPass(),
 ]
@@ -437,7 +445,7 @@ def optimize_model(
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,
                 input_size_limit=8192,
-                output_size_limit=512 * 512,
+                output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
         ]
     )
@@ -465,3 +473,26 @@ def optimize_model(
                 f"Check that the attention pattern matches the GQA rewrite rule.",
                 stacklevel=4,
             )
+
+
+def fold_constants_after_weights(model: ir.Model) -> None:
+    """Fold constants after weights have been applied.
+
+    This is a lightweight pass intended to run after :func:`apply_weights`
+    so that any weight-dependent Concat/other constant nodes (e.g. from
+    PackQKV fusion) get folded into single initializers.
+
+    The pass raises no errors: warnings are emitted for nodes that cannot
+    be evaluated (e.g. symbolic inputs), and those nodes are left in place.
+    """
+    pass_manager = ir.passes.PassManager(
+        [
+            onnxscript.optimizer._constant_folding.FoldConstantsPass(
+                shape_inference=False,
+                input_size_limit=8192,
+                output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
+            ),
+            common_passes.RemoveUnusedNodesPass(),
+        ]
+    )
+    pass_manager(model)

@@ -105,9 +105,10 @@ def make_kv_cache_dim_name(
 ) -> str:
     """Return the correct KV cache sequence dimension name.
 
-    For TRT-RTX with sliding window layers, the sequence dimension uses
-    ``"sliding_window_length"`` instead of ``"past_sequence_length"``
-    so that the runtime can allocate fixed-size sliding window buffers.
+    For TRT-RTX with sliding window layers, ``"sequence"`` in the dimension
+    name is replaced with ``"sliding"`` — e.g. ``"past_sequence_length"``
+    becomes ``"past_sliding_length"`` — so that the runtime allocates
+    fixed-size sliding window buffers instead of unbounded KV caches.
 
     Args:
         dim_name: The base dimension name (e.g. ``"past_sequence_length"``).

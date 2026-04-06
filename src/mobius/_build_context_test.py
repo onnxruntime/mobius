@@ -11,7 +11,6 @@ import pytest
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._execution_providers import EpCapabilities
 
-
 _CUDA_CAPABILITIES = EpCapabilities(
     name="cuda",
     gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
@@ -53,9 +52,11 @@ class TestBuildContextScoping:
 
     def test_capabilities_restored_on_exception(self):
         """Context restores state even if an exception is raised inside."""
-        with pytest.raises(RuntimeError, match="deliberate"):
-            with build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16):
-                raise RuntimeError("deliberate")
+        with (
+            pytest.raises(RuntimeError, match="deliberate"),
+            build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16),
+        ):
+            raise RuntimeError("deliberate")
         assert ep_capabilities().name == "default"
         assert get_build_dtype() == ir.DataType.FLOAT
 
@@ -92,6 +93,7 @@ class TestBuildContextThreadIsolation:
             try:
                 with build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16):
                     import time
+
                     time.sleep(0.05)  # yield to let other thread set its context
                     results["cuda"] = ep_capabilities().name
             except Exception as exc:
@@ -101,6 +103,7 @@ class TestBuildContextThreadIsolation:
             try:
                 with build_context(_CPU_CAPABILITIES, ir.DataType.FLOAT):
                     import time
+
                     time.sleep(0.05)
                     results["cpu"] = ep_capabilities().name
             except Exception as exc:
@@ -125,6 +128,7 @@ class TestBuildContextThreadIsolation:
             with build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16):
                 child_finished.set()
                 import time
+
                 time.sleep(0.1)
 
         thread = threading.Thread(target=child_thread)
