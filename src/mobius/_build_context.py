@@ -12,12 +12,12 @@ Usage::
     from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 
     # Components can read the active EP capabilities at any point:
-    caps = ep_capabilities()
-    if ir.DataType.FLOAT16 in caps.gqa_dtypes:
+    capabilities = ep_capabilities()
+    if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
         ...  # emit GQA-specific ops
 
     # Build orchestration wraps graph construction in a context:
-    with build_context(cuda_caps, ir.DataType.FLOAT16):
+    with build_context(cuda_capabilities, ir.DataType.FLOAT16):
         pkg = task.build(module, config)
 """
 
@@ -67,8 +67,8 @@ def build_context(
         from mobius._build_context import build_context
         from mobius._execution_providers import ep_registry
 
-        caps = ep_registry.require("cuda")
-        with build_context(caps, ir.DataType.FLOAT16):
+        capabilities = ep_registry.require("cuda")
+        with build_context(capabilities, ir.DataType.FLOAT16):
             pkg = task.build(module, config)
     """
     capabilities_token = _current_ep.set(capabilities)
@@ -91,8 +91,8 @@ def ep_capabilities() -> EpCapabilities:
         from mobius._build_context import ep_capabilities
         import onnx_ir as ir
 
-        caps = ep_capabilities()
-        if ir.DataType.FLOAT16 in caps.gqa_dtypes:
+        capabilities = ep_capabilities()
+        if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
             # emit GQA with fp16 inputs
             ...
     """
