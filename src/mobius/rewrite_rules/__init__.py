@@ -31,6 +31,7 @@ __all__ = [
     "bias_gelu_rules",
     "eliminate_shape_rules",
     "fused_matmul_rules",
+    "redirect_input_ids_seq_len_shape",
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "layer_norm_fusion_rules",
@@ -43,7 +44,10 @@ __all__ = [
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
-from mobius.rewrite_rules._eliminate_shape import eliminate_shape_rules
+from mobius.rewrite_rules._eliminate_shape import (
+    eliminate_shape_rules,
+    redirect_input_ids_seq_len_shape,
+)
 from mobius.rewrite_rules._fused_matmul import fused_matmul_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (

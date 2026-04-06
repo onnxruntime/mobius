@@ -293,6 +293,19 @@ class OpCounts(NamedTuple):
     source: str  # "mobius" | "ort-genai" | "file"
 
 
+class Difference(NamedTuple):
+    """A single op-count difference between two builders, with direction metadata.
+
+    ``direction`` is one of:
+    - ``"ort_more"``   — ORT GenAI count > mobius count (optimization opportunity; 🟢)
+    - ``"mobius_more"`` — mobius count > ORT GenAI count (potential regression; 🟣)
+    - ``"neutral"``    — no directional reference (mobius-only multi-EP comparison)
+    """
+
+    direction: str  # "ort_more" | "mobius_more" | "neutral"
+    text: str  # formatted Markdown string, e.g. "**GQA** (…): ort=16, mob=0  \n  ↳ …"
+
+
 @dataclass
 class ModelReport:
     model_id: str
@@ -300,7 +313,7 @@ class ModelReport:
     columns: list[OpCounts]
     verdict: str = ""  # "PASS" | "KNOWN_DIFF" | "FAIL" | "MOBIUS-ONLY"
     verdict_reason: str = ""
-    differences: list[str] = field(default_factory=list)
+    differences: list[Difference] = field(default_factory=list)
     qk_norm_issues: list[str] = field(
         default_factory=list
     )  # Non-empty → QK-norm invariant violated
@@ -512,7 +525,7 @@ def _all_ops_in_order(cols: list[OpCounts]) -> list[tuple[str, str]]:
     return result
 
 
-def _ep_differences(cols: list[OpCounts]) -> list[str]:
+def _ep_differences(cols: list[OpCounts]) -> list[Difference]:
     """Describe the expected per-EP differences for a multi-EP comparison."""
     diffs = []
     for op, lbl in _all_ops_in_order(cols):
@@ -521,7 +534,9 @@ def _ep_differences(cols: list[OpCounts]) -> list[str]:
             continue
         expl = OP_EXPLANATION.get(op, "uncatalogued op — count shown for transparency")
         vals = ", ".join(f"{c.label}={c.counts.get(op, 0)}" for c in cols)
-        diffs.append(f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}")
+        diffs.append(
+            Difference(direction="neutral", text=f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}")
+        )
     return diffs
 
 
@@ -529,7 +544,7 @@ def _compute_verdict(
     cols: list[OpCounts],
     model_id: str = "",
     extra_known_diff_ops: frozenset[str] | None = None,
-) -> tuple[str, str, list[str], list[str]]:
+) -> tuple[str, str, list[Difference], list[str]]:
     """Return (verdict, reason, differences_list, qk_norm_issues).
 
     extra_known_diff_ops: additional ops to treat as KNOWN_DIFF rather than FAIL,
@@ -545,8 +560,12 @@ def _compute_verdict(
         return "MOBIUS-ONLY", "Single builder — no cross-builder comparison.", [], []
 
     effective_critical = _CRITICAL_OPS - (extra_known_diff_ops or frozenset())
-    differences: list[str] = []
+    differences: list[Difference] = []
     critical_fail = False
+
+    # Resolve ORT GenAI and mobius columns once for direction computation.
+    ort_col = next((c for c in cols if c.source == "ort-genai"), None)
+    mob_col = next((c for c in cols if c.source == "mobius"), None)
 
     # Iterate ALL op types that appear in any column — catalogued first (in
     # priority order), then uncatalogued alphabetically.  Uncatalogued ops are
@@ -558,7 +577,20 @@ def _compute_verdict(
             continue  # All same — no difference
         vals = ", ".join(f"{c.label}={c.counts.get(op, 0)}" for c in cols)
         expl = OP_EXPLANATION.get(op, "uncatalogued op — count shown for transparency")
-        differences.append(f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}")
+        text = f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}"
+        # Determine direction relative to the first ORT GenAI vs first mobius column.
+        if ort_col and mob_col:
+            ort_n = ort_col.counts.get(op, 0)
+            mob_n = mob_col.counts.get(op, 0)
+            if ort_n > mob_n:
+                direction = "ort_more"
+            elif mob_n > ort_n:
+                direction = "mobius_more"
+            else:
+                direction = "neutral"
+        else:
+            direction = "neutral"
+        differences.append(Difference(direction=direction, text=text))
         if op in effective_critical:
             critical_fail = True
 
@@ -726,11 +758,32 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
             lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
+            _ORT_MORE_COLOR = "\033[42m"  # green background
+            _MOB_MORE_COLOR = "\033[45m"  # purple/magenta background
             for diff in mr.differences:
-                # Strip markdown for console
-                plain = diff.replace("**", "").replace("  \n  ↳ ", "\n     ↳ ")
+                # Strip markdown bold markers for console output
+                plain = diff.text.replace("**", "").replace("  \n  ↳ ", "\n     ↳ ")
+                if use_color:
+                    if diff.direction == "ort_more":
+                        prefix = f"{_ORT_MORE_COLOR}🟢{_RESET} "
+                    elif diff.direction == "mobius_more":
+                        prefix = f"{_MOB_MORE_COLOR}🟣{_RESET} "
+                    else:
+                        prefix = "   "
+                else:
+                    if diff.direction == "ort_more":
+                        prefix = "🟢 "
+                    elif diff.direction == "mobius_more":
+                        prefix = "🟣 "
+                    else:
+                        prefix = "   "
+                first_line = True
                 for dline in plain.splitlines():
-                    lines.append("│    " + dline)
+                    if first_line:
+                        lines.append("│    " + prefix + dline)
+                        first_line = False
+                    else:
+                        lines.append("│       " + dline)
             lines.append("│")
         if _is_qk_norm_model(mr.model_id):
             if mr.qk_norm_issues:
@@ -865,7 +918,20 @@ def render_markdown(report: ComparisonReport) -> str:
         if mr.differences:
             lines += ["### Differences", ""]
             for diff in mr.differences:
-                lines.append(f"- {diff}")
+                # Split at the soft-break so we can color only the op:counts line.
+                parts = diff.text.split("  \n  ↳ ", 1)
+                first_part = parts[0]
+                explanation = parts[1] if len(parts) > 1 else ""
+                if diff.direction == "ort_more":
+                    colored = f"<span style='background-color: #d4edda'>{first_part}</span>"
+                elif diff.direction == "mobius_more":
+                    colored = f"<span style='background-color: #e8d5f5'>{first_part}</span>"
+                else:
+                    colored = first_part
+                if explanation:
+                    lines.append(f"- {colored}  \n  ↳ {explanation}")
+                else:
+                    lines.append(f"- {colored}")
             lines += [""]
 
         if mr.expected_counts:
