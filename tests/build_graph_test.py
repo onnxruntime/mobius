@@ -3784,3 +3784,113 @@ class TestBuildSpeechGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+class TestBuildGQAGraph:
+    """Verify CausalLMTask(gqa=True) builds a valid GQA graph."""
+
+    def _build_gqa_model(self, model_type: str = "qwen2", **config_overrides):
+        """Build a model with GQA mode and return (model, config)."""
+        from mobius.components import GQAAttention
+
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config, attention_class=GQAAttention)
+        task = CausalLMTask(gqa=True)
+        pkg = task.build(module, config)
+        return pkg["model"], config
+
+    def test_gqa_graph_builds(self):
+        """Build a Qwen2 model with GQA mode."""
+        model, _ = self._build_gqa_model()
+        assert model.graph is not None
+        assert len(model.graph.inputs) > 0
+        assert len(model.graph.outputs) > 0
+
+    def test_gqa_graph_inputs(self):
+        """Verify inputs: input_ids, attention_mask, KV caches (no position_ids)."""
+        model, config = self._build_gqa_model()
+        input_names = {inp.name for inp in model.graph.inputs}
+        num_layers = config.num_hidden_layers
+
+        assert "input_ids" in input_names
+        assert "attention_mask" in input_names
+        # GQA mode: no position_ids (RoPE is fused inside GQA op)
+        assert "position_ids" not in input_names
+
+        for i in range(num_layers):
+            assert f"past_key_values.{i}.key" in input_names
+            assert f"past_key_values.{i}.value" in input_names
+
+        # Exact count: 2 standard + 2*num_layers caches
+        expected_count = 2 + 2 * num_layers
+        assert len(model.graph.inputs) == expected_count, (
+            f"Expected {expected_count} inputs, got {len(model.graph.inputs)}"
+        )
+
+    def test_gqa_graph_outputs(self):
+        """Verify outputs: logits + present KV caches."""
+        model, config = self._build_gqa_model()
+        output_names = {out.name for out in model.graph.outputs}
+        num_layers = config.num_hidden_layers
+
+        assert "logits" in output_names
+        for i in range(num_layers):
+            assert f"present.{i}.key" in output_names
+            assert f"present.{i}.value" in output_names
+
+        expected_count = 1 + 2 * num_layers
+        assert len(model.graph.outputs) == expected_count
+
+    def test_gqa_has_group_query_attention_ops(self):
+        """Verify the graph uses GroupQueryAttention, not standard Attention."""
+        model, _config = self._build_gqa_model()
+        op_types = {n.op_type for n in model.graph}
+
+        assert "GroupQueryAttention" in op_types
+        assert "Attention" not in op_types, "GQA graph should not have standard Attention ops"
+
+    def test_gqa_no_rotary_embedding_nodes(self):
+        """Verify RoPE is fused inside GQA (no RotaryEmbedding nodes)."""
+        model, _ = self._build_gqa_model()
+        op_types = {n.op_type for n in model.graph}
+        assert "RotaryEmbedding" not in op_types
+
+    def test_gqa_has_cos_sin_initializers(self):
+        """Verify cos_cache and sin_cache are graph initializers."""
+        model, _ = self._build_gqa_model()
+        init_names = list(model.graph.initializers)
+        assert any("cos_cache" in n for n in init_names), (
+            "GQA graph should have cos_cache initializer"
+        )
+        assert any("sin_cache" in n for n in init_names), (
+            "GQA graph should have sin_cache initializer"
+        )
+
+    def test_gqa_has_microsoft_opset(self):
+        """Verify com.microsoft opset is imported."""
+        model, _ = self._build_gqa_model()
+        assert "com.microsoft" in model.graph.opset_imports
+
+    def test_gqa_graph_validates(self):
+        """Verify the graph survives a serialization round-trip."""
+        model, _ = self._build_gqa_model()
+        proto = ir.serde.serialize_model(model)
+        assert len(proto.SerializeToString()) > 0
+
+    def test_gqa_do_rotary_attribute(self):
+        """Verify GroupQueryAttention nodes have do_rotary=1."""
+        model, config = self._build_gqa_model()
+        gqa_nodes = [n for n in model.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+
+        for node in gqa_nodes:
+            do_rotary = node.attributes.get("do_rotary")
+            assert do_rotary is not None
+            assert do_rotary.value == 1
+
+    def test_gqa_llama_model(self):
+        """Verify GQA mode also works with llama model type."""
+        model, _ = self._build_gqa_model(model_type="llama")
+        op_types = {n.op_type for n in model.graph}
+        assert "GroupQueryAttention" in op_types

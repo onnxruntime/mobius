@@ -246,6 +246,7 @@ def build(
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     trust_remote_code: bool = False,
+    module_kwargs: dict | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -278,6 +279,8 @@ def build(
         load_weights: Whether to download and apply weights from HuggingFace.
         trust_remote_code: Whether to trust remote code when loading the
             HuggingFace config.
+        module_kwargs: Extra keyword arguments passed to the module class
+            constructor (e.g. ``{"attention_class": GQAAttention}``).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -378,7 +381,7 @@ def build(
     if task is None:
         task = _default_task_for_model(model_type)
 
-    model_module = module_class(config)
+    model_module = module_class(config, **(module_kwargs or {}))
     pkg = build_from_module(model_module, config, task)
 
     # Set graph names

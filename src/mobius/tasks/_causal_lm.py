@@ -1,7 +1,7 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Causal language model tasks with internal and static KV cache."""
+"""Causal language model tasks with internal, static, and GQA KV cache."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
+from mobius.components._gqa_attention import GQAContext
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -23,10 +24,18 @@ from mobius.tasks._base import (
 )
 
 
+def _find_rotary_emb(module: nn.Module) -> nn.Module | None:
+    """Find the rotary embedding module by walking the module tree."""
+    for name, child in module.named_modules():
+        if name.endswith("rotary_emb") and hasattr(child, "cos_cache"):
+            return child
+    return None
+
+
 class CausalLMTask(ModelTask):
     """Causal language model with KV cache for text generation.
 
-    Supports two cache modes:
+    Supports three cache modes:
 
     **Dynamic cache** (default):
         Standard KV cache with dynamic sequence lengths. Past keys/values
@@ -61,11 +70,30 @@ class CausalLMTask(ModelTask):
 
         No ``attention_mask`` input — causal masking uses ``is_causal=1``.
 
+    **GQA mode** (``gqa=True``):
+        Uses ``com.microsoft::GroupQueryAttention`` with fused RoPE and
+        in-place KV cache support.  Compatible with the onnxruntime-genai
+        runtime (``past_present_share_buffer=true``).
+
+        Inputs:
+            - input_ids: [batch, sequence_len] INT64
+            - attention_mask: [batch, total_seq_len] INT64
+            - past_key_values.{i}.key: [batch, num_kv_heads, past_seq_len, head_dim]
+            - past_key_values.{i}.value: [batch, num_kv_heads, past_seq_len, head_dim]
+        Outputs:
+            - logits: FLOAT
+            - present.{i}.key / present.{i}.value: FLOAT
+
+        No ``position_ids`` input — RoPE is fused inside GroupQueryAttention
+        using cos_cache/sin_cache initializers.
+
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
     and return ``(logits, list_of_(key, value)_tuples)``.  In static cache
     mode, ``attention_mask`` will be ``None`` and ``past_key_values``
-    entries will be :class:`StaticCacheState` tuples.
+    entries will be :class:`StaticCacheState` tuples.  In GQA mode,
+    ``position_ids`` will be ``None`` and a ``gqa_context`` kwarg is
+    passed.
 
     Args:
         static_cache: If ``True``, use pre-allocated static KV cache
@@ -73,6 +101,8 @@ class CausalLMTask(ModelTask):
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
+        gqa: If ``True``, use ``com.microsoft::GroupQueryAttention``
+            with fused RoPE and in-place KV cache support.
     """
 
     def __init__(
@@ -80,15 +110,20 @@ class CausalLMTask(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        gqa: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._gqa = gqa
 
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        if self._gqa:
+            return self._build_gqa(module, config)
+
         static = self._static_cache
 
         # --- Static-cache pre-validation ---
@@ -194,6 +229,107 @@ class CausalLMTask(ModelTask):
             )
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
+
+    def _build_gqa(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        """Build a model using com.microsoft::GroupQueryAttention.
+
+        Creates the graph with:
+        - No position_ids input (RoPE is fused inside GQA)
+        - seqlens_k and total_seq_len computed from attention_mask
+        - cos_cache and sin_cache as graph initializers
+        - Standard 4D KV cache I/O (same naming as dynamic cache)
+        """
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        # --- Graph inputs ---
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        # No position_ids — GQA handles RoPE internally
+
+        graph_inputs = [input_ids, attention_mask]
+
+        # --- KV cache inputs (same 4D shape as dynamic cache) ---
+        cache_inputs, past_key_values = _make_kv_cache_inputs(
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        graph_inputs.extend(cache_inputs)
+
+        # --- Build graph ---
+        graph, builder = _make_graph(graph_inputs)
+        op = builder.op
+
+        # --- Compute seqlens_k and total_seq_len from attention_mask ---
+        # seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
+        axis = op.Constant(value_ints=[1])
+        reduce_sum = op.ReduceSum(attention_mask, axis)
+        one = op.Constant(value_ints=[1])
+        seqlens_k = op.Cast(op.Sub(reduce_sum, one), to=ir.DataType.INT32)
+
+        # total_seq_len = Cast(Gather(Shape(attention_mask), 1), INT32)
+        mask_shape = op.Shape(attention_mask)
+        idx_1 = op.Constant(value_int=1)
+        total_seq_len = op.Cast(op.Gather(mask_shape, idx_1), to=ir.DataType.INT32)
+
+        # --- Get cos/sin cache from the model's rotary embedding ---
+        # The model must have a rotary_emb with cos_cache/sin_cache parameters.
+        rotary_emb = _find_rotary_emb(module)
+        if rotary_emb is None:
+            raise ValueError(
+                "GQA mode requires the model to have a rotary embedding "
+                "module with cos_cache and sin_cache parameters. "
+                "Ensure the model uses initialize_rope()."
+            )
+        # Register cos/sin caches as graph initializers so they get
+        # serialized.  The rotary_emb module isn't called in GQA mode
+        # (GQA handles RoPE internally), so its parameters won't be
+        # auto-registered by the builder's module call machinery.
+        cos_cache = builder.initializer(rotary_emb.cos_cache.const_value, name="cos_cache")
+        sin_cache = builder.initializer(rotary_emb.sin_cache.const_value, name="sin_cache")
+
+        gqa_context = GQAContext(
+            seqlens_k=seqlens_k,
+            total_seq_len=total_seq_len,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+        )
+
+        # --- Invoke module ---
+        logits, present_key_values = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=past_key_values,
+            gqa_context=gqa_context,
+        )
+
+        logits.name = "logits"
+        graph.outputs.append(logits)
+        _register_kv_cache_outputs(graph, present_key_values)
+
+        model = _make_model(graph)
+        # Register the com.microsoft domain opset import for GQA
+        model.graph.opset_imports["com.microsoft"] = 1
+        return ModelPackage({"model": model}, config=config)
 
 
 class HybridCausalLMTask(ModelTask):

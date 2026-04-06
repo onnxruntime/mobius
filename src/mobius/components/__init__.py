@@ -29,6 +29,8 @@ __all__ = [
     "EncoderDecoderAttention",
     "EncoderLayer",
     "FCMLP",
+    "GQAAttention",
+    "GQAContext",
     "GatedDeltaNet",
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
@@ -171,6 +173,7 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gqa_attention import GQAAttention, GQAContext
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock

@@ -139,10 +139,26 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --static-cache."
         )
 
+    # Validate --gqa + --static-cache are mutually exclusive
+    if args.gqa and args.static_cache:
+        raise SystemExit("Error: --gqa and --static-cache are mutually exclusive.")
+
+    # Validate --gqa + --task compatibility
+    if args.gqa and args.task is not None:
+        raise SystemExit(
+            "Error: --gqa cannot be combined with --task. Remove --task to use --gqa."
+        )
+
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
+    module_kwargs: dict | None = None
     if args.static_cache:
         task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+    elif args.gqa:
+        from mobius.components import GQAAttention
+
+        task = CausalLMTask(gqa=True)
+        module_kwargs = {"attention_class": GQAAttention}
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -183,7 +199,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         if task is None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
-        model_module = module_class(config)
+        model_module = module_class(config, **(module_kwargs or {}))
         pkg = build_from_module(model_module, config, task=task)
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
@@ -199,6 +215,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
+            module_kwargs=module_kwargs,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -456,6 +473,12 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="Maximum sequence length for static cache buffers. "
         "Only used with --static-cache. Defaults to max_position_embeddings from config.",
+    )
+    build_parser.add_argument(
+        "--gqa",
+        action="store_true",
+        help="Use com.microsoft::GroupQueryAttention with fused RoPE and "
+        "in-place KV cache support. Compatible with onnxruntime-genai.",
     )
     build_parser.set_defaults(func=_cmd_build)
 

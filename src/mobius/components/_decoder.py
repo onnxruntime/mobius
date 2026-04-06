@@ -11,6 +11,7 @@ from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._attention import Attention, StaticCacheState
+from mobius.components._gqa_attention import GQAContext
 from mobius.components._mlp import MLP
 from mobius.components._rms_norm import RMSNorm
 
@@ -52,15 +53,18 @@ class DecoderLayer(nn.Module):
         attention_scale: float | None = None,
         post_norm: bool = False,
         linear_class: type | None = None,
+        attention_class: type[nn.Module] | None = None,
     ):
         super().__init__()
         if norm_class is None:
             norm_class = RMSNorm
+        if attention_class is None:
+            attention_class = Attention
 
         self._post_norm = post_norm
         self._residual_multiplier = residual_multiplier
 
-        self.self_attn = Attention(
+        self.self_attn = attention_class(
             config,
             rms_norm_class=norm_class,
             scale=attention_scale,
@@ -96,6 +100,17 @@ class DecoderLayer(nn.Module):
             past_key_value = None
         else:
             static_cache = None
+
+        # GQA mode: when attention_bias is a GQAContext, the attention
+        # component is GQAAttention and handles masking + RoPE internally.
+        if isinstance(attention_bias, GQAContext):
+            gqa_context = attention_bias
+            return self._forward_gqa(
+                op,
+                hidden_states,
+                gqa_context,
+                past_key_value,
+            )
 
         if self._post_norm:
             return self._forward_post_norm(
@@ -150,6 +165,42 @@ class DecoderLayer(nn.Module):
 
         return hidden_states, present_key_value
 
+    def _forward_gqa(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        gqa_context: GQAContext,
+        past_key_value: tuple | None,
+    ):
+        """Forward pass for GQA mode (pre-norm only).
+
+        GQAAttention handles RoPE and causal masking internally, so
+        position_embeddings and attention_bias are not needed.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(op, hidden_states)
+
+        attn_output, present_key_value = self.self_attn(
+            op,
+            hidden_states=hidden_states,
+            gqa_context=gqa_context,
+            past_key_value=past_key_value,
+        )
+
+        if not math.isclose(self._residual_multiplier, 1.0):
+            attn_output = op.Mul(attn_output, self._residual_multiplier)
+        hidden_states = op.Add(residual, attn_output)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(op, hidden_states)
+        hidden_states = self.mlp(op, hidden_states)
+
+        if not math.isclose(self._residual_multiplier, 1.0):
+            hidden_states = op.Mul(hidden_states, self._residual_multiplier)
+        hidden_states = op.Add(residual, hidden_states)
+
+        return hidden_states, present_key_value
+
     def _forward_post_norm(
         self,
         op: builder.OpBuilder,
@@ -185,6 +236,7 @@ def create_decoder_layer(
     norm_class: type[nn.Module] | None = None,
     post_norm: bool = False,
     linear_class: type | None = None,
+    attention_class: type[nn.Module] | None = None,
 ) -> DecoderLayer:
     """Config-driven factory for creating decoder layers.
 
@@ -200,6 +252,8 @@ def create_decoder_layer(
         post_norm: If True, use post-norm residual connections (OLMo-2 style).
         linear_class: Factory callable for projection layers. Pass a LoRA
             factory for LoRA-adapted layers.
+        attention_class: Attention module class override (default: Attention).
+            Pass GQAAttention for ORT GenAI-compatible models.
 
     Returns:
         A configured DecoderLayer instance.
@@ -214,6 +268,7 @@ def create_decoder_layer(
         attention_scale=attention_scale,
         post_norm=post_norm,
         linear_class=linear_class,
+        attention_class=attention_class,
     )
 
 

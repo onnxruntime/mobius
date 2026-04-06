@@ -28,6 +28,7 @@ from mobius._weight_utils import (
 from mobius.components import (
     DecoderLayer,
     Embedding,
+    GQAContext,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, attention_class=None):
         super().__init__()
         self._dtype = config.dtype
 
@@ -63,7 +64,11 @@ class TextModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=linear_class)
+                DecoderLayer(
+                    config,
+                    linear_class=linear_class,
+                    attention_class=attention_class,
+                )
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -75,14 +80,36 @@ class TextModel(nn.Module):
         op: builder.OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
-        position_ids: ir.Value,
+        position_ids: ir.Value | None,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        gqa_context: GQAContext | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
+
+        if gqa_context is not None:
+            # GQA mode: RoPE is fused inside the GQA op, and masking
+            # is handled by seqlens_k/total_seq_len. Pass GQAContext
+            # as the attention_bias to trigger the GQA path in DecoderLayer.
+            present_key_values = []
+            past_kvs = past_key_values or [None] * len(self.layers)
+            for layer, past_kv in zip(self.layers, past_kvs):
+                hidden_states, present_kv = layer(
+                    op,
+                    hidden_states=hidden_states,
+                    attention_bias=gqa_context,
+                    position_embeddings=None,
+                    past_key_value=past_kv,
+                )
+                present_key_values.append(present_kv)
+
+            hidden_states = self.norm(op, hidden_states)
+            return hidden_states, present_key_values
+
+        # Standard path: compute RoPE and padding mask
         position_embeddings = self.rotary_emb(op, position_ids)
 
         # When attention_mask is None (static cache mode), skip mask
@@ -132,10 +159,10 @@ class CausalLMModel(nn.Module):
     category: str = "Text Generation"
     config_class: type = CausalLMConfig
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, attention_class=None):
         super().__init__()
         self.config = config
-        self.model = TextModel(config)
+        self.model = TextModel(config, attention_class=attention_class)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
@@ -143,15 +170,20 @@ class CausalLMModel(nn.Module):
         op: builder.OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
-        position_ids: ir.Value,
+        position_ids: ir.Value | None,
         past_key_values: list | None = None,
+        gqa_context: GQAContext | None = None,
     ):
+        kwargs = {}
+        if gqa_context is not None:
+            kwargs["gqa_context"] = gqa_context
         hidden_states, present_key_values = self.model(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            **kwargs,
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -182,8 +214,8 @@ class LayerNormTextModel(TextModel):
     weight and bias) rather than the bias-free RMS normalisation.
     """
 
-    def __init__(self, config: ArchitectureConfig):
-        super().__init__(config)
+    def __init__(self, config: ArchitectureConfig, attention_class=None):
+        super().__init__(config, attention_class=attention_class)
         # Replace per-layer norms: DecoderLayer defaults to RMSNorm; override with LayerNorm.
         qc = getattr(config, "quantization", None)
         linear_class = None
@@ -195,7 +227,12 @@ class LayerNormTextModel(TextModel):
             )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=linear_class, norm_class=LayerNorm)
+                DecoderLayer(
+                    config,
+                    linear_class=linear_class,
+                    norm_class=LayerNorm,
+                    attention_class=attention_class,
+                )
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -216,7 +253,7 @@ class LayerNormCausalLMModel(CausalLMModel):
     and ``StableLmForCausalLM``.
     """
 
-    def __init__(self, config: ArchitectureConfig):
-        super().__init__(config)
+    def __init__(self, config: ArchitectureConfig, attention_class=None):
+        super().__init__(config, attention_class=attention_class)
         # Replace TextModel with the LayerNorm-based variant.
-        self.model = LayerNormTextModel(config)
+        self.model = LayerNormTextModel(config, attention_class=attention_class)
