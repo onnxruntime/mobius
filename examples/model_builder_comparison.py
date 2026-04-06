@@ -384,10 +384,27 @@ def _detect_model_dtype(model_id: str):
         return resolved if resolved is not None else ir.DataType.FLOAT
 
 
+# Mobius EP → dtype override for a fair comparison with ORT GenAI.
+# Mirrors _ORT_DEFAULT_PRECISION: EPs that don't support bfloat16 fall back to
+# float16 or float32 so GQA fires and the comparison is apples-to-apples.
+# ``None`` means "use model's native dtype" (e.g. CUDA supports bfloat16 natively).
+_MOBIUS_EP_DEFAULT_DTYPE: dict[str, str | None] = {
+    "cpu": "float32",
+    "cuda": None,  # CUDA supports bfloat16; use model's native dtype
+    "dml": "float16",  # DML: no bfloat16 GQA
+    "webgpu": "float32",  # WebGPU: no bfloat16 support
+    "trt-rtx": None,  # trt-rtx supports bfloat16
+    "default": None,  # portable ONNX: use model's native dtype
+}
+
+
 def build_mobius(model_id: str, ep: str, load_weights: bool = False) -> OpCounts:
     from mobius import build
 
-    pkg = build(model_id, execution_provider=ep, load_weights=load_weights)
+    # Use an EP-appropriate dtype to match ORT GenAI conventions.
+    # When None, build() auto-detects from the HuggingFace config.
+    dtype = _MOBIUS_EP_DEFAULT_DTYPE.get(ep)
+    pkg = build(model_id, execution_provider=ep, dtype=dtype, load_weights=load_weights)
     role = "model" if "model" in pkg else next(iter(pkg))
     counts = _count_ops(pkg[role])
     return OpCounts(
@@ -758,16 +775,16 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
             lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
-            _ORT_MORE_COLOR = "\033[42m"  # green background
-            _MOB_MORE_COLOR = "\033[45m"  # purple/magenta background
+            ort_more_color = "\033[42m"  # green background
+            mob_more_color = "\033[45m"  # purple/magenta background
             for diff in mr.differences:
                 # Strip markdown bold markers for console output
                 plain = diff.text.replace("**", "").replace("  \n  ↳ ", "\n     ↳ ")
                 if use_color:
                     if diff.direction == "ort_more":
-                        prefix = f"{_ORT_MORE_COLOR}🟢{_RESET} "
+                        prefix = f"{ort_more_color}🟢{_RESET} "
                     elif diff.direction == "mobius_more":
-                        prefix = f"{_MOB_MORE_COLOR}🟣{_RESET} "
+                        prefix = f"{mob_more_color}🟣{_RESET} "
                     else:
                         prefix = "   "
                 else:
