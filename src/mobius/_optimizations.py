@@ -482,6 +482,11 @@ def fold_constants_after_weights(model: ir.Model) -> None:
     so that any weight-dependent Concat/other constant nodes (e.g. from
     PackQKV fusion) get folded into single initializers.
 
+    Unlike the pre-weights fold pass (which uses input_size_limit=8192 to
+    avoid evaluating large dynamic tensors), this pass raises both limits to
+    accommodate the large weight tensors produced by PackQKV
+    (e.g. Llama-3.2-1B packed QKV is ~6.3M elements per layer).
+
     The pass raises no errors: warnings are emitted for nodes that cannot
     be evaluated (e.g. symbolic inputs), and those nodes are left in place.
     """
@@ -489,7 +494,8 @@ def fold_constants_after_weights(model: ir.Model) -> None:
         [
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,
-                input_size_limit=8192,
+                # Raised to fold large weight tensors from PackQKV fusion.
+                input_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
                 output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
             common_passes.RemoveUnusedNodesPass(),
