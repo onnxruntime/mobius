@@ -442,6 +442,9 @@ def optimize_model(
     fold_pass = ir.passes.PassManager(
         [
             common_passes.RemoveUnusedNodesPass(),
+            # CSE after lowering collapses duplicate Gather(cos/sin, position_ids)
+            # nodes introduced by SeparateRoPE in Stage 3 (2 per layer → 2 total).
+            common_passes.CommonSubexpressionEliminationPass(),
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,
                 input_size_limit=8192,
