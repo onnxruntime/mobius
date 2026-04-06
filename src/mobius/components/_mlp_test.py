@@ -50,8 +50,8 @@ class TestMLP:
         result = mlp(op, x)
         builder._adapt_outputs([result])
         assert graph.num_nodes() > 0
-        # gate_proj + up_proj + down_proj = at least 3 MatMul ops
-        assert count_op_type(graph, "MatMul") >= 3
+        # gate_proj + up_proj + down_proj = at least 3 FusedMatMul ops
+        assert count_op_type(graph, "FusedMatMul") >= 3
 
     def test_forward_has_mul_for_gating(self):
         config = make_config()
@@ -119,8 +119,8 @@ class TestFCMLP:
         result = mlp(op, x)
         builder._adapt_outputs([result])
         assert graph.num_nodes() > 0
-        # up_proj + down_proj = exactly 2 MatMul ops
-        assert count_op_type(graph, "MatMul") == 2
+        # up_proj + down_proj = exactly 2 FusedMatMul ops
+        assert count_op_type(graph, "FusedMatMul") == 2
 
     def test_forward_has_no_mul_gating(self):
         # FC MLP is not gated — there should be no elementwise Mul for gating

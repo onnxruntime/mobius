@@ -77,7 +77,7 @@ def _make_graph(
         [],
         nodes=[],
         name=name,
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
     )
     return graph, GraphBuilder(graph)
 

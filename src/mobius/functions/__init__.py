@@ -63,16 +63,20 @@ _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,
 }
 
-_cache: dict[ir.OperatorIdentifier, ir.Function] = {}
-
 
 def get_function(op_id: ir.OperatorIdentifier) -> ir.Function | None:
-    """Return the cached ``ir.Function`` for *op_id*, or ``None``."""
-    if op_id not in _FUNCTION_BUILDERS:
+    """Return a fresh ``ir.Function`` for *op_id*, or ``None``.
+
+    Each call returns a **new** function object so that models cannot
+    accidentally share mutable function bodies.  Rewrite passes (e.g.
+    onnxscript's ``RewriteRuleSet.apply_to_model``) process function bodies
+    in-place; sharing a single instance across models would corrupt it when
+    one model's rewrite mutates the body.
+    """
+    builder = _FUNCTION_BUILDERS.get(op_id)
+    if builder is None:
         return None
-    if op_id not in _cache:
-        _cache[op_id] = _FUNCTION_BUILDERS[op_id]()
-    return _cache[op_id]
+    return builder()
 
 
 def register_function_bodies(model: ir.Model) -> None:
@@ -83,6 +87,10 @@ def register_function_bodies(model: ir.Model) -> None:
 
     Only registers functions for ops that are not already defined in the
     model (to avoid overwriting user-provided function bodies).
+
+    Each call creates **fresh** ``ir.Function`` objects so that concurrent
+    builds in different threads (or sequential builds in the same process)
+    cannot corrupt each other's function bodies.
     """
     for op_id in _FUNCTION_BUILDERS:
         if op_id in model.functions:
