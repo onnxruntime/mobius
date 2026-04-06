@@ -291,6 +291,7 @@ class OpCounts(NamedTuple):
     counts: dict[str, int]
     total_nodes: int
     source: str  # "mobius" | "ort-genai" | "file"
+    dtype: str | None = None  # effective build dtype, e.g. "float32", "float16", "bfloat16"
 
 
 class Difference(NamedTuple):
@@ -399,6 +400,8 @@ _MOBIUS_EP_DEFAULT_DTYPE: dict[str, str | None] = {
 
 
 def build_mobius(model_id: str, ep: str, load_weights: bool = False) -> OpCounts:
+    import onnx_ir as ir
+
     from mobius import build
 
     # Use an EP-appropriate dtype to match ORT GenAI conventions.
@@ -407,11 +410,27 @@ def build_mobius(model_id: str, ep: str, load_weights: bool = False) -> OpCounts
     pkg = build(model_id, execution_provider=ep, dtype=dtype, load_weights=load_weights)
     role = "model" if "model" in pkg else next(iter(pkg))
     counts = _count_ops(pkg[role])
+
+    # Resolve the effective dtype for context-aware difference reporting.
+    # When dtype was explicitly set, use it directly.  When None (auto-detect),
+    # call _detect_model_dtype() so _compute_verdict() can explain GQA absences.
+    if dtype is not None:
+        effective_dtype = dtype
+    else:
+        detected = _detect_model_dtype(model_id)
+        _dtype_map: dict[ir.DataType, str] = {
+            ir.DataType.FLOAT: "float32",
+            ir.DataType.FLOAT16: "float16",
+            ir.DataType.BFLOAT16: "bfloat16",
+        }
+        effective_dtype = _dtype_map.get(detected, str(detected).lower())
+
     return OpCounts(
         label=f"mobius/{ep}",
         counts=counts,
         total_nodes=sum(counts.values()),
         source="mobius",
+        dtype=effective_dtype,
     )
 
 
@@ -557,6 +576,46 @@ def _ep_differences(cols: list[OpCounts]) -> list[Difference]:
     return diffs
 
 
+def _gqa_dtype_explanation(mob_col: OpCounts, ep_name: str) -> str | None:
+    """Return a self-explanatory message when GQA is absent due to dtype mismatch.
+
+    Returns None when the absence isn't caused by a dtype mismatch (e.g. when
+    the EP doesn't support GQA at all, or when the dtype IS supported).
+    """
+    if mob_col.dtype is None:
+        return None
+    try:
+        import onnx_ir as ir
+
+        from mobius._execution_providers import ep_registry
+
+        caps = ep_registry.get(ep_name)
+        if caps is None or not caps.gqa_dtypes:
+            return None
+
+        _str_to_ir: dict[str, ir.DataType] = {
+            "float32": ir.DataType.FLOAT,
+            "float16": ir.DataType.FLOAT16,
+            "bfloat16": ir.DataType.BFLOAT16,
+        }
+        _ir_to_str: dict[ir.DataType, str] = {v: k for k, v in _str_to_ir.items()}
+
+        mob_ir_dtype = _str_to_ir.get(mob_col.dtype)
+        if mob_ir_dtype is None or mob_ir_dtype in caps.gqa_dtypes:
+            return None  # dtype IS supported — absence is an unexpected bug, not a known dtype gap
+
+        supported = sorted(_ir_to_str.get(d, str(d).lower()) for d in caps.gqa_dtypes)
+        supported_str = " or ".join(supported)
+        rebuild_opts = " or ".join(f"--dtype {d}" for d in supported)
+        return (
+            f"{ep_name.upper()} supports GQA for {supported_str} only; "
+            f"current build uses {mob_col.dtype}. "
+            f"Rebuild with {rebuild_opts} to enable GQA."
+        )
+    except Exception:
+        return None
+
+
 def _compute_verdict(
     cols: list[OpCounts],
     model_id: str = "",
@@ -594,6 +653,19 @@ def _compute_verdict(
             continue  # All same — no difference
         vals = ", ".join(f"{c.label}={c.counts.get(op, 0)}" for c in cols)
         expl = OP_EXPLANATION.get(op, "uncatalogued op — count shown for transparency")
+
+        # For GQA: when mobius has 0 and ORT has >0, check if it's a dtype mismatch
+        # and emit a self-explanatory message (e.g. "DML supports GQA for float16 only;
+        # current build uses bfloat16. Rebuild with --dtype float16 to enable GQA.")
+        if op == "GroupQueryAttention" and mob_col is not None and ort_col is not None:
+            ort_n = ort_col.counts.get(op, 0)
+            mob_n = mob_col.counts.get(op, 0)
+            if mob_n == 0 and ort_n > 0:
+                ep_name = mob_col.label.split("/", 1)[-1]  # "mobius/webgpu" → "webgpu"
+                dtype_expl = _gqa_dtype_explanation(mob_col, ep_name)
+                if dtype_expl:
+                    expl = dtype_expl
+
         text = f"**{lbl}** ({op}): {vals}  \n  ↳ {expl}"
         # Determine direction relative to the first ORT GenAI vs first mobius column.
         if ort_col and mob_col:
