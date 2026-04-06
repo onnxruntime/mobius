@@ -44,6 +44,14 @@ def _make_qwen2_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
     return build_from_module(module, config, execution_provider=ep)
 
 
+def _make_qwen2_biased_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
+    """Build a tiny Qwen2 model with QKV bias enabled (mirrors Qwen2.5)."""
+    config = _base_config(dtype=dtype, attn_qkv_bias=True)
+    module_cls = registry.get("qwen2")
+    module = module_cls(config)
+    return build_from_module(module, config, execution_provider=ep)
+
+
 def _check_op_constraint(
     model: ir.Model,
     op_type: str,
@@ -174,6 +182,32 @@ def test_cuda_float16_has_gqa_qwen2():
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count > 0, f"CUDA+FLOAT16 Qwen2 should have GQA, got {gqa_count}"
+
+
+def test_cuda_float16_qwen2_has_packed_qkv():
+    """Qwen2 with QKV bias on CUDA+FLOAT16 has packed QKV (k=None, v=None).
+
+    Qwen2.5 uses attn_qkv_bias=True, so PackQKVWithBiasForGQA must fire.
+    The packed projection is Add(MatMul(hidden, packed_w), packed_bias).
+    """
+    pkg = _make_qwen2_biased_pkg(ep="cuda", dtype=ir.DataType.FLOAT16)
+    model = pkg["model"]
+    gqa_nodes = [n for n in model.graph if n.op_type == "GroupQueryAttention"]
+    assert gqa_nodes, "Expected GQA nodes on CUDA+FLOAT16"
+    for gqa in gqa_nodes:
+        assert gqa.inputs[1] is None, (
+            "Qwen2 GQA should be in packed mode (k=None) after PackQKVWithBiasForGQA"
+        )
+        assert gqa.inputs[2] is None, (
+            "Qwen2 GQA should be in packed mode (v=None) after PackQKVWithBiasForGQA"
+        )
+        packed_proj = gqa.inputs[0]
+        assert packed_proj is not None
+        # Packed projection must be Add(MatMul, bias) — not bare MatMul
+        producer = packed_proj.producer()
+        assert producer is not None and producer.op_type == "Add", (
+            "Biased packed QKV should produce Add(MatMul, packed_bias)"
+        )
 
 
 # ---------------------------------------------------------------------------

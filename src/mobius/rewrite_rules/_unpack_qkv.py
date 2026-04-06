@@ -6,20 +6,27 @@
 DML's ``GroupQueryAttention`` kernel does not support packed QKV (a single
 fused ``MatMul`` for Q+K+V combined, passed in the query slot with ``key``
 and ``value`` set to ``None``).  This rule reverses the ``PackQKVForGQA``
-fusion by splitting the packed weight initializer back into three separate
-weight matrices.
+and ``PackQKVWithBiasForGQA`` fusions by splitting the packed weight (and
+optional packed bias) back into three separate weight matrices.
 
-**Matched pattern:**
+**Matched pattern (no-bias, from PackQKVForGQA):**
 
 .. code-block:: text
 
     packed_qkv = MatMul(hidden, Transpose(W_qkv))
     out, pk, pv = GroupQueryAttention(packed_qkv, None, None, ...)
 
-Where ``W_qkv`` is a constant initializer that concatenates W_q, W_k, W_v
-along axis=0 (out_features dimension).
+**Matched pattern (with bias, from PackQKVWithBiasForGQA):**
 
-**Replacement:**
+.. code-block:: text
+
+    packed_qkv = Add(MatMul(hidden, Transpose(W_qkv)), bias_qkv)
+    out, pk, pv = GroupQueryAttention(packed_qkv, None, None, ...)
+
+Where ``W_qkv`` concatenates W_q, W_k, W_v along axis=0, and ``bias_qkv``
+concatenates bias_q, bias_k, bias_v along axis=0.
+
+**Replacement (no-bias):**
 
 .. code-block:: text
 
@@ -28,8 +35,17 @@ along axis=0 (out_features dimension).
     v = MatMul(hidden, Transpose(W_v))
     out, pk, pv = GroupQueryAttention(q, k, v, ...)
 
-The split sizes are derived from ``num_heads``, ``kv_num_heads``, and the
-packed weight shape:
+**Replacement (with bias):**
+
+.. code-block:: text
+
+    q = Add(MatMul(hidden, Transpose(W_q)), bias_q)
+    k = Add(MatMul(hidden, Transpose(W_k)), bias_k)
+    v = Add(MatMul(hidden, Transpose(W_v)), bias_v)
+    out, pk, pv = GroupQueryAttention(q, k, v, ...)
+
+The weight split sizes are derived from ``num_heads``, ``kv_num_heads``, and
+the packed weight shape:
 - ``q_size = num_heads * head_dim``
 - ``k_size = kv_num_heads * head_dim``
 - ``v_size = kv_num_heads * head_dim``
@@ -40,7 +56,7 @@ These rules are **not applied by default**.  Apply them post-export::
     from mobius.rewrite_rules import unpack_qkv_rules
     from onnxscript.rewriter import rewrite
 
-    model = build("Qwen/Qwen3-0.6B", execution_provider="dml")
+    model = build("Qwen/Qwen2.5-0.5B", execution_provider="dml")
     rewrite(model, pattern_rewrite_rules=unpack_qkv_rules())
 """
 
@@ -55,22 +71,28 @@ _counter: int = 0
 
 
 class GQAUnpackQKV(RewriteRuleClassBase):
-    """Split packed QKV in GQA into separate Q/K/V MatMul projections.
+    """Split packed QKV in GQA into separate Q/K/V MatMul (±Add bias) projections.
 
     Matches ``GroupQueryAttention`` nodes that use a single packed MatMul
     projection (``key=None``, ``value=None``) and splits the packed weight
-    back into three independent projections.
+    back into three independent projections.  Also handles the biased form
+    produced by :class:`PackQKVWithBiasForGQA`, where the packed projection
+    is ``Add(MatMul(hidden, packed_w), packed_bias)`` with ``packed_bias``
+    being a ``Concat`` of three individual bias parameters.
 
     Used for DML which does not support packed QKV in GQA.
     """
 
     _counter: int
     _split_weights: tuple[np.ndarray, np.ndarray, np.ndarray] | None
+    # Set in check() when the packed projection includes a bias Add node.
+    _bias_concat_node: object | None  # ir.Node | None
 
     def __init__(self):
         super().__init__()
         self._counter = 0
         self._split_weights = None
+        self._bias_concat_node = None
 
     # ------------------------------------------------------------------ pattern
 
@@ -100,32 +122,64 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         if inputs[1] is not None or inputs[2] is not None:
             return result.fail("GQA not in packed mode — k or v is present")
 
-        # packed_qkv must come from MatMul(hidden, Transpose(W))
-        matmul = packed_qkv.producer()
-        if matmul is None or matmul.op_type != "MatMul":
-            return result.fail("packed_qkv not produced by MatMul")
+        # Detect bias wrapping: packed_qkv may be Add(FusedMatMul, Concat(biases)).
+        self._bias_concat_node = None
+        qkv_producer = packed_qkv.producer()
+        if qkv_producer is not None and qkv_producer.op_type == "Add":
+            add_inputs = qkv_producer.inputs
+            if len(add_inputs) < 2 or None in add_inputs:
+                return result.fail("Add has missing inputs")
+            # Find which Add input is the matmul-like op and which is the bias Concat.
+            left, right = add_inputs[0], add_inputs[1]
+            left_prod = left.producer()
+            right_prod = right.producer()
+            if left_prod is not None and left_prod.op_type in ("MatMul", "FusedMatMul"):
+                matmul, bias_val = left_prod, right
+            elif right_prod is not None and right_prod.op_type in ("MatMul", "FusedMatMul"):
+                matmul, bias_val = right_prod, left
+            else:
+                return result.fail("Add inputs do not include a MatMul or FusedMatMul")
+            # Validate the bias Concat node.
+            bias_concat = bias_val.producer() if bias_val else None
+            if bias_concat is None or bias_concat.op_type != "Concat":
+                return result.fail("Bias is not produced by a Concat node")
+            if len(bias_concat.inputs) != 3:
+                return result.fail("Bias Concat does not have exactly 3 inputs")
+            for bias_input in bias_concat.inputs:
+                if bias_input is None or bias_input.producer() is not None:
+                    return result.fail("Bias Concat input is not a graph parameter")
+            self._bias_concat_node = bias_concat
+        else:
+            # No-bias path: packed_qkv must come from MatMul or FusedMatMul directly.
+            matmul = qkv_producer
+            if matmul is None or matmul.op_type not in ("MatMul", "FusedMatMul"):
+                return result.fail("packed_qkv not produced by MatMul or FusedMatMul")
+
+        # Validate the matmul weight structure (shared for both no-bias and biased paths).
         if len(matmul.inputs) < 2:
-            return result.fail("MatMul has fewer than 2 inputs")
+            return result.fail("MatMul/FusedMatMul has fewer than 2 inputs")
+        w_input = matmul.inputs[1]
+        if w_input is None:
+            return result.fail("MatMul/FusedMatMul weight input is None")
 
-        # The second MatMul input must be Transpose(...)
-        w_t = matmul.inputs[1]
-        if w_t is None:
-            return result.fail("MatMul weight input is None")
-        w_transpose = w_t.producer()
-        if w_transpose is None or w_transpose.op_type != "Transpose":
-            return result.fail("MatMul weight not produced by Transpose")
-
-        w_inner = w_transpose.inputs[0]
-        if w_inner is None:
-            return result.fail("Transpose input is None")
+        # FusedMatMul form: weight is Concat(W_q, W_k, W_v) directly (transB=1 handles transpose).
+        # MatMul form (legacy): weight is Transpose(Concat(W_q, W_k, W_v)).
+        if matmul.op_type == "FusedMatMul":
+            w_inner = w_input
+        else:
+            # MatMul: expect Transpose(Concat(...))
+            w_transpose = w_input.producer()
+            if w_transpose is None or w_transpose.op_type != "Transpose":
+                return result.fail("MatMul weight not produced by Transpose")
+            w_inner = w_transpose.inputs[0]
+            if w_inner is None:
+                return result.fail("Transpose input is None")
 
         # Case 1 (new): Transpose(Concat(W_q, W_k, W_v, axis=0))
-        # The Concat node holds individual weight parameters.
         concat_node = w_inner.producer()
         if concat_node is not None and concat_node.op_type == "Concat":
             if len(concat_node.inputs) != 3:
                 return result.fail("Concat does not have exactly 3 inputs")
-            # All Concat inputs must be graph parameters (no producer)
             for w in concat_node.inputs:
                 if w is None or w.producer() is not None:
                     return result.fail("Concat input is not a graph parameter")
@@ -166,35 +220,74 @@ class GQAUnpackQKV(RewriteRuleClassBase):
 
     def rewrite(self, op, packed_qkv, gqa_out, present_key, present_value, **_):
         gqa_node = gqa_out.producer()
-        matmul = packed_qkv.producer()
+        # Navigate through optional Add wrapper to find the matmul-like op.
+        qkv_producer = packed_qkv.producer()
+        if qkv_producer is not None and qkv_producer.op_type == "Add":
+            add_inputs = qkv_producer.inputs
+            left_prod = add_inputs[0].producer()
+            matmul = (
+                left_prod
+                if left_prod is not None and left_prod.op_type in ("MatMul", "FusedMatMul")
+                else add_inputs[1].producer()
+            )
+        else:
+            matmul = qkv_producer
         hidden_states = matmul.inputs[0]
 
-        w_transpose = matmul.inputs[1].producer()
-        w_inner = w_transpose.inputs[0]
+        # Extract w_inner: for FusedMatMul the weight is the direct second input;
+        # for legacy MatMul the weight goes through a Transpose first.
+        w_input = matmul.inputs[1]
+        if matmul.op_type == "FusedMatMul":
+            w_inner = w_input
+        else:
+            w_inner = w_input.producer().inputs[0]  # Transpose → inner Concat/param
+
         concat_node = w_inner.producer()
 
         self._counter += 1
         suffix = self._counter
 
         if concat_node is not None and concat_node.op_type == "Concat":
-            # New graph-level form: Concat(w_q, w_k, w_v) — just rewire directly.
+            # Graph-level form: Concat(w_q, w_k, w_v) — rewire directly.
             w_q, w_k, w_v = concat_node.inputs
-            q = op.MatMul(hidden_states, op.Transpose(w_q, perm=[1, 0]))
-            k = op.MatMul(hidden_states, op.Transpose(w_k, perm=[1, 0]))
-            v = op.MatMul(hidden_states, op.Transpose(w_v, perm=[1, 0]))
+            if matmul.op_type == "FusedMatMul":
+                # FusedMatMul: emit FusedMatMul(hidden, w_i, transB=1) for each
+                q_mm = op.FusedMatMul(hidden_states, w_q, _domain="com.microsoft", transB=1)
+                k_mm = op.FusedMatMul(hidden_states, w_k, _domain="com.microsoft", transB=1)
+                v_mm = op.FusedMatMul(hidden_states, w_v, _domain="com.microsoft", transB=1)
+            else:
+                # Legacy MatMul: emit MatMul(hidden, Transpose(w_i))
+                q_mm = op.MatMul(hidden_states, op.Transpose(w_q, perm=[1, 0]))
+                k_mm = op.MatMul(hidden_states, op.Transpose(w_k, perm=[1, 0]))
+                v_mm = op.MatMul(hidden_states, op.Transpose(w_v, perm=[1, 0]))
         else:
             # Legacy form: single constant initializer — split with numpy.
             assert self._split_weights is not None
-            w_q, w_k, w_v = self._split_weights
+            w_q_np, w_k_np, w_v_np = self._split_weights
             self._split_weights = None
 
             def _proj(w: np.ndarray, name: str) -> ir.Value:
                 init = op.initializer(ir.Tensor(w, name=name), name=name)
+                if matmul.op_type == "FusedMatMul":
+                    return op.FusedMatMul(
+                        hidden_states, init, _domain="com.microsoft", transB=1
+                    )
                 return op.MatMul(hidden_states, op.Transpose(init, perm=[1, 0]))
 
-            q = _proj(w_q, f"unpack_q_weight_{suffix}")
-            k = _proj(w_k, f"unpack_k_weight_{suffix}")
-            v = _proj(w_v, f"unpack_v_weight_{suffix}")
+            q_mm = _proj(w_q_np, f"unpack_q_weight_{suffix}")
+            k_mm = _proj(w_k_np, f"unpack_k_weight_{suffix}")
+            v_mm = _proj(w_v_np, f"unpack_v_weight_{suffix}")
+
+        # If bias was packed, redistribute bias_q/bias_k/bias_v.
+        bias_concat = self._bias_concat_node
+        self._bias_concat_node = None
+        if bias_concat is not None:
+            bias_q, bias_k, bias_v = bias_concat.inputs
+            q = op.Add(q_mm, bias_q)
+            k = op.Add(k_mm, bias_k)
+            v = op.Add(v_mm, bias_v)
+        else:
+            q, k, v = q_mm, k_mm, v_mm
 
         # Rebuild GQA with separate Q/K/V — preserve all existing attributes
         # and remaining inputs (past_key, past_value, seqlens_k, total_seq, ...).

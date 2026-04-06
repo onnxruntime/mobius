@@ -18,13 +18,16 @@ Two rules are provided, tried in order:
    position-embedding nodes remain in the graph and feed directly into
    the GQA ``query``/``key`` slots.
 
-A third rule (``PackQKVForGQA``) runs after the GQA fusion and
-consolidates separate Q, K, V projection MatMuls into a single packed
-MatMul when they share the same hidden_states input.  The packed QKV
-tensor is passed in the ``query`` slot of ``GroupQueryAttention`` with
-``key`` and ``value`` set to ``None``.  Models with QK norm (e.g.
-Qwen3) are unaffected because the Q/K projections are followed by a
-normalization op, so the pattern does not match.
+Two rules (``PackQKVForGQA`` and ``PackQKVWithBiasForGQA``) run after
+the GQA fusion and consolidate separate Q, K, V projection MatMuls into
+a single packed MatMul when they share the same hidden_states input.
+``PackQKVForGQA`` handles models without bias (Llama, Gemma) and
+``PackQKVWithBiasForGQA`` handles models with QKV bias (Qwen2.5, Phi).
+The packed QKV tensor is passed in the ``query`` slot of
+``GroupQueryAttention`` with ``key`` and ``value`` set to ``None``.
+Models with QK norm (e.g. Qwen3) are unaffected because the Q/K
+projections are followed by a normalization op, so the pattern does not
+match.
 
 These rules are **not applied by default**.  Apply them post-export::
 
@@ -244,11 +247,15 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 def _get_underlying_weight(weight: ir.Value) -> ir.Value:
     """Return the underlying weight parameter (out_features x hidden_size).
 
-    Handles two patterns:
+    Handles three patterns:
 
     1. ``Transpose(W, perm=[1, 0])`` — the input ``W`` has shape
        ``(out_features, hidden_size)``.  Returns ``W`` directly.
-    2. Plain graph input — assumed to be ``(out_features, hidden_size)``
+       (Legacy: produced when Transpose+MatMul not yet converted.)
+    2. Direct input to ``FusedMatMul`` with ``transB=1`` — ``weight`` is
+       already the parameter with shape ``(out_features, hidden_size)``.
+       Returns *weight* unchanged.
+    3. Plain graph input — assumed to be ``(out_features, hidden_size)``
        already.  Returns *weight* unchanged.
 
     Raises ``MatchFailureError`` if *weight* is produced by something
@@ -262,7 +269,7 @@ def _get_underlying_weight(weight: ir.Value) -> ir.Value:
                 # underlying is a graph input (parameter) — good
                 return underlying
         raise MatchFailureError(f"weight {weight.name!r} is not a graph parameter")
-    # weight itself is a graph input (no Transpose wrapping)
+    # weight itself is a graph input (no Transpose wrapping) — already (out, hidden)
     return weight
 
 
@@ -271,18 +278,16 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
     This rule runs **after** ``RotaryAttentionToGQA`` and looks for
     ``GroupQueryAttention`` nodes whose Q, K, V inputs each come from a
-    separate ``MatMul`` projection that shares the same ``hidden_states``
-    input.  The ``fused_matmul`` rewrite must run **after** this rule
-    so that projections are still plain ``MatMul`` nodes when this rule
-    matches.
+    separate ``FusedMatMul`` projection that shares the same ``hidden_states``
+    input.
 
     **Matched pattern:**
 
     .. code-block:: text
 
-        q = MatMul(hidden, Transpose(W_q))
-        k = MatMul(hidden, Transpose(W_k))
-        v = MatMul(hidden, Transpose(W_v))
+        q = FusedMatMul(hidden, W_q, transB=1)
+        k = FusedMatMul(hidden, W_k, transB=1)
+        v = FusedMatMul(hidden, W_v, transB=1)
         out, pkey, pval = GroupQueryAttention(q, k, v, ...)
 
     Where ``W_q``, ``W_k``, ``W_v`` are graph parameters (initializers).
@@ -291,7 +296,7 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
     .. code-block:: text
 
-        W_qkv = Concat(W_q, W_k, W_v, axis=0)   # (q_out+k_out+v_out, hidden)
+        W_qkv  = Concat(W_q, W_k, W_v, axis=0)   # (q_out+k_out+v_out, hidden)
         packed  = MatMul(hidden, Transpose(W_qkv))
         out, pkey, pval = GroupQueryAttention(packed, None, None, ...)
 
@@ -315,9 +320,9 @@ class PackQKVForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ pattern
 
     def pattern(self, op, hidden, q_w, k_w, v_w):
-        q = op.MatMul(hidden, q_w)
-        k = op.MatMul(hidden, k_w)
-        v = op.MatMul(hidden, v_w)
+        q = op.FusedMatMul(hidden, q_w, _domain="com.microsoft")
+        k = op.FusedMatMul(hidden, k_w, _domain="com.microsoft")
+        v = op.FusedMatMul(hidden, v_w, _domain="com.microsoft")
 
         return op.GroupQueryAttention(
             q,
@@ -363,10 +368,137 @@ class PackQKVForGQA(RewriteRuleClassBase):
         # A FoldConstantsPass after apply_weights() collapses it to one initializer.
         self._pack_counter += 1
         packed_w = op.Concat(w_q, w_k, w_v, axis=0)
-        packed_w_t = op.Transpose(packed_w, perm=[1, 0])
-        packed_qkv = op.MatMul(hidden, packed_w_t)
+        # FusedMatMul with transB=1 computes hidden @ packed_w.T in-kernel.
+        # The weight is stored as (q_out+k_out+v_out, hidden_size), same layout
+        # as the individual W_q/W_k/W_v parameters produced by Linear.
+        packed_qkv = op.FusedMatMul(hidden, packed_w, _domain="com.microsoft", transB=1)
 
         # Recover remaining GQA inputs and attributes from the matched node
+        gqa_node = gqa_out.producer()
+        attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
+
+        outputs = op.op_multi_out(
+            "GroupQueryAttention",
+            inputs=[
+                packed_qkv,
+                None,
+                None,
+                *gqa_node.inputs[3:],
+            ],
+            domain="com.microsoft",
+            attributes=attrs,
+            num_outputs=3,
+        )
+
+        return outputs[0], outputs[1], outputs[2]
+
+
+class PackQKVWithBiasForGQA(RewriteRuleClassBase):
+    """Pack Q/K/V projections (with bias) into a single FusedMatMul+Add for GQA.
+
+    Handles models where each QKV projection is ``Linear(bias=True)``,
+    producing ``FusedMatMul → Add(bias)`` per projection — e.g. Qwen2.5, Phi3/4.
+    The existing :class:`PackQKVForGQA` only matches the no-bias form.
+
+    **Matched pattern:**
+
+    .. code-block:: text
+
+        q = Add(FusedMatMul(hidden, W_q, transB=1), bias_q)
+        k = Add(FusedMatMul(hidden, W_k, transB=1), bias_k)
+        v = Add(FusedMatMul(hidden, W_v, transB=1), bias_v)
+        out, pkey, pval = GroupQueryAttention(q, k, v, ...)
+
+    Where ``W_q``, ``W_k``, ``W_v``, ``bias_q``, ``bias_k``, ``bias_v``
+    are graph parameters (initializers).
+
+    **Replacement:**
+
+    .. code-block:: text
+
+        W_qkv    = Concat(W_q, W_k, W_v, axis=0)
+        bias_qkv = Concat(bias_q, bias_k, bias_v, axis=0)
+        packed   = Add(FusedMatMul(hidden, W_qkv, transB=1), bias_qkv)
+        out, pkey, pval = GroupQueryAttention(packed, None, None, ...)
+
+    Both the weight ``Concat`` and the bias ``Concat`` are graph-level
+    ops so the rule fires without requiring actual weight data.  A
+    subsequent ``FoldConstantsPass`` collapses them once weights are
+    loaded.
+
+    GQA does not have a dedicated bias input, so the ``Add`` must stay
+    in the graph as the value that feeds the ``query`` slot.
+    """
+
+    _pack_counter: int
+
+    def __init__(self):
+        super().__init__()
+        self._pack_counter = 0
+
+    # ------------------------------------------------------------------ pattern
+
+    def pattern(self, op, hidden, q_w, bias_q, k_w, bias_k, v_w, bias_v):
+        q = op.Add(op.FusedMatMul(hidden, q_w, _domain="com.microsoft"), bias_q)
+        k = op.Add(op.FusedMatMul(hidden, k_w, _domain="com.microsoft"), bias_k)
+        v = op.Add(op.FusedMatMul(hidden, v_w, _domain="com.microsoft"), bias_v)
+
+        return op.GroupQueryAttention(
+            q,
+            k,
+            v,
+            _domain="com.microsoft",
+            _allow_other_attributes=True,
+            _allow_other_inputs=True,
+            _outputs=["gqa_out", "present_key", "present_value"],
+        )
+
+    # ------------------------------------------------------------------ check
+
+    def check(self, context, q_w, bias_q, k_w, bias_k, v_w, bias_v, **_):
+        # Projection weights must be traceable to graph parameters.
+        _get_underlying_weight(q_w)
+        _get_underlying_weight(k_w)
+        _get_underlying_weight(v_w)
+        # Bias terms must be direct graph parameters (no producer node).
+        for bias in (bias_q, bias_k, bias_v):
+            if bias is None or bias.producer() is not None:
+                raise MatchFailureError(f"bias {bias!r} is not a graph parameter")
+        return True
+
+    # ------------------------------------------------------------------ rewrite
+
+    def rewrite(
+        self,
+        op,
+        hidden,
+        q_w,
+        bias_q,
+        k_w,
+        bias_k,
+        v_w,
+        bias_v,
+        gqa_out,
+        present_key,
+        present_value,
+        **_,
+    ):
+        # Recover the underlying (out_features, hidden_size) weight parameters.
+        w_q = _get_underlying_weight(q_w)
+        w_k = _get_underlying_weight(k_w)
+        w_v = _get_underlying_weight(v_w)
+
+        # Concat weights along output dimension: (q_out + k_out + v_out, hidden)
+        self._pack_counter += 1
+        packed_w = op.Concat(w_q, w_k, w_v, axis=0)
+        # FusedMatMul with transB=1: hidden @ packed_w.T
+        packed_mm = op.FusedMatMul(hidden, packed_w, _domain="com.microsoft", transB=1)
+
+        # Concat biases: (q_out + k_out + v_out,)
+        packed_bias = op.Concat(bias_q, bias_k, bias_v, axis=0)
+        # GQA has no bias input — the Add stays in the graph.
+        packed_qkv = op.Add(packed_mm, packed_bias)
+
         gqa_node = gqa_out.producer()
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
 
@@ -544,17 +676,22 @@ def group_query_attention_rules() -> RewriteRuleSet:
 
 
 def pack_qkv_for_gqa_rules() -> RewriteRuleSet:
-    """Return rules that pack Q/K/V projections into a single MatMul.
+    """Return rules that pack Q/K/V projections into a single MatMul (±Add bias).
 
-    This rule set runs **after** :func:`group_query_attention_rules` and
-    consolidates the three separate Q/K/V projection MatMuls feeding a
-    ``GroupQueryAttention`` node into a single packed MatMul.
+    Two rules are included; both run **after** :func:`group_query_attention_rules`:
 
-    Only applies when the EP's ``packed_attn_dtypes`` includes the
-    current model dtype.  The caller is responsible for gating on that
-    condition.
+    1. :class:`PackQKVForGQA` — no-bias models (Llama, Gemma).  Matches
+       ``MatMul → GQA`` and packs the three weight matrices into one.
+
+    2. :class:`PackQKVWithBiasForGQA` — bias models (Qwen2.5, Phi3/4).
+       Matches ``MatMul → Add(bias) → GQA`` and packs both the weights and
+       the biases, emitting ``MatMul(packed_w) → Add(packed_bias) → GQA``.
+
+    Only applies when the EP's ``packed_attn_dtypes`` includes the current
+    model dtype.  The caller is responsible for gating on that condition.
 
     Returns:
-        :class:`RewriteRuleSet` containing the ``PackQKVForGQA`` rule.
+        :class:`RewriteRuleSet` containing the ``PackQKVForGQA`` and
+        ``PackQKVWithBiasForGQA`` rules.
     """
-    return RewriteRuleSet([PackQKVForGQA().rule()])
+    return RewriteRuleSet([PackQKVForGQA().rule(), PackQKVWithBiasForGQA().rule()])
