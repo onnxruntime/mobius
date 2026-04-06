@@ -1046,7 +1046,18 @@ def render_markdown(report: ComparisonReport) -> str:
         if mr.differences:
             lines += ["### Differences", ""]
             for diff in mr.differences:
-                lines.append(f"- {diff.text}")
+                if diff.direction == "ort_more":
+                    # Green background: ORT GenAI has more (optimization opportunity)
+                    lines.append(
+                        f"- <span style='background-color: #d4edda'>{diff.text}</span>"
+                    )
+                elif diff.direction == "mobius_more":
+                    # Purple background: mobius has more (potential regression)
+                    lines.append(
+                        f"- <span style='background-color: #e8d5f5'>{diff.text}</span>"
+                    )
+                else:
+                    lines.append(f"- {diff.text}")
             lines += [""]
 
         if mr.expected_counts:
