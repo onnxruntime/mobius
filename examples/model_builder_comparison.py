@@ -775,29 +775,25 @@ def render_console(report: ComparisonReport, color: bool = True) -> str:
             lines.append("│")
         if mr.differences:
             lines.append("│  Differences:")
-            ort_more_color = "\033[42m"  # green background
-            mob_more_color = "\033[45m"  # purple/magenta background
             for diff in mr.differences:
                 # Strip markdown bold markers for console output
                 plain = diff.text.replace("**", "").replace("  \n  ↳ ", "\n     ↳ ")
                 if use_color:
                     if diff.direction == "ort_more":
-                        prefix = f"{ort_more_color}🟢{_RESET} "
+                        line_color = "\033[42m"  # green background
                     elif diff.direction == "mobius_more":
-                        prefix = f"{mob_more_color}🟣{_RESET} "
+                        line_color = "\033[45m"  # purple/magenta background
                     else:
-                        prefix = "   "
+                        line_color = ""
                 else:
-                    if diff.direction == "ort_more":
-                        prefix = "🟢 "
-                    elif diff.direction == "mobius_more":
-                        prefix = "🟣 "
-                    else:
-                        prefix = "   "
+                    line_color = ""
                 first_line = True
                 for dline in plain.splitlines():
                     if first_line:
-                        lines.append("│    " + prefix + dline)
+                        if line_color:
+                            lines.append(f"│    {line_color}{dline}{_RESET}")
+                        else:
+                            lines.append("│    " + dline)
                         first_line = False
                     else:
                         lines.append("│       " + dline)
@@ -935,20 +931,7 @@ def render_markdown(report: ComparisonReport) -> str:
         if mr.differences:
             lines += ["### Differences", ""]
             for diff in mr.differences:
-                # Split at the soft-break so we can color only the op:counts line.
-                parts = diff.text.split("  \n  ↳ ", 1)
-                first_part = parts[0]
-                explanation = parts[1] if len(parts) > 1 else ""
-                if diff.direction == "ort_more":
-                    colored = f"<span style='background-color: #d4edda'>{first_part}</span>"
-                elif diff.direction == "mobius_more":
-                    colored = f"<span style='background-color: #e8d5f5'>{first_part}</span>"
-                else:
-                    colored = first_part
-                if explanation:
-                    lines.append(f"- {colored}  \n  ↳ {explanation}")
-                else:
-                    lines.append(f"- {colored}")
+                lines.append(f"- {diff.text}")
             lines += [""]
 
         if mr.expected_counts:
