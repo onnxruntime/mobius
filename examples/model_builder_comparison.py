@@ -26,8 +26,12 @@ Compare against ORT GenAI builder — ALL EPs by default (requires 'pip install 
     python examples/model_builder_comparison.py \\
         --model meta-llama/Llama-3.2-1B
 
-  Shows: Op | ORT GenAI | default | cuda | dml | webgpu | trt-rtx | ...
-  with a per-EP verdict row at the bottom.
+  Produces one table per EP, each showing ORT GenAI vs mobius side-by-side:
+    EP: cuda (fp16)  → ORT GenAI/cuda | mobius/cuda
+    EP: cpu  (fp32)  → ORT GenAI/cpu  | mobius/cpu
+    EP: dml  (fp16)  → ORT GenAI/dml  | mobius/dml
+    ...
+  "default" EP (mobius-only, no ORT GenAI equivalent) is shown separately.
 
 Compare a single specific EP against ORT GenAI:
 
@@ -381,12 +385,46 @@ def build_mobius(model_id: str, ep: str, load_weights: bool = False) -> OpCounts
     )
 
 
+# ---------------------------------------------------------------------------
+# ORT GenAI EP / precision mapping
+# ---------------------------------------------------------------------------
+
+# Mobius EP name → ORT GenAI execution_provider argument.
+# "default" has no ORT GenAI equivalent (it's mobius-specific portable ONNX).
+_ORT_EP_MAP: dict[str, str] = {
+    "cpu": "cpu",
+    "cuda": "cuda",
+    "dml": "dml",
+    "webgpu": "webgpu",
+    "trt-rtx": "NvTensorRtRtx",
+}
+
+# Default ORT GenAI precision per EP when --dtype is not explicitly set.
+# cpu/webgpu default to fp32; GPU EPs default to fp16.
+_ORT_DEFAULT_PRECISION: dict[str, str] = {
+    "cpu": "fp32",
+    "cuda": "fp16",
+    "dml": "fp16",
+    "webgpu": "fp32",
+    "NvTensorRtRtx": "fp16",
+}
+
+
 def build_ort_genai(
     model_id: str,
     ep: str,
     precision: str,
+    *,
+    mobius_ep_label: str | None = None,
 ) -> OpCounts:
     """Build an ORT GenAI model using the installed onnxruntime_genai package.
+
+    Args:
+        model_id: HuggingFace model ID.
+        ep: ORT GenAI execution_provider argument (e.g. "cuda", "NvTensorRtRtx").
+        precision: ORT GenAI precision argument (e.g. "fp16", "fp32").
+        mobius_ep_label: Mobius EP name to use in the column label (e.g. "trt-rtx").
+            Defaults to ep when not given.
 
     Requires: pip install onnxruntime-genai
     """
@@ -398,6 +436,7 @@ def build_ort_genai(
             "  pip install onnxruntime-genai"
         ) from exc
 
+    label_ep = mobius_ep_label or ep
     out_dir = tempfile.mkdtemp(prefix="ort_genai_cmp_")
     try:
         create_model(
@@ -414,7 +453,7 @@ def build_ort_genai(
         model = ir.load(str(candidates[0]))
         counts = _count_ops(model)
         return OpCounts(
-            label=f"ort-genai/{ep}",
+            label=f"ort-genai/{label_ep}",
             counts=counts,
             total_nodes=sum(counts.values()),
             source="ort-genai",
@@ -1038,10 +1077,11 @@ def main() -> None:
         "--dtype",
         "--ort-precision",
         dest="ort_precision",
-        default="fp16",
+        default=None,
         choices=["fp32", "float32", "fp16", "float16", "bf16", "bfloat16", "int4"],
-        help="Model dtype / ORT GenAI builder precision (default: fp16). "
-        "Accepts both short (fp16, bf16, fp32) and long (float16, bfloat16, float32) forms.",
+        help="Model dtype / ORT GenAI builder precision. "
+        "Accepts both short (fp16, bf16, fp32) and long (float16, bfloat16, float32) forms. "
+        "Default: auto-selected per EP (fp32 for cpu/webgpu, fp16 for cuda/dml/trt-rtx).",
     )
     parser.add_argument(
         "--load-weights",
@@ -1077,7 +1117,8 @@ def main() -> None:
 
     # Normalize long-form dtype aliases to the short forms that ORT GenAI expects.
     _dtype_normalize = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
-    args.ort_precision = _dtype_normalize.get(args.ort_precision, args.ort_precision)
+    if args.ort_precision is not None:
+        args.ort_precision = _dtype_normalize.get(args.ort_precision, args.ort_precision)
 
     if args.suite:
         models = STANDARD_SUITE
@@ -1120,56 +1161,69 @@ def main() -> None:
 
     for i, model_id in enumerate(models):
         if ort_all_eps_mode:
-            # ORT-all-EPs mode: build ORT GenAI once (cuda), mobius for every EP.
+            # ORT-all-EPs mode: one ModelReport per EP, each with two columns:
+            #   [ort-genai/{ep}  |  mobius/{ep}]
+            # ORT GenAI is built for each EP it supports; "default" is mobius-only.
             if not args.quiet:
                 print(
                     f"\n→ {model_id}  (ORT GenAI + all EPs: {', '.join(all_eps)})", flush=True
                 )
 
-            all_columns: list[OpCounts] = []
+            from mobius._execution_providers import ep_registry as _ep_reg
 
-            # ORT GenAI column (built with cuda — serves as reference)
-            ort_ep = "cuda"
+            model_dtype = _detect_model_dtype(model_id)
             ort_models_list = args.ort_models or []
             ort_path = ort_models_list[i] if i < len(ort_models_list) else None
-            if ort_path:
-                p = Path(ort_path)
-                found = (
-                    list(p.glob("**/*.onnx")) if p.is_dir() else ([p] if p.is_file() else [])
-                )
-                if found:
-                    if not args.quiet:
-                        print(f"  Loading ORT GenAI model: {found[0]}", flush=True)
-                    try:
-                        all_columns.append(_op_counts_from_file(found[0]))
-                    except Exception as e:
-                        print(f"  WARNING: {e}")
-            else:
-                if not args.quiet:
-                    print(
-                        f"  Building with ORT GenAI ({args.ort_precision}/{ort_ep}) ...",
-                        end="",
-                        flush=True,
-                    )
-                try:
-                    all_columns.append(
-                        build_ort_genai(
-                            model_id,
-                            ep=ort_ep,
-                            precision=args.ort_precision,
-                        )
-                    )
-                    if not args.quiet:
-                        print(" done.")
-                except Exception as e:
-                    print(f"\n  WARNING: ORT GenAI build failed: {e}")
 
-            # Mobius columns — one per EP
             for ep_target in all_eps:
+                ort_ep_name = _ORT_EP_MAP.get(ep_target)  # None for "default"
+                precision = args.ort_precision or _ORT_DEFAULT_PRECISION.get(
+                    ort_ep_name or "", "fp16"
+                )
+                ep_columns: list[OpCounts] = []
+
+                # --- ORT GenAI column (skipped for "default" EP) ---
+                if ort_ep_name and not no_ort:
+                    if ort_path:
+                        p = Path(ort_path)
+                        found = (
+                            list(p.glob("**/*.onnx"))
+                            if p.is_dir()
+                            else ([p] if p.is_file() else [])
+                        )
+                        if found:
+                            if not args.quiet:
+                                print(f"  Loading ORT GenAI model: {found[0]}", flush=True)
+                            try:
+                                ep_columns.append(_op_counts_from_file(found[0]))
+                            except Exception as e:
+                                print(f"  WARNING: {e}")
+                    else:
+                        if not args.quiet:
+                            print(
+                                f"  Building ort-genai/{ep_target} ({precision}) ...",
+                                end="",
+                                flush=True,
+                            )
+                        try:
+                            ep_columns.append(
+                                build_ort_genai(
+                                    model_id,
+                                    ep=ort_ep_name,
+                                    precision=precision,
+                                    mobius_ep_label=ep_target,
+                                )
+                            )
+                            if not args.quiet:
+                                print(" done.")
+                        except Exception as e:
+                            print(f"\n  WARNING: ORT GenAI {ep_target} failed: {e}")
+
+                # --- mobius column ---
                 if not args.quiet:
-                    print(f"  Building with mobius/{ep_target} ...", end="", flush=True)
+                    print(f"  Building mobius/{ep_target} ...", end="", flush=True)
                 try:
-                    all_columns.append(
+                    ep_columns.append(
                         build_mobius(model_id, ep=ep_target, load_weights=args.load_weights)
                     )
                     if not args.quiet:
@@ -1177,69 +1231,30 @@ def main() -> None:
                 except Exception as e:
                     print(f"\n  ERROR building mobius/{ep_target}: {e}")
 
-            if not all_columns:
-                continue
+                if not ep_columns:
+                    continue
 
-            # Compute per-EP verdict: each mobius column vs ORT GenAI column.
-            # GQA is downgraded to KNOWN_DIFF for EPs where the model's dtype
-            # is not in the EP's gqa_dtypes (e.g. cpu doesn't support bf16 GQA,
-            # dml/webgpu don't support bf16 GQA, etc.)
-            from mobius._execution_providers import ep_registry as _ep_reg
-
-            model_dtype = _detect_model_dtype(model_id)
-
-            ort_ref = [c for c in all_columns if c.source == "ort-genai"]
-            per_ep_verdicts: list[tuple[str, str, str]] = []
-            all_diffs: list[str] = []
-            all_qk_issues: list[str] = []
-            overall_verdict = "PASS"
-            for mob_col in [c for c in all_columns if c.source == "mobius"]:
-                ep_name = mob_col.label.removeprefix("mobius/")
-                ep_caps = _ep_reg.get(ep_name)
-                # GQA mismatch vs ORT GenAI/cuda is KNOWN_DIFF when the
-                # model's dtype is not in this EP's gqa_dtypes — the EP
-                # simply doesn't support GQA at that precision.
+                # --- per-EP verdict ---
+                ep_caps = _ep_reg.get(ep_target)
                 gqa_known_diff: frozenset[str] = frozenset()
                 if ep_caps is None or model_dtype not in ep_caps.gqa_dtypes:
                     gqa_known_diff = frozenset({"GroupQueryAttention"})
-                pair = [*ort_ref, mob_col] if ort_ref else [mob_col]
                 ep_v, ep_r, ep_diffs, ep_qk = _compute_verdict(
-                    pair, model_id=model_id, extra_known_diff_ops=gqa_known_diff
+                    ep_columns, model_id=model_id, extra_known_diff_ops=gqa_known_diff
                 )
-                per_ep_verdicts.append((ep_name, ep_v, ep_r))
-                all_diffs.extend(d for d in ep_diffs if d not in all_diffs)
-                all_qk_issues.extend(q for q in ep_qk if q not in all_qk_issues)
-                if ep_v == "FAIL":
-                    overall_verdict = "FAIL"
-                elif ep_v == "KNOWN_DIFF" and overall_verdict == "PASS":
-                    overall_verdict = "KNOWN_DIFF"
 
-            # Overall report verdict = worst of per-EP verdicts
-            if not ort_ref:
-                overall_verdict = "MOBIUS-ONLY"
-                overall_reason = "No ORT GenAI column — mobius-only multi-EP comparison."
-            else:
-                verdict_counts = {v for _, v, _ in per_ep_verdicts}
-                if "FAIL" in verdict_counts:
-                    overall_reason = "One or more EPs have FAIL verdict."
-                elif "KNOWN_DIFF" in verdict_counts:
-                    overall_reason = "All EPs have KNOWN_DIFF or better."
-                else:
-                    overall_reason = "All EPs PASS."
-
-            report.models.append(
-                ModelReport(
-                    model_id=model_id,
-                    ep="all",
-                    columns=all_columns,
-                    verdict=overall_verdict,
-                    verdict_reason=overall_reason,
-                    differences=all_diffs,
-                    qk_norm_issues=all_qk_issues,
-                    expected_counts=_expected_counts(model_id),
-                    per_ep_verdicts=per_ep_verdicts,
+                report.models.append(
+                    ModelReport(
+                        model_id=model_id,
+                        ep=ep_target,
+                        columns=ep_columns,
+                        verdict=ep_v,
+                        verdict_reason=ep_r,
+                        differences=ep_diffs,
+                        qk_norm_issues=ep_qk,
+                        expected_counts=_expected_counts(model_id),
+                    )
                 )
-            )
 
         elif args.ep_list or (args.no_ort and args.ep is None):
             # Multi-EP mobius-only mode: one ModelReport per model, one column per EP.
@@ -1285,8 +1300,13 @@ def main() -> None:
                     print(f"\n→ {model_id}  EP: {ep}", flush=True)
                 columns_: list[OpCounts] = []
 
+                ort_ep_name = _ORT_EP_MAP.get(ep)  # None for "default"
+                precision = args.ort_precision or _ORT_DEFAULT_PRECISION.get(
+                    ort_ep_name or "", "fp16"
+                )
+
                 # --- ORT GenAI column ---
-                if not no_ort:
+                if not no_ort and ort_ep_name:
                     ort_models = args.ort_models or []
                     ort_path = ort_models[i] if i < len(ort_models) else None
 
@@ -1311,7 +1331,7 @@ def main() -> None:
                     elif _ort_genai_available():
                         if not args.quiet:
                             print(
-                                f"  Building with ORT GenAI ({args.ort_precision}/{ep}) ...",
+                                f"  Building with ORT GenAI ({precision}/{ep}) ...",
                                 end="",
                                 flush=True,
                             )
@@ -1319,8 +1339,9 @@ def main() -> None:
                             columns_.append(
                                 build_ort_genai(
                                     model_id,
-                                    ep=ep,
-                                    precision=args.ort_precision,
+                                    ep=ort_ep_name,
+                                    precision=precision,
+                                    mobius_ep_label=ep,
                                 )
                             )
                             if not args.quiet:
@@ -1333,6 +1354,12 @@ def main() -> None:
                             "  NOTE: onnxruntime-genai not installed. "
                             "Run 'pip install onnxruntime-genai' to enable ORT GenAI comparison. "
                             "Skipping ORT GenAI column."
+                        )
+                elif not no_ort and ep == "default":
+                    if not args.quiet:
+                        print(
+                            "  NOTE: ORT GenAI has no 'default' EP — "
+                            "showing mobius/default only."
                         )
 
                 # --- mobius column ---
