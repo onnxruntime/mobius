@@ -115,6 +115,14 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
+     # ---------- Nemotron examples ----------
+
+      - name: "Example: nemotron_3_nano_text_generation"
+        run: python examples/nemotron_3_nano_text_generation.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
       # ---------- Static cache ----------
 
       - name: "Example: static_cache_generation"
