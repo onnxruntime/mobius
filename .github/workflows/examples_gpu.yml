@@ -1,4 +1,4 @@
-name: GPU Examples (Phi, Qwen, Static Cache)
+name: GPU Examples
 
 on:
   workflow_dispatch:
@@ -12,12 +12,14 @@ concurrency:
 
 jobs:
   run-examples:
-    name: Run example scripts
+    name: Run Validation Example Scripts (GPU)
     runs-on:
       - self-hosted
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
       - "JobId=gpu-examples-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     timeout-minutes: 120
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -49,84 +51,81 @@ jobs:
         run: |
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers,ort-genai]'
-          pip install sounddevice soundfile librosa ml_dtypes
+          pip install soundfile librosa ml_dtypes
 
-      # ---------- Phi examples ----------
+      # ── Phi ──────────────────────────────────────────────────────
 
-      - name: "Example: phi4mm_multimodal"
-        run: python examples/phi4mm_multimodal.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "phi4mm_multimodal (text mode)"
+        run: python examples/phi4mm_multimodal.py --mode text
+        timeout-minutes: 20
 
-      - name: "Example: phi4mm_ort_genai"
-        run: python examples/phi4mm_ort_genai.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "phi4mm_ort_genai (vision)"
+        run: >
+          python examples/phi4mm_ort_genai.py
+          --image testdata/pipeline-cat-chonk.jpeg
+        timeout-minutes: 20
 
-      # ---------- Qwen examples ----------
+      # ── Qwen text ───────────────────────────────────────────────
 
-      - name: "Example: qwen25_vl_ort_genai"
-        run: python examples/qwen25_vl_ort_genai.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen35_text_generation"
+        run: >
+          python examples/qwen35_text_generation.py
+          --device cuda --prompt "What is 2+2?"
+        timeout-minutes: 20
 
-      - name: "Example: qwen35_text_generation"
-        run: python examples/qwen35_text_generation.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # ── Qwen vision-language ────────────────────────────────────
 
-      - name: "Example: qwen35_vl_ort_genai"
-        run: python examples/qwen35_vl_ort_genai.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen25_vl_ort_genai"
+        run: >
+          python examples/qwen25_vl_ort_genai.py
+          --image testdata/pipeline-cat-chonk.jpeg
+        timeout-minutes: 20
 
-      - name: "Example: qwen3_asr"
-        run: python examples/qwen3_asr.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen3_vl_ort_genai"
+        run: >
+          python examples/qwen3_vl_ort_genai.py
+          --image testdata/pipeline-cat-chonk.jpeg
+        timeout-minutes: 20
 
-      - name: "Example: qwen3_forced_aligner"
-        run: python examples/qwen3_forced_aligner.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen35_vl_ort_genai"
+        run: >
+          python examples/qwen35_vl_ort_genai.py
+          --image testdata/pipeline-cat-chonk.jpeg
+        timeout-minutes: 20
 
-      - name: "Example: qwen3_tts"
-        run: python examples/qwen3_tts.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # ── Qwen audio (file-based, no mic/speaker) ────────────────
 
-      - name: "Example: qwen3_tts_voice_clone"
-        run: python examples/qwen3_tts_voice_clone.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen3_asr"
+        run: >
+          python examples/qwen3_asr.py
+          --audio testdata/652-129742-0006.flac
+        timeout-minutes: 20
 
-      - name: "Example: qwen3_vl_ort_genai"
-        run: python examples/qwen3_vl_ort_genai.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen3_forced_aligner"
+        run: >
+          python examples/qwen3_forced_aligner.py
+          --audio testdata/652-129742-0006.flac
+          --text "He hoped there would be stew for dinner."
+        timeout-minutes: 20
 
-     # ---------- Nemotron examples ----------
+      # ── Qwen TTS (build-only — inference needs audio device) ───
 
-      - name: "Example: nemotron_3_nano_text_generation"
-        run: python examples/nemotron_3_nano_text_generation.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: "qwen3_tts (build-only)"
+        run: >
+          python examples/qwen3_tts.py
+          --save-to /tmp/qwen3_tts_ci/
+        timeout-minutes: 20
 
-      # ---------- Static cache ----------
+      # ── Nemotron ────────────────────────────────────────────────
 
-      - name: "Example: static_cache_generation"
+      - name: "nemotron_3_nano_text_generation"
+        run: >
+          python examples/nemotron_3_nano_text_generation.py
+          --device cuda --prompt "What is 2+2?"
+        timeout-minutes: 20
+
+      # ── Static cache ────────────────────────────────────────────
+
+      - name: "static_cache_generation"
         run: python examples/static_cache_generation.py
-        timeout-minutes: 15
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        timeout-minutes: 20
