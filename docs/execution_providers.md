@@ -99,7 +99,7 @@ Some EPs cannot execute certain ops. These are handled by **lowering rules**
 |---|---|---|
 | No fused RoPE inside GQA | DML | `SeparateRoPE` rewrite: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
 | No packed QKV in GQA | DML | `UnpackQKV` rewrite: packed GQA → 3 separate `MatMul` projections |
-| No `Shape` operator | WebGPU | `EliminateShape` rewrite: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
+| No `Shape` operator | WebGPU | Generation-time: `_mask_seq_len()` emits `ReduceSum+ReduceMax` instead of `Shape` |
 | No `SkipLayerNorm` kernel | TRT-RTX | `InlinePass`: expands fused ops using their registered `ir.Function` bodies |
 
 ---
@@ -117,7 +117,7 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType]          # dtypes where GQA fusion fires
     qkv_pack_dtypes: frozenset[ir.DataType]     # dtypes where PackQKV fusion fires
     supports_fused_rope: bool = True           # False → SeparateRoPE + UnpackQKV
-    supports_shape: bool = True                # False → EliminateShape lowering
+    supports_shape: bool = True                # False → _mask_seq_len() uses ReduceSum+ReduceMax
     supports_skip_layer_norm: bool = True      # False → InlinePass expansion
     supports_fused_moe: bool = True            # False → decompose fused MoE ops
     default_int4_accuracy_level: int = 0       # 0 = no INT4; 4 = INT4 w/ accuracy
@@ -176,7 +176,7 @@ Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute
             decomposition for TRT-RTX).
 
 Stage 3:  Lowering     EP-gated. Structural rewrites for EP constraints.
-          ↓ SeparateRoPE, UnpackQKV, EliminateShape
+          ↓ SeparateRoPE, UnpackQKV
             (each only fires if the EP's capabilities require it)
 
 Stage 4:  Fold         EP-agnostic. Always applied.
@@ -241,9 +241,9 @@ The entry is automatically registered at module import. No other registration
 is needed — the `EpRegistry` validates EP names at optimization time.
 
 **Step 2:** If the EP has hard constraints not expressible via existing
-`EpCapabilities` fields, add a new boolean field and a corresponding lowering
-rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
-(for pattern rewrite rules) or `_eliminate_shape.py` (for shape-related passes).
+`EpCapabilities` fields, add a new boolean field. For structural rewrites,
+follow the pattern in `_separate_rope.py`. For generation-time EP-conditional
+logic (like `_mask_seq_len()`), add the decision to the relevant component.
 
 **Step 3:** Write tests:
 - A unit test for each new rewrite rule (graph-level, no ORT required)

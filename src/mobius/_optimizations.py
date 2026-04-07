@@ -309,7 +309,8 @@ def optimize_model(
     2. **Fusion** — promote standard ops to EP-supported fused ops
        (e.g. GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and role.
     3. **Lowering** — decompose ops the EP cannot execute
-       (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
+       (e.g. SeparateRoPE for DML). Note: WebGPU Shape avoidance is
+       handled at graph-construction time via ``_mask_seq_len()``.
     4. **Fold** — final dead-node removal and constant folding.
 
     After fusion, if GQA was expected for ``(ep, dtype)`` but zero

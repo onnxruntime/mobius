@@ -320,7 +320,7 @@ def test_dml_lowers_rope_and_qkv():
 
 
 def test_webgpu_no_shape_nodes():
-    """WebGPU: EliminateShape lowering must remove Shape ops from the graph."""
+    """WebGPU: _mask_seq_len() must emit no Shape nodes — uses ReduceSum+ReduceMax instead."""
     pkg = _make_llama_pkg(ep="webgpu", dtype=ir.DataType.FLOAT16)
     model = pkg["model"]
     shape_count = _count_ops(model, "Shape")

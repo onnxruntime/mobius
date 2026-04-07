@@ -73,7 +73,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
     .. code-block:: text
 
         seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
-        total_seq_len = Cast(Shape(attention_mask)[1], INT32)
+        total_seq_len = Cast(ReduceMax(ReduceSum(attention_mask, axis=1), axis=0), INT32)
         attn_out, present_key, present_value = GroupQueryAttention(
             q_pre, k_pre, v, past_key, past_value,
             seqlens_k, total_seq_len, cos_cache, sin_cache,
@@ -203,11 +203,11 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
                 to=6,
             )
 
-            # total_seq_len = Cast(Gather(Shape(attention_mask), 1), INT32)
-            mask_shape = op.Shape(attention_mask)
-            idx_1 = op.Constant(value_int=1)
+            # total_seq_len = Cast(ReduceMax(reduce_sum, axis=0), INT32)
+            # Derived from reduce_sum already computed above; avoids Shape.
+            axis_0 = op.Constant(value_ints=[0])
             self._total_seq_len = op.Cast(
-                op.Gather(mask_shape, idx_1),
+                op.ReduceMax(reduce_sum, axis_0, keepdims=0),
                 to=6,
             )
 
@@ -552,7 +552,7 @@ class AttentionToGQA(RewriteRuleClassBase):
     .. code-block:: text
 
         seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
-        total_seq_len = Cast(Shape(attention_mask)[1], INT32)
+        total_seq_len = Cast(ReduceMax(ReduceSum(attention_mask, axis=1), axis=0), INT32)
         attn_out, present_key, present_value = GroupQueryAttention(
             q, k, v, past_key, past_value, seqlens_k, total_seq_len,
             num_heads=..., kv_num_heads=..., do_rotary=0,
@@ -639,9 +639,9 @@ class AttentionToGQA(RewriteRuleClassBase):
             reduce_sum = op.ReduceSum(attention_mask, axis)
             one = op.Constant(value_ints=[1])
             self._seqlens_k = op.Cast(op.Sub(reduce_sum, one), to=6)
-            mask_shape = op.Shape(attention_mask)
-            idx_1 = op.Constant(value_int=1)
-            self._total_seq_len = op.Cast(op.Gather(mask_shape, idx_1), to=6)
+            # Derived from reduce_sum already computed above; avoids Shape.
+            axis_0 = op.Constant(value_ints=[0])
+            self._total_seq_len = op.Cast(op.ReduceMax(reduce_sum, axis_0, keepdims=0), to=6)
 
         # do_rotary=0: Q/K already have position embeddings baked in.
         gqa_attrs: dict[str, int | float] = {

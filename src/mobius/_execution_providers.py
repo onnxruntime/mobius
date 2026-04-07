@@ -60,7 +60,9 @@ class EpCapabilities:
             stage).
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
-        supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
+        supports_shape: ``False`` causes ``_mask_seq_len()`` in components to
+            emit ``ReduceSum+ReduceMax`` instead of ``Shape`` at graph-construction
+            time (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
         supports_fused_matmul: ``False`` expands ``FusedMatMul`` via InlinePass
