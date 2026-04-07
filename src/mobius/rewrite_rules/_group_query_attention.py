@@ -694,7 +694,7 @@ def pack_qkv_for_gqa_rules() -> RewriteRuleSet:
        Matches ``MatMul → Add(bias) → GQA`` and packs both the weights and
        the biases, emitting ``MatMul(packed_w) → Add(packed_bias) → GQA``.
 
-    Only applies when the EP's ``packed_attn_dtypes`` includes the current
+    Only applies when the EP's ``qkv_pack_dtypes`` includes the current
     model dtype.  The caller is responsible for gating on that condition.
 
     Returns:
