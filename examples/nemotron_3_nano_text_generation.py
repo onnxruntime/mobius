@@ -79,17 +79,16 @@ DTYPE_MAP = {"f16": np.float16, "f32": np.float32, "bf16": ml_dtypes.bfloat16}
 
 
 def _fix_nemotron_h_dt_bias(model) -> None:
-    """Reload dt_bias and out_proj.weight from the checkpoint.
+    """Reload dt_bias from the checkpoint.
 
-    HuggingFace's ``_init_weights`` unconditionally overwrites these
-    parameters *after* loading checkpoint weights:
+    HuggingFace's ``_init_weights`` unconditionally overwrites ``dt_bias``
+    with ``torch.rand(...)`` *after* loading checkpoint weights.
 
-    - ``dt_bias``: reinitialized with ``torch.rand(...)``
-    - ``out_proj.weight``: reinitialized with ``kaiming_uniform_`` then
-      scaled by ``1/sqrt(num_hidden_layers)``
-      (when ``config.rescale_prenorm_residual`` is True)
+    A separate bug with ``out_proj.weight`` (reinitialized via
+    ``kaiming_uniform_``) is avoided by setting
+    ``config.rescale_prenorm_residual = False`` before loading.
 
-    This reloads the correct values directly from safetensors.
+    This reloads the correct dt_bias values directly from safetensors.
     """
     import torch
     from safetensors.torch import load_file
@@ -97,7 +96,7 @@ def _fix_nemotron_h_dt_bias(model) -> None:
     from huggingface_hub import HfApi
 
     # Keys that _init_weights corrupts and must be reloaded
-    _CORRUPTED_KEYS = {"dt_bias", "out_proj.weight"}
+    _CORRUPTED_KEYS = {"dt_bias"}
 
     model_id = model.config._name_or_path
     api = HfApi()
@@ -504,9 +503,16 @@ def generate_hf(
 
     print(f"[HF] Loading {model_id} ...")
     torch_dtype = torch.float32 if device == "cpu" else "auto"
+    hf_config = transformers.AutoConfig.from_pretrained(
+        model_id, trust_remote_code=True
+    )
+    # Disable GPT-2 residual scaling init — it's a training-time flag that
+    # corrupts out_proj.weight when loading pretrained checkpoints.
+    hf_config.rescale_prenorm_residual = False
     model = (
         transformers.AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch_dtype, device_map=None
+            model_id, config=hf_config,
+            torch_dtype=torch_dtype, device_map=None
         )
         .to(device)
         .eval()
