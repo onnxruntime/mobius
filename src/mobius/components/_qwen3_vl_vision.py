@@ -250,7 +250,7 @@ class Qwen3VLVisionAttention(nn.Module):
             cu_seqlens_int32,
             num_heads=self.num_heads,
             scale=self.scale,
-            domain="com.microsoft",
+            _domain="com.microsoft",
             _outputs=["packed_attn_out"],
         )  # (total_seq, hidden_size)
 

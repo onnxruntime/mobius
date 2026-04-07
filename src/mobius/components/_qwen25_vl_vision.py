@@ -226,7 +226,7 @@ class Qwen25VLVisionAttention(nn.Module):
             cu_seqlens_int32,
             num_heads=self.num_heads,
             scale=float(1.0 / math.sqrt(self.head_dim)),
-            domain="com.microsoft",
+            _domain="com.microsoft",
             _outputs=["packed_attn_out"],
         )  # (token_count, hidden_size)
 

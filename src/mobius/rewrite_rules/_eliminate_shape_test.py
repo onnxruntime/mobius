@@ -82,11 +82,12 @@ class TestEliminateShapeRules:
         assert ops_after["ReduceSum"] >= 1, "Expected ReduceSum inserted by rule"
         assert ops_after["ReduceMax"] >= 1, "Expected ReduceMax inserted by rule"
 
-    def test_no_input_ids_seq_len_shape_at_source(self):
-        """create_padding_mask() and create_attention_bias() use attention_mask for seq-len.
+    def test_input_ids_seq_len_shape_present_and_attention_mask_shape_present(self):
+        """create_padding_mask() reads q_len from input_ids and total_len from attention_mask.
 
-        No Shape(input_ids, start=1, end=2) appears in the graph without any
-        redirect pre-processing.
+        Shape(input_ids, start=1, end=2) must be present (for the query length) and
+        Shape(attention_mask, start=1, end=2) must also be present (for total length).
+        Both are correct: q_len != total_len during decode (dynamic-cache) steps.
         """
         config = _tiny_qwen3_config()
         model_module = registry.get("qwen3")(config)
@@ -102,9 +103,24 @@ class TestEliminateShapeRules:
             and n.attributes.get_int("start", 0) == 1
             and n.attributes.get_int("end", -1) == 2
         )
-        assert input_ids_seq_len_shapes == 0, (
-            f"Expected no Shape(input_ids, start=1, end=2) nodes at source, "
+        assert input_ids_seq_len_shapes >= 1, (
+            f"Expected at least one Shape(input_ids, start=1, end=2) for q_len, "
             f"got {input_ids_seq_len_shapes}"
+        )
+
+        mask_seq_len_shapes = sum(
+            1
+            for n in model.graph
+            if n.op_type == "Shape"
+            and n.inputs[0] is not None
+            and n.inputs[0].name is not None
+            and "mask" in n.inputs[0].name
+            and n.attributes.get_int("start", 0) == 1
+            and n.attributes.get_int("end", -1) == 2
+        )
+        assert mask_seq_len_shapes >= 1, (
+            f"Expected at least one Shape(attention_mask, start=1, end=2) for total_len, "
+            f"got {mask_seq_len_shapes}"
         )
 
     def test_rewritten_model_runs_with_ort(self):

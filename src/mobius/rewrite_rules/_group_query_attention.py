@@ -264,6 +264,11 @@ def _get_underlying_weight(weight: ir.Value) -> ir.Value:
     producer = weight.producer()
     if producer is not None:
         if producer.op_type == "Transpose":
+            perm = producer.attributes.get("perm")
+            if perm is None or list(perm.value) != [1, 0]:
+                raise MatchFailureError(
+                    f"weight {weight.name!r} Transpose has unexpected perm {perm!r}, expected [1, 0]"
+                )
             underlying = producer.inputs[0]
             if underlying is not None and underlying.producer() is None:
                 # underlying is a graph input (parameter) — good
@@ -624,6 +629,8 @@ class AttentionToGQA(RewriteRuleClassBase):
             attention_mask = next(
                 (gi for gi in graph.inputs if gi.name == "attention_mask"), None
             )
+            if attention_mask is None:
+                return  # No attention_mask in graph — skip this rewrite
             axis = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
             one = op.Constant(value_ints=[1])

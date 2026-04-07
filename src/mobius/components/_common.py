@@ -263,11 +263,13 @@ def create_padding_mask(
     mask_3d = op.Unsqueeze(bool_mask, [1])
     # Build target shape [B, q_len, total_len] using explicit slices.
     # input_ids may be 2D (input_ids) or 3D (hidden_states when inputs_embeds is
-    # used), so we extract the batch dimension from it individually.  The sequence
-    # dimension (q_len) is taken from attention_mask so the EliminateShape rule on
-    # WebGPU can eliminate this Shape op along with the total_len one.
+    # used), so we extract the batch dimension from it individually.
+    # q_len comes from input_ids (the query, e.g. 1 in decode step); total_len
+    # comes from attention_mask (covers both past and current tokens).
     batch_size = op.Shape(input_ids, start=0, end=1)
-    q_len = op.Shape(attention_mask, start=1, end=2)
+    # q_len comes from input_ids dim 1 (query length, e.g. 1 during decode).
+    # total_len comes from attention_mask dim 1 (past + current tokens).
+    q_len = op.Shape(input_ids, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
     return op.Expand(mask_3d, target_shape)
