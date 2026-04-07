@@ -97,9 +97,6 @@ _TEXT_MODELS = [
         "openai-community/gpt2",
         False,
         id="gpt2",
-        marks=pytest.mark.xfail(
-            reason="tie_word_embeddings graph reference issue in ORT", strict=False
-        ),
     ),
     # OPT (learned positional embeddings)
     pytest.param(
@@ -113,10 +110,6 @@ _TEXT_MODELS = [
         "bigscience/bloom-560m",
         False,
         id="bloom-560m",
-        marks=pytest.mark.skip(
-            reason="Bloom word_embeddings_layernorm not implemented "
-            "in FalconCausalLMModel — weights silently dropped"
-        ),
     ),
     # Falcon (ALiBi attention, multi-query)
     pytest.param(
