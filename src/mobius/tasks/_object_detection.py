@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
@@ -23,6 +25,8 @@ class ObjectDetectionTask(ModelTask):
         - logits: [batch, num_queries, num_classes] FLOAT
         - pred_boxes: [batch, num_queries, 4] FLOAT
     """
+
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

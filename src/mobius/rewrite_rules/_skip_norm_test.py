@@ -25,32 +25,39 @@ class TestSkipNormRules:
         assert isinstance(rules, RewriteRuleSet)
 
     def test_fuses_add_rmsnorm(self):
+        """The default EP optimization pipeline fuses all 56 Add+RMSNorm pairs in Qwen3-0.6B.
+
+        Previously only 55 were fused (the last layer's single-consumer Add was skipped).
+        After the off-by-1 fix, all 56 are fused including the last layer's Add → final norm.
+        The remaining 57 RMSNorms are QK norms (cannot be fused — no preceding Add).
+        """
         pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
         model = pkg["model"]
         counts_before = count_ops(model)
-        assert counts_before["RMSNormalization"] == 113
-        assert counts_before["Add"] == 56
+        # All 56 Add+RMSNorm pairs already fused by the build pipeline
+        assert counts_before["RMSNormalization"] == 57
+        assert counts_before.get("Add", 0) == 0
 
         rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 
         counts_after = count_ops(model)
-        assert counts_after["SkipSimplifiedLayerNormalization"] == 55
-        # Last layer's Add → final norm has only 1 consumer, not fused
-        assert counts_after["Add"] == 1
-        # Remaining RMSNorms: first input_layernorm(1) + final norm(1) + QK norms(56)
-        assert counts_after["RMSNormalization"] == 58
+        # No-op: all fusible pairs already handled by the build pipeline
+        assert counts_after["SkipSimplifiedLayerNormalization"] == 56
+        assert counts_after.get("Add", 0) == 0
+        assert counts_after["RMSNormalization"] == 57
 
-    def test_preserves_single_consumer_add(self):
-        """Add nodes with only one consumer are not fused."""
+    def test_fuses_last_layer_single_consumer_add(self):
+        """The last decoder layer's Add → final norm is fused even though Add has 1 consumer.
+
+        This was an off-by-1 bug: the >= 2 consumer guard wrongly prevented fusion of the
+        last layer's residual Add (which feeds only the final model norm).
+        """
         pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
         model = pkg["model"]
-        count_ops(model)  # baseline
-
-        rewrite(model, pattern_rewrite_rules=skip_norm_rules())
-
-        counts_after = count_ops(model)
-        # The 1 remaining Add is the last layer's residual → final norm
-        assert counts_after["Add"] == 1
+        counts = count_ops(model)
+        # All Add+RMSNorm pairs fused — including the last layer's single-consumer Add
+        assert counts.get("Add", 0) == 0
+        assert counts["SkipSimplifiedLayerNormalization"] == 56
 
     def test_rewritten_model_runs_with_ort(self):
         """SkipNorm-rewritten model can be serialized and run with ORT."""
@@ -75,7 +82,7 @@ class TestSkipNormRules:
         fill_random_weights(m)
 
         rewrite(m, pattern_rewrite_rules=skip_norm_rules())
-        assert count_ops(m)["SkipSimplifiedLayerNormalization"] == 3
+        assert count_ops(m)["SkipSimplifiedLayerNormalization"] == 4
 
         session = OnnxModelSession(m)
         feeds = make_prefill_feeds(session)

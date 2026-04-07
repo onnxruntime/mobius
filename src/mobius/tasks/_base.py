@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -20,8 +20,9 @@ from mobius._model_package import ModelPackage
 _FUNCTIONS_DOMAIN = "pkg.mobius"
 
 # Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
-# layers.  MLP-only layers are stateless and use (None, None).
-StatePair = tuple[ir.Value, ir.Value] | tuple[None, None]
+# layers.  Single-state layers (conv/lightning) use a 1-tuple.
+# MLP-only layers are stateless and use (None, None).
+StatePair = tuple[ir.Value, ir.Value] | tuple[ir.Value] | tuple[None, None]
 
 
 class LinearAttentionDims(NamedTuple):
@@ -76,7 +77,7 @@ def _make_graph(
         [],
         nodes=[],
         name=name,
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
     )
     return graph, GraphBuilder(graph)
 
@@ -160,6 +161,12 @@ class ModelTask(ABC):
     sequence classification). Each task defines its own graph I/O contract.
     """
 
+    #: Maps package key → optimization role for each model produced by this task.
+    #: The role controls which fusion passes run (e.g. only ``"decoder"`` gets
+    #: GQA fusion). Override in subclasses that produce non-decoder outputs.
+    #: Unrecognised keys default to ``"decoder"``.
+    model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}
+
     @abstractmethod
     def build(
         self,
@@ -194,6 +201,7 @@ def _make_hybrid_cache_inputs(
 
     Supported layer types:
         ``"full_attention"`` — standard KV cache (key + value).
+        ``"conv"`` — ShortConv conv_state only.
         ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
         ``"mamba"`` / ``"mamba2"`` — conv_state + ssm_state.
         ``"mlp"`` — stateless, produces ``(None, None)`` pair.
@@ -262,6 +270,17 @@ def _make_hybrid_cache_inputs(
             )
             flat.extend([conv_state, rec_state])
             pairs.append((conv_state, rec_state))
+        elif ltype == "conv":
+            # ShortConv layers: conv_state only (no SSM state)
+            # State: (batch, hidden_size, short_conv_kernel - 1)
+            short_conv_kernel = getattr(config, "short_conv_kernel", 3)
+            conv_state = ir.Value(
+                name=f"{prefix}.{i}.conv_state",
+                shape=ir.Shape([batch, config.hidden_size, short_conv_kernel - 1]),
+                type=ir.TensorType(dtype),
+            )
+            flat.append(conv_state)
+            pairs.append((conv_state,))  # 1-tuple: conv has no second state
         elif ltype == "mlp":
             # MLP-only layers are stateless — no cache inputs needed
             pairs.append((None, None))
@@ -337,6 +356,11 @@ def _register_hybrid_cache_outputs(
             # Single recurrent state only (no conv_state for lightning)
             (state_a,) = states
             state_a.name = f"{prefix}.{i}.recurrent_state"
+            graph.outputs.append(state_a)
+        elif ltype == "conv":
+            # ShortConv: single conv_state only
+            (state_a,) = states
+            state_a.name = f"{prefix}.{i}.conv_state"
             graph.outputs.append(state_a)
         else:
             state_a, state_b = states

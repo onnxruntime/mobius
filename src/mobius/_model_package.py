@@ -29,6 +29,7 @@ import onnx_ir as ir
 import torch
 import tqdm
 
+from mobius._optimizations import fold_constants_after_weights
 from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     applied |= _apply_weights_to_model(model, unmatched)
 
         _log_weight_mapping(state_dict, applied)
+
+        # Fold constants now that weights have been loaded.
+        # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
+        # be constant-folded once the weight tensors carry their const_value.
+        for model in self.data.values():
+            fold_constants_after_weights(model)
 
 
 def _make_progress_callback():

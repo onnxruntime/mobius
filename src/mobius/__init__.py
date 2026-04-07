@@ -28,9 +28,12 @@ __all__ = [
     "YolosConfig",
     "apply_weights",
     "build",
+    "build_context",
     "build_diffusers_pipeline",
     "build_from_module",
     "components",
+    "ep_capabilities",
+    "get_build_dtype",
     "models",
     "registry",
     "tasks",
@@ -39,6 +42,7 @@ __all__ = [
 __version__ = "0.1.0"
 
 from mobius import components, models, tasks
+from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._builder import (
     build,
     build_from_module,

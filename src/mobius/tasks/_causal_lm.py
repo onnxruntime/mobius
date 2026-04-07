@@ -104,7 +104,7 @@ class CausalLMTask(ModelTask):
                 )
             _validate_static_cache_support(module)
 
-        # --- Symbolic dims ---
+        # --- Graph input dims ---
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 

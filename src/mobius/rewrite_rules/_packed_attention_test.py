@@ -106,15 +106,18 @@ class TestPackedAttentionRules:
         onnx_model = onnx_pkg["model"]
 
         counts_before = count_ops(onnx_model)
-        attention_before = counts_before["Attention"]
-        assert attention_before > 0
+        # After EP-aware build on cpu+FLOAT, Attention nodes are fused to GQA
+        gqa_count = counts_before.get("GroupQueryAttention", 0)
+        attn_count = counts_before.get("Attention", 0)
+        assert gqa_count + attn_count > 0, "Model should have attention-like nodes"
 
         rules = packed_attention_rules()
         rewrite(onnx_model, pattern_rewrite_rules=rules)
 
         counts_after = count_ops(onnx_model)
-        # No attention ops replaced
-        assert counts_after["Attention"] == attention_before
+        # Packed attention rule only matches block-diagonal mask pattern — not GQA/Attention
+        assert counts_after.get("GroupQueryAttention", 0) == gqa_count
+        assert counts_after.get("Attention", 0) == attn_count
         assert counts_after.get("PackedMultiHeadAttention", 0) == 0
 
     def test_packed_attention_rules_returns_rule_set(self):
