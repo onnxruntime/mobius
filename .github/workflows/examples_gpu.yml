@@ -1,0 +1,124 @@
+name: GPU Examples (Phi, Qwen, Static Cache)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-examples:
+    name: Run example scripts
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-examples-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-examples-gpu-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
+          restore-keys: |
+            pip-examples-gpu-
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-examples-gpu-${{ hashFiles('examples/*.py') }}
+          restore-keys: |
+            hf-examples-gpu-
+
+      - name: Install PyTorch (CUDA)
+        run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install -e '.[testing,transformers,ort-genai]'
+          pip install sounddevice soundfile librosa ml_dtypes
+
+      # ---------- Phi examples ----------
+
+      - name: "Example: phi4mm_multimodal"
+        run: python examples/phi4mm_multimodal.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: phi4mm_ort_genai"
+        run: python examples/phi4mm_ort_genai.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ---------- Qwen examples ----------
+
+      - name: "Example: qwen25_vl_ort_genai"
+        run: python examples/qwen25_vl_ort_genai.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen35_text_generation"
+        run: python examples/qwen35_text_generation.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen35_vl_ort_genai"
+        run: python examples/qwen35_vl_ort_genai.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen3_asr"
+        run: python examples/qwen3_asr.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen3_forced_aligner"
+        run: python examples/qwen3_forced_aligner.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen3_tts"
+        run: python examples/qwen3_tts.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen3_tts_voice_clone"
+        run: python examples/qwen3_tts_voice_clone.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: "Example: qwen3_vl_ort_genai"
+        run: python examples/qwen3_vl_ort_genai.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ---------- Static cache ----------
+
+      - name: "Example: static_cache_generation"
+        run: python examples/static_cache_generation.py
+        timeout-minutes: 15
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
