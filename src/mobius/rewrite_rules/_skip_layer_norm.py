@@ -12,7 +12,10 @@ result, mean, inv_std_var, and the skip (unnormalized sum).
 This complements the ``skip_norm_rules`` which handles Add + RMSNormalization
 → SkipSimplifiedLayerNormalization for models using RMSNorm.
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for EPs that support
+SkipLayerNormalization (``supports_skip_layer_norm=True``; all EPs except
+TRT-RTX).  They can also be applied manually::
 
     from mobius.rewrite_rules import skip_layer_norm_rules
     from onnxscript.rewriter import rewrite

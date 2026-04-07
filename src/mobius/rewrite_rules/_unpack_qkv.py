@@ -51,7 +51,10 @@ the packed weight shape:
 - ``v_size = kv_num_heads * head_dim``
 - ``head_dim = total_out // (num_heads + 2 * kv_num_heads)``
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for EPs that do not support
+fused RoPE (``supports_fused_rope=False``, e.g. DML).  They can also be
+applied manually::
 
     from mobius.rewrite_rules import unpack_qkv_rules
     from onnxscript.rewriter import rewrite

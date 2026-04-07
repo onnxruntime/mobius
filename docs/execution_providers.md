@@ -86,7 +86,7 @@ ops to fused equivalents:
 - `Attention` → `com.microsoft::GroupQueryAttention` (CUDA, CPU, DML, WebGPU, TRT-RTX)
 - `Add + LayerNorm` → `com.microsoft::SkipLayerNormalization` (all except TRT-RTX)
 - `Add + RMSNorm` → `com.microsoft::SkipSimplifiedLayerNormalization` (all except TRT-RTX)
-- `Add + GELU` → `com.microsoft::BiasGelu` (all EPs)
+- `decomposed GELU chain` → standard ONNX `Gelu` (all EPs)
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 

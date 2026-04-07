@@ -33,7 +33,10 @@ The ``position_ids`` graph input is looked up by name and used to index
 into the cosine/sine cache tables before applying the standard
 ``RotaryEmbedding`` op (standard ONNX opset 23).
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for EPs that do not support
+fused RoPE (``supports_fused_rope=False``, e.g. DML).  They can also be
+applied manually::
 
     from mobius.rewrite_rules import separate_rope_rules
     from onnxscript.rewriter import rewrite
