@@ -7,12 +7,21 @@ from __future__ import annotations
 
 import onnx_ir as ir
 
+from mobius._build_context import build_context
+from mobius._execution_providers import EpCapabilities
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius.components._common import (
     Embedding,
     Linear,
+    _mask_seq_len,
     create_attention_bias,
     create_padding_mask,
+)
+
+_WEBGPU_CAPS = EpCapabilities(
+    name="webgpu",
+    gqa_dtypes=frozenset(),
+    supports_shape=False,
 )
 
 
@@ -178,3 +187,33 @@ class TestCreatePaddingMask:
         assert count_op_type(graph_bias, "CumSum") >= 1
         assert count_op_type(graph_bias, "GreaterOrEqual") >= 1
         assert count_op_type(graph_bias, "Where") >= 1
+
+
+class TestMaskSeqLen:
+    """_mask_seq_len() must emit different ops depending on ep_capabilities().supports_shape."""
+
+    def test_supports_shape_true_emits_shape_op(self):
+        """Default EP (supports_shape=True): must emit Shape, not ReduceSum/ReduceMax."""
+        builder, op, graph = create_test_builder()
+        attention_mask = create_test_input(
+            builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        # Default build context has supports_shape=True
+        result = _mask_seq_len(op, attention_mask)
+        assert result is not None
+        assert count_op_type(graph, "Shape") == 1
+        assert count_op_type(graph, "ReduceSum") == 0
+        assert count_op_type(graph, "ReduceMax") == 0
+
+    def test_supports_shape_false_emits_reduce_ops_not_shape(self):
+        """WebGPU EP (supports_shape=False): must emit ReduceSum+ReduceMax, no Shape."""
+        builder, op, graph = create_test_builder()
+        attention_mask = create_test_input(
+            builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        with build_context(_WEBGPU_CAPS, ir.DataType.FLOAT16):
+            result = _mask_seq_len(op, attention_mask)
+        assert result is not None
+        assert count_op_type(graph, "Shape") == 0
+        assert count_op_type(graph, "ReduceSum") == 1
+        assert count_op_type(graph, "ReduceMax") == 1
