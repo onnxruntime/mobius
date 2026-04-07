@@ -17,8 +17,7 @@ Each function returns an ``ir.Function`` that can be attached to an
 Naming convention:
     Python factory functions are snake_case (e.g. ``causal_conv_nd_with_state``,
     ``linear_attention``) while the ir.Function op type strings are PascalCase
-    (``"CausalConvWithState"``, ``"LinearAttention"``).  PascalCase aliases
-    (``CausalConvWithState``) are provided for discoverability.
+    (``"CausalConvWithState"``, ``"LinearAttention"``).
 """
 
 from __future__ import annotations

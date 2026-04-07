@@ -114,8 +114,8 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 @dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
-    gqa_dtypes: frozenset[ir.DataType]        # dtypes where GQA fusion fires
-    packed_attn_dtypes: frozenset[ir.DataType] # dtypes where PackedAttention fires
+    gqa_dtypes: frozenset[ir.DataType]          # dtypes where GQA fusion fires
+    qkv_pack_dtypes: frozenset[ir.DataType]     # dtypes where PackQKV fusion fires
     supports_fused_rope: bool = True           # False → SeparateRoPE + UnpackQKV
     supports_shape: bool = True                # False → EliminateShape lowering
     supports_skip_layer_norm: bool = True      # False → InlinePass expansion
@@ -206,12 +206,15 @@ When `execution_provider` is omitted (or set to `"default"`), mobius produces
 **portable ONNX**:
 
 - Standard ops (`Attention`, `LayerNormalization`, etc.) are emitted as-is.
-- Custom ops with ONNX function bodies (`LinearAttention`, etc.) are emitted
-  with their function bodies intact. Any conformant runtime can expand the
-  body if it does not recognise the custom op.
-- No vendor-specific fused ops are emitted (`GroupQueryAttention`,
-  `SkipLayerNormalization`, etc. are not present).
-- Only cleanup and constant folding run (Stages 1 and 4).
+- Custom ops with ONNX function bodies (`LinearAttention`, `FusedMatMul`,
+  `SkipLayerNormalization`, etc.) are emitted with their function bodies intact.
+  Any conformant runtime can expand the body if it does not recognise the
+  custom op.
+- Standard fusions (SkipNorm, FusedMatMul, Gelu) are applied — they produce
+  `com.microsoft` ops that are portable thanks to their ONNX function bodies.
+- No EP-specific fused ops are emitted (`GroupQueryAttention`, PackQKV are
+  not applied).
+- Only cleanup, standard fusion, and constant folding run (Stages 1, 2, and 4).
 
 This means the default output is the broadest possible ONNX — maximum
 compatibility, minimum performance assumptions.
@@ -230,7 +233,7 @@ three-step change:
 EpCapabilities(
     name="my-ep",
     gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
-    packed_attn_dtypes=frozenset({ir.DataType.FLOAT16}),
+    qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
 )
 ```
 

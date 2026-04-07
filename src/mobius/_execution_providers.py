@@ -53,8 +53,11 @@ class EpCapabilities:
     Attributes:
         name: Canonical EP name (e.g. ``"cuda"``).
         gqa_dtypes: dtypes for which GroupQueryAttention fusion is supported.
-        packed_attn_dtypes: dtypes for which PackedAttention fusion is
-            supported.
+        qkv_pack_dtypes: dtypes for which QKV weight packing for
+            GroupQueryAttention is supported (PackQKV fusion).  Set to an
+            empty frozenset for EPs that do not support packed QKV inputs
+            (e.g. DML, which always unpacks via UnpackQKV in the lowering
+            stage).
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
@@ -76,7 +79,7 @@ class EpCapabilities:
 
     name: str
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
-    packed_attn_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
+    qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
     supports_shape: bool = True
     supports_skip_layer_norm: bool = True
@@ -171,26 +174,27 @@ def _register_builtins() -> None:
     Called once at module import. Adding a new EP = adding one entry here.
     """
     _builtins = [
-        # Generic ONNX-conformant runtime — no vendor-specific kernel fusions.
-        # All custom ops with ONNX function bodies are portable (the body is
-        # the executable fallback). Only cleanup + constant folding are applied.
+        # Generic ONNX-conformant runtime — no EP-specific fused ops (no GQA,
+        # no PackQKV). Standard fusions (SkipNorm, FusedMatMul, Gelu) are
+        # applied but remain portable: all custom ops have ONNX function bodies
+        # that any conformant runtime can expand as a fallback.
         # supports_X = True means "don't decompose X" — function bodies make
         # them portable, so decomposition would be counterproductive.
         EpCapabilities(
             name="default",
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
-            packed_attn_dtypes=frozenset(),  # no packed attention fusion
+            qkv_pack_dtypes=frozenset(),  # no QKV packing
         ),
         EpCapabilities(
             name="cpu",
             gqa_dtypes=frozenset({ir.DataType.FLOAT}),
-            packed_attn_dtypes=frozenset({ir.DataType.FLOAT}),
+            qkv_pack_dtypes=frozenset({ir.DataType.FLOAT}),
             default_int4_accuracy_level=4,
         ),
         EpCapabilities(
             name="cuda",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
-            packed_attn_dtypes=frozenset(
+            qkv_pack_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_packed_multi_head_attention=True,
@@ -202,14 +206,17 @@ def _register_builtins() -> None:
         EpCapabilities(
             name="dml",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
-            packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
+            # DML does not support packed QKV in GQA — UnpackQKV always fires
+            # (triggered by supports_fused_rope=False), so packing would be
+            # immediately undone.  Leave empty to skip the pointless round-trip.
+            qkv_pack_dtypes=frozenset(),
             supports_packed_multi_head_attention=True,
             supports_fused_rope=False,
         ),
         EpCapabilities(
             name="webgpu",
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-            packed_attn_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
+            qkv_pack_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             supports_shape=False,
             default_int4_accuracy_level=4,
             provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
@@ -217,7 +224,7 @@ def _register_builtins() -> None:
         EpCapabilities(
             name="trt-rtx",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
-            packed_attn_dtypes=frozenset(
+            qkv_pack_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_skip_layer_norm=False,

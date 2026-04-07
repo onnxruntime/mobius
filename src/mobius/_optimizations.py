@@ -9,7 +9,7 @@ four-stage pass pipeline to an ONNX IR model:
 1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
    folding, shape inference. EP-agnostic; always applied.
 2. **Fusion** — promote standard ops to EP-supported fused ops
-   (GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` and ``model_role``.
+   (GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and ``model_role``.
 3. **Lowering** — decompose ops the EP cannot execute
    (SeparateRoPE, EliminateShape).
 4. **Fold** — final dead-node removal and constant folding.
@@ -265,8 +265,8 @@ def _get_optimization_passes(
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
         fuse.append(("GQAFusion", list(group_query_attention_rules())))
 
-    # --- QKV packing (decoder only, gated by packed_attn_dtypes) ---
-    if model_role == "decoder" and dtype in caps.packed_attn_dtypes:
+    # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
+    if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:
         fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
 
     # --- Normalization fusions (all roles, all dtypes) ---
@@ -277,7 +277,7 @@ def _get_optimization_passes(
         fuse.append(("SkipLayerNorm", list(skip_layer_norm_rules())))
 
     # --- Activation fusions (all roles, all dtypes) ---
-    fuse.append(("BiasGelu", list(gelu_fusion_rules())))
+    fuse.append(("GeluFusion", list(gelu_fusion_rules())))
 
     # --- Lowering passes ---
     # SkipLayerNorm/SimplifiedLayerNorm decomposition is handled by InlinePass
@@ -311,7 +311,7 @@ def optimize_model(
     1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
        folding, shape inference (EP-agnostic; always applied).
     2. **Fusion** — promote standard ops to EP-supported fused ops
-       (e.g. GQA, SkipNorm, BiasGelu). Gated by ``(ep, dtype)`` and role.
+       (e.g. GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and role.
     3. **Lowering** — decompose ops the EP cannot execute
        (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
     4. **Fold** — final dead-node removal and constant folding.

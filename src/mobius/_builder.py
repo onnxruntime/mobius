@@ -146,13 +146,17 @@ def build_from_module(
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
         execution_provider: Target execution provider for EP-aware
-            optimizations. Defaults to ``"default"``, which produces
-            portable ONNX with no vendor-specific ops (no GQA, no
-            ``com.microsoft`` ops). Accepted values are the names returned
-            by ``ep_registry`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
-            ``"webgpu"``, ``"trt-rtx"``). Controls which fusion, lowering,
-            and structural passes are applied; in particular, ``"webgpu"``
-            uses concrete (non-symbolic) input dimensions.
+            optimizations. Defaults to ``"default"``, which applies standard
+            fusions (SkipNorm, FusedMatMul, Gelu) but no EP-specific vendor
+            ops (no GQA, no PackQKV). Custom ops like
+            ``com.microsoft::FusedMatMul`` and
+            ``com.microsoft::SkipLayerNormalization`` are present but carry
+            portable ONNX function bodies as fallbacks. Accepted values are
+            the names returned by ``ep_registry`` (e.g. ``"cpu"``,
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``). Controls
+            which fusion, lowering, and structural passes are applied; in
+            particular, ``"webgpu"`` uses concrete (non-symbolic) input
+            dimensions.
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage, showing which
             rules matched and how many nodes were added/removed.

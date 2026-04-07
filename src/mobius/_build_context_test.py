@@ -35,7 +35,7 @@ class TestBuildContextDefaults:
         """Default EP has no GQA dtypes (portable ONNX)."""
         capabilities = ep_capabilities()
         assert len(capabilities.gqa_dtypes) == 0
-        assert len(capabilities.packed_attn_dtypes) == 0
+        assert len(capabilities.qkv_pack_dtypes) == 0
 
 
 class TestBuildContextScoping:

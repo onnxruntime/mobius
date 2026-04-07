@@ -1,10 +1,11 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rewrite rules for optional graph transformations.
+"""Rewrite rules for graph transformations.
 
-These rules are **not applied by default**. Users can apply them after
-model export to replace standard ONNX patterns with optimised custom ops.
+These rules are applied automatically by :func:`~mobius._optimizations.optimize_model`
+for the relevant execution provider and dtype. They can also be applied
+manually after model export:
 
 Example::
 

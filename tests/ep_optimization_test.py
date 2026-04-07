@@ -152,10 +152,11 @@ def test_cpu_default_produces_attention_not_gqa():
 def test_default_ep_produces_portable_onnx():
     """build_from_module with no EP arg defaults to 'default' (portable ONNX).
 
-    'default' applies only cleanup + constant folding. No GQA fusion.
-    Custom ops (SkipLayerNorm, etc.) are kept when present since their
-    ONNX function bodies serve as portable fallbacks. Llama uses RMSNorm
-    (not LayerNorm), so no SkipLayerNormalization nodes appear here.
+    'default' applies standard fusions (SkipNorm, FusedMatMul, Gelu) but no
+    EP-specific ops (no GQA, no PackQKV). Custom ops like FusedMatMul and
+    SkipLayerNormalization are kept when fused since their ONNX function bodies
+    serve as portable fallbacks. Llama uses RMSNorm (not LayerNorm), so no
+    SkipLayerNormalization nodes appear here.
     """
     config = _base_config(dtype=ir.DataType.FLOAT16)
     module_cls = registry.get("llama")

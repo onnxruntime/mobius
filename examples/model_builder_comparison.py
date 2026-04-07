@@ -1196,7 +1196,6 @@ def _expected_counts(model_id: str) -> dict[str, int] | None:
         return None
     else:
         return expected
-    return None
 
 
 def _mobius_version() -> str:
