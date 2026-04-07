@@ -11,7 +11,7 @@ four-stage pass pipeline to an ONNX IR model:
 2. **Fusion** — promote standard ops to EP-supported fused ops
    (GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and ``model_role``.
 3. **Lowering** — decompose ops the EP cannot execute
-   (SeparateRoPE, EliminateShape).
+   (SeparateRoPE).
 4. **Fold** — final dead-node removal and constant folding.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
@@ -248,7 +248,6 @@ def _get_optimization_passes(
         tuples where payload is a rule list or IR pass.
     """
     from mobius.rewrite_rules import (
-        eliminate_shape_rules,
         gelu_fusion_rules,
         group_query_attention_rules,
         pack_qkv_for_gqa_rules,
@@ -285,9 +284,6 @@ def _get_optimization_passes(
     if not caps.supports_fused_rope:
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
-
-    if not caps.supports_shape:
-        lower.append(("EliminateShape", list(eliminate_shape_rules())))
 
     return fuse, lower
 

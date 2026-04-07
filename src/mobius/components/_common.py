@@ -8,6 +8,8 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities
+
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
 
@@ -158,6 +160,27 @@ class GroupNorm(nn.Module):
         )
 
 
+def _mask_seq_len(op: builder.OpBuilder, attention_mask) -> ir.Value:
+    """Extract the sequence length (dim 1) from attention_mask.
+
+    On EPs that support Shape (all except WebGPU), this emits
+    ``Shape(attention_mask, start=1, end=2)`` — a single op.
+
+    On WebGPU (``supports_shape=False``), Shape cannot run at runtime, so we
+    use a data-driven equivalent: ``ReduceMax(ReduceSum(attention_mask, axis=1))``
+    which sums each row (number of valid tokens) and takes the max across the
+    batch to get the total sequence length.
+    """
+    if not ep_capabilities().supports_shape:
+        # WebGPU path: derive seq_len from the mask values themselves.
+        # attention_mask is 0/1 INT64; row sums equal per-item seq lengths.
+        axis_1 = op.Constant(value_ints=[1])
+        counts = op.ReduceSum(attention_mask, axis_1, keepdims=0)  # (batch,)
+        axis_0 = op.Constant(value_ints=[0])
+        return op.ReduceMax(counts, axis_0, keepdims=1)  # (1,)
+    return op.Shape(attention_mask, start=1, end=2)  # (1,)
+
+
 def create_attention_bias(
     op: builder.OpBuilder,
     input_ids,
@@ -193,13 +216,10 @@ def create_attention_bias(
     # Get query_length and total_length from shapes.
     # query_length comes from input_ids dim 1 (the query; e.g. 1 during decode).
     # total_length comes from attention_mask dim 1 (past + current tokens).
-    # Using attention_mask for total_length lets the EliminateShape WebGPU rule
-    # eliminate that Shape op.  Using input_ids for query_length is semantically
-    # correct: during decode input_ids is (batch, 1), so query_length=1 and
-    # start = total_length - 1, giving the last row of q_indices.
-    # On WebGPU (concrete dims), Shape(input_ids, 1) is constant-folded away.
+    # _mask_seq_len() picks the right implementation at graph-construction time:
+    # Shape on most EPs, ReduceSum+ReduceMax on WebGPU where Shape is unsupported.
     query_length = op.Shape(input_ids, start=1, end=2)  # 1-D [1]
-    total_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
+    total_length = _mask_seq_len(op, attention_mask)  # 1-D [1]
     start = op.Sub(total_length, query_length)
     # q_indices_2d: (batch_size, query_length)
     q_indices_2d = op.Slice(all_indices, start, total_length, [1])
@@ -273,7 +293,8 @@ def create_padding_mask(
     batch_size = op.Shape(input_ids, start=0, end=1)
     # q_len comes from input_ids dim 1 (query length, e.g. 1 during decode).
     # total_len comes from attention_mask dim 1 (past + current tokens).
+    # _mask_seq_len() emits Shape on most EPs and ReduceSum+ReduceMax on WebGPU.
     q_len = op.Shape(input_ids, start=1, end=2)
-    total_len = op.Shape(attention_mask, start=1, end=2)
+    total_len = _mask_seq_len(op, attention_mask)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
     return op.Expand(mask_3d, target_shape)
