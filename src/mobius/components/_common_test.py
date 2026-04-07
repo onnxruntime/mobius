@@ -91,6 +91,31 @@ class TestCreateAttentionBias:
         assert bias is not None
         assert count_op_type(graph, "Less") >= 1
 
+    def test_query_length_from_input_ids_not_attention_mask(self):
+        """Shape(input_ids, 1) must provide query_length, not Shape(attention_mask, 1).
+
+        During decode, input_ids is (batch, 1) and attention_mask is (batch, total_len).
+        Both shapes must produce separate Shape nodes so the Slice picks only the
+        last query row.  If both came from attention_mask, start=0 and the full
+        sequence would be used as queries, producing wrong attention scores.
+        """
+        builder, op, graph = create_test_builder()
+        # Simulate decode: q_len=1, total_len=8 (7 past + 1 current token)
+        input_ids = create_test_input(builder, "input_ids", [2, 1], dtype=ir.DataType.INT64)
+        attention_mask = create_test_input(
+            builder, "attention_mask", [2, 8], dtype=ir.DataType.INT64
+        )
+        create_attention_bias(op, input_ids, attention_mask)
+
+        # query_length must come from input_ids (dim 1 = 1), not attention_mask.
+        # Verify there is a Shape node that reads from input_ids.
+        shape_inputs = [
+            n.inputs[0].name for n in graph if n.op_type == "Shape" and n.inputs[0] is not None
+        ]
+        assert any(name == "input_ids" for name in shape_inputs), (
+            "Shape(input_ids, 1) must be present to extract query_length correctly"
+        )
+
 
 class TestCreatePaddingMask:
     def test_creates_bool_mask_with_2d_input_ids(self):
