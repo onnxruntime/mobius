@@ -90,6 +90,14 @@ class EpCapabilities:
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
 
+    def __post_init__(self) -> None:
+        if not self.supports_fused_rope and self.qkv_pack_dtypes:
+            raise ValueError(
+                f"EP '{self.name}': qkv_pack_dtypes must be frozenset() when "
+                f"supports_fused_rope=False — UnpackQKV lowering always fires for "
+                f"this EP, so packing would be immediately undone."
+            )
+
 
 class EpRegistry:
     """Central registry mapping EP name → :class:`EpCapabilities`.

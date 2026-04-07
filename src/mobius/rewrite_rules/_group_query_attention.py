@@ -29,7 +29,10 @@ Models with QK norm (e.g. Qwen3) are unaffected because the Q/K
 projections are followed by a normalization op, so the pattern does not
 match.
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` when the EP's ``gqa_dtypes``
+or ``qkv_pack_dtypes`` includes the current model dtype (decoder role only).
+They can also be applied manually::
 
     from mobius.rewrite_rules import group_query_attention_rules
     from onnxscript.rewriter import rewrite
@@ -599,6 +602,11 @@ class AttentionToGQA(RewriteRuleClassBase):
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
 
+        # attention_mask must be a graph input — needed to build seqlens_k.
+        graph = attn.graph
+        if not any(gi.name == "attention_mask" for gi in graph.inputs):
+            return result.fail("No attention_mask graph input — cannot build seqlens_k")
+
         return result
 
     # ------------------------------------------------------------------ rewrite
@@ -626,11 +634,7 @@ class AttentionToGQA(RewriteRuleClassBase):
         # Build seqlens_k and total_seq_len from attention_mask (computed once).
         if self._seqlens_k is None:
             graph = attn.graph
-            attention_mask = next(
-                (gi for gi in graph.inputs if gi.name == "attention_mask"), None
-            )
-            if attention_mask is None:
-                return  # No attention_mask in graph — skip this rewrite
+            attention_mask = next(gi for gi in graph.inputs if gi.name == "attention_mask")
             axis = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
             one = op.Constant(value_ints=[1])

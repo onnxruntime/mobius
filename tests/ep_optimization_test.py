@@ -311,6 +311,12 @@ def test_dml_lowers_rope_and_qkv():
     assert rope_count > 0, (
         f"DML SeparateRoPE should add RotaryEmbedding nodes, got {rope_count}"
     )
+    # DML has qkv_pack_dtypes=frozenset() — PackQKV must not fire.
+    pack_qkv_count = _count_ops(model, "PackQKV")
+    assert pack_qkv_count == 0, (
+        f"DML has qkv_pack_dtypes=frozenset(), so PackQKV must not be present, "
+        f"got {pack_qkv_count}"
+    )
 
 
 def test_webgpu_no_shape_nodes():
