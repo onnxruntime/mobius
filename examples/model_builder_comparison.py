@@ -182,7 +182,7 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
     (
         "Shape",
         "Shape",
-        "Shape op. Should be 0 on WebGPU after EliminateShape lowering.",
+        "Shape op. Should be 0 on WebGPU — _mask_seq_len() uses ReduceSum+ReduceMax instead.",
     ),
     (
         "Cast",

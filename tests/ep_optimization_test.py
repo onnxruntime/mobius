@@ -325,7 +325,7 @@ def test_webgpu_no_shape_nodes():
     model = pkg["model"]
     shape_count = _count_ops(model, "Shape")
     assert shape_count == 0, (
-        f"WebGPU should have no Shape nodes after lowering, got {shape_count}"
+        f"WebGPU should have no Shape nodes (generation-time _mask_seq_len() avoids them), got {shape_count}"
     )
 
 
