@@ -168,7 +168,7 @@ Stage 1:  Cleanup      EP-agnostic. Always applied.
             constant folding, symbolic shape inference, metadata cleanup.
 
 Stage 2:  Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
-          ↓ GQAFusion, SkipNorm, SkipLayerNorm, BiasGelu
+          ↓ GQAFusion, SkipNorm, SkipLayerNorm, GeluFusion
             (each only fires if the EP's capabilities support it)
 
 Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute
@@ -298,7 +298,7 @@ INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (4 rule groups)
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 : +28 GroupQueryAttention, -28 Attention
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  : +28 SkipSimplifiedLayerNorm, -56 Add, -28 RMSNormalization
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             : no matches (0 nodes affected)
-INFO mobius._optimizations: [EP Trace]   BiasGelu                  : no matches (0 nodes affected)
+INFO mobius._optimizations: [EP Trace]   GeluFusion                : no matches (0 nodes affected)
 INFO mobius._optimizations: [EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)
 INFO mobius._optimizations: [EP Trace]   InlinePass                : no matches (0 nodes affected)
 INFO mobius._optimizations: [EP Trace] Stage 3: Lowering (0 rule groups for cuda)
@@ -310,7 +310,7 @@ INFO mobius._optimizations: [EP Trace]   -------------------------+--------+----
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 |      28 |     28 |     28
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  |      28 |     28 |     84
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             |       0 |      0 |      0
-INFO mobius._optimizations: [EP Trace]   BiasGelu                  |       0 |      0 |      0
+INFO mobius._optimizations: [EP Trace]   GeluFusion                |       0 |      0 |      0
 INFO mobius._optimizations: [EP Trace]   InlinePass                |       0 |      0 |      0
 ```
 
@@ -321,7 +321,7 @@ INFO mobius._optimizations: [EP Trace]   InlinePass                |       0 |  
 - **+Nodes** = new nodes introduced.
 - **-Nodes** = nodes eliminated.
 - `no matches (0 nodes affected)` — the rule is registered for this EP but
-  found no patterns. Common reasons: wrong model type (e.g. BiasGelu on a
+  found no patterns. Common reasons: wrong model type (e.g. GeluFusion on a
   SiLU model), or the pattern was already eliminated in Stage 1.
 
 ### Fusion assertions

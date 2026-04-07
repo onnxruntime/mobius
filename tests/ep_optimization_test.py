@@ -259,10 +259,10 @@ def test_trace_optimization_no_matches_shows_zero(caplog):
     messages = [r.message for r in caplog.records]
     # CPU+FLOAT16 has no GQA fusion in the support matrix, so GQAFusion should
     # NOT appear at all in the trace (it's not added to the stage list).
-    # But SkipLayerNorm or BiasGelu may show zero matches depending on the model.
-    # Verify that the "no matches" format appears at least once (BiasGelu won't match Llama).
+    # But SkipLayerNorm or GeluFusion may show zero matches depending on the model.
+    # Verify that the "no matches" format appears at least once (GeluFusion won't match Llama).
     assert any("no matches (0 nodes affected)" in m for m in messages), (
-        "Expected at least one 'no matches' entry — BiasGelu should not match Llama (uses SiLU)"
+        "Expected at least one 'no matches' entry — GeluFusion should not match Llama (uses SiLU)"
     )
 
 
