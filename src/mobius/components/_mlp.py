@@ -55,7 +55,17 @@ class GatedMLP(nn.Module):
     Implements SwiGLU / GeGLU / GateMLP patterns where the hidden
     dimension is split into a gate branch and an up branch.
 
-    Replaces: ``Qwen25VLVisionMLP``, ``_SwiGLUMLP``, ``PixtralGatedMLP``.
+    **When to use GatedMLP vs MLP:** Both implement the same gated forward
+    pass, but differ in how dimensions are specified at construction time.
+    Use ``GatedMLP`` when the model config provides ``hidden_size`` and
+    ``intermediate_size`` directly (vision encoders, codec models, etc.).
+    Use :class:`MLP` when the model dimensions come from an
+    :class:`~mobius._configs.ArchitectureConfig` object (language model
+    decoder layers).
+
+    Default parameter names are ``gate_proj`` / ``up_proj`` / ``down_proj``.
+    Models with different HuggingFace weight names should rename in
+    ``preprocess_weights()``.
 
     Args:
         hidden_size: Input/output dimension.
