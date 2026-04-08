@@ -127,6 +127,9 @@ def _suppress_dedup_empty_initializer_warnings():
         dedup_logger.removeFilter(log_filter)
 
 
+# Standard ONNX domains — functions from these domains are never expanded by InlinePass.
+_STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
+
 # ---------------------------------------------------------------------------
 # Op counting helpers
 # ---------------------------------------------------------------------------
@@ -370,6 +373,11 @@ def optimize_model(
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
+        # onnx-standard EP: inline every function whose domain is not a standard
+        # ONNX domain. This covers both the well-known ops below AND parametric
+        # ops like CausalConvWithState and LinearAttention registered per-model.
+        if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
+            return True
         if func.domain == "com.microsoft" and func.name in (
             "SkipLayerNormalization",
             "SkipSimplifiedLayerNormalization",

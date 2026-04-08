@@ -177,7 +177,7 @@ def get_ep(name: str) -> EpCapabilities:
 
 
 def _register_builtins() -> None:
-    """Populate the global registry with the six built-in EPs.
+    """Populate the global registry with the seven built-in EPs.
 
     Called once at module import. Adding a new EP = adding one entry here.
     """
@@ -238,6 +238,21 @@ def _register_builtins() -> None:
             supports_skip_layer_norm=False,
             enable_graph_capture=True,
             provider_options={"enable_cuda_graph": "1"},
+        ),
+        # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
+        # All com.microsoft ops (FusedMatMul, SkipLayerNorm, PackedMHA) are
+        # expanded via InlinePass to their standard-ONNX function bodies.
+        # No GQA or QKV packing fusion is applied. Use this EP to produce
+        # models that run on any conformant ONNX runtime without ORT extensions.
+        EpCapabilities(
+            name="onnx-standard",
+            gqa_dtypes=frozenset(),  # no GroupQueryAttention
+            qkv_pack_dtypes=frozenset(),  # no PackQKV
+            supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
+            supports_shape=True,  # Shape is a standard ONNX op — no elimination needed
+            supports_skip_layer_norm=False,  # inline SkipLayerNorm
+            supports_fused_matmul=False,  # inline FusedMatMul → Transpose+MatMul
+            supports_packed_multi_head_attention=False,  # inline PackedMHA
         ),
     ]
     for caps in _builtins:
