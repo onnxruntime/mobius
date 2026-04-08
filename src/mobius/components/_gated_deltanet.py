@@ -79,18 +79,14 @@ class _DepthwiseConv1d(nn.Module):
             present_state: (B, D, K-1) — updated carry state.
         """
         # Zero bias — model has no conv bias; the function requires it.
-        # Cast bias and weight to match input_val's compute dtype.
-        # self.weight is typed as float32 by nn.Parameter; input_val carries
-        # the correct compute dtype (float16/bfloat16) from upstream projections.
-        compute_dtype_ref = input_val
+        # CastLike ensures the bias matches the weight dtype (e.g. f16).
         conv_bias = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), compute_dtype_ref),
+            op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
-        weight = op.CastLike(self.weight, compute_dtype_ref)
         return op.CausalConvWithState(
             input_val,
-            weight,
+            self.weight,
             conv_bias,
             conv_state,
             activation="silu",
@@ -140,10 +136,6 @@ class GatedDeltaNet(nn.Module):
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
 
         # Learnable parameters for decay computation.
-        # Read the active build dtype so Cast(dt_bias, to=FLOAT) is not eliminated
-        # as identity when dtype=FLOAT16 (constant folding sees FLOAT16→FLOAT, not
-        # FLOAT→FLOAT, and preserves the Cast). See _ssm.py module docstring for
-        # a full explanation of the two fix strategies.
         dtype = get_build_dtype()
         self.dt_bias = nn.Parameter([self.num_v_heads], dtype=dtype)
         self.A_log = nn.Parameter([self.num_v_heads], dtype=dtype)

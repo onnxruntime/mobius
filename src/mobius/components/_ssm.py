@@ -32,7 +32,6 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._build_context import get_build_dtype
 from mobius.components._common import Linear
 
 
@@ -45,12 +44,7 @@ class SelectiveScan(nn.Module):
         dt_rank: Rank of the time-step projection.
     """
 
-    def __init__(
-        self,
-        d_inner: int,
-        d_state: int,
-        dt_rank: int,
-    ):
+    def __init__(self, d_inner: int, d_state: int, dt_rank: int):
         super().__init__()
         self.d_inner = d_inner
         self.d_state = d_state
@@ -61,13 +55,10 @@ class SelectiveScan(nn.Module):
         # Project dt from reduced rank back to d_inner
         self.dt_proj = Linear(dt_rank, d_inner, bias=True)
 
-        # A_log and D are always upcast to float32 in forward(). Read the active
-        # build dtype via get_build_dtype() so Cast(param, to=FLOAT) is a genuine
-        # type change (e.g. FLOAT16→FLOAT) and is not eliminated by constant
-        # folding as an identity. See module docstring for full explanation.
-        dtype = get_build_dtype()
-        self.A_log = nn.Parameter([d_inner, d_state], dtype=dtype)
-        self.D = nn.Parameter([d_inner], dtype=dtype)
+        # A_log: (d_inner, d_state) — log of state decay matrix
+        self.A_log = nn.Parameter([d_inner, d_state])
+        # D: (d_inner,) — skip connection / feedthrough
+        self.D = nn.Parameter([d_inner])
 
     def _project_ssm_params(self, op: builder.OpBuilder, x_db):
         """Split x_proj output into dt_raw, B, C.
@@ -231,13 +222,9 @@ class Mamba2Scan(nn.Module):
         self.n_groups = n_groups
         self.heads_per_group = num_heads // n_groups
 
-        # A_log, D, dt_bias are always upcast to float32 in forward(). Read
-        # get_build_dtype() so Cast(param, to=FLOAT) is not eliminated as
-        # identity when the model dtype is float16.
-        dtype = get_build_dtype()
-        self.A_log = nn.Parameter([num_heads], dtype=dtype)
-        self.D = nn.Parameter([num_heads], dtype=dtype)
-        self.dt_bias = nn.Parameter([num_heads], dtype=dtype)
+        self.A_log = nn.Parameter([num_heads])
+        self.D = nn.Parameter([num_heads])
+        self.dt_bias = nn.Parameter([num_heads])
 
     def forward(
         self,
@@ -326,15 +313,9 @@ class Mamba2Scan(nn.Module):
 class _RMSNorm(nn.Module):
     """Lightweight RMSNorm for SSM params (avoids circular import)."""
 
-    def __init__(
-        self,
-        size: int,
-        eps: float = 1e-5,
-    ):
+    def __init__(self, size: int, eps: float = 1e-5):
         super().__init__()
-        # Use the model's compute dtype so Cast(self.weight, to=FLOAT) is not
-        # eliminated by constant folding when dtype=FLOAT16 (see module docstring).
-        self.weight = nn.Parameter([size], dtype=get_build_dtype())
+        self.weight = nn.Parameter([size])
         self._eps = eps
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):

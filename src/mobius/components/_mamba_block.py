@@ -24,14 +24,17 @@ HuggingFace reference: ``MambaMixer``.
 
 from __future__ import annotations
 
-import onnx_ir as ir
+from typing import TYPE_CHECKING
+
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._build_context import get_build_dtype
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
+
+if TYPE_CHECKING:
+    import onnx_ir as ir
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -41,20 +44,10 @@ class _DepthwiseConv1d(nn.Module):
     Used for causal convolution in the Mamba block.
     """
 
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int,
-        bias: bool = True,
-    ):
+    def __init__(self, channels: int, kernel_size: int, bias: bool = True):
         super().__init__()
-        # Declare with the model's compute dtype so that if these weights are
-        # stored as float16 in HF, the type annotation matches the data and
-        # Conv's type constraint (X and W must share the same element type) is
-        # satisfied without relying on implicit casting.
-        dtype = get_build_dtype()
-        self.weight = nn.Parameter([channels, 1, kernel_size], dtype=dtype)
-        self.bias = nn.Parameter([channels], dtype=dtype) if bias else None
+        self.weight = nn.Parameter([channels, 1, kernel_size])
+        self.bias = nn.Parameter([channels]) if bias else None
         self._kernel_size = kernel_size
         self._channels = channels
 

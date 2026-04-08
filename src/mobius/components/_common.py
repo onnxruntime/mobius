@@ -8,8 +8,6 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._build_context import get_build_dtype
-
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
 

@@ -7,7 +7,6 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._build_context import get_build_dtype
 from mobius._flags import flags
 
 
@@ -38,12 +37,7 @@ class OffsetRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        # nn.Parameter defaults to float32. Cast weight and the offset constant to
-        # match hidden_states so the Add and downstream RMSNormalization see a
-        # consistent dtype (critical for float16/bfloat16 graphs).
-        weight = op.CastLike(self.weight, hidden_states)
-        one = op.CastLike(op.Constant(value_float=1.0), hidden_states)
-        effective_weight = op.Add(weight, one)
+        effective_weight = op.Add(self.weight, 1.0)
         return op.RMSNormalization(
             hidden_states,
             effective_weight,
@@ -75,12 +69,7 @@ class GatedRMSNorm(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        # Declare weight with the model's compute dtype. When dtype=FLOAT16,
-        # the CUDA workaround path uses Cast(self.weight, to=FLOAT); if the
-        # weight were typed as FLOAT, constant folding would eliminate that
-        # Cast as identity (FLOAT→FLOAT), leaving float16 data mislabeled
-        # as float32 → ORT crash. With the correct annotation the Cast is kept.
-        self.weight = nn.Parameter([hidden_size], dtype=get_build_dtype())
+        self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
         self.group_size = group_size
 

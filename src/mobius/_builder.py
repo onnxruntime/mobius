@@ -363,9 +363,7 @@ def build(
 
     # Establish the build context before constructing the module so that
     # get_build_dtype() and ep_capabilities() work inside component __init__
-    # methods.  Components declare nn.Parameter with the build dtype so that
-    # intentional fp32 upcasts (Cast(param, to=FLOAT)) are not eliminated by
-    # constant folding when the model dtype is float16.
+    # methods.
     capabilities = ep_registry.require(execution_provider)
     build_dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     with build_context(capabilities, build_dtype):
