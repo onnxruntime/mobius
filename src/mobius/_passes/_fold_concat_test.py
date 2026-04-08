@@ -313,7 +313,8 @@ class TestConcatThenTransposeFolding:
         v_init.const_value = ir.tensor(w_v)
 
         concat_node = ir.Node(
-            "", "Concat",
+            "",
+            "Concat",
             inputs=[q_init, k_init, v_init],
             attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
             num_outputs=1,
@@ -322,7 +323,8 @@ class TestConcatThenTransposeFolding:
         concat_node.outputs[0].dtype = ir.DataType.FLOAT
 
         transpose_node = ir.Node(
-            "", "Transpose",
+            "",
+            "Transpose",
             inputs=[concat_node.outputs[0]],
             attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
             num_outputs=1,
@@ -359,3 +361,79 @@ class TestConcatThenTransposeFolding:
         np.testing.assert_array_equal(
             model.graph.initializers[packed_t[0]].const_value.numpy(), expected
         )
+
+
+class TestLiftConstantsThenFold:
+    """Verify that Constant ops are promoted before fold passes run.
+
+    fold_initializers_after_weights runs LiftConstantsToInitializersPass
+    first so that any Constant nodes present after weight loading are visible
+    to FoldConcatInitializersPass and FoldTransposedInitializerPass.
+    """
+
+    def test_constant_op_is_promoted_before_concat_fold(self):
+        """A Constant op feeding a Concat should be promoted and then folded."""
+        from onnx_ir.passes import common as common_passes
+
+        w_k = np.random.randn(4, 8).astype(np.float32)
+        w_v = np.random.randn(4, 8).astype(np.float32)
+
+        # W_q is delivered as a Constant op node (not an initializer yet).
+        constant_node = ir.Node(
+            "",
+            "Constant",
+            inputs=[],
+            attributes=[
+                ir.Attr(
+                    "value",
+                    ir.AttributeType.TENSOR,
+                    ir.tensor(np.random.randn(4, 8).astype(np.float32)),
+                )
+            ],
+            num_outputs=1,
+        )
+        constant_node.outputs[0].shape = ir.Shape([4, 8])
+        constant_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        k_init = ir.Value(name="k_weight")
+        k_init.shape = ir.Shape([4, 8])
+        k_init.dtype = ir.DataType.FLOAT
+        k_init.const_value = ir.tensor(w_k)
+
+        v_init = ir.Value(name="v_weight")
+        v_init.shape = ir.Shape([4, 8])
+        v_init.dtype = ir.DataType.FLOAT
+        v_init.const_value = ir.tensor(w_v)
+
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[constant_node.outputs[0], k_init, v_init],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        concat_node.outputs[0].shape = ir.Shape([12, 8])
+        concat_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[concat_node.outputs[0]],
+            nodes=[constant_node, concat_node],
+            name="test",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(k_init)
+        graph.register_initializer(v_init)
+        model = ir.Model(graph, ir_version=10)
+
+        # Run in the same order as fold_initializers_after_weights.
+        ir.passes.PassManager(
+            [
+                common_passes.LiftConstantsToInitializersPass(),
+                FoldConcatInitializersPass(),
+            ]
+        )(model)
+
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Constant" not in node_types, "Constant op should be promoted"
+        assert "Concat" not in node_types, "Concat should be folded after Lift"

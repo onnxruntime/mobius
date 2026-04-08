@@ -502,9 +502,16 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
 
     Call this after :func:`apply_weights` has populated all initializers.
     Despite the ``fold_*`` name, this does more than constant-folding — it
-    runs four sequential passes:
+    runs five sequential passes:
 
-    1. **Folds Concat initializers** — pre-packs QKV weight matrices produced
+    1. **Lifts Constant ops to initializers** — promotes any remaining
+       ``Constant`` op nodes to proper graph initializers so the subsequent
+       fold passes can see them.  ``optimize_model()`` (pre-weight-loading)
+       already runs this pass, but weights may introduce new Constant nodes
+       (e.g. from rewrite rules or EP-specific lowering), so it is repeated
+       here to ensure no ``Constant`` ops remain in the final model.
+
+    2. **Folds Concat initializers** — pre-packs QKV weight matrices produced
        by the GQA ``PackQKV`` rewrite rules.  PackQKV emits
        ``Concat(W_q, W_k, W_v) → Transpose(concat_out) → MatMul``; the
        Concat inputs are initializers, so this pass folds them first into a
@@ -512,17 +519,17 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
        so that the Transpose immediately follows a bare initializer and can be
        eliminated in the next step.
 
-    2. **Folds Transpose initializers** — converts every
+    3. **Folds Transpose initializers** — converts every
        ``Transpose(weight, perm=[1, 0])`` (emitted by
-       :class:`~mobius.components.Linear`, or left by step 1) into a
+       :class:`~mobius.components.Linear`, or left by step 2) into a
        pre-transposed initializer.  The transposition is deferred via
        :class:`onnx_ir.LazyTensor` so the pass itself does not materialise
        all weight tensors simultaneously.
 
-    3. **Removes unused nodes** — prunes orphaned initializers and nodes left
+    4. **Removes unused nodes** — prunes orphaned initializers and nodes left
        behind by the two folding passes above.
 
-    4. **Folds remaining constants** — applies a lightweight constant-fold
+    5. **Folds remaining constants** — applies a lightweight constant-fold
        pass for any remaining small constant sub-graphs (e.g. shape arithmetic,
        RoPE embedding precomputation).
 
@@ -532,11 +539,16 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     """
     pass_manager = ir.passes.PassManager(
         [
-            # FoldConcat MUST run first: PackQKV emits Concat(W_q, W_k, W_v)
-            # whose output is NOT an initializer — FoldTransposedInitializerPass
-            # cannot match Transpose(concat_output).  After this pass, the
-            # Concat is replaced with a single packed initializer, exposing a
-            # bare Transpose(initializer) for the next pass to fold.
+            # Promote any Constant op nodes to proper initializers first so
+            # the fold passes below can match them.  This must run before
+            # FoldConcatInitializersPass and FoldTransposedInitializerPass.
+            common_passes.LiftConstantsToInitializersPass(),
+            # FoldConcat MUST run before FoldTranspose: PackQKV emits
+            # Concat(W_q, W_k, W_v) whose output is NOT an initializer —
+            # FoldTransposedInitializerPass cannot match Transpose(concat_output).
+            # After this pass the Concat is replaced with a single packed
+            # initializer, exposing a bare Transpose(initializer) for the
+            # next pass to fold.
             FoldConcatInitializersPass(),
             FoldTransposedInitializerPass(),
             common_passes.RemoveUnusedNodesPass(),
