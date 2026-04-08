@@ -79,6 +79,11 @@ def apply_rotary_pos_emb(
         Tensor with RoPE applied, same shape as input.
     """
     cos, sin = position_embeddings
+    # cos/sin are gathered from float32 caches (BaseRope stores them in float32
+    # for numerical accuracy). Cast to match x's compute dtype so RotaryEmbedding
+    # sees uniform types (required by the T type constraint on all three inputs).
+    cos = op.CastLike(cos, x)
+    sin = op.CastLike(sin, x)
     return op.RotaryEmbedding(
         x,
         cos,

@@ -78,14 +78,18 @@ class _DepthwiseConv1d(nn.Module):
             present_state: (B, D, K-1) — updated carry state.
         """
         # Zero bias — model has no conv bias; the function requires it.
-        # CastLike ensures the bias matches the weight dtype (e.g. f16).
+        # Cast bias and weight to match input_val's compute dtype.
+        # self.weight is typed as float32 by nn.Parameter; input_val carries
+        # the correct compute dtype (float16/bfloat16) from upstream projections.
+        compute_dtype_ref = input_val
         conv_bias = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), self.weight),
+            op.CastLike(op.Constant(value_float=0.0), compute_dtype_ref),
             op.Constant(value_ints=[self._channels]),
         )
+        weight = op.CastLike(self.weight, compute_dtype_ref)
         return op.CausalConvWithState(
             input_val,
-            self.weight,
+            weight,
             conv_bias,
             conv_state,
             activation="silu",

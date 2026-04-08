@@ -37,7 +37,12 @@ class OffsetRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        effective_weight = op.Add(self.weight, 1.0)
+        # nn.Parameter defaults to float32. Cast weight and the offset constant to
+        # match hidden_states so the Add and downstream RMSNormalization see a
+        # consistent dtype (critical for float16/bfloat16 graphs).
+        weight = op.CastLike(self.weight, hidden_states)
+        one = op.CastLike(op.Constant(value_float=1.0), hidden_states)
+        effective_weight = op.Add(weight, one)
         return op.RMSNormalization(
             hidden_states,
             effective_weight,
