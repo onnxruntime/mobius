@@ -243,7 +243,10 @@ is needed — the `EpRegistry` validates EP names at optimization time.
 **Step 2:** If the EP has hard constraints not expressible via existing
 `EpCapabilities` fields, add a new boolean field and a corresponding lowering
 rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
-(for pattern rewrite rules) or `_eliminate_shape.py` (for shape-related passes).
+(for pattern rewrite rules) or `_eliminate_shape.py` (for op-elimination
+passes). Alternatively, if the constraint can be resolved at graph-build time
+(i.e. within a component's `forward()`), query `ep_capabilities()` from
+`mobius._build_context` and branch on the flag there — no rewrite rule needed.
 
 **Step 3:** Write tests:
 - A unit test for each new rewrite rule (graph-level, no ORT required)
@@ -465,6 +468,70 @@ does not — it's for runtimes other than ORT that understand standard ONNX ops
 but not ORT custom ops. The distinction matters for cross-framework export:
 a `"default"` model can be loaded by any ONNX-conformant runtime (TFLite,
 CoreML, ONNX Runtime, etc.), while a `"cpu"` model is ORT-specific.
+
+---
+
+## When to Use `build_context()` vs `optimize_model()` Directly
+
+### The normal path: `build()` / `build_from_module()`
+
+For most users, `build()` and `build_from_module()` are the only entry points
+you need. They automatically:
+
+1. Set the build context (`build_context()`) for the duration of graph
+   construction so components can query EP capabilities.
+2. Call `optimize_model()` on every model in the package after the graph
+   is built.
+
+You do not need to call `build_context()` or `optimize_model()` yourself.
+
+### When to call `optimize_model()` directly
+
+If you have an existing `ir.Model` (e.g. from a custom pipeline or a
+previously exported graph) and want to apply EP-aware passes without going
+through the full `build()` pipeline:
+
+```python
+from mobius._optimizations import optimize_model
+import onnx_ir as ir
+
+# Apply CUDA optimizations to an already-constructed model
+optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16)
+```
+
+Note: `optimize_model()` runs **outside** any `build_context()`. This means
+that any component that calls `ep_capabilities()` during graph construction
+will not see these EP settings unless the graph was built inside a
+`build_context()` first.
+
+### When to call `build_context()` directly
+
+If you are building a graph using task-level APIs (e.g. `task.build(module,
+config)`) and want to control EP capabilities without going through
+`build_from_module()`:
+
+```python
+from mobius._build_context import build_context
+from mobius._execution_providers import ep_registry
+
+caps = ep_registry.require("cuda")
+with build_context(caps, ir.DataType.FLOAT16):
+    pkg = task.build(module, config)  # components see CUDA capabilities here
+```
+
+This is the correct pattern for testing EP-conditional component behaviour,
+building multiple graphs with different EPs in the same process, or
+integrating mobius into a custom build pipeline.
+
+### Summary
+
+| Use case | API |
+|---|---|
+| Build from a HuggingFace model ID | `build()` |
+| Build from a custom `nn.Module` | `build_from_module()` |
+| Optimize an existing `ir.Model` | `optimize_model()` |
+| Build graphs with explicit EP context | `build_context()` + `task.build()` |
+| Test EP-conditional component logic | `build_context()` (see `_common_test.py`) |
 
 ---
 
