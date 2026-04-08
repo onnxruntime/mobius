@@ -69,6 +69,21 @@ def _default_session_options() -> dict[str, Any]:
     }
 
 
+def _make_session_options(ep: str) -> dict[str, Any]:
+    """Return session options with EP-specific provider_options.
+
+    Args:
+        ep: Execution provider name (e.g. ``"cpu"``, ``"cuda"``,
+            ``"dml"``, ``"trt-rtx"``).
+    """
+    from mobius.integrations.ort_genai.ep_config import make_provider_options
+
+    return {
+        "log_id": "onnxruntime-genai",
+        "provider_options": make_provider_options(ep),
+    }
+
+
 class GenaiConfigGenerator:
     """Generates genai_config.json dicts for onnxruntime-genai.
 
@@ -85,6 +100,8 @@ class GenaiConfigGenerator:
         num_key_value_heads: Number of KV heads (for GQA).
         head_dim: Size per attention head.
         context_length: Maximum context length. Defaults to 4096.
+        ep: Execution provider for ``session_options`` (e.g. ``"cpu"``,
+            ``"cuda"``, ``"dml"``, ``"trt-rtx"``). Defaults to ``"cpu"``.
         bos_token_id: Beginning-of-sequence token ID.
         eos_token_id: End-of-sequence token ID(s).
         pad_token_id: Padding token ID.
@@ -101,6 +118,7 @@ class GenaiConfigGenerator:
         num_key_value_heads: int,
         head_dim: int,
         context_length: int = 4096,
+        ep: str = "cpu",
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
@@ -113,6 +131,7 @@ class GenaiConfigGenerator:
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.context_length = context_length
+        self.ep = ep
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
@@ -132,6 +151,7 @@ class GenaiConfigGenerator:
         model_type: str,
         *,
         context_length: int = 4096,
+        ep: str = "cpu",
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
@@ -162,6 +182,7 @@ class GenaiConfigGenerator:
             num_key_value_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             context_length=context_length,
+            ep=ep,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad,
@@ -215,7 +236,7 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _default_session_options(),
+            "session_options": _make_session_options(self.ep),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -229,7 +250,7 @@ class GenaiConfigGenerator:
             "outputs": {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _default_session_options(),
+            "session_options": _make_session_options(self.ep),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -277,7 +298,7 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _default_session_options(),
+            "session_options": _make_session_options(self.ep),
         }
 
         if audio_token_id is not None:
@@ -291,7 +312,7 @@ class GenaiConfigGenerator:
 
         # Decoder section
         decoder: dict[str, Any] = {
-            "session_options": _default_session_options(),
+            "session_options": _make_session_options(self.ep),
             "filename": "model.onnx",
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,

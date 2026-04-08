@@ -211,7 +211,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
-    """Save a ModelPackage to disk, applying optimizations."""
+    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -234,6 +234,19 @@ def _save_package(
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+    runtime = getattr(args, "runtime", None)
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai import export_for_ort_genai
+
+        hf_model_id = getattr(args, "model", None)
+        ep = getattr(args, "execution_provider", "cpu")
+        # Normalize EP: "default" means no EP-specific options → use "cpu"
+        if ep == "default":
+            ep = "cpu"
+        artifacts = export_for_ort_genai(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
@@ -489,6 +502,18 @@ def main(argv: list[str] | None = None) -> None:
             "(default: 'default' → portable ONNX, no vendor fusions). "
             "Use 'mobius list eps' to see available EPs. "
             "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
+        ),
+    )
+    build_parser.add_argument(
+        "--runtime",
+        default=None,
+        choices=["ort-genai"],
+        metavar="RUNTIME",
+        help=(
+            "Generate runtime-specific config files after building. "
+            "Currently supports: 'ort-genai' (writes genai_config.json and "
+            "copies tokenizer files). Requires --model (not --config) for "
+            "tokenizer file download."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

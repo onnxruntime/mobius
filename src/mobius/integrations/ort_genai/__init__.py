@@ -7,6 +7,7 @@ All onnxruntime-genai specific code lives here. The core model/task/component
 layers remain runtime-agnostic.
 """
 
+from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
 from mobius.integrations.ort_genai.ep_config import (
     make_genai_decoder_config,
     make_kv_cache_dim_name,
@@ -19,6 +20,7 @@ from mobius.integrations.ort_genai.genai_config import (
 
 __all__ = [
     "GenaiConfigGenerator",
+    "export_for_ort_genai",
     "make_genai_decoder_config",
     "make_kv_cache_dim_name",
     "make_provider_options",
