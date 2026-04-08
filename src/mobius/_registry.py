@@ -644,15 +644,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
 def _create_default_registry() -> ModelRegistry:
     """Create the default registry with all built-in architectures."""
     reg = ModelRegistry()
-    reg._map.update(_REGISTRATIONS)
-    # -----------------------------------------------------------------
-    # Test metadata — applied after all registrations
-    #
-    # test_model_id: HF model whose config.json is used for L2
-    #     architecture validation (full-size graph, no weights).
-    # family: Groups related model_types in the dashboard.
-    # variant: Labels the code-path variant for dashboard display.
-    # -----------------------------------------------------------------
+    for arch, entry in _REGISTRATIONS.items():
+        reg.register(
+            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+        )
+    # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
     return reg
 
