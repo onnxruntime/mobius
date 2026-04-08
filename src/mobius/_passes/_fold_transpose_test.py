@@ -9,7 +9,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
-from mobius.passes._fold_transpose import FoldTransposedInitializerPass
+from mobius._passes._fold_transpose import FoldTransposedInitializerPass
 
 
 def _make_model_with_transpose(

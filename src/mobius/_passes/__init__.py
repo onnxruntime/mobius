@@ -8,7 +8,7 @@ complementing the rewrite-rule infrastructure in :mod:`mobius.rewrite_rules`.
 
 **Split between** ``passes/`` **and** ``_optimizations.py``
 ------------------------------------------------------------
-- ``mobius/passes/`` contains **individual, composable** IR pass classes.
+- ``mobius/_passes/`` contains **individual, composable** IR pass classes.
   Each pass has a single responsibility (e.g. fold Transpose nodes, fold
   Concat nodes) and can be used, tested, and benchmarked independently.
 
@@ -44,5 +44,5 @@ __all__ = [
     "FoldConcatInitializersPass",
 ]
 
-from mobius.passes._fold_concat import FoldConcatInitializersPass
-from mobius.passes._fold_transpose import FoldTransposedInitializerPass
+from mobius._passes._fold_concat import FoldConcatInitializersPass
+from mobius._passes._fold_transpose import FoldTransposedInitializerPass

@@ -21,8 +21,8 @@ support requires only a new registry entry — no changes to this module.
 Post-weight passes
 ------------------
 :func:`fold_initializers_after_weights` should be called after weights are loaded.
-It runs :class:`~mobius.passes.FoldTransposedInitializerPass` and
-:class:`~mobius.passes.FoldConcatInitializersPass` to fold runtime Transpose and
+It runs :class:`~mobius._passes.FoldTransposedInitializerPass` and
+:class:`~mobius._passes.FoldConcatInitializersPass` to fold runtime Transpose and
 Concat nodes over initializers into pre-computed weights, then removes unused
 nodes.
 """
@@ -53,7 +53,7 @@ from onnx_ir.passes import common as common_passes
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
-from mobius.passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
+from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
 
 logger = logging.getLogger(__name__)
 
@@ -504,15 +504,20 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     Despite the ``fold_*`` name, this does more than constant-folding — it
     runs four sequential passes:
 
-    1. **Folds Transpose initializers** — converts every
-       ``Transpose(weight, perm=[1, 0])`` (emitted by
-       :class:`~mobius.components.Linear`) into a pre-transposed initializer.
-       The transposition is deferred via :class:`onnx_ir.LazyTensor` so the
-       pass itself does not materialise all weight tensors simultaneously.
+    1. **Folds Concat initializers** — pre-packs QKV weight matrices produced
+       by the GQA ``PackQKV`` rewrite rules.  PackQKV emits
+       ``Concat(W_q, W_k, W_v) → Transpose(concat_out) → MatMul``; the
+       Concat inputs are initializers, so this pass folds them first into a
+       single packed initializer.  Must run **before** FoldTransposedInitializerPass
+       so that the Transpose immediately follows a bare initializer and can be
+       eliminated in the next step.
 
-    2. **Folds Concat initializers** — pre-packs QKV weight matrices produced
-       by the GQA ``PackQKV`` rewrite rules.  Like the Transpose fold, the
-       actual numpy concatenation is deferred via :class:`onnx_ir.LazyTensor`.
+    2. **Folds Transpose initializers** — converts every
+       ``Transpose(weight, perm=[1, 0])`` (emitted by
+       :class:`~mobius.components.Linear`, or left by step 1) into a
+       pre-transposed initializer.  The transposition is deferred via
+       :class:`onnx_ir.LazyTensor` so the pass itself does not materialise
+       all weight tensors simultaneously.
 
     3. **Removes unused nodes** — prunes orphaned initializers and nodes left
        behind by the two folding passes above.
@@ -522,13 +527,18 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
        RoPE embedding precomputation).
 
     Note: the constant-fold step uses standard size limits.  Large weight
-    tensors are handled by the dedicated Transpose/Concat folding passes
+    tensors are handled by the dedicated Concat/Transpose folding passes
     above — not by constant folding.
     """
     pass_manager = ir.passes.PassManager(
         [
-            FoldTransposedInitializerPass(),
+            # FoldConcat MUST run first: PackQKV emits Concat(W_q, W_k, W_v)
+            # whose output is NOT an initializer — FoldTransposedInitializerPass
+            # cannot match Transpose(concat_output).  After this pass, the
+            # Concat is replaced with a single packed initializer, exposing a
+            # bare Transpose(initializer) for the next pass to fold.
             FoldConcatInitializersPass(),
+            FoldTransposedInitializerPass(),
             common_passes.RemoveUnusedNodesPass(),
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,

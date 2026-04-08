@@ -9,7 +9,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
-from mobius.passes._fold_concat import FoldConcatInitializersPass
+from mobius._passes._fold_concat import FoldConcatInitializersPass
 
 
 def _make_concat_model(
@@ -277,3 +277,85 @@ class TestFoldConcatInitializersPass:
         assert len(packed_keys) == 1
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Concat" not in node_types
+
+
+class TestConcatThenTransposeFolding:
+    """Verify that running FoldConcat then FoldTranspose fully eliminates
+    the Concat+Transpose pattern produced by PackQKVForGQA."""
+
+    def test_concat_then_transpose_fully_folded(self):
+        """FoldConcat followed by FoldTranspose eliminates Concat AND Transpose.
+
+        PackQKV emits: Concat(W_q, W_k, W_v) → Transpose(concat_out).
+        Running FoldConcat first folds Concat → packed_init.
+        Running FoldTranspose second folds Transpose(packed_init) → packed_t_init.
+        No runtime Concat or Transpose should remain.
+        """
+        from mobius._passes._fold_transpose import FoldTransposedInitializerPass
+
+        w_q = np.random.randn(4, 8).astype(np.float32)
+        w_k = np.random.randn(4, 8).astype(np.float32)
+        w_v = np.random.randn(4, 8).astype(np.float32)
+
+        q_init = ir.Value(name="q_weight")
+        q_init.shape = ir.Shape([4, 8])
+        q_init.dtype = ir.DataType.FLOAT
+        q_init.const_value = ir.tensor(w_q)
+
+        k_init = ir.Value(name="k_weight")
+        k_init.shape = ir.Shape([4, 8])
+        k_init.dtype = ir.DataType.FLOAT
+        k_init.const_value = ir.tensor(w_k)
+
+        v_init = ir.Value(name="v_weight")
+        v_init.shape = ir.Shape([4, 8])
+        v_init.dtype = ir.DataType.FLOAT
+        v_init.const_value = ir.tensor(w_v)
+
+        concat_node = ir.Node(
+            "", "Concat",
+            inputs=[q_init, k_init, v_init],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        concat_node.outputs[0].shape = ir.Shape([12, 8])
+        concat_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        transpose_node = ir.Node(
+            "", "Transpose",
+            inputs=[concat_node.outputs[0]],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        transpose_node.outputs[0].shape = ir.Shape([8, 12])
+        transpose_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[transpose_node.outputs[0]],
+            nodes=[concat_node, transpose_node],
+            name="qkv_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(q_init)
+        graph.register_initializer(k_init)
+        graph.register_initializer(v_init)
+        model = ir.Model(graph, ir_version=10)
+
+        # Run FoldConcat first, then FoldTranspose (correct order).
+        FoldConcatInitializersPass()(model)
+        FoldTransposedInitializerPass()(model)
+
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Concat" not in node_types, "Concat should be folded"
+        assert "Transpose" not in node_types, "Transpose should be folded"
+
+        # Exactly one packed+transposed initializer should remain.
+        packed_t = [k for k in model.graph.initializers if "_t" in k and "__concat" in k]
+        assert len(packed_t) == 1, f"Expected 1 packed+transposed init, got: {packed_t}"
+
+        # Verify the actual numeric content is correct.
+        expected = np.concatenate([w_q, w_k, w_v], axis=0).T  # shape (8, 12)
+        np.testing.assert_array_equal(
+            model.graph.initializers[packed_t[0]].const_value.numpy(), expected
+        )
