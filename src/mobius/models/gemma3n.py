@@ -27,6 +27,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import Gemma3nConfig
+from mobius._weight_utils import vlm_decoder_weights
 from mobius.components import (
     MLP,
     Attention,
@@ -599,14 +600,7 @@ class Gemma3nCausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Preprocess weights, handling language_model prefix from multimodal."""
-        for key in list(state_dict.keys()):
-            if "language_model." in key:
-                new_key = key.replace("language_model.", "")
-                state_dict[new_key] = state_dict.pop(key)
-            elif "vision_tower" in key or "multi_modal_projector" in key:
-                state_dict.pop(key)
-            elif "audio_tower" in key:
-                state_dict.pop(key)
+        state_dict = vlm_decoder_weights(state_dict)
 
         # AltUp submodules (correction_coefs, prediction_coefs, modality_router,
         # router_norm, correct_output_scale) are called via plain methods rather than
