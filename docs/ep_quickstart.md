@@ -33,7 +33,7 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
 
 # ONNX-standard — zero custom-domain ops, safe for any conformant ONNX runtime
 pkg = mobius.build("meta-llama/Llama-3.2-1B",
-                   execution_provider="onnx-standard")  # works with any dtype
+                   execution_provider="onnx-standard")  # dtype defaults to f32; you can also pass f16/bf16
 
 pkg.save("output/llama/")
 ```
