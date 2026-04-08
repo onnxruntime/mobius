@@ -290,9 +290,12 @@ class GenaiConfigGenerator:
         is_multimodal = self._vision is not None or self._speech is not None
 
         # Decoder section
+        # For multi-model (VLM) packages, decoder is saved in decoder/ subfolder.
+        # For single-model LLMs, it's at the root as model.onnx.
+        decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _default_session_options(),
-            "filename": "model.onnx",
+            "filename": decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": _default_decoder_inputs(is_vlm=is_multimodal),

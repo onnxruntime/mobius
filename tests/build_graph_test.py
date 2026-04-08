@@ -849,8 +849,8 @@ class TestBuildGraphVisionLanguage:
         assert "audio_features" in e_inputs
         assert "inputs_embeds" in e_outputs
 
-        # Decoder model (pkg["model"]): inputs_embeds → logits + KV cache
-        decoder = pkg["model"]
+        # Decoder model (pkg["decoder"]): inputs_embeds → logits + KV cache
+        decoder = pkg["decoder"]
         d_inputs = {inp.name for inp in decoder.graph.inputs}
         d_outputs = {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in d_inputs

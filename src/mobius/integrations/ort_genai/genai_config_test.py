@@ -452,6 +452,25 @@ class TestGenaiConfigGeneratorMultimodal:
         assert "inputs_embeds" in inputs
         assert "input_id" not in inputs
 
+    def test_multimodal_decoder_filename_uses_subfolder(self):
+        """Multimodal decoder filename points to decoder/ subfolder."""
+        config = self._make_phi4mm_gen().generate()
+        assert config["model"]["decoder"]["filename"] == "decoder/model.onnx"
+
+    def test_single_model_decoder_filename_is_flat(self):
+        """Single-model (LLM) decoder filename is flat model.onnx."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=64,
+        )
+        config = gen.generate()
+        assert config["model"]["decoder"]["filename"] == "model.onnx"
+
     def test_speech_only_uses_inputs_embeds(self):
         """Speech-only (no vision) still uses inputs_embeds."""
         gen = GenaiConfigGenerator(

@@ -205,7 +205,7 @@ class TestAutoExportEndToEnd:
         assert "vision" in pkg
         assert "speech" in pkg
         assert "embedding" in pkg
-        assert "model" in pkg
+        assert "decoder" in pkg
 
         # Simulate auto_export detection logic
         is_vlm = "vision" in pkg and "embedding" in pkg
