@@ -256,6 +256,7 @@ def _register_builtins() -> None:
             name="standard",
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
+            supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
             supports_skip_layer_norm=False,  # inline SkipLayerNorm
             supports_fused_matmul=False,  # inline FusedMatMul → Transpose+MatMul
             supports_packed_multi_head_attention=False,  # inline PackedMHA
