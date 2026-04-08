@@ -113,15 +113,17 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 @dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
-    gqa_dtypes: frozenset[ir.DataType]          # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]     # dtypes where PackQKV fusion fires
-    supports_fused_rope: bool = True           # False → SeparateRoPE + UnpackQKV
-    supports_shape: bool = True                # False → EliminateShape lowering
-    supports_skip_layer_norm: bool = True      # False → InlinePass expansion
-    supports_fused_moe: bool = True            # False → decompose fused MoE ops
-    default_int4_accuracy_level: int = 0       # 0 = no INT4; 4 = INT4 w/ accuracy
-    provider_options: dict[str, str]           # Default ORT GenAI provider options
-    enable_graph_capture: bool = False          # GPU graph capture default
+    gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
+    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
+    supports_shape: bool = True                      # False → EliminateShape lowering
+    supports_skip_layer_norm: bool = True            # False → InlinePass expansion
+    supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
+    supports_fused_moe: bool = True                  # False → decompose fused MoE ops
+    supports_packed_multi_head_attention: bool = False  # True → PackedMultiHeadAttention kernel
+    default_int4_accuracy_level: int = 0             # 0 = highest accuracy; 4 = fastest
+    provider_options: dict[str, str]                 # Default ORT GenAI provider options
+    enable_graph_capture: bool = False               # GPU graph capture default
 ```
 
 ### Current registry
@@ -296,8 +298,9 @@ Sample output:
 INFO mobius._optimizations: [EP Trace] Target: cuda, dtype: FLOAT16, role: decoder
 INFO mobius._optimizations: [EP Trace] Stage 1: Cleanup (9 passes)
 INFO mobius._optimizations: [EP Trace]   Cleanup: 512 → 486 nodes (-26)
-INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (4 rule groups)
+INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (5 rule groups)
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 : +28 GroupQueryAttention, -28 Attention
+INFO mobius._optimizations: [EP Trace]   PackQKV                   : +28 Concat, -56 FusedMatMul
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  : +28 SkipSimplifiedLayerNorm, -56 Add, -28 RMSNormalization
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             : no matches (0 nodes affected)
 INFO mobius._optimizations: [EP Trace]   GeluFusion                : no matches (0 nodes affected)
@@ -310,6 +313,7 @@ INFO mobius._optimizations: [EP Trace] Summary:
 INFO mobius._optimizations: [EP Trace]   Rule                      | Matched | +Nodes | -Nodes
 INFO mobius._optimizations: [EP Trace]   -------------------------+--------+-------+-------
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 |      28 |     28 |     28
+INFO mobius._optimizations: [EP Trace]   PackQKV                   |      56 |     28 |     56
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  |      28 |     28 |     84
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             |       0 |      0 |      0
 INFO mobius._optimizations: [EP Trace]   GeluFusion                |       0 |      0 |      0

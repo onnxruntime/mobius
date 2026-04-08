@@ -69,16 +69,17 @@ Example output:
 INFO  [EP Trace] Target: cuda, dtype: FLOAT16, role: decoder
 INFO  [EP Trace] Stage 1: Cleanup (9 passes)
 INFO  [EP Trace]   Cleanup: 512 → 486 nodes (-26)
-INFO  [EP Trace] Stage 2: Fusion (4 rule groups)
-INFO  [EP Trace]   GQAFusion    : +28 GroupQueryAttention, -28 Attention
-INFO  [EP Trace]   SkipNorm     : +28 SkipSimplifiedLayerNorm, -84 nodes
+INFO  [EP Trace] Stage 2: Fusion (5 rule groups)
+INFO  [EP Trace]   GQAFusion    : +16 GroupQueryAttention, -16 Attention
+INFO  [EP Trace]   PackQKV      : +16 Concat, -32 FusedMatMul
+INFO  [EP Trace]   SkipNorm     : +16 SkipSimplifiedLayerNorm, -48 nodes
 INFO  [EP Trace]   SkipLayerNorm: no matches (0 nodes affected)
 INFO  [EP Trace]   GeluFusion   : no matches (0 nodes affected)
 INFO  [EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)
 INFO  [EP Trace]   InlinePass   : no matches (0 nodes affected)
 INFO  [EP Trace] Stage 3: Lowering (0 rule groups for cuda)
 INFO  [EP Trace] Stage 4: Constant folding
-INFO  [EP Trace]   Fold: 374 → 371 nodes (-3)
+INFO  [EP Trace]   Fold: 374 → 355 nodes (-19)
 ```
 
 ---
