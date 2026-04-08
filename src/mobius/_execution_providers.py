@@ -71,13 +71,6 @@ class EpCapabilities:
             ``PackedMultiHeadAttention`` via InlinePass to a
             block-diagonal attention bias + standard ``Attention``.
             Leave ``True`` for CUDA / DML EPs that ship the native kernel.
-        expand_all_custom_ops: When ``True``, :class:`~onnx_ir.passes.common.InlinePass`
-            expands **every** registered function whose domain is not a standard
-            ONNX domain (``""`` or ``"ai.onnx"``), regardless of the individual
-            ``supports_X`` flags.  Use this for the ``"onnx-standard"`` EP to
-            guarantee a zero-custom-op output — including parametric ops like
-            ``CausalConvWithState`` and ``LinearAttention`` that are not covered
-            by the individual flags.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -93,7 +86,6 @@ class EpCapabilities:
     supports_fused_matmul: bool = True
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
-    expand_all_custom_ops: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -261,7 +253,6 @@ def _register_builtins() -> None:
             supports_skip_layer_norm=False,  # inline SkipLayerNorm
             supports_fused_matmul=False,  # inline FusedMatMul → Transpose+MatMul
             supports_packed_multi_head_attention=False,  # inline PackedMHA
-            expand_all_custom_ops=True,  # inline ALL remaining custom-domain ops (e.g. CausalConv, LinearAttention)
         ),
     ]
     for caps in _builtins:
