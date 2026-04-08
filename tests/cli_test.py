@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from unittest import mock
 
 import onnx
 import pytest
@@ -172,3 +173,56 @@ class TestCLIInfo:
         out = capsys.readouterr().out
         assert "qwen2" in out
         assert "Supported" in out
+
+
+class TestCLIBuildRuntime:
+    """Test the ``--runtime`` flag on the ``build`` subcommand."""
+
+    def test_runtime_ort_genai_calls_export_for_ort_genai(self):
+        """--runtime ort-genai calls export_for_ort_genai() after building."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch(
+                "mobius.integrations.ort_genai.export_for_ort_genai",
+                return_value={},
+            ) as mock_export:
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--runtime",
+                        "ort-genai",
+                    ]
+                )
+
+        mock_export.assert_called_once()
+        call_kwargs = mock_export.call_args
+        assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
+
+    def test_no_runtime_does_not_call_export_for_ort_genai(self):
+        """Omitting --runtime does NOT call export_for_ort_genai()."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch(
+                "mobius.integrations.ort_genai.export_for_ort_genai"
+            ) as mock_export:
+                main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
+
+        mock_export.assert_not_called()
+
+    def test_invalid_runtime_value_errors(self):
+        """An unrecognised --runtime value causes argparse to exit with an error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(SystemExit):
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--runtime",
+                        "tensorrt",  # not a supported value
+                    ]
+                )
