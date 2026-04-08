@@ -1,4 +1,4 @@
-# Design Document — mobius
+# System Architecture
 
 ## Overview
 
