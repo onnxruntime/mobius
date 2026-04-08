@@ -257,10 +257,10 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
+            supports_shape=True,  # Shape is a standard ONNX op — no elimination needed
             supports_skip_layer_norm=False,  # inline SkipLayerNorm
             supports_fused_matmul=False,  # inline FusedMatMul → Transpose+MatMul
             supports_packed_multi_head_attention=False,  # inline PackedMHA
-            supports_fused_moe=False,
             expand_all_custom_ops=True,  # inline ALL remaining custom-domain ops (e.g. CausalConv, LinearAttention)
         ),
     ]
