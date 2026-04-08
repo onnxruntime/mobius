@@ -54,6 +54,7 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     return default
 
+
 def _env_str(name: str, default: str, choices: tuple[str, ...]) -> str:
     """Read a string from an environment variable.
 
@@ -122,18 +123,18 @@ class _Flags:
     mamba_scan: str = dataclasses.field(
         default_factory=lambda: _env_str(
             "MOBIUS_MAMBA_SCAN",
-            "single",
+            "chunked_ssd",
             ("chunked_ssd", "scan", "single"),
         )
     )
     """Multi-token Mamba2 forward strategy.
 
-    - ``"chunked_ssd"``: chunked SSD algorithm — processes the full
-      sequence in parallel within chunks, with cross-chunk state
-      propagation.  Matches HF ``torch_forward``.
+    - ``"chunked_ssd"`` (default): chunked SSD algorithm — processes
+      the full sequence in parallel within chunks, with cross-chunk
+      state propagation.  Matches HF ``torch_forward``.
     - ``"scan"``: ONNX Scan op that iterates token-by-token.  Supports
       arbitrary seq_len but is sequential.
-    - ``"single"`` (default): single-token-only path (seq_len must be 1).
+    - ``"single"``: single-token-only path (seq_len must be 1).
 
     Set via ``MOBIUS_MAMBA_SCAN=chunked_ssd|scan|single``.
     For backwards compatibility, ``1``/``true`` → ``chunked_ssd``,

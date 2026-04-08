@@ -90,10 +90,8 @@ def _fix_nemotron_h_dt_bias(model) -> None:
 
     This reloads the correct dt_bias values directly from safetensors.
     """
-    import torch
-    from safetensors.torch import load_file
-
     from huggingface_hub import HfApi
+    from safetensors.torch import load_file
 
     # Keys that _init_weights corrupts and must be reloaded
     _CORRUPTED_KEYS = {"dt_bias"}
@@ -105,9 +103,7 @@ def _fix_nemotron_h_dt_bias(model) -> None:
         for f in api.model_info(model_id).siblings
         if f.rfilename.endswith(".safetensors")
     ]
-    repo_dir = os.path.dirname(
-        transformers.utils.cached_file(model_id, shard_files[0])
-    )
+    repo_dir = os.path.dirname(transformers.utils.cached_file(model_id, shard_files[0]))
 
     sd = model.state_dict()
 
@@ -122,9 +118,9 @@ def _fix_nemotron_h_dt_bias(model) -> None:
             sd_key = key
             if sd_key not in sd:
                 if key.startswith("backbone."):
-                    sd_key = "model." + key[len("backbone."):]
+                    sd_key = "model." + key[len("backbone.") :]
                 elif key.startswith("model."):
-                    sd_key = "backbone." + key[len("model."):]
+                    sd_key = "backbone." + key[len("model.") :]
             if sd_key in sd:
                 sd[sd_key] = value
                 patched += 1
@@ -225,7 +221,9 @@ def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.nda
     """
     batch_size = 1
     states: dict[str, np.ndarray] = {}
-    layer_types = getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    layer_types = (
+        getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    )
 
     # Mamba2 dims from NemotronH config (handle both old and new attr names)
     n_heads = getattr(config, "mamba_n_heads", None) or config.mamba_num_heads
@@ -279,7 +277,9 @@ def update_states(
     config,
 ) -> dict[str, np.ndarray]:
     """Copy present-state outputs back into the past-state inputs."""
-    layer_types = getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    layer_types = (
+        getattr(config, "layers_block_type", getattr(config, "layer_types", None)) or []
+    )
     new_states: dict[str, np.ndarray] = {}
 
     for i in range(config.num_hidden_layers):
@@ -389,8 +389,9 @@ def generate(
     """Greedy autoregressive generation with the hybrid architecture.
 
     Uses a single ONNX model built with ``NemotronHCausalLMModel``.
-    Because Mamba2 layers only support single-token decode, every
-    token (including the prompt) is processed one at a time.
+    This example processes both the prompt and generated output
+    token-by-token (``seq_len=1`` per session run), even if other
+    Mamba2 execution modes may support multi-token processing.
     Tokens are streamed to stdout as they are generated.
     """
     input_ids = tokenize_prompt(tokenizer, prompt, use_chat)
@@ -429,9 +430,7 @@ def generate(
 
     # Generate new tokens, streaming each to stdout
     raw_logits = outputs["logits"][0, -1, :]
-    penalized = _apply_repetition_penalty(
-        raw_logits, all_token_ids, repetition_penalty
-    )
+    penalized = _apply_repetition_penalty(raw_logits, all_token_ids, repetition_penalty)
     next_token_id = int(np.argmax(penalized))
     t0 = time.time()
 
@@ -440,9 +439,7 @@ def generate(
         all_token_ids.append(next_token_id)
 
         # Stream: decode and print the new token immediately
-        token_str = tokenizer.decode(
-            [next_token_id], skip_special_tokens=False
-        )
+        token_str = tokenizer.decode([next_token_id], skip_special_tokens=False)
         # Suppress common end-of-sequence markers from display
         if token_str not in ("<|im_end|>", "</s>", "<|endoftext|>"):
             sys.stdout.write(token_str)
@@ -466,9 +463,7 @@ def generate(
         past_seq_len = total_seq_len
 
         raw_logits = outputs["logits"][0, -1, :]
-        penalized = _apply_repetition_penalty(
-            raw_logits, all_token_ids, repetition_penalty
-        )
+        penalized = _apply_repetition_penalty(raw_logits, all_token_ids, repetition_penalty)
         next_token_id = int(np.argmax(penalized))
 
     # End the streamed output line
@@ -503,16 +498,13 @@ def generate_hf(
 
     print(f"[HF] Loading {model_id} ...")
     torch_dtype = torch.float32 if device == "cpu" else "auto"
-    hf_config = transformers.AutoConfig.from_pretrained(
-        model_id, trust_remote_code=True
-    )
+    hf_config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     # Disable GPT-2 residual scaling init — it's a training-time flag that
     # corrupts out_proj.weight when loading pretrained checkpoints.
     hf_config.rescale_prenorm_residual = False
     model = (
         transformers.AutoModelForCausalLM.from_pretrained(
-            model_id, config=hf_config,
-            torch_dtype=torch_dtype, device_map=None
+            model_id, config=hf_config, torch_dtype=torch_dtype, device_map=None
         )
         .to(device)
         .eval()
@@ -673,7 +665,10 @@ def main():
             print("(chat template enabled)")
         print("-" * 40)
         onnx_output = generate(
-            session, tokenizer, prompt, config,
+            session,
+            tokenizer,
+            prompt,
+            config,
             dtype=DTYPE_MAP[args.dtype],
             max_new_tokens=args.max_new_tokens,
             repetition_penalty=args.repetition_penalty,
@@ -697,7 +692,10 @@ def main():
                 print("(chat template enabled)")
             print("-" * 40)
             onnx_output = generate(
-                session, tokenizer, prompt, config,
+                session,
+                tokenizer,
+                prompt,
+                config,
                 dtype=DTYPE_MAP[args.dtype],
                 max_new_tokens=args.max_new_tokens,
                 repetition_penalty=args.repetition_penalty,
@@ -712,7 +710,9 @@ def main():
         print("=" * 60)
         for prompt, onnx_output in results:
             hf_output = generate_hf(
-                args.model, prompt, tokenizer,
+                args.model,
+                prompt,
+                tokenizer,
                 args.max_new_tokens,
                 device=args.device,
                 use_chat=use_chat,

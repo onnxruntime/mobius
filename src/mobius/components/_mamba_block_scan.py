@@ -30,10 +30,10 @@ class Mamba2BlockScan(Mamba2BlockBase):
     def _scan_body(
         self,
         op: builder.OpBuilder,
-        conv_state_in: ir.Value,
-        ssm_state_in: ir.Value,
-        xbc_in: ir.Value,
-        dt_in: ir.Value,
+        conv_state: ir.Value,
+        ssm_state: ir.Value,
+        xbc_t: ir.Value,
+        dt_t: ir.Value,
     ):
         """Scan body: per-token conv state update + SSM step.
 
@@ -42,15 +42,15 @@ class Mamba2BlockScan(Mamba2BlockBase):
             ssm_state:  (B, num_heads, d_head, d_state)
 
         Scan inputs (per-token, sliced along axis 1):
-            xbc_in: (B, conv_dim) -- projected xBC for this token
-            dt_in:  (B, num_heads) -- time step for this token
+            xbc_t: (B, conv_dim) -- projected xBC for this token
+            dt_t:  (B, num_heads) -- time step for this token
 
         Scan outputs (per-token, stacked along axis 1):
             y_t: (B, num_heads * d_head) -- SSM output before norm
         """
         # --- Conv state update (shift register) ---
-        xbc_3d = op.Unsqueeze(xbc_in, [2])
-        conv_cat = op.Concat(conv_state_in, xbc_3d, axis=2)
+        xbc_3d = op.Unsqueeze(xbc_t, [2])
+        conv_cat = op.Concat(conv_state, xbc_3d, axis=2)
         new_conv_state = op.Slice(
             conv_cat,
             starts=[1],
@@ -78,10 +78,10 @@ class Mamba2BlockScan(Mamba2BlockBase):
         y_flat, new_ssm = self.ssm(
             op,
             hidden_x,
-            dt_in,
+            dt_t,
             b_mat,
             c_mat,
-            ssm_state_in,
+            ssm_state,
         )
 
         return new_conv_state, new_ssm, y_flat
