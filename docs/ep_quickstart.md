@@ -86,7 +86,7 @@ INFO  [EP Trace]   Fold: 374 → 371 nodes (-3)
 ## 3. Query which EPs are available
 
 ```python
-from mobius._execution_providers import ep_registry, get_ep
+from mobius import ep_registry, get_ep
 
 # List all registered EP names
 print(sorted(ep_registry))
@@ -108,7 +108,7 @@ Out-of-tree EPs register via `register_ep()` before calling `build()`:
 
 ```python
 import onnx_ir as ir
-from mobius._execution_providers import EpCapabilities, register_ep
+from mobius import EpCapabilities, register_ep
 
 register_ep(EpCapabilities(
     name="my-ep",

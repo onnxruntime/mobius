@@ -11,6 +11,7 @@ __all__ = [
     "CausalLMTask",
     "DepthAnythingConfig",
     "EncoderConfig",
+    "EpCapabilities",
     "Gemma2Config",
     "Gemma3nConfig",
     "MambaConfig",
@@ -33,8 +34,12 @@ __all__ = [
     "build_from_module",
     "components",
     "ep_capabilities",
+    "ep_registry",
     "get_build_dtype",
+    "get_ep",
     "models",
+    "optimize_model",
+    "register_ep",
     "registry",
     "tasks",
 ]
@@ -67,7 +72,9 @@ from mobius._configs import (
 )
 from mobius._constants import OPSET_VERSION
 from mobius._diffusers_builder import build_diffusers_pipeline
+from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._model_package import ModelPackage
+from mobius._optimizations import optimize_model
 from mobius._registry import (
     ModelRegistration,
     ModelRegistry,

@@ -58,8 +58,7 @@ pkg = build_from_module(
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
 
 > **Note:** Passing an unknown EP name raises `ValueError` during
-> optimization. Use `ep_registry` from `mobius._execution_providers` to
-> query registered EPs.
+> optimization. Use `ep_registry` from `mobius` to query registered EPs.
 
 ---
 
@@ -147,7 +146,7 @@ EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
 Out-of-tree EPs can register at runtime via `register_ep()`:
 
 ```python
-from mobius._execution_providers import EpCapabilities, register_ep
+from mobius import EpCapabilities, register_ep
 
 register_ep(EpCapabilities(
     name="my-ep",
@@ -246,7 +245,7 @@ rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
 (for pattern rewrite rules) or `_eliminate_shape.py` (for op-elimination
 passes). Alternatively, if the constraint can be resolved at graph-build time
 (i.e. within a component's `forward()`), query `ep_capabilities()` from
-`mobius._build_context` and branch on the flag there — no rewrite rule needed.
+`mobius` and branch on the flag there — no rewrite rule needed.
 
 **Step 3:** Write tests:
 - A unit test for each new rewrite rule (graph-level, no ORT required)
@@ -362,7 +361,7 @@ if caps is None:
 The `EpRegistry` also exposes `require()` for direct lookup:
 
 ```python
-from mobius._execution_providers import get_ep
+from mobius import get_ep
 
 get_ep("cuda")   # → EpCapabilities(name="cuda", ...)
 get_ep("rocm")   # → ValueError: Unknown execution provider 'rocm'. ...
@@ -492,7 +491,7 @@ previously exported graph) and want to apply EP-aware passes without going
 through the full `build()` pipeline:
 
 ```python
-from mobius._optimizations import optimize_model
+from mobius import optimize_model
 import onnx_ir as ir
 
 # Apply CUDA optimizations to an already-constructed model
@@ -511,8 +510,7 @@ config)`) and want to control EP capabilities without going through
 `build_from_module()`:
 
 ```python
-from mobius._build_context import build_context
-from mobius._execution_providers import ep_registry
+from mobius import build_context, ep_registry
 
 caps = ep_registry.require("cuda")
 with build_context(caps, ir.DataType.FLOAT16):
@@ -545,7 +543,7 @@ layer.
 ### Reading the active context
 
 ```python
-from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius import ep_capabilities, get_build_dtype
 import onnx_ir as ir
 
 def forward(self, op, ...):
@@ -574,8 +572,7 @@ Advanced users who build graphs outside the standard pipeline can set the
 context explicitly:
 
 ```python
-from mobius._build_context import build_context
-from mobius._execution_providers import ep_registry
+from mobius import build_context, ep_registry
 
 capabilities = ep_registry.require("cuda")
 with build_context(capabilities, ir.DataType.FLOAT16):
@@ -592,8 +589,7 @@ concurrent builds with different EPs never interfere:
 
 ```python
 import asyncio
-from mobius._build_context import build_context
-from mobius._execution_providers import ep_registry
+from mobius import build_context, ep_registry
 
 async def build_cuda():
     caps = ep_registry.require("cuda")
