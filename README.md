@@ -91,6 +91,8 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 [full EP reference](docs/execution_providers.md) for all supported EPs and options.
 
 ### CLI
+
+```sh
 mobius build --model Qwen/Qwen2.5-0.5B output_dir/
 
 # Build without weights (graph skeleton only)
