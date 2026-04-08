@@ -56,6 +56,7 @@ pkg = build_from_module(
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
+| **ONNX-standard** | `"onnx-standard"` | Strict ONNX. Zero custom-domain ops — all `com.microsoft` ops (FusedMatMul, SkipLayerNorm, PackedMHA) are expanded to standard ONNX via InlinePass. No GQA or QKV packing. Use for non-ORT runtimes that do not support ORT extensions. |
 
 > **Note:** Passing an unknown EP name raises `ValueError` during
 > optimization. Use `ep_registry` from `mobius` to query registered EPs.
@@ -99,7 +100,9 @@ Some EPs cannot execute certain ops. These are handled by **lowering rules**
 | No fused RoPE inside GQA | DML | `SeparateRoPE` rewrite: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
 | No packed QKV in GQA | DML | `UnpackQKV` rewrite: packed GQA → 3 separate `MatMul` projections |
 | No `Shape` operator | WebGPU | `EliminateShape` rewrite: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
-| No `SkipLayerNorm` kernel | TRT-RTX | `InlinePass`: expands fused ops using their registered `ir.Function` bodies |
+| No `SkipLayerNorm` kernel | TRT-RTX, onnx-standard | `InlinePass`: expands fused ops using their registered `ir.Function` bodies |
+| No `FusedMatMul` kernel | onnx-standard | `InlinePass`: expands to `Transpose + MatMul` |
+| No `PackedMultiHeadAttention` kernel | onnx-standard | `InlinePass`: expands to block-diagonal attention bias + standard `Attention` |
 
 ---
 
@@ -143,6 +146,11 @@ EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
 EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                supports_skip_layer_norm=False, enable_graph_capture=True,
                provider_options={"enable_cuda_graph": "1"})
+EpCapabilities(name="onnx-standard",
+               gqa_dtypes=frozenset(), qkv_pack_dtypes=frozenset(),
+               supports_fused_rope=False, supports_skip_layer_norm=False,
+               supports_fused_matmul=False,
+               supports_packed_multi_head_attention=False)
 ```
 
 Out-of-tree EPs can register at runtime via `register_ep()`:
@@ -472,6 +480,27 @@ does not — it's for runtimes other than ORT that understand standard ONNX ops
 but not ORT custom ops. The distinction matters for cross-framework export:
 a `"default"` model can be loaded by any ONNX-conformant runtime (TFLite,
 CoreML, ONNX Runtime, etc.), while a `"cpu"` model is ORT-specific.
+
+### Why is `"onnx-standard"` separate from `"default"`?
+
+Both target non-ORT runtimes, but they differ in how they handle `com.microsoft`
+custom ops:
+
+- **`"default"`** keeps all `com.microsoft` ops in the graph. Custom ops carry
+  ONNX function bodies, so a conformant runtime can expand them on demand — but
+  the ops are still present in the graph. Some runtimes reject models that contain
+  unrecognised op domains, even with function bodies.
+
+- **`"onnx-standard"`** proactively expands all `com.microsoft` ops via
+  InlinePass at export time. The output graph contains **zero custom-domain ops**
+  — only standard ONNX opset ops. This is the safest choice for runtimes that
+  strictly refuse any non-standard domain (e.g. WASM runtimes, embedded
+  inference engines, or validation pipelines that fail on unknown domains).
+
+The trade-off: `"onnx-standard"` models may be larger (FusedMatMul expands to
+Transpose + MatMul) and slower (no GQA, no packed KV cache). Use `"default"`
+when the target runtime can silently expand function bodies; use
+`"onnx-standard"` when it cannot.
 
 ---
 

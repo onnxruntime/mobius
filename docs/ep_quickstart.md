@@ -31,6 +31,10 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
 pkg = mobius.build("meta-llama/Llama-3.2-1B",
                    execution_provider="trt-rtx", dtype="f16")
 
+# ONNX-standard — zero custom-domain ops, safe for any conformant ONNX runtime
+pkg = mobius.build("meta-llama/Llama-3.2-1B",
+                   execution_provider="onnx-standard")
+
 pkg.save("output/llama/")
 ```
 
@@ -135,6 +139,7 @@ graph construction or optimization starts — safe-fail by default.
 | Goal | EP | dtype | Notes |
 |---|---|---|---|
 | Portable ONNX (maximum compatibility) | `"default"` | any | No EP-specific vendor fusions (e.g. no GQA/PackQKV) |
+| Strict standard ONNX (no custom ops at all) | `"onnx-standard"` | any | All `com.microsoft` ops expanded via InlinePass; safe for non-ORT runtimes |
 | ORT CPU inference | `"cpu"` | `"f32"` | GQA fusion for FP32 |
 | NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + PackQKV |
 | Windows GPU (DirectX) | `"dml"` | `"f16"` | RoPE lowered separately |
