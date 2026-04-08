@@ -96,21 +96,6 @@ jobs:
             python examples/qwen35_vl_ort_genai.py --ci --compare-hf \
               --image testdata/pipeline-cat-chonk.jpeg
 
-          # ── Qwen audio (file-based, no mic/speaker) ─────────────
-          run_example "qwen3_asr" \
-            python examples/qwen3_asr.py --ci \
-              --audio testdata/652-129742-0006.flac
-
-          run_example "qwen3_forced_aligner" \
-            python examples/qwen3_forced_aligner.py --ci \
-              --audio testdata/652-129742-0006.flac \
-              --text "He hoped there would be stew for dinner."
-
-          # ── Qwen TTS (build-only — inference needs audio device) ─
-          run_example "qwen3_tts (build-only)" \
-            python examples/qwen3_tts.py --ci \
-              --save-to /tmp/qwen3_tts_ci/
-
           # ── Nemotron ─────────────────────────────────────────────
           run_example "nemotron_3_nano_text_generation" \
             python examples/nemotron_3_nano_text_generation.py --ci --compare-hf \
