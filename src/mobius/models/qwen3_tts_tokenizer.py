@@ -708,6 +708,10 @@ class Qwen3TTSTokenizerV2Model(nn.Module):
             if "codebook.initialized" in key:
                 continue
 
+            # Rename encoder transformer MLP weights:
+            # HF uses fc1/fc2; ONNX uses up_proj/down_proj
+            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
             # Pass through everything else
             cleaned[key] = value
 

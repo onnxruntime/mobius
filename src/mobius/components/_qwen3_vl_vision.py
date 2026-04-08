@@ -8,8 +8,7 @@ Provides modules for the Qwen3-VL vision backbone:
 - ``Qwen3VLPatchEmbed``: Conv3d patch tokenisation (temporal + spatial).
 - ``Qwen3VLVisionRotaryEmbedding``: 2D rotary embeddings from grid positions.
 - ``Qwen3VLVisionAttention``: Packed bidirectional MHA with ``cu_seqlens``.
-- ``Qwen3VLVisionMLP``: Single-gate MLP (Linear → activation → Linear).
-- ``Qwen3VLVisionBlock``: Pre-norm transformer block.
+- ``Qwen3VLVisionBlock``: Pre-norm transformer block (uses ``FCMLP``).
 - ``Qwen3VLPatchMerger``: Spatial merge to reduce token count.
 - ``Qwen3VLVisionModel``: Full encoder stack with DeepStack outputs.
 
@@ -29,6 +28,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius.components._common import LayerNorm, Linear
+from mobius.components._mlp import FCMLP
 from mobius.components._scan_utils import (
     compact_scan_output,
     create_body_graph,
@@ -320,20 +320,6 @@ class Qwen3VLVisionAttention(nn.Module):
         return attn_output
 
 
-class Qwen3VLVisionMLP(nn.Module):
-    """Single-gate MLP for the vision encoder."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.linear_fc1 = Linear(hidden_size, intermediate_size, bias=True)
-        self.linear_fc2 = Linear(intermediate_size, hidden_size, bias=True)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        hidden_states = self.linear_fc1(op, hidden_states)
-        hidden_states = op.Gelu(hidden_states, approximate="tanh")
-        return self.linear_fc2(op, hidden_states)
-
-
 class Qwen3VLVisionBlock(nn.Module):
     """Pre-norm vision transformer block with packed attention.
 
@@ -345,7 +331,8 @@ class Qwen3VLVisionBlock(nn.Module):
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-        self.mlp = Qwen3VLVisionMLP(hidden_size, intermediate_size)
+        # GELU (tanh approx) MLP with bias (HF linear_fc1/linear_fc2 → up_proj/down_proj)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu_new", bias=True)
 
     def forward(
         self,

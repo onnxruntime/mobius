@@ -337,7 +337,9 @@ class DeepSeekOCR2VisionEncoderModel(nn.Module):
             new_key = key[len("model.") :]
 
             if new_key.startswith("sam_model."):
-                # SAM weights map directly
+                # SAM weights: lin1/lin2 → up_proj/down_proj
+                new_key = new_key.replace(".mlp.lin1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.lin2.", ".mlp.down_proj.")
                 renamed[new_key] = value
             elif new_key.startswith("qwen2_model."):
                 # HF: qwen2_model.model.model.layers.N.* → qwen2_model.layers.N.*

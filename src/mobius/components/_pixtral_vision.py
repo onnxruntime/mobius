@@ -25,9 +25,9 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius.components._activations import silu
 from mobius.components._common import Linear
 from mobius.components._conv import Conv2dNoBias
+from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
@@ -188,38 +188,6 @@ class PixtralAttention(nn.Module):
         return self.o_proj(op, attn_output)
 
 
-class PixtralGatedMLP(nn.Module):
-    """Gated MLP with SiLU activation for Pixtral vision encoder.
-
-    ``SiLU(gate_proj(x)) * up_proj(x) → down_proj``
-
-    HF weight names: ``feed_forward.{gate,up,down}_proj.weight``
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-        )
-        self.up_proj = Linear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-        )
-        self.down_proj = Linear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
-        gate = silu(op, self.gate_proj(op, x))
-        up = self.up_proj(op, x)
-        return self.down_proj(op, op.Mul(gate, up))
-
-
 class PixtralTransformerLayer(nn.Module):
     """Single Pixtral transformer layer: pre-norm attn + MLP.
 
@@ -242,9 +210,9 @@ class PixtralTransformerLayer(nn.Module):
             head_dim,
         )
         self.ffn_norm = RMSNorm(hidden_size, eps)
-        self.feed_forward = PixtralGatedMLP(
-            hidden_size,
-            intermediate_size,
+        # SiLU gated MLP (no bias, matches HF PixtralAttentionMLP)
+        self.feed_forward = GatedMLP(
+            hidden_size, intermediate_size, activation="silu", bias=False
         )
 
     def forward(

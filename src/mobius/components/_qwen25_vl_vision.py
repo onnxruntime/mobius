@@ -8,8 +8,7 @@ Provides modules for the Qwen2.5-VL vision backbone:
 - ``Qwen25VLPatchEmbed``: Conv3d patch tokenisation (14x14x2, no bias).
 - ``Qwen25VLVisionRotaryEmbedding``: 2D rotary embeddings from grid positions.
 - ``Qwen25VLVisionAttention``: Packed MHA with cu_seqlens boundaries.
-- ``Qwen25VLVisionMLP``: Gate-up-down MLP with SiLU activation.
-- ``Qwen25VLVisionBlock``: Pre-norm transformer block (RMSNorm → Attn → MLP).
+- ``Qwen25VLVisionBlock``: Pre-norm transformer block (uses ``GatedMLP``).
 - ``Qwen25VLPatchMerger``: Spatial merge via RMSNorm → reshape → MLP.
 - ``Qwen25VLVisionModel``: Full encoder with windowed + full attention.
 
@@ -30,6 +29,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius.components._common import Linear
+from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._scan_utils import (
     compact_scan_output,
@@ -342,25 +342,6 @@ class Qwen25VLVisionAttention(nn.Module):
         return op.Where(same_segment, zero, neg_inf)
 
 
-class Qwen25VLVisionMLP(nn.Module):
-    """Gate-up-down MLP with SiLU activation (bias=True).
-
-    Matches HF Qwen2_5_VLMLP: gate_proj * act(up_proj) → down_proj.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=True)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=True)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=True)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        gate = self.gate_proj(op, hidden_states)
-        gate = op.Mul(gate, op.Sigmoid(gate))  # SiLU
-        up = self.up_proj(op, hidden_states)
-        return self.down_proj(op, op.Mul(gate, up))
-
-
 class Qwen25VLVisionBlock(nn.Module):
     """Pre-norm vision transformer block.
 
@@ -372,7 +353,8 @@ class Qwen25VLVisionBlock(nn.Module):
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Qwen25VLVisionAttention(hidden_size, num_heads)
-        self.mlp = Qwen25VLVisionMLP(hidden_size, intermediate_size)
+        # SiLU gated MLP with bias (gate_proj/up_proj/down_proj names match HF)
+        self.mlp = GatedMLP(hidden_size, intermediate_size, activation="silu", bias=True)
 
     def forward(
         self,

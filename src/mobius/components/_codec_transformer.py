@@ -24,6 +24,7 @@ from mobius.components._common import (
     LayerNorm,
     Linear,
 )
+from mobius.components._mlp import FCMLP, GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import (
     BaseRope,
@@ -76,7 +77,8 @@ class CodecDecoderTransformerLayer(nn.Module):
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = _SwiGLUMLP(hidden_size, intermediate_size)
+        # SwiGLU MLP: SiLU(gate_proj(x)) * up_proj(x) → down_proj
+        self.mlp = GatedMLP(hidden_size, intermediate_size, activation="silu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
 
     def forward(
@@ -194,23 +196,6 @@ class _CodecDecoderAttention(nn.Module):
         )
 
         return self.o_proj(op, attn_out)
-
-
-class _SwiGLUMLP(nn.Module):
-    """SwiGLU MLP: SiLU(gate_proj(x)) * up_proj(x) → down_proj."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        gate = self.gate_proj(op, x)
-        up = self.up_proj(op, x)
-        # SiLU(gate) * up
-        activated = op.Mul(op.Mul(gate, op.Sigmoid(gate)), up)
-        return self.down_proj(op, activated)
 
 
 class CodecDecoderTransformerModel(nn.Module):
@@ -341,7 +326,8 @@ class CodecEncoderTransformerLayer(nn.Module):
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
         self.post_attention_layernorm = LayerNorm(hidden_size)
-        self.mlp = _GELUFc1Fc2MLP(hidden_size, intermediate_size)
+        # GELU fc1/fc2 MLP (no bias, matches Mimi encoder)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
 
     def forward(
@@ -374,18 +360,6 @@ class CodecEncoderTransformerLayer(nn.Module):
         hidden_states = op.Add(residual, hidden_states)
 
         return hidden_states
-
-
-class _GELUFc1Fc2MLP(nn.Module):
-    """Simple MLP: fc1 → GELU → fc2."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.fc1 = Linear(hidden_size, intermediate_size, bias=False)
-        self.fc2 = Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        return self.fc2(op, op.Gelu(self.fc1(op, x)))
 
 
 class CodecEncoderTransformerModel(nn.Module):
