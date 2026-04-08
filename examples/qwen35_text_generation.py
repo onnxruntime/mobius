@@ -647,6 +647,8 @@ def main():
                 print("\n✗ Outputs differ!")
                 print(f"  ONNX: {onnx_output!r}")
                 print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
     else:
         # ---------------------------------------------------------------
         # Text-only mode: single ONNX model
@@ -700,6 +702,8 @@ def main():
                 print("\n✗ Outputs differ!")
                 print(f"  ONNX: {onnx_output!r}")
                 print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":

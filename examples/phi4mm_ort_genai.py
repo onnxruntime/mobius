@@ -287,7 +287,7 @@ def generate_multimodal(
     *,
     image_path: str | None = None,
     audio_path: str | None = None,
-) -> None:
+) -> str:
     """Run multimodal generation (text + image + audio).
 
     Uses the ORT GenAI ``PhiMultiModalProcessor`` for image
@@ -333,17 +333,19 @@ def generate_multimodal(
     print("-" * 40)
 
     tokenizer_stream = tokenizer.create_stream()
-    tokens_generated = 0
+    generated_tokens: list[int] = []
     while not generator.is_done():
         generator.generate_next_token()
         token = generator.get_next_tokens()[0]
+        generated_tokens.append(token)
         print(tokenizer_stream.decode(token), end="", flush=True)
-        tokens_generated += 1
-        if tokens_generated >= max_new_tokens:
+        if len(generated_tokens) >= max_new_tokens:
             break
 
     print("\n" + "-" * 40)
+    output = tokenizer.decode(generated_tokens)
     del generator
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +557,7 @@ def main():
     print("=" * 60)
 
     if has_image or has_audio:
-        generate_multimodal(
+        onnx_result = generate_multimodal(
             model_dir,
             prompt,
             args.max_new_tokens,
@@ -563,7 +565,7 @@ def main():
             audio_path=args.audio,
         )
     else:
-        generate_text(model_dir, prompt, args.max_new_tokens)
+        onnx_result = generate_text(model_dir, prompt, args.max_new_tokens)
 
     # ------------------------------------------------------------------
     # Optional HuggingFace comparison
@@ -579,7 +581,14 @@ def main():
             image_path=args.image,
             audio_path=args.audio,
         )
-        print(f"[HF] Output: {hf_result}")
+        print(f"\n[HF]  : {hf_result}")
+        print(f"[ONNX]: {onnx_result}")
+        if onnx_result.strip() == hf_result.strip():
+            print("\n\u2713 Outputs match exactly!")
+        else:
+            print("\n\u2717 Outputs differ!")
+            if args.ci:
+                sys.exit(1)
 
     print("\nDone.")
 

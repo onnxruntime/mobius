@@ -950,6 +950,8 @@ def main():
                 print("✅ Outputs match!")
             else:
                 print("⚠️  Outputs differ (may be due to numerical precision).")
+                if args.ci:
+                    sys.exit(1)
 
     print("\nDone.")
 

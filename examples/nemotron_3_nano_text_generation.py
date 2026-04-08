@@ -578,6 +578,8 @@ def main():
             print("✗ Answers differ:")
             print(f"  ONNX: {answer_onnx!r}")
             print(f"  HF:   {answer_hf!r}")
+            if args.ci:
+                sys.exit(1)
 
 
 if __name__ == "__main__":
