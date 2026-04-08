@@ -473,6 +473,9 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 stripped = stripped[len("model.") :]
 
             if stripped.startswith("visual."):
+                # Qwen3-VL uses linear_fc1/fc2; ONNX uses up_proj/down_proj
+                stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 suffix = stripped[len("language_model.") :]

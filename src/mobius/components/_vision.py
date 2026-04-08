@@ -20,6 +20,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
+from mobius.components._mlp import FCMLP
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -124,9 +125,15 @@ class VisionAttention(nn.Module):
 
 
 class _VisionLinear(nn.Module):
-    """Linear layer with bias for vision encoder."""
+    """Linear layer with Transpose+MatMul using standard ONNX ops.
 
-    def __init__(self, in_features: int, out_features: int):
+    Uses standard ONNX ops (not FusedMatMul) so ONNX symbolic shape
+    inference can propagate output shapes. Always includes bias.
+    The ``bias`` kwarg is accepted for API compatibility with ``FCMLP``'s
+    ``linear_class`` protocol but is always True.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
         self.weight = nn.Parameter([out_features, in_features])
         self.bias = nn.Parameter([out_features])
@@ -135,20 +142,6 @@ class _VisionLinear(nn.Module):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, weight_t)
         return op.Add(result, self.bias)
-
-
-class VisionMLP(nn.Module):
-    """Two-layer MLP with GELU activation for vision encoders."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.fc1 = _VisionLinear(hidden_size, intermediate_size)
-        self.fc2 = _VisionLinear(intermediate_size, hidden_size)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        hidden_states = self.fc1(op, hidden_states)
-        hidden_states = op.Gelu(hidden_states, approximate="tanh")
-        return self.fc2(op, hidden_states)
 
 
 class VisionLayerNorm(nn.Module):
@@ -187,7 +180,14 @@ class VisionEncoderLayer(nn.Module):
         self.layer_norm1 = VisionLayerNorm(hidden_size, eps=norm_eps)
         self.self_attn = VisionAttention(hidden_size, num_heads)
         self.layer_norm2 = VisionLayerNorm(hidden_size, eps=norm_eps)
-        self.mlp = VisionMLP(hidden_size, intermediate_size)
+        # GELU (tanh approx) MLP with bias (HF fc1/fc2 → up_proj/down_proj).
+        # Uses _VisionLinear (Transpose+MatMul) instead of Linear (FusedMatMul)
+        # so ONNX symbolic shape inference can propagate output shapes through
+        # models that feed vision features into dynamic Expand ops (e.g. BLIP-2).
+        self.mlp = FCMLP(
+            hidden_size, intermediate_size, activation="gelu_new", bias=True,
+            linear_class=_VisionLinear,
+        )
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
         residual = hidden_states

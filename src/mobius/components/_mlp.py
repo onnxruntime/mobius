@@ -49,6 +49,45 @@ class MLP(nn.Module):
         return self.down_proj(op, op.Mul(gate, up))
 
 
+class GatedMLP(nn.Module):
+    """Gated MLP: ``act(gate_proj(x)) * up_proj(x) → down_proj``.
+
+    Implements SwiGLU / GeGLU / GateMLP patterns where the hidden
+    dimension is split into a gate branch and an up branch.
+
+    Replaces: ``Qwen25VLVisionMLP``, ``_SwiGLUMLP``, ``PixtralGatedMLP``.
+
+    Args:
+        hidden_size: Input/output dimension.
+        intermediate_size: Hidden dimension of the gate/up branches.
+        activation: Activation applied to the gate branch (default
+            ``"silu"`` for SwiGLU).
+        bias: Whether to include bias in all projection layers.
+        linear_class: Factory callable for creating linear layers.
+            Defaults to ``Linear``.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: str = "silu",
+        bias: bool = False,
+        linear_class: type | None = None,
+    ):
+        super().__init__()
+        if linear_class is None:
+            linear_class = Linear
+        self.gate_proj = linear_class(hidden_size, intermediate_size, bias=bias)
+        self.up_proj = linear_class(hidden_size, intermediate_size, bias=bias)
+        self.down_proj = linear_class(intermediate_size, hidden_size, bias=bias)
+        self.act_fn = get_activation(activation)
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        gate = self.act_fn(op, self.gate_proj(op, x))
+        return self.down_proj(op, op.Mul(gate, self.up_proj(op, x)))
+
+
 class FCMLP(nn.Module):
     """Two-layer fully-connected MLP: ``up_proj → activation → down_proj``.
 
