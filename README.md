@@ -76,13 +76,15 @@ provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more â
 each with the right set of fused kernels and lowering passes applied automatically:
 
 ```python
+from mobius import build
+
 # CUDA: GQA fusion, SkipLayerNorm, PackQKV
-pkg = mobius.build("meta-llama/Llama-3.2-1B",
-                   execution_provider="cuda", dtype="f16")
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="cuda", dtype="f16")
 
 # WebGPU: GQA fusion, Shape ops replaced with portable alternatives
-pkg = mobius.build("meta-llama/Llama-3.2-1B",
-                   execution_provider="webgpu", dtype="f16")
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="webgpu", dtype="f16")
 ```
 
 See the [EP quickstart](docs/ep_quickstart.md) and

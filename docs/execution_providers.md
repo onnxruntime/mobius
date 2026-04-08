@@ -148,6 +148,7 @@ EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
 Out-of-tree EPs can register at runtime via `register_ep()`:
 
 ```python
+import onnx_ir as ir
 from mobius import EpCapabilities, register_ep
 
 register_ep(EpCapabilities(
@@ -514,6 +515,7 @@ config)`) and want to control EP capabilities without going through
 `build_from_module()`:
 
 ```python
+import onnx_ir as ir
 from mobius import build_context, ep_registry
 
 caps = ep_registry.require("cuda")
@@ -533,7 +535,7 @@ integrating mobius into a custom build pipeline.
 | Build from a custom `nn.Module` | `build_from_module()` |
 | Optimize an existing `ir.Model` | `optimize_model()` |
 | Build graphs with explicit EP context | `build_context()` + `task.build()` |
-| Test EP-conditional component logic | `build_context()` (see `_common_test.py`) |
+| Test EP-conditional component logic | `build_context()` (see `src/mobius/_build_context_test.py`) |
 
 ---
 
@@ -576,6 +578,7 @@ Advanced users who build graphs outside the standard pipeline can set the
 context explicitly:
 
 ```python
+import onnx_ir as ir
 from mobius import build_context, ep_registry
 
 capabilities = ep_registry.require("cuda")
@@ -593,6 +596,7 @@ concurrent builds with different EPs never interfere:
 
 ```python
 import asyncio
+import onnx_ir as ir
 from mobius import build_context, ep_registry
 
 async def build_cuda():

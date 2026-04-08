@@ -125,7 +125,8 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
                    execution_provider="my-ep", dtype="f16")
 ```
 
-Unrecognised EP names raise `ValueError` at optimization time — safe-fail by default.
+Unrecognised EP names raise `ValueError` during build-time validation, before
+graph construction or optimization starts — safe-fail by default.
 
 ---
 
@@ -133,7 +134,7 @@ Unrecognised EP names raise `ValueError` at optimization time — safe-fail by d
 
 | Goal | EP | dtype | Notes |
 |---|---|---|---|
-| Portable ONNX (maximum compatibility) | `"default"` | any | No vendor-specific ops |
+| Portable ONNX (maximum compatibility) | `"default"` | any | No EP-specific vendor fusions (e.g. no GQA/PackQKV) |
 | ORT CPU inference | `"cpu"` | `"f32"` | GQA fusion for FP32 |
 | NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + PackQKV |
 | Windows GPU (DirectX) | `"dml"` | `"f16"` | RoPE lowered separately |
