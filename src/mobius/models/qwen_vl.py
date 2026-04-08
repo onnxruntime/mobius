@@ -811,7 +811,7 @@ class Qwen3VLVisionEncoderModel(nn.Module):
         for key, value in state_dict.items():
             stripped = key
             if stripped.startswith("model."):
-                stripped = stripped[len("model."):]
+                stripped = stripped[len("model.") :]
             if stripped.startswith("visual."):
                 # Qwen3-VL uses linear_fc1/fc2; ONNX uses up_proj/down_proj
                 stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")

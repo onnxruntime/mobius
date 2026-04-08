@@ -211,7 +211,9 @@ class PixtralTransformerLayer(nn.Module):
         )
         self.ffn_norm = RMSNorm(hidden_size, eps)
         # SiLU gated MLP (no bias, matches HF PixtralAttentionMLP)
-        self.feed_forward = GatedMLP(hidden_size, intermediate_size, activation="silu", bias=False)
+        self.feed_forward = GatedMLP(
+            hidden_size, intermediate_size, activation="silu", bias=False
+        )
 
     def forward(
         self,

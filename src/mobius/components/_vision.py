@@ -185,7 +185,10 @@ class VisionEncoderLayer(nn.Module):
         # so ONNX symbolic shape inference can propagate output shapes through
         # models that feed vision features into dynamic Expand ops (e.g. BLIP-2).
         self.mlp = FCMLP(
-            hidden_size, intermediate_size, activation="gelu_new", bias=True,
+            hidden_size,
+            intermediate_size,
+            activation="gelu_new",
+            bias=True,
             linear_class=_VisionLinear,
         )
 

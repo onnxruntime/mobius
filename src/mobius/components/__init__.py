@@ -173,7 +173,7 @@ from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock
-from mobius.components._mlp import FCMLP, GatedMLP, MLP
+from mobius.components._mlp import FCMLP, MLP, GatedMLP
 from mobius.components._moe import (
     MoELayer,
     SigmoidTopKGate,

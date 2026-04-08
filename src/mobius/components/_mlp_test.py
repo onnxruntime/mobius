@@ -11,7 +11,7 @@ from mobius._testing import (
     create_test_input,
     make_config,
 )
-from mobius.components._mlp import FCMLP, GatedMLP, MLP
+from mobius.components._mlp import FCMLP, MLP, GatedMLP
 
 
 class TestMLP:
