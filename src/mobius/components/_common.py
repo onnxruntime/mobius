@@ -55,17 +55,7 @@ class Embedding(nn.Module):
         self.padding_idx = padding_idx
 
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
-        result = op.Gather(self.weight, input_ids)
-        # Propagate the compute dtype so downstream ops see the correct type.
-        # nn.Parameter creates float32 initializers by default; if the model is
-        # built with a non-default dtype (e.g. float16) the Gather output must be
-        # annotated with that dtype so ORT's type checker and graph transformers
-        # see a consistent type throughout the graph.  This mirrors how Linear
-        # propagates its input dtype via `result.type = x.type`.
-        dtype = get_build_dtype()
-        if dtype != ir.DataType.FLOAT:
-            result.type = ir.TensorType(dtype)
-        return result
+        return op.Gather(self.weight, input_ids)
 
 
 class LayerNorm(nn.Module):
