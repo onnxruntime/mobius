@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius.components._activations import ACT2FN
 from mobius.components._common import LayerNorm, Linear
+from mobius.components._mlp import FCMLP
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -107,30 +107,6 @@ class QFormerAttention(nn.Module):
         return self.out_proj(op, attn_output)
 
 
-class _QFormerMLP(nn.Module):
-    """Standard MLP for Q-Former layers (not SwiGLU).
-
-    Structure: Linear(hidden→intermediate) → activation → Linear(intermediate→hidden)
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str = "gelu",
-        bias: bool = True,
-    ):
-        super().__init__()
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=bias)
-        self._act_fn = ACT2FN[hidden_act]
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        hidden_states = self.up_proj(op, hidden_states)
-        hidden_states = self._act_fn(op, hidden_states)
-        return self.down_proj(op, hidden_states)
-
-
 class QFormerLayer(nn.Module):
     """Single Q-Former transformer layer.
 
@@ -181,11 +157,11 @@ class QFormerLayer(nn.Module):
         )
         self.cross_attn_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
 
-        # Feed-forward network
-        self.mlp = _QFormerMLP(
+        # Feed-forward network (up_proj/down_proj weight names already match FCMLP)
+        self.mlp = FCMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            hidden_act=hidden_act,
+            activation=hidden_act,
             bias=bias,
         )
         self.mlp_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)

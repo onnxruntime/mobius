@@ -149,6 +149,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     dtype_override = resolve_dtype(args.dtype)
     optimize = args.optimize
     component_filter = args.component
+    execution_provider = args.execution_provider
 
     # Auto-detect diffusers pipelines
     if args.model and not args.config:
@@ -184,7 +185,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
         model_module = module_class(config)
-        pkg = build_from_module(model_module, config, task=task)
+        pkg = build_from_module(
+            model_module, config, task=task, execution_provider=execution_provider
+        )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
@@ -199,6 +202,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
+            execution_provider=execution_provider,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -258,8 +262,25 @@ def _cmd_list(args: argparse.Namespace) -> None:
                 aliases = [k for k, v in DTYPE_MAP.items() if v == dt]
                 print(f"  {' | '.join(aliases):<25} → {dt.name}")
                 seen.add(dt.name)
+    elif resource == "eps":
+        from mobius._execution_providers import ep_registry
+
+        eps = sorted(ep_registry.names())
+        print(f"Registered execution providers ({len(eps)}):\n")
+        for ep_name in eps:
+            caps = ep_registry.require(ep_name)
+            gqa = ", ".join(dt.name for dt in sorted(caps.gqa_dtypes, key=lambda d: d.name))
+            extras = []
+            if not caps.supports_fused_rope:
+                extras.append("no-fused-rope")
+            if not caps.supports_shape:
+                extras.append("no-shape")
+            if not caps.supports_skip_layer_norm:
+                extras.append("no-skip-layer-norm")
+            flags = f"  [{', '.join(extras)}]" if extras else ""
+            print(f"  {ep_name:<12} gqa_dtypes=[{gqa}]{flags}")
     else:
-        print(f"Unknown resource '{resource}'. Use: models, tasks, dtypes")
+        print(f"Unknown resource '{resource}'. Use: models, tasks, dtypes, eps")
 
 
 def _cmd_build_gguf(args: argparse.Namespace) -> None:
@@ -457,6 +478,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Maximum sequence length for static cache buffers. "
         "Only used with --static-cache. Defaults to max_position_embeddings from config.",
     )
+    build_parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware optimizations "
+            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Use 'mobius list eps' to see available EPs. "
+            "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
+        ),
+    )
     build_parser.set_defaults(func=_cmd_build)
 
     # --- build-gguf ---
@@ -495,11 +529,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- list ---
     list_parser = subparsers.add_parser(
-        "list", help="List supported models, tasks, or dtypes."
+        "list", help="List supported models, tasks, dtypes, or EPs."
     )
     list_parser.add_argument(
         "resource",
-        choices=["models", "tasks", "dtypes"],
+        choices=["models", "tasks", "dtypes", "eps"],
         help="What to list.",
     )
     list_parser.set_defaults(func=_cmd_list)

@@ -30,6 +30,7 @@ __all__ = [
     "EncoderLayer",
     "FCMLP",
     "GatedDeltaNet",
+    "GatedMLP",
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
     "GroupNorm",
@@ -46,6 +47,7 @@ __all__ = [
     "LinearMultiModalProjector",
     "LoRALinear",
     "MLP",
+    "Mistral3MultiModalProjector",
     "MLPMultiModalProjector",
     "Mamba2Block",
     "Mamba2Scan",
@@ -54,6 +56,7 @@ __all__ = [
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
+    "PixtralVisionTower",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
     "QFormer",
@@ -64,7 +67,6 @@ __all__ = [
     "Qwen25VLPatchMerger",
     "Qwen25VLVisionAttention",
     "Qwen25VLVisionBlock",
-    "Qwen25VLVisionMLP",
     "Qwen25VLVisionModel",
     "Qwen25VLVisionRotaryEmbedding",
     "Qwen35Attention",
@@ -74,7 +76,6 @@ __all__ = [
     "Qwen3VLPatchMerger",
     "Qwen3VLVisionAttention",
     "Qwen3VLVisionBlock",
-    "Qwen3VLVisionMLP",
     "Qwen3VLVisionModel",
     "Qwen3VLVisionRotaryEmbedding",
     "RMSNorm",
@@ -172,7 +173,7 @@ from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock
-from mobius.components._mlp import FCMLP, MLP
+from mobius.components._mlp import FCMLP, MLP, GatedMLP
 from mobius.components._moe import (
     MoELayer,
     SigmoidTopKGate,
@@ -185,6 +186,10 @@ from mobius.components._multimodal import (
     InputMixer,
     LinearMultiModalProjector,
     MLPMultiModalProjector,
+)
+from mobius.components._pixtral_vision import (
+    Mistral3MultiModalProjector,
+    PixtralVisionTower,
 )
 from mobius.components._qformer import (
     QFormer,
@@ -204,7 +209,6 @@ from mobius.components._qwen3_vl_vision import (
     Qwen3VLPatchMerger,
     Qwen3VLVisionAttention,
     Qwen3VLVisionBlock,
-    Qwen3VLVisionMLP,
     Qwen3VLVisionModel,
     Qwen3VLVisionRotaryEmbedding,
 )
@@ -213,7 +217,6 @@ from mobius.components._qwen25_vl_vision import (
     Qwen25VLPatchMerger,
     Qwen25VLVisionAttention,
     Qwen25VLVisionBlock,
-    Qwen25VLVisionMLP,
     Qwen25VLVisionModel,
     Qwen25VLVisionRotaryEmbedding,
 )

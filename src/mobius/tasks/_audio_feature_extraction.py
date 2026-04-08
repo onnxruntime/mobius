@@ -9,6 +9,8 @@ that take raw waveform input and produce hidden state outputs.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._configs import ArchitectureConfig
@@ -20,6 +22,7 @@ class AudioFeatureExtractionTask(ModelTask):
     """Build ONNX graph for audio feature extraction (encoder-only)."""
 
     name = "audio-feature-extraction"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

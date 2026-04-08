@@ -93,11 +93,14 @@ class _LLaVAVisionEncoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {
-            key: value
-            for key, value in state_dict.items()
-            if key.startswith(("vision_tower.", "multi_modal_projector."))
-        }
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if not key.startswith(("vision_tower.", "multi_modal_projector.")):
+                continue
+            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
+            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
+            renamed[key] = value
         return renamed
 
 
@@ -135,6 +138,42 @@ class _LLaVAEmbeddingModel(nn.Module):
         return vlm_embedding_weights(state_dict)
 
 
+class _PixtralVisionEncoderModel(nn.Module):
+    """Pixtral vision encoder: 2D RoPE vision tower + Mistral3 projector.
+
+    Used for ``mistral3`` / ``pixtral`` model types that use the
+    Pixtral vision architecture instead of CLIP/SigLIP.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        from mobius.components import (
+            Mistral3MultiModalProjector,
+            PixtralVisionTower,
+        )
+
+        self.vision_tower = PixtralVisionTower(config)
+        self.multi_modal_projector = Mistral3MultiModalProjector(
+            vision_hidden_size=config.vision.hidden_size,
+            text_hidden_size=config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+            norm_eps=config.rms_norm_eps,
+        )
+
+    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+        hidden_states, grid_h, grid_w = self.vision_tower(op, pixel_values)
+        return self.multi_modal_projector(op, hidden_states, grid_h, grid_w)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value
+            for key, value in state_dict.items()
+            if key.startswith(("vision_tower.", "multi_modal_projector."))
+        }
+
+
 class LLaVAModel(nn.Module):
     """LLaVA vision-language model (3-model split).
 
@@ -151,7 +190,15 @@ class LLaVAModel(nn.Module):
         super().__init__()
         self.config = config
         self.decoder = _LLaVADecoderModel(config)
-        self.vision_encoder = _LLaVAVisionEncoderModel(config)
+        # Dispatch: use Pixtral vision encoder for pixtral-based models,
+        # CLIP/SigLIP for everything else.
+        self._is_pixtral = (
+            config.vision and getattr(config.vision, "model_type", None) == "pixtral"
+        )
+        if self._is_pixtral:
+            self.vision_encoder = _PixtralVisionEncoderModel(config)
+        else:
+            self.vision_encoder = _LLaVAVisionEncoderModel(config)
         self.embedding = _LLaVAEmbeddingModel(config)
 
     def forward(self, op: builder.OpBuilder, **kwargs):
@@ -163,9 +210,50 @@ class LLaVAModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # Mistral-3 / Pixtral models prefix decoder weights with
+        # ``language_model.`` — strip it so the decoder/embedding
+        # sub-models can find their weights.
+        if self._is_pixtral:
+            return _preprocess_pixtral_weights(state_dict, self.config.tie_word_embeddings)
+        # Default LLaVA: only handle weight tying
         if self.config.tie_word_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
         return state_dict
+
+
+def _preprocess_pixtral_weights(
+    state_dict: dict[str, torch.Tensor],
+    tie_word_embeddings: bool,
+) -> dict[str, torch.Tensor]:
+    """Remap HF Mistral-3/Pixtral weight names to ONNX sub-model names.
+
+    HF wraps everything under ``model.`` (Mistral3Model) and prefixes
+    decoder weights with ``language_model.``.  This function strips
+    the ``model.`` prefix, adds ``vision_encoder.`` for vision/projector
+    weights, and strips ``language_model.`` for decoder/embedding.
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        # Strip outer model. prefix (Mistral3ForConditionalGeneration.model)
+        k = key[len("model.") :] if key.startswith("model.") else key
+
+        if k.startswith(("vision_tower.", "multi_modal_projector.")):
+            renamed[f"vision_encoder.{k}"] = value
+        elif k.startswith("language_model.model.embed_tokens."):
+            suffix = k[len("language_model.model.") :]
+            renamed[f"decoder.model.{suffix}"] = value
+            renamed[f"embedding.{suffix}"] = value
+            if tie_word_embeddings:
+                renamed["decoder.lm_head.weight"] = value
+        elif k.startswith("language_model.lm_head."):
+            suffix = k[len("language_model.") :]
+            renamed[f"decoder.{suffix}"] = value
+        elif k.startswith("language_model."):
+            suffix = k[len("language_model.") :]
+            renamed[f"decoder.{suffix}"] = value
+        elif k == "lm_head.weight" or k.startswith("lm_head."):
+            renamed[f"decoder.{k}"] = value
+    return renamed
