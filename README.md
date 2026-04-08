@@ -71,10 +71,26 @@ pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```
 
-### CLI
+**EP-aware optimization** generates graphs tuned for a specific runtime execution
+provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more —
+each with the right set of fused kernels and lowering passes applied automatically:
 
-```bash
-# Build from a HuggingFace model ID
+```python
+from mobius import build
+
+# CUDA: GQA fusion, SkipLayerNorm, PackQKV
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="cuda", dtype="f16")
+
+# WebGPU: GQA fusion, Shape ops replaced with portable alternatives
+pkg = build("meta-llama/Llama-3.2-1B",
+            execution_provider="webgpu", dtype="f16")
+```
+
+See the [EP quickstart](docs/ep_quickstart.md) and
+[full EP reference](docs/execution_providers.md) for all supported EPs and options.
+
+### CLI
 mobius build --model Qwen/Qwen2.5-0.5B output_dir/
 
 # Build without weights (graph skeleton only)

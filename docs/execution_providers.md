@@ -58,8 +58,7 @@ pkg = build_from_module(
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
 
 > **Note:** Passing an unknown EP name raises `ValueError` during
-> optimization. Use `ep_registry` from `mobius._execution_providers` to
-> query registered EPs.
+> optimization. Use `ep_registry` from `mobius` to query registered EPs.
 
 ---
 
@@ -114,15 +113,17 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 @dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
-    gqa_dtypes: frozenset[ir.DataType]          # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]     # dtypes where PackQKV fusion fires
-    supports_fused_rope: bool = True           # False → SeparateRoPE + UnpackQKV
-    supports_shape: bool = True                # False → EliminateShape lowering
-    supports_skip_layer_norm: bool = True      # False → InlinePass expansion
-    supports_fused_moe: bool = True            # False → decompose fused MoE ops
-    default_int4_accuracy_level: int = 0       # 0 = no INT4; 4 = INT4 w/ accuracy
-    provider_options: dict[str, str]           # Default ORT GenAI provider options
-    enable_graph_capture: bool = False          # GPU graph capture default
+    gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
+    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
+    supports_shape: bool = True                      # False → EliminateShape lowering
+    supports_skip_layer_norm: bool = True            # False → InlinePass expansion
+    supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
+    supports_fused_moe: bool = True                  # False → decompose fused MoE ops
+    supports_packed_multi_head_attention: bool = False  # True → PackedMultiHeadAttention kernel
+    default_int4_accuracy_level: int = 0             # 0 = highest accuracy; 4 = fastest
+    provider_options: dict[str, str]                 # Default ORT GenAI provider options
+    enable_graph_capture: bool = False               # GPU graph capture default
 ```
 
 ### Current registry
@@ -147,7 +148,8 @@ EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
 Out-of-tree EPs can register at runtime via `register_ep()`:
 
 ```python
-from mobius._execution_providers import EpCapabilities, register_ep
+import onnx_ir as ir
+from mobius import EpCapabilities, register_ep
 
 register_ep(EpCapabilities(
     name="my-ep",
@@ -243,7 +245,10 @@ is needed — the `EpRegistry` validates EP names at optimization time.
 **Step 2:** If the EP has hard constraints not expressible via existing
 `EpCapabilities` fields, add a new boolean field and a corresponding lowering
 rule in `src/mobius/rewrite_rules/`. Follow the pattern in `_separate_rope.py`
-(for pattern rewrite rules) or `_eliminate_shape.py` (for shape-related passes).
+(for pattern rewrite rules) or `_eliminate_shape.py` (for op-elimination
+passes). Alternatively, if the constraint can be resolved at graph-build time
+(i.e. within a component's `forward()`), query `ep_capabilities()` from
+`mobius` and branch on the flag there — no rewrite rule needed.
 
 **Step 3:** Write tests:
 - A unit test for each new rewrite rule (graph-level, no ORT required)
@@ -294,8 +299,9 @@ Sample output:
 INFO mobius._optimizations: [EP Trace] Target: cuda, dtype: FLOAT16, role: decoder
 INFO mobius._optimizations: [EP Trace] Stage 1: Cleanup (9 passes)
 INFO mobius._optimizations: [EP Trace]   Cleanup: 512 → 486 nodes (-26)
-INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (4 rule groups)
+INFO mobius._optimizations: [EP Trace] Stage 2: Fusion (5 rule groups)
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 : +28 GroupQueryAttention, -28 Attention
+INFO mobius._optimizations: [EP Trace]   PackQKV                   : +28 Concat, -56 FusedMatMul
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  : +28 SkipSimplifiedLayerNorm, -56 Add, -28 RMSNormalization
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             : no matches (0 nodes affected)
 INFO mobius._optimizations: [EP Trace]   GeluFusion                : no matches (0 nodes affected)
@@ -308,6 +314,7 @@ INFO mobius._optimizations: [EP Trace] Summary:
 INFO mobius._optimizations: [EP Trace]   Rule                      | Matched | +Nodes | -Nodes
 INFO mobius._optimizations: [EP Trace]   -------------------------+--------+-------+-------
 INFO mobius._optimizations: [EP Trace]   GQAFusion                 |      28 |     28 |     28
+INFO mobius._optimizations: [EP Trace]   PackQKV                   |      56 |     28 |     56
 INFO mobius._optimizations: [EP Trace]   SkipNorm                  |      28 |     28 |     84
 INFO mobius._optimizations: [EP Trace]   SkipLayerNorm             |       0 |      0 |      0
 INFO mobius._optimizations: [EP Trace]   GeluFusion                |       0 |      0 |      0
@@ -359,7 +366,7 @@ if caps is None:
 The `EpRegistry` also exposes `require()` for direct lookup:
 
 ```python
-from mobius._execution_providers import get_ep
+from mobius import get_ep
 
 get_ep("cuda")   # → EpCapabilities(name="cuda", ...)
 get_ep("rocm")   # → ValueError: Unknown execution provider 'rocm'. ...
@@ -468,6 +475,70 @@ CoreML, ONNX Runtime, etc.), while a `"cpu"` model is ORT-specific.
 
 ---
 
+## When to Use `build_context()` vs `optimize_model()` Directly
+
+### The normal path: `build()` / `build_from_module()`
+
+For most users, `build()` and `build_from_module()` are the only entry points
+you need. They automatically:
+
+1. Set the build context (`build_context()`) for the duration of graph
+   construction so components can query EP capabilities.
+2. Call `optimize_model()` on every model in the package after the graph
+   is built.
+
+You do not need to call `build_context()` or `optimize_model()` yourself.
+
+### When to call `optimize_model()` directly
+
+If you have an existing `ir.Model` (e.g. from a custom pipeline or a
+previously exported graph) and want to apply EP-aware passes without going
+through the full `build()` pipeline:
+
+```python
+from mobius import optimize_model
+import onnx_ir as ir
+
+# Apply CUDA optimizations to an already-constructed model
+optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16)
+```
+
+Note: `optimize_model()` runs **outside** any `build_context()`. This means
+that any component that calls `ep_capabilities()` during graph construction
+will not see these EP settings unless the graph was built inside a
+`build_context()` first.
+
+### When to call `build_context()` directly
+
+If you are building a graph using task-level APIs (e.g. `task.build(module,
+config)`) and want to control EP capabilities without going through
+`build_from_module()`:
+
+```python
+import onnx_ir as ir
+from mobius import build_context, ep_registry
+
+caps = ep_registry.require("cuda")
+with build_context(caps, ir.DataType.FLOAT16):
+    pkg = task.build(module, config)  # components see CUDA capabilities here
+```
+
+This is the correct pattern for testing EP-conditional component behaviour,
+building multiple graphs with different EPs in the same process, or
+integrating mobius into a custom build pipeline.
+
+### Summary
+
+| Use case | API |
+|---|---|
+| Build from a HuggingFace model ID | `build()` |
+| Build from a custom `nn.Module` | `build_from_module()` |
+| Optimize an existing `ir.Model` | `optimize_model()` |
+| Build graphs with explicit EP context | `build_context()` + `task.build()` |
+| Test EP-conditional component logic | `build_context()` (see `src/mobius/_build_context_test.py`) |
+
+---
+
 ## Build-Time EP Queries
 
 During graph construction, components can query the active EP capabilities
@@ -478,7 +549,7 @@ layer.
 ### Reading the active context
 
 ```python
-from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius import ep_capabilities, get_build_dtype
 import onnx_ir as ir
 
 def forward(self, op, ...):
@@ -507,8 +578,8 @@ Advanced users who build graphs outside the standard pipeline can set the
 context explicitly:
 
 ```python
-from mobius._build_context import build_context
-from mobius._execution_providers import ep_registry
+import onnx_ir as ir
+from mobius import build_context, ep_registry
 
 capabilities = ep_registry.require("cuda")
 with build_context(capabilities, ir.DataType.FLOAT16):
@@ -525,8 +596,8 @@ concurrent builds with different EPs never interfere:
 
 ```python
 import asyncio
-from mobius._build_context import build_context
-from mobius._execution_providers import ep_registry
+import onnx_ir as ir
+from mobius import build_context, ep_registry
 
 async def build_cuda():
     caps = ep_registry.require("cuda")
