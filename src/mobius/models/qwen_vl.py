@@ -10,6 +10,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import vlm_decoder_weights
 from mobius.components import (
     InputMixer,
     Qwen3VLVisionModel,
@@ -38,13 +39,7 @@ class _QwenVLTextMixin:
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        for key in list(state_dict.keys()):
-            if "language_model." in key:
-                new_key = key.replace("language_model.", "")
-                state_dict[new_key] = state_dict.pop(key)
-            elif "visual." in key:
-                state_dict.pop(key)
-        return super().preprocess_weights(state_dict)
+        return super().preprocess_weights(vlm_decoder_weights(state_dict))
 
 
 class Qwen25VLTextModel(_QwenVLTextMixin, CausalLMModel):
