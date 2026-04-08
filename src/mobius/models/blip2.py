@@ -96,20 +96,21 @@ class _Blip2VisionEncoderModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        qformer_hidden = config.qformer_hidden_size or 768
+        qf = config.qformer
+        assert qf is not None, "BLIP-2 requires config.qformer"
         # ViT vision encoder
         self.vision_model = VisionModel(config)
         # Q-Former: learned queries cross-attend to visual features
         self.qformer = QFormer(
-            num_query_tokens=config.num_query_tokens or 32,
-            num_layers=config.qformer_num_hidden_layers or 12,
-            hidden_size=qformer_hidden,
-            num_attention_heads=config.qformer_num_attention_heads or 12,
-            intermediate_size=config.qformer_intermediate_size or 3072,
+            num_query_tokens=qf.num_query_tokens,
+            num_layers=qf.num_hidden_layers,
+            hidden_size=qf.hidden_size,
+            num_attention_heads=qf.num_attention_heads,
+            intermediate_size=qf.intermediate_size,
             encoder_hidden_size=config.vision.hidden_size,
         )
         # Project Q-Former output to text embedding dimension
-        self.language_projection = Linear(qformer_hidden, config.hidden_size)
+        self.language_projection = Linear(qf.hidden_size, config.hidden_size)
 
     def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
         # ViT: [batch, C, H, W] → [batch, num_patches, vision_hidden_size]

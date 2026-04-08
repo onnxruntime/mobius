@@ -114,10 +114,9 @@ class _GptOssMoELayer(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
+        assert config.moe is not None
+        self.num_experts = config.moe.num_local_experts
+        self.top_k = config.moe.num_experts_per_tok
         self.gate = _GptOssGate(config.hidden_size, self.num_experts, self.top_k)
         self.experts = nn.ModuleList(
             [

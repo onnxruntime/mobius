@@ -194,18 +194,18 @@ class MoELayer(nn.Module):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
+        assert config.moe is not None
+        moe = config.moe
+        self.num_experts = moe.num_local_experts
+        self.top_k = moe.num_experts_per_tok
         if gate is not None:
             self.gate = gate
         else:
             self.gate = TopKGate(config.hidden_size, self.num_experts, self.top_k)
         # Use moe_intermediate_size for experts when specified (Qwen2-MoE, Qwen3-MoE).
         expert_config = (
-            dataclasses.replace(config, intermediate_size=config.moe_intermediate_size)
-            if config.moe_intermediate_size is not None
+            dataclasses.replace(config, intermediate_size=moe.moe_intermediate_size)
+            if moe.moe_intermediate_size is not None
             else config
         )
         self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])

@@ -83,8 +83,9 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Routed MoE: top-k expert selection with softmax weighting
+        assert config.moe is not None
         gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size, config.moe.num_local_experts, config.moe.num_experts_per_tok
         )
         self.block_sparse_moe = MoELayer(config, gate=gate)
 
@@ -155,8 +156,9 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Routed MoE: top-k expert selection with softmax weighting
+        assert config.moe is not None
         gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size, config.moe.num_local_experts, config.moe.num_experts_per_tok
         )
         self.block_sparse_moe = MoELayer(config, gate=gate)
 

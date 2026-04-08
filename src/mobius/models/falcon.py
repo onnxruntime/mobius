@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from onnxscript import nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import AlibiConfig, ArchitectureConfig
 from mobius._weight_utils import split_fused_qkv
 from mobius.components import (
     FCMLP,
@@ -310,14 +310,16 @@ class _FalconTextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self._alibi = config.alibi
+        self._alibi = config.alibi_config is not None
         self._dtype = config.dtype
         self._num_heads = config.num_attention_heads
 
         self.word_embeddings = Embedding(config.vocab_size, config.hidden_size)
 
-        parallel_attn = config.parallel_attn
-        dual_ln = config.dual_ln
+        parallel_attn = (
+            config.alibi_config.parallel_attn if config.alibi_config is not None else False
+        )
+        dual_ln = config.alibi_config.dual_ln if config.alibi_config is not None else False
 
         self.h = nn.ModuleList()
         for _ in range(config.num_hidden_layers):
@@ -609,7 +611,7 @@ class BloomCausalLMModel(FalconCausalLMModel):
         # Bloom always uses ALiBi positional encoding — enforce it regardless
         # of whether the caller set alibi=True in the config, since HF's
         # BloomConfig has no alibi field and ArchitectureConfig defaults to False.
-        config = dataclasses.replace(config, alibi=True)
+        config = dataclasses.replace(config, alibi_config=AlibiConfig())
         super().__init__(config)
         self.transformer = _BloomTextModel(config)
 
@@ -662,7 +664,7 @@ class MPTCausalLMModel(FalconCausalLMModel):
         # MPT uses ALiBi (no RoPE) and sequential pre-norm (standard transformer):
         # norm_1 → attn → residual → norm_2 → mlp → residual
         # parallel_attn=False enables sequential computation with separate LNs.
-        config = dataclasses.replace(config, alibi=True, parallel_attn=False)
+        config = dataclasses.replace(config, alibi_config=AlibiConfig(parallel_attn=False))
         super().__init__(config)
 
     def preprocess_weights(

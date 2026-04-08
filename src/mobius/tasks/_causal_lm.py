@@ -148,8 +148,14 @@ class CausalLMTask(ModelTask):
             # kv_num_heads=num_attention_heads, so the KV cache must use
             # num_attention_heads (not num_key_value_heads).
             use_mla = (
-                config.qk_nope_head_dim is not None and config.qk_nope_head_dim > 0
-            ) or (config.qk_rope_head_dim is not None and config.qk_rope_head_dim > 0)
+                config.mla is not None
+                and config.mla.qk_nope_head_dim is not None
+                and config.mla.qk_nope_head_dim > 0
+            ) or (
+                config.mla is not None
+                and config.mla.qk_rope_head_dim is not None
+                and config.mla.qk_rope_head_dim > 0
+            )
             num_kv_cache_heads = (
                 config.num_attention_heads if use_mla else config.num_key_value_heads
             )
@@ -161,9 +167,14 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 past_seq_len,
-                key_head_dim=((config.qk_nope_head_dim or 0) + (config.qk_rope_head_dim or 0))
+                key_head_dim=(
+                    ((config.mla.qk_nope_head_dim or 0) + (config.mla.qk_rope_head_dim or 0))
+                    if config.mla is not None
+                    else 0
+                )
                 or None,
-                value_head_dim=config.v_head_dim or None,
+                value_head_dim=(config.mla.v_head_dim if config.mla is not None else None)
+                or None,
             )
 
         graph_inputs.extend(cache_inputs)

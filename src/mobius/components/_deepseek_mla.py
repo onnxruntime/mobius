@@ -46,13 +46,15 @@ class DeepSeekMLA(nn.Module):
         scale: float | None = None,
     ):
         super().__init__()
+        mla = config.mla
+        assert mla is not None, "DeepSeekMLA requires config.mla to be set"
         self.num_heads = config.num_attention_heads
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
+        self.q_lora_rank = mla.q_lora_rank
+        self.kv_lora_rank = mla.kv_lora_rank
+        self.qk_nope_head_dim = mla.qk_nope_head_dim
+        self.qk_rope_head_dim = mla.qk_rope_head_dim
+        self.qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
+        self.v_head_dim = mla.v_head_dim
 
         # Q path: LoRA compression → norm → decompression
         if self.q_lora_rank is not None and self.q_lora_rank > 0:

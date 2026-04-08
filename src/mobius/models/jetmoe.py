@@ -84,14 +84,13 @@ class _JetMoeAttention(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
+        assert config.moe is not None
 
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
         self.num_kv_heads = config.num_key_value_heads
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
+        self.top_k = config.moe.num_experts_per_tok
+        self.num_experts = config.moe.num_local_experts
         # num_q_heads = top_k * num_kv_heads (all Q heads across all slots)
         self.num_q_heads = config.num_attention_heads
         # q_size is the Q/K/V projection size per-expert = num_kv_heads * head_dim
@@ -433,9 +432,8 @@ class JetMoeCausalLMModel(CausalLMModel):
         - ``mlp.output_linear.weight`` [n, h, inter] → per-expert down proj
         - ``mlp.router.layer.weight`` → ``mlp.moe.gate.weight``
         """
-        assert self.config.num_local_experts is not None
-        assert self.config.num_experts_per_tok is not None
-        n_experts = self.config.num_local_experts
+        assert self.config.moe is not None
+        n_experts = self.config.moe.num_local_experts
 
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():

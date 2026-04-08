@@ -53,12 +53,14 @@ class _LongcatFlashMLA(nn.Module):
     def __init__(self, config: ArchitectureConfig, layer_idx: int = 0):
         super().__init__()
         self.num_heads = config.num_attention_heads
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
+        mla = config.mla
+        assert mla is not None, "LongcatFlashMLA requires config.mla to be set"
+        self.q_lora_rank = mla.q_lora_rank
+        self.kv_lora_rank = mla.kv_lora_rank
+        self.qk_nope_head_dim = mla.qk_nope_head_dim
+        self.qk_rope_head_dim = mla.qk_rope_head_dim
+        self.qk_head_dim = mla.qk_nope_head_dim + mla.qk_rope_head_dim
+        self.v_head_dim = mla.v_head_dim
 
         # Q path: LoRA compression → norm → decompression
         self.q_a_proj = Linear(config.hidden_size, self.q_lora_rank, bias=False)
@@ -191,11 +193,11 @@ class _LongcatFlashRouter(nn.Module):
 
     def __init__(self, config: ArchitectureConfig, total_experts: int):
         super().__init__()
-        assert config.num_experts_per_tok is not None
+        assert config.moe is not None
         self.classifier = Linear(config.hidden_size, total_experts, bias=False)
         self.e_score_correction_bias = nn.Parameter([total_experts])
-        self.top_k = config.num_experts_per_tok
-        self.routed_scaling_factor = config.routed_scaling_factor
+        self.top_k = config.moe.num_experts_per_tok
+        self.routed_scaling_factor = config.moe.routed_scaling_factor
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
         # Compute routing logits: (B*S, total_experts)
@@ -230,15 +232,15 @@ class _LongcatFlashMoE(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.moe_intermediate_size is not None
-        self.n_routed_experts = config.num_local_experts
+        assert config.moe is not None
+        assert config.moe.moe_intermediate_size is not None
+        self.n_routed_experts = config.moe.num_local_experts
         self.zero_expert_num = getattr(config, "zero_expert_num", 0)
         total_experts = self.n_routed_experts + self.zero_expert_num
         self.router = _LongcatFlashRouter(config, total_experts)
         # Only real experts have projection weights
         expert_config = dataclasses.replace(
-            config, intermediate_size=config.moe_intermediate_size
+            config, intermediate_size=config.moe.moe_intermediate_size
         )
         self.experts = nn.ModuleList(
             [MLP(expert_config) for _ in range(self.n_routed_experts)]
@@ -377,8 +379,12 @@ class LongcatFlashTextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # RoPE applies only to qk_rope_head_dim; use modified head_dim for cos/sin cache
-        if config.qk_rope_head_dim is not None and config.qk_rope_head_dim > 0:
-            rope_config = dataclasses.replace(config, head_dim=config.qk_rope_head_dim)
+        if (
+            config.mla is not None
+            and config.mla.qk_rope_head_dim is not None
+            and config.mla.qk_rope_head_dim > 0
+        ):
+            rope_config = dataclasses.replace(config, head_dim=config.mla.qk_rope_head_dim)
         else:
             rope_config = config
         self.rotary_emb = initialize_rope(rope_config)
@@ -459,7 +465,9 @@ class LongcatFlashCausalLMModel(CausalLMModel):
               mlp.experts.{i}.down_proj.weight
         """
         renamed: dict[str, torch.Tensor] = {}
-        n_routed = self.config.num_local_experts  # real experts with projection weights
+        n_routed = (
+            self.config.moe.num_local_experts if self.config.moe is not None else 0
+        )  # real experts with projection weights
 
         for key, value in state_dict.items():
             # Split fused gate_up_proj into per-expert gate/up weights

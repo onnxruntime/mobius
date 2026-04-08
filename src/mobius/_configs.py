@@ -608,6 +608,80 @@ class QuantizationConfig:
 
 
 @dataclasses.dataclass
+class MoEConfig:
+    """Parameters for Mixture-of-Experts routing and gating.
+
+    Present only when a model uses MoE layers (``num_local_experts > 0``).
+    Used by DeepSeek, Qwen MoE, Mixtral, Jamba, GraniteMoeHybrid, and others.
+    """
+
+    # Routing topology
+    num_local_experts: int = 0
+    num_experts_per_tok: int = 1
+    first_k_dense_replace: int = 0
+
+    # Expert sizing
+    moe_intermediate_size: int | None = None
+    shared_expert_intermediate_size: int | None = None
+    n_shared_experts: int | None = None
+
+    # Routing algorithm
+    scoring_func: str = "softmax"
+    topk_method: str = "greedy"
+    n_group: int = 1
+    topk_group: int = 1
+    norm_topk_prob: bool = True
+    routed_scaling_factor: float = 1.0
+
+    # Normalization
+    post_feedforward_norm: bool = False
+
+
+@dataclasses.dataclass
+class MLAConfig:
+    """Multi-head Latent Attention (MLA) parameters for DeepSeek V2/V3/R1.
+
+    MLA replaces the standard KV cache with a low-rank compressed KV projection.
+    All five fields must be set together; absence of this sub-config means standard
+    attention is used instead.
+    """
+
+    q_lora_rank: int | None = None
+    kv_lora_rank: int | None = None
+    qk_nope_head_dim: int | None = None
+    qk_rope_head_dim: int | None = None
+    v_head_dim: int | None = None
+
+
+@dataclasses.dataclass
+class QFormerConfig:
+    """Q-Former cross-attention bridge for vision-language models.
+
+    Bridges a frozen image encoder with a frozen LLM using learned query tokens.
+    Used by BLIP-2 and InstructBLIP architectures.
+    """
+
+    num_query_tokens: int = 32
+    hidden_size: int = 768
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 12
+    intermediate_size: int = 3072
+
+
+@dataclasses.dataclass
+class AlibiConfig:
+    """ALiBi attention bias and Falcon-specific layout parameters.
+
+    ALiBi replaces positional embeddings with attention score biases that grow
+    linearly with distance.  Presence of this sub-config implies ``alibi=True``.
+    Used by Falcon and Bloom model families.
+    """
+
+    parallel_attn: bool = False
+    dual_ln: bool = False
+
+
+@dataclasses.dataclass
 class BaseModelConfig:
     """Base configuration shared by all model architectures.
 
@@ -630,6 +704,75 @@ class BaseModelConfig:
 
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
+
+
+def _extract_moe_config(config) -> MoEConfig | None:
+    """Build MoEConfig from a HuggingFace config, or None if not an MoE model."""
+    n_experts = (
+        getattr(config, "num_local_experts", None)
+        or getattr(config, "num_experts", None)
+        or getattr(config, "n_routed_experts", None)
+    )
+    if not n_experts:
+        return None
+    return MoEConfig(
+        num_local_experts=n_experts,
+        num_experts_per_tok=getattr(config, "num_experts_per_tok", 1),
+        moe_intermediate_size=getattr(config, "moe_intermediate_size", None),
+        shared_expert_intermediate_size=getattr(
+            config, "shared_expert_intermediate_size", None
+        ),
+        n_shared_experts=getattr(config, "n_shared_experts", None),
+        norm_topk_prob=getattr(config, "norm_topk_prob", True),
+        post_feedforward_norm=getattr(config, "post_feedforward_norm", False),
+        n_group=getattr(config, "n_group", 1),
+        topk_group=getattr(config, "topk_group", 1),
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+        scoring_func=getattr(config, "scoring_func", "softmax"),
+        topk_method=getattr(config, "topk_method", "greedy"),
+        first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
+    )
+
+
+def _extract_mla_config(config) -> MLAConfig | None:
+    """Build MLAConfig from a HuggingFace config, or None if not an MLA model."""
+    nope_dim = getattr(config, "qk_nope_head_dim", None)
+    rope_dim = getattr(config, "qk_rope_head_dim", None)
+    if not nope_dim and not rope_dim:
+        return None
+    return MLAConfig(
+        q_lora_rank=getattr(config, "q_lora_rank", None),
+        kv_lora_rank=getattr(config, "kv_lora_rank", None),
+        qk_nope_head_dim=nope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=getattr(config, "v_head_dim", None),
+    )
+
+
+def _extract_qformer_config(config) -> QFormerConfig | None:
+    """Build QFormerConfig from a HuggingFace config, or None if no Q-Former."""
+    qformer = getattr(config, "qformer_config", None)
+    if qformer is None:
+        return None
+    qc = qformer if not isinstance(qformer, dict) else type("QC", (), qformer)()
+    return QFormerConfig(
+        num_query_tokens=getattr(config, "num_query_tokens", 32),
+        hidden_size=getattr(qc, "hidden_size", 768),
+        num_hidden_layers=getattr(qc, "num_hidden_layers", 12),
+        num_attention_heads=getattr(qc, "num_attention_heads", 12),
+        intermediate_size=getattr(qc, "intermediate_size", 3072),
+    )
+
+
+def _extract_alibi_config(config, model_type: str) -> AlibiConfig | None:
+    """Build AlibiConfig for Falcon/Bloom models, or None for all others."""
+    is_alibi = getattr(config, "alibi", False) or model_type in ("bloom",)
+    if not is_alibi:
+        return None
+    return AlibiConfig(
+        parallel_attn=getattr(config, "parallel_attn", False),
+        dual_ln=getattr(config, "dual_ln", False),
+    )
 
 
 @dataclasses.dataclass
@@ -674,29 +817,6 @@ class ArchitectureConfig(BaseModelConfig):
     is_gated_act: bool = False
     scale_decoder_outputs: bool | None = None
 
-    # MoE config
-    num_local_experts: int | None = None
-    num_experts_per_tok: int | None = None
-    moe_intermediate_size: int | None = None
-    shared_expert_intermediate_size: int | None = None
-    norm_topk_prob: bool = True
-    # When True, the decoder layer uses post-norm style (FlexOLMo): norms are applied
-    # to sub-layer outputs instead of inputs, with an extra post_feedforward_layernorm.
-    post_feedforward_norm: bool = False
-    n_group: int = 1
-    topk_group: int = 1
-    routed_scaling_factor: float = 1.0
-    scoring_func: str = "softmax"
-    topk_method: str = "greedy"
-    first_k_dense_replace: int = 0
-    n_shared_experts: int | None = None
-
-    # Multi-head Latent Attention (MLA) config — DeepSeek-V2/V3
-    q_lora_rank: int | None = None
-    kv_lora_rank: int | None = None
-    qk_nope_head_dim: int | None = None
-    qk_rope_head_dim: int | None = None
-    v_head_dim: int | None = None
     rope_interleave: bool = False
 
     # Vision shared fields (accessed as top-level config.X by tasks)
@@ -707,13 +827,6 @@ class ArchitectureConfig(BaseModelConfig):
     deepstack_visual_indexes: list[int] | None = None
     fullatt_block_indexes: list[int] | None = None
     window_size: int = 112
-
-    # Q-Former config (for BLIP-2 style models)
-    num_query_tokens: int | None = None
-    qformer_hidden_size: int | None = None
-    qformer_num_hidden_layers: int | None = None
-    qformer_num_attention_heads: int | None = None
-    qformer_intermediate_size: int | None = None
 
     # MRoPE config (for multimodal position encoding)
     mrope_section: list[int] | None = None
@@ -741,11 +854,6 @@ class ArchitectureConfig(BaseModelConfig):
     # Phi4MM image embedding config
     image_crop_size: int | None = None
 
-    # Falcon config
-    alibi: bool = False
-    parallel_attn: bool = False
-    dual_ln: bool = False  # True for models with two separate norms in parallel layers (MPT, GPT-NeoX-Falcon)
-
     # Post-norm vs pre-norm architecture toggle (used by OpenAI-GPT vs standard GPT-2)
     post_norm: bool = False
 
@@ -768,6 +876,10 @@ class ArchitectureConfig(BaseModelConfig):
     tts: TTSConfig | None = None
     codec_decoder: CodecDecoderConfig | None = None
     codec_encoder: CodecEncoderConfig | None = None
+    moe: MoEConfig | None = None
+    mla: MLAConfig | None = None
+    qformer: QFormerConfig | None = None
+    alibi_config: AlibiConfig | None = None
     quantization: QuantizationConfig | None = None
 
     @classmethod
@@ -926,32 +1038,9 @@ class ArchitectureConfig(BaseModelConfig):
                 if getattr(config, "tie_word_embeddings", None) is not None
                 else getattr(parent_config, "tie_word_embeddings", False)
             ),
-            # MoE
-            num_local_experts=(
-                getattr(config, "num_local_experts", None)
-                or getattr(config, "num_experts", None)
-                or getattr(config, "n_routed_experts", None)
-            ),
-            num_experts_per_tok=(getattr(config, "num_experts_per_tok", None)),
-            moe_intermediate_size=(getattr(config, "moe_intermediate_size", None)),
-            shared_expert_intermediate_size=(
-                getattr(config, "shared_expert_intermediate_size", None)
-            ),
-            norm_topk_prob=(getattr(config, "norm_topk_prob", True)),
-            post_feedforward_norm=(model_type in ("flex_olmo",)),
-            n_group=getattr(config, "n_group", 1),
-            topk_group=getattr(config, "topk_group", 1),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            scoring_func=getattr(config, "scoring_func", "softmax"),
-            topk_method=getattr(config, "topk_method", "greedy"),
-            first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
-            n_shared_experts=getattr(config, "n_shared_experts", None),
-            # Multi-head Latent Attention (MLA)
-            q_lora_rank=getattr(config, "q_lora_rank", None),
-            kv_lora_rank=getattr(config, "kv_lora_rank", None),
-            qk_nope_head_dim=getattr(config, "qk_nope_head_dim", None),
-            qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
-            v_head_dim=getattr(config, "v_head_dim", None),
+            moe=_extract_moe_config(config),
+            mla=_extract_mla_config(config),
+            alibi_config=_extract_alibi_config(config, model_type),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
@@ -978,9 +1067,6 @@ class ArchitectureConfig(BaseModelConfig):
             residual_multiplier=getattr(config, "residual_multiplier", 1.0),
             # Cohere logit scale
             logit_scale=getattr(config, "logit_scale", 1.0),
-            # Falcon config
-            alibi=getattr(config, "alibi", False),
-            parallel_attn=getattr(config, "parallel_attn", False),
         )
 
         # Falcon/Bloom model-specific overrides
@@ -993,7 +1079,6 @@ class ArchitectureConfig(BaseModelConfig):
             # Falcon uses config.bias for both attention and MLP
             options["mlp_bias"] = getattr(config, "bias", False)
         elif model_type == "bloom":
-            options["alibi"] = True
             options["mlp_bias"] = True
 
         # Convert rotary_dim to partial_rotary_factor (GPT-J, CodeGen, etc.)
@@ -1027,18 +1112,7 @@ class ArchitectureConfig(BaseModelConfig):
 
         # Q-Former config (for BLIP-2 style models)
         qformer_source = parent_config or config
-        hf_qformer_config = getattr(qformer_source, "qformer_config", None)
-        if hf_qformer_config is not None:
-            qc = (
-                hf_qformer_config
-                if not isinstance(hf_qformer_config, dict)
-                else type("QC", (), hf_qformer_config)()
-            )
-            options["num_query_tokens"] = getattr(qformer_source, "num_query_tokens", 32)
-            options["qformer_hidden_size"] = getattr(qc, "hidden_size", 768)
-            options["qformer_num_hidden_layers"] = getattr(qc, "num_hidden_layers", 12)
-            options["qformer_num_attention_heads"] = getattr(qc, "num_attention_heads", 12)
-            options["qformer_intermediate_size"] = getattr(qc, "intermediate_size", 3072)
+        options["qformer"] = _extract_qformer_config(qformer_source)
 
         # TTS config (Qwen3-TTS talker + code predictor + speaker encoder)
         tts_source = parent_config or config
@@ -1143,6 +1217,10 @@ class ArchitectureConfig(BaseModelConfig):
                 num_quantizers=getattr(ec, "num_quantizers", 32),
                 num_semantic_quantizers=getattr(ec, "num_semantic_quantizers", 1),
             )
+
+        # flex_olmo uses post-norm MoE style (post_feedforward_norm=True)
+        if model_type in ("flex_olmo",) and options.get("moe") is not None:
+            options["moe"] = dataclasses.replace(options["moe"], post_feedforward_norm=True)
 
         # Model dtype
         resolved = _resolve_dtype(config)
@@ -1346,14 +1424,21 @@ class LongcatFlashConfig(CausalLMConfig):
         ffn_hidden_size = getattr(config, "ffn_hidden_size", None)
         if ffn_hidden_size is not None:
             base = dataclasses.replace(base, intermediate_size=ffn_hidden_size)
-        # LongCat uses moe_topk (not num_experts_per_tok)
+        # LongCat overrides MoE topology fields with its own attribute names
+        moe = base.moe
         moe_topk = getattr(config, "moe_topk", None)
-        if moe_topk is not None:
-            base = dataclasses.replace(base, num_experts_per_tok=moe_topk)
-        # LongCat uses expert_ffn_hidden_size (not moe_intermediate_size)
         expert_ffn_hidden_size = getattr(config, "expert_ffn_hidden_size", None)
-        if expert_ffn_hidden_size is not None:
-            base = dataclasses.replace(base, moe_intermediate_size=expert_ffn_hidden_size)
+        if moe is not None and (moe_topk is not None or expert_ffn_hidden_size is not None):
+            moe = dataclasses.replace(
+                moe,
+                num_experts_per_tok=moe_topk
+                if moe_topk is not None
+                else moe.num_experts_per_tok,
+                moe_intermediate_size=expert_ffn_hidden_size
+                if expert_ffn_hidden_size is not None
+                else moe.moe_intermediate_size,
+            )
+            base = dataclasses.replace(base, moe=moe)
         return cls(
             **_shallow_fields(base),
             zero_expert_num=getattr(config, "zero_expert_num", 0),
@@ -1693,18 +1778,12 @@ class JambaConfig(ArchitectureConfig):
             else:
                 layer_types.append("mamba")
 
-        num_experts = getattr(config, "num_experts", 16)
-        num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
-
         # Exclude fields we set explicitly below to avoid duplicate keyword args
-        _exclude = {"layer_types", "num_local_experts", "num_experts_per_tok"}
+        _exclude = {"layer_types"}
         base_fields = {k: v for k, v in _shallow_fields(base).items() if k not in _exclude}
         return cls(
             **base_fields,
             layer_types=layer_types,
-            # HF uses "num_experts"; we use inherited "num_local_experts"
-            num_local_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
             mamba_d_state=getattr(config, "mamba_d_state", 16),
             mamba_d_conv=getattr(config, "mamba_d_conv", 4),
             mamba_expand=getattr(config, "mamba_expand", 2),

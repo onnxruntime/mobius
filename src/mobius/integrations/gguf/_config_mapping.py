@@ -25,7 +25,7 @@ __all__ = ["gguf_to_config"]
 import logging
 from typing import Any
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, MoEConfig
 
 logger = logging.getLogger(__name__)
 
@@ -264,11 +264,15 @@ def gguf_to_config(
         tie_word_embeddings=_infer_tie_embeddings(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
-        # MoE fields (None when not present → non-MoE model)
-        num_local_experts=hf_fields.get("num_local_experts"),
-        num_experts_per_tok=hf_fields.get("num_experts_per_tok"),
-        moe_intermediate_size=hf_fields.get("moe_intermediate_size"),
-        shared_expert_intermediate_size=hf_fields.get("shared_expert_intermediate_size"),
+        # MoE sub-config (None when not present → non-MoE model)
+        moe=MoEConfig(
+            num_local_experts=hf_fields["num_local_experts"],
+            num_experts_per_tok=hf_fields.get("num_experts_per_tok", 1),
+            moe_intermediate_size=hf_fields.get("moe_intermediate_size"),
+            shared_expert_intermediate_size=hf_fields.get("shared_expert_intermediate_size"),
+        )
+        if hf_fields.get("num_local_experts")
+        else None,
         # Hybrid architecture fields
         layer_types=layer_types,
         full_attention_interval=full_attention_interval,

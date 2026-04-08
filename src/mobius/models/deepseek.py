@@ -48,16 +48,16 @@ class DeepSeekMoEGate(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.norm_topk_prob = config.norm_topk_prob
-        self.scoring_func = config.scoring_func
-        self.topk_method = config.topk_method
+        assert config.moe is not None
+        moe = config.moe
+        self.num_experts = moe.num_local_experts
+        self.top_k = moe.num_experts_per_tok
+        self.n_group = moe.n_group
+        self.topk_group = moe.topk_group
+        self.routed_scaling_factor = moe.routed_scaling_factor
+        self.norm_topk_prob = moe.norm_topk_prob
+        self.scoring_func = moe.scoring_func
+        self.topk_method = moe.topk_method
 
         self.weight = nn.Parameter([self.num_experts, config.hidden_size])
         # Correction bias only used with sigmoid scoring (V3)
@@ -247,12 +247,12 @@ class _DeepSeekMoEFFN(nn.Module):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.moe_intermediate_size is not None
+        assert config.moe is not None
+        assert config.moe.moe_intermediate_size is not None
         self.moe = MoELayer(config, gate=gate)
         # Shared expert uses moe_intermediate_size * n_shared_experts
-        n_shared = config.n_shared_experts or 1
-        shared_intermediate = config.moe_intermediate_size * n_shared
+        n_shared = config.moe.n_shared_experts or 1
+        shared_intermediate = config.moe.moe_intermediate_size * n_shared
         self.shared_experts = _SharedExpertMLP(config, shared_intermediate)
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
@@ -295,11 +295,19 @@ class DeepSeekV3TextModel(nn.Module):
         self._dtype = config.dtype
 
         # Detect MLA vs standard attention
-        use_mla = config.qk_nope_head_dim is not None and config.qk_nope_head_dim > 0
+        use_mla = (
+            config.mla is not None
+            and config.mla.qk_nope_head_dim is not None
+            and config.mla.qk_nope_head_dim > 0
+        )
         LayerClass = DeepSeekMLADecoderLayer if use_mla else _DeepSeekStandardDecoderLayer  # noqa: N806
 
         # Build layers: dense for first k, MoE for rest
-        first_k = config.first_k_dense_replace
+        first_k = (
+            config.moe.first_k_dense_replace
+            if config.moe is not None
+            else config.num_hidden_layers
+        )
         self.layers = nn.ModuleList(
             [
                 LayerClass(config, is_moe=(i >= first_k))
@@ -311,8 +319,12 @@ class DeepSeekV3TextModel(nn.Module):
         # For MLA, RoPE applies only to the qk_rope_head_dim portion of Q and K,
         # not the full head_dim. Create a modified config so the cos/sin cache
         # has the correct dimensionality: (max_pos, qk_rope_head_dim/2).
-        if use_mla and config.qk_rope_head_dim is not None and config.qk_rope_head_dim > 0:
-            rope_config = dataclasses.replace(config, head_dim=config.qk_rope_head_dim)
+        if (
+            use_mla
+            and config.mla.qk_rope_head_dim is not None
+            and config.mla.qk_rope_head_dim > 0
+        ):
+            rope_config = dataclasses.replace(config, head_dim=config.mla.qk_rope_head_dim)
         else:
             rope_config = config
         self.rotary_emb = initialize_rope(rope_config)

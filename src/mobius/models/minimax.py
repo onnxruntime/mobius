@@ -77,11 +77,12 @@ class MiniMaxDecoderLayer(nn.Module):
         self._mlp_alpha: float = getattr(config, "mlp_alpha_factor", 1.0)
         self._mlp_beta: float = getattr(config, "mlp_beta_factor", 1.0)
 
+        assert config.moe is not None
         gate = SoftmaxTopKGate(
             config.hidden_size,
-            config.num_local_experts,
-            config.num_experts_per_tok,
-            norm_topk_prob=config.norm_topk_prob,
+            config.moe.num_local_experts,
+            config.moe.num_experts_per_tok,
+            norm_topk_prob=config.moe.norm_topk_prob,
         )
         self.mlp = MoELayer(config, gate=gate)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

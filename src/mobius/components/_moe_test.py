@@ -8,12 +8,24 @@ from __future__ import annotations
 import onnx_ir as ir
 import pytest
 
+from mobius._configs import MoEConfig
 from mobius._testing import (
     create_test_builder,
     create_test_input,
     make_config,
 )
 from mobius.components._moe import MoELayer, SparseMixerGate, TopKGate
+
+
+def _moe_config(num_local_experts=4, num_experts_per_tok=2, **kwargs):
+    """Create a test config with MoEConfig."""
+    return make_config(
+        moe=MoEConfig(
+            num_local_experts=num_local_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            **kwargs,
+        )
+    )
 
 
 class TestTopKGate:
@@ -68,25 +80,25 @@ class TestSparseMixerGate:
 
 class TestMoELayer:
     def test_moe_layer_has_gate(self):
-        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=4, num_experts_per_tok=2)
         layer = MoELayer(config)
         param_names = [n for n, _ in layer.named_parameters()]
         assert any("gate" in n for n in param_names)
 
     def test_moe_layer_has_experts(self):
-        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=4, num_experts_per_tok=2)
         layer = MoELayer(config)
         param_names = [n for n, _ in layer.named_parameters()]
         assert any("experts.0" in n for n in param_names)
         assert any("experts.3" in n for n in param_names)
 
     def test_moe_layer_num_experts(self):
-        config = make_config(num_local_experts=8, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=8, num_experts_per_tok=2)
         layer = MoELayer(config)
         assert len(layer.experts) == 8
 
     def test_moe_layer_forward(self):
-        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=4, num_experts_per_tok=2)
         layer = MoELayer(config)
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
@@ -95,22 +107,22 @@ class TestMoELayer:
         assert graph.num_nodes() > 0
 
     def test_moe_layer_requires_expert_config(self):
-        config = make_config()  # No MoE config
+        config = make_config()  # No MoE config (moe=None)
         with pytest.raises(AssertionError):
             MoELayer(config)
 
     def test_moe_layer_with_custom_gate(self):
-        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=4, num_experts_per_tok=2)
         gate = SparseMixerGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size, config.moe.num_local_experts, config.moe.num_experts_per_tok
         )
         layer = MoELayer(config, gate=gate)
         assert isinstance(layer.gate, SparseMixerGate)
 
     def test_moe_layer_forward_with_sparse_mixer_gate(self):
-        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        config = _moe_config(num_local_experts=4, num_experts_per_tok=2)
         gate = SparseMixerGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size, config.moe.num_local_experts, config.moe.num_experts_per_tok
         )
         layer = MoELayer(config, gate=gate)
         builder, op, graph = create_test_builder()

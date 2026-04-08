@@ -53,6 +53,8 @@ from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
     CodePredictorConfig,
+    MoEConfig,
+    QFormerConfig,
     SpeakerEncoderConfig,
     TTSConfig,
     VisionConfig,
@@ -1145,11 +1147,13 @@ class TestBuildGraphVisionLanguage:
             ),
             image_token_id=50265,
             # Q-Former config
-            num_query_tokens=4,
-            qformer_hidden_size=32,
-            qformer_num_hidden_layers=1,
-            qformer_num_attention_heads=2,
-            qformer_intermediate_size=64,
+            qformer=QFormerConfig(
+                num_query_tokens=4,
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=64,
+            ),
         )
         model_cls = registry.get("blip-2")
         module = model_cls(config)
@@ -1369,19 +1373,18 @@ class TestBuildGraphVisionLanguage:
         """Build DeepSeek-OCR-2 with 3-model VL split."""
         config = _base_config(
             # LLM decoder: DeepSeek-V2 non-MLA + MoE
-            qk_nope_head_dim=0,
-            qk_rope_head_dim=0,
-            v_head_dim=0,
-            num_local_experts=4,
-            num_experts_per_tok=2,
-            moe_intermediate_size=32,
-            n_group=1,
-            topk_group=1,
-            routed_scaling_factor=1.0,
-            scoring_func="softmax",
-            topk_method="greedy",
-            first_k_dense_replace=1,
-            n_shared_experts=2,
+            moe=MoEConfig(
+                num_local_experts=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=32,
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=1.0,
+                scoring_func="softmax",
+                topk_method="greedy",
+                first_k_dense_replace=1,
+                n_shared_experts=2,
+            ),
             image_token_id=100015,
         )
         model_cls = registry.get("deepseek_vl_v2")
@@ -3253,8 +3256,7 @@ class TestBuildJambaGraph:
             attn_layer_offset=1,
             expert_layer_period=2,
             expert_layer_offset=1,
-            num_local_experts=2,
-            num_experts_per_tok=1,
+            moe=MoEConfig(num_local_experts=2, num_experts_per_tok=1),
         )
 
     def test_jamba_builds(self):
@@ -3624,10 +3626,10 @@ class TestBuildStaticCacheGraph:
         """Build a MoE model (qwen2_moe) with static cache."""
         model, _config = self._build_static_cache_model(
             model_type="qwen2_moe",
-            num_local_experts=4,
-            num_experts_per_tok=2,
+            moe=MoEConfig(
+                num_local_experts=4, num_experts_per_tok=2, shared_expert_intermediate_size=64
+            ),
             attn_qkv_bias=True,
-            shared_expert_intermediate_size=64,
         )
 
         assert model.graph is not None

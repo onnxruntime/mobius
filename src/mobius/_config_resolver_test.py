@@ -302,11 +302,12 @@ class TestDeepSeekMLA:
     def test_mla_fields_extracted(self):
         hf = self._deepseek_config()
         result = _config_from_hf(hf)
-        assert result.q_lora_rank == 1536
-        assert result.kv_lora_rank == 512
-        assert result.qk_nope_head_dim == 128
-        assert result.qk_rope_head_dim == 64
-        assert result.v_head_dim == 128
+        assert result.mla is not None
+        assert result.mla.q_lora_rank == 1536
+        assert result.mla.kv_lora_rank == 512
+        assert result.mla.qk_nope_head_dim == 128
+        assert result.mla.qk_rope_head_dim == 64
+        assert result.mla.v_head_dim == 128
 
     def test_rope_interleave_auto_enabled(self):
         """rope_interleave is auto-enabled when qk_rope_head_dim > 0."""
@@ -323,17 +324,19 @@ class TestDeepSeekMLA:
     def test_moe_fields_extracted(self):
         hf = self._deepseek_config()
         result = _config_from_hf(hf)
-        assert result.num_local_experts == 64
-        assert result.num_experts_per_tok == 6
-        assert result.moe_intermediate_size == 1408
-        assert result.shared_expert_intermediate_size == 5632
-        assert result.n_shared_experts == 2
+        assert result.moe is not None
+        assert result.moe.num_local_experts == 64
+        assert result.moe.num_experts_per_tok == 6
+        assert result.moe.moe_intermediate_size == 1408
+        assert result.moe.shared_expert_intermediate_size == 5632
+        assert result.moe.n_shared_experts == 2
 
     def test_deepseek_v3_model_type(self):
         hf = self._deepseek_config(model_type="deepseek_v3")
         result = _config_from_hf(hf)
-        assert result.q_lora_rank == 1536
-        assert result.kv_lora_rank == 512
+        assert result.mla is not None
+        assert result.mla.q_lora_rank == 1536
+        assert result.mla.kv_lora_rank == 512
 
 
 # ── Whisper encoder-decoder nesting ─────────────────────────────────────

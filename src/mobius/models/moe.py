@@ -50,7 +50,9 @@ class MoEDecoderLayer(nn.Module):
         norm_class: type = RMSNorm,
     ):
         super().__init__()
-        self._post_feedforward_norm = config.post_feedforward_norm
+        self._post_feedforward_norm = (
+            config.moe.post_feedforward_norm if config.moe is not None else False
+        )
         self.self_attn = Attention(config)
         self.mlp = MoELayer(config, gate=gate)
         if not self._post_feedforward_norm:
@@ -147,14 +149,18 @@ class MoETextModel(nn.Module):
                 # Default: softmax-first routing matching HF Mixtral/OLMoE/Qwen2-MoE.
                 # norm_topk_prob=True renormalizes selected weights (Mixtral);
                 # norm_topk_prob=False keeps raw softmax probs (OLMoE, Qwen2-MoE).
+                assert config.moe is not None
                 return SoftmaxTopKGate(
                     config.hidden_size,
-                    config.num_local_experts,
-                    config.num_experts_per_tok,
-                    norm_topk_prob=config.norm_topk_prob,
+                    config.moe.num_local_experts,
+                    config.moe.num_experts_per_tok,
+                    norm_topk_prob=config.moe.norm_topk_prob,
                 )
+            assert config.moe is not None
             return gate_factory(
-                config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+                config.hidden_size,
+                config.moe.num_local_experts,
+                config.moe.num_experts_per_tok,
             )
 
         _layer_class = layer_class if layer_class is not None else MoEDecoderLayer
@@ -265,11 +271,11 @@ class Qwen2MoELayer(MoELayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
         super().__init__(config, gate=gate)
-        assert config.shared_expert_intermediate_size is not None, (
-            "Qwen2MoELayer requires config.shared_expert_intermediate_size"
-        )
+        assert (
+            config.moe is not None and config.moe.shared_expert_intermediate_size is not None
+        ), "Qwen2MoELayer requires config.moe.shared_expert_intermediate_size"
         shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_expert_intermediate_size
+            config, intermediate_size=config.moe.shared_expert_intermediate_size
         )
         self.shared_expert = MLP(shared_config)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
@@ -336,11 +342,11 @@ class UngatedSharedMoELayer(MoELayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
         super().__init__(config, gate=gate)
-        assert config.shared_expert_intermediate_size is not None, (
-            "UngatedSharedMoELayer requires config.shared_expert_intermediate_size"
-        )
+        assert (
+            config.moe is not None and config.moe.shared_expert_intermediate_size is not None
+        ), "UngatedSharedMoELayer requires config.moe.shared_expert_intermediate_size"
         shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_expert_intermediate_size
+            config, intermediate_size=config.moe.shared_expert_intermediate_size
         )
         self.shared_expert = MLP(shared_config)
 
@@ -431,10 +437,11 @@ class Glm4MoECausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
         self.config = config
+        assert config.moe is not None
         gate_factory = functools.partial(
             SigmoidTopKGate,
-            norm_topk_prob=config.norm_topk_prob,
-            routed_scaling_factor=config.routed_scaling_factor,
+            norm_topk_prob=config.moe.norm_topk_prob,
+            routed_scaling_factor=config.moe.routed_scaling_factor,
         )
         self.model = MoETextModel(
             config, gate_factory=gate_factory, layer_class=UngatedSharedMoEDecoderLayer

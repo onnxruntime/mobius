@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from mobius._configs import MLAConfig
 from mobius._testing import (
     count_op_type,
     create_test_builder,
@@ -19,22 +20,29 @@ from mobius.components._deepseek_mla import DeepSeekMLA
 # nope (non-positional) and rope (rotary) head dimensions.
 # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 _MLA_DEFAULTS = dict(
-    hidden_size=64,
-    num_attention_heads=4,
     q_lora_rank=16,
     kv_lora_rank=8,
     qk_nope_head_dim=12,
     qk_rope_head_dim=4,
     v_head_dim=8,
-    rope_interleave=False,
-    rms_norm_eps=1e-6,
 )
 
 
 def _mla_config(**overrides):
     """Create a test config for DeepSeek MLA."""
-    kw = {**_MLA_DEFAULTS, **overrides}
-    return make_config(**kw)
+    mla_kw = {**_MLA_DEFAULTS}
+    arch_kw = {}
+    for k, v in overrides.items():
+        if k in _MLA_DEFAULTS:
+            mla_kw[k] = v
+        else:
+            arch_kw[k] = v
+    arch_kw["mla"] = MLAConfig(**mla_kw)
+    arch_kw.setdefault("hidden_size", 64)
+    arch_kw.setdefault("num_attention_heads", 4)
+    arch_kw.setdefault("rms_norm_eps", 1e-6)
+    arch_kw.setdefault("rope_interleave", False)
+    return make_config(**arch_kw)
 
 
 class TestDeepSeekMLAInit:

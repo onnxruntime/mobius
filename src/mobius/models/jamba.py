@@ -82,10 +82,11 @@ class JambaMambaDecoderLayer(nn.Module):
 
         # MLP: MoE or dense
         if use_moe:
+            assert config.moe is not None
             gate = TopKGate(
                 config.hidden_size,
-                config.num_local_experts,
-                config.num_experts_per_tok,
+                config.moe.num_local_experts,
+                config.moe.num_experts_per_tok,
             )
             self.feed_forward = MoELayer(config, gate=gate)
         else:
@@ -143,10 +144,11 @@ class JambaAttentionDecoderLayer(nn.Module):
 
         # MLP: MoE or dense
         if use_moe:
+            assert config.moe is not None
             gate = TopKGate(
                 config.hidden_size,
-                config.num_local_experts,
-                config.num_experts_per_tok,
+                config.moe.num_local_experts,
+                config.moe.num_experts_per_tok,
             )
             self.feed_forward = MoELayer(config, gate=gate)
         else:
@@ -210,8 +212,8 @@ class _JambaTextModel(nn.Module):
         for i in range(config.num_hidden_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
             use_moe = (
-                config.num_local_experts is not None
-                and config.num_local_experts > 1
+                config.moe is not None
+                and config.moe.num_local_experts > 1
                 and (i - expert_offset) % expert_period == 0
             )
             if ltype == "mamba":

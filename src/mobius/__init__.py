@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "AlibiConfig",
     "ArchitectureConfig",
     "AudioConfig",
     "BaseModelConfig",
@@ -15,12 +16,15 @@ __all__ = [
     "Gemma2Config",
     "Gemma3nConfig",
     "MambaConfig",
+    "MLAConfig",
     "MllamaConfig",
     "ModelPackage",
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MoEConfig",
     "OPSET_VERSION",
+    "QFormerConfig",
     "Sam2Config",
     "SegformerConfig",
     "VisionConfig",
@@ -53,6 +57,7 @@ from mobius._builder import (
     build_from_module,
 )
 from mobius._configs import (
+    AlibiConfig,
     ArchitectureConfig,
     AudioConfig,
     BaseModelConfig,
@@ -62,7 +67,10 @@ from mobius._configs import (
     Gemma2Config,
     Gemma3nConfig,
     MambaConfig,
+    MLAConfig,
     MllamaConfig,
+    MoEConfig,
+    QFormerConfig,
     Sam2Config,
     SegformerConfig,
     VisionConfig,

@@ -61,26 +61,26 @@ class Qwen3NextMoEBlock(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        num_experts = config.num_local_experts
-        top_k = config.num_experts_per_tok
+        assert config.moe is not None
+        moe = config.moe
+        num_experts = moe.num_local_experts
+        top_k = moe.num_experts_per_tok
 
         self.gate = SoftmaxTopKGate(
             config.hidden_size,
             num_experts,
             top_k,
-            norm_topk_prob=config.norm_topk_prob,
+            norm_topk_prob=moe.norm_topk_prob,
         )
 
         expert_config = dataclasses.replace(
-            config, intermediate_size=config.moe_intermediate_size
+            config, intermediate_size=moe.moe_intermediate_size
         )
         self.experts = nn.ModuleList([MLP(expert_config) for _ in range(num_experts)])
 
         shared_config = dataclasses.replace(
             config,
-            intermediate_size=config.shared_expert_intermediate_size,
+            intermediate_size=moe.shared_expert_intermediate_size,
         )
         self.shared_expert = MLP(shared_config)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
