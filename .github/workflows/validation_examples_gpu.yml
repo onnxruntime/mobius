@@ -81,7 +81,7 @@ jobs:
           # ── Qwen text ────────────────────────────────────────────
           run_example "qwen35_text_generation" \
             python examples/qwen35_text_generation.py --ci --compare-hf \
-              --device cuda --prompt "What is 2+2?"
+              --device cuda
 
           # ── Qwen vision-language ─────────────────────────────────
           run_example "qwen25_vl_ort_genai" \
@@ -114,7 +114,7 @@ jobs:
           # ── Nemotron ─────────────────────────────────────────────
           run_example "nemotron_3_nano_text_generation" \
             python examples/nemotron_3_nano_text_generation.py --ci --compare-hf \
-              --device cuda --prompt "What is 2+2?"
+              --device cuda
 
           # ── Static cache ─────────────────────────────────────────
           run_example "static_cache_generation" \
