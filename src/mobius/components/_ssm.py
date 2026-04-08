@@ -38,13 +38,24 @@ Strategy A — CastLike (for parameters used directly at their declared dtype):
     the Cast, so the serialised initialiser has consistent type + data.
     Used by: _DepthwiseConv1d (weight/bias in Conv), OffsetRMSNorm, RoPE.
 
-Strategy B — dtype= constructor arg (for parameters that must upcast to fp32):
-    Declare ``nn.Parameter([...], dtype=dtype)`` so the annotation matches the
-    HF weight dtype (e.g. FLOAT16). Any subsequent ``Cast(param, to=FLOAT)``
-    is then FLOAT16→FLOAT — a genuine type change — so constant folding does
-    NOT eliminate it. Without this, Cast(FLOAT→FLOAT) looks like an identity
-    and is removed, leaving float16 data labelled as float32 → ORT SIGABRT.
-    Used by: A_log, D, dt_bias (always upcast to fp32 for numerical stability).
+Strategy B — get_build_dtype() in __init__ (for parameters that upcast to fp32):
+    Call ``get_build_dtype()`` from ``_build_context`` inside ``__init__`` and
+    declare ``nn.Parameter([...], dtype=dtype)`` with the result. This ensures
+    the annotation matches the HF weight dtype (e.g. FLOAT16) so that any
+    subsequent ``Cast(param, to=FLOAT)`` is FLOAT16→FLOAT — a genuine type
+    change — and constant folding does NOT eliminate it. Without this, constant
+    folding sees Cast(FLOAT→FLOAT) as an identity and removes it, leaving float16
+    data labelled as float32 → ORT SIGABRT on CUDA.
+
+    ``get_build_dtype()`` returns the correct dtype because :func:`build` wraps
+    module construction in :func:`build_context` before calling
+    ``module_class(config)``. For direct ``build_from_module`` callers who
+    construct modules outside a build context, ``_cast_module_dtype`` provides
+    the same guarantee by updating FLOAT annotations to the target dtype before
+    graph building.
+
+    Used by: A_log, D (always upcast to fp32 for numerical stability), dt_bias,
+    _RMSNorm.weight (Jamba), GatedRMSNorm.weight.
 """
 
 from __future__ import annotations
@@ -53,6 +64,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import get_build_dtype
 from mobius.components._common import Linear
 
 
@@ -70,7 +82,6 @@ class SelectiveScan(nn.Module):
         d_inner: int,
         d_state: int,
         dt_rank: int,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.d_inner = d_inner
@@ -82,10 +93,11 @@ class SelectiveScan(nn.Module):
         # Project dt from reduced rank back to d_inner
         self.dt_proj = Linear(dt_rank, d_inner, bias=True)
 
-        # A_log and D are always upcast to float32 in forward(). Declare with
-        # the model's compute dtype so Cast(param, to=FLOAT) is not eliminated
-        # as identity when dtype=FLOAT16 (constant folding sees FLOAT16→FLOAT,
-        # not FLOAT→FLOAT, and preserves the Cast).
+        # A_log and D are always upcast to float32 in forward(). Read the active
+        # build dtype via get_build_dtype() so Cast(param, to=FLOAT) is a genuine
+        # type change (e.g. FLOAT16→FLOAT) and is not eliminated by constant
+        # folding as an identity. See module docstring for full explanation.
+        dtype = get_build_dtype()
         self.A_log = nn.Parameter([d_inner, d_state], dtype=dtype)
         self.D = nn.Parameter([d_inner], dtype=dtype)
 
@@ -199,12 +211,11 @@ class JambaSelectiveScan(SelectiveScan):
         d_state: int,
         dt_rank: int,
         layer_norm_epsilon: float = 1e-5,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
-        super().__init__(d_inner, d_state, dt_rank, dtype=dtype)
-        self.dt_layernorm = _RMSNorm(dt_rank, eps=layer_norm_epsilon, dtype=dtype)
-        self.b_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon, dtype=dtype)
-        self.c_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon, dtype=dtype)
+        super().__init__(d_inner, d_state, dt_rank)
+        self.dt_layernorm = _RMSNorm(dt_rank, eps=layer_norm_epsilon)
+        self.b_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
+        self.c_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
 
     def _project_ssm_params(self, op, x_db):
         """Split + layernorm on dt, B, C."""
@@ -244,7 +255,6 @@ class Mamba2Scan(nn.Module):
         d_head: int,
         d_state: int,
         n_groups: int = 1,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -253,9 +263,10 @@ class Mamba2Scan(nn.Module):
         self.n_groups = n_groups
         self.heads_per_group = num_heads // n_groups
 
-        # A_log, D, dt_bias are always upcast to float32 in forward(). Declare
-        # with the model's compute dtype so Cast(param, to=FLOAT) is not
-        # eliminated as identity by constant folding when dtype=FLOAT16.
+        # A_log, D, dt_bias are always upcast to float32 in forward(). Read
+        # get_build_dtype() so Cast(param, to=FLOAT) is not eliminated as
+        # identity when the model dtype is float16.
+        dtype = get_build_dtype()
         self.A_log = nn.Parameter([num_heads], dtype=dtype)
         self.D = nn.Parameter([num_heads], dtype=dtype)
         self.dt_bias = nn.Parameter([num_heads], dtype=dtype)
@@ -351,13 +362,11 @@ class _RMSNorm(nn.Module):
         self,
         size: int,
         eps: float = 1e-5,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         # Use the model's compute dtype so Cast(self.weight, to=FLOAT) is not
-        # eliminated by constant folding when dtype=FLOAT16 (see module docstring
-        # comment on the two fix strategies).
-        self.weight = nn.Parameter([size], dtype=dtype)
+        # eliminated by constant folding when dtype=FLOAT16 (see module docstring).
+        self.weight = nn.Parameter([size], dtype=get_build_dtype())
         self._eps = eps
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):

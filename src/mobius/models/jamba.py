@@ -74,7 +74,6 @@ class JambaMambaDecoderLayer(nn.Module):
             dt_rank=dt_rank,
             conv_kernel=config.mamba_d_conv,
             rms_norm_eps=config.rms_norm_eps,
-            dtype=config.dtype,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -331,12 +330,11 @@ class _JambaMambaBlock(MambaBlock):
         dt_rank: int | None = None,
         conv_kernel: int = 4,
         rms_norm_eps: float = 1e-6,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
-        super().__init__(d_model, d_inner, d_state, dt_rank, conv_kernel, dtype=dtype)
+        super().__init__(d_model, d_inner, d_state, dt_rank, conv_kernel)
         # Replace the SSM with the Jamba variant (layernormed dt/B/C)
         self.ssm = JambaSelectiveScan(
-            d_inner, d_state, self.dt_rank, layer_norm_epsilon=rms_norm_eps, dtype=dtype
+            d_inner, d_state, self.dt_rank, layer_norm_epsilon=rms_norm_eps
         )
 
 

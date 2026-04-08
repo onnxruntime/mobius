@@ -82,7 +82,6 @@ class NemotronHMambaLayer(nn.Module):
             # NemotronH uses grouped RMSNorm: normalize within each
             # group of heads_per_group * head_dim dimensions.
             norm_group_size=d_inner // config.mamba_n_groups,
-            dtype=config.dtype,
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

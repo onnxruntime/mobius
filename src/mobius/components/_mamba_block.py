@@ -28,6 +28,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import get_build_dtype
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
@@ -45,13 +46,13 @@ class _DepthwiseConv1d(nn.Module):
         channels: int,
         kernel_size: int,
         bias: bool = True,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         # Declare with the model's compute dtype so that if these weights are
         # stored as float16 in HF, the type annotation matches the data and
         # Conv's type constraint (X and W must share the same element type) is
         # satisfied without relying on implicit casting.
+        dtype = get_build_dtype()
         self.weight = nn.Parameter([channels, 1, kernel_size], dtype=dtype)
         self.bias = nn.Parameter([channels], dtype=dtype) if bias else None
         self._kernel_size = kernel_size
@@ -93,7 +94,6 @@ class MambaBlock(nn.Module):
         d_state: int = 16,
         dt_rank: int | None = None,
         conv_kernel: int = 4,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.d_model = d_model
@@ -107,10 +107,10 @@ class MambaBlock(nn.Module):
         self.in_proj = Linear(d_model, 2 * d_inner, bias=False)
 
         # Causal depthwise Conv1D (with bias, matching HuggingFace)
-        self.conv1d = _DepthwiseConv1d(d_inner, conv_kernel, bias=True, dtype=dtype)
+        self.conv1d = _DepthwiseConv1d(d_inner, conv_kernel, bias=True)
 
         # Core SSM component
-        self.ssm = SelectiveScan(d_inner, d_state, self.dt_rank, dtype=dtype)
+        self.ssm = SelectiveScan(d_inner, d_state, self.dt_rank)
 
         # Output projection: d_inner → d_model
         self.out_proj = Linear(d_inner, d_model, bias=False)
@@ -214,7 +214,6 @@ class Mamba2Block(nn.Module):
         proj_bias: bool = False,
         eps: float = 1e-5,
         norm_group_size: int | None = None,
-        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.d_model = d_model
@@ -229,9 +228,9 @@ class Mamba2Block(nn.Module):
 
         proj_size = d_inner + self.conv_dim + num_heads
         self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
-        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel, bias=conv_bias, dtype=dtype)
-        self.ssm = Mamba2Scan(num_heads, d_head, d_state, n_groups, dtype=dtype)
-        self.norm = GatedRMSNorm(d_inner, eps=eps, group_size=norm_group_size, dtype=dtype)
+        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel, bias=conv_bias)
+        self.ssm = Mamba2Scan(num_heads, d_head, d_state, n_groups)
+        self.norm = GatedRMSNorm(d_inner, eps=eps, group_size=norm_group_size)
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
     def forward(

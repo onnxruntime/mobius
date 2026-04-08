@@ -33,6 +33,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import get_build_dtype
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import PostGatedRMSNorm
@@ -139,12 +140,13 @@ class GatedDeltaNet(nn.Module):
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
 
         # Learnable parameters for decay computation.
-        # Use config.dtype so the type annotation matches the HF weight dtype.
-        # Without this, Cast(dt_bias, to=FLOAT) has input_type=output_type=FLOAT
-        # (from the default annotation) and is eliminated as identity by constant
-        # folding, leaving float16 data with a float32 type label → ORT SIGABRT.
-        self.dt_bias = nn.Parameter([self.num_v_heads], dtype=config.dtype)
-        self.A_log = nn.Parameter([self.num_v_heads], dtype=config.dtype)
+        # Read the active build dtype so Cast(dt_bias, to=FLOAT) is not eliminated
+        # as identity when dtype=FLOAT16 (constant folding sees FLOAT16→FLOAT, not
+        # FLOAT→FLOAT, and preserves the Cast). See _ssm.py module docstring for
+        # a full explanation of the two fix strategies.
+        dtype = get_build_dtype()
+        self.dt_bias = nn.Parameter([self.num_v_heads], dtype=dtype)
+        self.A_log = nn.Parameter([self.num_v_heads], dtype=dtype)
 
         # Gated output normalization
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
