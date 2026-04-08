@@ -17,6 +17,14 @@ four-stage pass pipeline to an ONNX IR model:
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
 entries in the :data:`~mobius._execution_providers.ep_registry`. Adding EP
 support requires only a new registry entry — no changes to this module.
+
+Post-weight passes
+------------------
+:func:`fold_constants_after_weights` should be called after weights are loaded.
+It runs :class:`~mobius.passes.FoldTransposedInitializerPass` and
+:class:`~mobius.passes.FoldConcatInitializersPass` to fold runtime Transpose and
+Concat nodes over initializers into pre-computed weights, then removes unused
+nodes.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ from onnx_ir.passes import common as common_passes
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
+from mobius.passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +92,13 @@ class CleanupMetadataPass(ir.passes.InPlacePass):
 
 
 # Maximum number of elements allowed in a constant-folded output tensor.
-# Set high enough to fold packed-QKV weights (Llama-3.2-1B packed QKV is
-# ~6.3M elements per layer; 256M gives ample headroom for large models).
-_FOLD_OUTPUT_SIZE_LIMIT = 256 * 1024 * 1024
+# Set to onnxscript's standard default.  Large weight tensors (Transpose,
+# Concat/QKV packing) are handled by FoldTransposedInitializerPass and
+# FoldConcatInitializersPass after weight loading, so the general constant-fold
+# pass no longer needs a high limit.
+_FOLD_OUTPUT_SIZE_LIMIT = (
+    onnxscript.optimizer._constant_folding.DEFAULT_CONSTANT_FOLD_OUTPUT_SIZE_LIMIT
+)
 
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
@@ -365,6 +378,19 @@ def optimize_model(
 
     fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
 
+    # Apply FusedMatMul fusion BEFORE registering function bodies.
+    # fused_matmul_rules() converts Transpose(weight)+MatMul → FusedMatMul(transB=1).
+    # It must run before register_function_bodies() because the FusedMatMul function
+    # body itself contains Transpose+MatMul — applying the rule after registration
+    # would create a cyclic function dependency.
+    if caps.supports_fused_matmul:
+        from onnxscript.rewriter import rewrite as _rewrite
+        from mobius.rewrite_rules import fused_matmul_rules as _fused_matmul_rules
+
+        _rewrite(model, pattern_rewrite_rules=list(_fused_matmul_rules()))
+        # Remove FusedMatMul from fuse_stages since we just applied it.
+        fuse_stages = [(n, r) for n, r in fuse_stages if n != "FusedMatMul"]
+
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
     from mobius.functions import register_function_bodies
@@ -489,27 +515,39 @@ def optimize_model(
 def fold_constants_after_weights(model: ir.Model) -> None:
     """Fold constants after weights have been applied.
 
-    This is a lightweight pass intended to run after :func:`apply_weights`
-    so that any weight-dependent Concat/other constant nodes (e.g. from
-    PackQKV fusion) get folded into single initializers.
+    This pass is intended to run after :func:`apply_weights`.  It:
 
-    Unlike the pre-weights fold pass (which uses input_size_limit=8192 to
-    avoid evaluating large dynamic tensors), this pass raises both limits to
-    accommodate the large weight tensors produced by PackQKV
-    (e.g. Llama-3.2-1B packed QKV is ~6.3M elements per layer).
+    1. **Folds Transpose initializers** — converts every
+       ``Transpose(weight, perm=[1, 0])`` (emitted by
+       :class:`~mobius.components.Linear`) into a pre-transposed initializer.
+       The transposition is deferred via :class:`onnx_ir.LazyTensor` so the
+       pass itself does not materialise all weight tensors simultaneously.
 
-    The pass raises no errors: warnings are emitted for nodes that cannot
-    be evaluated (e.g. symbolic inputs), and those nodes are left in place.
+    2. **Folds Concat initializers** — pre-packs QKV weight matrices produced
+       by the GQA ``PackQKV`` rewrite rules.  Like the Transpose fold, the
+       actual numpy concatenation is deferred via :class:`onnx_ir.LazyTensor`.
+
+    3. **Removes unused nodes** — prunes orphaned initializers and nodes left
+       behind by the two folding passes above.
+
+    4. **Folds remaining constants** — applies a lightweight constant-fold
+       pass for any remaining small constant sub-graphs (e.g. shape arithmetic,
+       RoPE embedding precomputation).
+
+    Note: the constant-fold step uses standard size limits.  Large weight
+    tensors are handled by the dedicated Transpose/Concat folding passes
+    above — not by constant folding.
     """
     pass_manager = ir.passes.PassManager(
         [
+            FoldTransposedInitializerPass(),
+            FoldConcatInitializersPass(),
+            common_passes.RemoveUnusedNodesPass(),
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,
-                # Raised to fold large weight tensors from PackQKV fusion.
-                input_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
+                input_size_limit=onnxscript.optimizer._constant_folding.DEFAULT_CONSTANT_FOLD_INPUT_SIZE_LIMIT,
                 output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
-            common_passes.RemoveUnusedNodesPass(),
         ]
     )
     pass_manager(model)

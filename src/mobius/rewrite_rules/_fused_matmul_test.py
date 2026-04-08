@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-from onnx_ir.passes.common import InlinePass
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
-from mobius import build
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
@@ -41,61 +39,73 @@ class TestFusedMatMulRules:
         rules = fused_matmul_rules()
         assert isinstance(rules, RewriteRuleSet)
 
-    def test_llm_emits_fused_matmul_directly(self):
-        """Linear layers emit FusedMatMul directly — 197 for Qwen3-0.6B.
+    def test_linear_emits_transpose_matmul_before_optimization(self):
+        """Linear.forward() emits Transpose(weight,[1,0]) + MatMul(x, w_t).
 
-        Linear.forward() now emits com.microsoft::FusedMatMul(x, weight, transB=1)
-        rather than Transpose(weight) + MatMul(x, weight_t).  The 197 FusedMatMul
-        nodes correspond to all Q/K/V/O projections, gate and up projections,
-        and the lm_head Linear.
+        Before optimization, the raw graph produced by build_from_module
+        (pre-optimization) has Transpose+MatMul from every Linear layer and
+        no FusedMatMul nodes.
         """
-        pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
+        module = registry.get("qwen2")(_TINY_CONFIG)
+        # Build without optimization to inspect the raw graph
+        from mobius.tasks import get_task
+
+        task = get_task("text-generation")
+        pkg = task.build(module, _TINY_CONFIG)
         model = pkg["model"]
+
         counts = count_ops(model)
-        # Every Linear is now a FusedMatMul node; no raw Transpose+MatMul from Linear
-        assert counts["FusedMatMul"] == 197
-        assert counts.get("MatMul", 0) == 0
+        # Every Linear emits Transpose+MatMul; no FusedMatMul before optimization
+        assert counts.get("MatMul", 0) > 0
+        assert counts.get("Transpose", 0) > 0
+        assert counts.get("FusedMatMul", 0) == 0
 
-    def test_rule_converts_external_transpose_matmul(self):
-        """fused_matmul_rules() fuses Transpose+MatMul for external (non-mobius) models.
+    def test_fused_matmul_rules_convert_transpose_matmul(self):
+        """fused_matmul_rules() converts Transpose(w,[1,0])+MatMul → FusedMatMul.
 
-        External models may have Transpose(weight,[1,0]) + MatMul(x, weight_t) patterns.
-        We simulate this by inlining FusedMatMul back to its Transpose+MatMul fallback
-        body, then verifying the rule fuses them back.
+        Applies to mobius models (pre-optimization raw graph) and external models alike.
         """
-        model = registry.get("qwen2")(_TINY_CONFIG)
-        pkg = build_from_module(model, _TINY_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        module = registry.get("qwen2")(_TINY_CONFIG)
+        from mobius.tasks import get_task
 
-        # Inline FusedMatMul → Transpose+MatMul to simulate an external model
-        inline_pass = InlinePass(criteria=lambda fn: fn.name == "FusedMatMul")
-        inline_pass(m)
-        # Remove the function body so rewrite() won't process it and self-loop
-        fn_key = ("com.microsoft", "FusedMatMul", "")
-        m.functions.pop(fn_key, None)
+        task = get_task("text-generation")
+        pkg = task.build(module, _TINY_CONFIG)
+        m = pkg["model"]
 
         counts_before = count_ops(m)
-        assert counts_before["Transpose"] > 0
-        assert counts_before["MatMul"] > 0
+        assert counts_before.get("MatMul", 0) > 0
         assert counts_before.get("FusedMatMul", 0) == 0
 
         rewrite(m, pattern_rewrite_rules=fused_matmul_rules())
 
         counts_after = count_ops(m)
-        assert counts_after["FusedMatMul"] > 0
+        assert counts_after.get("FusedMatMul", 0) > 0
         assert counts_after.get("MatMul", 0) == 0
 
+    def test_build_from_module_has_fused_matmul_for_default_ep(self):
+        """After build_from_module (default EP), model has FusedMatMul nodes.
+
+        build_from_module applies optimize_model which runs fused_matmul_rules
+        when caps.supports_fused_matmul is True (default EP).
+        """
+        module = registry.get("qwen2")(_TINY_CONFIG)
+        pkg = build_from_module(module, _TINY_CONFIG)
+        m = pkg["model"]
+
+        counts = count_ops(m)
+        # Default EP supports FusedMatMul → fused_matmul_rules applied
+        assert counts.get("FusedMatMul", 0) > 0
+        assert counts.get("MatMul", 0) == 0
+
     def test_fused_matmul_model_runs_with_ort(self):
-        """FusedMatMul model (direct emission from Linear) runs correctly with ORT."""
-        model = registry.get("qwen2")(_TINY_CONFIG)
-        pkg = build_from_module(model, _TINY_CONFIG)
+        """Model with FusedMatMul (from default EP optimization) runs with ORT."""
+        module = registry.get("qwen2")(_TINY_CONFIG)
+        pkg = build_from_module(module, _TINY_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
         counts = count_ops(m)
-        assert counts["FusedMatMul"] > 0
-        assert counts.get("MatMul", 0) == 0
+        assert counts.get("FusedMatMul", 0) > 0
 
         session = OnnxModelSession(m)
         feeds = make_prefill_feeds(session)
@@ -108,16 +118,16 @@ class TestFusedMatMulRules:
         """SkipNorm + FusedMatMul model runs correctly with ORT."""
         from mobius.rewrite_rules import skip_norm_rules
 
-        model = registry.get("qwen2")(_TINY_CONFIG)
-        pkg = build_from_module(model, _TINY_CONFIG)
+        module = registry.get("qwen2")(_TINY_CONFIG)
+        pkg = build_from_module(module, _TINY_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
         rewrite(m, pattern_rewrite_rules=skip_norm_rules())
 
         counts = count_ops(m)
-        assert counts["SkipSimplifiedLayerNormalization"] > 0
-        assert counts["FusedMatMul"] > 0
+        assert counts.get("SkipSimplifiedLayerNormalization", 0) > 0
+        assert counts.get("FusedMatMul", 0) > 0
         assert counts.get("MatMul", 0) == 0
 
         session = OnnxModelSession(m)
