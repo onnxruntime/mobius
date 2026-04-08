@@ -33,7 +33,6 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._build_context import get_build_dtype
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import PostGatedRMSNorm
@@ -135,10 +134,9 @@ class GatedDeltaNet(nn.Module):
         # Causal depthwise Conv1D
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
 
-        # Learnable parameters for decay computation.
-        dtype = get_build_dtype()
-        self.dt_bias = nn.Parameter([self.num_v_heads], dtype=dtype)
-        self.A_log = nn.Parameter([self.num_v_heads], dtype=dtype)
+        # Learnable parameters for decay computation
+        self.dt_bias = nn.Parameter([self.num_v_heads])
+        self.A_log = nn.Parameter([self.num_v_heads])
 
         # Gated output normalization
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
