@@ -541,16 +541,20 @@ class TestGenaiConfigGeneratorEp:
 
     def test_cuda_ep_all_blocks_have_cuda_session_options(self):
         """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, speech)."""
-        gen = GenaiConfigGenerator(
-            "phi4mm",
-            vocab_size=200064,
-            hidden_size=3072,
-            num_hidden_layers=32,
-            num_attention_heads=24,
-            num_key_value_heads=8,
-            head_dim=128,
-            ep="cuda",
-        ).with_vision(image_token_id=200010).with_speech()
+        gen = (
+            GenaiConfigGenerator(
+                "phi4mm",
+                vocab_size=200064,
+                hidden_size=3072,
+                num_hidden_layers=32,
+                num_attention_heads=24,
+                num_key_value_heads=8,
+                head_dim=128,
+                ep="cuda",
+            )
+            .with_vision(image_token_id=200010)
+            .with_speech()
+        )
         config = gen.generate()
 
         for block in ("decoder", "vision", "embedding", "speech"):
