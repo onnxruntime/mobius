@@ -133,7 +133,8 @@ def _make_hybrid_cache_inputs(
 
     Supported layer types:
         ``"full_attention"`` — standard KV cache (key + value).
-        ``"conv"`` — ShortConv conv_state only.
+        ``"lightning_attention"`` — single recurrent state only; no conv_state.
+        ``"conv"`` — ShortConv conv_state only; no SSM state.
         ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
         ``"mamba"`` / ``"mamba2"`` — conv_state + ssm_state.
         ``"mlp"`` — stateless, produces ``(None, None)`` pair.
@@ -274,6 +275,7 @@ def _register_hybrid_cache_outputs(
 
     Uses ``.key``/``.value`` for full attention layers,
     ``.recurrent_state`` for lightning attention layers (1-tuple),
+    ``.conv_state`` for ShortConv layers (1-tuple),
     ``.conv_state``/``.recurrent_state`` for linear attention layers,
     and ``.conv_state``/``.ssm_state`` for mamba/mamba2 layers.
 
