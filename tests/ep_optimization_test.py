@@ -369,7 +369,7 @@ def test_unknown_ep_raises():
 
 
 # ---------------------------------------------------------------------------
-# Standard EP: zero custom-domain nodes
+# onnx_standard EP: zero custom-domain nodes
 # ---------------------------------------------------------------------------
 
 
@@ -385,56 +385,62 @@ def _non_standard_nodes(model: ir.Model) -> list[tuple[str, str]]:
     ]
 
 
-def test_standard_ep_llama_has_no_custom_domain_nodes():
-    """'standard' EP must produce zero nodes from non-standard domains on Llama.
+def test_onnx_standard_ep_llama_has_no_custom_domain_nodes():
+    """'onnx_standard' EP must produce zero nodes from non-standard domains on Llama.
 
     Verifies that FusedMatMul (com.microsoft) is expanded via InlinePass to
     standard Transpose+MatMul, and that no GQA/PackQKV/SkipLayerNorm ops
     are added during optimization.
     """
-    pkg = _make_llama_pkg(ep="standard", dtype=ir.DataType.FLOAT)
+    pkg = _make_llama_pkg(ep="onnx_standard", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
     bad = _non_standard_nodes(model)
-    assert not bad, f"'standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    assert not bad, (
+        f"'onnx_standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    )
 
 
-def test_standard_ep_qwen2_has_no_custom_domain_nodes():
-    """'standard' EP must produce zero non-standard-domain nodes on Qwen2."""
-    pkg = _make_qwen2_pkg(ep="standard", dtype=ir.DataType.FLOAT)
+def test_onnx_standard_ep_qwen2_has_no_custom_domain_nodes():
+    """'onnx_standard' EP must produce zero non-standard-domain nodes on Qwen2."""
+    pkg = _make_qwen2_pkg(ep="onnx_standard", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
     bad = _non_standard_nodes(model)
-    assert not bad, f"'standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    assert not bad, (
+        f"'onnx_standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    )
 
 
-def test_standard_ep_qwen2_biased_has_no_custom_domain_nodes():
-    """'standard' EP must produce zero non-standard-domain nodes on Qwen2 with QKV bias."""
-    pkg = _make_qwen2_biased_pkg(ep="standard", dtype=ir.DataType.FLOAT)
+def test_onnx_standard_ep_qwen2_biased_has_no_custom_domain_nodes():
+    """'onnx_standard' EP must produce zero non-standard-domain nodes on Qwen2 with QKV bias."""
+    pkg = _make_qwen2_biased_pkg(ep="onnx_standard", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
     bad = _non_standard_nodes(model)
-    assert not bad, f"'standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    assert not bad, (
+        f"'onnx_standard' EP produced {len(bad)} non-standard-domain node(s): {bad}"
+    )
 
 
-def test_standard_ep_has_matmul_not_fused():
-    """'standard' EP must expand FusedMatMul to standard MatMul+Transpose.
+def test_onnx_standard_ep_has_matmul_not_fused():
+    """'onnx_standard' EP must expand FusedMatMul to standard MatMul+Transpose.
 
     FusedMatMul is the primary com.microsoft op emitted by Linear components.
-    After standard EP optimization, all MatMul ops should be standard.
+    After onnx_standard EP optimization, all MatMul ops should be standard.
     """
-    pkg = _make_llama_pkg(ep="standard", dtype=ir.DataType.FLOAT)
+    pkg = _make_llama_pkg(ep="onnx_standard", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
     fused_mm_count = _count_ops(model, "FusedMatMul")
     matmul_count = _count_ops(model, "MatMul")
     assert fused_mm_count == 0, (
-        f"'standard' EP should have no FusedMatMul, got {fused_mm_count}"
+        f"'onnx_standard' EP should have no FusedMatMul, got {fused_mm_count}"
     )
     assert matmul_count > 0, (
-        f"'standard' EP should have MatMul nodes after FusedMatMul expansion, got {matmul_count}"
+        f"'onnx_standard' EP should have MatMul nodes after FusedMatMul expansion, got {matmul_count}"
     )
 
 
-def test_standard_ep_has_no_gqa():
-    """'standard' EP must not produce GroupQueryAttention."""
-    pkg = _make_llama_pkg(ep="standard", dtype=ir.DataType.FLOAT)
+def test_onnx_standard_ep_has_no_gqa():
+    """'onnx_standard' EP must not produce GroupQueryAttention."""
+    pkg = _make_llama_pkg(ep="onnx_standard", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
-    assert gqa_count == 0, f"'standard' EP should have no GQA, got {gqa_count}"
+    assert gqa_count == 0, f"'onnx_standard' EP should have no GQA, got {gqa_count}"
