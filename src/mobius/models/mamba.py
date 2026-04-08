@@ -27,8 +27,6 @@ HuggingFace references: ``MambaForCausalLM``, ``Mamba2ForCausalLM``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import onnx_ir as ir
 import torch
 from onnxscript import nn
@@ -42,9 +40,6 @@ from mobius.components import (
     MambaBlock,
     RMSNorm,
 )
-
-if TYPE_CHECKING:
-    pass
 
 
 class MambaBackbone(nn.Module):

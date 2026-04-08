@@ -22,7 +22,6 @@ HuggingFace reference: ``JambaForCausalLM``.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -44,9 +43,6 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._ssm import JambaSelectiveScan
-
-if TYPE_CHECKING:
-    pass
 
 # ---------------------------------------------------------------------------
 # Decoder layers

@@ -24,6 +24,27 @@ which upcasts A_log, dt, hidden_states, B, C to float32 for these ops.
 The output and updated state are cast back to the input dtype.
 
 HuggingFace reference: ``MambaMixer`` (SSM portion).
+
+--- Float16 dtype safety: two complementary strategies ---
+
+When building with dtype=FLOAT16, HuggingFace stores all weights as float16.
+``nn.Parameter()`` defaults the type annotation to FLOAT32. This mismatch
+causes two distinct problems, each requiring a different fix:
+
+Strategy A — CastLike (for parameters used directly at their declared dtype):
+    Use ``op.CastLike(self.weight, reference_tensor)`` in forward() to insert
+    an explicit Cast from the parameter's type annotation to the actual compute
+    dtype. Constant folding sees FLOAT→FLOAT16 (a real type change) and keeps
+    the Cast, so the serialised initialiser has consistent type + data.
+    Used by: _DepthwiseConv1d (weight/bias in Conv), OffsetRMSNorm, RoPE.
+
+Strategy B — dtype= constructor arg (for parameters that must upcast to fp32):
+    Declare ``nn.Parameter([...], dtype=dtype)`` so the annotation matches the
+    HF weight dtype (e.g. FLOAT16). Any subsequent ``Cast(param, to=FLOAT)``
+    is then FLOAT16→FLOAT — a genuine type change — so constant folding does
+    NOT eliminate it. Without this, Cast(FLOAT→FLOAT) looks like an identity
+    and is removed, leaving float16 data labelled as float32 → ORT SIGABRT.
+    Used by: A_log, D, dt_bias (always upcast to fp32 for numerical stability).
 """
 
 from __future__ import annotations
@@ -181,9 +202,9 @@ class JambaSelectiveScan(SelectiveScan):
         dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__(d_inner, d_state, dt_rank, dtype=dtype)
-        self.dt_layernorm = _RMSNorm(dt_rank, eps=layer_norm_epsilon)
-        self.b_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
-        self.c_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
+        self.dt_layernorm = _RMSNorm(dt_rank, eps=layer_norm_epsilon, dtype=dtype)
+        self.b_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon, dtype=dtype)
+        self.c_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon, dtype=dtype)
 
     def _project_ssm_params(self, op, x_db):
         """Split + layernorm on dt, B, C."""
@@ -326,9 +347,17 @@ class Mamba2Scan(nn.Module):
 class _RMSNorm(nn.Module):
     """Lightweight RMSNorm for SSM params (avoids circular import)."""
 
-    def __init__(self, size: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        size: int,
+        eps: float = 1e-5,
+        dtype: ir.DataType = ir.DataType.FLOAT,
+    ):
         super().__init__()
-        self.weight = nn.Parameter([size])
+        # Use the model's compute dtype so Cast(self.weight, to=FLOAT) is not
+        # eliminated by constant folding when dtype=FLOAT16 (see module docstring
+        # comment on the two fix strategies).
+        self.weight = nn.Parameter([size], dtype=dtype)
         self._eps = eps
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
