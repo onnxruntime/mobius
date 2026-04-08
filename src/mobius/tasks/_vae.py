@@ -14,7 +14,7 @@ import onnx_ir as ir
 
 from mobius._diffusers_configs import VAEConfig
 from mobius._model_package import ModelPackage
-from mobius.tasks._base import ModelTask, _make_graph, _make_model
+from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 
 
 class VAETask(ModelTask):
@@ -22,11 +22,14 @@ class VAETask(ModelTask):
 
     name = "vae"
 
+    components = ComponentSpec(encoder="encoder", decoder="decoder")
+
     def build(
         self,
         module,
         config: VAEConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         pkg = ModelPackage()
         pkg["encoder"] = self._build_encoder_graph(module, config)
         pkg["decoder"] = self._build_decoder_graph(module, config)

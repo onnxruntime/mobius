@@ -449,6 +449,40 @@ class TestSeq2SeqTask:
         for model in pkg.values():
             assert model.producer_name == "mobius"
 
+    def test_validates_missing_encoder(self):
+        """Seq2SeqTask raises TypeError when module lacks 'encoder'."""
+        from onnxscript import nn as _nn
+
+        class NoEncoder(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        config = make_config(hidden_act="gelu", max_position_embeddings=64)
+        task = Seq2SeqTask()
+        with pytest.raises(TypeError, match="encoder"):
+            task.build(NoEncoder(), config)
+
+    def test_validates_missing_decoder(self):
+        """Seq2SeqTask raises TypeError when module lacks 'decoder'."""
+        from onnxscript import nn as _nn
+
+        class NoDecoder(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        config = make_config(hidden_act="gelu", max_position_embeddings=64)
+        task = Seq2SeqTask()
+        with pytest.raises(TypeError, match="decoder"):
+            task.build(NoDecoder(), config)
+
 
 # ── DenoisingTask ────────────────────────────────────────────────────────
 
@@ -602,6 +636,33 @@ class TestVAETask:
         pkg = task.build(module, config)
         for model in pkg.values():
             assert model.producer_name == "mobius"
+
+    def test_validates_missing_encoder(self):
+        """VAETask raises TypeError when module lacks 'encoder'."""
+        from onnxscript import nn as _nn
+
+        class NoEncoder(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = _nn.Module()
+                self.quant_conv = None
+                self.post_quant_conv = None
+
+            def forward(self, op):
+                pass
+
+        from mobius._diffusers_configs import VAEConfig
+
+        config = VAEConfig(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=4,
+            block_out_channels=(32, 64),
+            layers_per_block=1,
+        )
+        task = VAETask()
+        with pytest.raises(TypeError, match="encoder"):
+            task.build(NoEncoder(), config)
 
 
 # ── FeatureExtractionTask ────────────────────────────────────────────────
@@ -1063,3 +1124,36 @@ class TestSpeechToTextTask:
         assert "logits" in output_names
         assert "present.0.key" in output_names
         assert "present.0.value" in output_names
+
+    def test_validates_missing_model_attr(self):
+        """SpeechToTextTask raises TypeError when module lacks 'model'."""
+        from onnxscript import nn as _nn
+
+        class NoModelAttr(_nn.Module):
+            def forward(self, op):
+                pass
+
+        from mobius._configs import WhisperConfig
+
+        config = WhisperConfig(
+            vocab_size=100,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            hidden_act="gelu",
+            pad_token_id=0,
+            encoder_layers=2,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=128,
+            num_mel_bins=40,
+            max_source_positions=64,
+            max_target_positions=32,
+            attn_qkv_bias=True,
+            attn_o_bias=True,
+        )
+        task = SpeechToTextTask()
+        with pytest.raises(TypeError, match="model"):
+            task.build(NoModelAttr(), config)

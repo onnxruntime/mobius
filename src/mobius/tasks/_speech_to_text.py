@@ -11,6 +11,7 @@ from onnxscript import nn
 from mobius._configs import BaseModelConfig, WhisperConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -35,11 +36,14 @@ class SpeechToTextTask(ModelTask):
     (matching the :class:`WhisperForConditionalGeneration` layout).
     """
 
+    components = ComponentSpec(model="model")
+
     def build(
         self,
         module: nn.Module,
         config: BaseModelConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         if not isinstance(config, WhisperConfig):
             raise TypeError(
                 f"SpeechToTextTask requires WhisperConfig, got {type(config).__name__}"
