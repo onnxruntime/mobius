@@ -178,11 +178,11 @@ class TestCLIInfo:
 class TestCLIBuildRuntime:
     """Test the ``--runtime`` flag on the ``build`` subcommand."""
 
-    def test_runtime_ort_genai_calls_export_for_ort_genai(self):
-        """--runtime ort-genai calls export_for_ort_genai() after building."""
+    def test_runtime_ort_genai_calls_write_ort_genai_config(self):
+        """--runtime ort-genai calls write_ort_genai_config() after building."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with mock.patch(
-                "mobius.integrations.ort_genai.export_for_ort_genai",
+                "mobius.integrations.ort_genai.write_ort_genai_config",
                 return_value={},
             ) as mock_export:
                 main(
@@ -201,11 +201,11 @@ class TestCLIBuildRuntime:
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
 
-    def test_no_runtime_does_not_call_export_for_ort_genai(self):
-        """Omitting --runtime does NOT call export_for_ort_genai()."""
+    def test_no_runtime_does_not_call_write_ort_genai_config(self):
+        """Omitting --runtime does NOT call write_ort_genai_config()."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with mock.patch(
-                "mobius.integrations.ort_genai.export_for_ort_genai"
+                "mobius.integrations.ort_genai.write_ort_genai_config"
             ) as mock_export:
                 main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
 

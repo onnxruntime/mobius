@@ -78,7 +78,7 @@ class TestCopyTokenizerFiles:
 
 
 class TestExportForOrtGenai:
-    """Unit tests for export_for_ort_genai()."""
+    """Unit tests for write_ort_genai_config()."""
 
     @staticmethod
     def _make_pkg():
@@ -103,10 +103,10 @@ class TestExportForOrtGenai:
 
     def test_genai_config_json_is_written(self, tmp_path):
         """genai_config.json is always written to the output directory."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = export_for_ort_genai(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "genai_config" in result
         assert os.path.isfile(result["genai_config"])
@@ -120,7 +120,7 @@ class TestExportForOrtGenai:
         import dataclasses
 
         from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         @dataclasses.dataclass
         class FakeVision:
@@ -146,7 +146,7 @@ class TestExportForOrtGenai:
             },
             config=FakeConfig(),
         )
-        result = export_for_ort_genai(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "processor_config" in result
         assert os.path.isfile(result["processor_config"])
@@ -156,28 +156,28 @@ class TestExportForOrtGenai:
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """processor_config.json is NOT written when pkg.config has no vision attr."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = export_for_ort_genai(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "processor_config" not in result
         assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
         with mock.patch(
             "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files"
         ) as mock_copy:
-            export_for_ort_genai(pkg, str(tmp_path), hf_model_id=None)
+            write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
         mock_copy.assert_not_called()
 
     def test_tokenizer_copied_when_model_id_provided(self, tmp_path):
         """Tokenizer files are copied when hf_model_id is provided."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
         with (
@@ -190,17 +190,17 @@ class TestExportForOrtGenai:
             mock_hf.return_value = mock.MagicMock(
                 model_type="qwen2", bos_token_id=1, eos_token_id=2, pad_token_id=0
             )
-            result = export_for_ort_genai(pkg, str(tmp_path), hf_model_id="fake/model")
+            result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id="fake/model")
 
         mock_copy.assert_called_once_with("fake/model", str(tmp_path))
         assert "tokenizer.json" in result
 
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = export_for_ort_genai(pkg, str(tmp_path), ep="default")
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="default")
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
@@ -208,10 +208,10 @@ class TestExportForOrtGenai:
 
     def test_ep_onnx_standard_normalizes_to_cpu(self, tmp_path):
         """ep='onnx-standard' is normalized to cpu (provider_options=[])."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = export_for_ort_genai(pkg, str(tmp_path), ep="onnx-standard")
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="onnx-standard")
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
@@ -219,10 +219,10 @@ class TestExportForOrtGenai:
 
     def test_ep_cuda_passes_through(self, tmp_path):
         """ep='cuda' passes through to session_options with CUDA provider."""
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = export_for_ort_genai(pkg, str(tmp_path), ep="cuda")
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
@@ -233,24 +233,24 @@ class TestExportForOrtGenai:
     def test_raises_when_pkg_config_is_none(self, tmp_path):
         """ValueError is raised when pkg.config is None."""
         from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
         with pytest.raises(ValueError, match="config"):
-            export_for_ort_genai(pkg, str(tmp_path))
+            write_ort_genai_config(pkg, str(tmp_path))
 
     def test_does_not_require_onnxruntime_genai(self, tmp_path):
-        """export_for_ort_genai works without onnxruntime-genai installed."""
+        """write_ort_genai_config works without onnxruntime-genai installed."""
         import sys
 
-        from mobius.integrations.ort_genai.auto_export import export_for_ort_genai
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
         # Remove onnxruntime_genai from sys.modules if present, then restore
         saved = sys.modules.pop("onnxruntime_genai", None)
         try:
             # Should not raise ImportError — ort-genai runtime is not needed
-            result = export_for_ort_genai(pkg, str(tmp_path))
+            result = write_ort_genai_config(pkg, str(tmp_path))
             assert "genai_config" in result
         finally:
             if saved is not None:

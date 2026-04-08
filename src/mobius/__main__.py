@@ -237,11 +237,11 @@ def _save_package(
 
     runtime = getattr(args, "runtime", None)
     if runtime == "ort-genai":
-        from mobius.integrations.ort_genai import export_for_ort_genai
+        from mobius.integrations.ort_genai import write_ort_genai_config
 
         hf_model_id = getattr(args, "model", None)
         ep = getattr(args, "execution_provider", "cpu")
-        artifacts = export_for_ort_genai(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
+        artifacts = write_ort_genai_config(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

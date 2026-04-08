@@ -5,14 +5,14 @@
 
 Two entry points:
 
-- :func:`export_for_ort_genai` — programmatic API. Takes an already-built
+- :func:`write_ort_genai_config` — programmatic API. Takes an already-built
   :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
   ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
   ``processor_config.json``) alongside the ONNX models.
 
 - :func:`auto_export` — end-to-end convenience function. Builds the model
   from a HuggingFace ID, saves the ONNX files, then calls
-  :func:`export_for_ort_genai` to write the config artifacts.
+  :func:`write_ort_genai_config` to write the config artifacts.
 
 Both functions produce a directory that ``onnxruntime-genai`` can load
 directly.
@@ -21,11 +21,11 @@ Example::
 
     # Programmatic API — build first, then export configs
     from mobius import build
-    from mobius.integrations.ort_genai import export_for_ort_genai
+    from mobius.integrations.ort_genai import write_ort_genai_config
 
     pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
     pkg.save("/output/qwen3")
-    export_for_ort_genai(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B")
+    write_ort_genai_config(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B")
 
     # End-to-end convenience
     from mobius.integrations.ort_genai.auto_export import auto_export
@@ -174,7 +174,7 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
-def export_for_ort_genai(
+def write_ort_genai_config(
     pkg: ModelPackage,
     directory: str,
     *,
@@ -220,7 +220,7 @@ def export_for_ort_genai(
     config = getattr(pkg, "config", None)
     if config is None:
         raise ValueError(
-            "export_for_ort_genai requires ModelPackage.config to be set. "
+            "write_ort_genai_config requires ModelPackage.config to be set. "
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
@@ -324,7 +324,7 @@ def auto_export(
     1. Builds the ONNX graph(s) via :func:`~mobius._builder.build`
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
-    4. Calls :func:`export_for_ort_genai` to write ``genai_config.json``,
+    4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
        tokenizer files, and ``processor_config.json``
 
     Args:
@@ -379,7 +379,7 @@ def auto_export(
     )
 
     # Write ORT-GenAI config artifacts (genai_config.json, tokenizer, processor)
-    result = export_for_ort_genai(
+    result = write_ort_genai_config(
         pkg,
         output_dir,
         hf_model_id=model_id,
