@@ -370,7 +370,7 @@ class Mamba2BlockSingle(Mamba2BlockBase):
 # =====================================================================
 
 
-def Mamba2Block(*args, **kwargs) -> Mamba2BlockBase:
+def Mamba2Block(*args, **kwargs) -> Mamba2BlockBase:  # noqa: N802
     """Instantiate the Mamba2 block variant for the current flag.
 
     Reads ``flags.mamba_scan`` at construction time and returns the

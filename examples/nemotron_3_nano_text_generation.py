@@ -54,12 +54,12 @@ import ml_dtypes
 import numpy as np
 import transformers
 
-# Suppress harmless HF warning about trust_remote_code model_type mismatch
-warnings.filterwarnings("ignore", message="You are using a model of type")
-
 from mobius import build
 from mobius._flags import override_flags
 from mobius._testing.ort_inference import OnnxModelSession
+
+# Suppress harmless HF warning about trust_remote_code model_type mismatch
+warnings.filterwarnings("ignore", message="You are using a model of type")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -94,7 +94,7 @@ def _fix_nemotron_h_dt_bias(model) -> None:
     from safetensors.torch import load_file
 
     # Keys that _init_weights corrupts and must be reloaded
-    _CORRUPTED_KEYS = {"dt_bias"}
+    _CORRUPTED_KEYS = {"dt_bias"}  # noqa: N806
 
     model_id = model.config._name_or_path
     api = HfApi()
@@ -364,7 +364,7 @@ def _apply_repetition_penalty(
     by ``penalty`` if positive, or multiplied by ``penalty`` if negative.
     This matches the HuggingFace ``RepetitionPenaltyLogitsProcessor``.
     """
-    if penalty == 1.0 or not token_ids:
+    if penalty == 1.0 or not token_ids:  # noqa: RUF069
         return logits
     logits = logits.copy()
     for tid in set(token_ids):
