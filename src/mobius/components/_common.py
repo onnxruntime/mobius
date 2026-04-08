@@ -30,8 +30,6 @@ class Linear(nn.Module):
         # so MatMul(x, w_t) computes x @ weight.T.
         # FoldTransposedInitializerPass (applied after weight loading) will
         # pre-compute this transpose and eliminate the runtime Transpose node.
-        # For EPs that support com.microsoft::FusedMatMul, the fused_matmul_rules()
-        # rewrite can convert this Transpose+MatMul back to FusedMatMul(transB=1).
         w_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, w_t)
         if self.bias is not None:

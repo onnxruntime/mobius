@@ -157,15 +157,21 @@ class TestFoldTransposedInitializerPass:
         x = ir.Value(name="x")
 
         t1 = ir.Node(
-            "", "Transpose", inputs=[weight_val],
-            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])], num_outputs=1,
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
         )
         t1.outputs[0].shape = ir.Shape([3, 2])
         t1.outputs[0].dtype = ir.DataType.FLOAT
 
         t2 = ir.Node(
-            "", "Transpose", inputs=[weight_val],
-            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])], num_outputs=1,
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
         )
         t2.outputs[0].shape = ir.Shape([3, 2])
         t2.outputs[0].dtype = ir.DataType.FLOAT

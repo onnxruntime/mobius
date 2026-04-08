@@ -281,23 +281,23 @@ class TestGroupQueryAttentionRules:
     # ---- Packed QKV tests ----
 
     def test_packed_qkv_reduces_matmul_count(self):
-        """Packing Q/K/V into one FusedMatMul removes 2 FusedMatMuls per layer."""
+        """Packing Q/K/V into one MatMul removes 2 MatMuls per layer."""
         model = registry.get("llama")(_LLAMA_CONFIG)
         pkg = build_from_module(model, _LLAMA_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
-        # Linear now emits FusedMatMul, so count FusedMatMul (not MatMul).
-        fused_before = count_ops(m)["FusedMatMul"]
+        # Linear emits Transpose+MatMul; count MatMul nodes.
+        matmul_before = count_ops(m)["MatMul"]
 
         # GQA fusion must run first; PackQKV is a separate pass.
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
-        fused_after = count_ops(m)["FusedMatMul"]
+        matmul_after = count_ops(m)["MatMul"]
         num_layers = _LLAMA_CONFIG.num_hidden_layers
-        # 3 separate Q/K/V FusedMatMuls → 1 packed FusedMatMul per layer = -2 per layer
-        assert fused_after == fused_before - 2 * num_layers
+        # 3 separate Q/K/V MatMuls → 1 packed MatMul per layer = -2 per layer
+        assert matmul_after == matmul_before - 2 * num_layers
 
     def test_packed_weight_uses_concat_node(self):
         """Packed QKV uses a graph-level Concat(w_q, w_k, w_v).
@@ -313,7 +313,7 @@ class TestGroupQueryAttentionRules:
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
-        # The packed GQA receives FusedMatMul(hidden, Concat(W_q, W_k, W_v), transB=1).
+        # The packed GQA receives MatMul(hidden, Transpose(Concat(W_q, W_k, W_v))).
         gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
         assert len(gqa_nodes) == _LLAMA_CONFIG.num_hidden_layers
 
@@ -325,10 +325,12 @@ class TestGroupQueryAttentionRules:
             assert gqa.inputs[1] is None, "GQA should be in packed mode (k=None)"
             assert gqa.inputs[2] is None, "GQA should be in packed mode (v=None)"
             packed_proj = gqa.inputs[0]
-            fused_mm = packed_proj.producer()
-            assert fused_mm is not None and fused_mm.op_type == "FusedMatMul"
-            # Weight is the packed Concat(w_q, w_k, w_v)
-            concat = fused_mm.inputs[1].producer()
+            mm = packed_proj.producer()
+            assert mm is not None and mm.op_type == "MatMul"
+            # Weight path: MatMul → Transpose → Concat(w_q, w_k, w_v)
+            transpose = mm.inputs[1].producer()
+            assert transpose is not None and transpose.op_type == "Transpose"
+            concat = transpose.inputs[0].producer()
             assert concat is not None and concat.op_type == "Concat"
             w_q, w_k, w_v = concat.inputs
             # Verify individual weight shapes via const_value (set by fill_random_weights)
@@ -338,21 +340,21 @@ class TestGroupQueryAttentionRules:
             assert tuple(w_v.const_value.shape) == (kv_dim, hidden)
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
-        """Qwen3 (QK norm) falls back; FusedMatMul count unchanged."""
+        """Qwen3 (QK norm) falls back; MatMul count unchanged after packing attempt."""
         model = registry.get("qwen3")(_QWEN3_CONFIG)
         pkg = build_from_module(model, _QWEN3_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
-        fused_before = count_ops(m)["FusedMatMul"]
+        matmul_before = count_ops(m)["MatMul"]
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
         # GQA should still be applied
         assert count_ops(m)["GroupQueryAttention"] == 2
-        # But FusedMatMul count should not decrease (no packing due to QK norm)
-        assert count_ops(m)["FusedMatMul"] == fused_before
+        # But MatMul count should not decrease (no packing due to QK norm)
+        assert count_ops(m)["MatMul"] == matmul_before
 
     def test_packed_model_runs_with_ort(self):
         """Packed-QKV GQA model runs correctly with ORT."""
@@ -397,26 +399,21 @@ class TestGroupQueryAttentionRules:
         assert result["logits"].shape == (1, 3, 256)
         session.close()
 
-    def test_packed_gqa_then_fused_matmul_runs_with_ort(self):
-        """Packing runs before fused_matmul (mirrors --optimize=all order).
-
-        Since Linear already emits FusedMatMul directly, fused_matmul_rules
-        should be a no-op here.  The packed model must still run with ORT.
-        """
+    def test_packed_gqa_count_and_runs_with_ort(self):
+        """Packing reduces MatMul count and the model still runs with ORT."""
         model = registry.get("llama")(_LLAMA_CONFIG)
         pkg = build_from_module(model, _LLAMA_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
-        fused_before = count_ops(m)["FusedMatMul"]
+        matmul_before = count_ops(m)["MatMul"]
 
-        # GQA fusion runs first, then QKV packing
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
         counts_after_gqa = count_ops(m)
         assert counts_after_gqa["GroupQueryAttention"] == 2
         num_layers = _LLAMA_CONFIG.num_hidden_layers
-        assert counts_after_gqa["FusedMatMul"] == fused_before - 2 * num_layers
+        assert counts_after_gqa["MatMul"] == matmul_before - 2 * num_layers
 
         session = OnnxModelSession(m)
         feeds = make_prefill_feeds(session)
@@ -428,22 +425,22 @@ class TestGroupQueryAttentionRules:
     # ---- Packed QKV with bias tests (Qwen2.5 / Phi3/4 style) ----
 
     def test_packed_qkv_with_bias_reduces_matmul_count(self):
-        """PackQKVWithBiasForGQA packs Q/K/V FusedMatMuls on a biased model (Qwen2-style)."""
+        """PackQKVWithBiasForGQA packs Q/K/V MatMuls on a biased model (Qwen2-style)."""
         model = registry.get("qwen2")(_QWEN2_BIAS_CONFIG)
         pkg = build_from_module(model, _QWEN2_BIAS_CONFIG)
         m = pkg["model"]
         fill_random_weights(m)
 
-        # Linear emits FusedMatMul; count those.
-        fused_before = count_ops(m)["FusedMatMul"]
+        # Linear emits Transpose+MatMul; count MatMul nodes.
+        matmul_before = count_ops(m)["MatMul"]
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
         rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
 
-        fused_after = count_ops(m)["FusedMatMul"]
+        matmul_after = count_ops(m)["MatMul"]
         num_layers = _QWEN2_BIAS_CONFIG.num_hidden_layers
-        # 3 separate Q/K/V FusedMatMuls → 1 packed FusedMatMul per layer = -2 per layer
-        assert fused_after == fused_before - 2 * num_layers
+        # 3 separate Q/K/V MatMuls → 1 packed MatMul per layer = -2 per layer
+        assert matmul_after == matmul_before - 2 * num_layers
 
     def test_packed_qkv_with_bias_uses_concat_nodes(self):
         """Biased packing emits Concat(w_q,w_k,w_v) and Concat(b_q,b_k,b_v)."""
@@ -463,23 +460,25 @@ class TestGroupQueryAttentionRules:
             assert gqa.inputs[2] is None, "GQA should be in packed mode (v=None)"
             packed_proj = gqa.inputs[0]
 
-            # Structure: Add(FusedMatMul(hidden, Concat(w_q, w_k, w_v), transB=1),
+            # Structure: Add(MatMul(hidden, Transpose(Concat(w_q, w_k, w_v))),
             #               Concat(bias_q, bias_k, bias_v))
             add_node = packed_proj.producer()
             assert add_node is not None and add_node.op_type == "Add", (
                 "Packed QKV with bias should be wrapped in Add"
             )
 
-            # Find FusedMatMul and bias Concat among Add inputs
+            # Find MatMul and bias Concat among Add inputs
             add_inputs = [i.producer() for i in add_node.inputs if i is not None]
-            fused_mm = next((n for n in add_inputs if n and n.op_type == "FusedMatMul"), None)
+            matmul = next((n for n in add_inputs if n and n.op_type == "MatMul"), None)
             bias_concat = next((n for n in add_inputs if n and n.op_type == "Concat"), None)
-            assert fused_mm is not None, "Add should contain FusedMatMul"
+            assert matmul is not None, "Add should contain MatMul"
             assert bias_concat is not None, "Add should contain bias Concat"
             assert len(bias_concat.inputs) == 3, "Bias Concat should have 3 inputs"
 
-            # Verify weight Concat (second input to FusedMatMul)
-            weight_concat = fused_mm.inputs[1].producer()
+            # Verify weight Concat (through Transpose, second input to MatMul)
+            w_transpose = matmul.inputs[1].producer()
+            assert w_transpose is not None and w_transpose.op_type == "Transpose"
+            weight_concat = w_transpose.inputs[0].producer()
             assert weight_concat is not None and weight_concat.op_type == "Concat"
             assert len(weight_concat.inputs) == 3, "Weight Concat should have 3 inputs"
 

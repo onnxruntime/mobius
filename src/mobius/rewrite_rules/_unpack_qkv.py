@@ -123,23 +123,23 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         if inputs[1] is not None or inputs[2] is not None:
             return result.fail("GQA not in packed mode — k or v is present")
 
-        # Detect bias wrapping: packed_qkv may be Add(FusedMatMul, Concat(biases)).
+        # Detect bias wrapping: packed_qkv may be Add(MatMul, Concat(biases)).
         self._bias_concat_node = None
         qkv_producer = packed_qkv.producer()
         if qkv_producer is not None and qkv_producer.op_type == "Add":
             add_inputs = qkv_producer.inputs
             if len(add_inputs) < 2 or None in add_inputs:
                 return result.fail("Add has missing inputs")
-            # Find which Add input is the matmul-like op and which is the bias Concat.
+            # Find which Add input is the matmul op and which is the bias Concat.
             left, right = add_inputs[0], add_inputs[1]
             left_prod = left.producer()
             right_prod = right.producer()
-            if left_prod is not None and left_prod.op_type in ("MatMul", "FusedMatMul"):
+            if left_prod is not None and left_prod.op_type == "MatMul":
                 matmul, bias_val = left_prod, right
-            elif right_prod is not None and right_prod.op_type in ("MatMul", "FusedMatMul"):
+            elif right_prod is not None and right_prod.op_type == "MatMul":
                 matmul, bias_val = right_prod, left
             else:
-                return result.fail("Add inputs do not include a MatMul or FusedMatMul")
+                return result.fail("Add inputs do not include a MatMul")
             # Validate the bias Concat node.
             bias_concat = bias_val.producer() if bias_val else None
             if bias_concat is None or bias_concat.op_type != "Concat":
@@ -151,32 +151,27 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                     return result.fail("Bias Concat input is not a graph parameter")
             self._bias_concat_node = bias_concat
         else:
-            # No-bias path: packed_qkv must come from MatMul or FusedMatMul directly.
+            # No-bias path: packed_qkv must come from MatMul directly.
             matmul = qkv_producer
-            if matmul is None or matmul.op_type not in ("MatMul", "FusedMatMul"):
-                return result.fail("packed_qkv not produced by MatMul or FusedMatMul")
+            if matmul is None or matmul.op_type != "MatMul":
+                return result.fail("packed_qkv not produced by MatMul")
 
         # Validate the matmul weight structure (shared for both no-bias and biased paths).
         if len(matmul.inputs) < 2:
-            return result.fail("MatMul/FusedMatMul has fewer than 2 inputs")
+            return result.fail("MatMul has fewer than 2 inputs")
         w_input = matmul.inputs[1]
         if w_input is None:
-            return result.fail("MatMul/FusedMatMul weight input is None")
+            return result.fail("MatMul weight input is None")
 
-        # FusedMatMul form: weight is Concat(W_q, W_k, W_v) directly (transB=1 handles transpose).
-        # MatMul form (legacy): weight is Transpose(Concat(W_q, W_k, W_v)).
-        if matmul.op_type == "FusedMatMul":
-            w_inner = w_input
-        else:
-            # MatMul: expect Transpose(Concat(...))
-            w_transpose = w_input.producer()
-            if w_transpose is None or w_transpose.op_type != "Transpose":
-                return result.fail("MatMul weight not produced by Transpose")
-            w_inner = w_transpose.inputs[0]
-            if w_inner is None:
-                return result.fail("Transpose input is None")
+        # MatMul form: weight is Transpose(Concat(W_q, W_k, W_v)).
+        w_transpose = w_input.producer()
+        if w_transpose is None or w_transpose.op_type != "Transpose":
+            return result.fail("MatMul weight not produced by Transpose")
+        w_inner = w_transpose.inputs[0]
+        if w_inner is None:
+            return result.fail("Transpose input is None")
 
-        # Case 1 (new): Transpose(Concat(W_q, W_k, W_v, axis=0))
+        # Case 1 (primary): Transpose(Concat(W_q, W_k, W_v, axis=0))
         concat_node = w_inner.producer()
         if concat_node is not None and concat_node.op_type == "Concat":
             if len(concat_node.inputs) != 3:
@@ -221,27 +216,23 @@ class GQAUnpackQKV(RewriteRuleClassBase):
 
     def rewrite(self, op, packed_qkv, gqa_out, present_key, present_value, **_):
         gqa_node = gqa_out.producer()
-        # Navigate through optional Add wrapper to find the matmul-like op.
+        # Navigate through optional Add wrapper to find the MatMul op.
         qkv_producer = packed_qkv.producer()
         if qkv_producer is not None and qkv_producer.op_type == "Add":
             add_inputs = qkv_producer.inputs
             left_prod = add_inputs[0].producer()
             matmul = (
                 left_prod
-                if left_prod is not None and left_prod.op_type in ("MatMul", "FusedMatMul")
+                if left_prod is not None and left_prod.op_type == "MatMul"
                 else add_inputs[1].producer()
             )
         else:
             matmul = qkv_producer
         hidden_states = matmul.inputs[0]
 
-        # Extract w_inner: for FusedMatMul the weight is the direct second input;
-        # for legacy MatMul the weight goes through a Transpose first.
+        # Extract w_inner: MatMul weight goes through Transpose(Concat(...)) or Transpose(W_qkv).
         w_input = matmul.inputs[1]
-        if matmul.op_type == "FusedMatMul":
-            w_inner = w_input
-        else:
-            w_inner = w_input.producer().inputs[0]  # Transpose → inner Concat/param
+        w_inner = w_input.producer().inputs[0]  # Transpose → inner Concat/param
 
         concat_node = w_inner.producer()
 
@@ -249,18 +240,11 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         suffix = self._counter
 
         if concat_node is not None and concat_node.op_type == "Concat":
-            # Graph-level form: Concat(w_q, w_k, w_v) — rewire directly.
+            # Graph-level form: Transpose(Concat(w_q, w_k, w_v)) — rewire directly.
             w_q, w_k, w_v = concat_node.inputs
-            if matmul.op_type == "FusedMatMul":
-                # FusedMatMul: emit FusedMatMul(hidden, w_i, transB=1) for each
-                q_mm = op.FusedMatMul(hidden_states, w_q, _domain="com.microsoft", transB=1)
-                k_mm = op.FusedMatMul(hidden_states, w_k, _domain="com.microsoft", transB=1)
-                v_mm = op.FusedMatMul(hidden_states, w_v, _domain="com.microsoft", transB=1)
-            else:
-                # Legacy MatMul: emit MatMul(hidden, Transpose(w_i))
-                q_mm = op.MatMul(hidden_states, op.Transpose(w_q, perm=[1, 0]))
-                k_mm = op.MatMul(hidden_states, op.Transpose(w_k, perm=[1, 0]))
-                v_mm = op.MatMul(hidden_states, op.Transpose(w_v, perm=[1, 0]))
+            q_mm = op.MatMul(hidden_states, op.Transpose(w_q, perm=[1, 0]))
+            k_mm = op.MatMul(hidden_states, op.Transpose(w_k, perm=[1, 0]))
+            v_mm = op.MatMul(hidden_states, op.Transpose(w_v, perm=[1, 0]))
         else:
             # Legacy form: single constant initializer — split with numpy.
             assert self._split_weights is not None
@@ -269,10 +253,6 @@ class GQAUnpackQKV(RewriteRuleClassBase):
 
             def _proj(w: np.ndarray, name: str) -> ir.Value:
                 init = op.initializer(ir.Tensor(w, name=name), name=name)
-                if matmul.op_type == "FusedMatMul":
-                    return op.FusedMatMul(
-                        hidden_states, init, _domain="com.microsoft", transB=1
-                    )
                 return op.MatMul(hidden_states, op.Transpose(init, perm=[1, 0]))
 
             q_mm = _proj(w_q_np, f"unpack_q_weight_{suffix}")

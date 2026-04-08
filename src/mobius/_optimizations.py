@@ -378,20 +378,6 @@ def optimize_model(
 
     fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
 
-    # Apply FusedMatMul fusion BEFORE registering function bodies.
-    # fused_matmul_rules() converts Transpose(weight)+MatMul → FusedMatMul(transB=1).
-    # It must run before register_function_bodies() because the FusedMatMul function
-    # body itself contains Transpose+MatMul — applying the rule after registration
-    # would create a cyclic function dependency.
-    if caps.supports_fused_matmul:
-        from onnxscript.rewriter import rewrite as _rewrite
-
-        from mobius.rewrite_rules import fused_matmul_rules as _fused_matmul_rules
-
-        _rewrite(model, pattern_rewrite_rules=list(_fused_matmul_rules()))
-        # Remove FusedMatMul from fuse_stages since we just applied it.
-        fuse_stages = [(n, r) for n, r in fuse_stages if n != "FusedMatMul"]
-
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
     from mobius.functions import register_function_bodies
@@ -410,8 +396,6 @@ def optimize_model(
             "SkipSimplifiedLayerNormalization",
         ):
             return not caps.supports_skip_layer_norm
-        if func.domain == "com.microsoft" and func.name == "FusedMatMul":
-            return not caps.supports_fused_matmul
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
         return False
