@@ -148,7 +148,8 @@ EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                provider_options={"enable_cuda_graph": "1"})
 EpCapabilities(name="onnx-standard",
                gqa_dtypes=frozenset(), qkv_pack_dtypes=frozenset(),
-               supports_fused_rope=False, supports_skip_layer_norm=False,
+               supports_fused_rope=False,  # no-op: SeparateRoPE only applies to GQA nodes, which are never emitted
+               supports_skip_layer_norm=False,
                supports_fused_matmul=False,
                supports_packed_multi_head_attention=False)
 ```
