@@ -74,7 +74,7 @@ class EpCapabilities:
         expand_all_custom_ops: When ``True``, :class:`~onnx_ir.passes.common.InlinePass`
             expands **every** registered function whose domain is not a standard
             ONNX domain (``""`` or ``"ai.onnx"``), regardless of the individual
-            ``supports_X`` flags.  Use this for the ``"onnx_standard"`` EP to
+            ``supports_X`` flags.  Use this for the ``"onnx-standard"`` EP to
             guarantee a zero-custom-op output — including parametric ops like
             ``CausalConvWithState`` and ``LinearAttention`` that are not covered
             by the individual flags.
@@ -247,13 +247,13 @@ def _register_builtins() -> None:
             enable_graph_capture=True,
             provider_options={"enable_cuda_graph": "1"},
         ),
-        # onnx_standard: ONNX-only runtime — emits zero custom-domain ops.
+        # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (FusedMatMul, SkipLayerNorm, PackedMHA) are
         # expanded via InlinePass to their standard-ONNX function bodies.
         # No GQA or QKV packing fusion is applied. Use this EP to produce
         # models that run on any conformant ONNX runtime without ORT extensions.
         EpCapabilities(
-            name="onnx_standard",
+            name="onnx-standard",
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
