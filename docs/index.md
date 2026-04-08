@@ -21,8 +21,8 @@ models/index
 :maxdepth: 2
 :caption: Execution Providers
 
-execution_providers
 ep_quickstart
+execution_providers
 ```
 
 ```{toctree}
@@ -31,15 +31,20 @@ ep_quickstart
 
 api/index
 feature-flags
-ai-model-support-strategy
 ```
 
 ```{toctree}
 :maxdepth: 2
 :caption: Design
 
-design
 design/index
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Contributing
+
+ai-model-support-strategy
 ```
 
 ```{toctree}

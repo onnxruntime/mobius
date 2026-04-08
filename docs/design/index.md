@@ -5,6 +5,7 @@ Detailed design notes and proposals for `mobius` subsystems.
 ```{toctree}
 :maxdepth: 1
 
+../design
 config-redesign
 gguf-support-proposal
 golden-infra-design
