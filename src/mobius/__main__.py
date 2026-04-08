@@ -241,9 +241,6 @@ def _save_package(
 
         hf_model_id = getattr(args, "model", None)
         ep = getattr(args, "execution_provider", "cpu")
-        # Normalize EP: "default" means no EP-specific options → use "cpu"
-        if ep == "default":
-            ep = "cpu"
         artifacts = export_for_ort_genai(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

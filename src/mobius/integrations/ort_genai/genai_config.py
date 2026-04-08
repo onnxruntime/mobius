@@ -61,14 +61,6 @@ def _default_search_params() -> dict[str, Any]:
     }
 
 
-def _default_session_options() -> dict[str, Any]:
-    """Return default ORT session options."""
-    return {
-        "log_id": "onnxruntime-genai",
-        "provider_options": [],
-    }
-
-
 def _make_session_options(ep: str) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
@@ -99,7 +91,10 @@ class GenaiConfigGenerator:
         num_attention_heads: Number of query attention heads.
         num_key_value_heads: Number of KV heads (for GQA).
         head_dim: Size per attention head.
-        context_length: Maximum context length. Defaults to 4096.
+        context_length: Minimum context length written to
+            ``genai_config.json``. Overridden upward by
+            ``max_position_embeddings`` from the model config when that
+            value is larger. Defaults to 4096.
         ep: Execution provider for ``session_options`` (e.g. ``"cpu"``,
             ``"cuda"``, ``"dml"``, ``"trt-rtx"``). Defaults to ``"cpu"``.
         bos_token_id: Beginning-of-sequence token ID.

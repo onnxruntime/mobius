@@ -227,6 +227,11 @@ def export_for_ort_genai(
 
     os.makedirs(directory, exist_ok=True)
 
+    # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
+    # that carry no EP-specific session options → treat as CPU.
+    if ep in ("default", "onnx-standard"):
+        ep = "cpu"
+
     # Resolve token IDs and ORT model type from HF config (if provided)
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
@@ -243,15 +248,27 @@ def export_for_ort_genai(
         eos_token_id = getattr(hf_config, "eos_token_id", None)
         pad_token_id = getattr(hf_config, "pad_token_id", None)
     else:
-        # Fall back to model_type from the mobius ArchitectureConfig
+        # Fall back to model_type from the mobius ArchitectureConfig.
+        # This path is taken when hf_model_id is not provided, so HF config
+        # is unavailable. The ArchitectureConfig.model_type may be absent on
+        # older configs, producing 'unknown' — ORT-GenAI may reject it.
         raw_type = getattr(config, "model_type", "unknown")
         ort_model_type = _resolve_ort_genai_model_type(raw_type)
+        if ort_model_type == "unknown":
+            logger.warning(
+                "Could not determine ORT-GenAI model type: pkg.config has no "
+                "'model_type' attribute. Pass hf_model_id to resolve it from "
+                "the HuggingFace config, or the generated genai_config.json "
+                "may not load correctly."
+            )
 
     # Detect multimodal capabilities from the package keys
     is_vlm = "vision" in pkg and "embedding" in pkg
     has_speech = "speech" in pkg
 
-    # Auto-detect phi4mm: HF model_type may be "phi" but model has speech
+    # Phi4MM quirk: HF reports model_type='phi' but the model package
+    # includes a 'speech' component that distinguishes it from plain Phi.
+    # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
 
@@ -378,20 +395,3 @@ def auto_export(
             result[name] = os.path.join(output_dir, name, "model.onnx")
 
     logger.info("Export complete: %d artifacts", len(result))
-    return result
-
-
-# ORT-GenAI model type overrides for model types whose ORT-GenAI name
-# differs from the HuggingFace model_type.
-_ORT_GENAI_MODEL_TYPE: dict[str, str] = {
-    "llama": "llama",
-    "qwen2": "qwen2",
-    "qwen3": "qwen2",
-    "phi3": "phi3",
-    "phi": "phi",
-    "phi4mm": "phi4mm",
-    "phi4_multimodal": "phi4mm",
-    "gemma": "gemma",
-    "gemma2": "gemma",
-    "mistral": "mistral",
-}
