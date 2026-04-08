@@ -78,7 +78,7 @@ class TestFoldConcatInitializersPass:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Concat" not in node_types
 
-        packed_name = "init_0__init_1__concat"
+        packed_name = "init_0__init_1_concat"
         assert packed_name in model.graph.initializers
 
         packed = model.graph.initializers[packed_name]
@@ -95,7 +95,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed_name = "init_0__init_1__init_2__concat"
+        packed_name = "init_0__init_1__init_2_concat"
         assert packed_name in model.graph.initializers
         packed = model.graph.initializers[packed_name]
         assert packed.shape == ir.Shape([12, 3])
@@ -111,7 +111,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed_name = "init_0__init_1__concat"
+        packed_name = "init_0__init_1_concat"
         packed = model.graph.initializers[packed_name]
         np.testing.assert_array_equal(
             packed.const_value.numpy(), np.concatenate([a, b], axis=1)
@@ -136,7 +136,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed = model.graph.initializers.get("init_0__init_1__concat")
+        packed = model.graph.initializers.get("init_0__init_1_concat")
         assert packed is not None
         with pytest.raises(AssertionError, match="no const_value"):
             _ = packed.const_value.numpy()
@@ -151,3 +151,36 @@ class TestFoldConcatInitializersPass:
         result2 = FoldConcatInitializersPass()(model)
         # Second run: no Concat nodes left → not modified
         assert not result2.modified
+
+    def test_mixed_dtype_not_folded(self):
+        """Concat of initializers with different dtypes is skipped with a warning."""
+        a = np.ones((4, 3), dtype=np.float32)
+        b = np.ones((4, 3), dtype=np.float16)
+        model, init_vals = _make_concat_model([a, b], axis=0)
+        # Assign mismatched dtypes explicitly so the pass sees them.
+        init_vals[0].dtype = ir.DataType.FLOAT
+        init_vals[1].dtype = ir.DataType.FLOAT16
+
+        result = FoldConcatInitializersPass()(model)
+        assert not result.modified
+
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Concat" in node_types, "Mixed-dtype Concat should not be removed"
+
+    def test_name_collision_uses_suffix(self):
+        """If the generated packed name already exists, a numeric suffix is used."""
+        a = np.ones((4, 3), dtype=np.float32)
+        b = np.ones((4, 3), dtype=np.float32)
+        model, _ = _make_concat_model([a, b], axis=0)
+
+        # Pre-register an initializer with the would-be packed name.
+        collision = ir.Value(name="init_0__init_1_concat")
+        collision.shape = ir.Shape([1])
+        collision.dtype = ir.DataType.FLOAT
+        collision.const_value = ir.tensor(np.array([0.0], dtype=np.float32))
+        model.graph.register_initializer(collision)
+
+        FoldConcatInitializersPass()(model)
+
+        # The original name is taken → pass should have used a suffixed name.
+        assert "init_0__init_1_concat_1" in model.graph.initializers

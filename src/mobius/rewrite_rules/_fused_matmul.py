@@ -3,11 +3,20 @@
 
 """Rewrite rules for fusing Transpose + MatMul into FusedMatMul.
 
-:class:`~mobius.components._common.Linear` now emits
-``com.microsoft::FusedMatMul`` directly, so these rules are **not needed
-for mobius-built models**.  They remain useful for **external models** (e.g.
-models from other exporters) that have ``Transpose(weight, perm=[1,0]) →
-MatMul(x, weight_t)`` patterns and need to be converted to FusedMatMul.
+:class:`~mobius.components._common.Linear` emits
+``Transpose(weight, perm=[1, 0]) → MatMul(x, weight_t)`` so that
+:class:`~mobius.passes.FoldTransposedInitializerPass` can pre-compute the
+transpose after weights are loaded.  For EPs that report
+``supports_fused_matmul=True``, :func:`~mobius._optimizations.optimize_model`
+applies these rules **before** registering function bodies, converting the
+``Transpose + MatMul`` pattern into
+``com.microsoft::FusedMatMul(transB=1)``.  For all other EPs the
+``FoldTransposedInitializerPass`` handles the pattern instead.
+
+These rules are therefore applied to **every mobius-built model** whose EP
+supports FusedMatMul.  They can also be applied to **external models** (e.g.
+models from other exporters) that have the same ``Transpose(weight) → MatMul``
+pattern.
 
 .. warning::
    Do not apply these rules to a model that has a ``com.microsoft::FusedMatMul``
@@ -17,8 +26,10 @@ MatMul(x, weight_t)`` patterns and need to be converted to FusedMatMul.
    would replace it with a self-recursive call, creating a cyclic dependency
    that :class:`~onnx_ir.passes.common.InlinePass` will reject.
 
-   If you need to apply this rule to a model with the function body, first
-   remove the FusedMatMul entry from ``model.functions``:
+   :func:`~mobius._optimizations.optimize_model` avoids this by applying the
+   rules **before** registering function bodies — see the inline comments
+   there.  If you apply these rules manually, ensure no FusedMatMul function
+   body is registered first, or remove it beforehand:
 
    .. code-block:: python
 

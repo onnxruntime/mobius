@@ -20,7 +20,7 @@ support requires only a new registry entry — no changes to this module.
 
 Post-weight passes
 ------------------
-:func:`fold_constants_after_weights` should be called after weights are loaded.
+:func:`fold_initializers_after_weights` should be called after weights are loaded.
 It runs :class:`~mobius.passes.FoldTransposedInitializerPass` and
 :class:`~mobius.passes.FoldConcatInitializersPass` to fold runtime Transpose and
 Concat nodes over initializers into pre-computed weights, then removes unused
@@ -32,7 +32,7 @@ from __future__ import annotations
 __all__ = [
     # Public API
     "optimize_model",
-    "fold_constants_after_weights",
+    "fold_initializers_after_weights",
     # Passes (used by tests and _builder re-exports)
     "CleanupMetadataPass",
     "SymbolicShapeInferencePass",
@@ -385,6 +385,7 @@ def optimize_model(
     # would create a cyclic function dependency.
     if caps.supports_fused_matmul:
         from onnxscript.rewriter import rewrite as _rewrite
+
         from mobius.rewrite_rules import fused_matmul_rules as _fused_matmul_rules
 
         _rewrite(model, pattern_rewrite_rules=list(_fused_matmul_rules()))
@@ -512,10 +513,12 @@ def optimize_model(
             )
 
 
-def fold_constants_after_weights(model: ir.Model) -> None:
-    """Fold constants after weights have been applied.
+def fold_initializers_after_weights(model: ir.Model) -> None:
+    """Run the full post-weight-loading pass pipeline.
 
-    This pass is intended to run after :func:`apply_weights`.  It:
+    Call this after :func:`apply_weights` has populated all initializers.
+    Despite the ``fold_*`` name, this does more than constant-folding — it
+    runs four sequential passes:
 
     1. **Folds Transpose initializers** — converts every
        ``Transpose(weight, perm=[1, 0])`` (emitted by
