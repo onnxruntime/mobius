@@ -12,12 +12,20 @@ import pytest
 
 from mobius._configs import (
     DEFAULT_INT,
+    AlibiConfig,
     ArchitectureConfig,
     AudioConfig,
+    MLAConfig,
+    MoEConfig,
+    QFormerConfig,
     QuantizationConfig,
     VisionConfig,
+    _extract_alibi_config,
     _extract_audio_config,
+    _extract_mla_config,
+    _extract_moe_config,
     _extract_mrope_fields,
+    _extract_qformer_config,
     _extract_rope_config,
     _extract_vision_config,
     _nested_rope_theta,
@@ -773,3 +781,210 @@ class TestArchitectureConfigValidate:
         msg = str(exc_info.value)
         assert "hidden_size" in msg
         assert "num_hidden_layers" in msg
+
+
+class TestExtractMoEConfig:
+    """Unit tests for _extract_moe_config helper."""
+
+    def _cfg(self, **kwargs):
+        return type("FakeHFConfig", (), kwargs)()
+
+    def test_non_moe_returns_none(self):
+        """Config with no expert count yields None."""
+        result = _extract_moe_config(self._cfg())
+        assert result is None
+
+    def test_num_local_experts_field(self):
+        """num_local_experts is the primary expert count field."""
+        result = _extract_moe_config(self._cfg(num_local_experts=8, num_experts_per_tok=2))
+        assert isinstance(result, MoEConfig)
+        assert result.num_local_experts == 8
+        assert result.num_experts_per_tok == 2
+
+    def test_num_experts_fallback(self):
+        """num_experts is accepted as a fallback for num_local_experts."""
+        result = _extract_moe_config(self._cfg(num_experts=4))
+        assert result is not None
+        assert result.num_local_experts == 4
+
+    def test_n_routed_experts_fallback(self):
+        """n_routed_experts (DeepSeek) is accepted as a fallback."""
+        result = _extract_moe_config(self._cfg(n_routed_experts=64))
+        assert result is not None
+        assert result.num_local_experts == 64
+
+    def test_intermediate_size_field(self):
+        """moe_intermediate_size in HF config maps to intermediate_size in MoEConfig."""
+        result = _extract_moe_config(
+            self._cfg(num_local_experts=8, moe_intermediate_size=1408)
+        )
+        assert result is not None
+        assert result.intermediate_size == 1408
+
+    def test_optional_fields_default(self):
+        """Optional fields use sensible defaults when absent."""
+        result = _extract_moe_config(self._cfg(num_local_experts=4))
+        assert result is not None
+        assert result.num_experts_per_tok == 1
+        assert result.intermediate_size is None
+        assert result.shared_expert_intermediate_size is None
+        assert result.n_shared_experts is None
+        assert result.first_k_dense_replace == 0
+        assert result.norm_topk_prob is True
+        assert result.scoring_func == "softmax"
+        assert result.topk_method == "greedy"
+
+    def test_full_deepseek_config(self):
+        """All DeepSeek-style MoE fields are extracted correctly."""
+        hf = self._cfg(
+            n_routed_experts=64,
+            num_experts_per_tok=6,
+            moe_intermediate_size=1408,
+            shared_expert_intermediate_size=5632,
+            n_shared_experts=2,
+            first_k_dense_replace=1,
+            n_group=4,
+            topk_group=2,
+            routed_scaling_factor=2.5,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+        )
+        result = _extract_moe_config(hf)
+        assert result is not None
+        assert result.num_local_experts == 64
+        assert result.intermediate_size == 1408
+        assert result.n_group == 4
+        assert result.topk_group == 2
+        assert result.routed_scaling_factor == 2.5
+        assert result.scoring_func == "sigmoid"
+        assert result.topk_method == "noaux_tc"
+
+
+class TestExtractMLAConfig:
+    """Unit tests for _extract_mla_config helper."""
+
+    def _cfg(self, **kwargs):
+        return type("FakeHFConfig", (), kwargs)()
+
+    def test_non_mla_returns_none(self):
+        """Config without qk_nope_head_dim/qk_rope_head_dim yields None."""
+        result = _extract_mla_config(self._cfg())
+        assert result is None
+
+    def test_standard_mla_fields(self):
+        """All MLA fields are extracted into MLAConfig."""
+        hf = self._cfg(
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+        result = _extract_mla_config(hf)
+        assert isinstance(result, MLAConfig)
+        assert result.q_lora_rank == 1536
+        assert result.kv_lora_rank == 512
+        assert result.qk_nope_head_dim == 128
+        assert result.qk_rope_head_dim == 64
+        assert result.v_head_dim == 128
+
+    def test_rope_dim_only(self):
+        """Only qk_rope_head_dim present still creates MLAConfig."""
+        result = _extract_mla_config(self._cfg(qk_rope_head_dim=64))
+        assert result is not None
+        assert result.qk_rope_head_dim == 64
+        assert result.qk_nope_head_dim is None
+
+    def test_nope_dim_only(self):
+        """Only qk_nope_head_dim present still creates MLAConfig."""
+        result = _extract_mla_config(self._cfg(qk_nope_head_dim=128))
+        assert result is not None
+        assert result.qk_nope_head_dim == 128
+
+
+class TestExtractQFormerConfig:
+    """Unit tests for _extract_qformer_config helper."""
+
+    def _cfg(self, **kwargs):
+        return type("FakeHFConfig", (), kwargs)()
+
+    def test_no_qformer_returns_none(self):
+        """Config with no qformer_config yields None."""
+        result = _extract_qformer_config(self._cfg())
+        assert result is None
+
+    def test_qformer_config_as_object(self):
+        """qformer_config as a nested object is parsed correctly."""
+        qc = type(
+            "QC",
+            (),
+            {
+                "hidden_size": 768,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 12,
+                "intermediate_size": 3072,
+            },
+        )()
+        hf = self._cfg(qformer_config=qc, num_query_tokens=32)
+        result = _extract_qformer_config(hf)
+        assert isinstance(result, QFormerConfig)
+        assert result.hidden_size == 768
+        assert result.num_hidden_layers == 6
+        assert result.num_query_tokens == 32
+
+    def test_qformer_config_as_dict(self):
+        """qformer_config as a plain dict is also handled."""
+        hf = self._cfg(
+            qformer_config={
+                "hidden_size": 1024,
+                "num_hidden_layers": 12,
+                "num_attention_heads": 16,
+                "intermediate_size": 4096,
+            },
+            num_query_tokens=64,
+        )
+        result = _extract_qformer_config(hf)
+        assert result is not None
+        assert result.hidden_size == 1024
+        assert result.num_query_tokens == 64
+
+
+class TestExtractAlibiConfig:
+    """Unit tests for _extract_alibi_config helper."""
+
+    def _cfg(self, **kwargs):
+        return type("FakeHFConfig", (), kwargs)()
+
+    def test_non_alibi_model_returns_none(self):
+        """Regular config (no alibi=True, not bloom) yields None."""
+        result = _extract_alibi_config(self._cfg(), "llama")
+        assert result is None
+
+    def test_alibi_true_field(self):
+        """Config with alibi=True creates AlibiConfig."""
+        result = _extract_alibi_config(self._cfg(alibi=True), "falcon")
+        assert isinstance(result, AlibiConfig)
+
+    def test_bloom_model_type_implies_alibi(self):
+        """bloom model type always yields AlibiConfig even without alibi field."""
+        result = _extract_alibi_config(self._cfg(), "bloom")
+        assert result is not None
+
+    def test_parallel_attn_field(self):
+        """parallel_attn is extracted from config."""
+        result = _extract_alibi_config(self._cfg(alibi=True, parallel_attn=True), "falcon")
+        assert result is not None
+        assert result.parallel_attn is True
+
+    def test_dual_ln_field(self):
+        """dual_ln is extracted from config."""
+        result = _extract_alibi_config(self._cfg(alibi=True, dual_ln=True), "falcon")
+        assert result is not None
+        assert result.dual_ln is True
+
+    def test_defaults_when_fields_absent(self):
+        """parallel_attn and dual_ln default to False when absent."""
+        result = _extract_alibi_config(self._cfg(alibi=True), "mpt")
+        assert result is not None
+        assert result.parallel_attn is False
+        assert result.dual_ln is False

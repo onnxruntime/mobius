@@ -73,9 +73,7 @@ class Qwen3NextMoEBlock(nn.Module):
             norm_topk_prob=moe.norm_topk_prob,
         )
 
-        expert_config = dataclasses.replace(
-            config, intermediate_size=moe.moe_intermediate_size
-        )
+        expert_config = dataclasses.replace(config, intermediate_size=moe.intermediate_size)
         self.experts = nn.ModuleList([MLP(expert_config) for _ in range(num_experts)])
 
         shared_config = dataclasses.replace(

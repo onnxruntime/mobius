@@ -29,7 +29,7 @@ from PIL import Image
 from transformers.cache_utils import DynamicCache
 
 from mobius import build, models
-from mobius._configs import ArchitectureConfig, VisionConfig
+from mobius._configs import ArchitectureConfig, MoEConfig, VisionConfig
 from mobius._constants import OPSET_VERSION
 from mobius._testing.comparison import (
     assert_generation_match,
@@ -2525,19 +2525,18 @@ def test_ocr2_3model_weight_routing():
         rms_norm_eps=1e-6,
         rope_type="default",
         rope_theta=10000.0,
-        qk_nope_head_dim=0,
-        qk_rope_head_dim=0,
-        v_head_dim=0,
-        num_local_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        n_group=1,
-        topk_group=1,
-        routed_scaling_factor=1.0,
-        scoring_func="softmax",
-        topk_method="greedy",
-        first_k_dense_replace=1,
-        n_shared_experts=2,
+        moe=MoEConfig(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            intermediate_size=32,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            scoring_func="softmax",
+            topk_method="greedy",
+            first_k_dense_replace=1,
+            n_shared_experts=2,
+        ),
         image_token_id=100015,
     )
 
@@ -2661,19 +2660,18 @@ def test_ocr2_3model_graph_all_weights_assigned():
         rms_norm_eps=1e-6,
         rope_type="default",
         rope_theta=10000.0,
-        qk_nope_head_dim=0,
-        qk_rope_head_dim=0,
-        v_head_dim=0,
-        num_local_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        n_group=1,
-        topk_group=1,
-        routed_scaling_factor=1.0,
-        scoring_func="softmax",
-        topk_method="greedy",
-        first_k_dense_replace=1,
-        n_shared_experts=2,
+        moe=MoEConfig(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            intermediate_size=32,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            scoring_func="softmax",
+            topk_method="greedy",
+            first_k_dense_replace=1,
+            n_shared_experts=2,
+        ),
         image_token_id=100015,
         vision=VisionConfig(image_size=1024),
         dtype=ir.DataType.FLOAT,

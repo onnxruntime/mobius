@@ -1376,7 +1376,7 @@ class TestBuildGraphVisionLanguage:
             moe=MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 n_group=1,
                 topk_group=1,
                 routed_scaling_factor=1.0,

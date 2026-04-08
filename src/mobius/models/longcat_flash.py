@@ -233,14 +233,14 @@ class _LongcatFlashMoE(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         assert config.moe is not None
-        assert config.moe.moe_intermediate_size is not None
+        assert config.moe.intermediate_size is not None
         self.n_routed_experts = config.moe.num_local_experts
         self.zero_expert_num = getattr(config, "zero_expert_num", 0)
         total_experts = self.n_routed_experts + self.zero_expert_num
         self.router = _LongcatFlashRouter(config, total_experts)
         # Only real experts have projection weights
         expert_config = dataclasses.replace(
-            config, intermediate_size=config.moe.moe_intermediate_size
+            config, intermediate_size=config.moe.intermediate_size
         )
         self.experts = nn.ModuleList(
             [MLP(expert_config) for _ in range(self.n_routed_experts)]

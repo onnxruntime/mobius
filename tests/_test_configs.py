@@ -172,7 +172,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 shared_expert_intermediate_size=32,
                 norm_topk_prob=True,
             ),
@@ -410,7 +410,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=128,
+                intermediate_size=128,
                 shared_expert_intermediate_size=64,
             ),
             "attn_qkv_bias": True,
@@ -421,7 +421,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "qwen3_moe",
         {
             "moe": MoEConfig(
-                num_local_experts=4, num_experts_per_tok=2, moe_intermediate_size=128
+                num_local_experts=4, num_experts_per_tok=2, intermediate_size=128
             ),
             "attn_qk_norm": True,
         },
@@ -437,7 +437,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 shared_expert_intermediate_size=32,
             ),
             "linear_num_value_heads": 4,
@@ -493,7 +493,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 n_group=2,
                 topk_group=1,
                 routed_scaling_factor=2.5,
@@ -528,7 +528,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 n_group=2,
                 topk_group=1,
                 routed_scaling_factor=1.0,
@@ -548,7 +548,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 n_group=1,
                 topk_group=1,
                 routed_scaling_factor=1.0,
@@ -701,7 +701,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=16,
+                intermediate_size=16,
                 routed_scaling_factor=1.0,
             ),
             "zero_expert_num": 2,
@@ -814,7 +814,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=128,
+                intermediate_size=128,
                 shared_expert_intermediate_size=128,
             ),
         },
@@ -837,7 +837,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=128,
+                intermediate_size=128,
                 shared_expert_intermediate_size=128,
             ),
         },
@@ -932,7 +932,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 shared_expert_intermediate_size=32,
                 norm_topk_prob=True,
             ),
@@ -956,7 +956,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=32,
+                intermediate_size=32,
                 shared_expert_intermediate_size=32,
                 norm_topk_prob=True,
             ),
@@ -1913,7 +1913,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "moe": MoEConfig(
                 num_local_experts=4,
                 num_experts_per_tok=2,
-                moe_intermediate_size=64,
+                intermediate_size=64,
                 first_k_dense_replace=0,
                 n_shared_experts=1,
             ),

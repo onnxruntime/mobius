@@ -327,7 +327,7 @@ class TestDeepSeekMLA:
         assert result.moe is not None
         assert result.moe.num_local_experts == 64
         assert result.moe.num_experts_per_tok == 6
-        assert result.moe.moe_intermediate_size == 1408
+        assert result.moe.intermediate_size == 1408
         assert result.moe.shared_expert_intermediate_size == 5632
         assert result.moe.n_shared_experts == 2
 

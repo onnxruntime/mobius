@@ -537,7 +537,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "longcat_flash": {
             "num_local_experts": "n_routed_experts",
             "num_experts_per_tok": "moe_topk",
-            "moe_intermediate_size": "expert_ffn_hidden_size",
+            "intermediate_size": "expert_ffn_hidden_size",
         },
     }
     if hf_model_type in expert_field_aliases:

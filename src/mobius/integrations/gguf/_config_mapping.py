@@ -72,7 +72,7 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     # MoE fields
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
-    "expert_feed_forward_length": "moe_intermediate_size",
+    "expert_feed_forward_length": "intermediate_size",
     "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
     # Hybrid (DeltaNet / Mamba + Attention) fields
     "full_attention_interval": "full_attention_interval",
@@ -268,7 +268,7 @@ def gguf_to_config(
         moe=MoEConfig(
             num_local_experts=hf_fields["num_local_experts"],
             num_experts_per_tok=hf_fields.get("num_experts_per_tok", 1),
-            moe_intermediate_size=hf_fields.get("moe_intermediate_size"),
+            intermediate_size=hf_fields.get("intermediate_size"),
             shared_expert_intermediate_size=hf_fields.get("shared_expert_intermediate_size"),
         )
         if hf_fields.get("num_local_experts")

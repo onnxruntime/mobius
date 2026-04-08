@@ -621,7 +621,7 @@ class MoEConfig:
     first_k_dense_replace: int = 0
 
     # Expert sizing
-    moe_intermediate_size: int | None = None
+    intermediate_size: int | None = None
     shared_expert_intermediate_size: int | None = None
     n_shared_experts: int | None = None
 
@@ -634,6 +634,10 @@ class MoEConfig:
     routed_scaling_factor: float = 1.0
 
     # Normalization
+    # post_feedforward_norm is MoE-specific: it applies RMSNorm to each expert's output
+    # before combining (used by Qwen3-MoE and flex_olmo). flex_olmo sets this via a
+    # post-extraction override in from_transformers() because its HF config does not
+    # expose the field directly.
     post_feedforward_norm: bool = False
 
 
@@ -718,7 +722,7 @@ def _extract_moe_config(config) -> MoEConfig | None:
     return MoEConfig(
         num_local_experts=n_experts,
         num_experts_per_tok=getattr(config, "num_experts_per_tok", 1),
-        moe_intermediate_size=getattr(config, "moe_intermediate_size", None),
+        intermediate_size=getattr(config, "moe_intermediate_size", None),
         shared_expert_intermediate_size=getattr(
             config, "shared_expert_intermediate_size", None
         ),
@@ -879,7 +883,7 @@ class ArchitectureConfig(BaseModelConfig):
     moe: MoEConfig | None = None
     mla: MLAConfig | None = None
     qformer: QFormerConfig | None = None
-    alibi_config: AlibiConfig | None = None
+    alibi: AlibiConfig | None = None
     quantization: QuantizationConfig | None = None
 
     @classmethod
@@ -1040,7 +1044,7 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             moe=_extract_moe_config(config),
             mla=_extract_mla_config(config),
-            alibi_config=_extract_alibi_config(config, model_type),
+            alibi=_extract_alibi_config(config, model_type),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
@@ -1434,9 +1438,9 @@ class LongcatFlashConfig(CausalLMConfig):
                 num_experts_per_tok=moe_topk
                 if moe_topk is not None
                 else moe.num_experts_per_tok,
-                moe_intermediate_size=expert_ffn_hidden_size
+                intermediate_size=expert_ffn_hidden_size
                 if expert_ffn_hidden_size is not None
-                else moe.moe_intermediate_size,
+                else moe.intermediate_size,
             )
             base = dataclasses.replace(base, moe=moe)
         return cls(

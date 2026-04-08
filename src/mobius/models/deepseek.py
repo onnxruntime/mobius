@@ -248,11 +248,11 @@ class _DeepSeekMoEFFN(nn.Module):
     def __init__(self, config: ArchitectureConfig, gate: nn.Module):
         super().__init__()
         assert config.moe is not None
-        assert config.moe.moe_intermediate_size is not None
+        assert config.moe.intermediate_size is not None
         self.moe = MoELayer(config, gate=gate)
-        # Shared expert uses moe_intermediate_size * n_shared_experts
+        # Shared expert uses moe.intermediate_size * n_shared_experts
         n_shared = config.moe.n_shared_experts or 1
-        shared_intermediate = config.moe.moe_intermediate_size * n_shared
+        shared_intermediate = config.moe.intermediate_size * n_shared
         self.shared_experts = _SharedExpertMLP(config, shared_intermediate)
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
