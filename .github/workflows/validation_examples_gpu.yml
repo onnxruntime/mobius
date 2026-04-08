@@ -72,28 +72,28 @@ jobs:
 
           # ── Phi ──────────────────────────────────────────────────
           run_example "phi4mm_multimodal (text mode)" \
-            python examples/phi4mm_multimodal.py --ci --mode text
+            python examples/phi4mm_multimodal.py --ci --compare-hf --mode text
 
           run_example "phi4mm_ort_genai (vision)" \
-            python examples/phi4mm_ort_genai.py --ci \
+            python examples/phi4mm_ort_genai.py --ci --compare-hf \
               --image testdata/pipeline-cat-chonk.jpeg
 
           # ── Qwen text ────────────────────────────────────────────
           run_example "qwen35_text_generation" \
-            python examples/qwen35_text_generation.py --ci \
+            python examples/qwen35_text_generation.py --ci --compare-hf \
               --device cuda --prompt "What is 2+2?"
 
           # ── Qwen vision-language ─────────────────────────────────
           run_example "qwen25_vl_ort_genai" \
-            python examples/qwen25_vl_ort_genai.py --ci \
+            python examples/qwen25_vl_ort_genai.py --ci --compare-hf \
               --image testdata/pipeline-cat-chonk.jpeg
 
           run_example "qwen3_vl_ort_genai" \
-            python examples/qwen3_vl_ort_genai.py --ci \
+            python examples/qwen3_vl_ort_genai.py --ci --compare-hf \
               --image testdata/pipeline-cat-chonk.jpeg
 
           run_example "qwen35_vl_ort_genai" \
-            python examples/qwen35_vl_ort_genai.py --ci \
+            python examples/qwen35_vl_ort_genai.py --ci --compare-hf \
               --image testdata/pipeline-cat-chonk.jpeg
 
           # ── Qwen audio (file-based, no mic/speaker) ─────────────
@@ -113,7 +113,7 @@ jobs:
 
           # ── Nemotron ─────────────────────────────────────────────
           run_example "nemotron_3_nano_text_generation" \
-            python examples/nemotron_3_nano_text_generation.py --ci \
+            python examples/nemotron_3_nano_text_generation.py --ci --compare-hf \
               --device cuda --prompt "What is 2+2?"
 
           # ── Static cache ─────────────────────────────────────────
