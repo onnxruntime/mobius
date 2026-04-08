@@ -3,22 +3,27 @@
 
 """Rewrite rules for fusing Transpose + MatMul into FusedMatMul.
 
-Every ``Linear`` layer in our generated graphs emits
-``Transpose(weight, perm=[1,0]) → MatMul(x, transposed_weight)``.
-The ``com.microsoft::FusedMatMul`` custom op absorbs the weight
-transpose via its ``transB`` attribute, eliminating one node per
-linear projection.
+:class:`~mobius.components._common.Linear` now emits
+``com.microsoft::FusedMatMul`` directly, so these rules are **not needed
+for mobius-built models**.  They remain useful for **external models** (e.g.
+models from other exporters) that have ``Transpose(weight, perm=[1,0]) →
+MatMul(x, weight_t)`` patterns and need to be converted to FusedMatMul.
 
-For a typical LLM like Qwen3-0.6B this removes **197 Transpose nodes**
-(one per Linear layer) with zero numerical change.
+.. warning::
+   Do not apply these rules to a model that has a ``com.microsoft::FusedMatMul``
+   function body registered (e.g. the default body from
+   :func:`~mobius.functions.register_function_bodies`).  The rule matches
+   the ``Transpose + MatMul`` pattern inside the function body itself and
+   would replace it with a self-recursive call, creating a cyclic dependency
+   that :class:`~onnx_ir.passes.common.InlinePass` will reject.
 
-These rules are **not applied by default**.  Apply them post-export::
+   If you need to apply this rule to a model with the function body, first
+   remove the FusedMatMul entry from ``model.functions``:
 
-    from mobius.rewrite_rules import fused_matmul_rules
-    from onnxscript.rewriter import rewrite
+   .. code-block:: python
 
-    model = build("Qwen/Qwen3-0.6B")
-    rewrite(model, pattern_rewrite_rules=fused_matmul_rules())
+       m.functions.pop(("com.microsoft", "FusedMatMul", ""), None)
+       rewrite(m, pattern_rewrite_rules=fused_matmul_rules())
 """
 
 from __future__ import annotations

@@ -28,7 +28,9 @@ represent GeLU as a chain of primitive ops.
 These rules fuse these chains into the standard ONNX ``Gelu`` op
 (opset 20+).
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for all execution providers
+(GeluFusion stage).  They can also be applied manually::
 
     from mobius.rewrite_rules import gelu_fusion_rules
     from onnxscript.rewriter import rewrite

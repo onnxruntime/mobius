@@ -9,33 +9,36 @@ This module provides the core functions for constructing ONNX models from
 - :func:`build_from_module` — Build from a module instance and config.
 - :func:`build` — Build from a HuggingFace model ID.
 - :func:`resolve_dtype` — Resolve dtype strings to ``ir.DataType``.
+
+EP capabilities are defined in :mod:`mobius._execution_providers`.
+The optimization pipeline lives in :mod:`mobius._optimizations`.
 """
 
 from __future__ import annotations
 
 __all__ = [
+    # Public build API
     "DTYPE_MAP",
     "build",
     "build_from_module",
     "resolve_dtype",
 ]
 
-import contextlib
+import dataclasses
 import logging
 
 import onnx_ir as ir
-import onnx_shape_inference
-import onnxscript.optimizer._constant_folding  # TODO(justinchuby): Expose the FoldConstantsPass from onnxscript
 import torch
 from onnx_ir import tensor_adapters
-from onnx_ir.passes import common as common_passes
 from onnxscript import nn
 
+from mobius._build_context import build_context
 from mobius._configs import (
     BaseModelConfig,
 )
-from mobius._flags import flags
+from mobius._execution_providers import ep_registry
 from mobius._model_package import ModelPackage
+from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
 from mobius.tasks import ModelTask, get_task
@@ -43,91 +46,9 @@ from mobius.tasks import ModelTask, get_task
 logger = logging.getLogger(__name__)
 
 
-class _SuppressNoConstValueWarning(logging.Filter):
-    """Filter out 'has no constant value' warnings from initializer dedup.
-
-    Mobius runs optimization passes before weight loading, so weight
-    initializers intentionally have no const_value at that point.
-    Other warnings from the pass (e.g. hash collisions) are preserved.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "has no constant value" not in record.getMessage()
-
-
-@contextlib.contextmanager
-def _suppress_dedup_empty_initializer_warnings():
-    """Temporarily suppress 'has no constant value' dedup warnings.
-
-    Scoped to the optimization pass invocation only — the filter is
-    removed when the context exits so it doesn't affect other code.
-    """
-    dedup_logger = logging.getLogger("onnx_ir.passes.common.initializer_deduplication")
-    log_filter = _SuppressNoConstValueWarning()
-    dedup_logger.addFilter(log_filter)
-    try:
-        yield
-    finally:
-        dedup_logger.removeFilter(log_filter)
-
-
 # ---------------------------------------------------------------------------
-# Public build API
+# Dtype helpers
 # ---------------------------------------------------------------------------
-
-
-class SymbolicShapeInferencePass(ir.passes.InPlacePass):
-    """ONNX IR pass that applies symbolic shape inference to all nodes."""
-
-    def __init__(self, policy: onnx_shape_inference.ShapeMergePolicy = "refine"):
-        super().__init__()
-        self.policy = policy
-
-    def call(self, model: ir.Model) -> ir.passes.PassResult:
-        onnx_shape_inference.infer_symbolic_shapes(model, policy=self.policy)
-        return ir.passes.PassResult(model, modified=True)
-
-
-class CleanupMetadataPass(ir.passes.InPlacePass):
-    """ONNX IR pass that removes redundant metadata from all nodes."""
-
-    def __init__(self):
-        self.keys_to_remove = ["pkg.onnxscript.shape_inference_error"]
-
-    def call(self, model: ir.Model) -> ir.passes.PassResult:
-        modified = False
-        for node in model.graph.all_nodes():
-            for key in self.keys_to_remove:
-                if key in node.metadata_props:
-                    modified = True
-                    del node.metadata_props[key]
-        return ir.passes.PassResult(model, modified=modified)
-
-
-_DEFAULT_PASSES = [
-    common_passes.IdentityEliminationPass(),
-    common_passes.LiftConstantsToInitializersPass(),
-    common_passes.DeduplicateInitializersPass(),
-    common_passes.CommonSubexpressionEliminationPass(),
-    common_passes.RemoveUnusedNodesPass(),
-    common_passes.RemoveUnusedOpsetsPass(),
-    SymbolicShapeInferencePass(),
-    onnxscript.optimizer._constant_folding.FoldConstantsPass(
-        shape_inference=False, input_size_limit=8192, output_size_limit=512 * 512
-    ),
-    CleanupMetadataPass(),
-]
-
-
-def _optimize(model: ir.Model) -> None:
-    """Apply default optimization passes to a model in-place."""
-    pass_ = ir.passes.PassManager(_DEFAULT_PASSES, steps=2)
-    if flags.suppress_dedup_warning:
-        with _suppress_dedup_empty_initializer_warnings():
-            pass_(model)
-    else:
-        pass_(model)
-
 
 # Mapping of short dtype names to ONNX IR dtypes
 DTYPE_MAP: dict[str, ir.DataType] = {
@@ -182,10 +103,32 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
             param.const_value = tensor_adapters.TorchTensor(cast_tensor)
 
 
+# Map ModelPackage entry names to semantic model roles.
+# GQA fusion is only applied to "decoder" role models.
+_MODEL_ROLE_MAP: dict[str, str] = {
+    "model": "decoder",
+    "decoder": "decoder",
+    "vision": "vision",
+    "embedding": "embedding",
+    "encoder": "encoder",
+    # Audio sub-models are encoder-role; must not receive decoder-only fusions.
+    "audio_encoder": "encoder",
+    "speech": "encoder",
+}
+
+
+# ---------------------------------------------------------------------------
+# Build API
+# ---------------------------------------------------------------------------
+
+
 def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
     task: str | ModelTask = "text-generation",
+    *,
+    execution_provider: str = "default",
+    trace_optimization: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -202,6 +145,21 @@ def build_from_module(
             to catch invalid fields early.
         task: The model task. Either a task name string
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
+        execution_provider: Target execution provider for EP-aware
+            optimizations. Defaults to ``"default"``, which applies standard
+            fusions (SkipNorm, FusedMatMul, Gelu) but no EP-specific vendor
+            ops (no GQA, no PackQKV). Custom ops like
+            ``com.microsoft::FusedMatMul`` and
+            ``com.microsoft::SkipLayerNormalization`` are present but carry
+            portable ONNX function bodies as fallbacks. Accepted values are
+            the names returned by ``ep_registry`` (e.g. ``"cpu"``,
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``). Controls
+            which fusion, lowering, and structural passes are applied; in
+            particular, ``"webgpu"`` uses concrete (non-symbolic) input
+            dimensions.
+        trace_optimization: When ``True``, log step-by-step diagnostic
+            output at INFO level for each optimization stage, showing which
+            rules matched and how many nodes were added/removed.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -230,11 +188,24 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
-    _cast_module_dtype(module, getattr(config, "dtype", ir.DataType.FLOAT))
+    dtype = getattr(config, "dtype", ir.DataType.FLOAT)
+    _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
-    pkg = resolved_task.build(module, config)
-    for model in pkg.values():
-        _optimize(model)
+    capabilities = ep_registry.require(execution_provider)
+    with build_context(capabilities, dtype):
+        pkg = resolved_task.build(module, config)
+
+    for name, model in pkg.items():
+        # Resolve role from the task first, then fall back to the global name map.
+        # This ensures encoder-only tasks (e.g. ViT, BERT) don't get GQA fusion.
+        role = resolved_task.model_roles.get(name) or _MODEL_ROLE_MAP.get(name, "decoder")
+        optimize_model(
+            model,
+            ep=execution_provider,
+            dtype=dtype,
+            model_role=role,
+            trace=trace_optimization,
+        )
     return pkg
 
 
@@ -246,6 +217,8 @@ def build(
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
     trust_remote_code: bool = False,
+    execution_provider: str = "default",
+    trace_optimization: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -278,6 +251,17 @@ def build(
         load_weights: Whether to download and apply weights from HuggingFace.
         trust_remote_code: Whether to trust remote code when loading the
             HuggingFace config.
+        execution_provider: Target execution provider for EP-aware
+            optimizations. Defaults to ``"default"``, which produces
+            portable ONNX with no vendor-specific ops. Accepted values are
+            the names returned by ``ep_registry`` (e.g. ``"cpu"``,
+            ``"cuda"``, ``"dml"``, ``"webgpu"``, ``"trt-rtx"``). Controls
+            which fusion and lowering passes are applied during graph
+            optimization; ``"webgpu"`` additionally uses concrete (non-
+            symbolic) input dimensions.
+        trace_optimization: When ``True``, log step-by-step diagnostic
+            output at INFO level for each optimization stage. See
+            :func:`build_from_module` for details.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -302,8 +286,6 @@ def build(
         task = CausalLMTask(static_cache=True, max_seq_len=2048)
         pkg = build("meta-llama/Llama-3-8B", task=task)
     """
-    import dataclasses
-
     import transformers
 
     from mobius._config_resolver import (
@@ -331,6 +313,7 @@ def build(
             )
 
     model_type = hf_config.model_type
+
     parent_config = hf_config
     if hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
@@ -379,9 +362,14 @@ def build(
         task = _default_task_for_model(model_type)
 
     model_module = module_class(config)
-    pkg = build_from_module(model_module, config, task)
+    pkg = build_from_module(
+        model_module,
+        config,
+        task,
+        execution_provider=execution_provider,
+        trace_optimization=trace_optimization,
+    )
 
-    # Set graph names
     for name, model in pkg.items():
         model.graph.name = f"{model_id}/{name}"
 

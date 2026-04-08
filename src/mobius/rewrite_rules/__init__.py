@@ -1,10 +1,11 @@
 # Copyright (c) ONNX Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rewrite rules for optional graph transformations.
+"""Rewrite rules for graph transformations.
 
-These rules are **not applied by default**. Users can apply them after
-model export to replace standard ONNX patterns with optimised custom ops.
+These rules are applied automatically by :func:`~mobius._optimizations.optimize_model`
+for the relevant execution provider and dtype. They can also be applied
+manually after model export:
 
 Example::
 
@@ -29,24 +30,32 @@ Example::
 
 __all__ = [
     "bias_gelu_rules",
+    "eliminate_shape_rules",
     "fused_matmul_rules",
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "layer_norm_fusion_rules",
+    "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
+    "separate_rope_rules",
     "skip_layer_norm_rules",
     "skip_norm_rules",
+    "unpack_qkv_rules",
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
+from mobius.rewrite_rules._eliminate_shape import eliminate_shape_rules
 from mobius.rewrite_rules._fused_matmul import fused_matmul_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
+    pack_qkv_for_gqa_rules,
 )
 from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
 from mobius.rewrite_rules._packed_attention import packed_attention_rules
+from mobius.rewrite_rules._separate_rope import separate_rope_rules
 from mobius.rewrite_rules._skip_layer_norm import skip_layer_norm_rules
 from mobius.rewrite_rules._skip_norm import skip_norm_rules
+from mobius.rewrite_rules._unpack_qkv import unpack_qkv_rules

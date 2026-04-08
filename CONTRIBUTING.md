@@ -92,6 +92,33 @@ Within the `components/` package itself, private cross-imports
   that may not be installed (e.g. `transformers`, `safetensors`), or
   (c) docstring examples.
 
+### Zero protobuf operations
+
+**Never use `onnx.helper`, `onnx.TensorProto`, `onnx.ModelProto`, or any
+`onnx_proto` / protobuf construction APIs anywhere in this codebase.**
+
+Always use `onnx_ir` to construct ONNX models (`onnxscript.ir` is a
+deprecated alias — do not use it):
+
+```python
+# Good — onnx_ir APIs
+import onnx_ir as ir
+
+graph = ir.Graph(...)
+node = ir.Node("", "MatMul", inputs=[a, b])
+func = ir.Function(domain="com.microsoft", name="MyOp")
+tensor = ir.Tensor(np.array([1.0], dtype=np.float32))
+
+# Bad — protobuf construction (forbidden)
+import onnx
+node = onnx.helper.make_node("MatMul", inputs=["a", "b"], outputs=["c"])
+graph = onnx.helper.make_graph(nodes, "my_graph", inputs, outputs)
+tensor = onnx.TensorProto()
+```
+
+This rule applies to all code: models, components, tasks, rewrite rules,
+tests, fixtures, and utilities. No exceptions.
+
 ### Model architecture modules
 
 Each model file in `models/` should:
