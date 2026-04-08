@@ -13,8 +13,10 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
     _register_kv_cache_outputs,
 )
 
