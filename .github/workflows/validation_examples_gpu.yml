@@ -1,6 +1,8 @@
 name: GPU Examples
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
