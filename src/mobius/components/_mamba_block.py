@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
@@ -34,7 +35,7 @@ from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -87,6 +88,7 @@ class MambaBlock(nn.Module):
         d_state: int = 16,
         dt_rank: int | None = None,
         conv_kernel: int = 4,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.d_model = d_model
@@ -103,7 +105,7 @@ class MambaBlock(nn.Module):
         self.conv1d = _DepthwiseConv1d(d_inner, conv_kernel, bias=True)
 
         # Core SSM component
-        self.ssm = SelectiveScan(d_inner, d_state, self.dt_rank)
+        self.ssm = SelectiveScan(d_inner, d_state, self.dt_rank, dtype=dtype)
 
         # Output projection: d_inner → d_model
         self.out_proj = Linear(d_inner, d_model, bias=False)
@@ -207,6 +209,7 @@ class Mamba2Block(nn.Module):
         proj_bias: bool = False,
         eps: float = 1e-5,
         norm_group_size: int | None = None,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.d_model = d_model
@@ -222,8 +225,8 @@ class Mamba2Block(nn.Module):
         proj_size = d_inner + self.conv_dim + num_heads
         self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel, bias=conv_bias)
-        self.ssm = Mamba2Scan(num_heads, d_head, d_state, n_groups)
-        self.norm = GatedRMSNorm(d_inner, eps=eps, group_size=norm_group_size)
+        self.ssm = Mamba2Scan(num_heads, d_head, d_state, n_groups, dtype=dtype)
+        self.norm = GatedRMSNorm(d_inner, eps=eps, group_size=norm_group_size, dtype=dtype)
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
     def forward(

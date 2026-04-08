@@ -44,7 +44,13 @@ class SelectiveScan(nn.Module):
         dt_rank: Rank of the time-step projection.
     """
 
-    def __init__(self, d_inner: int, d_state: int, dt_rank: int):
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int,
+        dt_rank: int,
+        dtype: ir.DataType = ir.DataType.FLOAT,
+    ):
         super().__init__()
         self.d_inner = d_inner
         self.d_state = d_state
@@ -55,10 +61,12 @@ class SelectiveScan(nn.Module):
         # Project dt from reduced rank back to d_inner
         self.dt_proj = Linear(dt_rank, d_inner, bias=True)
 
-        # A_log: (d_inner, d_state) — log of state decay matrix
-        self.A_log = nn.Parameter([d_inner, d_state])
-        # D: (d_inner,) — skip connection / feedthrough
-        self.D = nn.Parameter([d_inner])
+        # A_log and D are always upcast to float32 in forward(). Declare with
+        # the model's compute dtype so Cast(param, to=FLOAT) is not eliminated
+        # as identity when dtype=FLOAT16 (constant folding sees FLOAT16→FLOAT,
+        # not FLOAT→FLOAT, and preserves the Cast).
+        self.A_log = nn.Parameter([d_inner, d_state], dtype=dtype)
+        self.D = nn.Parameter([d_inner], dtype=dtype)
 
     def _project_ssm_params(self, op: builder.OpBuilder, x_db):
         """Split x_proj output into dt_raw, B, C.
@@ -170,8 +178,9 @@ class JambaSelectiveScan(SelectiveScan):
         d_state: int,
         dt_rank: int,
         layer_norm_epsilon: float = 1e-5,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
-        super().__init__(d_inner, d_state, dt_rank)
+        super().__init__(d_inner, d_state, dt_rank, dtype=dtype)
         self.dt_layernorm = _RMSNorm(dt_rank, eps=layer_norm_epsilon)
         self.b_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
         self.c_layernorm = _RMSNorm(d_state, eps=layer_norm_epsilon)
@@ -214,6 +223,7 @@ class Mamba2Scan(nn.Module):
         d_head: int,
         d_state: int,
         n_groups: int = 1,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -222,9 +232,12 @@ class Mamba2Scan(nn.Module):
         self.n_groups = n_groups
         self.heads_per_group = num_heads // n_groups
 
-        self.A_log = nn.Parameter([num_heads])
-        self.D = nn.Parameter([num_heads])
-        self.dt_bias = nn.Parameter([num_heads])
+        # A_log, D, dt_bias are always upcast to float32 in forward(). Declare
+        # with the model's compute dtype so Cast(param, to=FLOAT) is not
+        # eliminated as identity by constant folding when dtype=FLOAT16.
+        self.A_log = nn.Parameter([num_heads], dtype=dtype)
+        self.D = nn.Parameter([num_heads], dtype=dtype)
+        self.dt_bias = nn.Parameter([num_heads], dtype=dtype)
 
     def forward(
         self,

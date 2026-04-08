@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -43,7 +44,7 @@ from mobius.components import (
 )
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass
 
 
 class MambaBackbone(nn.Module):
@@ -66,6 +67,7 @@ class MambaBackbone(nn.Module):
                     dt_rank=config.time_step_rank,
                     conv_kernel=config.conv_kernel,
                     layer_norm_epsilon=config.layer_norm_epsilon,
+                    dtype=config.dtype,
                 )
                 for _ in range(config.num_hidden_layers)
             ]
@@ -117,6 +119,7 @@ class _MambaResidualBlock(nn.Module):
         dt_rank: int,
         conv_kernel: int,
         layer_norm_epsilon: float,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.norm = RMSNorm(d_model, eps=layer_norm_epsilon)
@@ -126,6 +129,7 @@ class _MambaResidualBlock(nn.Module):
             d_state=d_state,
             dt_rank=dt_rank,
             conv_kernel=conv_kernel,
+            dtype=dtype,
         )
 
     def forward(
@@ -276,6 +280,7 @@ class _Mamba2ResidualBlock(nn.Module):
         conv_kernel: int,
         layer_norm_epsilon: float,
         use_conv_bias: bool = True,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.norm = RMSNorm(d_model, eps=layer_norm_epsilon)
@@ -288,6 +293,7 @@ class _Mamba2ResidualBlock(nn.Module):
             n_groups=n_groups,
             conv_kernel=conv_kernel,
             conv_bias=use_conv_bias,
+            dtype=dtype,
         )
 
     def forward(
@@ -347,6 +353,7 @@ class Mamba2Backbone(nn.Module):
                     conv_kernel=config.conv_kernel,
                     layer_norm_epsilon=config.layer_norm_epsilon,
                     use_conv_bias=config.use_conv_bias,
+                    dtype=config.dtype,
                 )
                 for _ in range(config.num_hidden_layers)
             ]

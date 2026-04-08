@@ -79,6 +79,7 @@ class BambaMambaDecoderLayer(nn.Module):
             conv_bias=config.mamba_conv_bias,
             proj_bias=config.mamba_proj_bias,
             eps=config.rms_norm_eps,
+            dtype=config.dtype,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_ff_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -71,10 +71,16 @@ class GatedRMSNorm(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         group_size: int | None = None,
+        dtype: ir.DataType = ir.DataType.FLOAT,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.weight = nn.Parameter([hidden_size])
+        # Declare weight with the model's compute dtype. When dtype=FLOAT16,
+        # the CUDA workaround path uses Cast(self.weight, to=FLOAT); if the
+        # weight were typed as FLOAT, constant folding would eliminate that
+        # Cast as identity (FLOAT→FLOAT), leaving float16 data mislabeled
+        # as float32 → ORT crash. With the correct annotation the Cast is kept.
+        self.weight = nn.Parameter([hidden_size], dtype=dtype)
         self.variance_epsilon = eps
         self.group_size = group_size
 

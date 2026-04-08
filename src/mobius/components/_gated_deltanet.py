@@ -138,9 +138,13 @@ class GatedDeltaNet(nn.Module):
         # Causal depthwise Conv1D
         self.conv1d = _DepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
 
-        # Learnable parameters for decay computation
-        self.dt_bias = nn.Parameter([self.num_v_heads])
-        self.A_log = nn.Parameter([self.num_v_heads])
+        # Learnable parameters for decay computation.
+        # Use config.dtype so the type annotation matches the HF weight dtype.
+        # Without this, Cast(dt_bias, to=FLOAT) has input_type=output_type=FLOAT
+        # (from the default annotation) and is eliminated as identity by constant
+        # folding, leaving float16 data with a float32 type label → ORT SIGABRT.
+        self.dt_bias = nn.Parameter([self.num_v_heads], dtype=config.dtype)
+        self.A_log = nn.Parameter([self.num_v_heads], dtype=config.dtype)
 
         # Gated output normalization
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
