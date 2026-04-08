@@ -47,6 +47,7 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
         # Map from original initializer name → pre-transposed ir.Value, so
         # multiple Transpose nodes using the same initializer share one result.
         folded: dict[str, ir.Value] = {}
+        folded_nodes = 0  # total Transpose nodes removed (may exceed len(folded))
         modified = False
 
         for node in list(model.graph.all_nodes()):
@@ -101,11 +102,15 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             replacement = folded[inp.name]
             out_val.replace_all_uses_with(replacement, replace_graph_outputs=True)
             model.graph.remove(node)
+            folded_nodes += 1
             modified = True
 
         if modified:
             logger.debug(
-                "FoldTransposedInitializerPass: folded %d Transpose nodes", len(folded)
+                "FoldTransposedInitializerPass: folded %d Transpose nodes"
+                " (%d unique initializers pre-transposed)",
+                folded_nodes,
+                len(folded),
             )
 
         return ir.passes.PassResult(model, modified=modified)

@@ -78,7 +78,7 @@ class TestFoldConcatInitializersPass:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Concat" not in node_types
 
-        packed_name = "init_0__init_1_concat"
+        packed_name = "init_0__init_1__axis_0__concat"
         assert packed_name in model.graph.initializers
 
         packed = model.graph.initializers[packed_name]
@@ -95,7 +95,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed_name = "init_0__init_1__init_2_concat"
+        packed_name = "init_0__init_1__init_2__axis_0__concat"
         assert packed_name in model.graph.initializers
         packed = model.graph.initializers[packed_name]
         assert packed.shape == ir.Shape([12, 3])
@@ -111,7 +111,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed_name = "init_0__init_1_concat"
+        packed_name = "init_0__init_1__axis_1__concat"
         packed = model.graph.initializers[packed_name]
         np.testing.assert_array_equal(
             packed.const_value.numpy(), np.concatenate([a, b], axis=1)
@@ -136,7 +136,7 @@ class TestFoldConcatInitializersPass:
 
         FoldConcatInitializersPass()(model)
 
-        packed = model.graph.initializers.get("init_0__init_1_concat")
+        packed = model.graph.initializers.get("init_0__init_1__axis_0__concat")
         assert packed is not None
         with pytest.raises(AssertionError, match="no const_value"):
             _ = packed.const_value.numpy()
@@ -167,20 +167,113 @@ class TestFoldConcatInitializersPass:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Concat" in node_types, "Mixed-dtype Concat should not be removed"
 
-    def test_name_collision_uses_suffix(self):
-        """If the generated packed name already exists, a numeric suffix is used."""
+    def test_same_inputs_different_axis_both_folded(self):
+        """Same inputs concatenated along two different axes produce distinct packed names."""
         a = np.ones((4, 3), dtype=np.float32)
         b = np.ones((4, 3), dtype=np.float32)
-        model, _ = _make_concat_model([a, b], axis=0)
 
-        # Pre-register an initializer with the would-be packed name.
-        collision = ir.Value(name="init_0__init_1_concat")
-        collision.shape = ir.Shape([1])
-        collision.dtype = ir.DataType.FLOAT
-        collision.const_value = ir.tensor(np.array([0.0], dtype=np.float32))
-        model.graph.register_initializer(collision)
+        # Build a model with TWO Concat nodes over the same initializers along axis=0
+        # and axis=1 respectively.  They must produce different packed names.
+        init_0 = ir.Value(name="init_0")
+        init_0.shape = ir.Shape([4, 3])
+        init_0.dtype = ir.DataType.FLOAT
+        init_0.const_value = ir.tensor(a)
 
-        FoldConcatInitializersPass()(model)
+        init_1 = ir.Value(name="init_1")
+        init_1.shape = ir.Shape([4, 3])
+        init_1.dtype = ir.DataType.FLOAT
+        init_1.const_value = ir.tensor(b)
 
-        # The original name is taken → pass should have used a suffixed name.
-        assert "init_0__init_1_concat_1" in model.graph.initializers
+        concat0 = ir.Node(
+            "",
+            "Concat",
+            inputs=[init_0, init_1],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        concat0.outputs[0].shape = ir.Shape([8, 3])
+        concat0.outputs[0].dtype = ir.DataType.FLOAT
+
+        concat1 = ir.Node(
+            "",
+            "Concat",
+            inputs=[init_0, init_1],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 1)],
+            num_outputs=1,
+        )
+        concat1.outputs[0].shape = ir.Shape([4, 6])
+        concat1.outputs[0].dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[concat0.outputs[0], concat1.outputs[0]],
+            nodes=[concat0, concat1],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(init_0)
+        graph.register_initializer(init_1)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldConcatInitializersPass()(model)
+        assert result.modified
+
+        assert "init_0__init_1__axis_0__concat" in model.graph.initializers
+        assert "init_0__init_1__axis_1__concat" in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Concat" not in node_types
+
+    def test_duplicate_concat_nodes_reuse_packed_initializer(self):
+        """Two identical Concat nodes reuse the same packed initializer."""
+        a = np.ones((4, 3), dtype=np.float32)
+        b = np.ones((4, 3), dtype=np.float32)
+
+        init_0 = ir.Value(name="init_0")
+        init_0.shape = ir.Shape([4, 3])
+        init_0.dtype = ir.DataType.FLOAT
+        init_0.const_value = ir.tensor(a)
+
+        init_1 = ir.Value(name="init_1")
+        init_1.shape = ir.Shape([4, 3])
+        init_1.dtype = ir.DataType.FLOAT
+        init_1.const_value = ir.tensor(b)
+
+        concat0 = ir.Node(
+            "",
+            "Concat",
+            inputs=[init_0, init_1],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        concat0.outputs[0].shape = ir.Shape([8, 3])
+        concat0.outputs[0].dtype = ir.DataType.FLOAT
+
+        concat1 = ir.Node(
+            "",
+            "Concat",
+            inputs=[init_0, init_1],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        concat1.outputs[0].shape = ir.Shape([8, 3])
+        concat1.outputs[0].dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[concat0.outputs[0], concat1.outputs[0]],
+            nodes=[concat0, concat1],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(init_0)
+        graph.register_initializer(init_1)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldConcatInitializersPass()(model)
+        assert result.modified
+
+        # Only one packed initializer should be registered.
+        packed_keys = [k for k in model.graph.initializers if "__concat" in k]
+        assert len(packed_keys) == 1
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Concat" not in node_types

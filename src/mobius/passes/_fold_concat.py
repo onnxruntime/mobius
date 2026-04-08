@@ -35,7 +35,7 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
     For each ``Concat`` node whose **every** input is a graph initializer:
 
-    1. A new initializer ``{name_0}__{name_1}_concat`` is registered whose
+    1. A new initializer ``{name_0}__{name_1}__axis_{axis}__concat`` is registered whose
        :class:`~onnx_ir.LazyTensor` value lazily concatenates the inputs along
        the Concat's ``axis`` attribute.
     2. All consumers of the ``Concat`` output are rewired to the new
@@ -84,18 +84,29 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 )
                 continue
 
-            # Build a name for the packed initializer from the input names.
+            # Build a name for the packed initializer from the input names and axis.
+            # The concatenated value depends on both, so include axis to avoid
+            # collisions when the same inputs are concatenated along different axes.
             input_names = [v.name for v in inputs]  # type: ignore[union-attr]
-            base_name = "__".join(input_names) + "_concat"
+            packed_name = "__".join(input_names) + f"__axis_{axis}__concat"
 
-            # Guard against name collisions with pre-existing initializers.
-            # This is rare but can happen when a model already has an initializer
-            # whose name happens to match the generated packed name.
-            packed_name = base_name
-            suffix = 1
-            while packed_name in model.graph.initializers:
-                packed_name = f"{base_name}_{suffix}"
-                suffix += 1
+            # If an equivalent packed initializer already exists, reuse it and still
+            # remove this Concat node so all eligible Concat nodes are folded.
+            if packed_name in model.graph.initializers:
+                existing_val = model.graph.initializers[packed_name]
+                out_val.replace_all_uses_with(existing_val, replace_graph_outputs=True)
+                model.graph.remove(node)
+                folded_count += 1
+                modified = True
+
+                logger.debug(
+                    "FoldConcatInitializers: reused [%s] → %r (axis=%d, shape=%s)",
+                    ", ".join(input_names),
+                    packed_name,
+                    axis,
+                    out_shape,
+                )
+                continue
 
             captured_inputs = list(inputs)  # capture for closure
 
