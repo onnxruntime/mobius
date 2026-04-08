@@ -53,7 +53,7 @@ class Phi4MMMultiModalTask(ModelTask):
         vision="vision_encoder",
         speech="speech_encoder",
         embedding="embedding",
-        model="decoder",
+        decoder="decoder",
     )
 
     def build(
@@ -67,7 +67,7 @@ class Phi4MMMultiModalTask(ModelTask):
         models["vision"] = self._build_vision(module.vision_encoder, config)
         models["speech"] = self._build_speech(module.speech_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
-        models["model"] = self._build_decoder(module.decoder, config)
+        models["decoder"] = self._build_decoder(module.decoder, config)
 
         return ModelPackage(models, config=config)
 

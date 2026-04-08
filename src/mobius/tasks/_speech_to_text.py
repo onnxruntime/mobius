@@ -36,7 +36,7 @@ class SpeechToTextTask(ModelTask):
     (matching the :class:`WhisperForConditionalGeneration` layout).
     """
 
-    components = ComponentSpec(model="model")
+    components = ComponentSpec(encoder="model.encoder", decoder="model.decoder")
 
     def build(
         self,

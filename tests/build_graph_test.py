@@ -655,8 +655,8 @@ class TestBuildGraphLoRA:
         module = model_cls(config)
         task = Phi4MMMultiModalTask()
         pkg = task.build(module, config)
-        # LoRA adapters live in the decoder model (pkg["model"])
-        decoder = pkg["model"]
+        # LoRA adapters live in the decoder model (pkg["decoder"])
+        decoder = pkg["decoder"]
 
         init_names = list(decoder.graph.initializers)
         lora_names = [n for n in init_names if "lora" in n]
@@ -817,7 +817,7 @@ class TestBuildGraphVisionLanguage:
         assert "vision" in pkg, "Should have vision model"
         assert "speech" in pkg, "Should have speech model"
         assert "embedding" in pkg, "Should have embedding model"
-        assert "model" in pkg, "Should have decoder model"
+        assert "decoder" in pkg, "Should have decoder model"
 
         # Vision model: pixel_values + image_sizes → image_features
         vision = pkg["vision"]
@@ -1500,7 +1500,7 @@ class TestBuildGraphMultiModal:
 
         # Verify 4 models in package
         assert len(pkg) == 4, f"Expected 4 models, got {len(pkg)}"
-        for key in ("vision", "speech", "embedding", "model"):
+        for key in ("vision", "speech", "embedding", "decoder"):
             assert key in pkg, f"Missing model: {key}"
 
         # Vision model has SigLIP encoder initializers
@@ -1515,8 +1515,8 @@ class TestBuildGraphMultiModal:
             "Speech model should have Conformer initializers"
         )
 
-        # Decoder model (pkg["model"]) has LoRA initializers
-        decoder_inits = list(pkg["model"].graph.initializers)
+        # Decoder model (pkg["decoder"]) has LoRA initializers
+        decoder_inits = list(pkg["decoder"].graph.initializers)
         assert any("lora" in n for n in decoder_inits), (
             "Decoder model should have LoRA initializers"
         )

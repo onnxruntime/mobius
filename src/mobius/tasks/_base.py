@@ -53,6 +53,9 @@ class ComponentSpec:
     def validate(self, module: nn.Module, task_name: str) -> None:
         """Check that all required sub-module attributes exist on *module*.
 
+        Attribute names may use dot notation to reference nested attributes,
+        e.g. ``"model.encoder"`` checks that ``module.model.encoder`` exists.
+
         Args:
             module: The module passed to ``task.build()``.
             task_name: Name of the task class (for the error message).
@@ -62,10 +65,18 @@ class ComponentSpec:
                 a message that lists every missing component and the attribute
                 name expected for each.
         """
+
+        def _has_nested(obj: object, dotted: str) -> bool:
+            for part in dotted.split("."):
+                if not hasattr(obj, part):
+                    return False
+                obj = getattr(obj, part)
+            return True
+
         missing = [
             (output_name, attr_name)
             for output_name, attr_name in self._components.items()
-            if not hasattr(module, attr_name)
+            if not _has_nested(module, attr_name)
         ]
         if not missing:
             return
@@ -141,7 +152,7 @@ class ModelTask(ABC):
     #: Optional component spec for multi-component tasks.  When set,
     #: :meth:`_validate_components` checks that all declared attributes
     #: exist on the module before building begins.
-    components: ComponentSpec | None = None
+    components: ClassVar[ComponentSpec | None] = None
 
     @abstractmethod
     def build(

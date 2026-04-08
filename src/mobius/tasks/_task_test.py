@@ -5,7 +5,7 @@
 
 Covers: CausalLM, VisionLanguage, Seq2Seq, Denoising, VAE,
 FeatureExtraction, ImageClassification, SSM, SSM2, AudioFeatureExtraction,
-ObjectDetection, SpeechToText, ComponentSpec.
+ObjectDetection, SpeechToText, SpeechLanguage, Phi4MMMultiModal, ComponentSpec.
 """
 
 from __future__ import annotations
@@ -28,7 +28,9 @@ from mobius.tasks import (
     ImageClassificationTask,
     ModelTask,
     ObjectDetectionTask,
+    Phi4MMMultiModalTask,
     Seq2SeqTask,
+    SpeechLanguageTask,
     SpeechToTextTask,
     SSM2CausalLMTask,
     SSMCausalLMTask,
@@ -226,6 +228,45 @@ class TestComponentSpec:
         task = VisionLanguageTask()
         with pytest.raises(TypeError, match="vision_encoder"):
             task.build(IncompleteVLModule(), config)
+
+    def test_speech_language_task_validates_on_build(self):
+        """SpeechLanguageTask.build() raises TypeError on missing sub-module."""
+        from onnxscript import nn as _nn
+
+        class IncompleteSpeechModule(_nn.Module):
+            """Has audio_tower but is missing embedding and decoder."""
+
+            def __init__(self):
+                super().__init__()
+                self.audio_tower = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        config = _make_multimodal_config()
+        task = SpeechLanguageTask()
+        with pytest.raises(TypeError, match="embedding"):
+            task.build(IncompleteSpeechModule(), config)
+
+    def test_phi4mm_task_validates_on_build(self):
+        """Phi4MMMultiModalTask.build() raises TypeError on missing sub-module."""
+        from onnxscript import nn as _nn
+
+        class IncompletePhi4MMModule(_nn.Module):
+            """Has vision_encoder and speech_encoder but missing embedding and decoder."""
+
+            def __init__(self):
+                super().__init__()
+                self.vision_encoder = _nn.Module()
+                self.speech_encoder = _nn.Module()
+
+            def forward(self, op):
+                pass
+
+        config = _make_multimodal_config()
+        task = Phi4MMMultiModalTask()
+        with pytest.raises(TypeError, match="embedding"):
+            task.build(IncompletePhi4MMModule(), config)
 
     def test_validate_components_noop_when_no_spec(self):
         """Tasks without components declared should not raise."""
@@ -1155,5 +1196,5 @@ class TestSpeechToTextTask:
             attn_o_bias=True,
         )
         task = SpeechToTextTask()
-        with pytest.raises(TypeError, match="model"):
+        with pytest.raises(TypeError, match=r"model\.encoder"):
             task.build(NoModelAttr(), config)
