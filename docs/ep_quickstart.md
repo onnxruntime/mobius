@@ -38,7 +38,7 @@ CLI equivalent:
 
 ```bash
 mobius build --model meta-llama/Llama-3.2-1B output/ \
-  --execution-provider cuda --dtype f16
+  --ep cuda --dtype f16
 ```
 
 ---
