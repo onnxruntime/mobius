@@ -24,38 +24,6 @@ which upcasts A_log, dt, hidden_states, B, C to float32 for these ops.
 The output and updated state are cast back to the input dtype.
 
 HuggingFace reference: ``MambaMixer`` (SSM portion).
-
---- Float16 dtype safety: two complementary strategies ---
-
-When building with dtype=FLOAT16, HuggingFace stores all weights as float16.
-``nn.Parameter()`` defaults the type annotation to FLOAT32. This mismatch
-causes two distinct problems, each requiring a different fix:
-
-Strategy A — CastLike (for parameters used directly at their declared dtype):
-    Use ``op.CastLike(self.weight, reference_tensor)`` in forward() to insert
-    an explicit Cast from the parameter's type annotation to the actual compute
-    dtype. Constant folding sees FLOAT→FLOAT16 (a real type change) and keeps
-    the Cast, so the serialised initialiser has consistent type + data.
-    Used by: _DepthwiseConv1d (weight/bias in Conv), OffsetRMSNorm, RoPE.
-
-Strategy B — get_build_dtype() in __init__ (for parameters that upcast to fp32):
-    Call ``get_build_dtype()`` from ``_build_context`` inside ``__init__`` and
-    declare ``nn.Parameter([...], dtype=dtype)`` with the result. This ensures
-    the annotation matches the HF weight dtype (e.g. FLOAT16) so that any
-    subsequent ``Cast(param, to=FLOAT)`` is FLOAT16→FLOAT — a genuine type
-    change — and constant folding does NOT eliminate it. Without this, constant
-    folding sees Cast(FLOAT→FLOAT) as an identity and removes it, leaving float16
-    data labelled as float32 → ORT SIGABRT on CUDA.
-
-    ``get_build_dtype()`` returns the correct dtype because :func:`build` wraps
-    module construction in :func:`build_context` before calling
-    ``module_class(config)``. For direct ``build_from_module`` callers who
-    construct modules outside a build context, ``_cast_module_dtype`` provides
-    the same guarantee by updating FLOAT annotations to the target dtype before
-    graph building.
-
-    Used by: A_log, D (always upcast to fp32 for numerical stability), dt_bias,
-    _RMSNorm.weight (Jamba), GatedRMSNorm.weight.
 """
 
 from __future__ import annotations
