@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 
+from mobius._weight_utils import strip_prefix
 from mobius.models.bert import BertModel
 
 # Old BERT checkpoints use gamma/beta instead of weight/bias
@@ -44,6 +45,9 @@ class LayoutLMv3Model(BertModel):
         After BERT attribute alignment, only prefix stripping and
         skipping unsupported layers remain.
         """
+        # Strip "layoutlmv3." prefix — non-layoutlmv3. keys (pooler, cls, classifier,
+        # patch_embed, etc.) are dropped by the rename function anyway.
+        state_dict = strip_prefix(state_dict, "layoutlmv3.")
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_layoutlmv3_weight(name)
@@ -53,11 +57,10 @@ class LayoutLMv3Model(BertModel):
 
 
 def _rename_layoutlmv3_weight(name: str) -> str | None:
-    """Rename HF LayoutLMv3 weight to our naming convention."""
-    # Strip layoutlmv3. prefix
-    if name.startswith("layoutlmv3."):
-        name = name[len("layoutlmv3.") :]
+    """Rename HF LayoutLMv3 weight to our naming convention.
 
+    Expects keys with the ``layoutlmv3.`` prefix already stripped.
+    """
     # Skip pooler, cls heads, visual-specific, spatial embeddings
     if name.startswith(
         (

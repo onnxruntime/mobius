@@ -12,6 +12,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import strip_prefix
 from mobius.components import FCMLP
 from mobius.components._common import Embedding, LayerNorm
 from mobius.components._encoder import EncoderAttention
@@ -105,6 +106,9 @@ class DistilBertModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # Strip "distilbert." prefix before renaming — non-distilbert. keys
+        # (vocab_projector, vocab_layer_norm, cls.*) are already dropped by the rename function.
+        state_dict = strip_prefix(state_dict, "distilbert.")
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_distilbert_weight(name)
@@ -141,11 +145,10 @@ _DISTILBERT_RENAMES = {
 
 
 def _rename_distilbert_weight(name: str) -> str | None:
-    """Rename a HF DistilBERT weight to our naming convention."""
-    # Strip "distilbert." prefix
-    if name.startswith("distilbert."):
-        name = name[len("distilbert.") :]
+    """Rename a HF DistilBERT weight to our naming convention.
 
+    Expects keys with the ``distilbert.`` prefix already stripped.
+    """
     # Skip vocab projector / MLM head
     if name.startswith(("vocab_", "cls.")):
         return None

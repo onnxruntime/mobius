@@ -26,6 +26,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import strip_prefix
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, LayerNorm, Linear
 from mobius.components._rotary_embedding import (
@@ -222,6 +223,9 @@ class ModernBertModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # Strip "model." prefix before renaming — non-model. keys (classifier., head.)
+        # are dropped by the rename function anyway.
+        state_dict = strip_prefix(state_dict, "model.")
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_modernbert_weight(name, tensor, new_state_dict)
@@ -240,13 +244,9 @@ def _rename_modernbert_weight(
 ) -> str | None:
     """Rename HF ModernBERT weight and split fused projections.
 
-    After attribute alignment, only prefix stripping, embedding
-    remapping, and fused QKV/Wi splits remain.
+    Expects keys with the ``model.`` prefix already stripped.
+    After attribute alignment, only embedding remapping and fused QKV/Wi splits remain.
     """
-    # Strip model. prefix
-    if name.startswith("model."):
-        name = name[len("model.") :]
-
     # Skip classifier heads
     if name.startswith(("classifier.", "head.")):
         return None
