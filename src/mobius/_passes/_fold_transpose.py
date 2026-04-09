@@ -32,8 +32,9 @@ logger = logging.getLogger(__name__)
 class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     """Fold ``Transpose(initializer, perm=[1, 0])`` into a pre-transposed weight.
 
-    For each ``Transpose`` node whose sole input is a graph initializer and
-    whose ``perm`` attribute is ``[1, 0]``:
+    For each ``Transpose`` node whose sole input is a graph initializer that
+    has **exactly one use** (the Transpose node itself) and whose ``perm``
+    attribute is ``[1, 0]``:
 
     1. A new initializer ``{original_name}_t`` is registered whose
        :class:`~onnx_ir.LazyTensor` value lazily transposes the original data.
@@ -41,8 +42,8 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
        initializer.
     3. The ``Transpose`` node is removed from the graph.
 
-    If multiple ``Transpose`` nodes reference the same initializer, the
-    transposed initializer is created only once and shared among all consumers.
+    Initializers with multiple consumers are skipped — renaming or removing a
+    shared initializer would silently break the other consumers.
 
     The original initializer is left in place; a subsequent
     :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (or the
@@ -69,6 +70,11 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
             # Only fold initializer inputs (not graph inputs or computed values).
             if not inp.is_initializer():
+                continue
+
+            # Skip if the initializer is shared by multiple consumers — folding
+            # would rename/remove it and silently break the other users.
+            if len(inp.uses()) != 1:
                 continue
 
             perm_attr = node.attributes.get("perm")
