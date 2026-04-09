@@ -207,6 +207,64 @@ class TestFoldTransposedInitializerPass:
         t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
         assert len(t_inits) == 1, "Should have exactly one folded initializer after two runs"
 
+    def test_non_none_value_uses_lazy_tensor(self):
+        """When const_value is present, the folded initializer wraps it in a LazyTensor.
+
+        LazyTensor defers the transpose computation until serialization, avoiding
+        holding a second full copy of the weight in memory.
+        """
+        data = np.arange(12, dtype=np.float32).reshape(4, 3)
+        model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+        FoldTransposedInitializerPass()(model)
+
+        t_val = model.graph.initializers["weight_t"]
+        assert isinstance(t_val.const_value, ir.LazyTensor), (
+            "Folded initializer should use LazyTensor for deferred computation, "
+            f"got {type(t_val.const_value)}"
+        )
+        # Value must still be numerically correct when materialised.
+        np.testing.assert_array_equal(t_val.const_value.numpy(), data.T)
+
+    def test_identity_perm_not_folded(self):
+        """Transpose with perm=[0,1] (identity) on a 2D weight is NOT folded.
+
+        Only perm=[1,0] (the true matrix transpose) is eligible for folding.
+        """
+        data = np.zeros((4, 3), dtype=np.float32)
+        weight_val = ir.Value(name="weight_id")
+        weight_val.shape = ir.Shape([4, 3])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [0, 1])],
+            num_outputs=1,
+        )
+        out = transpose_node.outputs[0]
+        out.shape = ir.Shape([4, 3])
+        out.dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[out],
+            nodes=[transpose_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+        assert "weight_id_t" not in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" in node_types, "Identity Transpose should not be removed"
+
     def test_missing_const_value_leaves_none_on_folded(self):
         """When source const_value is None, folded initializer const_value is also None.
 

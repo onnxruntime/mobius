@@ -147,6 +147,28 @@ class TestFoldConcatInitializersPass:
         assert packed.metadata_props.get("_fold_sources") == "init_0,init_1"
         assert packed.metadata_props.get("_fold_axis") == "0"
 
+    def test_all_non_none_uses_lazy_tensor(self):
+        """When all source const_values are present, the packed initializer uses LazyTensor.
+
+        LazyTensor defers np.concatenate until serialization, so the individual
+        source weights and the packed weight are not both in memory simultaneously.
+        """
+        a = np.ones((4, 8), dtype=np.float32)
+        b = np.ones((4, 8), dtype=np.float32) * 2
+        model, _ = _make_concat_model([a, b], axis=0)
+
+        FoldConcatInitializersPass()(model)
+
+        packed = model.graph.initializers["init_0__init_1__axis_0__concat"]
+        assert isinstance(packed.const_value, ir.LazyTensor), (
+            "Packed initializer should use LazyTensor for deferred computation, "
+            f"got {type(packed.const_value)}"
+        )
+        # Value must still be numerically correct when materialised.
+        np.testing.assert_array_equal(
+            packed.const_value.numpy(), np.concatenate([a, b], axis=0)
+        )
+
     def test_idempotent(self):
         """Running the pass twice does not create duplicate initializers."""
         a = np.ones((4, 3), dtype=np.float32)
