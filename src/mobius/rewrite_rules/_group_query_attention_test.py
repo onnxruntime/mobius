@@ -281,45 +281,45 @@ class TestGroupQueryAttentionRules:
     # ---- Packed QKV tests ----
 
     def test_packed_qkv_reduces_matmul_count(self):
-        """Packing Q/K/V into one MatMul removes 2 MatMuls per layer."""
-        model = registry.get("llama")(_LLAMA_CONFIG)
-        pkg = build_from_module(model, _LLAMA_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        """Packing Q/K/V into one MatMul removes 2 MatMuls per layer.
 
-        # Linear emits Transpose+MatMul; count MatMul nodes.
-        matmul_before = count_ops(m)["MatMul"]
-
-        # GQA fusion must run first; PackQKV is a separate pass.
-        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
-
-        matmul_after = count_ops(m)["MatMul"]
+        The CPU EP build runs GQA fusion + PackQKV in stage 2 (before the
+        structural fold in stage 5), so the MatMul count reduction is visible
+        by comparing a default EP build (no packing) with a CPU EP build.
+        """
         num_layers = _LLAMA_CONFIG.num_hidden_layers
+
+        m_default = build_from_module(registry.get("llama")(_LLAMA_CONFIG), _LLAMA_CONFIG)[
+            "model"
+        ]
+        matmul_default = count_ops(m_default)["MatMul"]
+
+        m_cpu = build_from_module(
+            registry.get("llama")(_LLAMA_CONFIG),
+            _LLAMA_CONFIG,
+            execution_provider="cpu",
+        )["model"]
+        matmul_packed = count_ops(m_cpu)["MatMul"]
+
         # 3 separate Q/K/V MatMuls → 1 packed MatMul per layer = -2 per layer
-        assert matmul_after == matmul_before - 2 * num_layers
+        assert matmul_packed == matmul_default - 2 * num_layers
 
     def test_packed_weight_uses_concat_node(self):
-        """Packed QKV uses a graph-level Concat(w_q, w_k, w_v).
+        """CPU EP build produces packed GQA; stage 5 folds Concat+Transpose into one initializer.
 
-        Packing must work without weight data since optimization runs
-        before apply_weights.
+        After the full CPU EP pipeline (stage 2: GQA fusion + PackQKV;
+        stage 5: FoldConcat + FoldTranspose), the packed weight is a single
+        pre-transposed initializer with fold metadata pointing to the original
+        W_q, W_k, W_v sources — no runtime Concat or Transpose nodes remain.
         """
-        model = registry.get("llama")(_LLAMA_CONFIG)
-        pkg = build_from_module(model, _LLAMA_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        m = build_from_module(
+            registry.get("llama")(_LLAMA_CONFIG),
+            _LLAMA_CONFIG,
+            execution_provider="cpu",
+        )["model"]
 
-        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
-
-        # The packed GQA receives MatMul(hidden, Transpose(Concat(W_q, W_k, W_v))).
         gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
         assert len(gqa_nodes) == _LLAMA_CONFIG.num_hidden_layers
-
-        q_dim = _LLAMA_CONFIG.num_attention_heads * _LLAMA_CONFIG.head_dim
-        kv_dim = _LLAMA_CONFIG.num_key_value_heads * _LLAMA_CONFIG.head_dim
-        hidden = _LLAMA_CONFIG.hidden_size
 
         for gqa in gqa_nodes:
             assert gqa.inputs[1] is None, "GQA should be in packed mode (k=None)"
@@ -327,17 +327,21 @@ class TestGroupQueryAttentionRules:
             packed_proj = gqa.inputs[0]
             mm = packed_proj.producer()
             assert mm is not None and mm.op_type == "MatMul"
-            # Weight path: MatMul → Transpose → Concat(w_q, w_k, w_v)
-            transpose = mm.inputs[1].producer()
-            assert transpose is not None and transpose.op_type == "Transpose"
-            concat = transpose.inputs[0].producer()
-            assert concat is not None and concat.op_type == "Concat"
-            w_q, w_k, w_v = concat.inputs
-            # Verify individual weight shapes via const_value (set by fill_random_weights)
-            assert w_q.const_value is not None
-            assert tuple(w_q.const_value.shape) == (q_dim, hidden)
-            assert tuple(w_k.const_value.shape) == (kv_dim, hidden)
-            assert tuple(w_v.const_value.shape) == (kv_dim, hidden)
+
+            # After stage 5 fold, the weight is a direct initializer — no Transpose node.
+            w = mm.inputs[1]
+            assert w is not None and w.producer() is None, (
+                "Packed weight should be a direct initializer after structural fold"
+            )
+            # The fold metadata links back to the original W_q, W_k, W_v initializers.
+            assert w.metadata_props.get("_fold_source") is not None, (
+                "Packed+transposed weight should have _fold_source metadata"
+            )
+            fold_src = m.graph.initializers.get(w.metadata_props["_fold_source"])
+            assert fold_src is not None, "_fold_source initializer should be in graph"
+            assert fold_src.metadata_props.get("_fold_sources") is not None, (
+                "Concat initializer should have _fold_sources metadata with W_q,W_k,W_v names"
+            )
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
         """Qwen3 (QK norm) falls back; MatMul count unchanged after packing attempt."""
@@ -400,22 +404,30 @@ class TestGroupQueryAttentionRules:
         session.close()
 
     def test_packed_gqa_count_and_runs_with_ort(self):
-        """Packing reduces MatMul count and the model still runs with ORT."""
-        model = registry.get("llama")(_LLAMA_CONFIG)
-        pkg = build_from_module(model, _LLAMA_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        """Packing reduces MatMul count and the model still runs with ORT.
 
-        matmul_before = count_ops(m)["MatMul"]
-
-        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
-        counts_after_gqa = count_ops(m)
-        assert counts_after_gqa["GroupQueryAttention"] == 2
+        Build with CPU EP so that stage 2 applies GQA fusion + PackQKV before
+        stage 5 runs the structural fold.  The final model has fewer MatMuls
+        (3 separate Q/K/V → 1 packed per layer) and still produces correct output.
+        """
         num_layers = _LLAMA_CONFIG.num_hidden_layers
-        assert counts_after_gqa["MatMul"] == matmul_before - 2 * num_layers
 
-        session = OnnxModelSession(m)
+        m_default = build_from_module(registry.get("llama")(_LLAMA_CONFIG), _LLAMA_CONFIG)[
+            "model"
+        ]
+        matmul_default = count_ops(m_default)["MatMul"]
+
+        m_cpu = build_from_module(
+            registry.get("llama")(_LLAMA_CONFIG),
+            _LLAMA_CONFIG,
+            execution_provider="cpu",
+        )["model"]
+        fill_random_weights(m_cpu)
+        counts_after = count_ops(m_cpu)
+        assert counts_after["GroupQueryAttention"] == num_layers
+        assert counts_after["MatMul"] == matmul_default - 2 * num_layers
+
+        session = OnnxModelSession(m_cpu)
         feeds = make_prefill_feeds(session)
         result = session.run(feeds)
         assert "logits" in result
@@ -425,32 +437,40 @@ class TestGroupQueryAttentionRules:
     # ---- Packed QKV with bias tests (Qwen2.5 / Phi3/4 style) ----
 
     def test_packed_qkv_with_bias_reduces_matmul_count(self):
-        """PackQKVWithBiasForGQA packs Q/K/V MatMuls on a biased model (Qwen2-style)."""
-        model = registry.get("qwen2")(_QWEN2_BIAS_CONFIG)
-        pkg = build_from_module(model, _QWEN2_BIAS_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        """PackQKVWithBiasForGQA packs Q/K/V MatMuls on a biased model (Qwen2-style).
 
-        # Linear emits Transpose+MatMul; count MatMul nodes.
-        matmul_before = count_ops(m)["MatMul"]
-
-        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
-
-        matmul_after = count_ops(m)["MatMul"]
+        Build with CPU EP so stage 2 fires PackQKVWithBiasForGQA before stage 5
+        applies the structural fold.  Compare against a default EP build.
+        """
         num_layers = _QWEN2_BIAS_CONFIG.num_hidden_layers
+
+        m_default = build_from_module(
+            registry.get("qwen2")(_QWEN2_BIAS_CONFIG), _QWEN2_BIAS_CONFIG
+        )["model"]
+        matmul_default = count_ops(m_default)["MatMul"]
+
+        m_cpu = build_from_module(
+            registry.get("qwen2")(_QWEN2_BIAS_CONFIG),
+            _QWEN2_BIAS_CONFIG,
+            execution_provider="cpu",
+        )["model"]
+        matmul_packed = count_ops(m_cpu)["MatMul"]
+
         # 3 separate Q/K/V MatMuls → 1 packed MatMul per layer = -2 per layer
-        assert matmul_after == matmul_before - 2 * num_layers
+        assert matmul_packed == matmul_default - 2 * num_layers
 
     def test_packed_qkv_with_bias_uses_concat_nodes(self):
-        """Biased packing emits Concat(w_q,w_k,w_v) and Concat(b_q,b_k,b_v)."""
-        model = registry.get("qwen2")(_QWEN2_BIAS_CONFIG)
-        pkg = build_from_module(model, _QWEN2_BIAS_CONFIG)
-        m = pkg["model"]
-        fill_random_weights(m)
+        """Biased packing produces packed GQA; stage 5 folds weight and bias Concat.
 
-        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
-        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+        After the full CPU EP pipeline (stage 2: PackQKVWithBiasForGQA;
+        stage 5: FoldConcat + FoldTranspose), the packed weight and bias are
+        folded initializers — no runtime Concat or Transpose nodes remain.
+        """
+        m = build_from_module(
+            registry.get("qwen2")(_QWEN2_BIAS_CONFIG),
+            _QWEN2_BIAS_CONFIG,
+            execution_provider="cpu",
+        )["model"]
 
         gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
         assert len(gqa_nodes) == _QWEN2_BIAS_CONFIG.num_hidden_layers
@@ -460,27 +480,42 @@ class TestGroupQueryAttentionRules:
             assert gqa.inputs[2] is None, "GQA should be in packed mode (v=None)"
             packed_proj = gqa.inputs[0]
 
-            # Structure: Add(MatMul(hidden, Transpose(Concat(w_q, w_k, w_v))),
-            #               Concat(bias_q, bias_k, bias_v))
+            # Structure after stage 5: Add(MatMul(hidden, qkv_t), bias_packed)
             add_node = packed_proj.producer()
             assert add_node is not None and add_node.op_type == "Add", (
                 "Packed QKV with bias should be wrapped in Add"
             )
 
-            # Find MatMul and bias Concat among Add inputs
-            add_inputs = [i.producer() for i in add_node.inputs if i is not None]
-            matmul = next((n for n in add_inputs if n and n.op_type == "MatMul"), None)
-            bias_concat = next((n for n in add_inputs if n and n.op_type == "Concat"), None)
+            # Find MatMul and the bias value among Add inputs.
+            add_ins = [i for i in add_node.inputs if i is not None]
+            matmul = next(
+                (
+                    i.producer()
+                    for i in add_ins
+                    if i.producer() and i.producer().op_type == "MatMul"
+                ),
+                None,
+            )
+            bias_val = next(
+                (i for i in add_ins if i.producer() is None),
+                None,
+            )
             assert matmul is not None, "Add should contain MatMul"
-            assert bias_concat is not None, "Add should contain bias Concat"
-            assert len(bias_concat.inputs) == 3, "Bias Concat should have 3 inputs"
+            assert bias_val is not None, "Add should contain bias initializer"
 
-            # Verify weight Concat (through Transpose, second input to MatMul)
-            w_transpose = matmul.inputs[1].producer()
-            assert w_transpose is not None and w_transpose.op_type == "Transpose"
-            weight_concat = w_transpose.inputs[0].producer()
-            assert weight_concat is not None and weight_concat.op_type == "Concat"
-            assert len(weight_concat.inputs) == 3, "Weight Concat should have 3 inputs"
+            # After stage 5, the bias Concat is folded to a direct initializer.
+            assert bias_val.metadata_props.get("_fold_sources") is not None, (
+                "Packed bias should be a folded concat initializer with _fold_sources"
+            )
+
+            # After stage 5, the weight Transpose is folded to a direct initializer.
+            w = matmul.inputs[1]
+            assert w is not None and w.producer() is None, (
+                "Packed weight should be a direct initializer after structural fold"
+            )
+            assert w.metadata_props.get("_fold_source") is not None, (
+                "Packed+transposed weight should have _fold_source metadata"
+            )
 
     def test_packed_qkv_with_bias_runs_with_ort(self):
         """Biased packed-QKV GQA model runs correctly with ORT."""

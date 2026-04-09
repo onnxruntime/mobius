@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-import pytest
 
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 
@@ -125,8 +124,12 @@ class TestFoldConcatInitializersPass:
         result = FoldConcatInitializersPass()(model)
         assert not result.modified
 
-    def test_missing_const_value_raises_on_access(self):
-        """LazyTensor raises AssertionError when weights not loaded."""
+    def test_missing_const_value_leaves_none_on_folded(self):
+        """When any source const_value is None, folded initializer const_value is also None.
+
+        The fold is still structural (Concat node removed, packed initializer registered)
+        but value computation is deferred to fold_initializers_after_weights().
+        """
         a = np.ones((4, 3), dtype=np.float32)
         b = np.ones((4, 3), dtype=np.float32)
         model, init_vals = _make_concat_model([a, b], axis=0)
@@ -137,9 +140,12 @@ class TestFoldConcatInitializersPass:
         FoldConcatInitializersPass()(model)
 
         packed = model.graph.initializers.get("init_0__init_1__axis_0__concat")
-        assert packed is not None
-        with pytest.raises(AssertionError, match="no const_value"):
-            _ = packed.const_value.numpy()
+        assert packed is not None, "packed initializer should be registered even without data"
+        # No data yet — const_value stays None until weights are applied
+        assert packed.const_value is None
+        # Source names recorded for later materialisation
+        assert packed.metadata_props.get("_fold_sources") == "init_0,init_1"
+        assert packed.metadata_props.get("_fold_axis") == "0"
 
     def test_idempotent(self):
         """Running the pass twice does not create duplicate initializers."""
@@ -280,8 +286,7 @@ class TestFoldConcatInitializersPass:
 
 
 class TestConcatThenTransposeFolding:
-    """Verify that running FoldConcat then FoldTranspose fully eliminates
-    the Concat+Transpose pattern produced by PackQKVForGQA."""
+    """Verify FoldConcat + FoldTranspose eliminates the Concat+Transpose pattern from PackQKV."""
 
     def test_concat_then_transpose_fully_folded(self):
         """FoldConcat followed by FoldTranspose eliminates Concat AND Transpose.

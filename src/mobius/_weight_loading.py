@@ -80,14 +80,19 @@ def _assign_weight(
 def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     """Apply weights from a state dict to an ONNX model.
 
-    When the weight dtype differs from the initializer's declared type,
-    ``ir.LazyTensor`` is used to lazily cast the tensor at serialization
-    time, avoiding eager memory allocation.
+    Assigns each tensor in *state_dict* to the matching initializer in the
+    model.  After all weights are assigned,
+    :func:`~mobius._optimizations.fold_initializers_after_weights` is called to
+    materialise any deferred folded initializers (created by stage 5 of
+    :func:`~mobius._optimizations.optimize_model`) and remove the now-redundant
+    source initializers.
 
     Args:
         model: The ONNX IR model.
         state_dict: Mapping of parameter names to torch tensors.
     """
+    from mobius._optimizations import fold_initializers_after_weights
+
     for name, tensor in state_dict.items():
         if name not in model.graph.initializers:
             logger.warning(
@@ -97,6 +102,8 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
             continue
 
         _assign_weight(model.graph.initializers[name], tensor, name)
+
+    fold_initializers_after_weights(model)
 
 
 def _parallel_download(

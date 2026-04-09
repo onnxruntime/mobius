@@ -444,3 +444,55 @@ def test_onnx_standard_ep_has_no_gqa():
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count == 0, f"'onnx-standard' EP should have no GQA, got {gqa_count}"
+
+
+def test_optimize_model_eliminates_weight_transpose_structurally():
+    """optimize_model() stage 5 folds Transpose(weight) nodes even without weights.
+
+    Linear emits Transpose(weight, perm=[1,0]) → MatMul. After optimize_model,
+    no Transpose nodes should target initializers — they should be replaced by
+    pre-transposed weight_t initializers. This works even before apply_weights()
+    because the fold is structural (lazy tensors defer value computation).
+    """
+    pkg = _make_llama_pkg(ep="cpu", dtype=ir.DataType.FLOAT)
+    model = pkg["model"]
+    # All Transpose(initializer, perm=[1,0]) nodes should be folded.
+    remaining_transpose = sum(
+        1
+        for node in model.graph.all_nodes()
+        if node.op_type == "Transpose"
+        and node.inputs[0] is not None
+        and node.inputs[0].name in model.graph.initializers
+    )
+    assert remaining_transpose == 0, (
+        f"optimize_model should fold all Transpose(initializer) nodes, "
+        f"{remaining_transpose} remain"
+    )
+    # weight_t initializers should exist.
+    transposed_inits = [k for k in model.graph.initializers if k.endswith("_t")]
+    assert len(transposed_inits) > 0, "Expected pre-transposed weight_t initializers"
+
+
+def test_optimize_model_cuda_eliminates_qkv_concat_structurally():
+    """optimize_model() stage 5 folds PackQKV Concat+Transpose even without weights.
+
+    On CUDA EP, PackQKV rewrites Q/K/V projections into Concat(W_q,W_k,W_v) →
+    Transpose → MatMul. After optimize_model stage 5, no Concat nodes should
+    remain over initializers.
+    """
+    pkg = _make_llama_pkg(ep="cuda", dtype=ir.DataType.FLOAT)
+    model = pkg["model"]
+    remaining_concat = sum(
+        1
+        for node in model.graph.all_nodes()
+        if node.op_type == "Concat"
+        and all(
+            inp is not None and inp.name in model.graph.initializers
+            for inp in node.inputs
+            if inp is not None
+        )
+    )
+    assert remaining_concat == 0, (
+        f"optimize_model should fold all Concat(initializer, …) nodes, "
+        f"{remaining_concat} remain"
+    )

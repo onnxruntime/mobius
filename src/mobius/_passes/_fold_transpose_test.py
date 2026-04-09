@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-import pytest
 
 from mobius._passes._fold_transpose import FoldTransposedInitializerPass
 
@@ -57,7 +56,7 @@ class TestFoldTransposedInitializerPass:
     def test_folds_2d_transpose(self):
         """Transpose(weight, perm=[1,0]) is replaced by a pre-transposed initializer."""
         data = np.arange(12, dtype=np.float32).reshape(4, 3)
-        model, weight_val, transpose_node = _make_model_with_transpose(data, [1, 0])
+        model, _, _ = _make_model_with_transpose(data, [1, 0])
 
         result = FoldTransposedInitializerPass()(model)
         assert result.modified
@@ -192,8 +191,12 @@ class TestFoldTransposedInitializerPass:
         t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
         assert len(t_inits) == 1
 
-    def test_missing_const_value_raises_on_access(self):
-        """LazyTensor raises AssertionError when accessed before weights are loaded."""
+    def test_missing_const_value_leaves_none_on_folded(self):
+        """When source const_value is None, folded initializer const_value is also None.
+
+        The fold is still structural (Transpose node removed, weight_t registered)
+        but value computation is deferred to fold_initializers_after_weights().
+        """
         data = np.zeros((4, 3), dtype=np.float32)
         model, weight_val, _ = _make_model_with_transpose(data, [1, 0])
 
@@ -203,6 +206,122 @@ class TestFoldTransposedInitializerPass:
         FoldTransposedInitializerPass()(model)
 
         t_val = model.graph.initializers.get("weight_t")
-        assert t_val is not None
-        with pytest.raises(AssertionError, match="no const_value"):
-            _ = t_val.const_value.numpy()
+        assert t_val is not None, "weight_t should be registered even without data"
+        # No data yet — const_value stays None until weights are applied
+        assert t_val.const_value is None
+        # Source name recorded for later materialisation
+        assert t_val.metadata_props.get("_fold_source") == "weight"
+
+
+class TestFoldTransposeStructural:
+    """Structural fold works even when const_value is None (no weights loaded).
+
+    onnxscript's nn.Module registers initializers without const_value (bypassing
+    register_initializer's const_value check). The fold passes must handle this
+    gracefully: fold the graph structure, set const_value=None, and record source
+    info in metadata_props so fold_initializers_after_weights() can materialise.
+    """
+
+    def test_folds_before_weights_loaded(self):
+        """FoldTransposedInitializerPass folds Transpose even with const_value=None."""
+        weight = ir.Value(name="weight")
+        weight.shape = ir.Shape([4, 8])
+        weight.dtype = ir.DataType.FLOAT
+        # No const_value — simulates how onnxscript registers build-time parameters.
+
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        transpose_node.outputs[0].shape = ir.Shape([8, 4])
+        transpose_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        matmul_node = ir.Node(
+            "",
+            "MatMul",
+            inputs=[ir.Value(name="x"), transpose_node.outputs[0]],
+            num_outputs=1,
+        )
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test",
+            opset_imports={"": 20},
+        )
+        # Use dict assignment (not register_initializer) to bypass const_value check,
+        # matching how onnxscript registers build-time parameters.
+        graph.initializers["weight"] = weight
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert result.modified
+
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" not in node_types, "Transpose should be removed structurally"
+        assert "weight_t" in model.graph.initializers, (
+            "weight_t initializer should be registered"
+        )
+
+        t_val = model.graph.initializers["weight_t"]
+        # No data yet — const_value is None until weights are loaded.
+        assert t_val.const_value is None
+        # Source name recorded for materialisation.
+        assert t_val.metadata_props.get("_fold_source") == "weight"
+
+        # The original initializer must stay registered so apply_weights can populate it.
+        assert "weight" in model.graph.initializers, (
+            "original initializer must stay registered so apply_weights can find it"
+        )
+
+    def test_materialises_after_weights_set(self):
+        """After weights are set on the source, _materialize_deferred_initializers fills in weight_t."""
+        from mobius._optimizations import _materialize_deferred_initializers
+
+        weight = ir.Value(name="weight")
+        weight.shape = ir.Shape([4, 8])
+        weight.dtype = ir.DataType.FLOAT
+
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        transpose_node.outputs[0].shape = ir.Shape([8, 4])
+        transpose_node.outputs[0].dtype = ir.DataType.FLOAT
+
+        matmul_node = ir.Node(
+            "",
+            "MatMul",
+            inputs=[ir.Value(name="x"), transpose_node.outputs[0]],
+            num_outputs=1,
+        )
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test",
+            opset_imports={"": 20},
+        )
+        graph.initializers["weight"] = weight
+        model = ir.Model(graph, ir_version=10)
+
+        FoldTransposedInitializerPass()(model)
+
+        # Simulate weight loading: set const_value on the original.
+        data = np.arange(32, dtype=np.float32).reshape(4, 8)
+        model.graph.initializers["weight"].const_value = ir.tensor(data)
+
+        # Materialise deferred values.
+        _materialize_deferred_initializers(model)
+
+        np.testing.assert_array_equal(
+            model.graph.initializers["weight_t"].const_value.numpy(), data.T
+        )

@@ -5,19 +5,18 @@
 
 When all inputs to a ``Concat`` node are graph initializers the concatenation
 result is statically known at weight-load time.  This pass materialises the
-result as a new initializer, removing the runtime ``Concat`` node and its
-operands.
+result as a new initializer, removing the runtime ``Concat`` node.
 
-:class:`onnx_ir.LazyTensor` is used so the actual numpy concatenation is
-deferred until the tensor data is first accessed (e.g. during ONNX
-serialization), avoiding memory spikes from eagerly materialising all
-concatenated weights during the pass itself.
+If any input has no tensor data (``const_value is None``), the new initializer
+is registered with ``const_value=None`` and source information is stored in
+``metadata_props`` so that
+:func:`~mobius._optimizations.fold_initializers_after_weights` can materialise
+the value once weights are loaded.
 
 Primary use case: QKV weight packing.  After the GQA rewrite rules produce
-``Concat(q_weight_t, k_weight_t, v_weight_t, axis=0)`` and the Transpose
-folding pass replaces each ``*_weight_t`` with a pre-transposed initializer,
-this pass folds the resulting all-initializer Concat into a single packed
-``qkv_weight`` initializer.
+``Concat(q_weight, k_weight, v_weight, axis=0)`` and the Transpose folding pass
+replaces each ``*_weight_t`` with a pre-transposed initializer, this pass folds
+the resulting all-initializer Concat into a single packed initializer.
 """
 
 from __future__ import annotations
@@ -35,16 +34,18 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
     For each ``Concat`` node whose **every** input is a graph initializer:
 
-    1. A new initializer ``{name_0}__{name_1}__axis_{axis}__concat`` is registered whose
-       :class:`~onnx_ir.LazyTensor` value lazily concatenates the inputs along
-       the Concat's ``axis`` attribute.
+    1. A new initializer ``{name_0}__{name_1}__axis_{axis}__concat`` is
+       registered.  If all sources have tensor data the value is concatenated
+       immediately; otherwise ``const_value`` is left as ``None`` and the source
+       names are stored in ``metadata_props`` for later materialisation.
     2. All consumers of the ``Concat`` output are rewired to the new
        initializer.
     3. The ``Concat`` node is removed from the graph.
 
     The original initializers are left in place; a subsequent
-    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (or the
-    initializer-dedup pass) will prune them if they have no remaining uses.
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (called after
+    :func:`~mobius._optimizations.fold_initializers_after_weights` materialises
+    any deferred values) will prune them once they have no remaining uses.
     """
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
@@ -71,6 +72,14 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
             out_val = node.outputs[0]
             out_shape = out_val.shape
+            # If shape inference hasn't set the Concat output shape, compute it
+            # from the input shapes so folded initializers have usable metadata.
+            if out_shape is None:
+                input_shapes = [v.shape for v in inputs]  # type: ignore[union-attr]
+                if all(s is not None for s in input_shapes):
+                    dims = list(input_shapes[0])  # type: ignore[arg-type]
+                    dims[axis] = sum(int(s[axis]) for s in input_shapes)  # type: ignore[index]
+                    out_shape = ir.Shape(dims)
 
             # Require uniform dtype — mixed-dtype concat is unusual and likely
             # a modelling error; skip and warn rather than silently produce
@@ -108,24 +117,21 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 )
                 continue
 
-            captured_inputs = list(inputs)  # capture for closure
-
-            def _make_packed(
-                parts: list[ir.Value] = captured_inputs, ax: int = axis
-            ) -> ir.TensorProtocol:
-                arrays = []
-                for v in parts:
-                    assert v.const_value is not None, (
-                        f"Initializer {v.name!r} has no const_value. "
-                        "FoldConcatInitializersPass must run after weights are loaded."
-                    )
-                    arrays.append(v.const_value.numpy())
-                return ir.tensor(np.concatenate(arrays, axis=ax))
-
-            dtype = inputs[0].dtype or ir.DataType.FLOAT  # type: ignore[union-attr]
             new_val = ir.Value(name=packed_name, shape=out_shape, type=out_val.type)
-            new_val.const_value = ir.LazyTensor(_make_packed, dtype=dtype, shape=out_shape)
-            model.graph.register_initializer(new_val)
+
+            # Check if all sources have data available.
+            all_have_data = all(v.const_value is not None for v in inputs)  # type: ignore[union-attr]
+            if all_have_data:
+                # Eagerly compute the concatenated value.
+                arrays = [v.const_value.numpy() for v in inputs]  # type: ignore[union-attr]
+                new_val.const_value = ir.tensor(np.concatenate(arrays, axis=axis))
+            else:
+                # No data yet — leave const_value=None and record the source names
+                # so fold_initializers_after_weights() can fill it in later.
+                new_val.metadata_props["_fold_sources"] = ",".join(input_names)
+                new_val.metadata_props["_fold_axis"] = str(axis)
+
+            model.graph.initializers[new_val.name] = new_val
 
             out_val.replace_all_uses_with(new_val, replace_graph_outputs=True)
             model.graph.remove(node)

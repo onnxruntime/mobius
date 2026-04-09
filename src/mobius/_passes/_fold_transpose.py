@@ -8,10 +8,11 @@ After :class:`~mobius.components.Linear` emits ``Transpose(weight, perm=[1, 0])
 result as a new initializer named ``{original_name}_t``.  The runtime
 Transpose node is then removed, eliminating per-inference overhead.
 
-:class:`onnx_ir.LazyTensor` is used so the actual numpy transposition is
-deferred until the tensor data is first accessed (e.g. during ONNX
-serialization), avoiding memory spikes from eagerly materializing all
-transposed weights during the pass itself.
+When the source initializer has no tensor data (``const_value is None``), the
+folded initializer is registered with ``const_value=None`` and the source name
+is stored in ``metadata_props["_fold_source"]`` so that
+:func:`~mobius._optimizations.fold_initializers_after_weights` can materialise
+the value once weights are loaded.
 """
 
 from __future__ import annotations
@@ -29,8 +30,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     For each ``Transpose`` node whose sole input is a graph initializer and
     whose ``perm`` attribute is ``[1, 0]``:
 
-    1. A new initializer ``{original_name}_t`` is registered whose
-       :class:`~onnx_ir.LazyTensor` value lazily transposes the original data.
+    1. A new initializer ``{original_name}_t`` is registered.  If the source
+       has tensor data its value is transposed immediately; otherwise
+       ``const_value`` is left as ``None`` and the source name is stored in
+       ``metadata_props["_fold_source"]`` for later materialisation.
     2. All consumers of the ``Transpose`` output are rewired to the new
        initializer.
     3. The ``Transpose`` node is removed from the graph.
@@ -39,8 +42,9 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     transposed initializer is created only once and shared among all consumers.
 
     The original initializer is left in place; a subsequent
-    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (or the
-    initializer-dedup pass) will prune it if it has no remaining consumers.
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (called after
+    :func:`~mobius._optimizations.fold_initializers_after_weights` materialises
+    any deferred values) will prune it once it has no remaining consumers.
     """
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
@@ -73,25 +77,24 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
             if inp.name not in folded:
                 # Derive shape of the transposed tensor from the Transpose output.
-                t_shape = out_val.shape  # already transposed by shape inference
-
-                # Create a LazyTensor that transposes the original data on demand.
-                original = inp  # captured by closure — updated when weights load
-
-                def _make_transposed(w: ir.Value = original) -> ir.TensorProtocol:
-                    assert w.const_value is not None, (
-                        f"Initializer {w.name!r} has no const_value. "
-                        "FoldTransposedInitializerPass must run after weights are loaded."
-                    )
-                    return ir.tensor(w.const_value.numpy().T)
+                # Fall back to computing from the input shape if shape inference
+                # did not propagate to this new node (e.g. after stage-2 rewrites).
+                t_shape = out_val.shape
+                if t_shape is None and inp.shape is not None:
+                    perm = list(perm_attr.value)
+                    t_shape = ir.Shape([inp.shape[p] for p in perm])
 
                 new_val = ir.Value(name=f"{inp.name}_t", shape=t_shape, type=inp.type)
-                new_val.const_value = ir.LazyTensor(
-                    _make_transposed,
-                    dtype=inp.dtype or ir.DataType.FLOAT,
-                    shape=t_shape,
-                )
-                model.graph.register_initializer(new_val)
+
+                if inp.const_value is not None:
+                    # Eagerly compute the transposed value.
+                    new_val.const_value = ir.tensor(inp.const_value.numpy().T)
+                else:
+                    # No data yet — leave const_value=None and record the source
+                    # so fold_initializers_after_weights() can fill it in later.
+                    new_val.metadata_props["_fold_source"] = inp.name
+
+                model.graph.initializers[new_val.name] = new_val
                 folded[inp.name] = new_val
                 logger.debug(
                     "FoldTransposedInitializer: registered %r (shape %s)",
