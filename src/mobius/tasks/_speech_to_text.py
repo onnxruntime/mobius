@@ -48,11 +48,11 @@ class SpeechToTextTask(ModelTask):
         module: nn.Module,
         config: BaseModelConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         if not isinstance(config, WhisperConfig):
             raise TypeError(
                 f"SpeechToTextTask requires WhisperConfig, got {type(config).__name__}"
             )
-        self._validate_components(module)
 
         encoder_model = self._build_encoder(module.model.encoder, config)
         decoder_model = self._build_decoder(module.model.decoder, config)

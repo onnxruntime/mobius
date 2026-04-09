@@ -5,7 +5,8 @@
 
 Covers: CausalLM, VisionLanguage, Seq2Seq, Denoising, VAE,
 FeatureExtraction, ImageClassification, SSM, SSM2, AudioFeatureExtraction,
-ObjectDetection, SpeechToText.
+ObjectDetection, SpeechToText, and shared builder helpers
+(build_decoder_from_embeds, build_embedding_from_features).
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from mobius.tasks import (
     SSMCausalLMTask,
     VAETask,
     VisionLanguageTask,
+    build_decoder_from_embeds,
+    build_embedding_from_features,
     get_task,
 )
 
@@ -932,3 +935,112 @@ class TestSpeechToTextTask:
         assert "logits" in output_names
         assert "present.0.key" in output_names
         assert "present.0.value" in output_names
+
+
+# ── build_decoder_from_embeds ─────────────────────────────────────────────
+
+
+class TestBuildDecoderFromEmbeds:
+    """Smoke tests for the shared build_decoder_from_embeds helper."""
+
+    def _make_decoder_module(self):
+        from mobius.models.gemma3 import Gemma3MultiModalModel
+
+        config = _make_multimodal_config()
+        module = Gemma3MultiModalModel(config)
+        return config, module.decoder
+
+    def test_returns_ir_model(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        assert isinstance(model, ir.Model)
+
+    def test_graph_name_is_decoder(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        assert model.graph.name == "decoder"
+
+    def test_inputs_include_inputs_embeds_and_kv_cache(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        input_names = {v.name for v in model.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+        assert "past_key_values.0.key" in input_names
+
+    def test_outputs_include_logits_and_kv_cache(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        output_names = {v.name for v in model.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+
+    def test_mrope_position_ids_are_3d(self):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config, mrope=True)
+        pos_ids = next(v for v in model.graph.inputs if v.name == "position_ids")
+        # MRoPE shape: [3, batch, seq_len]
+        assert pos_ids.shape is not None
+        assert pos_ids.shape[0] == 3
+
+
+# ── build_embedding_from_features ─────────────────────────────────────────
+
+
+class TestBuildEmbeddingFromFeatures:
+    """Smoke tests for the shared build_embedding_from_features helper."""
+
+    def _make_embedding_module(self):
+        from mobius.models.gemma3 import Gemma3MultiModalModel
+
+        config = _make_multimodal_config()
+        module = Gemma3MultiModalModel(config)
+        return config, module.embedding
+
+    def test_returns_ir_model(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        assert isinstance(model, ir.Model)
+
+    def test_graph_name_is_embedding(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        assert model.graph.name == "embedding"
+
+    def test_inputs_include_input_ids_and_features(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        input_names = {v.name for v in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "image_features" in input_names
+
+    def test_output_is_inputs_embeds(self):
+        config, embedding = self._make_embedding_module()
+        model = build_embedding_from_features(
+            embedding, config, feature_name="image_features", feature_dim=config.hidden_size
+        )
+        output_names = {v.name for v in model.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_custom_feature_name(self):
+        # Use a stub module that accepts any feature name to verify
+        # that the feature_name argument correctly controls graph input naming.
+        from onnxscript import nn as onnx_nn
+
+        class _StubEmbedding(onnx_nn.Module):
+            def forward(self, op, input_ids, audio_features):
+                return op.Identity(input_ids)
+
+        config = _make_multimodal_config()
+        model = build_embedding_from_features(
+            _StubEmbedding(), config, feature_name="audio_features", feature_dim=64
+        )
+        input_names = {v.name for v in model.graph.inputs}
+        assert "audio_features" in input_names

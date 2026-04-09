@@ -23,11 +23,11 @@ from mobius.tasks._base import (
     ModelTask,
     _make_graph,
     _make_model,
+    build_decoder_from_embeds,
+    build_embedding_from_features,
 )
 from mobius.tasks._cache_utils import (
     _register_kv_cache_outputs,
-    build_decoder_from_embeds,
-    build_embedding_from_features,
 )
 
 

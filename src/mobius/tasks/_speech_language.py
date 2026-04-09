@@ -25,8 +25,6 @@ from mobius.tasks._base import (
     ModelTask,
     _make_graph,
     _make_model,
-)
-from mobius.tasks._cache_utils import (
     build_decoder_from_embeds,
     build_embedding_from_features,
 )
