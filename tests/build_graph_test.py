@@ -1131,6 +1131,63 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
+    def test_gemma4_multimodal_graph(self):
+        """Build Gemma4 multimodal model (3-model split: decoder + vision + embedding)."""
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            # Dual layer types: 1 local + 1 global
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            # Global attention config (same head_dim in test for simplicity)
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        # Decoder: inputs_embeds -> logits + per-layer KV cache
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+        # Vision: pixel_values + pixel_position_ids -> image_features
+        vision = pkg["vision"]
+        vision_input_names = {i.name for i in vision.graph.inputs}
+        assert "pixel_values" in vision_input_names
+        assert "pixel_position_ids" in vision_input_names
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+        # Embedding: input_ids + image_features -> inputs_embeds
+        embedding = pkg["embedding"]
+        assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -3388,6 +3445,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "blip-2",
     "deepseek_vl_v2",
     "gemma3_multimodal",
+    "gemma4",
     "llava",
     "mllama",
     "phi4_multimodal",
@@ -3440,7 +3498,6 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 # cannot be tested with our generic test infrastructure.
 _KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
     "deepseek_v2_moe",  # Alias for deepseek_v2 — tested via deepseek_v2
-    "gemma4",  # Placeholder: gemma4-multimodal task not yet implemented
     "qwen3_5_vl_text",  # VL text decoder — tested via parent VL model
 }
 
