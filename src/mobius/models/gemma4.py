@@ -75,8 +75,10 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # All-ones scale tensor — no learnable parameter to load
+        # All-ones scale tensor — no learnable parameter to load.
+        # CastLike ensures the scale matches the input dtype (fp16/bf16/fp32).
         scale = op.ConstantOfShape(op.Constant(value_ints=[self.dim]), value=1.0)
+        scale = op.CastLike(scale, hidden_states)
         return op.RMSNormalization(hidden_states, scale, epsilon=self.eps, axis=-1)
 
 
@@ -940,7 +942,20 @@ class Gemma4TextModel(nn.Module):
         # shared_kv_states: source layers populate it, shared layers consume it
         shared_kv_states: dict = {}
         present_key_values = []
-        past_kvs = past_key_values or [None] * len(self.layers)
+
+        # Build per-layer past_kv list for all num_hidden_layers layers.
+        # past_key_values has only num_kv_layers entries (no entry for KV-shared
+        # layers). Expand it to a full per-layer list so we can zip over all
+        # layers without truncation.
+        if past_key_values is not None:
+            kv_iter = iter(past_key_values)
+            past_kvs: list = [
+                None if layer.self_attn.is_kv_shared_layer else next(kv_iter)
+                for layer in self.layers
+            ]
+        else:
+            past_kvs = [None] * len(self.layers)
+
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
@@ -959,7 +974,10 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
             )
-            present_key_values.append(present_kv)
+            # KV-shared layers borrow K,V from source layers — exclude from
+            # present_key_values so the output has exactly num_kv_layers entries.
+            if not layer.self_attn.is_kv_shared_layer:
+                present_key_values.append(present_kv)
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values

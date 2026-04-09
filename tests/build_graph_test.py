@@ -1305,6 +1305,86 @@ class TestBuildGraphVisionLanguage:
         assert "image_features" in emb_input_names
         assert "audio_features" in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+        # KV cache outputs: exactly num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
+        decoder_output_names = {o.name for o in decoder.graph.outputs}
+        assert "present.0.key" in decoder_output_names
+        assert "present.0.value" in decoder_output_names
+        assert "present.1.key" not in decoder_output_names  # shared layer excluded
+        assert "present.1.value" not in decoder_output_names  # shared layer excluded
+
+    def test_gemma4_kv_shared_layer_tracing(self):
+        """Verify all num_hidden_layers are traced and present_key_values has num_kv_layers entries.
+
+        With num_kv_shared_layers=1 and num_hidden_layers=2:
+        - Both layers must be traced (Attention op count = 2)
+        - KV cache inputs: 1 entry (only layer 0 has its own K/V)
+        - KV cache outputs: 1 entry (shared layer excluded from present_key_values)
+        """
+        from mobius._configs import Gemma4Config, Gemma4AudioConfig
+        from mobius.tasks._gemma4 import Gemma4AnyToAnyTask
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                audio_token_id=255998,
+            ),
+        )
+        model_cls = registry.get("gemma4_any_to_any")
+        module = model_cls(config)
+        task = Gemma4AnyToAnyTask()
+        pkg = task.build(module, config)
+        decoder = pkg["decoder"]
+
+        # All num_hidden_layers=2 layers must be traced: each produces one Attention op.
+        attention_nodes = [n for n in decoder.graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == config.num_hidden_layers, (
+            f"Expected {config.num_hidden_layers} Attention ops (all layers traced), "
+            f"got {len(attention_nodes)}"
+        )
+
+        # KV cache inputs: exactly num_kv_layers = 1 (shared layer has no own KV)
+        input_names = {i.name for i in decoder.graph.inputs}
+        assert "past_key_values.0.key" in input_names
+        assert "past_key_values.1.key" not in input_names
+
+        # KV cache outputs: exactly num_kv_layers = 1 (shared layer excluded)
+        output_names = {o.name for o in decoder.graph.outputs}
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+        assert "present.1.key" not in output_names
+        assert "present.1.value" not in output_names
 
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
