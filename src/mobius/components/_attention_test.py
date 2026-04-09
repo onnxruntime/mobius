@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import onnx_ir as ir
 import pytest
 
 from mobius._testing import (
@@ -186,3 +187,218 @@ class TestQwen35Attention:
         # Should have Attention op + Sigmoid (for gate) + Mul (output gating)
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "Sigmoid") >= 1
+
+
+class TestGQAContextDispatch:
+    """Tests for the GQAContext direct GroupQueryAttention emission path."""
+
+    def test_gqa_context_emits_group_query_attention(self):
+        """When attention_bias is a GQAContext, Attention emits GroupQueryAttention directly."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        # rotary_dim = head_dim / 2 = 16 / 2 = 8 (inv_freq has half the head_dim entries)
+        cos_cache = create_test_input(builder, "cos_cache", [32, 8])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 8])
+
+        gqa_ctx = GQAContext(
+            seqlens_k=seqlens_k,
+            total_seq_len=total_seq_len,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+        )
+
+        output, (pk, pv) = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output, pk, pv])
+
+        # Direct path: GroupQueryAttention instead of ONNX Attention
+        assert count_op_type(graph, "GroupQueryAttention") >= 1
+        assert count_op_type(graph, "Attention") == 0
+
+    def test_gqa_context_respects_rotary_interleaved(self):
+        """rotary_interleaved attribute is set from config.rope_interleave."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config(rope_interleave=True)
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, 8])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 8])
+
+        gqa_ctx = GQAContext(seqlens_k, total_seq_len, cos_cache, sin_cache)
+
+        output, _ = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output])
+
+        gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
+        assert gqa_node.attributes["rotary_interleaved"].value == 1
+
+    def test_standard_attention_when_no_gqa_context(self):
+        """Without GQAContext, standard ONNX Attention is emitted."""
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        bias = create_test_input(builder, "bias", [1, 4, 8, 8])
+
+        output, _ = attn(op, hidden, attention_bias=bias)
+        builder._adapt_outputs([output])
+
+        assert count_op_type(graph, "Attention") >= 1
+        assert count_op_type(graph, "GroupQueryAttention") == 0
+
+    def test_build_with_cuda_ep_emits_gqa_directly(self):
+        """build_from_module with CUDA EP and float16 config emits GroupQueryAttention directly."""
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            dtype=ir.DataType.FLOAT16,
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="cuda",
+        )
+        ops = count_ops(pkg["model"])
+        # Direct generation: each layer should have a GroupQueryAttention node
+        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
+        # Standard ONNX Attention should not appear
+        assert ops.get("Attention", 0) == 0
+
+    def test_build_with_default_ep_uses_standard_attention(self):
+        """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="default",
+        )
+        ops = count_ops(pkg["model"])
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == config.num_hidden_layers
+
+    def test_mrope_model_does_not_use_direct_gqa(self):
+        """Models with MRoPE (Qwen2.5-VL, Qwen3-VL) must NOT emit GQA directly.
+
+        GQA do_rotary=1 only supports 1D RoPE. _MRopeBase subclasses
+        (ChunkedMRope, InterleavedMRope) use 3D position_ids for temporal/
+        height/width axes. Silently emitting GQA would produce wrong outputs.
+        CUDA+f16 EP is used to trigger the GQA path for 1D-RoPE models;
+        the MRoPE model must fall through to the rewrite-rule path instead.
+        """
+        from mobius._builder import build_from_module
+        from mobius._configs import ArchitectureConfig
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        # Minimal Qwen2.5-VL-style config with mrope_section (activates ChunkedMRope).
+        mrope_config = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            dtype=ir.DataType.FLOAT16,
+            mrope_section=[4, 6, 6],  # activates ChunkedMRope
+        )
+        # Use "llama" model class (TextModel backbone) so use_gqa condition is evaluated.
+        # qwen2_5_vl uses a different model class, but the relevant guard is in TextModel.
+        pkg = build_from_module(
+            registry.get("llama")(mrope_config),
+            mrope_config,
+            execution_provider="cuda",
+        )
+        ops = count_ops(pkg["model"])
+        # MRoPE model must NOT use direct GQA (do_rotary=1 is 1D only).
+        # The rewrite rule path still applies GroupQueryAttention after graph construction.
+        assert ops.get("GroupQueryAttention", 0) == mrope_config.num_hidden_layers
+
+    def test_direct_gqa_and_rewrite_rule_produce_same_structure(self):
+        """Direct GQA and rewrite-rule paths both produce GroupQueryAttention per layer.
+
+        Verifies that for a standard 1D-RoPE model:
+        - CPU EP (direct path): num_layers GQA nodes
+        - Default EP + manual rewrite rule: same count
+        """
+        from onnxscript.rewriter import rewrite
+
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules import group_query_attention_rules
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        num_layers = config.num_hidden_layers
+
+        # Direct path: CPU EP uses GQA directly (FLOAT is in cpu.gqa_dtypes)
+        pkg_direct = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="cpu",
+        )
+
+        # Rewrite-rule path: default EP keeps Attention + RoPE, then rewrite fires
+        pkg_default = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="default",
+        )
+        rewrite(pkg_default["model"], group_query_attention_rules())
+
+        ops_direct = count_ops(pkg_direct["model"])
+        ops_rewrite = count_ops(pkg_default["model"])
+
+        # Both paths must produce the same number of GroupQueryAttention nodes
+        assert ops_direct.get("GroupQueryAttention", 0) == num_layers
+        assert ops_rewrite.get("GroupQueryAttention", 0) == num_layers
+        # Neither path should leave any standard Attention nodes
+        assert ops_direct.get("Attention", 0) == 0
+        assert ops_rewrite.get("Attention", 0) == 0

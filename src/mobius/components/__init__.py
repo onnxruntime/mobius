@@ -34,6 +34,7 @@ __all__ = [
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
     "GroupNorm",
+    "GQAContext",
     "INT64_MAX",
     "InputMixer",
     "JambaSelectiveScan",
@@ -109,6 +110,7 @@ __all__ = [
 from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
+    GQAContext,
     Qwen35Attention,
     StaticCacheState,
 )
