@@ -42,8 +42,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
        initializer.
     3. The ``Transpose`` node is removed from the graph.
 
-    Initializers with multiple consumers are skipped — renaming or removing a
-    shared initializer would silently break the other consumers.
+    Initializers consumed by more than one node are skipped.  For example, if
+    a weight is used both through a ``Transpose`` *and* directly by a
+    ``MatMul``, folding would require duplicating the tensor — the pass simply
+    skips that ``Transpose`` instead.
 
     The original initializer is left in place; a subsequent
     :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (or the
@@ -72,8 +74,11 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             if not inp.is_initializer():
                 continue
 
-            # Skip if the initializer is shared by multiple consumers — folding
-            # would rename/remove it and silently break the other users.
+            # Only fold when the initializer's sole consumer is this Transpose node.
+            # If the weight is used elsewhere (e.g. another MatMul consuming it
+            # directly), folding would require duplicating the tensor — skip instead.
+            # Since `node` is already a consumer of `inp`, len == 1 guarantees the
+            # sole use IS this Transpose node.
             if len(inp.uses()) != 1:
                 continue
 
