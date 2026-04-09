@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import onnx_ir as ir
 import pytest
 
 from mobius._testing import (
@@ -186,3 +187,129 @@ class TestQwen35Attention:
         # Should have Attention op + Sigmoid (for gate) + Mul (output gating)
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "Sigmoid") >= 1
+
+
+class TestGQAContextDispatch:
+    """Tests for the GQAContext direct GroupQueryAttention emission path."""
+
+    def test_gqa_context_emits_group_query_attention(self):
+        """When attention_bias is a GQAContext, Attention emits GroupQueryAttention directly."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, 16])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 16])
+
+        gqa_ctx = GQAContext(
+            seqlens_k=seqlens_k,
+            total_seq_len=total_seq_len,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+        )
+
+        output, (pk, pv) = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output, pk, pv])
+
+        # Direct path: GroupQueryAttention instead of ONNX Attention
+        assert count_op_type(graph, "GroupQueryAttention") >= 1
+        assert count_op_type(graph, "Attention") == 0
+
+    def test_gqa_context_respects_rotary_interleaved(self):
+        """rotary_interleaved attribute is set from config.rope_interleave."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config(rope_interleave=True)
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, 16])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 16])
+
+        gqa_ctx = GQAContext(seqlens_k, total_seq_len, cos_cache, sin_cache)
+
+        output, _ = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output])
+
+        gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
+        assert gqa_node.attributes["rotary_interleaved"].value == 1
+
+    def test_standard_attention_when_no_gqa_context(self):
+        """Without GQAContext, standard ONNX Attention is emitted."""
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        bias = create_test_input(builder, "bias", [1, 4, 8, 8])
+
+        output, _ = attn(op, hidden, attention_bias=bias)
+        builder._adapt_outputs([output])
+
+        assert count_op_type(graph, "Attention") >= 1
+        assert count_op_type(graph, "GroupQueryAttention") == 0
+
+    def test_build_with_cuda_ep_emits_gqa_directly(self):
+        """build_from_module with CUDA EP and float16 config emits GroupQueryAttention directly."""
+        import onnx_ir as ir
+
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            dtype=ir.DataType.FLOAT16,
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="cuda",
+        )
+        ops = count_ops(pkg["model"])
+        # Direct generation: each layer should have a GroupQueryAttention node
+        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
+        # Standard ONNX Attention should not appear
+        assert ops.get("Attention", 0) == 0
+
+    def test_build_with_default_ep_uses_standard_attention(self):
+        """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="default",
+        )
+        ops = count_ops(pkg["model"])
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == config.num_hidden_layers

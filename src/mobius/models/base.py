@@ -13,12 +13,12 @@ Qwen2ForCausalLM structure.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._weight_utils import (
     preprocess_awq_weights,
@@ -35,9 +35,8 @@ from mobius.components import (
     initialize_rope,
     make_quantized_linear_factory,
 )
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
+from mobius.components._attention import GQAContext
+from mobius.components._rotary_embedding import BaseRope
 
 
 class TextModel(nn.Module):
@@ -83,21 +82,67 @@ class TextModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
 
-        # When attention_mask is None (static cache mode), skip mask
-        # creation entirely — the Attention op uses is_causal=1 instead.
-        # When present, create a bool padding mask. Causal masking is
-        # handled by is_causal=1 on the Attention op (set in
-        # _apply_attention), so we only need padding information here.
-        if attention_mask is not None:
-            padding_mask = create_padding_mask(
-                op,
-                input_ids=hidden_states if input_ids is None else input_ids,
-                attention_mask=attention_mask,
+        # Determine whether to emit GroupQueryAttention directly.
+        # Conditions: the active EP supports GQA for the build dtype, the
+        # model uses standard RotaryEmbeddingBase (cos/sin tables available),
+        # and we are in dynamic-cache mode (attention_mask is present).
+        caps = ep_capabilities()
+        dtype = get_build_dtype()
+        use_gqa = (
+            attention_mask is not None
+            and dtype in caps.gqa_dtypes
+            and caps.supports_fused_rope
+            and isinstance(self.rotary_emb, BaseRope)
+        )
+
+        if use_gqa:
+            # Call rotary_emb to realize cos_cache / sin_cache as ONNX graph
+            # initializers (onnxscript registers parameters on module __call__).
+            # The returned gathered embeddings are discarded — GroupQueryAttention
+            # will index the full tables itself via do_rotary=1.
+            self.rotary_emb(op, position_ids)
+
+            # Build GQAContext from the cos/sin parameter tables and a
+            # seqlens_k / total_seq_len pair derived from attention_mask.
+            # Access cos_cache / sin_cache directly as ir.Value to avoid
+            # creating dead Gather(cos_cache, position_ids) nodes.
+            #
+            # seqlens_k[b] = sum(attention_mask[b]) - 1 = last valid KV index.
+            # total_seq_len = attention_mask.shape[1] = past + current len.
+            one_i32 = op.Constant(value_int=1)
+            seqlens_k = op.Cast(
+                op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i32),
+                to=ir.DataType.INT32,
+            )  # [batch] INT32
+            total_seq_len = op.Cast(
+                op.Gather(op.Shape(attention_mask), op.Constant(value_int=1)),
+                to=ir.DataType.INT32,
+            )  # scalar INT32
+
+            attention_bias: GQAContext | ir.Value | None = GQAContext(
+                seqlens_k=seqlens_k,
+                total_seq_len=total_seq_len,
+                cos_cache=self.rotary_emb.cos_cache,  # [max_seq, rotary_dim]
+                sin_cache=self.rotary_emb.sin_cache,  # [max_seq, rotary_dim]
             )
+            position_embeddings = None
         else:
-            padding_mask = None
+            position_embeddings = self.rotary_emb(op, position_ids)
+
+            # When attention_mask is None (static cache mode), skip mask
+            # creation entirely — the Attention op uses is_causal=1 instead.
+            # When present, create a bool padding mask. Causal masking is
+            # handled by is_causal=1 on the Attention op (set in
+            # _apply_attention), so we only need padding information here.
+            if attention_mask is not None:
+                attention_bias = create_padding_mask(
+                    op,
+                    input_ids=hidden_states if input_ids is None else input_ids,
+                    attention_mask=attention_mask,
+                )
+            else:
+                attention_bias = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
@@ -105,7 +150,7 @@ class TextModel(nn.Module):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
-                attention_bias=padding_mask,
+                attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
