@@ -33,8 +33,9 @@ class GQAContext(NamedTuple):
     (e.g. Qwen3.5 with 3D mRoPE).
 
     Fields:
-        seqlens_k: Per-batch actual KV sequence length ``[batch]`` INT32.
-            Computed as ``ReduceSum(attention_mask, axis=1) - 1``.
+        seqlens_k: Per-batch last valid KV index ``[batch]`` INT32.
+            Computed as ``ReduceSum(attention_mask, axis=1) - 1``; this is a
+            0-based index into the valid KV tokens, not the KV length itself.
         total_seq_len: Scalar total sequence length INT32.
             Computed as ``Shape(attention_mask)[1]``.
         cos_cache: Full cosine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
