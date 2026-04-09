@@ -305,12 +305,12 @@ class TestGroupQueryAttentionRules:
         assert matmul_packed == matmul_default - 2 * num_layers
 
     def test_packed_weight_uses_concat_node(self):
-        """CPU EP build produces packed GQA; stage 5 folds Concat+Transpose into one initializer.
+        """CPU EP build produces packed GQA with Concat+Transpose weight form.
 
-        After the full CPU EP pipeline (stage 2: GQA fusion + PackQKV;
-        stage 5: FoldConcat + FoldTranspose), the packed weight is a single
-        pre-transposed initializer with fold metadata pointing to the original
-        W_q, W_k, W_v sources — no runtime Concat or Transpose nodes remain.
+        After the CPU EP pipeline (stage 2: GQA fusion + PackQKV), the packed
+        weight is ``MatMul(hidden, Transpose(Concat(W_q, W_k, W_v)))``.
+        Fold passes run later (in fold_initializers_after_weights after weights
+        are loaded), so Concat and Transpose nodes are still present here.
         """
         m = build_from_module(
             registry.get("llama")(_LLAMA_CONFIG),
@@ -328,21 +328,18 @@ class TestGroupQueryAttentionRules:
             mm = packed_proj.producer()
             assert mm is not None and mm.op_type == "MatMul"
 
-            # After stage 5 fold, the weight is a direct initializer — no Transpose node.
-            w = mm.inputs[1]
-            assert w is not None and w.producer() is None, (
-                "Packed weight should be a direct initializer after structural fold"
+            # The weight goes through Transpose(Concat(W_q, W_k, W_v)).
+            w_input = mm.inputs[1]
+            assert w_input is not None
+            transpose = w_input.producer()
+            assert transpose is not None and transpose.op_type == "Transpose", (
+                "Packed weight should go through a Transpose node before fold passes run"
             )
-            # The fold metadata links back to the original W_q, W_k, W_v initializers.
-            # After stage 5 + RemoveUnused, the intermediate packed initializer is gone;
-            # its pkg.mobius.fold_sources metadata was propagated directly onto the transposed
-            # weight by FoldTransposedInitializerPass.
-            assert w.metadata_props.get("pkg.mobius.fold_source") is not None, (
-                "Packed+transposed weight should have pkg.mobius.fold_source metadata"
+            concat = transpose.inputs[0].producer()
+            assert concat is not None and concat.op_type == "Concat", (
+                "Transpose input should be a Concat of W_q, W_k, W_v"
             )
-            assert w.metadata_props.get("pkg.mobius.fold_sources") is not None, (
-                "Packed+transposed weight should carry pkg.mobius.fold_sources (W_q,W_k,W_v names)"
-            )
+            assert len(concat.inputs) == 3, "Concat should have exactly 3 inputs (Q, K, V)"
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
         """Qwen3 (QK norm) falls back; MatMul count unchanged after packing attempt."""
@@ -461,11 +458,12 @@ class TestGroupQueryAttentionRules:
         assert matmul_packed == matmul_default - 2 * num_layers
 
     def test_packed_qkv_with_bias_uses_concat_nodes(self):
-        """Biased packing produces packed GQA; stage 5 folds weight and bias Concat.
+        """Biased packing produces packed GQA with Concat+Transpose weight and bias forms.
 
-        After the full CPU EP pipeline (stage 2: PackQKVWithBiasForGQA;
-        stage 5: FoldConcat + FoldTranspose), the packed weight and bias are
-        folded initializers — no runtime Concat or Transpose nodes remain.
+        After the CPU EP pipeline (stage 2: PackQKVWithBiasForGQA), the packed
+        weight is ``MatMul(hidden, Transpose(Concat(W_q, W_k, W_v)))`` and the
+        bias is ``Concat(bias_q, bias_k, bias_v)``.  Fold passes run after
+        weights are loaded, so Concat and Transpose nodes are still present here.
         """
         m = build_from_module(
             registry.get("qwen2")(_QWEN2_BIAS_CONFIG),
@@ -481,7 +479,7 @@ class TestGroupQueryAttentionRules:
             assert gqa.inputs[2] is None, "GQA should be in packed mode (v=None)"
             packed_proj = gqa.inputs[0]
 
-            # Structure after stage 5: Add(MatMul(hidden, qkv_t), bias_packed)
+            # Structure: Add(MatMul(hidden, Transpose(Concat(W_q,W_k,W_v))), Concat(b_q,b_k,b_v))
             add_node = packed_proj.producer()
             assert add_node is not None and add_node.op_type == "Add", (
                 "Packed QKV with bias should be wrapped in Add"
@@ -498,24 +496,27 @@ class TestGroupQueryAttentionRules:
                 None,
             )
             bias_val = next(
-                (i for i in add_ins if i.producer() is None),
+                (i for i in add_ins if i.producer() and i.producer().op_type == "Concat"),
                 None,
             )
             assert matmul is not None, "Add should contain MatMul"
-            assert bias_val is not None, "Add should contain bias initializer"
+            assert bias_val is not None, "Add should contain Concat bias"
 
-            # After stage 5, the bias Concat is folded to a direct initializer.
-            assert bias_val.metadata_props.get("pkg.mobius.fold_sources") is not None, (
-                "Packed bias should be a folded concat initializer with pkg.mobius.fold_sources"
-            )
+            # The bias is a Concat of individual biases.
+            bias_concat = bias_val.producer()
+            assert bias_concat is not None and bias_concat.op_type == "Concat"
+            assert len(bias_concat.inputs) == 3, "Bias Concat should have 3 inputs"
 
-            # After stage 5, the weight Transpose is folded to a direct initializer.
-            w = matmul.inputs[1]
-            assert w is not None and w.producer() is None, (
-                "Packed weight should be a direct initializer after structural fold"
+            # The weight goes through Transpose(Concat(W_q, W_k, W_v)).
+            w_input = matmul.inputs[1]
+            assert w_input is not None
+            transpose = w_input.producer()
+            assert transpose is not None and transpose.op_type == "Transpose", (
+                "Weight should go through Transpose before fold passes run"
             )
-            assert w.metadata_props.get("pkg.mobius.fold_source") is not None, (
-                "Packed+transposed weight should have pkg.mobius.fold_source metadata"
+            concat = transpose.inputs[0].producer()
+            assert concat is not None and concat.op_type == "Concat", (
+                "Transpose input should be Concat of W_q, W_k, W_v"
             )
 
     def test_packed_qkv_with_bias_runs_with_ort(self):

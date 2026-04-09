@@ -3,7 +3,7 @@
 
 """EP-aware model optimization pipeline.
 
-Exposes :func:`optimize_model` which applies a five-stage pass pipeline to an
+Exposes :func:`optimize_model` which applies a four-stage pass pipeline to an
 ONNX IR model:
 
 1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
@@ -13,11 +13,6 @@ ONNX IR model:
 3. **Lowering** — decompose ops the EP cannot execute
    (SeparateRoPE, EliminateShape).
 4. **Fold** — final dead-node removal and constant folding.
-5. **Structural weight fold** — fold ``Concat(init…)`` and
-   ``Transpose(init, perm=[1,0])`` nodes by graph structure, then remove unused
-   source initializers.  When weights are not yet loaded the folded initializers
-   record their source in ``metadata_props`` so that
-   :func:`fold_initializers_after_weights` can materialise the values later.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
 entries in the :data:`~mobius._execution_providers.ep_registry`. Adding EP
@@ -25,12 +20,11 @@ support requires only a new registry entry — no changes to this module.
 
 Post-weight passes
 ------------------
-:func:`fold_initializers_after_weights` is called automatically by
-:meth:`~mobius._model_package.ModelPackage.apply_weights` after weights have
-been loaded.  It repeats the structural fold passes (which are no-ops if
-:func:`optimize_model` already ran stage 5) then materialises any deferred
-folded initializers, removes unused nodes, and performs a final
-constant-folding sweep.
+:func:`fold_initializers_after_weights` should be called after weights are loaded.
+It runs :class:`~mobius._passes.FoldTransposedInitializerPass` and
+:class:`~mobius._passes.FoldConcatInitializersPass` to fold runtime Transpose and
+Concat nodes over initializers into pre-computed weights, then removes unused
+nodes.
 """
 
 from __future__ import annotations
@@ -334,12 +328,6 @@ def optimize_model(
     3. **Lowering** — decompose ops the EP cannot execute
        (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
     4. **Fold** — final dead-node removal and constant folding.
-    5. **Structural weight fold** — fold ``Concat(init, …)`` and
-       ``Transpose(init, perm=[1,0])`` nodes by graph structure, eliminating
-       runtime overhead for QKV packing and :class:`~mobius.components.Linear`
-       weight transposition.  The lazy tensors defer actual value computation
-       until weights are loaded; :meth:`fold_initializers_after_weights` performs
-       the post-load cleanup.
 
     After fusion, if GQA was expected for ``(ep, dtype)`` but zero
     ``GroupQueryAttention`` nodes were produced while ``Attention`` nodes
@@ -490,45 +478,12 @@ def optimize_model(
             after_fold,
             after_fold - before_fold,
         )
-
-    # Stage 5: Structural weight fold — eliminate Concat(init, …) and
-    # Transpose(init, perm=[1,0]) from the graph even before weights are loaded.
-    #
-    # Linear emits Transpose(weight) → MatMul; PackQKV emits
-    # Concat(W_q, W_k, W_v) → Transpose(concat_out) → MatMul.
-    # Both patterns are folded here into pre-packed/pre-transposed initializers.
-    # When weights are not yet available (const_value is None), the folded
-    # initializers record their source in metadata_props so that
-    # fold_initializers_after_weights() can materialise the values later.
-    # RemoveUnusedNodesPass then prunes the now-orphaned source initializers.
-    if trace:
-        before_struct = sum(_count_all_ops(model).values())
-        logger.info("[EP Trace] Stage 5: Structural weight fold")
-
-    struct_fold_pass = ir.passes.PassManager(
-        [
-            # FoldConcat MUST precede FoldTranspose: PackQKV emits
-            # Concat(W_q, W_k, W_v) whose output is NOT an initializer.
-            # After FoldConcat replaces it with a single packed initializer,
-            # FoldTranspose can match Transpose(packed_init).
-            FoldConcatInitializersPass(),
-            FoldTransposedInitializerPass(),
-            # Remove source initializers that are no longer referenced now that
-            # they have been replaced by folded (packed/transposed) equivalents.
-            common_passes.RemoveUnusedNodesPass(),
-        ]
-    )
-    struct_fold_pass(model)
-
-    if trace:
-        after_struct = sum(_count_all_ops(model).values())
         logger.info(
-            "[EP Trace]   Structural fold: %d → %d nodes (%+d)",
-            before_struct,
-            after_struct,
-            after_struct - before_struct,
+            "[EP Trace] Summary: %d nodes total, ep=%s, dtype=%s",
+            after_fold,
+            ep,
+            dtype.name,
         )
-        _log_trace_summary(trace_entries)
 
     # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
@@ -544,110 +499,15 @@ def optimize_model(
             )
 
 
-def _materialize_deferred_initializers(model: ir.Model) -> None:
-    """Compute values for initializers that were folded structurally without data.
-
-    Stage 5 of :func:`optimize_model` may fold ``Transpose`` and ``Concat``
-    nodes over initializers before weights are loaded, leaving the resulting
-    folded initializers with ``const_value=None``.  Once weights have been
-    applied to the source initializers (or directly to the model state dict),
-    this function fills in those deferred values so that
-    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` can safely prune the
-    (now-redundant) source initializers.
-
-    Values are set as ``ir.LazyTensor`` to defer the actual compute until
-    serialisation, avoiding transient peak-memory spikes from holding both the
-    original weights and the transposed/packed copies simultaneously.
-
-    Source information is stored by the fold passes in ``metadata_props``:
-
-    - ``"pkg.mobius.fold_source"`` — name of the single source initializer
-      (set by :class:`~mobius._passes.FoldTransposedInitializerPass`).
-    - ``"pkg.mobius.fold_sources"`` / ``"pkg.mobius.fold_axis"`` — comma-separated
-      source names and the concatenation axis
-      (set by :class:`~mobius._passes.FoldConcatInitializersPass`).
-
-    When both keys are present the initializer is a *transposed concat*: it was
-    produced by folding ``Transpose(Concat(W_q, W_k, W_v))``.  In that case
-    the value is computed as ``np.concatenate(sources, axis).T``.
-    """
-    import numpy as np
-
-    for init in model.graph.initializers.values():
-        if init.const_value is not None:
-            continue  # already has data
-
-        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
-        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
-
-        if fold_source is not None and fold_sources_str is not None:
-            # Transposed concat: Transpose(Concat(W_q, W_k, W_v)).
-            # Compute np.concatenate(sources, axis).T lazily.
-            source_names = fold_sources_str.split(",")
-            axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
-            sources = [model.graph.initializers.get(n) for n in source_names]
-            if all(s is not None and s.const_value is not None for s in sources):
-                captured = list(sources)  # type: ignore[misc]
-                captured_axis = axis
-                init.const_value = ir.LazyTensor(
-                    lambda ss=captured, ax=captured_axis: ir.tensor(
-                        np.concatenate(
-                            [s.const_value.numpy() for s in ss],  # type: ignore[union-attr]
-                            axis=ax,
-                        ).T
-                    ),
-                    dtype=init.dtype or ir.DataType.FLOAT,
-                    shape=init.shape,
-                    name=init.name,
-                )
-            continue
-
-        if fold_source is not None:
-            # Simple transposed initializer: lazily compute weight.T.
-            source = model.graph.initializers.get(fold_source)
-            if source is not None and source.const_value is not None:
-                src = source
-                init.const_value = ir.LazyTensor(
-                    lambda s=src: ir.tensor(s.const_value.numpy().T),
-                    dtype=init.dtype or ir.DataType.FLOAT,
-                    shape=init.shape,
-                    name=init.name,
-                )
-            continue
-
-        if fold_sources_str is not None:
-            # Packed (concatenated) initializer: lazily compute np.concatenate.
-            source_names = fold_sources_str.split(",")
-            axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
-            sources = [model.graph.initializers.get(n) for n in source_names]
-            if all(s is not None and s.const_value is not None for s in sources):
-                captured = list(sources)  # type: ignore[misc]
-                captured_axis = axis
-                init.const_value = ir.LazyTensor(
-                    lambda ss=captured, ax=captured_axis: ir.tensor(
-                        np.concatenate(
-                            [s.const_value.numpy() for s in ss],  # type: ignore[union-attr]
-                            axis=ax,
-                        )
-                    ),
-                    dtype=init.dtype or ir.DataType.FLOAT,
-                    shape=init.shape,
-                    name=init.name,
-                )
-
-
 def fold_initializers_after_weights(model: ir.Model) -> None:
     """Run the post-weight-loading cleanup pipeline.
 
     Call this after :func:`apply_weights` has populated all initializers.
-    :func:`optimize_model` already performs a **structural** fold in stage 5
-    (removing Transpose and Concat nodes over initializers, with
-    ``const_value=None`` when weights are not yet loaded), so by the time
-    this function runs the fold passes are typically no-ops.  Their presence
-    here ensures correct behaviour even when :func:`optimize_model` was not
-    called (e.g. in tests that build graphs directly).
+    :func:`optimize_model` does not fold weight ``Transpose`` and ``Concat``
+    nodes, so this function performs the structural fold after weights are
+    available.
 
-    The pipeline runs five sequential steps:
+    The pipeline runs four sequential steps:
 
     1. **Lifts Constant ops to initializers** — promotes any remaining
        ``Constant`` op nodes to proper graph initializers so the subsequent
@@ -655,7 +515,7 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
        introduced after :func:`optimize_model` ran.
 
     2. **Folds Concat initializers** — pre-packs QKV weight matrices produced
-       by the GQA ``PackQKV`` rewrite rules (no-op if already done in stage 5).
+       by the GQA ``PackQKV`` rewrite rules.
        FoldConcat must run **before** FoldTranspose: PackQKV emits
        ``Concat(W_q, W_k, W_v) → Transpose(concat_out) → MatMul``; the Concat
        inputs are initializers, so this pass folds them first into a single
@@ -665,14 +525,9 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     3. **Folds Transpose initializers** — converts every
        ``Transpose(weight, perm=[1, 0])`` (emitted by
        :class:`~mobius.components.Linear`, or left by step 2) into a
-       pre-transposed initializer (no-op if already done in stage 5).
+       pre-transposed initializer.
 
-    4. **Materialises deferred folded initializers** — when stage 5 created
-       ``weight_t`` or ``qkv__concat`` initializers with ``const_value=None``
-       (because weights were not loaded at build time), this step uses the now-
-       populated source initializers to fill in the actual tensor values.
-
-    5. **Removes unused nodes** — prunes orphaned initializers and nodes left
+    4. **Removes unused nodes** — prunes orphaned initializers and nodes left
        behind by the folding passes.  Source initializers (e.g. the individual
        ``q_proj.weight``, ``k_proj.weight``, ``v_proj.weight``) are now safe to
        remove because their data has been copied into the packed/transposed
@@ -686,7 +541,6 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     creates two nodes with the same output name for graph outputs that are
     also SSM state tensors.
     """
-    # Steps 1-3: structural fold passes (may be no-ops if stage 5 already ran).
     ir.passes.PassManager(
         [
             common_passes.LiftConstantsToInitializersPass(),
@@ -696,9 +550,5 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
         ]
     )(model)
 
-    # Step 4: compute deferred values for initializers folded in stage 5
-    # before weights were available.
-    _materialize_deferred_initializers(model)
-
-    # Step 5: prune orphaned initializers and nodes.
+    # Prune orphaned initializers and nodes.
     ir.passes.PassManager([common_passes.RemoveUnusedNodesPass()])(model)

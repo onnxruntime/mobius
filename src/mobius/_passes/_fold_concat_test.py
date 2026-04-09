@@ -124,31 +124,8 @@ class TestFoldConcatInitializersPass:
         result = FoldConcatInitializersPass()(model)
         assert not result.modified
 
-    def test_missing_const_value_leaves_none_on_folded(self):
-        """When any source const_value is None, folded initializer const_value is also None.
-
-        The fold is still structural (Concat node removed, packed initializer registered)
-        but value computation is deferred to fold_initializers_after_weights().
-        """
-        a = np.ones((4, 3), dtype=np.float32)
-        b = np.ones((4, 3), dtype=np.float32)
-        model, init_vals = _make_concat_model([a, b], axis=0)
-
-        # Clear const_value to simulate pre-weight-load state
-        init_vals[0].const_value = None
-
-        FoldConcatInitializersPass()(model)
-
-        packed = model.graph.initializers.get("init_0__init_1__axis_0__concat")
-        assert packed is not None, "packed initializer should be registered even without data"
-        # No data yet — const_value stays None until weights are applied
-        assert packed.const_value is None
-        # Source names recorded for later materialisation
-        assert packed.metadata_props.get("pkg.mobius.fold_sources") == "init_0,init_1"
-        assert packed.metadata_props.get("pkg.mobius.fold_axis") == "0"
-
-    def test_all_non_none_uses_lazy_tensor(self):
-        """When all source const_values are present, the packed initializer uses LazyTensor.
+    def test_uses_lazy_tensor(self):
+        """The packed initializer wraps sources in a LazyTensor.
 
         LazyTensor defers np.concatenate until serialization, so the individual
         source weights and the packed weight are not both in memory simultaneously.

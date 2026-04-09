@@ -8,15 +8,16 @@ After :class:`~mobius.components.Linear` emits ``Transpose(weight, perm=[1, 0])
 result as a new initializer named ``{original_name}_t``.  The runtime
 Transpose node is then removed, eliminating per-inference overhead.
 
-When the source initializer has tensor data (``const_value is not None``), the
-folded initializer uses ``ir.LazyTensor`` so the transposition is deferred until
-serialisation, avoiding holding a duplicate copy of the weight in memory.
+:class:`onnx_ir.LazyTensor` is used so the actual numpy transposition is
+deferred until the tensor data is first accessed (e.g. during ONNX
+serialization), avoiding memory spikes from eagerly materializing all
+transposed weights during the pass itself.
 
-When the source initializer has no tensor data (``const_value is None``), the
-folded initializer is registered with ``const_value=None`` and the source name
-is stored in ``metadata_props["pkg.mobius.fold_source"]`` so that
-:func:`~mobius._optimizations.fold_initializers_after_weights` can materialise
-the value once weights are loaded.
+.. important::
+    This pass must run **after** weights are loaded (i.e. after
+    :func:`~mobius._optimizations.fold_initializers_after_weights` is called).
+    The ``LazyTensor`` closures capture the source initializer and will fail
+    if ``const_value`` is still ``None`` when the model is serialized.
 """
 
 from __future__ import annotations
@@ -34,21 +35,8 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     For each ``Transpose`` node whose sole input is a graph initializer and
     whose ``perm`` attribute is ``[1, 0]``:
 
-    1. A new initializer ``{original_name}_t`` is registered.
-
-       * If the source has tensor data, the new initializer uses
-         ``ir.LazyTensor`` so the transposition is deferred until serialisation,
-         avoiding a duplicate in-memory copy.
-       * If the source has no tensor data (``const_value is None``), the
-         initializer is left with ``const_value=None`` and
-         ``metadata_props["pkg.mobius.fold_source"]`` records the source name for later
-         materialisation by :func:`~mobius._optimizations.fold_initializers_after_weights`.
-         If the source is itself a folded-concat initializer (it carries
-         ``pkg.mobius.fold_sources``), those source names are propagated to the
-         transposed initializer so that weight loading can compute the value
-         directly from the original HuggingFace weights without needing the
-         intermediate packed initializer.
-
+    1. A new initializer ``{original_name}_t`` is registered whose
+       :class:`~onnx_ir.LazyTensor` value lazily transposes the original data.
     2. All consumers of the ``Transpose`` output are rewired to the new
        initializer.
     3. The ``Transpose`` node is removed from the graph.
@@ -57,9 +45,8 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     transposed initializer is created only once and shared among all consumers.
 
     The original initializer is left in place; a subsequent
-    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (called after
-    :func:`~mobius._optimizations.fold_initializers_after_weights` materialises
-    any deferred values) will prune it once it has no remaining consumers.
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` (or the
+    initializer-dedup pass) will prune it if it has no remaining consumers.
     """
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
@@ -103,32 +90,16 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
                 new_val = ir.Value(name=new_name, shape=t_shape, type=inp.type)
 
-                if inp.const_value is not None:
-                    # Use a LazyTensor to defer the transpose until serialization,
-                    # avoiding holding a second copy of the weight in memory.
-                    src = inp  # captured for the closure below
-                    new_val.const_value = ir.LazyTensor(
-                        lambda s=src: ir.tensor(s.const_value.numpy().T),
-                        dtype=inp.dtype or ir.DataType.FLOAT,
-                        shape=t_shape,
-                        name=new_val.name,
-                    )
-                else:
-                    # No data yet — leave const_value=None and record the source
-                    # so fold_initializers_after_weights() can fill it in later.
-                    new_val.metadata_props["pkg.mobius.fold_source"] = inp.name
-                    # If the source is itself a folded-concat (packed weight), propagate
-                    # its fold_sources and fold_axis so weight loading can compute the
-                    # value directly from the original HuggingFace weights without
-                    # needing the intermediate packed initializer to be in the graph.
-                    if "pkg.mobius.fold_sources" in inp.metadata_props:
-                        new_val.metadata_props["pkg.mobius.fold_sources"] = inp.metadata_props[
-                            "pkg.mobius.fold_sources"
-                        ]
-                    if "pkg.mobius.fold_axis" in inp.metadata_props:
-                        new_val.metadata_props["pkg.mobius.fold_axis"] = inp.metadata_props[
-                            "pkg.mobius.fold_axis"
-                        ]
+                # Create a LazyTensor that transposes the original data on demand.
+                # The actual numpy transposition is deferred until serialization,
+                # avoiding holding a second copy of the weight in memory.
+                src = inp  # captured for the closure below
+                new_val.const_value = ir.LazyTensor(
+                    lambda s=src: ir.tensor(s.const_value.numpy().T),
+                    dtype=inp.dtype or ir.DataType.FLOAT,
+                    shape=t_shape,
+                    name=new_val.name,
+                )
 
                 model.graph.initializers[new_val.name] = new_val
                 folded[inp.name] = new_val

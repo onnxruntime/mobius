@@ -446,19 +446,28 @@ def test_onnx_standard_ep_has_no_gqa():
     assert gqa_count == 0, f"'onnx-standard' EP should have no GQA, got {gqa_count}"
 
 
-def test_optimize_model_eliminates_weight_transpose_structurally():
-    """optimize_model() stage 5 folds Transpose(weight) nodes even without weights.
+def test_optimize_model_eliminates_weight_transpose_after_weights():
+    """fold_initializers_after_weights folds Transpose(weight) nodes once weights are set.
 
-    Linear emits Transpose(weight, perm=[1,0]) → MatMul. After optimize_model,
-    no Transpose nodes should target initializers — they should be replaced by
-    pre-transposed weight_t initializers. This works even before apply_weights()
-    because the fold is structural (lazy tensors defer value computation).
+    Linear emits Transpose(weight, perm=[1,0]) → MatMul.  After the fold pass
+    runs (post-weight-load), no Transpose nodes should target initializers —
+    they are replaced by pre-transposed weight_t initializers.
     """
+    import numpy as np
+
+    from mobius._optimizations import fold_initializers_after_weights
+
     pkg = _make_llama_pkg(ep="cpu", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
-    # Only count perm=[1,0] weight transposes (what FoldTransposedInitializerPass folds).
-    # Other Transpose ops over initializers (e.g. different perms) are not folded by
-    # this pass and should not cause the assertion to fail.
+
+    # Initialise all uninitialised parameters so the fold can materialise.
+    for init in model.graph.initializers.values():
+        if init.const_value is None:
+            shape = [int(d) for d in init.shape]
+            init.const_value = ir.Tensor(np.random.randn(*shape).astype(np.float32))
+
+    fold_initializers_after_weights(model)
+
     remaining_transpose = sum(
         1
         for node in model.graph.all_nodes()
@@ -468,23 +477,34 @@ def test_optimize_model_eliminates_weight_transpose_structurally():
         and list(node.attributes["perm"].value) == [1, 0]
     )
     assert remaining_transpose == 0, (
-        f"optimize_model should fold all Transpose(initializer) nodes, "
+        f"fold_initializers_after_weights should fold all Transpose(initializer) nodes, "
         f"{remaining_transpose} remain"
     )
-    # weight_t initializers should exist.
     transposed_inits = [k for k in model.graph.initializers if k.endswith("_t")]
     assert len(transposed_inits) > 0, "Expected pre-transposed weight_t initializers"
 
 
-def test_optimize_model_cuda_eliminates_qkv_concat_structurally():
-    """optimize_model() stage 5 folds PackQKV Concat+Transpose even without weights.
+def test_optimize_model_cuda_eliminates_qkv_concat_after_weights():
+    """fold_initializers_after_weights folds PackQKV Concat+Transpose after weights are set.
 
     On CUDA EP, PackQKV rewrites Q/K/V projections into Concat(W_q,W_k,W_v) →
-    Transpose → MatMul. After optimize_model stage 5, no Concat nodes should
-    remain over initializers.
+    Transpose → MatMul.  After fold_initializers_after_weights, no Concat nodes
+    should remain over initializers.
     """
+    import numpy as np
+
+    from mobius._optimizations import fold_initializers_after_weights
+
     pkg = _make_llama_pkg(ep="cuda", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
+
+    for init in model.graph.initializers.values():
+        if init.const_value is None:
+            shape = [int(d) for d in init.shape]
+            init.const_value = ir.Tensor(np.random.randn(*shape).astype(np.float32))
+
+    fold_initializers_after_weights(model)
+
     remaining_concat = sum(
         1
         for node in model.graph.all_nodes()
@@ -496,6 +516,6 @@ def test_optimize_model_cuda_eliminates_qkv_concat_structurally():
         )
     )
     assert remaining_concat == 0, (
-        f"optimize_model should fold all Concat(initializer, …) nodes, "
+        f"fold_initializers_after_weights should fold all Concat(initializer, …) nodes, "
         f"{remaining_concat} remain"
     )

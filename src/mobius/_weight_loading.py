@@ -83,102 +83,24 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     Assigns each tensor in *state_dict* to the matching initializer in the
     model.  After all weights are assigned,
     :func:`~mobius._optimizations.fold_initializers_after_weights` is called to
-    materialise any deferred folded initializers (created by stage 5 of
-    :func:`~mobius._optimizations.optimize_model`) and remove the now-redundant
-    source initializers.
-
-    Stage 5 of :func:`~mobius._optimizations.optimize_model` folds structural
-    ``Transpose`` and ``Concat`` nodes and removes the original source
-    initializers from the graph.  Weights for those removed initializers still
-    arrive in *state_dict* but are no longer present in
-    ``model.graph.initializers``.  This function detects that case by inspecting
-    ``pkg.mobius.fold_source`` / ``pkg.mobius.fold_sources`` metadata on folded
-    initializers and computes the deferred tensor values directly from the state
-    dict rather than requiring the intermediate initializers to be in the graph.
+    fold ``Transpose`` and ``Concat`` nodes over initializers into pre-computed
+    weights and remove unused source initializers.
 
     Args:
         model: The ONNX IR model.
         state_dict: Mapping of parameter names to torch tensors.
     """
-    import numpy as np
-
     from mobius._optimizations import fold_initializers_after_weights
 
-    # Collect source names that were folded away by stage 5 so we can suppress
-    # false-positive "weight not found" warnings for those entries.
-    folded_sources: set[str] = set()
-    for init in model.graph.initializers.values():
-        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
-        if fold_source:
-            folded_sources.add(fold_source)
-        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
-        if fold_sources_str:
-            folded_sources.update(fold_sources_str.split(","))
-
-    # Step 1: Assign weights that are directly present in the graph.
     for name, tensor in state_dict.items():
-        if name in model.graph.initializers:
-            _assign_weight(model.graph.initializers[name], tensor, name)
-        elif name not in folded_sources:
+        if name not in model.graph.initializers:
             logger.warning(
                 "Weight '%s' not found in the model. Skipped applying.",
                 name,
             )
-
-    # Step 2: Populate deferred folded initializers whose source initializers
-    # were removed from the graph by stage 5's RemoveUnusedNodesPass.
-    # This covers two cases:
-    #   a) Transposed concat — init has both pkg.mobius.fold_source and pkg.mobius.fold_sources:
-    #      the value is np.concatenate(W_q, W_k, W_v, axis).T
-    #   b) Pure concat — init has only pkg.mobius.fold_sources:
-    #      the value is np.concatenate(bias_q, bias_k, bias_v, axis)
-    for init in model.graph.initializers.values():
-        if init.const_value is not None:
-            continue  # already set by step 1
-
-        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
-        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
-
-        if fold_sources_str is None:
-            continue  # no packed-sources metadata; handled by _materialize_deferred
-
-        source_names = fold_sources_str.split(",")
-        axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
-
-        # Only apply this path when the sources were removed from the graph
-        # (i.e. stage 5 + RemoveUnused pruned them).  If they are still present,
-        # _materialize_deferred_initializers will handle them after step 1.
-        if any(n in model.graph.initializers for n in source_names):
             continue
 
-        if not all(n in state_dict for n in source_names):
-            continue  # cannot compute; leave for materialise to handle or warn
-
-        tensors = [state_dict[n] for n in source_names]
-        onnx_dtype = init.dtype or ir.DataType.FLOAT
-        target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
-        captured_axis = axis
-
-        if fold_source is not None:
-            # Transposed concat: concatenate along axis then transpose.
-            init.const_value = ir.LazyTensor(
-                lambda ts=tensors, ax=captured_axis, dt=target_dtype: ir.tensor(
-                    np.concatenate([t.to(dt).numpy() for t in ts], axis=ax).T
-                ),
-                dtype=onnx_dtype,
-                shape=init.shape,
-                name=init.name,
-            )
-        else:
-            # Pure concat: concatenate along axis.
-            init.const_value = ir.LazyTensor(
-                lambda ts=tensors, ax=captured_axis, dt=target_dtype: ir.tensor(
-                    np.concatenate([t.to(dt).numpy() for t in ts], axis=ax)
-                ),
-                dtype=onnx_dtype,
-                shape=init.shape,
-                name=init.name,
-            )
+        _assign_weight(model.graph.initializers[name], tensor, name)
 
     fold_initializers_after_weights(model)
 
