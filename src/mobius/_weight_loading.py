@@ -108,10 +108,10 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     # false-positive "weight not found" warnings for those entries.
     folded_sources: set[str] = set()
     for init in model.graph.initializers.values():
-        fold_source = init.metadata_props.get("pkg.pkg.mobius.fold_source")
+        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
         if fold_source:
             folded_sources.add(fold_source)
-        fold_sources_str = init.metadata_props.get("pkg.pkg.mobius.fold_sources")
+        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
         if fold_sources_str:
             folded_sources.update(fold_sources_str.split(","))
 
@@ -136,14 +136,14 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
         if init.const_value is not None:
             continue  # already set by step 1
 
-        fold_source = init.metadata_props.get("pkg.pkg.mobius.fold_source")
-        fold_sources_str = init.metadata_props.get("pkg.pkg.mobius.fold_sources")
+        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
+        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
 
         if fold_sources_str is None:
             continue  # no packed-sources metadata; handled by _materialize_deferred
 
         source_names = fold_sources_str.split(",")
-        axis = int(init.metadata_props.get("pkg.pkg.mobius.fold_axis", "0"))
+        axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
 
         # Only apply this path when the sources were removed from the graph
         # (i.e. stage 5 + RemoveUnused pruned them).  If they are still present,

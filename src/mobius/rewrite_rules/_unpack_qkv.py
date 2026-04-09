@@ -172,9 +172,9 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                     if bias_input is None or bias_input.producer() is not None:
                         return result.fail("Bias Concat input is not a graph parameter")
                 self._bias_concat_node = bias_concat
-            elif bias_concat is None and bias_val.metadata_props.get("pkg.pkg.mobius.fold_sources"):
+            elif bias_concat is None and bias_val.metadata_props.get("pkg.mobius.fold_sources"):
                 # Post-fold: bias is a packed initializer; recover individual biases.
-                source_names = bias_val.metadata_props["pkg.pkg.mobius.fold_sources"].split(",")
+                source_names = bias_val.metadata_props["pkg.mobius.fold_sources"].split(",")
                 if len(source_names) != 3:
                     return result.fail("Post-fold bias has wrong number of sources")
                 graph = gqa_node.graph
@@ -256,7 +256,7 @@ class GQAUnpackQKV(RewriteRuleClassBase):
             # Post-fold form: weight is a pre-packed + pre-transposed initializer
             # created by FoldConcatInitializersPass + FoldTransposedInitializerPass.
             # Follow the fold metadata to recover the original W_q, W_k, W_v.
-            fold_source = w_input.metadata_props.get("pkg.pkg.mobius.fold_source")
+            fold_source = w_input.metadata_props.get("pkg.mobius.fold_source")
             if fold_source is None:
                 return result.fail(
                     "Direct MatMul weight has no pkg.mobius.fold_source metadata — cannot unpack"
@@ -271,7 +271,7 @@ class GQAUnpackQKV(RewriteRuleClassBase):
             if concat_init is None:
                 return result.fail(f"Fold source {fold_source!r} not found in graph")
 
-            fold_sources = concat_init.metadata_props.get("pkg.pkg.mobius.fold_sources")
+            fold_sources = concat_init.metadata_props.get("pkg.mobius.fold_sources")
             if fold_sources is None:
                 return result.fail(
                     "Fold source has no pkg.mobius.fold_sources metadata — cannot determine Q/K/V split"

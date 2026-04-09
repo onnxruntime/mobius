@@ -561,9 +561,9 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
 
     Source information is stored by the fold passes in ``metadata_props``:
 
-    - ``"pkg.pkg.mobius.fold_source"`` — name of the single source initializer
+    - ``"pkg.mobius.fold_source"`` — name of the single source initializer
       (set by :class:`~mobius._passes.FoldTransposedInitializerPass`).
-    - ``"pkg.pkg.mobius.fold_sources"`` / ``"pkg.pkg.mobius.fold_axis"`` — comma-separated
+    - ``"pkg.mobius.fold_sources"`` / ``"pkg.mobius.fold_axis"`` — comma-separated
       source names and the concatenation axis
       (set by :class:`~mobius._passes.FoldConcatInitializersPass`).
 
@@ -577,14 +577,14 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
         if init.const_value is not None:
             continue  # already has data
 
-        fold_source = init.metadata_props.get("pkg.pkg.mobius.fold_source")
-        fold_sources_str = init.metadata_props.get("pkg.pkg.mobius.fold_sources")
+        fold_source = init.metadata_props.get("pkg.mobius.fold_source")
+        fold_sources_str = init.metadata_props.get("pkg.mobius.fold_sources")
 
         if fold_source is not None and fold_sources_str is not None:
             # Transposed concat: Transpose(Concat(W_q, W_k, W_v)).
             # Compute np.concatenate(sources, axis).T lazily.
             source_names = fold_sources_str.split(",")
-            axis = int(init.metadata_props.get("pkg.pkg.mobius.fold_axis", "0"))
+            axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
             sources = [model.graph.initializers.get(n) for n in source_names]
             if all(s is not None and s.const_value is not None for s in sources):
                 captured = list(sources)  # type: ignore[misc]
@@ -618,7 +618,7 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
         if fold_sources_str is not None:
             # Packed (concatenated) initializer: lazily compute np.concatenate.
             source_names = fold_sources_str.split(",")
-            axis = int(init.metadata_props.get("pkg.pkg.mobius.fold_axis", "0"))
+            axis = int(init.metadata_props.get("pkg.mobius.fold_axis", "0"))
             sources = [model.graph.initializers.get(n) for n in source_names]
             if all(s is not None and s.const_value is not None for s in sources):
                 captured = list(sources)  # type: ignore[misc]

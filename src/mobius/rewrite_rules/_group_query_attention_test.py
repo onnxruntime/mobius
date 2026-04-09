@@ -337,10 +337,10 @@ class TestGroupQueryAttentionRules:
             # After stage 5 + RemoveUnused, the intermediate packed initializer is gone;
             # its pkg.mobius.fold_sources metadata was propagated directly onto the transposed
             # weight by FoldTransposedInitializerPass.
-            assert w.metadata_props.get("pkg.pkg.mobius.fold_source") is not None, (
+            assert w.metadata_props.get("pkg.mobius.fold_source") is not None, (
                 "Packed+transposed weight should have pkg.mobius.fold_source metadata"
             )
-            assert w.metadata_props.get("pkg.pkg.mobius.fold_sources") is not None, (
+            assert w.metadata_props.get("pkg.mobius.fold_sources") is not None, (
                 "Packed+transposed weight should carry pkg.mobius.fold_sources (W_q,W_k,W_v names)"
             )
 
@@ -505,7 +505,7 @@ class TestGroupQueryAttentionRules:
             assert bias_val is not None, "Add should contain bias initializer"
 
             # After stage 5, the bias Concat is folded to a direct initializer.
-            assert bias_val.metadata_props.get("pkg.pkg.mobius.fold_sources") is not None, (
+            assert bias_val.metadata_props.get("pkg.mobius.fold_sources") is not None, (
                 "Packed bias should be a folded concat initializer with pkg.mobius.fold_sources"
             )
 
@@ -514,7 +514,7 @@ class TestGroupQueryAttentionRules:
             assert w is not None and w.producer() is None, (
                 "Packed weight should be a direct initializer after structural fold"
             )
-            assert w.metadata_props.get("pkg.pkg.mobius.fold_source") is not None, (
+            assert w.metadata_props.get("pkg.mobius.fold_source") is not None, (
                 "Packed+transposed weight should have pkg.mobius.fold_source metadata"
             )
 
