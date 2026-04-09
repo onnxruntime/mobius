@@ -33,6 +33,7 @@ __all__ = [
     "GatedMLP",
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
+    "Gemma4AudioEncoder",
     "GroupNorm",
     "GQAContext",
     "INT64_MAX",
@@ -115,6 +116,7 @@ from mobius.components._attention import (
     StaticCacheState,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._codec_conv import (
     CausalConv1d,
     CausalConvNd,
