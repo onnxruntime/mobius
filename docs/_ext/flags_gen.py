@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+
 """Sphinx extension: generate feature flags documentation at build time.
 
 Hooks into ``builder-inited`` to generate ``docs/feature-flags.md`` from

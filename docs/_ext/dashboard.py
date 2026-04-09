@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+
 """Sphinx extension: generate the confidence dashboard after build.
 
 Hooks into ``build-finished`` to run ``scripts/generate_dashboard.py``

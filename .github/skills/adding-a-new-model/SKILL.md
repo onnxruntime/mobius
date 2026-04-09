@@ -46,8 +46,8 @@ If the logits match HuggingFace, you only need the registry entry.
 Create `src/mobius/models/<model_name>.py`.  The minimal template:
 
 ```python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -304,7 +304,7 @@ new model is a significant addition.
 
 ## Checklist
 
-- [ ] Model file in `src/mobius/models/` with Apache-2.0 copyright header
+- [ ] Model file in `src/mobius/models/` with Microsoft MIT copyright header
 - [ ] Class has `default_task` and `category` attributes (if not standard text-generation)
 - [ ] Class has a descriptive docstring (first paragraph used in generated docs)
 - [ ] `preprocess_weights` handles any key mismatches

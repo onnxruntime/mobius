@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+
 """Root conftest: ensure the local worktree src/ is on sys.path first."""
 
 from __future__ import annotations
