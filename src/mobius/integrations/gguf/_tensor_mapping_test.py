@@ -115,6 +115,79 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", "gemma2")
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    # ---- Gemma 4 ----
+
+    def test_gemma4_inherits_llama_base(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.3.attn_q.weight", "gemma4")
+            == "model.layers.3.self_attn.q_proj.weight"
+        )
+        assert map_gguf_to_hf_names("token_embd.weight", "gemma4") == "model.embed_tokens.weight"
+        assert map_gguf_to_hf_names("output_norm.weight", "gemma4") == "model.norm.weight"
+
+    def test_gemma4_ffn_norm_override(self) -> None:
+        # Gemma 4 overrides the Llama mapping: ffn_norm → pre_feedforward_layernorm
+        # (not post_attention_layernorm as in the base Llama mapping).
+        assert (
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma4")
+            == "model.layers.0.pre_feedforward_layernorm.weight"
+        )
+
+    def test_gemma4_attention_norms(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma4")
+            == "model.layers.0.post_attention_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma4")
+            == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "gemma4")
+            == "model.layers.0.self_attn.q_norm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "gemma4")
+            == "model.layers.0.self_attn.k_norm.weight"
+        )
+
+    def test_gemma4_layer_scalar(self) -> None:
+        # LAYER_OUT_SCALE → layer_scalar (all variants)
+        assert (
+            map_gguf_to_hf_names("blk.5.layer_output_scale.weight", "gemma4")
+            == "model.layers.5.layer_scalar.weight"
+        )
+
+    def test_gemma4_moe_norms(self) -> None:
+        # MoE path norms (models with enable_moe_block=True, e.g. 26B-A4B)
+        assert (
+            map_gguf_to_hf_names("blk.2.pre_ffw_norm_2.weight", "gemma4")
+            == "model.layers.2.pre_feedforward_layernorm_2.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.2.post_ffw_norm_1.weight", "gemma4")
+            == "model.layers.2.post_feedforward_layernorm_1.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.2.post_ffw_norm_2.weight", "gemma4")
+            == "model.layers.2.post_feedforward_layernorm_2.weight"
+        )
+
+    def test_gemma4_per_layer_input(self) -> None:
+        # Per-layer input embedding path (models with hidden_size_per_layer_input>0)
+        assert (
+            map_gguf_to_hf_names("blk.1.inp_gate.weight", "gemma4")
+            == "model.layers.1.per_layer_input_gate.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.1.proj.weight", "gemma4")
+            == "model.layers.1.per_layer_projection.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.1.post_norm.weight", "gemma4")
+            == "model.layers.1.post_per_layer_input_norm.weight"
+        )
+
     # ---- Phi-3 ----
 
     def test_phi3_fused_qkv(self) -> None:
