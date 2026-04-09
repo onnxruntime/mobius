@@ -7,6 +7,10 @@ When all inputs to a ``Concat`` node are graph initializers the concatenation
 result is statically known at weight-load time.  This pass materialises the
 result as a new initializer, removing the runtime ``Concat`` node.
 
+If all inputs have tensor data (``const_value is not None``), the new
+initializer uses ``ir.LazyTensor`` so the concatenation is deferred until
+serialisation, avoiding holding a duplicate copy of all weight slices in memory.
+
 If any input has no tensor data (``const_value is None``), the new initializer
 is registered with ``const_value=None`` and source information is stored in
 ``metadata_props`` so that
@@ -35,9 +39,16 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
     For each ``Concat`` node whose **every** input is a graph initializer:
 
     1. A new initializer ``{name_0}__{name_1}__axis_{axis}__concat`` is
-       registered.  If all sources have tensor data the value is concatenated
-       immediately; otherwise ``const_value`` is left as ``None`` and the source
-       names are stored in ``metadata_props`` for later materialisation.
+       registered.
+
+       * If all sources have tensor data, the new initializer uses
+         ``ir.LazyTensor`` so the concatenation is deferred until serialisation,
+         avoiding holding duplicate copies of all weight slices in memory.
+       * If any source has no tensor data (``const_value is None``),
+         ``const_value`` is left as ``None`` and the source names are stored in
+         ``metadata_props`` for later materialisation by
+         :func:`~mobius._optimizations.fold_initializers_after_weights`.
+
     2. All consumers of the ``Concat`` output are rewired to the new
        initializer.
     3. The ``Concat`` node is removed from the graph.
@@ -122,9 +133,18 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             # Check if all sources have data available.
             all_have_data = all(v.const_value is not None for v in inputs)  # type: ignore[union-attr]
             if all_have_data:
-                # Eagerly compute the concatenated value.
-                arrays = [v.const_value.numpy() for v in inputs]  # type: ignore[union-attr]
-                new_val.const_value = ir.tensor(np.concatenate(arrays, axis=axis))
+                # Use a LazyTensor to defer the concatenation until serialization,
+                # avoiding holding a second copy of all weights in memory.
+                captured_inputs = list(inputs)
+                captured_axis = axis
+                new_val.const_value = ir.LazyTensor(
+                    lambda ins=captured_inputs, ax=captured_axis: ir.tensor(
+                        np.concatenate([v.const_value.numpy() for v in ins], axis=ax)  # type: ignore[union-attr]
+                    ),
+                    dtype=dtypes[0] or ir.DataType.FLOAT,
+                    shape=out_shape,
+                    name=new_val.name,
+                )
             else:
                 # No data yet — leave const_value=None and record the source names
                 # so fold_initializers_after_weights() can fill it in later.

@@ -8,6 +8,10 @@ After :class:`~mobius.components.Linear` emits ``Transpose(weight, perm=[1, 0])
 result as a new initializer named ``{original_name}_t``.  The runtime
 Transpose node is then removed, eliminating per-inference overhead.
 
+When the source initializer has tensor data (``const_value is not None``), the
+folded initializer uses ``ir.LazyTensor`` so the transposition is deferred until
+serialisation, avoiding holding a duplicate copy of the weight in memory.
+
 When the source initializer has no tensor data (``const_value is None``), the
 folded initializer is registered with ``const_value=None`` and the source name
 is stored in ``metadata_props["_fold_source"]`` so that
@@ -30,10 +34,16 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     For each ``Transpose`` node whose sole input is a graph initializer and
     whose ``perm`` attribute is ``[1, 0]``:
 
-    1. A new initializer ``{original_name}_t`` is registered.  If the source
-       has tensor data its value is transposed immediately; otherwise
-       ``const_value`` is left as ``None`` and the source name is stored in
-       ``metadata_props["_fold_source"]`` for later materialisation.
+    1. A new initializer ``{original_name}_t`` is registered.
+
+       * If the source has tensor data, the new initializer uses
+         ``ir.LazyTensor`` so the transposition is deferred until serialisation,
+         avoiding a duplicate in-memory copy.
+       * If the source has no tensor data (``const_value is None``), the
+         initializer is left with ``const_value=None`` and
+         ``metadata_props["_fold_source"]`` records the source name for later
+         materialisation by :func:`~mobius._optimizations.fold_initializers_after_weights`.
+
     2. All consumers of the ``Transpose`` output are rewired to the new
        initializer.
     3. The ``Transpose`` node is removed from the graph.
@@ -87,8 +97,15 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 new_val = ir.Value(name=f"{inp.name}_t", shape=t_shape, type=inp.type)
 
                 if inp.const_value is not None:
-                    # Eagerly compute the transposed value.
-                    new_val.const_value = ir.tensor(inp.const_value.numpy().T)
+                    # Use a LazyTensor to defer the transpose until serialization,
+                    # avoiding holding a second copy of the weight in memory.
+                    src = inp  # captured for the closure below
+                    new_val.const_value = ir.LazyTensor(
+                        lambda s=src: ir.tensor(s.const_value.numpy().T),
+                        dtype=inp.dtype or ir.DataType.FLOAT,
+                        shape=t_shape,
+                        name=new_val.name,
+                    )
                 else:
                     # No data yet — leave const_value=None and record the source
                     # so fold_initializers_after_weights() can fill it in later.
