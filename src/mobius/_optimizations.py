@@ -50,10 +50,22 @@ import onnx_ir as ir
 import onnx_shape_inference
 import onnxscript.optimizer._constant_folding
 from onnx_ir.passes import common as common_passes
+from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
 from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
+from mobius.functions import register_function_bodies
+from mobius.rewrite_rules import (
+    eliminate_shape_rules,
+    gelu_fusion_rules,
+    group_query_attention_rules,
+    pack_qkv_for_gqa_rules,
+    separate_rope_rules,
+    skip_layer_norm_rules,
+    skip_norm_rules,
+    unpack_qkv_rules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +217,6 @@ def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -
     if isinstance(rules_or_pass, ir.passes.InPlacePass):
         rules_or_pass(model)
     elif rules_or_pass:
-        from onnxscript.rewriter import rewrite
-
         rewrite(model, pattern_rewrite_rules=rules_or_pass)
 
 
@@ -260,17 +270,6 @@ def _get_optimization_passes(
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
         tuples where payload is a rule list or IR pass.
     """
-    from mobius.rewrite_rules import (
-        eliminate_shape_rules,
-        gelu_fusion_rules,
-        group_query_attention_rules,
-        pack_qkv_for_gqa_rules,
-        separate_rope_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-        unpack_qkv_rules,
-    )
-
     fuse: list[tuple[str, list]] = []
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
 
@@ -377,8 +376,6 @@ def optimize_model(
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
-    from mobius.functions import register_function_bodies
-
     register_function_bodies(model)
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
@@ -435,16 +432,12 @@ def optimize_model(
         lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
 
         if all_fuse_rules:
-            from onnxscript.rewriter import rewrite
-
             rewrite(model, pattern_rewrite_rules=all_fuse_rules)
 
         # Expand unsupported custom ops via registered ir.Function bodies.
         inline_pass(model)
 
         if all_lower_rules:
-            from onnxscript.rewriter import rewrite
-
             rewrite(model, pattern_rewrite_rules=all_lower_rules)
 
         for _, ir_pass in lower_ir_passes:

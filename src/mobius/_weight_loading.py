@@ -24,9 +24,13 @@ import json
 import logging
 
 import onnx_ir as ir
+import safetensors.torch
 import torch
 import tqdm
+from huggingface_hub import hf_hub_download
 from onnx_ir import tensor_adapters
+
+from mobius._optimizations import fold_initializers_after_weights
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +94,6 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
         model: The ONNX IR model.
         state_dict: Mapping of parameter names to torch tensors.
     """
-    from mobius._optimizations import fold_initializers_after_weights
-
     for name, tensor in state_dict.items():
         if name not in model.graph.initializers:
             logger.warning(
@@ -122,8 +124,6 @@ def _parallel_download(
     Returns:
         List of local file paths in the same order as *filenames*.
     """
-    from huggingface_hub import hf_hub_download
-
     if len(filenames) <= 1:
         # No benefit from parallelism for a single file
         return [hf_hub_download(repo_id=model_id, filename=f) for f in filenames]
@@ -152,9 +152,6 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
 
     Uses parallel downloads when multiple safetensors shards exist.
     """
-    import safetensors.torch
-    from huggingface_hub import hf_hub_download
-
     try:
         index_path = hf_hub_download(
             repo_id=model_id,
