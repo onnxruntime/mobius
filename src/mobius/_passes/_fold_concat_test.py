@@ -144,8 +144,8 @@ class TestFoldConcatInitializersPass:
         # No data yet — const_value stays None until weights are applied
         assert packed.const_value is None
         # Source names recorded for later materialisation
-        assert packed.metadata_props.get("_fold_sources") == "init_0,init_1"
-        assert packed.metadata_props.get("_fold_axis") == "0"
+        assert packed.metadata_props.get("mobius.fold_sources") == "init_0,init_1"
+        assert packed.metadata_props.get("mobius.fold_axis") == "0"
 
     def test_all_non_none_uses_lazy_tensor(self):
         """When all source const_values are present, the packed initializer uses LazyTensor.

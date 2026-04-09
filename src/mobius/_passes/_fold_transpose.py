@@ -14,7 +14,7 @@ serialisation, avoiding holding a duplicate copy of the weight in memory.
 
 When the source initializer has no tensor data (``const_value is None``), the
 folded initializer is registered with ``const_value=None`` and the source name
-is stored in ``metadata_props["_fold_source"]`` so that
+is stored in ``metadata_props["mobius.fold_source"]`` so that
 :func:`~mobius._optimizations.fold_initializers_after_weights` can materialise
 the value once weights are loaded.
 """
@@ -41,8 +41,13 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
          avoiding a duplicate in-memory copy.
        * If the source has no tensor data (``const_value is None``), the
          initializer is left with ``const_value=None`` and
-         ``metadata_props["_fold_source"]`` records the source name for later
+         ``metadata_props["mobius.fold_source"]`` records the source name for later
          materialisation by :func:`~mobius._optimizations.fold_initializers_after_weights`.
+         If the source is itself a folded-concat initializer (it carries
+         ``mobius.fold_sources``), those source names are propagated to the
+         transposed initializer so that weight loading can compute the value
+         directly from the original HuggingFace weights without needing the
+         intermediate packed initializer.
 
     2. All consumers of the ``Transpose`` output are rewired to the new
        initializer.
@@ -76,7 +81,7 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 continue
 
             # Only fold initializer inputs (not graph inputs or computed values).
-            if inp.name not in model.graph.initializers:
+            if not inp.is_initializer():
                 continue
 
             perm_attr = node.attributes.get("perm")
@@ -88,43 +93,50 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             if inp.name not in folded:
                 new_name = f"{inp.name}_t"
 
-                if new_name in model.graph.initializers:
-                    # An equivalent transposed initializer already exists (e.g. from a
-                    # previous pass invocation).  Reuse it rather than silently overwriting.
-                    folded[inp.name] = model.graph.initializers[new_name]
-                else:
-                    # Derive shape of the transposed tensor from the Transpose output.
-                    # Fall back to computing from the input shape if shape inference
-                    # did not propagate to this new node (e.g. after stage-2 rewrites).
-                    t_shape = out_val.shape
-                    if t_shape is None and inp.shape is not None:
-                        perm = list(perm_attr.value)
-                        t_shape = ir.Shape([inp.shape[p] for p in perm])
+                # Derive shape of the transposed tensor from the Transpose output.
+                # Fall back to computing from the input shape if shape inference
+                # did not propagate to this new node (e.g. after stage-2 rewrites).
+                t_shape = out_val.shape
+                if t_shape is None and inp.shape is not None:
+                    perm = list(perm_attr.value)
+                    t_shape = ir.Shape([inp.shape[p] for p in perm])
 
-                    new_val = ir.Value(name=new_name, shape=t_shape, type=inp.type)
+                new_val = ir.Value(name=new_name, shape=t_shape, type=inp.type)
 
-                    if inp.const_value is not None:
-                        # Use a LazyTensor to defer the transpose until serialization,
-                        # avoiding holding a second copy of the weight in memory.
-                        src = inp  # captured for the closure below
-                        new_val.const_value = ir.LazyTensor(
-                            lambda s=src: ir.tensor(s.const_value.numpy().T),
-                            dtype=inp.dtype or ir.DataType.FLOAT,
-                            shape=t_shape,
-                            name=new_val.name,
-                        )
-                    else:
-                        # No data yet — leave const_value=None and record the source
-                        # so fold_initializers_after_weights() can fill it in later.
-                        new_val.metadata_props["_fold_source"] = inp.name
-
-                    model.graph.initializers[new_val.name] = new_val
-                    folded[inp.name] = new_val
-                    logger.debug(
-                        "FoldTransposedInitializer: registered %r (shape %s)",
-                        new_val.name,
-                        t_shape,
+                if inp.const_value is not None:
+                    # Use a LazyTensor to defer the transpose until serialization,
+                    # avoiding holding a second copy of the weight in memory.
+                    src = inp  # captured for the closure below
+                    new_val.const_value = ir.LazyTensor(
+                        lambda s=src: ir.tensor(s.const_value.numpy().T),
+                        dtype=inp.dtype or ir.DataType.FLOAT,
+                        shape=t_shape,
+                        name=new_val.name,
                     )
+                else:
+                    # No data yet — leave const_value=None and record the source
+                    # so fold_initializers_after_weights() can fill it in later.
+                    new_val.metadata_props["mobius.fold_source"] = inp.name
+                    # If the source is itself a folded-concat (packed weight), propagate
+                    # its fold_sources and fold_axis so weight loading can compute the
+                    # value directly from the original HuggingFace weights without
+                    # needing the intermediate packed initializer to be in the graph.
+                    if "mobius.fold_sources" in inp.metadata_props:
+                        new_val.metadata_props["mobius.fold_sources"] = inp.metadata_props[
+                            "mobius.fold_sources"
+                        ]
+                    if "mobius.fold_axis" in inp.metadata_props:
+                        new_val.metadata_props["mobius.fold_axis"] = inp.metadata_props[
+                            "mobius.fold_axis"
+                        ]
+
+                model.graph.initializers[new_val.name] = new_val
+                folded[inp.name] = new_val
+                logger.debug(
+                    "FoldTransposedInitializer: registered %r (shape %s)",
+                    new_val.name,
+                    t_shape,
+                )
 
             replacement = folded[inp.name]
             out_val.replace_all_uses_with(replacement, replace_graph_outputs=True)

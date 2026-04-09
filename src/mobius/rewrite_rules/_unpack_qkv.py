@@ -163,7 +163,7 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                 return result.fail("Add inputs do not include a MatMul")
 
             # Validate the bias — either a Concat node (pre-fold) or a folded
-            # initializer with _fold_sources metadata (post-fold).
+            # initializer with mobius.fold_sources metadata (post-fold).
             bias_concat = bias_val.producer() if bias_val else None
             if bias_concat is not None and bias_concat.op_type == "Concat":
                 if len(bias_concat.inputs) != 3:
@@ -172,9 +172,9 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                     if bias_input is None or bias_input.producer() is not None:
                         return result.fail("Bias Concat input is not a graph parameter")
                 self._bias_concat_node = bias_concat
-            elif bias_concat is None and bias_val.metadata_props.get("_fold_sources"):
+            elif bias_concat is None and bias_val.metadata_props.get("mobius.fold_sources"):
                 # Post-fold: bias is a packed initializer; recover individual biases.
-                source_names = bias_val.metadata_props["_fold_sources"].split(",")
+                source_names = bias_val.metadata_props["mobius.fold_sources"].split(",")
                 if len(source_names) != 3:
                     return result.fail("Post-fold bias has wrong number of sources")
                 graph = gqa_node.graph
@@ -188,7 +188,7 @@ class GQAUnpackQKV(RewriteRuleClassBase):
                 self._post_fold_bias_sources = bias_sources
             else:
                 return result.fail(
-                    "Bias is not produced by a Concat node and has no _fold_sources metadata"
+                    "Bias is not produced by a Concat node and has no mobius.fold_sources metadata"
                 )
         else:
             # No-bias path: packed_qkv must come from MatMul directly.
@@ -256,10 +256,10 @@ class GQAUnpackQKV(RewriteRuleClassBase):
             # Post-fold form: weight is a pre-packed + pre-transposed initializer
             # created by FoldConcatInitializersPass + FoldTransposedInitializerPass.
             # Follow the fold metadata to recover the original W_q, W_k, W_v.
-            fold_source = w_input.metadata_props.get("_fold_source")
+            fold_source = w_input.metadata_props.get("mobius.fold_source")
             if fold_source is None:
                 return result.fail(
-                    "Direct MatMul weight has no _fold_source metadata — cannot unpack"
+                    "Direct MatMul weight has no mobius.fold_source metadata — cannot unpack"
                 )
 
             graph = gqa_node.graph
@@ -271,10 +271,10 @@ class GQAUnpackQKV(RewriteRuleClassBase):
             if concat_init is None:
                 return result.fail(f"Fold source {fold_source!r} not found in graph")
 
-            fold_sources = concat_init.metadata_props.get("_fold_sources")
+            fold_sources = concat_init.metadata_props.get("mobius.fold_sources")
             if fold_sources is None:
                 return result.fail(
-                    "Fold source has no _fold_sources metadata — cannot determine Q/K/V split"
+                    "Fold source has no mobius.fold_sources metadata — cannot determine Q/K/V split"
                 )
 
             source_names = fold_sources.split(",")

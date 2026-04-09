@@ -14,17 +14,10 @@ ONNX IR model:
    (SeparateRoPE, EliminateShape).
 4. **Fold** — final dead-node removal and constant folding.
 5. **Structural weight fold** — fold ``Concat(init…)`` and
-   ``Transpose(init, perm=[1,0])`` nodes by graph structure.  When weights are
-   not yet loaded the folded initializers record their source in
-   ``metadata_props`` so that :func:`fold_initializers_after_weights` can
-   materialise the values later.
-
-   .. important::
-       Stage 5 does **not** run :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass`
-       after folding.  The original source initializers must remain registered
-       so that :func:`apply_weights` can later populate their ``const_value``.
-       :func:`fold_initializers_after_weights` materialises deferred values and
-       then removes the (now-redundant) source initializers.
+   ``Transpose(init, perm=[1,0])`` nodes by graph structure, then remove unused
+   source initializers.  When weights are not yet loaded the folded initializers
+   record their source in ``metadata_props`` so that
+   :func:`fold_initializers_after_weights` can materialise the values later.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
 entries in the :data:`~mobius._execution_providers.ep_registry`. Adding EP
@@ -105,13 +98,10 @@ class CleanupMetadataPass(ir.passes.InPlacePass):
 
 
 # Maximum number of elements allowed in a constant-folded output tensor.
-# Set to onnxscript's standard default.  Large weight tensors (Transpose,
-# Concat/QKV packing) are handled by FoldTransposedInitializerPass and
-# FoldConcatInitializersPass after weight loading, so the general constant-fold
-# pass no longer needs a high limit.
-_FOLD_OUTPUT_SIZE_LIMIT = (
-    onnxscript.optimizer._constant_folding.DEFAULT_CONSTANT_FOLD_OUTPUT_SIZE_LIMIT
-)
+# Large weight tensors (Transpose, Concat/QKV packing) are handled by
+# FoldTransposedInitializerPass and FoldConcatInitializersPass after weight
+# loading, so the general constant-fold pass no longer needs a high limit.
+_FOLD_OUTPUT_SIZE_LIMIT = 262144
 
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
@@ -510,12 +500,7 @@ def optimize_model(
     # When weights are not yet available (const_value is None), the folded
     # initializers record their source in metadata_props so that
     # fold_initializers_after_weights() can materialise the values later.
-    #
-    # IMPORTANT: RemoveUnusedNodesPass is intentionally NOT run after this stage.
-    # The original source initializers (e.g. q_proj.weight, k_proj.weight, …)
-    # must remain registered in the graph so that apply_weights() can find them
-    # by name and populate their const_value.  fold_initializers_after_weights()
-    # then materialises deferred values and removes the sources.
+    # RemoveUnusedNodesPass then prunes the now-orphaned source initializers.
     if trace:
         before_struct = sum(_count_all_ops(model).values())
         logger.info("[EP Trace] Stage 5: Structural weight fold")
@@ -528,6 +513,9 @@ def optimize_model(
             # FoldTranspose can match Transpose(packed_init).
             FoldConcatInitializersPass(),
             FoldTransposedInitializerPass(),
+            # Remove source initializers that are no longer referenced now that
+            # they have been replaced by folded (packed/transposed) equivalents.
+            common_passes.RemoveUnusedNodesPass(),
         ]
     )
     struct_fold_pass(model)
@@ -562,9 +550,10 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
     Stage 5 of :func:`optimize_model` may fold ``Transpose`` and ``Concat``
     nodes over initializers before weights are loaded, leaving the resulting
     folded initializers with ``const_value=None``.  Once weights have been
-    applied to the source initializers, this function fills in those deferred
-    values so that :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` can
-    safely prune the (now-redundant) source initializers.
+    applied to the source initializers (or directly to the model state dict),
+    this function fills in those deferred values so that
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` can safely prune the
+    (now-redundant) source initializers.
 
     Values are set as ``ir.LazyTensor`` to defer the actual compute until
     serialisation, avoiding transient peak-memory spikes from holding both the
@@ -572,10 +561,15 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
 
     Source information is stored by the fold passes in ``metadata_props``:
 
-    - ``"_fold_source"`` — name of the single source initializer
+    - ``"mobius.fold_source"`` — name of the single source initializer
       (set by :class:`~mobius._passes.FoldTransposedInitializerPass`).
-    - ``"_fold_sources"`` / ``"_fold_axis"`` — comma-separated source names and
-      the concatenation axis (set by :class:`~mobius._passes.FoldConcatInitializersPass`).
+    - ``"mobius.fold_sources"`` / ``"mobius.fold_axis"`` — comma-separated
+      source names and the concatenation axis
+      (set by :class:`~mobius._passes.FoldConcatInitializersPass`).
+
+    When both keys are present the initializer is a *transposed concat*: it was
+    produced by folding ``Transpose(Concat(W_q, W_k, W_v))``.  In that case
+    the value is computed as ``np.concatenate(sources, axis).T``.
     """
     import numpy as np
 
@@ -583,9 +577,33 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
         if init.const_value is not None:
             continue  # already has data
 
-        fold_source = init.metadata_props.get("_fold_source")
+        fold_source = init.metadata_props.get("mobius.fold_source")
+        fold_sources_str = init.metadata_props.get("mobius.fold_sources")
+
+        if fold_source is not None and fold_sources_str is not None:
+            # Transposed concat: Transpose(Concat(W_q, W_k, W_v)).
+            # Compute np.concatenate(sources, axis).T lazily.
+            source_names = fold_sources_str.split(",")
+            axis = int(init.metadata_props.get("mobius.fold_axis", "0"))
+            sources = [model.graph.initializers.get(n) for n in source_names]
+            if all(s is not None and s.const_value is not None for s in sources):
+                captured = list(sources)  # type: ignore[misc]
+                captured_axis = axis
+                init.const_value = ir.LazyTensor(
+                    lambda ss=captured, ax=captured_axis: ir.tensor(
+                        np.concatenate(
+                            [s.const_value.numpy() for s in ss],  # type: ignore[union-attr]
+                            axis=ax,
+                        ).T
+                    ),
+                    dtype=init.dtype or ir.DataType.FLOAT,
+                    shape=init.shape,
+                    name=init.name,
+                )
+            continue
+
         if fold_source is not None:
-            # Transposed initializer: lazily compute weight.T from the source.
+            # Simple transposed initializer: lazily compute weight.T.
             source = model.graph.initializers.get(fold_source)
             if source is not None and source.const_value is not None:
                 src = source
@@ -597,11 +615,10 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
                 )
             continue
 
-        fold_sources = init.metadata_props.get("_fold_sources")
-        if fold_sources is not None:
-            # Packed (concatenated) initializer: lazily compute np.concatenate from sources.
-            source_names = fold_sources.split(",")
-            axis = int(init.metadata_props.get("_fold_axis", "0"))
+        if fold_sources_str is not None:
+            # Packed (concatenated) initializer: lazily compute np.concatenate.
+            source_names = fold_sources_str.split(",")
+            axis = int(init.metadata_props.get("mobius.fold_axis", "0"))
             sources = [model.graph.initializers.get(n) for n in source_names]
             if all(s is not None and s.const_value is not None for s in sources):
                 captured = list(sources)  # type: ignore[misc]

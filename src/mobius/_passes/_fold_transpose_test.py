@@ -284,7 +284,7 @@ class TestFoldTransposedInitializerPass:
         # No data yet — const_value stays None until weights are applied
         assert t_val.const_value is None
         # Source name recorded for later materialisation
-        assert t_val.metadata_props.get("_fold_source") == "weight"
+        assert t_val.metadata_props.get("mobius.fold_source") == "weight"
 
 
 class TestFoldTransposeStructural:
@@ -345,7 +345,7 @@ class TestFoldTransposeStructural:
         # No data yet — const_value is None until weights are loaded.
         assert t_val.const_value is None
         # Source name recorded for materialisation.
-        assert t_val.metadata_props.get("_fold_source") == "weight"
+        assert t_val.metadata_props.get("mobius.fold_source") == "weight"
 
         # The original initializer must stay registered so apply_weights can populate it.
         assert "weight" in model.graph.initializers, (

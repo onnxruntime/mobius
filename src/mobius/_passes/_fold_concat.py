@@ -72,10 +72,7 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 continue
 
             # Only fold when ALL inputs are graph initializers.
-            if not all(
-                v is not None and v.name is not None and v.name in model.graph.initializers
-                for v in inputs
-            ):
+            if not all(v is not None and v.is_initializer() for v in inputs):
                 continue
 
             axis_attr = node.attributes.get("axis")
@@ -105,13 +102,17 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 continue
 
             # Build a name for the packed initializer from the input names and axis.
-            # The concatenated value depends on both, so include axis to avoid
-            # collisions when the same inputs are concatenated along different axes.
+            # The name encodes both the ordered input names and the axis, so two Concat
+            # nodes with the same inputs in the same order along the same axis will
+            # produce the same packed_name — they represent identical computations and
+            # the second occurrence safely reuses the first initializer.
             input_names = [v.name for v in inputs]  # type: ignore[union-attr]
             packed_name = "__".join(input_names) + f"__axis_{axis}__concat"
 
-            # If an equivalent packed initializer already exists, reuse it and still
-            # remove this Concat node so all eligible Concat nodes are folded.
+            # If an equivalent packed initializer already exists (same inputs, same axis),
+            # the name collision is not an error — it is the idempotency guard.  Reuse the
+            # existing initializer and still remove this Concat node so all eligible Concat
+            # nodes are folded.
             if packed_name in model.graph.initializers:
                 existing_val = model.graph.initializers[packed_name]
                 out_val.replace_all_uses_with(existing_val, replace_graph_outputs=True)
@@ -148,8 +149,8 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             else:
                 # No data yet — leave const_value=None and record the source names
                 # so fold_initializers_after_weights() can fill it in later.
-                new_val.metadata_props["_fold_sources"] = ",".join(input_names)
-                new_val.metadata_props["_fold_axis"] = str(axis)
+                new_val.metadata_props["mobius.fold_sources"] = ",".join(input_names)
+                new_val.metadata_props["mobius.fold_axis"] = str(axis)
 
             model.graph.initializers[new_val.name] = new_val
 
