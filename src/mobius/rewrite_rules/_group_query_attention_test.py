@@ -283,9 +283,10 @@ class TestGroupQueryAttentionRules:
     def test_packed_qkv_reduces_matmul_count(self):
         """Packing Q/K/V into one MatMul removes 2 MatMuls per layer.
 
-        The CPU EP build runs GQA fusion + PackQKV in stage 2 (before the
-        structural fold in stage 5), so the MatMul count reduction is visible
-        by comparing a default EP build (no packing) with a CPU EP build.
+        The CPU EP build runs GQA fusion + PackQKV in stage 2, so the MatMul
+        count reduction is visible by comparing a default EP build (no packing)
+        with a CPU EP build.  The structural fold (Transpose/Concat over
+        initializers) runs inside apply_weights, after weights are loaded.
         """
         num_layers = _LLAMA_CONFIG.num_hidden_layers
 
@@ -404,9 +405,11 @@ class TestGroupQueryAttentionRules:
     def test_packed_gqa_count_and_runs_with_ort(self):
         """Packing reduces MatMul count and the model still runs with ORT.
 
-        Build with CPU EP so that stage 2 applies GQA fusion + PackQKV before
-        stage 5 runs the structural fold.  The final model has fewer MatMuls
-        (3 separate Q/K/V → 1 packed per layer) and still produces correct output.
+        Build with CPU EP so that stage 2 applies GQA fusion + PackQKV.
+        The structural fold (Transpose/Concat over initializers) runs inside
+        apply_weights after weights are loaded.  The final model has fewer
+        MatMuls (3 separate Q/K/V → 1 packed per layer) and still produces
+        correct output.
         """
         num_layers = _LLAMA_CONFIG.num_hidden_layers
 
@@ -437,8 +440,9 @@ class TestGroupQueryAttentionRules:
     def test_packed_qkv_with_bias_reduces_matmul_count(self):
         """PackQKVWithBiasForGQA packs Q/K/V MatMuls on a biased model (Qwen2-style).
 
-        Build with CPU EP so stage 2 fires PackQKVWithBiasForGQA before stage 5
-        applies the structural fold.  Compare against a default EP build.
+        Build with CPU EP so stage 2 fires PackQKVWithBiasForGQA.  The
+        structural fold runs inside apply_weights after weights are loaded.
+        Compare against a default EP build.
         """
         num_layers = _QWEN2_BIAS_CONFIG.num_hidden_layers
 
