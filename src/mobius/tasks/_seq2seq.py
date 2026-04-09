@@ -146,7 +146,7 @@ class Seq2SeqTask(ModelTask):
             v.name = f"past_key_values.{idx}.cross.{kv_type}"
         graph_inputs.extend(cross_kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="decoder")
+        graph, builder = _make_graph(graph_inputs)
         op = builder.op
 
         logits, present_self_kvs, present_cross_kvs = module.decoder(

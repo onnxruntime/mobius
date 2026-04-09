@@ -293,7 +293,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
 
         graph_inputs.extend(flat_kv)
 
-        graph, graph_builder = _make_graph(graph_inputs, name="decoder")
+        graph, graph_builder = _make_graph(graph_inputs)
         op = graph_builder.op
 
         logits, present_key_values = decoder(

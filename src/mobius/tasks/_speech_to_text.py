@@ -123,7 +123,7 @@ class SpeechToTextTask(ModelTask):
         )
         graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="decoder")
+        graph, builder = _make_graph(graph_inputs)
         op = builder.op
 
         logits, present_key_values = decoder(

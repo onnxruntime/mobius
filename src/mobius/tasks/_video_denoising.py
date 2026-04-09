@@ -53,7 +53,7 @@ class VideoDenoisingTask(ModelTask):
             shape=ir.Shape(("batch", "sequence_length", config.cross_attention_dim)),
         )
 
-        graph, builder = _make_graph([sample, timestep, encoder_hidden_states], name="model")
+        graph, builder = _make_graph([sample, timestep, encoder_hidden_states])
         op = builder.op
 
         noise_pred = module(

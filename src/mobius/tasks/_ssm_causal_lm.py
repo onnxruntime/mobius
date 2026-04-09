@@ -71,7 +71,7 @@ def _build_ssm_task(
         graph_inputs.extend([conv_state, ssm_state])
         past_states.append((conv_state, ssm_state))
 
-    graph, builder = _make_graph(graph_inputs, name="model")
+    graph, builder = _make_graph(graph_inputs)
     logits, present_states = module(
         builder.op,
         input_ids=input_ids,

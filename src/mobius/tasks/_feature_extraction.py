@@ -53,7 +53,7 @@ class FeatureExtractionTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, builder = _make_graph([input_ids, attention_mask, token_type_ids], name="model")
+        graph, builder = _make_graph([input_ids, attention_mask, token_type_ids])
         op = builder.op
 
         last_hidden_state = module(

@@ -39,7 +39,7 @@ class AdapterTask(ModelTask):
                 shape=ir.Shape(("batch", config.image_embed_dim)),
             )
 
-        graph, builder = _make_graph([condition], name="model")
+        graph, builder = _make_graph([condition])
         op = builder.op
 
         outputs = module(op, condition)

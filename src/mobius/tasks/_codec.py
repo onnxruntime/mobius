@@ -71,7 +71,7 @@ class CodecTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, builder = _make_graph([codes], name="decoder")
+        graph, builder = _make_graph([codes])
         waveform = decoder(builder.op, codes)
 
         waveform.name = "waveform"

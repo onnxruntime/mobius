@@ -958,7 +958,8 @@ class TestBuildDecoderFromEmbeds:
     def test_graph_name_is_decoder(self):
         config, decoder = self._make_decoder_module()
         model = build_decoder_from_embeds(decoder, config)
-        assert model.graph.name == "decoder"
+        # name= arg removed; builder overrides graph.name with model_id anyway
+        assert model.graph.name == "main_graph"
 
     def test_inputs_include_inputs_embeds_and_kv_cache(self):
         config, decoder = self._make_decoder_module()
@@ -1093,7 +1094,8 @@ class TestBuildDecoderFromEmbedsHybrid:
         config = self._make_hybrid_config()
         decoder = self._make_stub_hybrid_decoder(config)
         model = build_decoder_from_embeds(decoder, config, hybrid=True)
-        assert model.graph.name == "decoder"
+        # name= arg removed; builder overrides graph.name with model_id anyway
+        assert model.graph.name == "main_graph"
 
     def test_hybrid_has_linear_attention_state_inputs(self):
         config = self._make_hybrid_config()

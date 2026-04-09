@@ -267,7 +267,7 @@ def build_decoder_from_embeds(
         )
     graph_inputs.extend(cache_inputs)
 
-    graph, builder = _make_graph(graph_inputs, name="decoder")
+    graph, builder = _make_graph(graph_inputs)
     logits, present_key_values = decoder(
         builder.op,
         inputs_embeds=inputs_embeds,
