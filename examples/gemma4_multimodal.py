@@ -30,9 +30,9 @@ During prefill all four sessions run.  During decode only embedding + decoder
 are used (vision and audio encoders run once per generation).
 
 .. note::
-    Gemma 4 model implementation in mobius is in progress.  This script
-    documents the expected API and can be used to validate the implementation
-    once it is complete.
+    This script documents the Gemma 4 Any-to-Any inference API.  Run it
+    against a real ``google/gemma-4-E2B-it`` checkpoint once the model
+    weights are available locally.
 
 Prerequisites::
 

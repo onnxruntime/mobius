@@ -52,6 +52,10 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 if TYPE_CHECKING:
     import onnx_ir as ir
 
+# ONNX data type constant for float32 (TensorProto.FLOAT = 1).
+# Used with op.Cast when the output type of a custom op is unknown to the type system.
+_ONNX_FLOAT: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
@@ -314,13 +318,17 @@ class Gemma4TextAttention(nn.Module):
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
         prev_layers = layer_types[:first_kv_shared_layer_idx]
         if self.is_kv_shared_layer:
+            # Reverse-scan prev_layers to find the last non-shared layer with the
+            # same type — KV-shared layers borrow K,V from that source layer.
             self.kv_shared_layer_index = (
                 len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
-            self.store_full_length_kv = False
+            self.provides_shared_kv = False
         else:
             self.kv_shared_layer_index = None
-            self.store_full_length_kv = first_kv_shared_layer_idx > 0 and (
+            # True for the last non-shared layer of each type that has downstream
+            # KV-shared layers depending on it — it must store its K,V for reuse.
+            self.provides_shared_kv = first_kv_shared_layer_idx > 0 and (
                 layer_idx
                 == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
@@ -433,7 +441,7 @@ class Gemma4TextAttention(nn.Module):
             )
 
             # Source layers store K,V for downstream KV-shared layers
-            if self.store_full_length_kv and shared_kv_states is not None:
+            if self.provides_shared_kv and shared_kv_states is not None:
                 shared_kv_states[self.layer_idx] = (present_key, present_value)
 
         attn_output = self.o_proj(op, attn_output)
@@ -511,10 +519,12 @@ class Gemma4DecoderLayer(nn.Module):
     parallel architecture — a dense MLP and a MoE block run independently, then
     their outputs are summed before the final post-FF norm::
 
-        h = pre_ff_norm(h)
-        h_dense  = post_ff_norm_1(mlp(h))
-        h_moe    = post_ff_norm_2(experts(pre_ff_norm_2(residual), router(residual)))
-        h = post_ff_norm(h_dense + h_moe)
+        h = pre_ff_norm(h)                                    # pre_feedforward_layernorm
+        h_dense  = post_ff_norm_dense(mlp(h))                 # post_feedforward_layernorm_1
+        h_moe    = post_ff_norm_moe(                          # post_feedforward_layernorm_2
+            experts(pre_ff_norm_moe(residual), router(residual))  # pre_feedforward_layernorm_2
+        )
+        h = post_ff_norm(h_dense + h_moe)                    # post_feedforward_layernorm
         h = residual + h
 
     Uses standard RMSNorm (not OffsetRMSNorm). KV-shared layers use double-wide
@@ -667,7 +677,7 @@ class Gemma4DecoderLayer(nn.Module):
                         normalize_routing_weights=1,
                         _domain="com.microsoft",
                     ),
-                    to=1,  # FLOAT — op.MoE has no schema so its output type is None
+                    to=_ONNX_FLOAT,  # Cast to float32: op.MoE has no ONNX schema so output type is untyped
                 )  # [B*S, H]
             else:
                 moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
