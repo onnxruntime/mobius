@@ -330,6 +330,88 @@ into 1 token:
 ```
 The merge reduces token count by 4× and projects to text model dimension.
 
+## Any-to-Any 4-model tasks (vision + audio + text)
+
+Some model families come in two tiers:
+
+| Tier | Models | Modalities | ONNX split |
+|------|--------|-----------|------------|
+| **Small (Any-to-Any)** | E2B, E4B | Vision + Audio + Text | **4 models** |
+| **Large (Image-Text-to-Text)** | 26B-A4B, 31B | Vision + Text only (no audio) | **3 models** |
+
+Example: `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it` are Any-to-Any;
+`google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` are Image-Text-to-Text.
+
+Check the config to decide which split to use:
+
+```python
+has_audio = getattr(config, "audio_config", None) is not None
+```
+
+### 4-model split layout
+
+```
+[vision.onnx]    pixel_values → image_features
+[audio.onnx]     input_features → audio_features
+[embedding.onnx] input_ids, image_features, audio_features → inputs_embeds
+[model.onnx]     inputs_embeds, attention_mask, past_kv → logits, present_kv
+```
+
+### Reference: Phi4MMMultiModalTask
+
+Use `Phi4MMMultiModalTask` in `tasks/` as the template for 4-model tasks.
+It already implements the 4-way split with audio + vision encoders:
+
+```python
+from mobius.tasks import Phi4MMMultiModalTask
+
+pkg = build_from_module(module, config, task=Phi4MMMultiModalTask())
+# pkg["model"]     → decoder
+# pkg["vision"]    → vision encoder
+# pkg["audio"]     → audio encoder
+# pkg["embedding"] → embedding + InputMixer
+```
+
+### Audio encoder wiring
+
+The audio encoder takes raw speech features and produces embeddings that the
+`InputMixer` scatters into the text embedding stream alongside vision tokens:
+
+```
+input_features: (batch, mel_frames, mel_bins)
+    → AudioEncoder
+    → audio_features: (batch, num_audio_tokens, hidden_size)
+    → InputMixer (alongside vision_features)
+    → inputs_embeds
+```
+
+The `InputMixer` handles both image and audio token positions. Audio tokens
+are marked with `audio_token_id` in `input_ids` — the mixer replaces those
+positions with `audio_features`.
+
+### Task class pattern
+
+```python
+class MyAnyToAnyTask(TaskBase):
+    def build(self, module, config):
+        has_audio = getattr(config, "audio_config", None) is not None
+        if has_audio:
+            return self._build_4model(module, config)
+        else:
+            return self._build_3model(module, config)
+
+    def _build_4model(self, module, config):
+        # Build vision, audio, embedding, decoder separately
+        ...
+
+    def _build_3model(self, module, config):
+        # Vision + embedding + decoder only (reuse VisionLanguageTask pattern)
+        ...
+```
+
+This conditional ensures the same task class handles both tier splits without
+requiring separate registration.
+
 ## Qwen3.5-VL
 
 Qwen3.5-VL uses the same **3-model split** as Qwen3-VL (decoder + vision +
