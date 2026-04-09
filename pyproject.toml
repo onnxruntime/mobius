@@ -7,11 +7,11 @@ name = "mobius-ai"
 dynamic = ["version"]
 description = "ONNX model definitions for GenAI using onnxscript.nn"
 authors = [
-    { name = "ONNX Contributors", email = "onnx-technical-discuss@lists.lfaidata.foundation" },
+    { name = "Microsoft Corporation" },
 ]
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = "MIT"
 dependencies = [
     "huggingface_hub",
     "numpy>=1.24.0",

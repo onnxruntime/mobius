@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen2.5-VL generation with onnxruntime-genai.
 

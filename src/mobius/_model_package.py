@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ModelPackage: a collection of named ONNX models forming a complete model.
 
@@ -29,7 +29,7 @@ import onnx_ir as ir
 import torch
 import tqdm
 
-from mobius._optimizations import fold_constants_after_weights
+from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
@@ -238,7 +238,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
-            fold_constants_after_weights(model)
+            fold_initializers_after_weights(model)
 
 
 def _make_progress_callback():

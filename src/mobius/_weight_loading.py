@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 # SECURITY: Do NOT use torch.load() or pickle deserialization anywhere in this
 # module.  Only safetensors is permitted for weight loading to prevent arbitrary
@@ -24,9 +24,13 @@ import json
 import logging
 
 import onnx_ir as ir
+import safetensors.torch
 import torch
 import tqdm
+from huggingface_hub import hf_hub_download
 from onnx_ir import tensor_adapters
+
+from mobius._optimizations import fold_initializers_after_weights
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +84,11 @@ def _assign_weight(
 def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     """Apply weights from a state dict to an ONNX model.
 
-    When the weight dtype differs from the initializer's declared type,
-    ``ir.LazyTensor`` is used to lazily cast the tensor at serialization
-    time, avoiding eager memory allocation.
+    Assigns each tensor in *state_dict* to the matching initializer in the
+    model.  After all weights are assigned,
+    :func:`~mobius._optimizations.fold_initializers_after_weights` is called to
+    fold ``Transpose`` and ``Concat`` nodes over initializers into pre-computed
+    weights and remove unused source initializers.
 
     Args:
         model: The ONNX IR model.
@@ -97,6 +103,8 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
             continue
 
         _assign_weight(model.graph.initializers[name], tensor, name)
+
+    fold_initializers_after_weights(model)
 
 
 def _parallel_download(
@@ -116,8 +124,6 @@ def _parallel_download(
     Returns:
         List of local file paths in the same order as *filenames*.
     """
-    from huggingface_hub import hf_hub_download
-
     if len(filenames) <= 1:
         # No benefit from parallelism for a single file
         return [hf_hub_download(repo_id=model_id, filename=f) for f in filenames]
@@ -146,9 +152,6 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
 
     Uses parallel downloads when multiple safetensors shards exist.
     """
-    import safetensors.torch
-    from huggingface_hub import hf_hub_download
-
     try:
         index_path = hf_hub_download(
             repo_id=model_id,

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Command-line interface for mobius."""
 
@@ -79,7 +79,6 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
 
     from mobius.rewrite_rules import (
         bias_gelu_rules,
-        fused_matmul_rules,
         group_query_attention_rules,
         packed_attention_rules,
         skip_layer_norm_rules,
@@ -88,11 +87,7 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
 
     rule_map = {
         "bias_gelu": bias_gelu_rules,
-        # group_query_attention (incl. QKV packing) must run before
-        # fused_matmul so that projections are still plain MatMul nodes
-        # when the packing pattern matches.
         "group_query_attention": group_query_attention_rules,
-        "fused_matmul": fused_matmul_rules,
         "packed_attention": packed_attention_rules,
         "skip_layer_norm": skip_layer_norm_rules,
         "skip_norm": skip_norm_rules,
@@ -211,7 +206,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
-    """Save a ModelPackage to disk, applying optimizations."""
+    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -234,6 +229,16 @@ def _save_package(
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+    runtime = getattr(args, "runtime", None)
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai import write_ort_genai_config
+
+        hf_model_id = getattr(args, "model", None)
+        ep = getattr(args, "execution_provider", "cpu")
+        artifacts = write_ort_genai_config(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
@@ -273,8 +278,6 @@ def _cmd_list(args: argparse.Namespace) -> None:
             extras = []
             if not caps.supports_fused_rope:
                 extras.append("no-fused-rope")
-            if not caps.supports_shape:
-                extras.append("no-shape")
             if not caps.supports_skip_layer_norm:
                 extras.append("no-skip-layer-norm")
             flags = f"  [{', '.join(extras)}]" if extras else ""
@@ -489,6 +492,18 @@ def main(argv: list[str] | None = None) -> None:
             "(default: 'default' → portable ONNX, no vendor fusions). "
             "Use 'mobius list eps' to see available EPs. "
             "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
+        ),
+    )
+    build_parser.add_argument(
+        "--runtime",
+        default=None,
+        choices=["ort-genai"],
+        metavar="RUNTIME",
+        help=(
+            "Generate runtime-specific config files after building. "
+            "Currently supports: 'ort-genai' (writes genai_config.json and "
+            "copies tokenizer files). Requires --model (not --config) for "
+            "tokenizer file download."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

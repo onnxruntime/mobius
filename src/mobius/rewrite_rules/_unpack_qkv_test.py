@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ class TestUnpackQKVRules:
         # If the GQA was packed (k=None, v=None), apply unpack
         if gqa_node.inputs[1] is None and gqa_node.inputs[2] is None:
             counts_before = count_ops(model)
-            fused_before = counts_before.get("FusedMatMul", 0)
+            matmul_before = counts_before.get("MatMul", 0)
 
             rewrite(model, pattern_rewrite_rules=unpack_qkv_rules())
 
@@ -87,9 +87,9 @@ class TestUnpackQKVRules:
             gqa_after = next(n for n in model.graph if n.op_type == "GroupQueryAttention")
             assert gqa_after.inputs[1] is not None, "K should be separate after unpack"
             assert gqa_after.inputs[2] is not None, "V should be separate after unpack"
-            # Should have 2 additional FusedMatMul nodes (was 1 packed → 3 separate)
-            fused_after = counts_after.get("FusedMatMul", 0)
-            assert fused_after == fused_before + 2
+            # Should have 2 additional MatMul nodes (was 1 packed → 3 separate)
+            matmul_after = counts_after.get("MatMul", 0)
+            assert matmul_after == matmul_before + 2
         else:
             # PackQKV didn't fire (e.g., QK norm present), skip this test
             pass
@@ -112,12 +112,12 @@ class TestUnpackQKVRules:
         k_in = gqa_after.inputs[1]
         v_in = gqa_after.inputs[2]
 
-        # q, k, v should be produced by FusedMatMul nodes (or MatMul for legacy)
+        # q, k, v should be produced by MatMul nodes
         for name, inp in [("q", q_in), ("k", k_in), ("v", v_in)]:
             assert inp is not None
             prod = inp.producer()
-            assert prod is not None and prod.op_type in ("FusedMatMul", "MatMul"), (
-                f"{name} projection should come from FusedMatMul or MatMul after unpack"
+            assert prod is not None and prod.op_type == "MatMul", (
+                f"{name} projection should come from MatMul after unpack"
             )
 
     def test_no_match_when_already_separate(self):
@@ -152,7 +152,7 @@ class TestUnpackQKVRules:
             "Packed projection for biased model should be wrapped in Add"
         )
 
-        fused_before = count_ops(model)["FusedMatMul"]
+        matmul_before = count_ops(model)["MatMul"]
         rewrite(model, pattern_rewrite_rules=unpack_qkv_rules())
 
         # GQA should now have separate Q/K/V.
@@ -160,7 +160,7 @@ class TestUnpackQKVRules:
         assert gqa_after.inputs[1] is not None, "K should be separate after unpack"
         assert gqa_after.inputs[2] is not None, "V should be separate after unpack"
 
-        # Each projection should be Add(FusedMatMul, bias).
+        # Each projection should be Add(MatMul, bias).
         for slot_name, slot_input in [
             ("q", gqa_after.inputs[0]),
             ("k", gqa_after.inputs[1]),
@@ -169,18 +169,18 @@ class TestUnpackQKVRules:
             assert slot_input is not None
             producer = slot_input.producer()
             assert producer is not None and producer.op_type == "Add", (
-                f"{slot_name} projection after unpack should be Add(FusedMatMul, bias)"
+                f"{slot_name} projection after unpack should be Add(MatMul, bias)"
             )
-            # One Add input must be FusedMatMul, the other must be a graph parameter.
+            # One Add input must be MatMul, the other must be a graph parameter.
             mm = next(
                 (
                     i
                     for i in producer.inputs
-                    if i and i.producer() and i.producer().op_type in ("FusedMatMul", "MatMul")
+                    if i and i.producer() and i.producer().op_type == "MatMul"
                 ),
                 None,
             )
-            assert mm is not None, f"{slot_name} Add must contain FusedMatMul or MatMul"
+            assert mm is not None, f"{slot_name} Add must contain MatMul"
 
-        # FusedMatMul count must increase by 2 (1 packed → 3 separate).
-        assert count_ops(model)["FusedMatMul"] == fused_before + 2
+        # MatMul count must increase by 2 (1 packed → 3 separate).
+        assert count_ops(model)["MatMul"] == matmul_before + 2

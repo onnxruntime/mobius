@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Execution provider capability registry.
 
@@ -60,12 +60,8 @@ class EpCapabilities:
             stage).
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
-        supports_shape: ``False`` triggers EliminateShape lowering (WebGPU).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
-        supports_fused_matmul: ``False`` expands ``FusedMatMul`` via InlinePass
-            to ``Transpose + MatMul``.  Leave ``True`` for all ORT-based EPs
-            that support the ``com.microsoft::FusedMatMul`` kernel.
         supports_fused_moe: ``False`` decomposes fused MoE ops.
         supports_packed_multi_head_attention: ``False`` expands
             ``PackedMultiHeadAttention`` via InlinePass to a
@@ -81,9 +77,7 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
-    supports_shape: bool = True
     supports_skip_layer_norm: bool = True
-    supports_fused_matmul: bool = True
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     default_int4_accuracy_level: int = 0
@@ -183,9 +177,9 @@ def _register_builtins() -> None:
     """
     _builtins = [
         # Generic ONNX-conformant runtime — no EP-specific fused ops (no GQA,
-        # no PackQKV). Standard fusions (SkipNorm, FusedMatMul, Gelu) are
-        # applied but remain portable: all custom ops have ONNX function bodies
-        # that any conformant runtime can expand as a fallback.
+        # no PackQKV). Standard fusions (SkipNorm, Gelu) are applied but remain
+        # portable: all custom ops have ONNX function bodies that any conformant
+        # runtime can expand as a fallback.
         # supports_X = True means "don't decompose X" — function bodies make
         # them portable, so decomposition would be counterproductive.
         EpCapabilities(
@@ -225,7 +219,6 @@ def _register_builtins() -> None:
             name="webgpu",
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
-            supports_shape=False,
             default_int4_accuracy_level=4,
             provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
         ),
@@ -240,18 +233,16 @@ def _register_builtins() -> None:
             provider_options={"enable_cuda_graph": "1"},
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
-        # All com.microsoft ops (FusedMatMul, SkipLayerNorm, PackedMHA) are
-        # expanded via InlinePass to their standard-ONNX function bodies.
-        # No GQA or QKV packing fusion is applied. Use this EP to produce
-        # models that run on any conformant ONNX runtime without ORT extensions.
+        # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
+        # InlinePass to their standard-ONNX function bodies. No GQA or QKV
+        # packing fusion is applied. Use this EP to produce models that run
+        # on any conformant ONNX runtime without ORT extensions.
         EpCapabilities(
             name="onnx-standard",
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
-            supports_shape=True,  # Shape is a standard ONNX op — no elimination needed
             supports_skip_layer_norm=False,  # inline SkipLayerNorm
-            supports_fused_matmul=False,  # inline FusedMatMul → Transpose+MatMul
             supports_packed_multi_head_attention=False,  # inline PackedMHA
         ),
     ]
