@@ -243,7 +243,10 @@ jobs:
 
   integration-fast:
     name: Integration (fast)
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-integration-fast-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
@@ -257,8 +260,8 @@ jobs:
           key: hf-integration-fast-${{ hashFiles('tests/integration_test.py') }}
           restore-keys: |
             hf-integration-fast-
-      - name: Install PyTorch CPU
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PyTorch CUDA
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
