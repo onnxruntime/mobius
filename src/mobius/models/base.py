@@ -36,7 +36,7 @@ from mobius.components import (
     make_quantized_linear_factory,
 )
 from mobius.components._attention import GQAContext
-from mobius.components._rotary_embedding import BaseRope
+from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 
 
 class TextModel(nn.Module):
@@ -84,9 +84,17 @@ class TextModel(nn.Module):
             hidden_states = self.embed_tokens(op, input_ids)
 
         # Determine whether to emit GroupQueryAttention directly.
-        # Conditions: the active EP supports GQA for the build dtype, the
-        # model uses standard RotaryEmbeddingBase (cos/sin tables available),
-        # and we are in dynamic-cache mode (attention_mask is present).
+        # Conditions:
+        #  - attention_mask present: static-cache mode passes None; GQA requires seqlens_k.
+        #  - EP gqa_dtypes: EP must declare GQA support for the build dtype (cuda/f16,
+        #    cpu/f32, etc.). Default EP has gqa_dtypes={} so GQA is never emitted.
+        #  - supports_fused_rope: EP must handle do_rotary=1 inside GQA. DML has
+        #    gqa_dtypes={FLOAT16} but supports_fused_rope=False, so it uses the
+        #    RotaryAttentionToGQA rewrite + SeparateRoPE path instead.
+        #  - BaseRope (not _MRopeBase): standard 1D RoPE tables are required.
+        #    _MRopeBase subclasses (ChunkedMRope for Qwen2.5-VL, InterleavedMRope for
+        #    Qwen3-VL/Qwen3.5) use 3D position_ids; GQA do_rotary=1 only implements 1D
+        #    RoPE, so those models must fall through to the RotaryAttentionToGQA rule.
         caps = ep_capabilities()
         dtype = get_build_dtype()
         use_gqa = (
@@ -94,6 +102,7 @@ class TextModel(nn.Module):
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
             and isinstance(self.rotary_emb, BaseRope)
+            and not isinstance(self.rotary_emb, _MRopeBase)
         )
 
         if use_gqa:
@@ -126,6 +135,9 @@ class TextModel(nn.Module):
                 cos_cache=self.rotary_emb.cos_cache,  # [max_seq, rotary_dim]
                 sin_cache=self.rotary_emb.sin_cache,  # [max_seq, rotary_dim]
             )
+            # position_embeddings not needed: GroupQueryAttention handles RoPE
+            # internally via do_rotary=1. Passing None skips apply_rotary_pos_emb
+            # in Attention.forward() (which checks `if position_embeddings is not None`).
             position_embeddings = None
         else:
             position_embeddings = self.rotary_emb(op, position_ids)

@@ -82,6 +82,7 @@ def _apply_attention(
     num_attention_heads: int,
     num_key_value_heads: int,
     scale: float,
+    softcap: float = 0.0,
     static_cache: StaticCacheState | None = None,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Apply the ONNX Attention op with internal or static KV cache.
@@ -156,6 +157,7 @@ def _apply_attention(
             q_num_heads=num_attention_heads,
             kv_num_heads=num_key_value_heads,
             scale=scale,
+            softcap=softcap,
             is_causal=1,
             _outputs=3,
         )
@@ -175,6 +177,7 @@ def _apply_attention(
         q_num_heads=num_attention_heads,
         kv_num_heads=num_key_value_heads,
         scale=scale,
+        softcap=softcap,
         is_causal=1,
         _outputs=3,
     )
@@ -328,6 +331,7 @@ class Attention(nn.Module):
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
+            softcap=self._softcap,
             static_cache=static_cache,
         )
 
