@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### WebGPU Shape Op Support
+
+#### Changed
+
+- WebGPU now supports the ONNX `Shape` operator natively. The `EliminateShape`
+  rewrite pass (which replaced `Shape(attention_mask)` with `ReduceSum` +
+  `ReduceMax`) has been removed.
+
+#### Removed
+
+- **Breaking**: `EpCapabilities.supports_shape` field removed. Custom EPs that
+  passed `supports_shape=True` or `supports_shape=False` to `EpCapabilities(...)`
+  will get a `TypeError`. Remove the argument — `Shape` is now universally
+  supported across all EPs.
+- `mobius.rewrite_rules.eliminate_shape_rules` removed from the public API.
+
+---
+
 ### Mistral-3 / Pixtral VLM Support
 
 #### Added

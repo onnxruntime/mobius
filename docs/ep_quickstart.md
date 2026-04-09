@@ -120,7 +120,6 @@ register_ep(EpCapabilities(
     gqa_dtypes=frozenset({ir.DataType.FLOAT16}),
     qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
     supports_fused_rope=True,
-    supports_shape=True,
     provider_options={"some_option": "value"},
 ))
 
