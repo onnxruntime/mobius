@@ -195,6 +195,18 @@ class TestFoldTransposedInitializerPass:
         t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
         assert len(t_inits) == 1
 
+    def test_idempotent(self):
+        """Running the pass twice does not create duplicate initializers."""
+        data = np.arange(12, dtype=np.float32).reshape(4, 3)
+        model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+        FoldTransposedInitializerPass()(model)
+        result2 = FoldTransposedInitializerPass()(model)
+        # Second run: no Transpose nodes left → not modified
+        assert not result2.modified
+        t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
+        assert len(t_inits) == 1, "Should have exactly one folded initializer after two runs"
+
     def test_missing_const_value_leaves_none_on_folded(self):
         """When source const_value is None, folded initializer const_value is also None.
 
