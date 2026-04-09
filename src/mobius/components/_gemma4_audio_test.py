@@ -1,153 +1,351 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+"""Unit tests for Gemma4AudioEncoder components.
 
-"""Tests for Gemma4 audio encoder components."""
+All tests build ONNX graphs without weights.  They verify:
+- graph builds without exception
+- output nodes are present
+- expected parameter names exist
+- parameter counts match architecture expectations
+"""
 
 from __future__ import annotations
 
 from mobius._testing import create_test_builder, create_test_input
 from mobius.components._gemma4_audio import (
+    Gemma4Attention,
     Gemma4AudioEncoder,
-    Gemma4CausalChunkedAttention,
-    Gemma4ConformerEncoderLayer,
+    Gemma4AudioLayer,
     Gemma4ConvSubsampling,
+    Gemma4FeedForward,
+    Gemma4LightConv1d,
 )
 
-_DIM = 32
-_HEADS = 2
-_INNER = 64
-_KERNEL = 3
-_CTX_LEFT = 4  # attention_context_left for tests
-_BATCH = 1
-_TIME = 16
-_INPUT_SIZE = 16
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+HIDDEN = 64
+HEADS = 4
+HEAD_DIM = HIDDEN // HEADS  # 16
+CTX_LEFT = 5
+
+
+def _build(comp, inputs):
+    """Build graph and return the last output value."""
+    b, op, graph = create_test_builder()
+    result = comp(op, *inputs(b))
+    b._adapt_outputs([result])
+    return result, graph
+
+
+# ---------------------------------------------------------------------------
+# Gemma4ConvSubsampling
+# ---------------------------------------------------------------------------
 
 
 class TestGemma4ConvSubsampling:
-    def test_has_parameters(self):
-        sub = Gemma4ConvSubsampling(_INPUT_SIZE, conv_channels=[8, 4], hidden_size=_DIM)
-        param_names = [n for n, _ in sub.named_parameters()]
-        assert any("conv0" in n for n in param_names)
-        assert any("conv1" in n for n in param_names)
-        assert any("out" in n for n in param_names)
+    def test_graph_builds(self):
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 20, 32])
+        result = comp(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
 
-    def test_forward(self):
-        sub = Gemma4ConvSubsampling(_INPUT_SIZE, conv_channels=[8, 4], hidden_size=_DIM)
-        builder, op, _graph = create_test_builder()
-        x = create_test_input(builder, "x", [_BATCH, _TIME, _INPUT_SIZE])
-        out = sub(op, x)
-        assert out is not None
+    def test_parameter_names(self):
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "conv0.weight" in names
+        assert "conv1.weight" in names
+        assert "norm0.weight" in names
+        assert "norm1.weight" in names
+        assert "input_proj_linear.weight" in names
 
-    def test_channel_progression(self):
-        # Stage-0 weight: [c0, 1, 3, 3], stage-1 weight: [c1, c0, 3, 3]
-        sub = Gemma4ConvSubsampling(_INPUT_SIZE, conv_channels=[8, 4], hidden_size=_DIM)
-        param_shapes = {n: p.shape for n, p in sub.named_parameters()}
-        assert param_shapes["conv0.weight"][0] == 8  # c0 output channels
-        assert param_shapes["conv1.weight"][0] == 4  # c1 output channels
+    def test_no_bias_convolutions(self):
+        """Subsampling conv layers have no bias (matches HF Conv2dNoBias)."""
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "conv0.bias" not in names
+        assert "conv1.bias" not in names
+
+    def test_no_norm_bias(self):
+        """LayerNorm layers have no bias (matches HF bias=False)."""
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "norm0.bias" not in names
+        assert "norm1.bias" not in names
+
+    def test_proj_input_dim(self):
+        """Linear projection input size = (freq_after_2_strides * c1)."""
+        # input_size=32, 2 stride-2 convs with pad=1:
+        # 32 → (32-1)//2+1 = 16 → (16-1)//2+1 = 8; then c1=8 → 8*8=64
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        params = dict(comp.named_parameters())
+        in_proj = params["input_proj_linear.weight"]
+        assert in_proj.shape == (64, HIDDEN)
 
 
-class TestGemma4CausalChunkedAttention:
-    def test_has_parameters(self):
-        attn = Gemma4CausalChunkedAttention(_DIM, _HEADS, _CTX_LEFT)
-        param_names = [n for n, _ in attn.named_parameters()]
-        assert any("linear_q" in n for n in param_names)
-        assert any("linear_k" in n for n in param_names)
-        assert any("linear_v" in n for n in param_names)
-        assert any("linear_out" in n for n in param_names)
-
-    def test_forward(self):
-        attn = Gemma4CausalChunkedAttention(_DIM, _HEADS, _CTX_LEFT)
-        builder, op, _graph = create_test_builder()
-        x = create_test_input(builder, "x", [_BATCH, _TIME, _DIM])
-        out = attn(op, x)
-        assert out is not None
+# ---------------------------------------------------------------------------
+# Gemma4FeedForward
+# ---------------------------------------------------------------------------
 
 
-class TestGemma4ConformerEncoderLayer:
-    def test_has_parameters(self):
-        layer = Gemma4ConformerEncoderLayer(
-            _DIM, _HEADS, _INNER, _KERNEL, _CTX_LEFT
+class TestGemma4FeedForward:
+    def test_graph_builds(self):
+        comp = Gemma4FeedForward(hidden_size=HIDDEN)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 10, HIDDEN])
+        result = comp(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
+
+    def test_parameter_names(self):
+        comp = Gemma4FeedForward(hidden_size=HIDDEN)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "pre_layer_norm.weight" in names
+        assert "post_layer_norm.weight" in names
+        assert "ffw_layer_1.weight" in names
+        assert "ffw_layer_2.weight" in names
+
+    def test_has_bias(self):
+        """Feed-forward linears have bias=True (matches HF Gemma4ClippableLinear default)."""
+        comp = Gemma4FeedForward(hidden_size=HIDDEN)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "ffw_layer_1.bias" in names
+        assert "ffw_layer_2.bias" in names
+
+    def test_linear_shapes(self):
+        """FF1 expands h→4h, FF2 contracts 4h→h. ONNX weight is (out, in)."""
+        comp = Gemma4FeedForward(hidden_size=HIDDEN)
+        params = dict(comp.named_parameters())
+        assert params["ffw_layer_1.weight"].shape == (HIDDEN * 4, HIDDEN)
+        assert params["ffw_layer_2.weight"].shape == (HIDDEN, HIDDEN * 4)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4LightConv1d
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4LightConv1d:
+    def test_graph_builds(self):
+        comp = Gemma4LightConv1d(hidden_size=HIDDEN, conv_kernel_size=5)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 10, HIDDEN])
+        result = comp(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
+
+    def test_parameter_names(self):
+        comp = Gemma4LightConv1d(hidden_size=HIDDEN, conv_kernel_size=5)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "pre_layer_norm.weight" in names
+        assert "linear_start.weight" in names
+        assert "linear_end.weight" in names
+        assert "depthwise_conv1d.weight" in names
+        assert "conv_norm.weight" in names
+
+    def test_glu_expansion(self):
+        """linear_start doubles hidden size for GLU split. ONNX weight is (out, in)."""
+        comp = Gemma4LightConv1d(hidden_size=HIDDEN, conv_kernel_size=5)
+        params = dict(comp.named_parameters())
+        assert params["linear_start.weight"].shape == (HIDDEN * 2, HIDDEN)
+
+    def test_depthwise_weight_shape(self):
+        """Depthwise conv weight: [channels, 1, kernel_size]."""
+        comp = Gemma4LightConv1d(hidden_size=HIDDEN, conv_kernel_size=5)
+        params = dict(comp.named_parameters())
+        assert params["depthwise_conv1d.weight"].shape == (HIDDEN, 1, 5)
+
+    def test_no_conv_bias(self):
+        """Depthwise conv has no bias (HF CausalConv1d uses bias=False)."""
+        comp = Gemma4LightConv1d(hidden_size=HIDDEN, conv_kernel_size=5)
+        names = {n for n, _ in comp.named_parameters()}
+        assert "depthwise_conv1d.bias" not in names
+
+
+# ---------------------------------------------------------------------------
+# Gemma4Attention
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4Attention:
+    def test_graph_builds(self):
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
         )
-        param_names = [n for n, _ in layer.named_parameters()]
-        assert any("self_attn" in n for n in param_names)
-        assert any("feed_forward_in" in n for n in param_names)
-        assert any("feed_forward_out" in n for n in param_names)
-        assert any("conv" in n for n in param_names)
-        assert any("layer_norm" in n for n in param_names)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 10, HIDDEN])
+        result = comp(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
 
-    def test_forward(self):
-        layer = Gemma4ConformerEncoderLayer(
-            _DIM, _HEADS, _INNER, _KERNEL, _CTX_LEFT
+    def test_parameter_names(self):
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
         )
-        builder, op, _graph = create_test_builder()
-        x = create_test_input(builder, "x", [_BATCH, _TIME, _DIM])
-        out = layer(op, x)
-        assert out is not None
+        names = {n for n, _ in comp.named_parameters()}
+        assert "q_proj.weight" in names
+        assert "k_proj.weight" in names
+        assert "v_proj.weight" in names
+        assert "post.weight" in names
+        assert "per_dim_scale" in names
+        assert "relative_k_proj.weight" in names
+        assert "pos_embed" in names
 
-    def test_uses_rms_norm(self):
-        """Verify attention pre-norm and final norm are RMSNorm (not LayerNorm)."""
-        from mobius.components._rms_norm import RMSNorm
-
-        layer = Gemma4ConformerEncoderLayer(
-            _DIM, _HEADS, _INNER, _KERNEL, _CTX_LEFT
+    def test_per_dim_scale_shape(self):
+        """per_dim_scale is [head_dim] = [hidden_size / num_heads]."""
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
         )
-        assert isinstance(layer.layer_norm_att, RMSNorm)
-        assert isinstance(layer.layer_norm, RMSNorm)
+        params = dict(comp.named_parameters())
+        assert params["per_dim_scale"].shape == (HEAD_DIM,)
+
+    def test_pos_embed_shape(self):
+        """pos_embed is [context_left, hidden_size]."""
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
+        )
+        params = dict(comp.named_parameters())
+        assert params["pos_embed"].shape == (CTX_LEFT, HIDDEN)
+
+    def test_pos_embed_is_precomputed(self):
+        """pos_embed has a precomputed constant value (not random)."""
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
+        )
+        params = dict(comp.named_parameters())
+        p = params["pos_embed"]
+        # If constant value is set, const_value is not None
+        assert p.const_value is not None
+
+    def test_no_qkv_bias(self):
+        """Q/K/V projections have no bias (HF: nn.Linear(..., bias=False)).
+
+        Output projection (post) does have bias (HF Gemma4ClippableLinear default).
+        """
+        comp = Gemma4Attention(
+            hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
+        )
+        names = {n for n, _ in comp.named_parameters()}
+        assert "q_proj.bias" not in names
+        assert "k_proj.bias" not in names
+        assert "v_proj.bias" not in names
+        assert "relative_k_proj.bias" not in names
+        assert "post.bias" in names  # post uses ClippableLinear (bias=True)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4AudioLayer
+# ---------------------------------------------------------------------------
+
+
+class TestGemma4AudioLayer:
+    def test_graph_builds(self):
+        comp = Gemma4AudioLayer(
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            conv_kernel_size=5,
+            attention_context_left=CTX_LEFT,
+        )
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 10, HIDDEN])
+        result = comp(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
+
+    def test_parameter_names(self):
+        comp = Gemma4AudioLayer(
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            conv_kernel_size=5,
+            attention_context_left=CTX_LEFT,
+        )
+        names = {n for n, _ in comp.named_parameters()}
+        # Feed-forward blocks
+        assert "feed_forward1.pre_layer_norm.weight" in names
+        assert "feed_forward2.pre_layer_norm.weight" in names
+        # Attention
+        assert "self_attn.q_proj.weight" in names
+        # LightConv1d
+        assert "lconv1d.depthwise_conv1d.weight" in names
+        # Per-layer norms
+        assert "norm_pre_attn.weight" in names
+        assert "norm_post_attn.weight" in names
+        assert "norm_out.weight" in names
+
+    def test_submodule_types(self):
+        comp = Gemma4AudioLayer(
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            conv_kernel_size=5,
+            attention_context_left=CTX_LEFT,
+        )
+        assert isinstance(comp.feed_forward1, Gemma4FeedForward)
+        assert isinstance(comp.feed_forward2, Gemma4FeedForward)
+        assert isinstance(comp.self_attn, Gemma4Attention)
+        assert isinstance(comp.lconv1d, Gemma4LightConv1d)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4AudioEncoder
+# ---------------------------------------------------------------------------
 
 
 class TestGemma4AudioEncoder:
-    def test_has_parameters(self):
-        enc = Gemma4AudioEncoder(
-            input_size=_INPUT_SIZE,
-            hidden_size=_DIM,
-            num_heads=_HEADS,
-            num_layers=1,
-            ffn_inner_size=_INNER,
-            conv_kernel_size=_KERNEL,
-            conv_channels=[8, 4],
-            attention_context_left=_CTX_LEFT,
-            output_proj_dims=_DIM,
+    def _make_encoder(self, num_layers=2):
+        return Gemma4AudioEncoder(
+            input_size=32,
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            num_layers=num_layers,
+            conv_kernel_size=5,
+            conv_channels=[16, 8],
+            attention_context_left=CTX_LEFT,
+            output_proj_dims=96,
         )
-        param_names = [n for n, _ in enc.named_parameters()]
-        assert any("subsampling" in n for n in param_names)
-        assert any("encoders" in n for n in param_names)
-        assert any("output_projection" in n for n in param_names)
 
-    def test_forward(self):
-        enc = Gemma4AudioEncoder(
-            input_size=_INPUT_SIZE,
-            hidden_size=_DIM,
-            num_heads=_HEADS,
-            num_layers=1,
-            ffn_inner_size=_INNER,
-            conv_kernel_size=_KERNEL,
-            conv_channels=[8, 4],
-            attention_context_left=_CTX_LEFT,
-            output_proj_dims=_DIM,
-        )
-        builder, op, _graph = create_test_builder()
-        x = create_test_input(builder, "x", [_BATCH, _TIME, _INPUT_SIZE])
-        out = enc(op, x)
-        assert out is not None
-
-    def test_default_config_matches_gemma4(self):
-        """Default args match google/gemma-4-E2B-it audio config."""
-        enc = Gemma4AudioEncoder()
-        assert len(enc.encoders) == 12
-        assert enc.output_projection.weight.shape == [1536, 1024]
-        # Check context window on first layer's attention
-        assert enc.encoders[0].self_attn._attention_context_left == 13
+    def test_graph_builds(self):
+        enc = self._make_encoder()
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "input_features", [1, 20, 32])
+        result = enc(op, x)
+        b._adapt_outputs([result])
+        assert graph.num_nodes() > 0
 
     def test_layer_count(self):
-        enc = Gemma4AudioEncoder(
-            input_size=_INPUT_SIZE,
-            hidden_size=_DIM,
-            num_heads=_HEADS,
-            num_layers=3,
-            ffn_inner_size=_INNER,
-            conv_kernel_size=_KERNEL,
-            conv_channels=[8, 4],
-            attention_context_left=_CTX_LEFT,
-            output_proj_dims=_DIM,
-        )
-        assert len(enc.encoders) == 3
+        enc = self._make_encoder(num_layers=3)
+        assert len(enc.layers) == 3
+
+    def test_output_proj_has_bias(self):
+        """Output projection has bias=True (matches HF nn.Linear(..., bias=True))."""
+        enc = self._make_encoder()
+        names = {n for n, _ in enc.named_parameters()}
+        assert "output_proj.bias" in names
+
+    def test_subsampling_submodule(self):
+        enc = self._make_encoder()
+        assert isinstance(enc.subsample_conv_projection, Gemma4ConvSubsampling)
+
+    def test_layer_types(self):
+        enc = self._make_encoder(num_layers=2)
+        for layer in enc.layers:
+            assert isinstance(layer, Gemma4AudioLayer)
+
+    def test_parameter_namespacing(self):
+        enc = self._make_encoder(num_layers=1)
+        names = {n for n, _ in enc.named_parameters()}
+        # Subsampling
+        assert "subsample_conv_projection.conv0.weight" in names
+        # First (and only) layer
+        assert "layers.0.self_attn.q_proj.weight" in names
+        # Output proj with bias
+        assert "output_proj.weight" in names
+        assert "output_proj.bias" in names
+
+    def test_exports_from_components(self):
+        """Gemma4AudioEncoder is importable from mobius.components."""
+        from mobius.components import Gemma4AudioEncoder as _Enc
+
+        assert _Enc is Gemma4AudioEncoder
