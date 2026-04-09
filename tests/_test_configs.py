@@ -296,12 +296,10 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "_config_cls": Gemma4Config,
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
-            # 5:1 sliding/full pattern — use sliding_attention while the model is a
-            # placeholder inheriting Gemma3 (update to local_sliding once the real
-            # Gemma4 decoder is implemented).
-            "layer_types": ["sliding_attention", "sliding_attention",
-                            "sliding_attention", "full_attention"],
+            # 2-layer test: 1 sliding + 1 full (must match TINY_LAYERS=2)
+            "layer_types": ["sliding_attention", "full_attention"],
             "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
             "final_logit_softcapping": 30.0,
         },
         True,

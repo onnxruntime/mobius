@@ -1188,6 +1188,81 @@ class TestBuildGraphVisionLanguage:
         embedding = pkg["embedding"]
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
 
+    def test_gemma4_any_to_any_graph(self):
+        """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+audio+embedding)."""
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            # num_kv_shared_layers=1 → layer 1 shares KV from layer 0 (same type)
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                audio_token_id=255998,
+            ),
+        )
+        model_cls = registry.get("gemma4_any_to_any")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4_any_to_any")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}
+        # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
+        decoder = pkg["decoder"]
+        decoder_input_names = {i.name for i in decoder.graph.inputs}
+        assert "inputs_embeds" in decoder_input_names
+        assert "past_key_values.0.key" in decoder_input_names
+        assert "past_key_values.1.key" not in decoder_input_names  # shared layer
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+        # Vision
+        vision = pkg["vision"]
+        vision_input_names = {i.name for i in vision.graph.inputs}
+        assert "pixel_values" in vision_input_names
+        assert "pixel_position_ids" in vision_input_names
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+        # Audio
+        audio = pkg["audio"]
+        assert "input_features" in {i.name for i in audio.graph.inputs}
+        assert "audio_features" in {o.name for o in audio.graph.outputs}
+        # Embedding
+        embedding = pkg["embedding"]
+        emb_input_names = {i.name for i in embedding.graph.inputs}
+        assert "input_ids" in emb_input_names
+        assert "image_features" in emb_input_names
+        assert "audio_features" in emb_input_names
+        assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -3446,6 +3521,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "deepseek_vl_v2",
     "gemma3_multimodal",
     "gemma4",
+    "gemma4_any_to_any",
     "llava",
     "mllama",
     "phi4_multimodal",

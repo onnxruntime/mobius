@@ -42,6 +42,7 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4AnyToAnyModel,
     Gemma4CausalLMModel,
     Gemma4MultiModalModel,
     GemmaCausalLMModel,
@@ -465,6 +466,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
     "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
     "gemma4": ModelRegistration(Gemma4MultiModalModel, task="gemma4-multimodal", config_class=Gemma4Config),
+    "gemma4_any_to_any": ModelRegistration(Gemma4AnyToAnyModel, task="gemma4-any-to-any", config_class=Gemma4Config),
 
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),

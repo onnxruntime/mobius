@@ -1,16 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Gemma4 vision-language task (3-model split).
+"""Gemma4 task classes (3-model and 4-model splits).
 
-Builds three separate ONNX models:
+3-model split (``Gemma4VisionLanguageTask``):
 1. **decoder** (text decoder): ``inputs_embeds`` -> logits + KV cache
 2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` -> ``image_features``
 3. **embedding**: ``input_ids, image_features`` -> ``inputs_embeds``
 
+4-model split (``Gemma4AnyToAnyTask``):
+1. **decoder** (text decoder): ``inputs_embeds`` -> logits + KV cache
+2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` -> ``image_features``
+3. **audio** (audio encoder): ``input_features`` -> ``audio_features``
+4. **embedding**: ``input_ids, image_features, audio_features`` -> ``inputs_embeds``
+
 The decoder uses per-layer KV cache where local (sliding_attention) layers
 use ``config.head_dim`` and global (full_attention) layers use
-``config.global_head_dim``.
+``config.global_head_dim``.  When ``config.num_kv_shared_layers > 0``, the
+last ``num_kv_shared_layers`` decoder layers share K,V from earlier layers
+and therefore have NO separate KV cache entries — the cache only contains
+entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 """
 
 from __future__ import annotations
@@ -35,18 +44,26 @@ def _make_gemma4_kv_cache_inputs(
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
 ) -> tuple[list[ir.Value], list[tuple[ir.Value, ir.Value]]]:
-    """Create per-layer KV cache inputs accounting for dual head_dim.
+    """Create per-layer KV cache inputs accounting for dual head_dim and KV sharing.
 
     Local (sliding_attention) layers use ``config.head_dim``;
     global (full_attention) layers use ``config.global_head_dim``.
+
+    The last ``config.num_kv_shared_layers`` layers share K,V from earlier
+    layers and do NOT have their own cache entries — only
+    ``num_hidden_layers - num_kv_shared_layers`` entries are created.
     """
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
+    # Number of layers with independent KV projections
+    num_kv_shared = config.num_kv_shared_layers or 0
+    num_kv_layers = config.num_hidden_layers - num_kv_shared
     layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
 
     flat: list[ir.Value] = []
     pairs: list[tuple[ir.Value, ir.Value]] = []
-    for i, layer_type in enumerate(layer_types):
+    for i in range(num_kv_layers):
+        layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
         past_key = ir.Value(
             name=f"past_key_values.{i}.key",
@@ -222,3 +239,189 @@ class Gemma4VisionLanguageTask(ModelTask):
         graph.outputs.append(inputs_embeds)
 
         return _make_model(graph)
+
+
+class Gemma4AnyToAnyTask(ModelTask):
+    """4-model split task for Gemma4 Any-to-Any models (E2B, E4B).
+
+    The module must expose four sub-modules:
+
+    - ``decoder``: text decoder accepting ``inputs_embeds``
+    - ``vision_encoder``: vision encoder accepting ``pixel_values, pixel_position_ids``
+    - ``audio_encoder``: Conformer encoder accepting ``input_features``
+    - ``embedding``: embedding model fusing ``input_ids``, ``image_features``,
+      and ``audio_features``
+
+    Decoder KV cache is per-layer with correct head_dim per layer type.
+    KV cache has ``num_hidden_layers - num_kv_shared_layers`` entries.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: Gemma4Config,
+    ) -> ModelPackage:
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = self._build_decoder(module.decoder, config)
+        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["audio"] = self._build_audio(module.audio_encoder, config)
+        models["embedding"] = self._build_embedding(module.embedding, config)
+        return ModelPackage(models, config=config)
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build text decoder: inputs_embeds -> logits + per-layer KV cache."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        inputs_embeds = ir.Value(
+            name="inputs_embeds",
+            shape=ir.Shape([batch, seq_len, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        position_ids = ir.Value(
+            name="position_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [inputs_embeds, attention_mask, position_ids]
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
+            config, batch, past_seq_len
+        )
+        graph_inputs.extend(kv_inputs)
+
+        graph, graph_builder = _make_graph(graph_inputs, name="decoder")
+        op = graph_builder.op
+
+        logits, present_key_values = decoder(
+            op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+
+        logits.name = "logits"
+        graph.outputs.append(logits)
+        _register_kv_cache_outputs(graph, present_key_values)
+        return _make_model(graph)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build vision encoder: pixel_values + pixel_position_ids -> image_features."""
+        batch = ir.SymbolicDim("batch")
+        num_patches = ir.SymbolicDim("num_patches")
+        patch_size = config.vision.patch_size or 16 if config.vision else 16
+        pixel_dim = 3 * patch_size * patch_size
+
+        pixel_values = ir.Value(
+            name="pixel_values",
+            shape=ir.Shape([batch, num_patches, pixel_dim]),
+            type=ir.TensorType(config.dtype),
+        )
+        pixel_position_ids = ir.Value(
+            name="pixel_position_ids",
+            shape=ir.Shape([batch, num_patches, 2]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph, graph_builder = _make_graph(
+            [pixel_values, pixel_position_ids], name="vision"
+        )
+        op = graph_builder.op
+
+        image_features = vision(
+            op,
+            pixel_values=pixel_values,
+            pixel_position_ids=pixel_position_ids,
+        )
+        image_features.name = "image_features"
+        graph.outputs.append(image_features)
+        return _make_model(graph)
+
+    def _build_audio(
+        self,
+        audio: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build audio encoder: input_features -> audio_features.
+
+        Input:
+        - ``input_features [batch, time, input_size]``: mel-spectrogram
+
+        Output:
+        - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
+        """
+        batch = ir.SymbolicDim("batch")
+        time = ir.SymbolicDim("time")
+        input_size = (config.audio.input_size if config.audio else None) or 128
+
+        input_features = ir.Value(
+            name="input_features",
+            shape=ir.Shape([batch, time, input_size]),
+            type=ir.TensorType(config.dtype),
+        )
+
+        graph, graph_builder = _make_graph([input_features], name="audio")
+        op = graph_builder.op
+
+        audio_features = audio(op, input_features)
+        audio_features.name = "audio_features"
+        graph.outputs.append(audio_features)
+        return _make_model(graph)
+
+    def _build_embedding(
+        self,
+        embedding: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build embedding: input_ids + image_features + audio_features -> inputs_embeds."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        num_image_tokens = ir.SymbolicDim("num_image_tokens")
+        num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
+
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        image_features = ir.Value(
+            name="image_features",
+            shape=ir.Shape([num_image_tokens, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+        audio_features = ir.Value(
+            name="audio_features",
+            shape=ir.Shape([num_audio_tokens, config.hidden_size]),
+            type=ir.TensorType(config.dtype),
+        )
+
+        graph, graph_builder = _make_graph(
+            [input_ids, image_features, audio_features], name="embedding"
+        )
+        op = graph_builder.op
+
+        inputs_embeds = embedding(
+            op,
+            input_ids=input_ids,
+            image_features=image_features,
+            audio_features=audio_features,
+        )
+        inputs_embeds.name = "inputs_embeds"
+        graph.outputs.append(inputs_embeds)
+        return _make_model(graph)
+

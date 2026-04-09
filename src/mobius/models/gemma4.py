@@ -7,6 +7,8 @@ Architecture variants:
 - **Gemma4CausalLMModel**: Text-only causal LM (model_type ``gemma4_text``).
 - **Gemma4MultiModalModel**: Multimodal 3-model split — decoder + vision + embedding
   (model_type ``gemma4``).  For 26B-A4B and 31B variants (Image-Text-to-Text).
+- **Gemma4AnyToAnyModel**: 4-model split — decoder + vision + audio + embedding
+  (model_type ``gemma4_any_to_any``).  For E2B and E4B variants (vision+audio+text).
 
 Key architectural differences from Gemma3:
 - Standard ``RMSNorm`` throughout (no ``OffsetRMSNorm``).
@@ -17,6 +19,8 @@ Key architectural differences from Gemma3:
 - Vision encoder: pre-patchified input ``[B, N, 3*P^2]`` with 2D position lookup,
   bidirectional attention, 4-norm structure, and scale-then-project pooling.
 - Vision projector: scale-free RMSNorm -> Linear (matches ``embed_vision`` weights).
+- KV sharing: last ``num_kv_shared_layers`` layers borrow K,V from earlier layers
+  and have no k_proj/v_proj weights of their own.
 """
 
 from __future__ import annotations
@@ -33,12 +37,14 @@ from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
-    Attention,
     Linear,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
 )
+from mobius.components._activations import get_activation
+from mobius.components._gemma4_audio import Gemma4AudioEncoder
+from mobius.components._mlp import GatedMLP
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
@@ -265,32 +271,224 @@ class _Gemma4VisionEncoderCore(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Gemma4DecoderLayer(nn.Module):
-    """Gemma4 text decoder layer.
+class Gemma4TextAttention(nn.Module):
+    """Gemma4 text multi-head attention with per-head QKV norms and KV sharing.
 
-    Uses standard ``RMSNorm`` (not ``OffsetRMSNorm`` as in Gemma3) and a
-    4-norm structure.
+    Key differences from standard Attention:
+    - Fixed scale=1.0 (HF hardcodes this)
+    - Q and K normalized per-head with learnable RMSNorm
+    - V normalized per-head with parameterless RMS (no learnable scale)
+    - head_dim and rotary_embedding_dim differ between sliding/full layers
+    - KV-shared layers borrow K,V from a source layer (no k/v projections)
 
-    The ``config`` argument controls whether this is a local (sliding_attention)
-    or global (full_attention) layer via ``head_dim``, ``partial_rotary_factor``,
-    and ``rope_theta``.  Pass a ``dataclasses.replace``-d config for global layers.
-
-    When ``config.hidden_size_per_layer_input > 0``, expects a
-    ``per_layer_input [B, S, per_layer_dim]`` tensor and applies gated projection
-    after the MLP block (matching HF ``Gemma4TextDecoderLayer``).
+    Args:
+        config: Gemma4Config.
+        layer_idx: Index of this layer (0-based).
+        layer_types: Full list of layer types for all layers.
+        first_kv_shared_layer_idx: First layer index where KV sharing starts.
+        head_dim: Head dimension (differs per layer type).
+        rotary_embedding_dim: Dims to rotate (0 = full rotation).
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: Gemma4Config,
+        layer_idx: int,
+        layer_types: list[str],
+        first_kv_shared_layer_idx: int,
+        head_dim: int,
+        rotary_embedding_dim: int,
+    ):
         super().__init__()
-        self.self_attn = Attention(config, rms_norm_class=RMSNorm)
-        self.mlp = MLP(config)
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = head_dim
+        self.scaling = 1.0
+        self._v_norm_eps = config.rms_norm_eps
+        self.rotary_embedding_dim = rotary_embedding_dim
+        self._rope_interleave = config.rope_interleave
+        self.layer_idx = layer_idx
+
+        # KV sharing: layers >= first_kv_shared_layer_idx borrow K,V from source
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+            self.store_full_length_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            self.store_full_length_kv = first_kv_shared_layer_idx > 0 and (
+                layer_idx
+                == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+
+        # All layers have Q projection + Q norm + output projection
+        self.q_proj = Linear(
+            config.hidden_size, config.num_attention_heads * head_dim, bias=False
+        )
+        self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.o_proj = Linear(
+            config.num_attention_heads * head_dim, config.hidden_size, bias=False
+        )
+
+        # KV-shared layers borrow K,V — no projections needed
+        if not self.is_kv_shared_layer:
+            self.k_proj = Linear(
+                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
+            )
+            self.v_proj = Linear(
+                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
+            )
+            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: "ir.Value",
+        attention_bias: "ir.Value",
+        position_embeddings: tuple | None = None,
+        shared_kv_states: dict | None = None,
+        past_key_value: tuple | None = None,
+    ):
+        from mobius.components._attention import _apply_attention, apply_rotary_pos_emb
+
+        # Q projection + per-head Q norm + optional RoPE
+        query_states = self.q_proj(op, hidden_states)
+        query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+        query_states = self.q_norm(op, query_states)
+        query_states = op.Reshape(query_states, [0, 0, -1])
+
+        if position_embeddings is not None:
+            query_states = apply_rotary_pos_emb(
+                op,
+                x=query_states,
+                position_embeddings=position_embeddings,
+                num_heads=self.num_attention_heads,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                interleaved=self._rope_interleave,
+            )
+
+        if self.is_kv_shared_layer:
+            # Borrow full-history K,V from source layer
+            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+            attn_output, present_key, present_value = _apply_attention(
+                op,
+                query_states,
+                src_key,
+                src_value,
+                attention_bias,
+                past_key=None,
+                past_value=None,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                scale=self.scaling,
+            )
+        else:
+            # K projection + per-head K norm + optional RoPE
+            key_states = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_states = self.k_norm(op, key_states)
+            key_states = op.Reshape(key_states, [0, 0, -1])
+
+            if position_embeddings is not None:
+                key_states = apply_rotary_pos_emb(
+                    op,
+                    x=key_states,
+                    position_embeddings=position_embeddings,
+                    num_heads=self.num_key_value_heads,
+                    rotary_embedding_dim=self.rotary_embedding_dim,
+                    interleaved=self._rope_interleave,
+                )
+
+            # V projection + parameterless per-head V normalisation
+            value_states = self.v_proj(op, hidden_states)
+            value_states = op.Reshape(
+                value_states,
+                op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
+            )
+            sq = op.Mul(value_states, value_states)
+            mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
+            rms = op.Sqrt(op.Add(mean_sq, self._v_norm_eps))
+            value_states = op.Div(value_states, rms)
+            value_states = op.Reshape(value_states, [0, 0, -1])
+
+            attn_output, present_key, present_value = _apply_attention(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                attention_bias,
+                past_key_value[0] if past_key_value is not None else None,
+                past_key_value[1] if past_key_value is not None else None,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                scale=self.scaling,
+            )
+
+            # Source layers store K,V for downstream KV-shared layers
+            if self.store_full_length_kv and shared_kv_states is not None:
+                shared_kv_states[self.layer_idx] = (present_key, present_value)
+
+        attn_output = self.o_proj(op, attn_output)
+        return attn_output, (present_key, present_value)
+
+
+class Gemma4DecoderLayer(nn.Module):
+    """Gemma4 text decoder layer with 4 norms, layer_scalar, and optional per-layer input.
+
+    Architecture (dense path):
+        h = residual + post_attn_norm(attn(input_layernorm(h)))
+        h = residual + post_ff_norm(mlp(pre_ff_norm(h)))
+        if per_layer_input:
+            h += post_per_layer_norm(project(act(gate(h)) * per_layer_input))
+        h = h * layer_scalar   # LAST step, after per-layer input
+
+    Uses standard RMSNorm (not OffsetRMSNorm). KV-shared layers use double-wide
+    MLP when config.use_double_wide_mlp=True.
+    """
+
+    def __init__(self, config: Gemma4Config, layer_idx: int):
+        super().__init__()
+        layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
+        first_kv_shared = config.num_hidden_layers - config.num_kv_shared_layers
+        layer_type = layer_types[layer_idx]
+        is_full = layer_type == "full_attention"
+
+        head_dim = (config.global_head_dim or config.head_dim) if is_full else config.head_dim
+        rotary_dim = int(head_dim * config.global_partial_rotary_factor) if is_full else 0
+
+        self.self_attn = Gemma4TextAttention(
+            config,
+            layer_idx=layer_idx,
+            layer_types=layer_types,
+            first_kv_shared_layer_idx=first_kv_shared,
+            head_dim=head_dim,
+            rotary_embedding_dim=rotary_dim,
+        )
+
+        is_kv_shared = layer_idx >= first_kv_shared > 0
+        intermediate_size = config.intermediate_size * (
+            2 if (config.use_double_wide_mlp and is_kv_shared) else 1
+        )
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            activation=config.hidden_act,
+            bias=config.mlp_bias,
+        )
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        if self._per_layer_dim:
+        # layer_scalar: learned or constant scalar applied at end of layer
+        self.layer_scalar = nn.Parameter([1])
+
+        self._per_layer_dim = config.hidden_size_per_layer_input
+        if self._per_layer_dim > 0:
             self.per_layer_input_gate = Linear(
                 config.hidden_size, self._per_layer_dim, bias=False
             )
@@ -300,20 +498,24 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            # gelu_pytorch_tanh matches HF hidden_activation for Gemma4
-            from mobius.components._activations import gelu_tanh
-            self._act_fn = gelu_tanh
+            self.act_fn = get_activation(config.hidden_act)
+
+        if config.enable_moe_block:
+            raise NotImplementedError(
+                "Gemma4 MoE block not yet implemented. Set enable_moe_block=False."
+            )
 
     def forward(
         self,
         op: builder.OpBuilder,
-        hidden_states: ir.Value,
-        attention_bias: ir.Value,
+        hidden_states: "ir.Value",
+        attention_bias: "ir.Value",
         position_embeddings: tuple,
+        shared_kv_states: dict,
+        per_layer_input: "ir.Value | None",
         past_key_value: tuple | None,
-        per_layer_input: ir.Value | None = None,
-    ) -> tuple[ir.Value, tuple]:
-        # Attention block
+    ):
+        # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_output, present_key_value = self.self_attn(
@@ -321,27 +523,31 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_bias=attention_bias,
             position_embeddings=position_embeddings,
+            shared_kv_states=shared_kv_states,
             past_key_value=past_key_value,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
 
-        # MLP block
+        # MLP block: pre-norm -> mlp -> post-norm -> residual
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(op, hidden_states)
         hidden_states = self.mlp(op, hidden_states)
         hidden_states = self.post_feedforward_layernorm(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
 
-        # Optional per-layer input gating (Gemma4-specific)
-        if self._per_layer_dim and per_layer_input is not None:
+        # Per-layer input gating (skip when disabled)
+        if self._per_layer_dim > 0 and per_layer_input is not None:
             residual = hidden_states
             gated = self.per_layer_input_gate(op, hidden_states)
-            gated = self._act_fn(op, gated)
+            gated = self.act_fn(op, gated)
             gated = op.Mul(gated, per_layer_input)
-            gated = self.per_layer_projection(op, gated)
-            gated = self.post_per_layer_input_norm(op, gated)
-            hidden_states = op.Add(residual, gated)
+            projected = self.per_layer_projection(op, gated)
+            projected = self.post_per_layer_input_norm(op, projected)
+            hidden_states = op.Add(residual, projected)
+
+        # Layer scalar LAST (after per-layer input contribution)
+        hidden_states = op.Mul(hidden_states, self.layer_scalar)
 
         return hidden_states, present_key_value
 
@@ -402,12 +608,7 @@ class Gemma4TextModel(nn.Module):
         )
 
         self.layers = nn.ModuleList(
-            [
-                Gemma4DecoderLayer(
-                    local_config if lt == "sliding_attention" else global_config
-                )
-                for lt in layer_types
-            ]
+            [Gemma4DecoderLayer(config, layer_idx=i) for i in range(len(layer_types))]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -416,6 +617,7 @@ class Gemma4TextModel(nn.Module):
 
         # Per-layer input embeddings (optional feature)
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        self._hidden_size = config.hidden_size
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
@@ -444,11 +646,9 @@ class Gemma4TextModel(nn.Module):
         if not self._per_layer_dim:
             return None
 
-        # Project hidden states to per-layer space and normalise
+        # Project hidden states and scale by hidden_size**-0.5 (matches HF)
         proj = self.per_layer_model_projection(op, inputs_embeds)
-        # Scale by 1 / sqrt(num_layers) to stabilise training
-        scale = float(self._num_layers**-0.5) * float(self._per_layer_dim**0.5)
-        proj = op.Mul(proj, op.Constant(value_float=scale))
+        proj = op.Mul(proj, float(self._hidden_size**-0.5))
         proj = op.Reshape(
             proj, op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim])
         )
@@ -462,7 +662,8 @@ class Gemma4TextModel(nn.Module):
             )
             proj = op.Add(proj, token_emb)
 
-        return proj
+        # Scale combined result by 2**-0.5 (matches HF project_per_layer_inputs)
+        return op.Mul(proj, float(0.5**0.5))
 
     def forward(
         self,
@@ -503,23 +704,27 @@ class Gemma4TextModel(nn.Module):
             ),
         }
 
+        # shared_kv_states: source layers populate it, shared layers consume it
+        shared_kv_states: dict = {}
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
-            per_layer_input = (
-                op.Gather(per_layer_inputs, op.Constant(value_int=i), axis=2)
-                if per_layer_inputs is not None
-                else None
-            )
+            if per_layer_inputs is not None:
+                idx = op.Constant(value_ints=[i])
+                pli = op.Gather(per_layer_inputs, idx, axis=2)
+                per_layer_input = op.Squeeze(pli, [2])
+            else:
+                per_layer_input = None
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias_dict[layer_type],
                 position_embeddings=position_embeddings_dict[layer_type],
-                past_key_value=past_kv,
+                shared_kv_states=shared_kv_states,
                 per_layer_input=per_layer_input,
+                past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
 
@@ -567,6 +772,10 @@ class Gemma4CausalLMModel(CausalLMModel):
             inputs_embeds=inputs_embeds,
         )
         logits = self.lm_head(op, hidden_states)
+        # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
+        if self.config.final_logit_softcapping:
+            cap = float(self.config.final_logit_softcapping)
+            logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
         return logits, present_key_values
 
     def preprocess_weights(
@@ -807,6 +1016,204 @@ class Gemma4MultiModalModel(nn.Module):
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
                 pass  # Scale-free norm: no learnable parameter
+
+            else:
+                renamed[key] = value
+
+        return renamed
+
+
+# ---------------------------------------------------------------------------
+# Gemma4AnyToAnyModel support classes (4-model split, E2B/E4B)
+# ---------------------------------------------------------------------------
+
+
+class _Gemma4AudioEncoderModel(nn.Module):
+    """Gemma4 Conformer audio encoder sub-model.
+
+    Wraps :class:`Gemma4AudioEncoder` for use in the 4-model split.
+
+    Inputs:
+    - ``input_features [B, T, input_size]``: mel-spectrogram features
+
+    Output:
+    - ``audio_features [B, T//4, text_hidden_size]``: projected audio tokens
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        self.config = config
+        ac = config.audio  # Gemma4AudioConfig
+        input_size = (ac.input_size if ac else None) or 128
+        hidden_size = (ac.hidden_size if ac else None) or 1024
+        num_layers = (ac.num_layers if ac else None) or 12
+        output_proj_dims = (ac.output_dim if ac else None) or config.hidden_size
+        conv_channels = (ac.subsampling_conv_channels if ac else None)
+        rms_norm_eps = config.rms_norm_eps or 1e-6
+
+        self.encoder = Gemma4AudioEncoder(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_heads=8,               # fixed per Gemma4 audio_config
+            num_layers=num_layers,
+            conv_kernel_size=5,        # fixed per Gemma4 audio_config
+            conv_channels=conv_channels,
+            attention_context_left=13, # fixed per Gemma4 audio_config
+            output_proj_dims=output_proj_dims,
+            rms_norm_eps=rms_norm_eps,
+        )
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_features: ir.Value,
+    ) -> ir.Value:
+        # input_features: [B, T, input_size] → [B, T//4, text_hidden_size]
+        return self.encoder(op, input_features)
+
+
+class _Gemma4AnyToAnyEmbeddingModel(nn.Module):
+    """Embedding sub-model that fuses vision and audio features into text.
+
+    Scatters image features at ``image_token_id`` positions and audio
+    features at ``audio_token_id`` positions in the token embedding sequence.
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        self.config = config
+        embed_scale = float(np.float16(config.hidden_size**0.5))
+        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            config.pad_token_id,
+            embed_scale=embed_scale,
+        )
+        self.image_token_id = config.image_token_id or 0
+        self.audio_token_id = (
+            (config.audio.audio_token_id if config.audio else None) or 0
+        )
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_ids: ir.Value,
+        image_features: ir.Value,
+        audio_features: ir.Value,
+    ) -> ir.Value:
+        text_embeds = self.embed_tokens(op, input_ids)  # [B, S, hidden]
+
+        # --- Scatter image features at image-token positions ---
+        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        image_mask_3d = op.Unsqueeze(image_mask, [-1])
+        img_mask_int = op.Cast(image_mask, to=7)  # INT64
+        img_cumsum = op.CumSum(img_mask_int, op.Constant(value_int=1))
+        img_indices = op.Clip(op.Sub(img_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        img_gathered = op.Gather(image_features, img_indices, axis=0)
+        hidden = op.Where(image_mask_3d, img_gathered, text_embeds)
+
+        # --- Scatter audio features at audio-token positions ---
+        audio_mask = op.Equal(input_ids, op.Constant(value_int=self.audio_token_id))
+        audio_mask_3d = op.Unsqueeze(audio_mask, [-1])
+        aud_mask_int = op.Cast(audio_mask, to=7)  # INT64
+        aud_cumsum = op.CumSum(aud_mask_int, op.Constant(value_int=1))
+        aud_indices = op.Clip(op.Sub(aud_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        aud_gathered = op.Gather(audio_features, aud_indices, axis=0)
+        return op.Where(audio_mask_3d, aud_gathered, hidden)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return vlm_embedding_weights(state_dict)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4AnyToAnyModel (4-model split, Any-to-Any, E2B/E4B)
+# ---------------------------------------------------------------------------
+
+
+class Gemma4AnyToAnyModel(nn.Module):
+    """Gemma 4 Any-to-Any model (4-model split).
+
+    Builds four separate ONNX models:
+    - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
+    - ``vision_encoder``: SigLIP-style encoder + projector
+    - ``audio_encoder``: Conformer audio encoder
+    - ``embedding``: scaled word embedding + image + audio feature fusion
+
+    Used for the Any-to-Any variants (E2B, E4B) that accept vision+audio+text.
+    Registered as ``gemma4_any_to_any`` with task ``gemma4-any-to-any``.
+    """
+
+    default_task: str = "gemma4-any-to-any"
+    category: str = "Multimodal"
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        self.config = config
+        self.decoder = _Gemma4DecoderModel(config)
+        self.vision_encoder = _Gemma4VisionEncoderModel(config)
+        self.audio_encoder = _Gemma4AudioEncoderModel(config)
+        self.embedding = _Gemma4AnyToAnyEmbeddingModel(config)
+
+    def forward(self, op: builder.OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Gemma4AnyToAnyModel uses Gemma4AnyToAnyTask which calls each "
+            "sub-module (decoder, vision_encoder, audio_encoder, embedding) separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Rename HuggingFace weight keys to ONNX initializer names.
+
+        Mapping:
+        - ``language_model.*`` -> ``decoder.*``
+        - ``vision_tower.*`` -> ``vision_encoder.encoder.*`` (strip .linear. infix)
+        - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
+        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free)
+        - ``audio_tower.*`` -> ``audio_encoder.encoder.*``
+        - ``embed_audio.embedding_projection.*`` -> skip (output_proj is inside encoder)
+        - ``language_model.model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
+        """
+        if self.config.tie_word_embeddings:
+            embed_key = "language_model.model.embed_tokens.weight"
+            head_key = "language_model.lm_head.weight"
+            if head_key not in state_dict and embed_key in state_dict:
+                state_dict[head_key] = state_dict[embed_key]
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("language_model."):
+                new_key = "decoder." + key[len("language_model."):]
+                renamed[new_key] = value
+                if key == "language_model.model.embed_tokens.weight":
+                    renamed["embedding.embed_tokens.weight"] = value
+
+            elif key.startswith("vision_tower."):
+                new_key = "vision_encoder.encoder." + key[len("vision_tower."):]
+                new_key = new_key.replace(".linear.weight", ".weight")
+                new_key = new_key.replace(".linear.bias", ".bias")
+                renamed[new_key] = value
+
+            elif key.startswith("embed_vision.embedding_projection."):
+                suffix = key[len("embed_vision.embedding_projection."):]
+                renamed["vision_encoder.projector." + suffix] = value
+
+            elif key.startswith("embed_vision.embedding_pre_projection_norm."):
+                pass  # Scale-free norm: no learnable parameter
+
+            elif key.startswith("audio_tower."):
+                # Map audio_tower.* -> audio_encoder.encoder.*
+                new_key = "audio_encoder.encoder." + key[len("audio_tower."):]
+                renamed[new_key] = value
+
+            elif key.startswith("embed_audio.embedding_projection."):
+                # Audio output_proj is already inside Gemma4AudioEncoder.output_proj
+                pass
+
+            elif key.startswith("embed_audio."):
+                pass  # Other embed_audio keys (e.g. scale-free norm)
 
             else:
                 renamed[key] = value
