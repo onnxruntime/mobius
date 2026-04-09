@@ -80,7 +80,7 @@ class VisionLanguageTask(ModelTask):
     ) -> ir.Model:
         """Build vision encoder: pixel_values [batch, C, H, W] -> image_features."""
         batch = ir.SymbolicDim("batch")
-        image_size = config.vision.image_size or 224 if config.vision else 224
+        image_size = (config.vision.image_size if config.vision else None) or 224
 
         pixel_values = ir.Value(
             name="pixel_values",
@@ -130,7 +130,7 @@ class QwenVLTask(VisionLanguageTask):
         total_patches = ir.SymbolicDim("total_patches")
         num_images = ir.SymbolicDim("num_images")
 
-        patch_size = config.vision.patch_size or 14 if config.vision else 14
+        patch_size = (config.vision.patch_size if config.vision else None) or 14
         temporal_patch_size = config.temporal_patch_size
         in_channels = config.vision.in_channels if config.vision else 3
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size

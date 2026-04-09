@@ -36,12 +36,13 @@ from mobius.tasks._cache_utils import (
 class TTSTask(ModelTask):
     """4-model split for Qwen3-TTS.
 
-    The module must provide four sub-modules as attributes:
+    The module must provide three required sub-modules and one optional:
 
     - ``talker``: Decoder producing logits + last_hidden_state
     - ``code_predictor``: Small decoder for remaining code groups
     - ``embedding``: Text + codec embedding model
-    - ``speaker_encoder``: ECAPA-TDNN speaker encoder
+    - ``speaker_encoder``: ECAPA-TDNN speaker encoder *(optional — omitted
+      when the model uses a pre-computed speaker embedding instead)*
 
     Each sub-module is wired into its own ONNX graph.
     """

@@ -61,11 +61,7 @@ class SpeechLanguageTask(ModelTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["audio_encoder"] = self._build_audio_encoder(module.audio_tower, config)
-        output_dim = (
-            config.audio.output_dim or config.hidden_size
-            if config.audio
-            else config.hidden_size
-        )
+        output_dim = (config.audio.output_dim if config.audio else None) or config.hidden_size
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -84,7 +80,7 @@ class SpeechLanguageTask(ModelTask):
         """Build audio encoder: mel (batch, n_mels, time) → audio features."""
         batch = ir.SymbolicDim("batch")
         mel_seq = ir.SymbolicDim("mel_sequence_len")
-        n_mels = config.audio.num_mel_bins or 128 if config.audio else 128
+        n_mels = (config.audio.num_mel_bins if config.audio else None) or 128
 
         input_features = ir.Value(
             name="input_features",
