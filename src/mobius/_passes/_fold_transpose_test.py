@@ -284,7 +284,7 @@ class TestFoldTransposedInitializerPass:
         # No data yet — const_value stays None until weights are applied
         assert t_val.const_value is None
         # Source name recorded for later materialisation
-        assert t_val.metadata_props.get("mobius.fold_source") == "weight"
+        assert t_val.metadata_props.get("pkg.pkg.mobius.fold_source") == "weight"
 
 
 class TestFoldTransposeStructural:
@@ -345,7 +345,7 @@ class TestFoldTransposeStructural:
         # No data yet — const_value is None until weights are loaded.
         assert t_val.const_value is None
         # Source name recorded for materialisation.
-        assert t_val.metadata_props.get("mobius.fold_source") == "weight"
+        assert t_val.metadata_props.get("pkg.pkg.mobius.fold_source") == "weight"
 
         # The original initializer must stay registered so apply_weights can populate it.
         assert "weight" in model.graph.initializers, (
@@ -489,7 +489,7 @@ class TestFoldTransposeStructural:
         assert list(w_t_init.shape) == [3, 2]
 
     def test_fold_sources_propagated_from_concat_folded_source(self):
-        """When the source initializer itself has mobius.fold_sources, those are propagated."""
+        """When the source initializer itself has pkg.mobius.fold_sources, those are propagated."""
         # Simulate: qkv_packed was created by FoldConcat from W_q, W_k, W_v.
         # It has fold_sources metadata but no const_value yet (weights not loaded).
         # Then FoldTranspose sees Transpose(qkv_packed) and must propagate fold_sources
@@ -497,8 +497,8 @@ class TestFoldTransposeStructural:
         packed = ir.Value(name="qkv_packed")
         packed.shape = ir.Shape([12, 4])
         packed.dtype = ir.DataType.FLOAT
-        packed.metadata_props["mobius.fold_sources"] = "W_q,W_k,W_v"
-        packed.metadata_props["mobius.fold_axis"] = "0"
+        packed.metadata_props["pkg.pkg.mobius.fold_sources"] = "W_q,W_k,W_v"
+        packed.metadata_props["pkg.pkg.mobius.fold_axis"] = "0"
         # const_value is None — weights not loaded yet.
 
         x = ir.Value(name="x")
@@ -531,7 +531,7 @@ class TestFoldTransposeStructural:
         assert "qkv_packed_t" in model.graph.initializers
         t_val = model.graph.initializers["qkv_packed_t"]
         # fold_source points to the intermediate packed init.
-        assert t_val.metadata_props.get("mobius.fold_source") == "qkv_packed"
+        assert t_val.metadata_props.get("pkg.pkg.mobius.fold_source") == "qkv_packed"
         # fold_sources and fold_axis are propagated from the concat-folded source.
-        assert t_val.metadata_props.get("mobius.fold_sources") == "W_q,W_k,W_v"
-        assert t_val.metadata_props.get("mobius.fold_axis") == "0"
+        assert t_val.metadata_props.get("pkg.pkg.mobius.fold_sources") == "W_q,W_k,W_v"
+        assert t_val.metadata_props.get("pkg.pkg.mobius.fold_axis") == "0"

@@ -149,8 +149,8 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             else:
                 # No data yet — leave const_value=None and record the source names
                 # so fold_initializers_after_weights() can fill it in later.
-                new_val.metadata_props["mobius.fold_sources"] = ",".join(input_names)
-                new_val.metadata_props["mobius.fold_axis"] = str(axis)
+                new_val.metadata_props["pkg.pkg.mobius.fold_sources"] = ",".join(input_names)
+                new_val.metadata_props["pkg.pkg.mobius.fold_axis"] = str(axis)
 
             model.graph.initializers[new_val.name] = new_val
 

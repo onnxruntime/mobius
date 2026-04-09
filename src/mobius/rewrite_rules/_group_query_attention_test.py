@@ -335,13 +335,13 @@ class TestGroupQueryAttentionRules:
             )
             # The fold metadata links back to the original W_q, W_k, W_v initializers.
             # After stage 5 + RemoveUnused, the intermediate packed initializer is gone;
-            # its mobius.fold_sources metadata was propagated directly onto the transposed
+            # its pkg.mobius.fold_sources metadata was propagated directly onto the transposed
             # weight by FoldTransposedInitializerPass.
-            assert w.metadata_props.get("mobius.fold_source") is not None, (
-                "Packed+transposed weight should have mobius.fold_source metadata"
+            assert w.metadata_props.get("pkg.pkg.mobius.fold_source") is not None, (
+                "Packed+transposed weight should have pkg.mobius.fold_source metadata"
             )
-            assert w.metadata_props.get("mobius.fold_sources") is not None, (
-                "Packed+transposed weight should carry mobius.fold_sources (W_q,W_k,W_v names)"
+            assert w.metadata_props.get("pkg.pkg.mobius.fold_sources") is not None, (
+                "Packed+transposed weight should carry pkg.mobius.fold_sources (W_q,W_k,W_v names)"
             )
 
     def test_falls_back_to_separate_qkv_with_qk_norm(self):
@@ -505,8 +505,8 @@ class TestGroupQueryAttentionRules:
             assert bias_val is not None, "Add should contain bias initializer"
 
             # After stage 5, the bias Concat is folded to a direct initializer.
-            assert bias_val.metadata_props.get("mobius.fold_sources") is not None, (
-                "Packed bias should be a folded concat initializer with mobius.fold_sources"
+            assert bias_val.metadata_props.get("pkg.pkg.mobius.fold_sources") is not None, (
+                "Packed bias should be a folded concat initializer with pkg.mobius.fold_sources"
             )
 
             # After stage 5, the weight Transpose is folded to a direct initializer.
@@ -514,8 +514,8 @@ class TestGroupQueryAttentionRules:
             assert w is not None and w.producer() is None, (
                 "Packed weight should be a direct initializer after structural fold"
             )
-            assert w.metadata_props.get("mobius.fold_source") is not None, (
-                "Packed+transposed weight should have mobius.fold_source metadata"
+            assert w.metadata_props.get("pkg.pkg.mobius.fold_source") is not None, (
+                "Packed+transposed weight should have pkg.mobius.fold_source metadata"
             )
 
     def test_packed_qkv_with_bias_runs_with_ort(self):

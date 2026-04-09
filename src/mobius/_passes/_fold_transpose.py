@@ -14,7 +14,7 @@ serialisation, avoiding holding a duplicate copy of the weight in memory.
 
 When the source initializer has no tensor data (``const_value is None``), the
 folded initializer is registered with ``const_value=None`` and the source name
-is stored in ``metadata_props["mobius.fold_source"]`` so that
+is stored in ``metadata_props["pkg.pkg.mobius.fold_source"]`` so that
 :func:`~mobius._optimizations.fold_initializers_after_weights` can materialise
 the value once weights are loaded.
 """
@@ -41,10 +41,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
          avoiding a duplicate in-memory copy.
        * If the source has no tensor data (``const_value is None``), the
          initializer is left with ``const_value=None`` and
-         ``metadata_props["mobius.fold_source"]`` records the source name for later
+         ``metadata_props["pkg.pkg.mobius.fold_source"]`` records the source name for later
          materialisation by :func:`~mobius._optimizations.fold_initializers_after_weights`.
          If the source is itself a folded-concat initializer (it carries
-         ``mobius.fold_sources``), those source names are propagated to the
+         ``pkg.mobius.fold_sources``), those source names are propagated to the
          transposed initializer so that weight loading can compute the value
          directly from the original HuggingFace weights without needing the
          intermediate packed initializer.
@@ -116,18 +116,18 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 else:
                     # No data yet — leave const_value=None and record the source
                     # so fold_initializers_after_weights() can fill it in later.
-                    new_val.metadata_props["mobius.fold_source"] = inp.name
+                    new_val.metadata_props["pkg.pkg.mobius.fold_source"] = inp.name
                     # If the source is itself a folded-concat (packed weight), propagate
                     # its fold_sources and fold_axis so weight loading can compute the
                     # value directly from the original HuggingFace weights without
                     # needing the intermediate packed initializer to be in the graph.
-                    if "mobius.fold_sources" in inp.metadata_props:
-                        new_val.metadata_props["mobius.fold_sources"] = inp.metadata_props[
-                            "mobius.fold_sources"
+                    if "pkg.pkg.mobius.fold_sources" in inp.metadata_props:
+                        new_val.metadata_props["pkg.pkg.mobius.fold_sources"] = inp.metadata_props[
+                            "pkg.pkg.mobius.fold_sources"
                         ]
-                    if "mobius.fold_axis" in inp.metadata_props:
-                        new_val.metadata_props["mobius.fold_axis"] = inp.metadata_props[
-                            "mobius.fold_axis"
+                    if "pkg.pkg.mobius.fold_axis" in inp.metadata_props:
+                        new_val.metadata_props["pkg.pkg.mobius.fold_axis"] = inp.metadata_props[
+                            "pkg.pkg.mobius.fold_axis"
                         ]
 
                 model.graph.initializers[new_val.name] = new_val

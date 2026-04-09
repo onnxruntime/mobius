@@ -92,7 +92,7 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     initializers from the graph.  Weights for those removed initializers still
     arrive in *state_dict* but are no longer present in
     ``model.graph.initializers``.  This function detects that case by inspecting
-    ``mobius.fold_source`` / ``mobius.fold_sources`` metadata on folded
+    ``pkg.mobius.fold_source`` / ``pkg.mobius.fold_sources`` metadata on folded
     initializers and computes the deferred tensor values directly from the state
     dict rather than requiring the intermediate initializers to be in the graph.
 
@@ -108,10 +108,10 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     # false-positive "weight not found" warnings for those entries.
     folded_sources: set[str] = set()
     for init in model.graph.initializers.values():
-        fold_source = init.metadata_props.get("mobius.fold_source")
+        fold_source = init.metadata_props.get("pkg.pkg.mobius.fold_source")
         if fold_source:
             folded_sources.add(fold_source)
-        fold_sources_str = init.metadata_props.get("mobius.fold_sources")
+        fold_sources_str = init.metadata_props.get("pkg.pkg.mobius.fold_sources")
         if fold_sources_str:
             folded_sources.update(fold_sources_str.split(","))
 
@@ -128,22 +128,22 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     # Step 2: Populate deferred folded initializers whose source initializers
     # were removed from the graph by stage 5's RemoveUnusedNodesPass.
     # This covers two cases:
-    #   a) Transposed concat — init has both mobius.fold_source and mobius.fold_sources:
+    #   a) Transposed concat — init has both pkg.mobius.fold_source and pkg.mobius.fold_sources:
     #      the value is np.concatenate(W_q, W_k, W_v, axis).T
-    #   b) Pure concat — init has only mobius.fold_sources:
+    #   b) Pure concat — init has only pkg.mobius.fold_sources:
     #      the value is np.concatenate(bias_q, bias_k, bias_v, axis)
     for init in model.graph.initializers.values():
         if init.const_value is not None:
             continue  # already set by step 1
 
-        fold_source = init.metadata_props.get("mobius.fold_source")
-        fold_sources_str = init.metadata_props.get("mobius.fold_sources")
+        fold_source = init.metadata_props.get("pkg.pkg.mobius.fold_source")
+        fold_sources_str = init.metadata_props.get("pkg.pkg.mobius.fold_sources")
 
         if fold_sources_str is None:
             continue  # no packed-sources metadata; handled by _materialize_deferred
 
         source_names = fold_sources_str.split(",")
-        axis = int(init.metadata_props.get("mobius.fold_axis", "0"))
+        axis = int(init.metadata_props.get("pkg.pkg.mobius.fold_axis", "0"))
 
         # Only apply this path when the sources were removed from the graph
         # (i.e. stage 5 + RemoveUnused pruned them).  If they are still present,
