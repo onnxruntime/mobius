@@ -191,11 +191,9 @@ def create_attention_bias(
     # Get query_length and total_length from shapes.
     # query_length comes from input_ids dim 1 (the query; e.g. 1 during decode).
     # total_length comes from attention_mask dim 1 (past + current tokens).
-    # Using attention_mask for total_length lets the EliminateShape WebGPU rule
-    # eliminate that Shape op.  Using input_ids for query_length is semantically
-    # correct: during decode input_ids is (batch, 1), so query_length=1 and
-    # start = total_length - 1, giving the last row of q_indices.
-    # On WebGPU (concrete dims), Shape(input_ids, 1) is constant-folded away.
+    # Using input_ids for query_length is semantically correct: during decode
+    # input_ids is (batch, 1), so query_length=1 and start = total_length - 1,
+    # giving the last row of q_indices.
     query_length = op.Shape(input_ids, start=1, end=2)  # 1-D [1]
     total_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
     start = op.Sub(total_length, query_length)

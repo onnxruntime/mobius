@@ -319,13 +319,14 @@ def test_dml_lowers_rope_and_qkv():
     )
 
 
-def test_webgpu_no_shape_nodes():
-    """WebGPU: EliminateShape lowering must remove Shape ops from the graph."""
+def test_webgpu_supports_shape_nodes():
+    """WebGPU: Shape ops are now supported natively — graph must retain them."""
     pkg = _make_llama_pkg(ep="webgpu", dtype=ir.DataType.FLOAT16)
     model = pkg["model"]
     shape_count = _count_ops(model, "Shape")
-    assert shape_count == 0, (
-        f"WebGPU should have no Shape nodes after lowering, got {shape_count}"
+    assert shape_count > 0, (
+        f"WebGPU graph should still contain Shape nodes (Shape is now supported), "
+        f"got {shape_count}"
     )
 
 

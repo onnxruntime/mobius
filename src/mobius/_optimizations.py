@@ -11,7 +11,7 @@ ONNX IR model:
 2. **Fusion** — promote standard ops to EP-supported fused ops
    (GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and ``model_role``.
 3. **Lowering** — decompose ops the EP cannot execute
-   (SeparateRoPE, EliminateShape).
+   (SeparateRoPE).
 4. **Fold** — final dead-node removal and constant folding.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
@@ -57,7 +57,6 @@ from mobius._flags import flags
 from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
-    eliminate_shape_rules,
     gelu_fusion_rules,
     group_query_attention_rules,
     pack_qkv_for_gqa_rules,
@@ -298,9 +297,6 @@ def _get_optimization_passes(
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
 
-    if not caps.supports_shape:
-        lower.append(("EliminateShape", list(eliminate_shape_rules())))
-
     return fuse, lower
 
 
@@ -325,7 +321,7 @@ def optimize_model(
     2. **Fusion** — promote standard ops to EP-supported fused ops
        (e.g. GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and role.
     3. **Lowering** — decompose ops the EP cannot execute
-       (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
+       (e.g. SeparateRoPE for DML).
     4. **Fold** — final dead-node removal and constant folding.
 
     After fusion, if GQA was expected for ``(ep, dtype)`` but zero

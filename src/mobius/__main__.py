@@ -278,8 +278,6 @@ def _cmd_list(args: argparse.Namespace) -> None:
             extras = []
             if not caps.supports_fused_rope:
                 extras.append("no-fused-rope")
-            if not caps.supports_shape:
-                extras.append("no-shape")
             if not caps.supports_skip_layer_norm:
                 extras.append("no-skip-layer-norm")
             flags = f"  [{', '.join(extras)}]" if extras else ""
