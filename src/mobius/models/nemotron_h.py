@@ -42,7 +42,7 @@ from mobius.components import (
     Linear,
     Mamba2Block,
     RMSNorm,
-    create_attention_bias,
+    create_padding_mask,
     initialize_rope,
 )
 
@@ -241,11 +241,10 @@ class _NemotronHTextModel(nn.Module):
         hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        attention_bias = create_attention_bias(
+        attention_bias = create_padding_mask(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            dtype=self._dtype,
         )
 
         present_key_values = []
