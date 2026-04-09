@@ -500,55 +500,20 @@ def optimize_model(
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
-    """Run the post-weight-loading cleanup pipeline.
+    """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.
 
-    Call this after :func:`apply_weights` has populated all initializers.
-    :func:`optimize_model` does not fold weight ``Transpose`` and ``Concat``
-    nodes, so this function performs the structural fold after weights are
-    available.
-
-    The pipeline runs four sequential steps:
-
-    1. **Lifts Constant ops to initializers** — promotes any remaining
-       ``Constant`` op nodes to proper graph initializers so the subsequent
-       fold passes can see them.  This catches any new Constant nodes
-       introduced after :func:`optimize_model` ran.
-
-    2. **Folds Concat initializers** — pre-packs QKV weight matrices produced
-       by the GQA ``PackQKV`` rewrite rules.
-       FoldConcat must run **before** FoldTranspose: PackQKV emits
-       ``Concat(W_q, W_k, W_v) → Transpose(concat_out) → MatMul``; the Concat
-       inputs are initializers, so this pass folds them first into a single
-       packed initializer, exposing a bare ``Transpose(initializer)`` for the
-       next pass to eliminate.
-
-    3. **Folds Transpose initializers** — converts every
-       ``Transpose(weight, perm=[1, 0])`` (emitted by
-       :class:`~mobius.components.Linear`, or left by step 2) into a
-       pre-transposed initializer.
-
-    4. **Removes unused nodes** — prunes orphaned initializers and nodes left
-       behind by the folding passes.  Source initializers (e.g. the individual
-       ``q_proj.weight``, ``k_proj.weight``, ``v_proj.weight``) are now safe to
-       remove because their data has been copied into the packed/transposed
-       folded initializers.
-
-    Note: ``FoldConstantsPass`` is intentionally **not** run here.
-    :func:`optimize_model` stage 4 already folds all constant sub-graphs
-    (shape arithmetic, RoPE precomputation, etc.) before weights are loaded.
-    Running it again after weights are applied causes a duplicate-name bug in
-    hybrid SSM/attention models (e.g. Jamba, Bamba, NemotronH): the pass
-    creates two nodes with the same output name for graph outputs that are
-    also SSM state tensors.
+    Runs :class:`~onnx_ir.passes.common.LiftConstantsToInitializersPass`,
+    :class:`~mobius._passes.FoldConcatInitializersPass`,
+    :class:`~mobius._passes.FoldTransposedInitializerPass`, and
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
+    FoldConcat must precede FoldTranspose so that packed QKV initializers are
+    visible before the Transpose fold runs.
     """
     ir.passes.PassManager(
         [
             common_passes.LiftConstantsToInitializersPass(),
-            # FoldConcat MUST run before FoldTranspose (see docstring above).
             FoldConcatInitializersPass(),
             FoldTransposedInitializerPass(),
+            common_passes.RemoveUnusedNodesPass(),
         ]
     )(model)
-
-    # Prune orphaned initializers and nodes.
-    ir.passes.PassManager([common_passes.RemoveUnusedNodesPass()])(model)
