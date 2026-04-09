@@ -406,6 +406,9 @@ class Mamba2BlockChunkedSSD(Mamba2BlockBase):
         D = self.d_head
         N = self.d_state
 
+        # Dtype-matched zero for Pad ops (avoids f32/f16 mismatch)
+        pad_zero = op.CastLike(op.Constant(value_float=0.0), hidden_states)
+
         # Step 1: Batch-project all tokens at once
         projected = self.in_proj(op, hidden_states)  # (B, T, proj)
         gate, x_bc, dt_raw = op.Split(
@@ -423,7 +426,7 @@ class Mamba2BlockChunkedSSD(Mamba2BlockBase):
             op.Constant(
                 value_ints=[0, 0, self.conv_kernel - 1, 0, 0, 0],
             ),
-            op.Constant(value_float=0.0),
+            pad_zero,
         )  # (B, conv_dim, T+K-1)
         conv_out_raw = self.conv1d(op, padded)
         # SiLU activation
@@ -550,10 +553,11 @@ class Mamba2BlockChunkedSSD(Mamba2BlockBase):
             zero_1d,
             axis=0,
         )
-        x_4d = op.Pad(x_4d, pads_4d, op.Constant(value_float=0.0))
-        dt = op.Pad(dt, pads_3d, op.Constant(value_float=0.0))
-        B_heads = op.Pad(B_heads, pads_4d, op.Constant(value_float=0.0))
-        C_heads = op.Pad(C_heads, pads_4d, op.Constant(value_float=0.0))
+        pad_zero_f32 = op.Constant(value_float=0.0)
+        x_4d = op.Pad(x_4d, pads_4d, pad_zero_f32)
+        dt = op.Pad(dt, pads_3d, pad_zero_f32)
+        B_heads = op.Pad(B_heads, pads_4d, pad_zero_f32)
+        C_heads = op.Pad(C_heads, pads_4d, pad_zero_f32)
 
         # Step 6: Chunked SSD
         y, new_ssm_state = self._chunked_ssd(
