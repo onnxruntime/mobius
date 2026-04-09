@@ -250,6 +250,109 @@ Integration tests use a random-weight HF model with reduced layers and
 experts (e.g. 4 layers, 4 experts, top-2 routing).  See
 `test_qwen35_moe_prefill_logits_match` in `tests/integration_test.py`.
 
+## Direct MoE op emission (com.microsoft.MoE)
+
+OnnxRuntime ships a fused `com.microsoft.MoE` contrib op available on CUDA
+(float32/fp16/bf16) and CPU (float32/fp16). Emitting it directly — like GQA —
+is preferred over relying on a rewrite rule for new models.
+
+### Op variants
+
+| Op name | Purpose |
+|---------|---------|
+| `com.microsoft.MoE` | Standard dense weights |
+| `com.microsoft.QMoE` | INT4/INT8 quantized weights with scales and zero-points |
+| `com.microsoft.ShardedMoE` | Tensor-parallel (CUDA only) |
+
+### Input schema (com.microsoft.MoE)
+
+| Index | Name | Shape | Required |
+|-------|------|-------|---------|
+| 0 | `input` | `(num_tokens, hidden_size)` | ✅ |
+| 1 | `router_probs` | `(num_tokens, num_experts)` — **full pre-topk distribution** | ✅ |
+| 2 | `fc1_experts_weights` | `(num_experts, hidden_size, inter_size)` | ✅ |
+| 3 | `fc1_experts_bias` | `(num_experts, inter_size)` | Optional |
+| 4 | `fc2_experts_weights` | `(num_experts, inter_size, hidden_size)` | ✅ |
+| 5 | `fc2_experts_bias` | `(num_experts, hidden_size)` | Optional |
+| 6 | `fc3_experts_weights` | `(num_experts, hidden_size, inter_size)` | Optional (SwiGLU gate path) |
+| 7 | `fc3_experts_bias` | Optional |
+
+**Output:** single tensor, same shape as `input`.
+
+### Attributes
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `k` | int64 | ✅ | Top-k experts per token |
+| `activation_type` | string | ✅ | `"silu"`, `"gelu"`, `"relu"`, `"swiglu"`, `"identity"` |
+| `normalize_routing_weights` | int64 | default 0 | Renormalize top-k weights to sum=1 |
+| `use_sparse_mixer` | int64 | default 0 | SparseMixer routing (k=2 only) |
+| `swiglu_fusion` | int64 | default 0 | Interleaved SwiGLU weights; **CPU requires =1** |
+
+### Emission pattern
+
+```python
+# In MoELayer.forward(), when supports_fused_moe() is True:
+router_probs = self.gate.get_router_probs(op, hidden_states)  # full (tokens, num_experts)
+result = op.MoE(
+    hidden_states,
+    router_probs,
+    self.fc1_experts_weights,   # 3D packed: (N, hidden, inter)
+    None,                        # fc1_bias (optional)
+    self.fc2_experts_weights,   # 3D packed: (N, inter, hidden)
+    _domain="com.microsoft",
+    k=self.top_k,
+    activation_type="silu",
+    normalize_routing_weights=int(self.gate.normalize_routing_weights),
+)
+```
+
+### Critical: router_probs must be the FULL distribution
+
+The op performs top-k selection internally using the `k` attribute. It expects
+the **full** `(num_tokens, num_experts)` pre-topk probability tensor — NOT the
+post-topk selected values.
+
+Each gate variant must expose a `get_router_probs()` method returning the full
+distribution before `TopK`:
+
+| Gate | router_probs |
+|------|-------------|
+| `TopKGate` | `Softmax(MatMul(hidden, weight_t))` |
+| `SoftmaxTopKGate` | `Softmax(MatMul(hidden, weight_t))` |
+| `SigmoidTopKGate` | `Sigmoid(MatMul(hidden, weight_t))` |
+| `SparseMixerGate` | Raw router logits (identity) |
+
+### Rewrite rule vs. direct emission
+
+**A rewrite rule is NOT feasible** for MoE. The loop-over-experts pattern
+(N experts → N MatMul chains, N conditional branches, N Adds) does not produce
+a regular, pattern-matchable subgraph.
+
+**Direct emission is the right approach**, exactly like GQA. Use
+`supports_fused_moe()` from the EP context system to gate the emission path.
+
+### preprocess_weights: stacking per-expert weights into 3D tensors
+
+The ORT op expects all expert weights packed into 3D tensors
+`(num_experts, in_dim, out_dim)`. HuggingFace checkpoints typically store
+them as individual matrices per expert.
+
+```python
+def preprocess_weights(self, state_dict):
+    n = self.config.num_local_experts
+    # Stack gate_proj: (N, inter_size, hidden_size)
+    gate = torch.stack([state_dict.pop(f"experts.{i}.gate_proj.weight") for i in range(n)])
+    # Stack down_proj: (N, hidden_size, inter_size)
+    down = torch.stack([state_dict.pop(f"experts.{i}.down_proj.weight") for i in range(n)])
+    state_dict["fc1_experts_weights"] = gate
+    state_dict["fc2_experts_weights"] = down
+    return state_dict
+```
+
+Some checkpoints already store fused `gate_up_proj` (e.g., Qwen3.5-MoE).
+Split along `dim=1` before stacking if `inter_size` is known.
+
 ## Testing MoE models
 
 MoE integration tests require a model with MoE layers.  A good test model
