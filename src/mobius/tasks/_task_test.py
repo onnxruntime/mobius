@@ -1272,7 +1272,7 @@ class TestTTSTaskSpeakerEncoderOptional:
         task = _TTSTask()
         # ComponentSpec must NOT include speaker_encoder
         assert task.components is not None
-        keys = {k for k, _ in task.components.items()}
+        keys = task.components.keys()
         assert "speaker_encoder" not in keys
         assert "talker" in keys
         assert "code_predictor" in keys
