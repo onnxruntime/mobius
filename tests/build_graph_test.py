@@ -3440,6 +3440,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 # cannot be tested with our generic test infrastructure.
 _KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
     "deepseek_v2_moe",  # Alias for deepseek_v2 — tested via deepseek_v2
+    "gemma4",  # Placeholder: gemma4-multimodal task not yet implemented
     "qwen3_5_vl_text",  # VL text decoder — tested via parent VL model
 }
 

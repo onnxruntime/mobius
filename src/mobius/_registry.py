@@ -385,6 +385,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
     "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
+    "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
@@ -459,6 +461,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
     "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "gemma4": ModelRegistration(Gemma4MultiModalModel, task="gemma4-multimodal", config_class=Gemma4Config),
+
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(MoECausalLMModel),

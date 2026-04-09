@@ -26,6 +26,7 @@ from mobius._configs import (
     DepthAnythingConfig,
     Gemma2Config,
     Gemma3nConfig,
+    Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
@@ -286,6 +287,22 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["full_attention", "sliding_attention"],
+        },
+        True,
+    ),
+    (
+        "gemma4_text",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            # 5:1 sliding/full pattern — use sliding_attention while the model is a
+            # placeholder inheriting Gemma3 (update to local_sliding once the real
+            # Gemma4 decoder is implemented).
+            "layer_types": ["sliding_attention", "sliding_attention",
+                            "sliding_attention", "full_attention"],
+            "global_head_dim": TINY_HEAD_DIM,
+            "final_logit_softcapping": 30.0,
         },
         True,
     ),

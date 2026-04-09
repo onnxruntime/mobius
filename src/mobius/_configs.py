@@ -114,6 +114,8 @@ class VisionConfig:
     image_crop_size: int | None = None
     # LoRA config
     lora: dict | None = None
+    # Gemma4 SigLIP vision encoder uses clipped linear activations
+    use_clipped_linears: bool = False
 
 
 @dataclasses.dataclass
@@ -243,6 +245,26 @@ class AudioConfig:
     classify_num: int | None = None
     # LoRA config
     lora: dict | None = None
+
+
+@dataclasses.dataclass
+class Gemma4AudioConfig(AudioConfig):
+    """Configuration for the Gemma4 Conformer audio encoder.
+
+    Extends :class:`AudioConfig` with Gemma4-specific fields:
+
+    - ``num_layers``: number of Conformer encoder blocks (12 for Gemma4)
+    - ``hidden_size``: encoder hidden dimension (1024 for Gemma4)
+    - ``subsampling_conv_channels``: channel sizes for 2D convolutional
+      subsampling layers (e.g. ``[128, 32]`` for Gemma4)
+    - ``use_causal_chunked_attn``: whether attention is causal + chunked
+      (streaming-compatible) rather than full bidirectional
+    """
+
+    num_layers: int = 12
+    hidden_size: int = 1024
+    subsampling_conv_channels: list[int] | None = None
+    use_causal_chunked_attn: bool = False
 
 
 def _first_not_none(*values, default=None):
@@ -382,6 +404,8 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             deepstack_visual_indexes=getattr(vc, "deepstack_visual_indexes", None),
             fullatt_block_indexes=getattr(vc, "fullatt_block_indexes", None),
             window_size=getattr(vc, "window_size", None),
+            # Gemma4 SigLIP uses clipped linear activations
+            use_clipped_linears=getattr(vc, "use_clipped_linears", False),
         )
     vision_fields["mm_tokens_per_image"] = getattr(vision_source, "mm_tokens_per_image", None)
     vision_fields["image_token_id"] = getattr(vision_source, "image_token_id", None)
@@ -551,6 +575,32 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
         audio_fields["audio_start_token_id"] = getattr(tc, "audio_start_token_id", None)
         audio_fields["audio_end_token_id"] = getattr(tc, "audio_end_token_id", None)
         audio_fields["classify_num"] = getattr(tc, "classify_num", None)
+
+    # Gemma4 audio config (from composite audio_config sub-config)
+    if model_type == "gemma4":
+        composite = parent_config or config
+        hf_audio_config = getattr(composite, "audio_config", None)
+        if hf_audio_config is not None:
+            ac = (
+                hf_audio_config
+                if not isinstance(hf_audio_config, dict)
+                else type("AC", (), hf_audio_config)()
+            )
+            subsampling = getattr(ac, "subsampling_conv_channels", None)
+            return {
+                "audio": Gemma4AudioConfig(
+                    num_layers=getattr(ac, "num_hidden_layers", 12),
+                    hidden_size=getattr(ac, "hidden_size", 1024),
+                    subsampling_conv_channels=(
+                        list(subsampling) if subsampling is not None else None
+                    ),
+                    use_causal_chunked_attn=getattr(
+                        ac, "use_causal_chunked_attn", False
+                    ),
+                    output_dim=getattr(ac, "output_dim", None),
+                    audio_token_id=getattr(composite, "audio_token_id", None),
+                )
+            }
 
     # Build AudioConfig sub-config if any audio fields are set
     has_audio = any(v is not None for v in audio_fields.values())
@@ -1405,6 +1455,101 @@ class MllamaConfig(VisionLanguageConfig):
         return cls(
             **_shallow_fields(base),
             cross_attention_layers=getattr(config, "cross_attention_layers", None),
+        )
+
+
+@dataclasses.dataclass
+class Gemma4Config(VisionLanguageConfig):
+    """Configuration for Gemma4 multimodal models.
+
+    Extends :class:`VisionLanguageConfig` with Gemma4-specific text decoder
+    fields.  Vision config lives in the inherited ``vision`` sub-config
+    (:class:`VisionConfig`) and audio config in the ``audio`` sub-config
+    (:class:`Gemma4AudioConfig`).
+
+    Text decoder specifics:
+    - ``global_head_dim``: head dimension for full-attention (global) layers
+      (512 for Gemma4), which differs from the local-sliding head_dim (256).
+    - ``global_rope_theta``: RoPE base frequency for full-attention layers
+      (1_000_000 for Gemma4).
+    - ``global_partial_rotary_factor``: fraction of head_dim to rotate for
+      global attention (0.25, so rotary_dim = 512 * 0.25 = 128).
+    - ``hidden_size_per_layer_input``: per-layer input gating dimension
+      (256 for Gemma4); 0 disables per-layer input entirely.
+    - ``vocab_size_per_layer_input``: vocabulary size for per-layer embeddings.
+    - ``num_kv_shared_layers``: how many layers share KV projections with the
+      next layer (20 for the 27B variant; 0 if disabled).
+    - ``use_double_wide_mlp``: whether the MLP intermediate size is doubled
+      relative to the standard multiplier.
+    - ``final_logit_softcapping``: tanh soft-cap applied to final logits
+      (30.0 for Gemma4); 0.0 disables it.
+    - ``enable_moe_block``: whether any layers use MoE routing.
+      MoE hyper-parameters (``num_local_experts``, ``num_experts_per_tok``,
+      ``moe_intermediate_size``) are inherited from :class:`ArchitectureConfig`.
+    """
+
+    global_head_dim: int | None = None
+    global_rope_theta: float = 1_000_000.0
+    global_partial_rotary_factor: float = 0.25
+    hidden_size_per_layer_input: int = 0
+    vocab_size_per_layer_input: int = 0
+    num_kv_shared_layers: int = 0
+    use_double_wide_mlp: bool = False
+    final_logit_softcapping: float = 0.0
+    enable_moe_block: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # Gemma4 encodes the full/local pattern as a single integer
+        # (sliding_window_pattern) rather than a list.  Convert it to
+        # layer_types if not already set by the base extractor.
+        if base.layer_types is None:
+            sliding_window_pattern = getattr(config, "sliding_window_pattern", None)
+            if sliding_window_pattern is not None and base.num_hidden_layers:
+                # Every sliding_window_pattern-th layer (1-indexed) is full attention;
+                # all others use sliding-window attention.
+                layer_types = []
+                for i in range(base.num_hidden_layers):
+                    if (i + 1) % sliding_window_pattern == 0:
+                        layer_types.append("full_attention")
+                    else:
+                        layer_types.append("sliding_attention")
+                base = dataclasses.replace(base, layer_types=layer_types)
+
+        # MoE fields — map Gemma4 names to ArchitectureConfig fields
+        num_local_experts = getattr(config, "num_experts", None)
+        num_experts_per_tok = getattr(config, "top_k_experts", None)
+        moe_intermediate_size = getattr(config, "expert_intermediate_size", None)
+        if num_local_experts is not None:
+            base = dataclasses.replace(base, num_local_experts=num_local_experts)
+        if num_experts_per_tok is not None:
+            base = dataclasses.replace(base, num_experts_per_tok=num_experts_per_tok)
+        if moe_intermediate_size is not None:
+            base = dataclasses.replace(base, moe_intermediate_size=moe_intermediate_size)
+
+        # Extract dual RoPE parameters from rope_parameters dict
+        rope_params = getattr(config, "rope_parameters", {}) or {}
+        full_rope = rope_params.get("full_attention", {}) if isinstance(rope_params, dict) else {}
+
+        return cls(
+            **_shallow_fields(base),
+            global_head_dim=getattr(config, "global_head_dim", None),
+            global_rope_theta=float(full_rope.get("rope_theta", 1_000_000.0)),
+            global_partial_rotary_factor=float(full_rope.get("partial_rotary_factor", 0.25)),
+            hidden_size_per_layer_input=int(
+                getattr(config, "hidden_size_per_layer_input", 0) or 0
+            ),
+            vocab_size_per_layer_input=int(
+                getattr(config, "vocab_size_per_layer_input", 0) or 0
+            ),
+            num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
+            use_double_wide_mlp=getattr(config, "use_double_wide_mlp", False),
+            final_logit_softcapping=(
+                getattr(config, "final_logit_softcapping", 0.0) or 0.0
+            ),
+            enable_moe_block=getattr(config, "enable_moe_block", False),
         )
 
 
