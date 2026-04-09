@@ -1,0 +1,113 @@
+name: GPU Examples
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-examples:
+    name: Run Validation Example Scripts (GPU)
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-examples-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-examples-gpu-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
+          restore-keys: |
+            pip-examples-gpu-
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-examples-gpu-${{ hashFiles('examples/*.py') }}
+          restore-keys: |
+            hf-examples-gpu-
+
+      - name: Install PyTorch (CUDA)
+        run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install -e '.[testing,transformers,ort-genai]'
+          pip install soundfile librosa ml_dtypes
+
+      - name: Run example scripts
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        timeout-minutes: 90
+        run: |
+          failures=0
+
+          run_example() {
+            local name="$1"; shift
+            echo "::group::${name}"
+            if "$@"; then
+              echo "::endgroup::"
+            else
+              echo "::error::${name} failed with exit code $?"
+              echo "::endgroup::"
+              failures=$((failures + 1))
+            fi
+          }
+
+          # ── Phi ──────────────────────────────────────────────────
+          run_example "phi4mm_multimodal (text mode)" \
+            python examples/phi4mm_multimodal.py --ci --compare-hf --mode text
+
+          run_example "phi4mm_ort_genai (vision)" \
+            python examples/phi4mm_ort_genai.py --ci --compare-hf \
+              --image testdata/pipeline-cat-chonk.jpeg
+
+          # ── Qwen text ────────────────────────────────────────────
+          run_example "qwen35_text_generation" \
+            python examples/qwen35_text_generation.py --ci --compare-hf \
+              --device cuda
+
+          # ── Qwen vision-language ─────────────────────────────────
+          run_example "qwen25_vl_ort_genai" \
+            python examples/qwen25_vl_ort_genai.py --ci --compare-hf \
+              --image testdata/pipeline-cat-chonk.jpeg
+
+          run_example "qwen3_vl_ort_genai" \
+            python examples/qwen3_vl_ort_genai.py --ci --compare-hf \
+              --image testdata/pipeline-cat-chonk.jpeg
+
+          run_example "qwen35_vl_ort_genai" \
+            python examples/qwen35_vl_ort_genai.py --ci --compare-hf \
+              --image testdata/pipeline-cat-chonk.jpeg
+
+          # ── Nemotron ─────────────────────────────────────────────
+          run_example "nemotron_3_nano_text_generation" \
+            python examples/nemotron_3_nano_text_generation.py --ci --compare-hf \
+              --device cuda
+
+          # ── Static cache ─────────────────────────────────────────
+          run_example "static_cache_generation" \
+            python examples/static_cache_generation.py --ci
+
+          if [[ "$failures" -ne 0 ]]; then
+            echo "::error::${failures} example(s) failed"
+            exit 1
+          fi

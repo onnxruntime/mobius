@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import onnxruntime as ort
@@ -950,6 +951,11 @@ def main():
         action="store_true",
         help=("Also run with HuggingFace transformers and compare outputs."),
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     if args.save_to:
@@ -968,7 +974,7 @@ def main():
         print("=" * 60)
         print("ORT GenAI")
         print("=" * 60)
-        generate_with_image(
+        onnx_output = generate_with_image(
             model_dir,
             args.model_id,
             prompt,
@@ -979,24 +985,46 @@ def main():
             print("\n" + "=" * 60)
             print("HuggingFace Transformers")
             print("=" * 60)
-            generate_with_image_hf(
+            hf_output = generate_with_image_hf(
                 args.model_id,
                 prompt,
                 args.image,
                 args.max_new_tokens,
             )
+            if onnx_output.strip() == hf_output.strip():
+                print("\n✓ Outputs match exactly!")
+            else:
+                print("\n✗ Outputs differ!")
+                print(f"  ONNX: {onnx_output!r}")
+                print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
     else:
         prompt = args.prompt or DEFAULT_PROMPT
         print("=" * 60)
         print("ORT GenAI")
         print("=" * 60)
-        generate(model_dir, args.model_id, prompt, args.max_new_tokens)
+        onnx_output = generate(model_dir, args.model_id, prompt, args.max_new_tokens)
         if args.compare_hf:
             print("\n" + "=" * 60)
             print("HuggingFace Transformers")
             print("=" * 60)
-            generate_text_hf(args.model_id, prompt, args.max_new_tokens)
+            hf_output = generate_text_hf(args.model_id, prompt, args.max_new_tokens)
+            if onnx_output.strip() == hf_output.strip():
+                print("\n✓ Outputs match exactly!")
+            else:
+                print("\n✗ Outputs differ!")
+                print(f"  ONNX: {onnx_output!r}")
+                print(f"  HF:   {hf_output!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

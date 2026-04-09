@@ -68,6 +68,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 import transformers
@@ -824,6 +825,11 @@ def main():
         action="store_true",
         help=("Also run with HuggingFace transformers and compare outputs."),
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -944,9 +950,17 @@ def main():
                 print("✅ Outputs match!")
             else:
                 print("⚠️  Outputs differ (may be due to numerical precision).")
+                if args.ci:
+                    sys.exit(1)
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise
