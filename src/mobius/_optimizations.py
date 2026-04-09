@@ -566,6 +566,10 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
     values so that :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` can
     safely prune the (now-redundant) source initializers.
 
+    Values are set as ``ir.LazyTensor`` to defer the actual compute until
+    serialisation, avoiding transient peak-memory spikes from holding both the
+    original weights and the transposed/packed copies simultaneously.
+
     Source information is stored by the fold passes in ``metadata_props``:
 
     - ``"_fold_source"`` — name of the single source initializer
@@ -581,21 +585,38 @@ def _materialize_deferred_initializers(model: ir.Model) -> None:
 
         fold_source = init.metadata_props.get("_fold_source")
         if fold_source is not None:
-            # Transposed initializer: compute weight.T from the source.
+            # Transposed initializer: lazily compute weight.T from the source.
             source = model.graph.initializers.get(fold_source)
             if source is not None and source.const_value is not None:
-                init.const_value = ir.tensor(source.const_value.numpy().T)
+                src = source
+                init.const_value = ir.LazyTensor(
+                    lambda s=src: ir.tensor(s.const_value.numpy().T),
+                    dtype=init.dtype or ir.DataType.FLOAT,
+                    shape=init.shape,
+                    name=init.name,
+                )
             continue
 
         fold_sources = init.metadata_props.get("_fold_sources")
         if fold_sources is not None:
-            # Packed (concatenated) initializer: compute np.concatenate from sources.
+            # Packed (concatenated) initializer: lazily compute np.concatenate from sources.
             source_names = fold_sources.split(",")
             axis = int(init.metadata_props.get("_fold_axis", "0"))
             sources = [model.graph.initializers.get(n) for n in source_names]
             if all(s is not None and s.const_value is not None for s in sources):
-                arrays = [s.const_value.numpy() for s in sources]  # type: ignore[union-attr]
-                init.const_value = ir.tensor(np.concatenate(arrays, axis=axis))
+                captured = list(sources)  # type: ignore[misc]
+                captured_axis = axis
+                init.const_value = ir.LazyTensor(
+                    lambda ss=captured, ax=captured_axis: ir.tensor(
+                        np.concatenate(
+                            [s.const_value.numpy() for s in ss],  # type: ignore[union-attr]
+                            axis=ax,
+                        )
+                    ),
+                    dtype=init.dtype or ir.DataType.FLOAT,
+                    shape=init.shape,
+                    name=init.name,
+                )
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:

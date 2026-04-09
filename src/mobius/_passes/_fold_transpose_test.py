@@ -21,8 +21,12 @@ def _make_model_with_transpose(
     weight_val.dtype = ir.DataType.FLOAT
     weight_val.const_value = ir.tensor(weight_data)
 
+    # MatMul contract: x[batch, K] @ w_t[K, N] → out[batch, N].
+    # weight_data has shape (K, N); w_t = weight_data.T has shape (N, K) — wait,
+    # actually perm=[1,0] swaps axes: w_t.shape = [weight_data.shape[1], weight_data.shape[0]].
+    # For MatMul(x, w_t) to be valid x's last dim must equal w_t.shape[0] = weight_data.shape[1].
     x = ir.Value(name="x")
-    x.shape = ir.Shape([2, weight_data.shape[0]])
+    x.shape = ir.Shape([2, weight_data.shape[1]])
     x.dtype = ir.DataType.FLOAT
 
     transpose_node = ir.Node(

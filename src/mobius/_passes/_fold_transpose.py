@@ -86,38 +86,45 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             out_val = node.outputs[0]
 
             if inp.name not in folded:
-                # Derive shape of the transposed tensor from the Transpose output.
-                # Fall back to computing from the input shape if shape inference
-                # did not propagate to this new node (e.g. after stage-2 rewrites).
-                t_shape = out_val.shape
-                if t_shape is None and inp.shape is not None:
-                    perm = list(perm_attr.value)
-                    t_shape = ir.Shape([inp.shape[p] for p in perm])
+                new_name = f"{inp.name}_t"
 
-                new_val = ir.Value(name=f"{inp.name}_t", shape=t_shape, type=inp.type)
-
-                if inp.const_value is not None:
-                    # Use a LazyTensor to defer the transpose until serialization,
-                    # avoiding holding a second copy of the weight in memory.
-                    src = inp  # captured for the closure below
-                    new_val.const_value = ir.LazyTensor(
-                        lambda s=src: ir.tensor(s.const_value.numpy().T),
-                        dtype=inp.dtype or ir.DataType.FLOAT,
-                        shape=t_shape,
-                        name=new_val.name,
-                    )
+                if new_name in model.graph.initializers:
+                    # An equivalent transposed initializer already exists (e.g. from a
+                    # previous pass invocation).  Reuse it rather than silently overwriting.
+                    folded[inp.name] = model.graph.initializers[new_name]
                 else:
-                    # No data yet — leave const_value=None and record the source
-                    # so fold_initializers_after_weights() can fill it in later.
-                    new_val.metadata_props["_fold_source"] = inp.name
+                    # Derive shape of the transposed tensor from the Transpose output.
+                    # Fall back to computing from the input shape if shape inference
+                    # did not propagate to this new node (e.g. after stage-2 rewrites).
+                    t_shape = out_val.shape
+                    if t_shape is None and inp.shape is not None:
+                        perm = list(perm_attr.value)
+                        t_shape = ir.Shape([inp.shape[p] for p in perm])
 
-                model.graph.initializers[new_val.name] = new_val
-                folded[inp.name] = new_val
-                logger.debug(
-                    "FoldTransposedInitializer: registered %r (shape %s)",
-                    new_val.name,
-                    t_shape,
-                )
+                    new_val = ir.Value(name=new_name, shape=t_shape, type=inp.type)
+
+                    if inp.const_value is not None:
+                        # Use a LazyTensor to defer the transpose until serialization,
+                        # avoiding holding a second copy of the weight in memory.
+                        src = inp  # captured for the closure below
+                        new_val.const_value = ir.LazyTensor(
+                            lambda s=src: ir.tensor(s.const_value.numpy().T),
+                            dtype=inp.dtype or ir.DataType.FLOAT,
+                            shape=t_shape,
+                            name=new_val.name,
+                        )
+                    else:
+                        # No data yet — leave const_value=None and record the source
+                        # so fold_initializers_after_weights() can fill it in later.
+                        new_val.metadata_props["_fold_source"] = inp.name
+
+                    model.graph.initializers[new_val.name] = new_val
+                    folded[inp.name] = new_val
+                    logger.debug(
+                        "FoldTransposedInitializer: registered %r (shape %s)",
+                        new_val.name,
+                        t_shape,
+                    )
 
             replacement = folded[inp.name]
             out_val.replace_all_uses_with(replacement, replace_graph_outputs=True)

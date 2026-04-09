@@ -456,13 +456,16 @@ def test_optimize_model_eliminates_weight_transpose_structurally():
     """
     pkg = _make_llama_pkg(ep="cpu", dtype=ir.DataType.FLOAT)
     model = pkg["model"]
-    # All Transpose(initializer, perm=[1,0]) nodes should be folded.
+    # Only count perm=[1,0] weight transposes (what FoldTransposedInitializerPass folds).
+    # Other Transpose ops over initializers (e.g. different perms) are not folded by
+    # this pass and should not cause the assertion to fail.
     remaining_transpose = sum(
         1
         for node in model.graph.all_nodes()
         if node.op_type == "Transpose"
         and node.inputs[0] is not None
         and node.inputs[0].name in model.graph.initializers
+        and list(node.attributes["perm"].value) == [1, 0]
     )
     assert remaining_transpose == 0, (
         f"optimize_model should fold all Transpose(initializer) nodes, "
