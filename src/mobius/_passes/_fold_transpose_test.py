@@ -399,3 +399,139 @@ class TestFoldTransposeStructural:
         np.testing.assert_array_equal(
             model.graph.initializers["weight_t"].const_value.numpy(), data.T
         )
+
+    def test_transpose_with_zero_inputs_skipped(self):
+        """A Transpose node with no inputs does not cause an error and is not folded."""
+        # Build a Transpose node with no inputs (malformed but should be skipped gracefully).
+        x = ir.Value(name="x")
+        transpose_node = ir.Node("", "Transpose", inputs=[], num_outputs=1)
+        matmul_node = ir.Node(
+            "", "MatMul", inputs=[x, transpose_node.outputs[0]], num_outputs=1
+        )
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+        result = FoldTransposedInitializerPass()(model)
+        # Nothing folded — the node has no inputs so it is skipped.
+        assert not result.modified
+
+    def test_transpose_with_none_input_skipped(self):
+        """A Transpose node whose first input is None is skipped gracefully."""
+        # Construct a Transpose node that has an input slot but the slot is None
+        # (can happen with optional inputs in some graph constructions).
+        x = ir.Value(name="x")
+        # Use a value with no name to trigger the inp.name is None guard.
+        nameless = ir.Value()  # name defaults to None
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[nameless],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        matmul_node = ir.Node(
+            "", "MatMul", inputs=[x, transpose_node.outputs[0]], num_outputs=1
+        )
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+
+    def test_shape_derived_from_input_when_output_shape_missing(self):
+        """When the Transpose output has no shape, shape is derived from the input."""
+        data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        weight_val = ir.Value(name="weight")
+        weight_val.shape = ir.Shape([2, 3])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        # Deliberately leave output shape as None (no shape inference).
+        w_t = transpose_node.outputs[0]
+        w_t.dtype = ir.DataType.FLOAT
+        # w_t.shape is not set → None
+
+        matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        assert result.modified
+        assert "weight_t" in model.graph.initializers
+        # Shape should be derived from input shape via perm=[1,0]: (2,3) → (3,2).
+        w_t_init = model.graph.initializers["weight_t"]
+        assert list(w_t_init.shape) == [3, 2]
+
+    def test_fold_sources_propagated_from_concat_folded_source(self):
+        """When the source initializer itself has mobius.fold_sources, those are propagated."""
+        # Simulate: qkv_packed was created by FoldConcat from W_q, W_k, W_v.
+        # It has fold_sources metadata but no const_value yet (weights not loaded).
+        # Then FoldTranspose sees Transpose(qkv_packed) and must propagate fold_sources
+        # onto qkv_packed_t so that apply_weights can compute it directly.
+        packed = ir.Value(name="qkv_packed")
+        packed.shape = ir.Shape([12, 4])
+        packed.dtype = ir.DataType.FLOAT
+        packed.metadata_props["mobius.fold_sources"] = "W_q,W_k,W_v"
+        packed.metadata_props["mobius.fold_axis"] = "0"
+        # const_value is None — weights not loaded yet.
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[packed],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        w_t = transpose_node.outputs[0]
+        w_t.shape = ir.Shape([4, 12])
+        w_t.dtype = ir.DataType.FLOAT
+
+        matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        # Use direct dict assignment (same as FoldConcatInitializersPass does) so
+        # graph.initializers accepts const_value=None on the packed intermediate.
+        graph.initializers[packed.name] = packed
+        model = ir.Model(graph, ir_version=10)
+
+        FoldTransposedInitializerPass()(model)
+
+        assert "qkv_packed_t" in model.graph.initializers
+        t_val = model.graph.initializers["qkv_packed_t"]
+        # fold_source points to the intermediate packed init.
+        assert t_val.metadata_props.get("mobius.fold_source") == "qkv_packed"
+        # fold_sources and fold_axis are propagated from the concat-folded source.
+        assert t_val.metadata_props.get("mobius.fold_sources") == "W_q,W_k,W_v"
+        assert t_val.metadata_props.get("mobius.fold_axis") == "0"

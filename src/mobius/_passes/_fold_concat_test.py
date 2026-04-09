@@ -464,3 +464,74 @@ class TestLiftConstantsThenFold:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Constant" not in node_types, "Constant op should be promoted"
         assert "Concat" not in node_types, "Concat should be folded after Lift"
+
+
+class TestFoldConcatEdgeCases:
+    """Cover edge-case guard lines in FoldConcatInitializersPass."""
+
+    def test_concat_with_no_inputs_skipped(self):
+        """A Concat node with an empty input list is skipped without error."""
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        x = ir.Value(name="x")
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[concat_node.outputs[0]],
+            nodes=[concat_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+        result = FoldConcatInitializersPass()(model)
+        assert not result.modified
+
+    def test_shape_computed_from_inputs_when_output_shape_missing(self):
+        """When the Concat output has no shape, shape is inferred from input shapes."""
+        a = np.ones((4, 3), dtype=np.float32)
+        b = np.ones((4, 3), dtype=np.float32)
+
+        init_0 = ir.Value(name="init_0")
+        init_0.shape = ir.Shape([4, 3])
+        init_0.dtype = ir.DataType.FLOAT
+        init_0.const_value = ir.tensor(a)
+
+        init_1 = ir.Value(name="init_1")
+        init_1.shape = ir.Shape([4, 3])
+        init_1.dtype = ir.DataType.FLOAT
+        init_1.const_value = ir.tensor(b)
+
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[init_0, init_1],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        out = concat_node.outputs[0]
+        # Deliberately leave out.shape as None — shape inference did not run.
+        out.dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[out],
+            nodes=[concat_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(init_0)
+        graph.register_initializer(init_1)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldConcatInitializersPass()(model)
+
+        assert result.modified
+        packed_name = "init_0__init_1__axis_0__concat"
+        assert packed_name in model.graph.initializers
+        # Shape should be computed from inputs: (4,3) + (4,3) along axis 0 → (8,3).
+        packed = model.graph.initializers[packed_name]
+        assert list(packed.shape) == [8, 3]
