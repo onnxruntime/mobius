@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._model_package import ModelPackage
@@ -14,7 +16,7 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class AdapterTask(ModelTask):
     """Build ONNX graph for conditioning adapters (T2I, IP-Adapter)."""
 
-    name = "adapter"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
@@ -37,7 +39,7 @@ class AdapterTask(ModelTask):
                 shape=ir.Shape(("batch", config.image_embed_dim)),
             )
 
-        graph, builder = _make_graph([condition])
+        graph, builder = _make_graph([condition], name="model")
         op = builder.op
 
         outputs = module(op, condition)
@@ -50,4 +52,4 @@ class AdapterTask(ModelTask):
             outputs.name = "adapter_output"
             graph.outputs.append(outputs)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)

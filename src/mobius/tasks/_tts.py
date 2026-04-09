@@ -14,12 +14,15 @@ Used by Qwen3TTSForConditionalGeneration.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -43,11 +46,24 @@ class TTSTask(ModelTask):
     Each sub-module is wired into its own ONNX graph.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {
+        "talker": "decoder",
+        "code_predictor": "decoder",
+        "embedding": "embedding",
+        "speaker_encoder": "encoder",
+    }
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        talker="talker",
+        code_predictor="code_predictor",
+        embedding="embedding",
+    )
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["talker"] = self._build_talker(module.talker, config)

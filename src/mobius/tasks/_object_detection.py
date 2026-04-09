@@ -44,7 +44,7 @@ class ObjectDetectionTask(ModelTask):
             type=ir.TensorType(ir.DataType.FLOAT),
         )
 
-        graph, builder = _make_graph([pixel_values])
+        graph, builder = _make_graph([pixel_values], name="model")
         op = builder.op
 
         logits, pred_boxes = module(op, pixel_values=pixel_values)

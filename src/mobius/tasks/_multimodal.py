@@ -94,7 +94,7 @@ class MultiModalTask(ModelTask):
         )
         graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs)
+        graph, builder = _make_graph(graph_inputs, name="model")
         op = builder.op
 
         logits, present_key_values = module(

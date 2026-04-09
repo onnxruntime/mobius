@@ -21,7 +21,6 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class AudioFeatureExtractionTask(ModelTask):
     """Build ONNX graph for audio feature extraction (encoder-only)."""
 
-    name = "audio-feature-extraction"
     model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
@@ -35,7 +34,7 @@ class AudioFeatureExtractionTask(ModelTask):
             shape=ir.Shape(("batch", "time")),
         )
 
-        graph, builder = _make_graph([input_values])
+        graph, builder = _make_graph([input_values], name="model")
         op = builder.op
 
         last_hidden_state = module(op, input_values=input_values)
@@ -43,4 +42,4 @@ class AudioFeatureExtractionTask(ModelTask):
         last_hidden_state.name = "last_hidden_state"
         graph.outputs.append(last_hidden_state)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)

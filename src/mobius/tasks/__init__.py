@@ -23,6 +23,7 @@ __all__ = [
     "AudioFeatureExtractionTask",
     "CausalLMTask",
     "CodecTask",
+    "ComponentSpec",
     "ControlNetTask",
     "DenoisingTask",
     "FeatureExtractionTask",
@@ -54,7 +55,7 @@ __all__ = [
 from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
-from mobius.tasks._base import ModelTask
+from mobius.tasks._base import ComponentSpec, ModelTask
 from mobius.tasks._causal_lm import (
     CausalLMTask,
     HybridCausalLMTask,

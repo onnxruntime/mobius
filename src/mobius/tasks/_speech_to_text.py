@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import BaseModelConfig, WhisperConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -35,6 +38,11 @@ class SpeechToTextTask(ModelTask):
     (matching the :class:`WhisperForConditionalGeneration` layout).
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        encoder="model.encoder", decoder="model.decoder"
+    )
+
     def build(
         self,
         module: nn.Module,
@@ -44,6 +52,7 @@ class SpeechToTextTask(ModelTask):
             raise TypeError(
                 f"SpeechToTextTask requires WhisperConfig, got {type(config).__name__}"
             )
+        self._validate_components(module)
 
         encoder_model = self._build_encoder(module.model.encoder, config)
         decoder_model = self._build_decoder(module.model.decoder, config)

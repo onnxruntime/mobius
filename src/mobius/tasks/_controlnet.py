@@ -21,7 +21,6 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class ControlNetTask(ModelTask):
     """Build ONNX graph for ControlNet residual generation."""
 
-    name = "controlnet"
     model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
@@ -72,4 +71,4 @@ class ControlNetTask(ModelTask):
         mid_output.name = "mid_block_res"
         graph.outputs.append(mid_output)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)
