@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for Linear, Embedding, and attention bias utilities."""
 
@@ -36,8 +36,8 @@ class TestLinear:
         linear = Linear(64, 128, bias=True)
         result = linear(op, x)
         assert result is not None
-        # Linear emits FusedMatMul(x, weight, transB=1) directly
-        assert count_op_type(graph, "FusedMatMul") >= 1
+        # Linear emits Transpose(weight, perm=[1,0]) + MatMul(x, w_t)
+        assert count_op_type(graph, "MatMul") >= 1
         assert count_op_type(graph, "Add") >= 1
 
     def test_linear_no_bias_forward(self):
@@ -46,7 +46,7 @@ class TestLinear:
         linear = Linear(64, 128, bias=False)
         result = linear(op, x)
         assert result is not None
-        assert count_op_type(graph, "FusedMatMul") >= 1
+        assert count_op_type(graph, "MatMul") >= 1
         assert count_op_type(graph, "Add") == 0
 
 

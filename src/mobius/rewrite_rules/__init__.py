@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Rewrite rules for graph transformations.
 
@@ -30,8 +30,6 @@ Example::
 
 __all__ = [
     "bias_gelu_rules",
-    "eliminate_shape_rules",
-    "fused_matmul_rules",
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "layer_norm_fusion_rules",
@@ -44,8 +42,6 @@ __all__ = [
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
-from mobius.rewrite_rules._eliminate_shape import eliminate_shape_rules
-from mobius.rewrite_rules._fused_matmul import fused_matmul_rules
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,

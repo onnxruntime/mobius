@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Unit tests for the CLI (``__main__.py``).
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from unittest import mock
 
 import onnx
 import pytest
@@ -172,3 +173,57 @@ class TestCLIInfo:
         out = capsys.readouterr().out
         assert "qwen2" in out
         assert "Supported" in out
+
+
+class TestCLIBuildRuntime:
+    """Test the ``--runtime`` flag on the ``build`` subcommand."""
+
+    def test_runtime_ort_genai_calls_write_ort_genai_config(self):
+        """--runtime ort-genai calls write_ort_genai_config() after building."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_export,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        mock_export.assert_called_once()
+        call_kwargs = mock_export.call_args
+        assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
+
+    def test_no_runtime_does_not_call_write_ort_genai_config(self):
+        """Omitting --runtime does NOT call write_ort_genai_config()."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius.integrations.ort_genai.write_ort_genai_config") as mock_export,
+        ):
+            main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
+
+        mock_export.assert_not_called()
+
+    def test_invalid_runtime_value_errors(self):
+        """An unrecognised --runtime value causes argparse to exit with an error."""
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--runtime",
+                    "tensorrt",  # not a supported value
+                ]
+            )

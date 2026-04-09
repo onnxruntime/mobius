@@ -99,7 +99,6 @@ Some EPs cannot execute certain ops. These are handled by **lowering rules**
 |---|---|---|
 | No fused RoPE inside GQA | DML | `SeparateRoPE` rewrite: GQA `do_rotary=1` → explicit `RotaryEmbedding` + GQA `do_rotary=0` |
 | No packed QKV in GQA | DML | `UnpackQKV` rewrite: packed GQA → 3 separate `MatMul` projections |
-| No `Shape` operator | WebGPU | `EliminateShape` rewrite: `Shape(attention_mask)` → `ReduceSum` + `ReduceMax` |
 | No `SkipLayerNorm` kernel | TRT-RTX, onnx-standard | `InlinePass`: expands fused ops using their registered `ir.Function` bodies |
 | No `FusedMatMul` kernel | onnx-standard | `InlinePass`: expands to `Transpose + MatMul` |
 | No `PackedMultiHeadAttention` kernel | onnx-standard | `InlinePass`: expands to block-diagonal attention bias + standard `Attention` |
@@ -119,7 +118,6 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
     qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
-    supports_shape: bool = True                      # False → EliminateShape lowering
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
     supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
     supports_fused_moe: bool = True                  # False → decompose fused MoE ops
@@ -141,7 +139,7 @@ EpCapabilities(name="cuda",    gqa_dtypes={FLOAT16, BFLOAT16},
 EpCapabilities(name="dml",     gqa_dtypes={FLOAT16},
                supports_fused_rope=False)
 EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
-               supports_shape=False, default_int4_accuracy_level=4,
+               default_int4_accuracy_level=4,
                provider_options={"enableGraphCapture": "0", ...})
 EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                supports_skip_layer_norm=False, enable_graph_capture=True,
@@ -187,7 +185,7 @@ Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute
             decomposition for TRT-RTX).
 
 Stage 3:  Lowering     EP-gated. Structural rewrites for EP constraints.
-          ↓ SeparateRoPE, UnpackQKV, EliminateShape
+          ↓ SeparateRoPE, UnpackQKV
             (each only fires if the EP's capabilities require it)
 
 Stage 4:  Fold         EP-agnostic. Always applied.

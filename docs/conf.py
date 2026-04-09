@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Configuration file for the Sphinx documentation builder.
 
 To build the documentation: python -m sphinx docs docs/_build/html
@@ -14,8 +17,8 @@ sys.path.insert(0, os.path.abspath("_ext"))
 # -- Project information -----------------------------------------------------
 
 project = "mobius"
-copyright = "2026, ONNX Project Contributors"
-author = "ONNX Project Contributors"
+copyright = "2026, Microsoft Corporation"
+author = "Microsoft Corporation"
 
 # -- General configuration ---------------------------------------------------
 

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for LoRALinear component."""
 
@@ -57,7 +57,7 @@ class TestLoRALinear:
 
         result = layer(op, x)
         builder._adapt_outputs([result])
-        assert count_op_type(graph, "FusedMatMul") >= 1
+        assert count_op_type(graph, "MatMul") >= 1
 
     def test_forward_with_adapter(self):
         layer = LoRALinear(64, 128, lora_adapters=[("default", 8, 1.0)])
@@ -66,8 +66,8 @@ class TestLoRALinear:
 
         result = layer(op, x)
         builder._adapt_outputs([result])
-        # Base FusedMatMul + lora_A FusedMatMul + lora_B FusedMatMul = at least 3
-        assert count_op_type(graph, "FusedMatMul") >= 3
+        # Base MatMul + lora_A MatMul + lora_B MatMul = at least 3
+        assert count_op_type(graph, "MatMul") >= 3
         # scale Mul + Add for residual
         assert count_op_type(graph, "Add") >= 1
 
@@ -85,8 +85,8 @@ class TestLoRALinear:
 
         result = layer(op, x)
         builder._adapt_outputs([result])
-        # Base + 2*(lora_A + lora_B) = 5 FusedMatMul ops
-        assert count_op_type(graph, "FusedMatMul") >= 5
+        # Base + 2*(lora_A + lora_B) = 5 MatMul ops
+        assert count_op_type(graph, "MatMul") >= 5
 
     def test_with_bias(self):
         layer = LoRALinear(64, 128, bias=True, lora_adapters=[("default", 8, 1.0)])

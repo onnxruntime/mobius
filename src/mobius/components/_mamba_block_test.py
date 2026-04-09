@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for the MambaBlock component."""
 
@@ -122,8 +122,8 @@ class TestMambaBlock:
 
         block(op, hidden, conv_state, ssm_state)
 
-        # in_proj, x_proj, dt_proj, out_proj = at least 4 FusedMatMul ops
-        assert count_op_type(graph, "FusedMatMul") >= 4
+        # in_proj, x_proj, dt_proj, out_proj = at least 4 MatMul ops
+        assert count_op_type(graph, "MatMul") >= 4
 
     def test_custom_conv_kernel(self):
         """Custom conv_kernel size is reflected in parameters."""

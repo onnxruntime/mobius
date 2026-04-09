@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Vision encoder components (SigLIP-style).
 
@@ -127,10 +127,8 @@ class VisionAttention(nn.Module):
 class _VisionLinear(nn.Module):
     """Linear layer with Transpose+MatMul using standard ONNX ops.
 
-    Uses standard ONNX ops (not FusedMatMul) so ONNX symbolic shape
-    inference can propagate output shapes. Always includes bias.
-    The ``bias`` kwarg is accepted for API compatibility with ``FCMLP``'s
-    ``linear_class`` protocol but is always True.
+    Always includes bias. The ``bias`` kwarg is accepted for API
+    compatibility with ``FCMLP``'s ``linear_class`` protocol but is always True.
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
@@ -181,9 +179,9 @@ class VisionEncoderLayer(nn.Module):
         self.self_attn = VisionAttention(hidden_size, num_heads)
         self.layer_norm2 = VisionLayerNorm(hidden_size, eps=norm_eps)
         # GELU (tanh approx) MLP with bias (HF fc1/fc2 → up_proj/down_proj).
-        # Uses _VisionLinear (Transpose+MatMul) instead of Linear (FusedMatMul)
-        # so ONNX symbolic shape inference can propagate output shapes through
-        # models that feed vision features into dynamic Expand ops (e.g. BLIP-2).
+        # Uses _VisionLinear (Transpose+MatMul) to ensure ONNX symbolic shape
+        # inference can propagate output shapes through models that feed vision
+        # features into dynamic Expand ops (e.g. BLIP-2).
         self.mlp = FCMLP(
             hidden_size,
             intermediate_size,

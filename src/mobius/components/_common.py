@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -26,14 +26,12 @@ class Linear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
-        # FusedMatMul(x, weight, transB=1) computes x @ weight.T in a single
-        # fused kernel on supporting EPs.  The ir.Function body provides a
-        # portable Transpose + MatMul fallback for all other runtimes.
-        result = op.FusedMatMul(x, self.weight, _domain="com.microsoft", transB=1)
-        # FusedMatMul has no ONNX schema; propagate the input dtype so
-        # downstream constant-cache lookups use the correct type key.
-        if x.type is not None:
-            result.type = x.type
+        # Transpose weight from [out_features, in_features] → [in_features, out_features]
+        # so MatMul(x, w_t) computes x @ weight.T.
+        # FoldTransposedInitializerPass (applied after weight loading) will
+        # pre-compute this transpose and eliminate the runtime Transpose node.
+        w_t = op.Transpose(self.weight, perm=[1, 0])
+        result = op.MatMul(x, w_t)
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result
@@ -193,11 +191,9 @@ def create_attention_bias(
     # Get query_length and total_length from shapes.
     # query_length comes from input_ids dim 1 (the query; e.g. 1 during decode).
     # total_length comes from attention_mask dim 1 (past + current tokens).
-    # Using attention_mask for total_length lets the EliminateShape WebGPU rule
-    # eliminate that Shape op.  Using input_ids for query_length is semantically
-    # correct: during decode input_ids is (batch, 1), so query_length=1 and
-    # start = total_length - 1, giving the last row of q_indices.
-    # On WebGPU (concrete dims), Shape(input_ids, 1) is constant-folded away.
+    # Using input_ids for query_length is semantically correct: during decode
+    # input_ids is (batch, 1), so query_length=1 and start = total_length - 1,
+    # giving the last row of q_indices.
     query_length = op.Shape(input_ids, start=1, end=2)  # 1-D [1]
     total_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
     start = op.Sub(total_length, query_length)

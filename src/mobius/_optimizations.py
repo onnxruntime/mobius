@@ -1,22 +1,30 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """EP-aware model optimization pipeline.
 
-Exposes :func:`optimize_model` which applies a
-four-stage pass pipeline to an ONNX IR model:
+Exposes :func:`optimize_model` which applies a four-stage pass pipeline to an
+ONNX IR model:
 
 1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
    folding, shape inference. EP-agnostic; always applied.
 2. **Fusion** — promote standard ops to EP-supported fused ops
    (GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and ``model_role``.
 3. **Lowering** — decompose ops the EP cannot execute
-   (SeparateRoPE, EliminateShape).
+   (SeparateRoPE).
 4. **Fold** — final dead-node removal and constant folding.
 
 All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
 entries in the :data:`~mobius._execution_providers.ep_registry`. Adding EP
 support requires only a new registry entry — no changes to this module.
+
+Post-weight passes
+------------------
+:func:`fold_initializers_after_weights` should be called after weights are loaded.
+It runs :class:`~mobius._passes.FoldTransposedInitializerPass` and
+:class:`~mobius._passes.FoldConcatInitializersPass` to fold runtime Transpose and
+Concat nodes over initializers into pre-computed weights, then removes unused
+nodes.
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ from __future__ import annotations
 __all__ = [
     # Public API
     "optimize_model",
-    "fold_constants_after_weights",
+    "fold_initializers_after_weights",
     # Passes (used by tests and _builder re-exports)
     "CleanupMetadataPass",
     "SymbolicShapeInferencePass",
@@ -42,9 +50,21 @@ import onnx_ir as ir
 import onnx_shape_inference
 import onnxscript.optimizer._constant_folding
 from onnx_ir.passes import common as common_passes
+from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
+from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
+from mobius.functions import register_function_bodies
+from mobius.rewrite_rules import (
+    gelu_fusion_rules,
+    group_query_attention_rules,
+    pack_qkv_for_gqa_rules,
+    separate_rope_rules,
+    skip_layer_norm_rules,
+    skip_norm_rules,
+    unpack_qkv_rules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +103,10 @@ class CleanupMetadataPass(ir.passes.InPlacePass):
 
 
 # Maximum number of elements allowed in a constant-folded output tensor.
-# Set high enough to fold packed-QKV weights (Llama-3.2-1B packed QKV is
-# ~6.3M elements per layer; 256M gives ample headroom for large models).
-_FOLD_OUTPUT_SIZE_LIMIT = 256 * 1024 * 1024
+# Large weight tensors (Transpose, Concat/QKV packing) are handled by
+# FoldTransposedInitializerPass and FoldConcatInitializersPass after weight
+# loading, so the general constant-fold pass no longer needs a high limit.
+_FOLD_OUTPUT_SIZE_LIMIT = 262144
 
 _DEFAULT_PASSES = [
     common_passes.IdentityEliminationPass(),
@@ -195,8 +216,6 @@ def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -
     if isinstance(rules_or_pass, ir.passes.InPlacePass):
         rules_or_pass(model)
     elif rules_or_pass:
-        from onnxscript.rewriter import rewrite
-
         rewrite(model, pattern_rewrite_rules=rules_or_pass)
 
 
@@ -250,17 +269,6 @@ def _get_optimization_passes(
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
         tuples where payload is a rule list or IR pass.
     """
-    from mobius.rewrite_rules import (
-        eliminate_shape_rules,
-        gelu_fusion_rules,
-        group_query_attention_rules,
-        pack_qkv_for_gqa_rules,
-        separate_rope_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-        unpack_qkv_rules,
-    )
-
     fuse: list[tuple[str, list]] = []
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
 
@@ -289,9 +297,6 @@ def _get_optimization_passes(
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
 
-    if not caps.supports_shape:
-        lower.append(("EliminateShape", list(eliminate_shape_rules())))
-
     return fuse, lower
 
 
@@ -309,14 +314,14 @@ def optimize_model(
 ) -> None:
     """Apply EP-aware optimization passes to *model* in-place.
 
-    Runs a four-stage pipeline:
+    Runs a five-stage pipeline:
 
     1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
        folding, shape inference (EP-agnostic; always applied).
     2. **Fusion** — promote standard ops to EP-supported fused ops
        (e.g. GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and role.
     3. **Lowering** — decompose ops the EP cannot execute
-       (e.g. SeparateRoPE for DML, EliminateShape for WebGPU).
+       (e.g. SeparateRoPE for DML).
     4. **Fold** — final dead-node removal and constant folding.
 
     After fusion, if GQA was expected for ``(ep, dtype)`` but zero
@@ -367,8 +372,6 @@ def optimize_model(
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
-    from mobius.functions import register_function_bodies
-
     register_function_bodies(model)
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
@@ -383,8 +386,6 @@ def optimize_model(
             "SkipSimplifiedLayerNormalization",
         ):
             return not caps.supports_skip_layer_norm
-        if func.domain == "com.microsoft" and func.name == "FusedMatMul":
-            return not caps.supports_fused_matmul
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
         return False
@@ -427,16 +428,12 @@ def optimize_model(
         lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
 
         if all_fuse_rules:
-            from onnxscript.rewriter import rewrite
-
             rewrite(model, pattern_rewrite_rules=all_fuse_rules)
 
         # Expand unsupported custom ops via registered ir.Function bodies.
         inline_pass(model)
 
         if all_lower_rules:
-            from onnxscript.rewriter import rewrite
-
             rewrite(model, pattern_rewrite_rules=all_lower_rules)
 
         for _, ir_pass in lower_ir_passes:
@@ -470,7 +467,12 @@ def optimize_model(
             after_fold,
             after_fold - before_fold,
         )
-        _log_trace_summary(trace_entries)
+        logger.info(
+            "[EP Trace] Summary: %d nodes total, ep=%s, dtype=%s",
+            after_fold,
+            ep,
+            dtype.name,
+        )
 
     # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
@@ -486,30 +488,21 @@ def optimize_model(
             )
 
 
-def fold_constants_after_weights(model: ir.Model) -> None:
-    """Fold constants after weights have been applied.
+def fold_initializers_after_weights(model: ir.Model) -> None:
+    """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.
 
-    This is a lightweight pass intended to run after :func:`apply_weights`
-    so that any weight-dependent Concat/other constant nodes (e.g. from
-    PackQKV fusion) get folded into single initializers.
-
-    Unlike the pre-weights fold pass (which uses input_size_limit=8192 to
-    avoid evaluating large dynamic tensors), this pass raises both limits to
-    accommodate the large weight tensors produced by PackQKV
-    (e.g. Llama-3.2-1B packed QKV is ~6.3M elements per layer).
-
-    The pass raises no errors: warnings are emitted for nodes that cannot
-    be evaluated (e.g. symbolic inputs), and those nodes are left in place.
+    Runs :class:`~onnx_ir.passes.common.LiftConstantsToInitializersPass`,
+    :class:`~mobius._passes.FoldConcatInitializersPass`,
+    :class:`~mobius._passes.FoldTransposedInitializerPass`, and
+    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
+    FoldConcat must precede FoldTranspose so that packed QKV initializers are
+    visible before the Transpose fold runs.
     """
-    pass_manager = ir.passes.PassManager(
+    ir.passes.PassManager(
         [
-            onnxscript.optimizer._constant_folding.FoldConstantsPass(
-                shape_inference=False,
-                # Raised to fold large weight tensors from PackQKV fusion.
-                input_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
-                output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
-            ),
+            common_passes.LiftConstantsToInitializersPass(),
+            FoldConcatInitializersPass(),
+            FoldTransposedInitializerPass(),
             common_passes.RemoveUnusedNodesPass(),
         ]
-    )
-    pass_manager(model)
+    )(model)

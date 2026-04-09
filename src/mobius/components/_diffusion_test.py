@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for shared diffusion transformer components."""
 
@@ -133,8 +133,8 @@ class TestTimestepEmbedding:
         t_emb = create_test_input(builder, "t_emb", [1, 64], ir.DataType.FLOAT)
         result = mod(op, t_emb)
         graph.outputs.append(result)
-        # Two FusedMatMul ops for the two Linear layers
-        assert count_op_type(graph, "FusedMatMul") >= 2
+        # Two MatMul ops for the two Linear layers
+        assert count_op_type(graph, "MatMul") >= 2
 
 
 class TestDiffusionFFN:
