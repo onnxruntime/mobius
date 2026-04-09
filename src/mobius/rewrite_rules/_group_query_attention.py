@@ -43,7 +43,6 @@ They can also be applied manually::
 
 from __future__ import annotations
 
-import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchFailureError, MatchResult
 from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleClassBase,
@@ -247,55 +246,24 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
 # ====================================================================
 
 
-def _get_underlying_weight(weight: ir.Value) -> ir.Value:
-    """Return the underlying weight parameter (out_features x hidden_size).
-
-    Handles three patterns:
-
-    1. ``Transpose(W, perm=[1, 0])`` — the input ``W`` has shape
-       ``(out_features, hidden_size)``.  Returns ``W`` directly.
-       (Legacy: produced when Transpose+MatMul not yet converted.)
-    2. Direct input to ``FusedMatMul`` with ``transB=1`` — ``weight`` is
-       already the parameter with shape ``(out_features, hidden_size)``.
-       Returns *weight* unchanged.
-    3. Plain graph input — assumed to be ``(out_features, hidden_size)``
-       already.  Returns *weight* unchanged.
-
-    Raises ``MatchFailureError`` if *weight* is produced by something
-    other than a Transpose of a graph parameter.
-    """
-    producer = weight.producer()
-    if producer is not None:
-        if producer.op_type == "Transpose":
-            perm = producer.attributes.get("perm")
-            if perm is None or list(perm.value) != [1, 0]:
-                raise MatchFailureError(
-                    f"weight {weight.name!r} Transpose has unexpected perm {perm!r}, expected [1, 0]"
-                )
-            underlying = producer.inputs[0]
-            if underlying is not None and underlying.producer() is None:
-                # underlying is a graph input (parameter) — good
-                return underlying
-        raise MatchFailureError(f"weight {weight.name!r} is not a graph parameter")
-    # weight itself is a graph input (no Transpose wrapping) — already (out, hidden)
-    return weight
-
-
 class PackQKVForGQA(RewriteRuleClassBase):
     """Pack separate Q/K/V projections into a single MatMul for GQA.
 
     This rule runs **after** ``RotaryAttentionToGQA`` and looks for
     ``GroupQueryAttention`` nodes whose Q, K, V inputs each come from a
-    separate ``FusedMatMul`` projection that shares the same ``hidden_states``
-    input.
+    separate ``Transpose+MatMul`` projection that shares the same
+    ``hidden_states`` input.
 
     **Matched pattern:**
 
     .. code-block:: text
 
-        q = FusedMatMul(hidden, W_q, transB=1)
-        k = FusedMatMul(hidden, W_k, transB=1)
-        v = FusedMatMul(hidden, W_v, transB=1)
+        q_wt = Transpose(W_q, perm=[1, 0])
+        k_wt = Transpose(W_k, perm=[1, 0])
+        v_wt = Transpose(W_v, perm=[1, 0])
+        q    = MatMul(hidden, q_wt)
+        k    = MatMul(hidden, k_wt)
+        v    = MatMul(hidden, v_wt)
         out, pkey, pval = GroupQueryAttention(q, k, v, ...)
 
     Where ``W_q``, ``W_k``, ``W_v`` are graph parameters (initializers).
@@ -328,9 +296,12 @@ class PackQKVForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ pattern
 
     def pattern(self, op, hidden, q_w, k_w, v_w):
-        q = op.FusedMatMul(hidden, q_w, _domain="com.microsoft")
-        k = op.FusedMatMul(hidden, k_w, _domain="com.microsoft")
-        v = op.FusedMatMul(hidden, v_w, _domain="com.microsoft")
+        q_wt = op.Transpose(q_w, perm=[1, 0])
+        k_wt = op.Transpose(k_w, perm=[1, 0])
+        v_wt = op.Transpose(v_w, perm=[1, 0])
+        q = op.MatMul(hidden, q_wt)
+        k = op.MatMul(hidden, k_wt)
+        v = op.MatMul(hidden, v_wt)
 
         return op.GroupQueryAttention(
             q,
@@ -347,9 +318,12 @@ class PackQKVForGQA(RewriteRuleClassBase):
     def check(self, context, q_w, k_w, v_w, **_):
         # Verify all three projection weights are traceable to graph parameters.
         # Raises MatchFailureError if any weight is a computed (non-parameter) value.
-        _get_underlying_weight(q_w)
-        _get_underlying_weight(k_w)
-        _get_underlying_weight(v_w)
+        if q_w.producer() is not None:
+            raise MatchFailureError(f"q_w {q_w.name!r} is not a graph parameter")
+        if k_w.producer() is not None:
+            raise MatchFailureError(f"k_w {k_w.name!r} is not a graph parameter")
+        if v_w.producer() is not None:
+            raise MatchFailureError(f"v_w {v_w.name!r} is not a graph parameter")
         return True
 
     # ------------------------------------------------------------------ rewrite
@@ -366,20 +340,14 @@ class PackQKVForGQA(RewriteRuleClassBase):
         present_value,
         **_,
     ):
-        # Recover the underlying (out_features, hidden_size) weight parameters.
-        w_q = _get_underlying_weight(q_w)
-        w_k = _get_underlying_weight(k_w)
-        w_v = _get_underlying_weight(v_w)
-
         # Concat along output dimension: (q_out + k_out + v_out, hidden)
         # This is a graph-level op so it works without actual weight data.
         # A FoldConstantsPass after apply_weights() collapses it to one initializer.
         self._pack_counter += 1
-        packed_w = op.Concat(w_q, w_k, w_v, axis=0)
-        # FusedMatMul with transB=1 computes hidden @ packed_w.T in-kernel.
-        # The weight is stored as (q_out+k_out+v_out, hidden_size), same layout
-        # as the individual W_q/W_k/W_v parameters produced by Linear.
-        packed_qkv = op.FusedMatMul(hidden, packed_w, _domain="com.microsoft", transB=1)
+        packed_w = op.Concat(q_w, k_w, v_w, axis=0)
+        # Transpose packed weight: (q_out+k_out+v_out, hidden) → (hidden, q_out+k_out+v_out)
+        packed_wt = op.Transpose(packed_w, perm=[1, 0])
+        packed_qkv = op.MatMul(hidden, packed_wt)
 
         # Recover remaining GQA inputs and attributes from the matched node
         gqa_node = gqa_out.producer()
@@ -402,19 +370,22 @@ class PackQKVForGQA(RewriteRuleClassBase):
 
 
 class PackQKVWithBiasForGQA(RewriteRuleClassBase):
-    """Pack Q/K/V projections (with bias) into a single FusedMatMul+Add for GQA.
+    """Pack Q/K/V projections (with bias) into a single MatMul+Add for GQA.
 
     Handles models where each QKV projection is ``Linear(bias=True)``,
-    producing ``FusedMatMul → Add(bias)`` per projection — e.g. Qwen2.5, Phi3/4.
+    producing ``Transpose+MatMul → Add(bias)`` per projection — e.g. Qwen2.5, Phi3/4.
     The existing :class:`PackQKVForGQA` only matches the no-bias form.
 
     **Matched pattern:**
 
     .. code-block:: text
 
-        q = Add(FusedMatMul(hidden, W_q, transB=1), bias_q)
-        k = Add(FusedMatMul(hidden, W_k, transB=1), bias_k)
-        v = Add(FusedMatMul(hidden, W_v, transB=1), bias_v)
+        q_wt = Transpose(W_q, perm=[1, 0])
+        k_wt = Transpose(W_k, perm=[1, 0])
+        v_wt = Transpose(W_v, perm=[1, 0])
+        q = Add(MatMul(hidden, q_wt), bias_q)
+        k = Add(MatMul(hidden, k_wt), bias_k)
+        v = Add(MatMul(hidden, v_wt), bias_v)
         out, pkey, pval = GroupQueryAttention(q, k, v, ...)
 
     Where ``W_q``, ``W_k``, ``W_v``, ``bias_q``, ``bias_k``, ``bias_v``
@@ -426,7 +397,7 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
 
         W_qkv    = Concat(W_q, W_k, W_v, axis=0)
         bias_qkv = Concat(bias_q, bias_k, bias_v, axis=0)
-        packed   = Add(FusedMatMul(hidden, W_qkv, transB=1), bias_qkv)
+        packed   = Add(MatMul(hidden, Transpose(W_qkv)), bias_qkv)
         out, pkey, pval = GroupQueryAttention(packed, None, None, ...)
 
     Both the weight ``Concat`` and the bias ``Concat`` are graph-level
@@ -447,9 +418,12 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ pattern
 
     def pattern(self, op, hidden, q_w, bias_q, k_w, bias_k, v_w, bias_v):
-        q = op.Add(op.FusedMatMul(hidden, q_w, _domain="com.microsoft"), bias_q)
-        k = op.Add(op.FusedMatMul(hidden, k_w, _domain="com.microsoft"), bias_k)
-        v = op.Add(op.FusedMatMul(hidden, v_w, _domain="com.microsoft"), bias_v)
+        q_wt = op.Transpose(q_w, perm=[1, 0])
+        k_wt = op.Transpose(k_w, perm=[1, 0])
+        v_wt = op.Transpose(v_w, perm=[1, 0])
+        q = op.Add(op.MatMul(hidden, q_wt), bias_q)
+        k = op.Add(op.MatMul(hidden, k_wt), bias_k)
+        v = op.Add(op.MatMul(hidden, v_wt), bias_v)
 
         return op.GroupQueryAttention(
             q,
@@ -464,10 +438,13 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
     # ------------------------------------------------------------------ check
 
     def check(self, context, q_w, bias_q, k_w, bias_k, v_w, bias_v, **_):
-        # Projection weights must be traceable to graph parameters.
-        _get_underlying_weight(q_w)
-        _get_underlying_weight(k_w)
-        _get_underlying_weight(v_w)
+        # Projection weights must be direct graph parameters.
+        if q_w.producer() is not None:
+            raise MatchFailureError(f"q_w {q_w.name!r} is not a graph parameter")
+        if k_w.producer() is not None:
+            raise MatchFailureError(f"k_w {k_w.name!r} is not a graph parameter")
+        if v_w.producer() is not None:
+            raise MatchFailureError(f"v_w {v_w.name!r} is not a graph parameter")
         # Bias terms must be direct graph parameters (no producer node).
         for bias in (bias_q, bias_k, bias_v):
             if bias is None or bias.producer() is not None:
@@ -491,16 +468,12 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
         present_value,
         **_,
     ):
-        # Recover the underlying (out_features, hidden_size) weight parameters.
-        w_q = _get_underlying_weight(q_w)
-        w_k = _get_underlying_weight(k_w)
-        w_v = _get_underlying_weight(v_w)
-
         # Concat weights along output dimension: (q_out + k_out + v_out, hidden)
         self._pack_counter += 1
-        packed_w = op.Concat(w_q, w_k, w_v, axis=0)
-        # FusedMatMul with transB=1: hidden @ packed_w.T
-        packed_mm = op.FusedMatMul(hidden, packed_w, _domain="com.microsoft", transB=1)
+        packed_w = op.Concat(q_w, k_w, v_w, axis=0)
+        # Transpose packed weight: (q_out+k_out+v_out, hidden) → (hidden, q_out+k_out+v_out)
+        packed_wt = op.Transpose(packed_w, perm=[1, 0])
+        packed_mm = op.MatMul(hidden, packed_wt)
 
         # Concat biases: (q_out + k_out + v_out,)
         packed_bias = op.Concat(bias_q, bias_k, bias_v, axis=0)

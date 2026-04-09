@@ -66,8 +66,8 @@ class LoRALinear(Linear):
         for name, scale_param in self._adapters:
             lora_a = getattr(self, f"_lora_A_{name}")
             lora_b = getattr(self, f"_lora_B_{name}")
-            h = op.FusedMatMul(x, lora_a, _domain="com.microsoft", transB=1)
-            lora_out = op.FusedMatMul(h, lora_b, _domain="com.microsoft", transB=1)
+            h = op.MatMul(x, op.Transpose(lora_a, perm=[1, 0]))
+            lora_out = op.MatMul(h, op.Transpose(lora_b, perm=[1, 0]))
             lora_out = op.Mul(lora_out, scale_param)
             result = op.Add(result, lora_out)
         return result

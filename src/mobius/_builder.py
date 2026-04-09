@@ -147,9 +147,8 @@ def build_from_module(
             (e.g. ``"text-generation"``) or a :class:`ModelTask` instance.
         execution_provider: Target execution provider for EP-aware
             optimizations. Defaults to ``"default"``, which applies standard
-            fusions (SkipNorm, FusedMatMul, Gelu) but no EP-specific vendor
-            ops (no GQA, no PackQKV). Custom ops like
-            ``com.microsoft::FusedMatMul`` and
+            fusions (SkipNorm, Gelu) but no EP-specific vendor ops (no GQA,
+            no PackQKV). Custom ops like
             ``com.microsoft::SkipLayerNormalization`` are present but carry
             portable ONNX function bodies as fallbacks. Accepted values are
             the names returned by ``ep_registry`` (e.g. ``"cpu"``,

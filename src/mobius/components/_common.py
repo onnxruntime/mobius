@@ -26,14 +26,12 @@ class Linear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
-        # FusedMatMul(x, weight, transB=1) computes x @ weight.T in a single
-        # fused kernel on supporting EPs.  The ir.Function body provides a
-        # portable Transpose + MatMul fallback for all other runtimes.
-        result = op.FusedMatMul(x, self.weight, _domain="com.microsoft", transB=1)
-        # FusedMatMul has no ONNX schema; propagate the input dtype so
-        # downstream constant-cache lookups use the correct type key.
-        if x.type is not None:
-            result.type = x.type
+        # Transpose weight from [out_features, in_features] → [in_features, out_features]
+        # so MatMul(x, w_t) computes x @ weight.T.
+        # FoldTransposedInitializerPass (applied after weight loading) will
+        # pre-compute this transpose and eliminate the runtime Transpose node.
+        w_t = op.Transpose(self.weight, perm=[1, 0])
+        result = op.MatMul(x, w_t)
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result

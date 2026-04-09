@@ -120,8 +120,8 @@ class TestMLP:
         x = create_test_input(builder, "x", [2, 4, 64])
         result = mlp(op, x)
         assert result is not None
-        # gate_proj + up_proj + down_proj = at least 3 FusedMatMul ops
-        assert count_op_type(graph, "FusedMatMul") >= 3
+        # gate_proj + up_proj + down_proj = at least 3 MatMul ops
+        assert count_op_type(graph, "MatMul") >= 3
 
     def test_mlp_with_different_activations(self):
         for act in ["silu", "gelu", "relu"]:
