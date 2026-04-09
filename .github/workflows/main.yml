@@ -233,13 +233,13 @@ jobs:
             --junitxml golden-results.xml
         timeout-minutes: 30
       - name: Upload coverage to Codecov
-        if: always()
+        if: steps.check_golden.outputs.has_golden == 'true'
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: golden
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
+        if: steps.check_golden.outputs.has_golden == 'true' && !cancelled()
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
