@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Gemma4Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -41,6 +42,8 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4CausalLMModel,
+    Gemma4MultiModalModel,
     GemmaCausalLMModel,
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
