@@ -1521,7 +1521,7 @@ class Gemma4Config(VisionLanguageConfig):
         # MoE fields — map Gemma4 names to ArchitectureConfig fields
         num_local_experts = getattr(config, "num_experts", None)
         num_experts_per_tok = getattr(config, "top_k_experts", None)
-        moe_intermediate_size = getattr(config, "expert_intermediate_size", None)
+        moe_intermediate_size = getattr(config, "moe_intermediate_size", None)
         if num_local_experts is not None:
             base = dataclasses.replace(base, num_local_experts=num_local_experts)
         if num_experts_per_tok is not None:

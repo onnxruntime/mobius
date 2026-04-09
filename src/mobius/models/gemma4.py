@@ -33,6 +33,7 @@ import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
@@ -410,7 +411,11 @@ class Gemma4TextAttention(nn.Module):
             )
             sq = op.Mul(value_states, value_states)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
-            rms = op.Sqrt(op.Add(mean_sq, self._v_norm_eps))
+            # Use op.Constant to create a 1D tensor node (not a scalar initializer).
+            # Scalar Python floats use a type-keyed cache that can fail when upstream
+            # type information is missing (e.g., after custom ops like com.microsoft.MoE).
+            eps = op.Constant(value_floats=[self._v_norm_eps])
+            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
             value_states = op.Div(value_states, rms)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
@@ -435,6 +440,63 @@ class Gemma4TextAttention(nn.Module):
         return attn_output, (present_key, present_value)
 
 
+# ---------------------------------------------------------------------------
+# Gemma4 MoE router
+# ---------------------------------------------------------------------------
+
+
+class _Gemma4MoeRouter(nn.Module):
+    """Gemma4 MoE router: scale-free RMSNorm → learned scale → linear → softmax.
+
+    Matches ``Gemma4TextRouter`` in HuggingFace.
+
+    Parameters (aligned with HF state_dict, with one weight-fold):
+    - ``scale`` [hidden_size]: ``router.scale * hidden_size^-0.5`` (folded during
+      ``preprocess_weights`` — see ``Gemma4CausalLMModel.preprocess_weights``)
+    - ``proj.weight`` [num_experts, hidden_size]: router logits (no bias)
+    - ``per_expert_scale`` [num_experts]: per-expert output weight scaling
+
+    ``router.norm`` is scale-free (no learnable parameter, omitted from state_dict).
+
+    The ``hidden_size^-0.5`` scale factor is absorbed into ``self.scale`` at weight-load
+    time to avoid graph-level float-constant collisions across multiple decoder layers.
+
+    Args:
+        hidden_size: Model hidden dimension.
+        num_experts: Total number of experts.
+        rms_norm_eps: Epsilon for the scale-free RMSNorm.
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int, rms_norm_eps: float = 1e-6):
+        super().__init__()
+        self._eps = rms_norm_eps
+        self._hidden_size = hidden_size
+        # ``scale`` stores router.scale * hidden_size^-0.5 (folded in preprocess_weights)
+        self.scale = nn.Parameter([hidden_size])
+        self.proj = Linear(hidden_size, num_experts, bias=False)
+        self.per_expert_scale = nn.Parameter([num_experts])
+
+    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        """Compute router probabilities over all experts.
+
+        Args:
+            hidden_states: [num_tokens, hidden_size] (batch-sequence flattened)
+
+        Returns:
+            router_probs: [num_tokens, num_experts] full softmax probabilities
+        """
+        # Scale-free RMSNorm using RMSNormalization op (epsilon as attribute avoids
+        # graph-level float constant name collisions across multiple decoder layers).
+        H_shape = op.Shape(hidden_states, start=1, end=2)  # [1] containing hidden_size
+        ones = op.CastLike(op.ConstantOfShape(H_shape, value=1.0), hidden_states)
+        x_normed = op.RMSNormalization(hidden_states, ones, epsilon=self._eps, axis=-1)
+        # Scale: x_normed * self.scale  (hidden_size^-0.5 already folded into scale)
+        x_scaled = op.Mul(x_normed, self.scale)
+        # Linear projection then softmax -> router_probs [num_tokens, num_experts]
+        expert_scores = self.proj(op, x_scaled)
+        return op.Softmax(expert_scores, axis=-1)
+
+
 class Gemma4DecoderLayer(nn.Module):
     """Gemma4 text decoder layer with 4 norms, layer_scalar, and optional per-layer input.
 
@@ -444,6 +506,16 @@ class Gemma4DecoderLayer(nn.Module):
         if per_layer_input:
             h += post_per_layer_norm(project(act(gate(h)) * per_layer_input))
         h = h * layer_scalar   # LAST step, after per-layer input
+
+    When ``enable_moe_block=True`` (Gemma4 26B-A4B, 31B), the MLP block uses a
+    parallel architecture — a dense MLP and a MoE block run independently, then
+    their outputs are summed before the final post-FF norm::
+
+        h = pre_ff_norm(h)
+        h_dense  = post_ff_norm_1(mlp(h))
+        h_moe    = post_ff_norm_2(experts(pre_ff_norm_2(residual), router(residual)))
+        h = post_ff_norm(h_dense + h_moe)
+        h = residual + h
 
     Uses standard RMSNorm (not OffsetRMSNorm). KV-shared layers use double-wide
     MLP when config.use_double_wide_mlp=True.
@@ -500,10 +572,33 @@ class Gemma4DecoderLayer(nn.Module):
             )
             self.act_fn = get_activation(config.hidden_act)
 
+        self._enable_moe_block = config.enable_moe_block
         if config.enable_moe_block:
-            raise NotImplementedError(
-                "Gemma4 MoE block not yet implemented. Set enable_moe_block=False."
+            assert config.num_local_experts is not None, "num_local_experts required for MoE"
+            assert config.num_experts_per_tok is not None, "num_experts_per_tok required for MoE"
+            assert config.moe_intermediate_size is not None, "moe_intermediate_size required for MoE"
+
+            self._top_k = config.num_experts_per_tok
+            self._num_experts = config.num_local_experts
+            moe_inter = config.moe_intermediate_size
+
+            self.router = _Gemma4MoeRouter(
+                config.hidden_size, config.num_local_experts, config.rms_norm_eps
             )
+            # Expert weights stored as 3D tensors (all experts stacked).
+            # fc1_experts_weights: gate+up combined [E, 2*moe_inter, hidden].
+            # fc2_experts_weights: down projection [E, hidden, moe_inter].
+            # These map to HF experts.gate_up_proj and experts.down_proj.
+            self.fc1_experts_weights = nn.Parameter(
+                [config.num_local_experts, 2 * moe_inter, config.hidden_size]
+            )
+            self.fc2_experts_weights = nn.Parameter(
+                [config.num_local_experts, config.hidden_size, moe_inter]
+            )
+            # MoE-specific norms (in addition to the shared pre/post_feedforward norms)
+            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -529,12 +624,62 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
 
-        # MLP block: pre-norm -> mlp -> post-norm -> residual
+        # MLP block: dense MLP path runs always; parallel MoE path added when enabled.
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(op, hidden_states)
         hidden_states = self.mlp(op, hidden_states)
-        hidden_states = self.post_feedforward_layernorm(op, hidden_states)
-        hidden_states = op.Add(residual, hidden_states)
+
+        if self._enable_moe_block:
+            # Hybrid dense+MoE architecture:
+            #   dense path output: post_ff_norm_1(mlp(pre_ff_norm(h)))
+            #   moe   path output: post_ff_norm_2(experts(pre_ff_norm_2(residual)))
+            #   combined: post_ff_norm(dense + moe) + residual
+            dense_out = self.post_feedforward_layernorm_1(op, hidden_states)
+
+            # MoE input is the pre-attention residual (flattened to 2D for routing).
+            batch_size = op.Shape(residual, start=0, end=1)    # [1] scalar
+            seq_len = op.Shape(residual, start=1, end=2)       # [1] scalar
+            hidden_size = op.Shape(residual, start=2, end=3)   # [1] scalar
+            num_tokens = op.Mul(batch_size, seq_len)           # [1]
+            flat_shape = op.Concat(num_tokens, hidden_size, axis=0)  # [2]
+            residual_flat = op.Reshape(residual, flat_shape)   # [B*S, H]
+
+            # router_probs: [B*S, E] full softmax over all experts
+            router_probs = self.router(op, residual_flat)       # [B*S, E]
+
+            # Norm residual before experts
+            normed_flat = self.pre_feedforward_layernorm_2(op, residual_flat)  # [B*S, H]
+
+            caps = ep_capabilities()
+            if caps.supports_fused_moe:
+                # Fused MoE op: handles top-k selection + expert dispatch internally.
+                # NOTE: per_expert_scale is NOT applied in fused path (ORT op limitation).
+                # Cast restores dtype after op.MoE (custom op, type=None on output)
+                # so downstream ops can correctly infer types and share scalar initializers.
+                moe_out_flat = op.Cast(
+                    op.MoE(  # type: ignore[attr-defined]
+                        normed_flat,
+                        router_probs,
+                        self.fc1_experts_weights,
+                        self.fc2_experts_weights,
+                        activation_type="silu",
+                        k=self._top_k,
+                        normalize_routing_weights=1,
+                        _domain="com.microsoft",
+                    ),
+                    to=1,  # FLOAT — op.MoE has no schema so its output type is None
+                )  # [B*S, H]
+            else:
+                moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
+
+            moe_out = op.Reshape(moe_out_flat, op.Shape(residual))  # [B, S, H]
+            moe_out = self.post_feedforward_layernorm_2(op, moe_out)
+            ff_out = op.Add(dense_out, moe_out)
+            hidden_states = self.post_feedforward_layernorm(op, ff_out)
+            hidden_states = op.Add(residual, hidden_states)
+        else:
+            hidden_states = self.post_feedforward_layernorm(op, hidden_states)
+            hidden_states = op.Add(residual, hidden_states)
 
         # Per-layer input gating (skip when disabled)
         if self._per_layer_dim > 0 and per_layer_input is not None:
@@ -551,6 +696,84 @@ class Gemma4DecoderLayer(nn.Module):
 
         return hidden_states, present_key_value
 
+    def _dispatch_moe_fallback(
+        self,
+        op: builder.OpBuilder,
+        normed_flat: ir.Value,
+        router_probs: ir.Value,
+    ) -> ir.Value:
+        """Fallback expert dispatch (static unroll) when fused MoE op is unavailable.
+
+        Iterates over each expert (outer loop), accumulates the routing weight for
+        all k slots that select that expert (inner loop), applies the SwiGLU MLP,
+        and accumulates into the output tensor.  O(E * K) unrolled ops — acceptable
+        for small expert counts in the fallback path.
+
+        Args:
+            normed_flat: [T, H] — pre-normed input for the experts (T = B*S).
+            router_probs: [T, E] — full softmax router probabilities.
+
+        Returns:
+            [T, H] — weighted sum of expert outputs.
+        """
+        # Top-K selection: top_weights/top_indices both [T, K]
+        top_weights_raw, top_indices = op.TopK(
+            router_probs, op.Constant(value_ints=[self._top_k]), axis=-1
+        )
+        # Normalise selected weights (re-softmax over top-k so they sum to 1)
+        top_weights = op.Softmax(top_weights_raw, axis=-1)  # [T, K]
+
+        # Scale routing weights by per_expert_scale for each selected expert
+        # Gather from [E] using [T, K] indices → result [T, K]
+        pes_topk = op.Gather(self.router.per_expert_scale, top_indices, axis=0)  # [T, K]
+        top_weights = op.Mul(top_weights, op.CastLike(pes_topk, top_weights))    # [T, K]
+
+        # Build output accumulator, matching dtype of the input
+        out_shape = op.Shape(normed_flat)                      # [T, H] shape vec
+        output = op.CastLike(op.ConstantOfShape(out_shape, value=0.0), normed_flat)
+
+        # T_shape: 1-D tensor [T] used for per-expert weight accumulation
+        T_shape = op.Shape(normed_flat, start=0, end=1)        # shape vec of length 1
+
+        for e_idx in range(self._num_experts):
+            # Gather this expert's weight matrices
+            fc1 = op.Squeeze(
+                op.Gather(self.fc1_experts_weights, [e_idx], axis=0), [0]
+            )  # [2*moe_inter, H]
+            fc2 = op.Squeeze(
+                op.Gather(self.fc2_experts_weights, [e_idx], axis=0), [0]
+            )  # [H, moe_inter]
+
+            # Gated SiLU MLP: fc1 produces gate+up concatenated → SwiGLU
+            proj = op.MatMul(normed_flat, op.Transpose(fc1))   # [T, 2*moe_inter]
+            half = op.Shape(fc2, start=1, end=2)               # [moe_inter]
+            gate = op.Slice(proj, [0], half, [1])              # [T, moe_inter] first half
+            up   = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
+            # SiLU(gate) = gate * sigmoid(gate)
+            expert_out = op.MatMul(
+                op.Mul(op.Mul(gate, op.Sigmoid(gate)), up),    # [T, moe_inter]
+                op.Transpose(fc2),                             # → [T, H]
+            )
+
+            # Accumulate routing weight for expert e_idx across all k slots
+            e_weight = op.CastLike(op.ConstantOfShape(T_shape, value=0.0), top_weights)
+            for k_idx in range(self._top_k):
+                # idx_k: [T] — which expert was selected at slot k_idx
+                idx_k = op.Squeeze(op.Slice(top_indices, [k_idx], [k_idx + 1], [1]), [1])
+                # w_k: [T] — routing weight for slot k_idx
+                w_k = op.Squeeze(op.Slice(top_weights, [k_idx], [k_idx + 1], [1]), [1])
+                # Add w_k only for tokens routed to expert e_idx at this slot
+                is_expert = op.CastLike(op.Equal(idx_k, op.Constant(value_int=e_idx)), w_k)
+                e_weight = op.Add(e_weight, op.Mul(is_expert, w_k))
+
+            # Weight expert output by aggregated routing weight and add to output
+            e_weight_2d = op.Reshape(
+                e_weight,
+                op.Concat(T_shape, op.Constant(value_ints=[1]), axis=0),  # [T, 1]
+            )
+            output = op.Add(output, op.Mul(expert_out, op.CastLike(e_weight_2d, expert_out)))
+
+        return output
 
 # ---------------------------------------------------------------------------
 # Gemma4 text model
@@ -788,6 +1011,27 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict[new_key] = state_dict.pop(key)
             elif "vision_tower" in key or "embed_vision" in key:
                 state_dict.pop(key, None)
+        # Map HF expert weight names to our 3D stacked parameter names.
+        # HF stores: layers.N.experts.gate_up_proj [E, 2*inter, H]
+        #             layers.N.experts.down_proj     [E, H, inter]
+        # We store:  layers.N.fc1_experts_weights   [E, 2*inter, H]
+        #             layers.N.fc2_experts_weights   [E, H, inter]
+        for key in list(state_dict.keys()):
+            if ".experts.gate_up_proj" in key:
+                new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
+                state_dict[new_key] = state_dict.pop(key)
+            elif ".experts.down_proj" in key:
+                new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
+                state_dict[new_key] = state_dict.pop(key)
+        # Fold hidden_size^-0.5 into router.scale.
+        # The router computes: x_normed * scale * hidden_size^-0.5.
+        # We pre-multiply scale by hidden_size^-0.5 here so the forward only needs
+        # x_normed * self.scale, avoiding float-constant name collisions across layers.
+        if self.config.enable_moe_block:
+            scale_factor = float(self.config.hidden_size**-0.5)
+            for key in list(state_dict.keys()):
+                if ".router.scale" in key:
+                    state_dict[key] = state_dict[key] * scale_factor
         return super().preprocess_weights(state_dict)
 
 

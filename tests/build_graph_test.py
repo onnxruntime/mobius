@@ -1188,6 +1188,49 @@ class TestBuildGraphVisionLanguage:
         embedding = pkg["embedding"]
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
 
+    def test_gemma4_moe_graph(self):
+        """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            # MoE config: every layer has a parallel MoE block
+            enable_moe_block=True,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+        model_cls = registry.get("gemma4_text")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4_text")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert "model" in pkg
+        model = pkg["model"]
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        assert "input_ids" in input_names
+        assert "logits" in output_names
+
     def test_gemma4_any_to_any_graph(self):
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+audio+embedding)."""
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
