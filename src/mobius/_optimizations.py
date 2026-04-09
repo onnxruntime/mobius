@@ -609,7 +609,7 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     here ensures correct behaviour even when :func:`optimize_model` was not
     called (e.g. in tests that build graphs directly).
 
-    The pipeline runs six sequential steps:
+    The pipeline runs five sequential steps:
 
     1. **Lifts Constant ops to initializers** — promotes any remaining
        ``Constant`` op nodes to proper graph initializers so the subsequent
@@ -640,8 +640,13 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
        remove because their data has been copied into the packed/transposed
        folded initializers.
 
-    6. **Folds remaining constants** — lightweight constant-fold for small
-       sub-graphs (shape arithmetic, RoPE precomputation, etc.).
+    Note: ``FoldConstantsPass`` is intentionally **not** run here.
+    :func:`optimize_model` stage 4 already folds all constant sub-graphs
+    (shape arithmetic, RoPE precomputation, etc.) before weights are loaded.
+    Running it again after weights are applied causes a duplicate-name bug in
+    hybrid SSM/attention models (e.g. Jamba, Bamba, NemotronH): the pass
+    creates two nodes with the same output name for graph outputs that are
+    also SSM state tensors.
     """
     # Steps 1-3: structural fold passes (may be no-ops if stage 5 already ran).
     ir.passes.PassManager(
@@ -657,14 +662,5 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     # before weights were available.
     _materialize_deferred_initializers(model)
 
-    # Steps 5-6: prune and fold constants now that all values are populated.
-    ir.passes.PassManager(
-        [
-            common_passes.RemoveUnusedNodesPass(),
-            onnxscript.optimizer._constant_folding.FoldConstantsPass(
-                shape_inference=False,
-                input_size_limit=onnxscript.optimizer._constant_folding.DEFAULT_CONSTANT_FOLD_INPUT_SIZE_LIMIT,
-                output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
-            ),
-        ]
-    )(model)
+    # Step 5: prune orphaned initializers and nodes.
+    ir.passes.PassManager([common_passes.RemoveUnusedNodesPass()])(model)
