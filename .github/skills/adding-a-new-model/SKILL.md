@@ -819,3 +819,122 @@ When adding a new model, use these files as canonical references:
 | **Minimal** — encoder subclass | `models/layoutlmv3.py` | Extends `BertModel`, only overrides `preprocess_weights()`. Same pattern for encoder-only models. |
 | **Moderate** — custom components | `models/gemma.py` | Adds custom attention (soft-capping), custom MLP (GeGLU), and custom normalization. Good example of component subclassing. |
 | **Complex** — multi-model architecture | `models/qwen3_tts.py` | 4-model TTS split with talker, code predictor, embedding, and speaker encoder sub-modules. Shows how to structure multi-model architectures. |
+
+## KV sharing across layers (num_kv_shared_layers)
+
+Some models (e.g. Gemma 4) use **KV weight sharing** where the last N decoder
+layers reuse the Key and Value projections computed by an earlier layer.
+This is controlled by `num_kv_shared_layers` in the HuggingFace config.
+
+### What it means
+
+```
+first_shared_idx = num_hidden_layers - num_kv_shared_layers
+Layers [0 .. first_shared_idx-1]: normal — each has its own k_proj, v_proj, k_norm, v_norm
+Layers [first_shared_idx .. end]: shared — NO k_proj/v_proj weights; reuse KV from source
+```
+
+Each shared layer finds the **last non-shared layer of the same attention type**
+(e.g. sliding vs. full attention) and borrows its K/V states at runtime.
+Only Q is computed fresh per shared layer.
+
+### Impact on weights
+
+Shared layers have **no `k_proj`, `v_proj`, `k_norm`, `v_norm`** — these keys
+are absent from the HuggingFace checkpoint. In `preprocess_weights`, do NOT
+assert these keys exist for shared-layer indices; skip them silently.
+
+```python
+def preprocess_weights(self, state_dict):
+    n_shared = self.config.num_kv_shared_layers or 0
+    first_shared = self.config.num_hidden_layers - n_shared
+    # Do not try to load k_proj/v_proj for shared layers
+    for i in range(first_shared, self.config.num_hidden_layers):
+        for key in (f"layers.{i}.self_attn.k_proj.weight",
+                    f"layers.{i}.self_attn.v_proj.weight",
+                    f"layers.{i}.self_attn.k_norm.weight",
+                    f"layers.{i}.self_attn.v_norm.weight"):
+            state_dict.pop(key, None)
+    return state_dict
+```
+
+### Impact on KV cache
+
+Shared layers **do not update** the KV cache — they never call
+`past_key_values.update()`. The KV cache has only
+`num_hidden_layers - num_kv_shared_layers` entries (not `num_hidden_layers`).
+
+This affects:
+- The number of KV cache slots in `CausalLMTask`
+- The `past_key_values` list unpacking in the text model's forward loop
+
+### Gemma4SharedKVAttention subclass pattern
+
+Create a subclass of `Attention` that takes `shared_key` and `shared_value`
+as explicit graph inputs instead of computing its own K/V projections:
+
+```python
+class Gemma4SharedKVAttention(Attention):
+    """Attention that reuses K/V from a source layer (no k_proj/v_proj weights)."""
+
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        # Remove the K/V projection modules — they have no weights
+        del self.k_proj
+        del self.v_proj
+
+    def forward(self, op, hidden_states, attention_bias, position_embeddings,
+                shared_key, shared_value, past_key_value=None):
+        # Compute Q from this layer's own q_proj (each shared layer has unique Q)
+        query_states = self.q_proj(op, hidden_states)
+        # Reuse K/V from the source layer passed as explicit graph values
+        key_states = shared_key
+        value_states = shared_value
+        return self._attend(op, query_states, key_states, value_states,
+                            attention_bias, past_key_value)
+```
+
+### Source layer emits K/V as extra outputs
+
+The last non-shared layer of each attention type must expose its K/V so the
+graph can route them to all downstream shared layers:
+
+```python
+class Gemma4SourceAttention(Attention):
+    """Attention that additionally outputs K/V for sharing with later layers."""
+
+    def forward(self, op, hidden_states, ...):
+        result, present_kv = super().forward(...)
+        # Also return K, V for the shared layers to consume
+        return result, present_kv, self._last_key, self._last_value
+```
+
+The text model's forward loop passes these K/V values as explicit arguments:
+
+```python
+shared_key, shared_value = None, None
+for i, layer in enumerate(self.layers):
+    if layer.is_kv_shared:
+        hidden_states, kv = layer(op, hidden_states, ...,
+                                  shared_key=shared_key, shared_value=shared_value)
+    else:
+        hidden_states, kv, shared_key, shared_value = layer(op, hidden_states, ...)
+```
+
+### Type-aware sharing (sliding vs. full attention)
+
+When a model has multiple attention types (e.g. Gemma 4's 5:1 sliding/full
+pattern), each shared layer finds the last non-shared layer of the **same
+type**. Maintain separate `shared_key/value` per attention type:
+
+```python
+source_kvs = {}  # keyed by layer_type (e.g. "sliding", "full")
+for i, layer in enumerate(self.layers):
+    layer_type = self.config.layer_types[i]
+    if layer.is_kv_shared:
+        sk, sv = source_kvs[layer_type]
+        hidden, kv = layer(op, hidden, ..., shared_key=sk, shared_value=sv)
+    else:
+        hidden, kv, sk, sv = layer(op, hidden, ...)
+        source_kvs[layer_type] = (sk, sv)
+```
