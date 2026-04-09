@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3-ASR: Audio speech recognition with Qwen3 text decoder.
 

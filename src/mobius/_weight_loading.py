@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 # SECURITY: Do NOT use torch.load() or pickle deserialization anywhere in this
 # module.  Only safetensors is permitted for weight loading to prevent arbitrary

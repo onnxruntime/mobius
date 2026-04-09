@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Transformer components for the Qwen3-TTS codec tokenizer.
 

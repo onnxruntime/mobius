@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen3.5 text generation — standalone greedy decoding (no onnxruntime-genai).
 

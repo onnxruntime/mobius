@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Rewrite rule for unpacking packed QKV back into separate Q/K/V projections.
 

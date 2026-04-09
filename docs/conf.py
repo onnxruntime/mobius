@@ -1,3 +1,5 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 """Configuration file for the Sphinx documentation builder.
 
 To build the documentation: python -m sphinx docs docs/_build/html

@@ -1,3 +1,5 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 """Sphinx extension: generate model documentation pages at build time.
 
 Hooks into ``builder-inited`` to run the existing model page generator
