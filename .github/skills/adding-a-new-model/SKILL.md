@@ -863,6 +863,22 @@ The attention class detects at `__init__` time whether it is a shared layer:
 class Gemma4Attention(nn.Module):
     def __init__(self, config, layer_idx, layer_types, first_kv_shared_idx, ...):
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_idx > 0
+        prev_layers = layer_types[:first_kv_shared_idx]
+
+        if self.is_kv_shared_layer:
+            # Index of the source layer whose K,V this layer borrows
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+            self.provides_shared_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            # True for the last non-shared layer of each type that has downstream
+            # KV-shared layers depending on it — it stores K,V for reuse.
+            self.provides_shared_kv = first_kv_shared_idx > 0 and (
+                layer_idx
+                == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
 
         # All layers have Q projection
         self.q_proj = Linear(config.hidden_size, num_heads * head_dim)
@@ -920,21 +936,30 @@ has `num_hidden_layers - num_kv_shared_layers` entries, not `num_hidden_layers`:
 shared_kv_states: dict = {}
 present_key_values = []
 
-# Expand past_key_values to per-layer list (None for shared layers)
+# past_key_values has only num_kv_layers entries (no entry for KV-shared layers).
+# Expand it to a full per-layer list so we can zip cleanly over all layers.
 if past_key_values is not None:
     kv_iter = iter(past_key_values)
-    past_kvs = [
+    past_kvs: list = [
         None if layer.self_attn.is_kv_shared_layer else next(kv_iter)
         for layer in self.layers
     ]
 else:
     past_kvs = [None] * len(self.layers)
 
-for layer, layer_type, past_kv in zip(self.layers, self.layer_types, past_kvs):
+for i, (layer, layer_type, past_kv) in enumerate(
+    zip(self.layers, self.layer_types, past_kvs)
+):
     hidden_states, present_kv = layer(
-        op, hidden_states, ..., shared_kv_states=shared_kv_states, past_key_value=past_kv
+        op,
+        hidden_states=hidden_states,
+        attention_bias=attention_bias_dict[layer_type],
+        position_embeddings=position_embeddings_dict[layer_type],
+        shared_kv_states=shared_kv_states,
+        past_key_value=past_kv,
     )
-    # Only accumulate KV cache for non-shared layers
+    # KV-shared layers borrow K,V — exclude from present_key_values so the
+    # output has exactly num_kv_layers (not num_hidden_layers) entries.
     if not layer.self_attn.is_kv_shared_layer:
         present_key_values.append(present_kv)
 ```
