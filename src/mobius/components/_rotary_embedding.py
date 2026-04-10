@@ -67,8 +67,11 @@ def apply_rotary_pos_emb(
     Args:
         op: The OpBuilder.
         x: Input tensor of shape ``(batch_size, seq_length, num_heads * head_dim)``.
-        position_embeddings: Tuple of ``(cos, sin)`` embeddings, each
-            ``(batch_size, seq_length, rotary_dim)``.
+        position_embeddings: Tuple of ``(cos, sin)`` or ``(cos, sin, attn_scale)``
+            embeddings. The cos/sin tensors have shape
+            ``(batch_size, seq_length, rotary_dim)``. The optional attn_scale
+            (used by Ministral3/Mistral4) is not consumed here — it is applied
+            separately in the attention module after RoPE.
         num_heads: Number of attention heads.
         rotary_embedding_dim: Dimension for partial RoPE (0 = full embedding).
         interleaved: If True, use interleaved RoPE layout where real/imag
@@ -78,7 +81,7 @@ def apply_rotary_pos_emb(
     Returns:
         Tensor with RoPE applied, same shape as input.
     """
-    cos, sin = position_embeddings
+    cos, sin = position_embeddings[0], position_embeddings[1]
     return op.RotaryEmbedding(
         x,
         cos,
@@ -223,8 +226,13 @@ class LongRope(BaseRope):
 class YarnRope(BaseRope):
     """YaRN (Yet another RoPE extensioN) rotary embeddings.
 
-    Used by DeepSeek-V2/V3. Blends interpolated and extrapolated
-    frequencies with a linear ramp, and applies mscale attention factor.
+    Used by DeepSeek-V2/V3 and Ministral3 (Pixtral). Blends interpolated
+    and extrapolated frequencies with a linear ramp, and applies mscale
+    attention factor.
+
+    For Ministral3/Mistral4 models with ``llama_4_scaling_beta`` in
+    rope_scaling, ``forward()`` returns a 3-tuple ``(cos, sin, attn_scale)``
+    where ``attn_scale`` is a position-dependent query scaling factor.
 
     Reference: https://huggingface.co/papers/2309.00071
     """
@@ -290,6 +298,32 @@ class YarnRope(BaseRope):
             config.max_position_embeddings, inv_freq, attention_factor
         )
         super().__init__(cos_cache, sin_cache)
+
+        # Store llama_4_scaling_beta for Ministral3 position-dependent query scaling.
+        # When set, forward() returns (cos, sin, attn_scale) instead of (cos, sin).
+        self._llama4_beta = rope_scaling.get("llama_4_scaling_beta")
+        self._llama4_original_max_pos = float(original_max_pos)
+
+    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+        cos_sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
+        if self._llama4_beta is None:
+            return cos_sin
+
+        # Compute position-dependent attention scale for Ministral3/Mistral4:
+        #   scale = 1 + beta * log(1 + floor(position_ids / original_max_pos))
+        # For pos < original_max_pos: floor(pos / max) = 0 → scale = 1.0
+        # Computed in FP32 for precision, then cast to match model dtype.
+        pos_float = op.Cast(position_ids, to=ir.DataType.FLOAT)
+        floored = op.Floor(op.Div(pos_float, float(self._llama4_original_max_pos)))
+        log_term = op.Log(op.Add(floored, 1.0))
+        attn_scale = op.Add(op.Mul(log_term, float(self._llama4_beta)), 1.0)
+        # Cast to match model dtype (e.g. FP16) — cos_cache has the target dtype
+        cos_dtype = self.cos_cache.dtype
+        if cos_dtype is not None and cos_dtype != ir.DataType.FLOAT:
+            attn_scale = op.Cast(attn_scale, to=cos_dtype)
+        # Unsqueeze to [batch, seq_len, 1] for broadcasting with 3D query states
+        attn_scale = op.Unsqueeze(attn_scale, [-1])
+        return (cos_sin[0], cos_sin[1], attn_scale)
 
 
 class _MRopeBase(BaseRope):

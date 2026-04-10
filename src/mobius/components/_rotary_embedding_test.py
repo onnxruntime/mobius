@@ -254,3 +254,70 @@ class TestApplyRotaryPosEmb:
         cos, sin = get_rotary_pos_emb(op, pos_ids, cos_cache, sin_cache)
         assert cos is not None
         assert sin is not None
+
+
+class TestYarnRopeAttnScale:
+    """Tests for YarnRope with llama_4_attn_scale (Ministral3)."""
+
+    def test_yarn_without_attn_scale_returns_2tuple(self):
+        """Standard YaRN (no llama_4_scaling_beta) returns (cos, sin)."""
+        from mobius.components._rotary_embedding import YarnRope
+
+        config = make_config(
+            head_dim=128,
+            max_position_embeddings=16384,
+            rope_theta=1000000.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+            },
+        )
+        rope = YarnRope(config)
+        builder, op, _graph = create_test_builder()
+        pos_ids = create_test_input(builder, "pos_ids", [1, 4])
+        result = rope.forward(op, pos_ids)
+        assert len(result) == 2, "Without llama_4_scaling_beta, should return (cos, sin)"
+
+    def test_yarn_with_attn_scale_returns_3tuple(self):
+        """YaRN with llama_4_scaling_beta returns (cos, sin, attn_scale)."""
+        from mobius.components._rotary_embedding import YarnRope
+
+        config = make_config(
+            head_dim=128,
+            max_position_embeddings=262144,
+            rope_theta=1000000.0,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 16.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16384,
+                "llama_4_scaling_beta": 0.1,
+            },
+        )
+        rope = YarnRope(config)
+        builder, op, _graph = create_test_builder()
+        pos_ids = create_test_input(builder, "pos_ids", [1, 4])
+        result = rope.forward(op, pos_ids)
+        assert len(result) == 3, (
+            "With llama_4_scaling_beta, should return (cos, sin, attn_scale)"
+        )
+
+    def test_apply_rotary_pos_emb_ignores_3rd_element(self):
+        """apply_rotary_pos_emb should work with both 2-tuple and 3-tuple."""
+        builder, op, _graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 4, 64])
+        cos = create_test_input(builder, "cos", [1, 4, 8])
+        sin = create_test_input(builder, "sin", [1, 4, 8])
+        scale = create_test_input(builder, "scale", [1, 4, 1])
+
+        # 3-tuple should work — apply_rotary_pos_emb only uses [0] and [1]
+        result = apply_rotary_pos_emb(op, x, (cos, sin, scale), num_heads=4)
+        assert result is not None

@@ -24,6 +24,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._conv import Conv2dNoBias
@@ -174,17 +175,31 @@ class PixtralAttention(nn.Module):
             num_heads=self._num_heads,
         )
 
-        # Bidirectional attention (is_causal=0, no KV cache)
+        # Bidirectional attention (no causal mask, no KV cache).
+        # Use com.microsoft.MultiHeadAttention for all EPs that support
+        # custom-domain ops (it has fused kernels on CUDA/DML and runs
+        # correctly on CPU). Fall back to standard opset-23 Attention
+        # for onnx-standard EP which prohibits custom-domain ops.
         scale = float(1.0 / (self._head_dim**0.5))
-        attn_output = op.Attention(
-            q,
-            k,
-            v,
-            q_num_heads=self._num_heads,
-            kv_num_heads=self._num_heads,
-            scale=scale,
-            is_causal=0,
-        )
+        if ep_capabilities().name == "onnx-standard":
+            attn_output = op.Attention(
+                q,
+                k,
+                v,
+                q_num_heads=self._num_heads,
+                kv_num_heads=self._num_heads,
+                scale=scale,
+                is_causal=0,
+            )
+        else:
+            attn_output = op.MultiHeadAttention(
+                q,
+                k,
+                v,
+                num_heads=self._num_heads,
+                scale=scale,
+                _domain="com.microsoft",
+            )
         return self.o_proj(op, attn_output)
 
 
@@ -349,10 +364,15 @@ class Mistral3PatchMerger(nn.Module):
         )
         x = op.Reshape(hidden_states, shape_6d)
 
-        # Transpose: [batch, H/ms, W/ms, ms, ms, D]
-        x = op.Transpose(x, perm=[0, 1, 3, 2, 4, 5])
+        # Transpose to match HuggingFace F.unfold ordering (dim-major).
+        # F.unfold groups elements as [D, ms_h, ms_w] per spatial position,
+        # meaning the hidden dim D is the outermost loop. To reproduce
+        # this with reshape + transpose:
+        #   from: [batch, H/ms, ms, W/ms, ms, D]
+        #     to: [batch, H/ms, W/ms, D, ms, ms]
+        x = op.Transpose(x, perm=[0, 1, 3, 5, 2, 4])
 
-        # Flatten: [batch, (H/ms)*(W/ms), ms*ms*D]
+        # Flatten: [batch, (H/ms)*(W/ms), D*ms*ms]
         merged_count = op.Mul(h_m_1d, w_m_1d)
         shape_3d = op.Concat(
             batch,

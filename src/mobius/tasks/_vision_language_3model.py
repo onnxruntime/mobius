@@ -187,6 +187,57 @@ class HybridQwenVLTask(QwenVLTask):
         return ModelPackage(models, config=config)
 
 
+class PixtralVLTask(VisionLanguageTask):
+    """Vision-language task with dynamic-resolution Pixtral vision encoder.
+
+    Pixtral's internal computations (patch embedding, 2D RoPE, spatial merge)
+    are fully dynamic — grid_h and grid_w are derived from ``op.Shape()`` at
+    runtime.  This subclass replaces the static ``image_size`` input shape
+    with symbolic ``height`` / ``width`` dimensions so the exported ONNX
+    model accepts variable-resolution images.
+
+    Constraints (enforced at runtime, not in the graph):
+      - H, W ≥ ``patch_size * spatial_merge_size`` (28 for Pixtral)
+      - H, W ≤ ``image_size`` (1540 for Pixtral) due to RoPE cache limits
+    """
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build Pixtral vision encoder with dynamic HxW input."""
+        batch = ir.SymbolicDim("batch")
+        height = ir.SymbolicDim("height")
+        width = ir.SymbolicDim("width")
+
+        pixel_values = ir.Value(
+            name="pixel_values",
+            shape=ir.Shape([batch, 3, height, width]),
+            type=ir.TensorType(config.dtype),
+        )
+
+        graph_inputs = [pixel_values]
+
+        graph, graph_builder = _make_graph(graph_inputs, name="vision")
+        op = graph_builder.op
+
+        image_features = vision(
+            op,
+            pixel_values=pixel_values,
+        )
+
+        # Squeeze batch dim: [batch, num_patches, hidden] → [num_patches, hidden]
+        # The runtime (ort-genai) expects rank-2 vision features because the
+        # vision encoder always processes one image at a time.
+        image_features = op.Squeeze(image_features, [0])
+
+        image_features.name = "image_features"
+        graph.outputs.append(image_features)
+
+        return _make_model(graph)
+
+
 class MllamaVisionLanguageTask(VisionLanguageTask):
     """Mllama VL task with cross-attention KV caching.
 
