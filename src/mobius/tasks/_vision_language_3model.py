@@ -396,6 +396,11 @@ class PixtralVLTask(VisionLanguageTask):
             pixel_values=pixel_values,
         )
 
+        # Squeeze batch dim: [batch, num_patches, hidden] → [num_patches, hidden]
+        # The runtime (ort-genai) expects rank-2 vision features because the
+        # vision encoder always processes one image at a time.
+        image_features = op.Squeeze(image_features, [0])
+
         image_features.name = "image_features"
         graph.outputs.append(image_features)
 

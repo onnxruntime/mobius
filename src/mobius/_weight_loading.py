@@ -159,16 +159,18 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     bfloat16 values scaled into the FP8 range.
 
     This function detects FP8 tensors, applies the scale, and removes the
-    auxiliary ``weight_scale_inv`` and ``activation_scale`` tensors.
+    auxiliary ``weight_scale_inv``, ``activation_scale``, and
+    ``input_scale`` tensors.
 
     Returns:
-        A new dict with FP8 weights dequantized to bfloat16 and auxiliary
-        scale tensors removed.
+        A new dict with FP8 weights dequantized to bfloat16 and the
+        auxiliary scale tensors removed.  Always returns a new dict,
+        even when no FP8 weights are found.
     """
     fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
     fp8_keys = [k for k, v in state_dict.items() if v.dtype in fp8_dtypes]
     if not fp8_keys:
-        return state_dict
+        return dict(state_dict)
 
     # Work on a copy to avoid mutating the caller's dict
     result = dict(state_dict)
