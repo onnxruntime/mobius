@@ -140,7 +140,7 @@ class TestGenaiConfigGeneratorLLM:
         assert search["past_present_share_buffer"] is False
 
     def test_search_params_webgpu_sets_past_present_share_buffer(self):
-        """WebGPU EP sets past_present_share_buffer=True via EpCapabilities and caps max_length."""
+        """WebGPU EP sets supports_past_present_share_buffer=True via EpCapabilities and caps max_length."""
         gen = GenaiConfigGenerator(
             "qwen2",
             vocab_size=151936,
@@ -190,7 +190,7 @@ class TestGenaiConfigGeneratorLLM:
         assert config["search"]["past_present_share_buffer"] is False
 
     def test_search_params_custom_ep_with_share_buffer(self):
-        """A custom EP registered with past_present_share_buffer=True gets the flag set.
+        """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
 
         This proves the value comes from EpCapabilities, not from a hardcoded
         'ep == webgpu' check.
@@ -198,7 +198,7 @@ class TestGenaiConfigGeneratorLLM:
         from mobius._execution_providers import EpCapabilities, ep_registry
 
         ep_registry.register(
-            EpCapabilities(name="test-custom-ep", past_present_share_buffer=True),
+            EpCapabilities(name="test-custom-ep", supports_past_present_share_buffer=True),
             overwrite=True,
         )
         try:
