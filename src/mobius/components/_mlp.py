@@ -141,7 +141,7 @@ class FusedGateUpMLP(nn.Module):
         gate_up = self.gate_up_proj(op, x)
         # Split activations at intermediate_size boundary
         gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
-        # SwiGLU: act(gate) * up → down_proj
+        # gated activation (e.g. SiLU(gate) * up) → down_proj
         return self.down_proj(op, op.Mul(self.act_fn(op, gate), up))
 
 

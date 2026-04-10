@@ -297,5 +297,5 @@ class FusedGateUpCausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        # Replace TextModel with FusedGateUpMLP layers.
+        # Parameterize TextModel to use FusedGateUpMLP for each decoder layer.
         self.model = TextModel(config, mlp_class=FusedGateUpMLP)
