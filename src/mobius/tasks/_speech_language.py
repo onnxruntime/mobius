@@ -13,19 +13,20 @@ Used by Qwen3-ASR and Qwen3-ForcedAligner.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
-)
-from mobius.tasks._cache_utils import (
-    _make_kv_cache_inputs,
-    _register_kv_cache_outputs,
+    build_decoder_from_embeds,
+    build_embedding_from_features,
 )
 
 
@@ -41,17 +42,34 @@ class SpeechLanguageTask(ModelTask):
     Each sub-module is wired into its own ONNX graph.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {
+        "audio_encoder": "encoder",
+        "embedding": "embedding",
+        "decoder": "decoder",
+    }
+    components = ComponentSpec(
+        audio_encoder="audio_tower",
+        embedding="embedding",
+        decoder="decoder",
+    )
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
-
         models["audio_encoder"] = self._build_audio_encoder(module.audio_tower, config)
-        models["embedding"] = self._build_embedding(module.embedding, config)
-        models["decoder"] = self._build_decoder(module.decoder, config)
-
+        output_dim = (config.audio.output_dim if config.audio else None) or config.hidden_size
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="audio_features",
+            feature_dim=output_dim,
+        )
+        # MRoPE 3D position_ids (temporal, height, width)
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
         return ModelPackage(models, config=config)
 
     def _build_audio_encoder(
@@ -62,7 +80,7 @@ class SpeechLanguageTask(ModelTask):
         """Build audio encoder: mel (batch, n_mels, time) → audio features."""
         batch = ir.SymbolicDim("batch")
         mel_seq = ir.SymbolicDim("mel_sequence_len")
-        n_mels = config.audio.num_mel_bins or 128 if config.audio else 128
+        n_mels = (config.audio.num_mel_bins if config.audio else None) or 128
 
         input_features = ir.Value(
             name="input_features",
@@ -75,94 +93,4 @@ class SpeechLanguageTask(ModelTask):
 
         audio_features.name = "audio_features"
         graph.outputs.append(audio_features)
-        return _make_model(graph)
-
-    def _build_embedding(
-        self,
-        embedding: nn.Module,
-        config: ArchitectureConfig,
-    ) -> ir.Model:
-        """Build embedding: input_ids + audio_features → inputs_embeds."""
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
-        output_dim = (
-            config.audio.output_dim or config.hidden_size
-            if config.audio
-            else config.hidden_size
-        )
-
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        audio_features = ir.Value(
-            name="audio_features",
-            shape=ir.Shape([num_audio_tokens, output_dim]),
-            type=ir.TensorType(config.dtype),
-        )
-
-        graph, builder = _make_graph([input_ids, audio_features], name="embedding")
-        inputs_embeds = embedding(
-            builder.op,
-            input_ids=input_ids,
-            audio_features=audio_features,
-        )
-
-        inputs_embeds.name = "inputs_embeds"
-        graph.outputs.append(inputs_embeds)
-        return _make_model(graph)
-
-    def _build_decoder(
-        self,
-        decoder: nn.Module,
-        config: ArchitectureConfig,
-    ) -> ir.Model:
-        """Build decoder with MRoPE 3D position_ids."""
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        past_seq_len = ir.SymbolicDim("past_sequence_len")
-
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        # MRoPE: 3D position_ids (3, batch, seq_len)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([3, batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
-            config.num_hidden_layers,
-            config.num_key_value_heads,
-            config.head_dim,
-            config.dtype,
-            batch,
-            past_seq_len,
-        )
-        graph_inputs.extend(kv_inputs)
-
-        graph, builder = _make_graph(graph_inputs, name="decoder")
-        logits, present_key_values = decoder(
-            builder.op,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
-
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
         return _make_model(graph)

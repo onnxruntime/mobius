@@ -21,7 +21,6 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class DenoisingTask(ModelTask):
     """Build ONNX graph for diffusion denoising."""
 
-    name = "denoising"
     model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
@@ -58,4 +57,4 @@ class DenoisingTask(ModelTask):
         noise_pred.name = "noise_pred"
         graph.outputs.append(noise_pred)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)

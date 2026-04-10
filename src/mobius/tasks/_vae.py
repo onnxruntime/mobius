@@ -10,27 +10,30 @@ Builds a ModelPackage with separate "encoder" and "decoder" ONNX graphs:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._diffusers_configs import VAEConfig
 from mobius._model_package import ModelPackage
-from mobius.tasks._base import ModelTask, _make_graph, _make_model
+from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 
 
 class VAETask(ModelTask):
     """Build VAE encoder and decoder ONNX graphs."""
 
-    name = "vae"
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
 
     def build(
         self,
         module,
         config: VAEConfig,
     ) -> ModelPackage:
-        pkg = ModelPackage()
-        pkg["encoder"] = self._build_encoder_graph(module, config)
-        pkg["decoder"] = self._build_decoder_graph(module, config)
-        return pkg
+        self._validate_components(module)
+        encoder = self._build_encoder_graph(module, config)
+        decoder = self._build_decoder_graph(module, config)
+        return ModelPackage({"encoder": encoder, "decoder": decoder}, config=config)
 
     def _build_encoder_graph(
         self,
