@@ -548,20 +548,23 @@ Each tier uses a different number of exported ONNX models.
 | Large Image-Text-to-Text | 26B-A4B, 31B | 3 models: decoder + vision + embedding | `google/gemma-4-26B-A4B-it` |
 
 The task class detects which tier to use from the config (e.g. whether
-`audio_config` is present and non-null).
+`config.audio is not None` — `ArchitectureConfig.from_transformers` populates
+the `audio` field when the HuggingFace config contains an audio sub-config).
 
 ### 4-model task structure
 
 ```
 decoder          inputs_embeds [B, S, H] → logits + KV cache
-vision_encoder   pixel_values [B, N, patch_dim] → image_features [B, N, H]
-audio_encoder    input_features [B, T, mel] → audio_features [B, T', H]
-embedding        input_ids + image_features + audio_features → inputs_embeds
+vision_encoder   pixel_values [B, 3, H, W] → image_features [num_image_tokens, H]
+audio_encoder    input_features [B, T, mel] → audio_features [num_audio_tokens, H]
+embedding        input_ids + image_features + audio_features → inputs_embeds [B, S, H]
 ```
 
 Reference implementation: `Gemma4AnyToAnyTask` in
-`src/mobius/tasks/_gemma4.py`. This is the same 4-model split pattern as
-`Phi4MMMultiModalTask` in `src/mobius/tasks/_phi4mm.py`.
+`src/mobius/tasks/_gemma4.py`. This follows the same 4-model structural pattern as
+`Phi4MMMultiModalTask` in `src/mobius/tasks/_phi4mm_multimodal.py`
+(each modality is a separate ONNX model; embedding splices features at placeholder
+positions), though the exact I/O shapes differ per architecture.
 
 ### Audio encoder wiring
 

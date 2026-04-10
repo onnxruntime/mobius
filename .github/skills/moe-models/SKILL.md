@@ -291,7 +291,7 @@ router_probs = op.Softmax(op.MatMul(hidden_states, self.weight), axis=-1)
 ### Emission pattern (from Gemma 4 implementation)
 
 ```python
-from mobius._execution_providers import ep_capabilities
+from mobius._build_context import ep_capabilities
 
 caps = ep_capabilities()
 if caps.supports_fused_moe:
@@ -370,7 +370,8 @@ When `supports_fused_moe` is False, implement a static unroll:
 
 ```python
 def _dispatch_moe_fallback(self, op, hidden, router_probs):
-    top_weights, top_indices = op.TopK(router_probs, [self._top_k], axis=-1)
+    k_tensor = op.Constant(value_ints=[self._top_k])
+    top_weights, top_indices = op.TopK(router_probs, k_tensor, axis=-1)
     top_weights = op.Softmax(top_weights, axis=-1)   # renormalize
     output = op.CastLike(op.ConstantOfShape(op.Shape(hidden), value=0.0), hidden)
     for e_idx in range(self._num_experts):

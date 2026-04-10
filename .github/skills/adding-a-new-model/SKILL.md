@@ -848,8 +848,8 @@ exist for shared-layer indices — they simply won't be present.
 ```python
 def preprocess_weights(self, state_dict):
     # shared layers have no k/v proj — remove them silently if accidentally present
-    first_shared = config.num_hidden_layers - config.num_kv_shared_layers
-    for i in range(first_shared, config.num_hidden_layers):
+    first_shared = self.config.num_hidden_layers - self.config.num_kv_shared_layers
+    for i in range(first_shared, self.config.num_hidden_layers):
         for suffix in ("k_proj.weight", "v_proj.weight", "k_norm.weight"):
             state_dict.pop(f"model.layers.{i}.self_attn.{suffix}", None)
     return super().preprocess_weights(state_dict)
