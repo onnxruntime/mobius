@@ -115,7 +115,7 @@ class TestGenaiConfigGeneratorLLM:
         assert "pad_token_id" not in config["model"]
 
     def test_search_params_defaults(self):
-        """Search section has sensible defaults."""
+        """Search section has sensible defaults for CPU EP."""
         gen = GenaiConfigGenerator(
             "llama",
             vocab_size=32000,
@@ -124,15 +124,102 @@ class TestGenaiConfigGeneratorLLM:
             num_attention_heads=32,
             num_key_value_heads=8,
             head_dim=128,
+            context_length=8192,
         )
         config = gen.generate()
         search = config["search"]
-        assert search["do_sample"] is False
+        # Sampling is enabled by default for chat/generation use cases
+        assert search["do_sample"] is True
         assert search["num_beams"] == 1
         assert search["temperature"] == pytest.approx(1.0)
         assert search["top_k"] == 1
         assert search["top_p"] == pytest.approx(1.0)
+        # max_length tracks the model's context window
+        assert search["max_length"] == 8192
+        # CPU does not share past/present KV buffers
         assert search["past_present_share_buffer"] is False
+
+    def test_search_params_webgpu_sets_past_present_share_buffer(self):
+        """WebGPU EP sets supports_past_present_share_buffer=True via EpCapabilities and caps max_length."""
+        gen = GenaiConfigGenerator(
+            "qwen2",
+            vocab_size=151936,
+            hidden_size=896,
+            num_hidden_layers=24,
+            num_attention_heads=14,
+            num_key_value_heads=2,
+            head_dim=64,
+            ep="webgpu",
+            context_length=32768,
+        )
+        config = gen.generate()
+        assert config["search"]["past_present_share_buffer"] is True
+        # 32768 > 4096 cap, so max_length is capped to avoid pre-allocating huge KV cache
+        assert config["search"]["max_length"] == 4096
+
+    def test_search_params_webgpu_small_context_not_capped(self):
+        """WebGPU max_length is not capped when context_length <= 4096."""
+        gen = GenaiConfigGenerator(
+            "phi3",
+            vocab_size=32064,
+            hidden_size=3072,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            head_dim=96,
+            ep="webgpu",
+            context_length=2048,
+        )
+        config = gen.generate()
+        assert config["search"]["past_present_share_buffer"] is True
+        assert config["search"]["max_length"] == 2048
+
+    def test_search_params_cuda_does_not_share_buffer(self):
+        """CUDA EP does not set past_present_share_buffer by default."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            ep="cuda",
+        )
+        config = gen.generate()
+        assert config["search"]["past_present_share_buffer"] is False
+
+    def test_search_params_custom_ep_with_share_buffer(self):
+        """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
+
+        This proves the value comes from EpCapabilities, not from a hardcoded
+        'ep == webgpu' check.
+        """
+        from mobius._execution_providers import EpCapabilities, ep_registry
+
+        ep_registry.register(
+            EpCapabilities(name="test-custom-ep", supports_past_present_share_buffer=True),
+            overwrite=True,
+        )
+        try:
+            gen = GenaiConfigGenerator(
+                "llama",
+                vocab_size=32000,
+                hidden_size=4096,
+                num_hidden_layers=32,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                ep="test-custom-ep",
+                context_length=8192,
+            )
+            config = gen.generate()
+            assert config["search"]["past_present_share_buffer"] is True
+            # Buffer-sharing EP: max_length capped at 4096
+            assert config["search"]["max_length"] == 4096
+        finally:
+            # Clean up the test EP so it doesn't bleed into other tests
+            ep_registry._entries.pop("test-custom-ep", None)
 
     def test_session_options_present(self):
         """Decoder has session_options with log_id."""

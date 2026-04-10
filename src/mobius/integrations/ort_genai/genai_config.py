@@ -44,16 +44,39 @@ def _default_decoder_outputs() -> dict[str, str]:
     }
 
 
-def _default_search_params() -> dict[str, Any]:
-    """Return sensible default search parameters."""
+_SHARE_BUFFER_MAX_LENGTH_CAP = 4096
+
+
+def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
+    """Return sensible default search parameters.
+
+    Args:
+        ep: Execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``).  Capability flags are read from
+            :data:`~mobius._execution_providers.ep_registry`.
+        context_length: Model context window; used as the default
+            ``max_length`` for generation so the limit matches the model.
+    """
+    from mobius._execution_providers import ep_registry
+
+    caps = ep_registry.get(ep)
+    share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
+    if share_buffer:
+        # EPs that pre-allocate KV-cache for the full max_length at load time
+        # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
+        # buffers (~8 GB for 128K-token models) on consumer hardware.  Users
+        # can raise the limit in genai_config.json for their target device.
+        max_length = min(context_length, _SHARE_BUFFER_MAX_LENGTH_CAP)
+    else:
+        max_length = context_length
     return {
-        "do_sample": False,
+        "do_sample": True,
         "early_stopping": True,
-        "max_length": 4096,
+        "max_length": max_length,
         "min_length": 0,
         "num_beams": 1,
         "num_return_sequences": 1,
-        "past_present_share_buffer": False,
+        "past_present_share_buffer": share_buffer,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_k": 1,
@@ -347,7 +370,7 @@ class GenaiConfigGenerator:
 
         return {
             "model": model,
-            "search": _default_search_params(),
+            "search": _default_search_params(ep=self.ep, context_length=self.context_length),
         }
 
     def write(self, output_dir: str) -> str:
