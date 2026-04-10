@@ -248,11 +248,9 @@ def write_ort_genai_config(
         eos_token_id = getattr(hf_config, "eos_token_id", None)
         pad_token_id = getattr(hf_config, "pad_token_id", None)
     else:
-        # Fall back to model_type from the mobius ArchitectureConfig.
-        # This path is taken when hf_model_id is not provided, so HF config
-        # is unavailable. The ArchitectureConfig.model_type may be absent on
-        # older configs, producing 'unknown' — ORT-GenAI may reject it.
-        raw_type = getattr(config, "model_type", "unknown")
+        # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
+        # This path is taken when hf_model_id is not provided (e.g. --config mode).
+        raw_type = getattr(config, "model_type", None) or "unknown"
         ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
@@ -261,6 +259,13 @@ def write_ort_genai_config(
                 "the HuggingFace config, or the generated genai_config.json "
                 "may not load correctly."
             )
+        # Read token IDs from ArchitectureConfig (populated by from_transformers()
+        # when --config is used with a local directory).
+        bos_token_id = getattr(config, "bos_token_id", None)
+        eos_token_id = getattr(config, "eos_token_id", None)
+        # pad_token_id is in BaseModelConfig; map DEFAULT_INT sentinel to None
+        _pad = getattr(config, "pad_token_id", None)
+        pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
     # Detect multimodal capabilities from the package keys
     is_vlm = "vision" in pkg and "embedding" in pkg

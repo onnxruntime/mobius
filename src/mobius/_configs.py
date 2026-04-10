@@ -770,6 +770,12 @@ class ArchitectureConfig(BaseModelConfig):
     codec_encoder: CodecEncoderConfig | None = None
     quantization: QuantizationConfig | None = None
 
+    # HuggingFace model_type and special token IDs — populated by from_transformers()
+    # so that genai_config.json can be written without re-fetching the HF config.
+    model_type: str | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
@@ -846,6 +852,9 @@ class ArchitectureConfig(BaseModelConfig):
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
+            model_type=model_type,
+            bos_token_id=getattr(config, "bos_token_id", None),
+            eos_token_id=getattr(config, "eos_token_id", None),
             rms_norm_eps=(
                 getattr(config, "rms_norm_eps", None)
                 or getattr(config, "layer_norm_eps", None)
