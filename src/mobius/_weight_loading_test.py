@@ -461,6 +461,92 @@ class TestCorruptedFileHandling:
 
 
 # ===========================================================================
+# (6b) Weight tying — genuine ONNX initializer sharing
+# ===========================================================================
+
+
+class TestWeightTying:
+    """Verify that tied weights (lm_head = embed_tokens) share one ONNX initializer."""
+
+    def _build_tied_model(self) -> tuple[ir.Model, CausalLMModel]:
+        config = make_config(tie_word_embeddings=True)
+        module = CausalLMModel(config)
+        pkg = build_from_module(module, config)
+        return pkg["model"], module
+
+    def test_tied_weights_share_single_initializer(self):
+        """When tie_word_embeddings=True, lm_head.weight must NOT be a separate initializer."""
+        model, module = self._build_tied_model()
+        weight = torch.zeros(make_config().vocab_size, make_config().hidden_size)
+        sd = module.preprocess_weights({"model.embed_tokens.weight": weight})
+        assert sd["model.embed_tokens.weight"] is sd["lm_head.weight"], (
+            "preprocess_weights must produce the same tensor object for tied weights"
+        )
+
+        apply_weights(model, sd)
+
+        assert "lm_head.weight" not in model.graph.initializers, (
+            "lm_head.weight initializer should be removed — merged into embed_tokens"
+        )
+        assert "model.embed_tokens.weight" in model.graph.initializers, (
+            "embed_tokens initializer must remain as the canonical shared weight"
+        )
+
+    def test_untied_weights_have_separate_initializers(self):
+        """When tie_word_embeddings=False, both initializers remain independent."""
+        config = make_config(tie_word_embeddings=False)
+        module = CausalLMModel(config)
+        pkg = build_from_module(module, config)
+        model = pkg["model"]
+
+        vocab_size = config.vocab_size
+        hidden_size = config.hidden_size
+        sd = {
+            "model.embed_tokens.weight": torch.zeros(vocab_size, hidden_size),
+            "lm_head.weight": torch.zeros(vocab_size, hidden_size),
+        }
+        apply_weights(model, sd)
+
+        assert "model.embed_tokens.weight" in model.graph.initializers
+        assert "lm_head.weight" in model.graph.initializers
+
+    def test_tied_model_initializer_count_lower_than_untied(self):
+        """Tied model must have fewer initializers than untied (one embed weight, not two)."""
+        from mobius._testing import make_config as mc
+
+        config_tied = mc(tie_word_embeddings=True)
+        module_tied = CausalLMModel(config_tied)
+        pkg_tied = build_from_module(module_tied, config_tied)
+        model_tied = pkg_tied["model"]
+        sd_tied = module_tied.preprocess_weights(
+            {
+                "model.embed_tokens.weight": torch.zeros(
+                    config_tied.vocab_size, config_tied.hidden_size
+                )
+            }
+        )
+        apply_weights(model_tied, sd_tied)
+
+        config_untied = mc(tie_word_embeddings=False)
+        module_untied = CausalLMModel(config_untied)
+        pkg_untied = build_from_module(module_untied, config_untied)
+        model_untied = pkg_untied["model"]
+        sd_untied = {
+            "model.embed_tokens.weight": torch.zeros(
+                config_untied.vocab_size, config_untied.hidden_size
+            ),
+            "lm_head.weight": torch.zeros(config_untied.vocab_size, config_untied.hidden_size),
+        }
+        apply_weights(model_untied, sd_untied)
+
+        n_tied = len(model_tied.graph.initializers)
+        n_untied = len(model_untied.graph.initializers)
+        assert n_tied < n_untied, (
+            f"Tied model should have fewer initializers ({n_tied}) than untied ({n_untied})"
+        )
+
+
+# ===========================================================================
 # (6) build_from_module contract preservation
 # ===========================================================================
 
