@@ -121,9 +121,20 @@ class TestCopyTokenizerFilesFromLocal:
         copied = _copy_tokenizer_files_from_local(str(src), str(dst))
         assert copied == []
 
+    def test_missing_source_dir_warns_and_returns_empty(self, tmp_path, caplog):
+        """Non-existent source_dir emits a warning and returns empty list."""
+        import logging
 
-class TestWriteOrtGenaiConfigLocalPath:
-    """Tests for write_ort_genai_config with local_config_path."""
+        dst = tmp_path / "output"
+        dst.mkdir()
+        with caplog.at_level(logging.WARNING, logger="mobius.integrations.ort_genai.auto_export"):
+            copied = _copy_tokenizer_files_from_local(str(tmp_path / "nonexistent"), str(dst))
+        assert copied == []
+        assert "does not exist" in caplog.text
+
+
+class TestWriteOrtGenaiConfigLocalDir:
+    """Tests for write_ort_genai_config with local_config_dir."""
 
     @staticmethod
     def _make_pkg():
@@ -144,8 +155,8 @@ class TestWriteOrtGenaiConfigLocalPath:
 
         return ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
 
-    def test_local_config_path_copies_tokenizer_files(self, tmp_path):
-        """When local_config_path is set, tokenizer files are copied from it."""
+    def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
+        """When local_config_dir is set, tokenizer files are copied from it."""
         src = tmp_path / "local_model"
         src.mkdir()
         (src / "tokenizer.json").write_text('{"local": true}')
@@ -158,15 +169,15 @@ class TestWriteOrtGenaiConfigLocalPath:
         result = write_ort_genai_config(
             pkg,
             str(out),
-            local_config_path=str(src),
+            local_config_dir=str(src),
         )
 
         assert "tokenizer.json" in result
         assert (out / "tokenizer.json").read_text() == '{"local": true}'
         assert "tokenizer_config.json" in result
 
-    def test_hf_model_id_takes_precedence_over_local_path(self, tmp_path):
-        """When both hf_model_id and local_config_path are set, HF takes precedence."""
+    def test_hf_model_id_takes_precedence_over_local_dir(self, tmp_path):
+        """When both hf_model_id and local_config_dir are set, HF takes precedence."""
         src = tmp_path / "local_model"
         src.mkdir()
         (src / "tokenizer.json").write_text('{"local": true}')
@@ -199,7 +210,7 @@ class TestWriteOrtGenaiConfigLocalPath:
                 pkg,
                 str(out),
                 hf_model_id="meta-llama/Llama-3-8B",
-                local_config_path=str(src),
+                local_config_dir=str(src),
             )
 
         mock_hf.assert_called_once()

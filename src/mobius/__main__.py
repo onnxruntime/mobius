@@ -238,13 +238,13 @@ def _save_package(
         ep = getattr(args, "execution_provider", "cpu")
         # When --config (local dir) is used instead of --model, copy tokenizer
         # files from the local directory rather than downloading from HF.
-        local_config_path = getattr(args, "config", None)
+        local_config_dir = getattr(args, "config", None)
         artifacts = write_ort_genai_config(
             pkg,
             output_dir,
             hf_model_id=hf_model_id,
             ep=ep,
-            local_config_path=local_config_path,
+            local_config_dir=local_config_dir,
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")

@@ -111,6 +111,12 @@ def _copy_tokenizer_files_from_local(
 
     Returns list of copied filenames.
     """
+    if not os.path.isdir(source_dir):
+        logger.warning(
+            "Local tokenizer source directory does not exist: %s — no tokenizer files copied.",
+            source_dir,
+        )
+        return []
     tokenizer_files = [
         "tokenizer.json",
         "tokenizer_config.json",
@@ -212,7 +218,7 @@ def write_ort_genai_config(
     hf_model_id: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
-    local_config_path: str | None = None,
+    local_config_dir: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -229,14 +235,14 @@ def write_ort_genai_config(
         hf_model_id: HuggingFace model ID. When provided, used to fetch token
             IDs (``bos``/``eos``/``pad``) and download tokenizer files.
             When ``None``, token IDs default to ``None`` and tokenizer files
-            are not copied unless ``local_config_path`` is set.
+            are not copied unless ``local_config_dir`` is set.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
         context_length: Minimum context length written to
             ``genai_config.json``. Overridden upward by
             ``max_position_embeddings`` from ``pkg.config``.
-        local_config_path: Path to a local model directory. When provided
+        local_config_dir: Path to a local model directory. When provided
             and ``hf_model_id`` is ``None``, tokenizer files are copied from
             this directory instead of downloaded from HuggingFace Hub.
             Typically set when the CLI ``--config`` flag points to a local
@@ -326,25 +332,23 @@ def write_ort_genai_config(
 
     result: dict[str, str] = {"genai_config": genai_path}
 
-    # Copy tokenizer files — from HuggingFace Hub or local directory
+    # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
+    # for --config mode where no HF model ID is available.
     if hf_model_id is not None:
         logger.info("Copying tokenizer files from %s", hf_model_id)
         tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
-    elif local_config_path is not None:
-        if not os.path.isdir(local_config_path):
-            raise ValueError(
-                f"local_config_path must be an existing directory: {local_config_path}"
-            )
-        logger.info("Copying tokenizer files from local path %s", local_config_path)
-        tokenizer_files = _copy_tokenizer_files_from_local(local_config_path, directory)
+    elif local_config_dir is not None:
+        logger.info("Copying tokenizer files from local directory %s", local_config_dir)
+        tokenizer_files = _copy_tokenizer_files_from_local(local_config_dir, directory)
         if not tokenizer_files:
             logger.warning(
-                "No tokenizer files were copied from local path %s. "
+                "No tokenizer files were copied from local directory %s. "
                 "The export may be missing tokenizer artifacts required by ORT-GenAI.",
-                local_config_path,
+                local_config_dir,
             )
+
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
