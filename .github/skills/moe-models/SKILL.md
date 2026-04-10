@@ -260,3 +260,123 @@ should be small enough for CI (~1-4B params).  The test pattern:
 3. Optionally test greedy generation (token-ID matching)
 
 See `tests/moe_integration_test.py` for the complete pattern.
+
+## Direct MoE op emission (com.microsoft.MoE)
+
+OnnxRuntime ships a fused `com.microsoft.MoE` contrib op (CUDA float32/fp16/bf16,
+CPU float32/fp16). For new model architectures, **emit it directly** — like
+`com.microsoft.GroupQueryAttention` — rather than relying on a rewrite rule.
+
+### When to use
+
+Use `com.microsoft.MoE` when:
+- The model uses top-k MoE routing (standard softmax gate → TopK)
+- All expert weights are the same shape (no dynamic expert counts)
+- The EP's `caps.supports_fused_moe` is `True`
+
+Fall back to the loop-over-experts path when `supports_fused_moe` is `False`
+(CPU EP without contrib ops, or EPs that don't support the custom op).
+
+### Gate output: full pre-topk router_probs
+
+The op takes the **full** `(num_tokens, num_experts)` probability tensor and
+performs top-k selection internally via the `k` attribute. The gate must
+produce the full softmax distribution — not already-selected top-k indices.
+
+```python
+# In your gate forward(), return shape [num_tokens, num_experts]
+router_probs = op.Softmax(op.MatMul(hidden_states, self.weight), axis=-1)
+```
+
+### Emission pattern (from Gemma 4 implementation)
+
+```python
+from mobius._execution_providers import ep_capabilities
+
+caps = ep_capabilities()
+if caps.supports_fused_moe:
+    moe_out = op.CastLike(
+        op.MoE(                        # type: ignore[attr-defined]
+            normed_hidden,             # [num_tokens, hidden_size]
+            router_probs,              # [num_tokens, num_experts] — full pre-topk
+            self.fc1_experts_weights,  # [E, inter_size, hidden_size]
+            self.fc2_experts_weights,  # [E, hidden_size, inter_size]
+            activation_type="silu",
+            k=self._top_k,
+            normalize_routing_weights=1,
+            _domain="com.microsoft",
+        ),
+        normed_hidden,  # CastLike: preserve bf16/fp16/fp32 — NOT hardcoded float32
+    )
+else:
+    moe_out = self._dispatch_moe_fallback(op, normed_hidden, router_probs)
+```
+
+**Critical: use `CastLike` after the MoE op.** The `com.microsoft.MoE` custom
+op has `type=None` on its output — ONNX type propagation cannot infer the
+output dtype. `op.CastLike(moe_output, target=input)` restores the correct
+dtype (bf16/fp16/fp32), which allows downstream ops to share scalar
+initializers and avoids hard-coded `Cast` to float32.
+
+### preprocess_weights: expert weight mapping
+
+HuggingFace Gemma 4 stores experts as a 3D tensor per projection:
+`layers.N.experts.gate_up_proj [E, 2*inter, H]`
+`layers.N.experts.down_proj    [E, H, inter]`
+
+Map these to the parameter names used by the ONNX MoE op:
+
+```python
+def preprocess_weights(self, state_dict):
+    for key in list(state_dict.keys()):
+        if ".experts.gate_up_proj" in key:
+            new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+        elif ".experts.down_proj" in key:
+            new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+    return super().preprocess_weights(state_dict)
+```
+
+For models that store per-expert weights separately (one matrix per expert),
+stack them into 3D tensors in `preprocess_weights`:
+
+```python
+n = config.num_local_experts
+gate = torch.stack([state_dict.pop(f"experts.{i}.gate_proj.weight") for i in range(n)])
+down = torch.stack([state_dict.pop(f"experts.{i}.down_proj.weight") for i in range(n)])
+state_dict["fc1_experts_weights"] = gate   # [E, inter, hidden]
+state_dict["fc2_experts_weights"] = down   # [E, hidden, inter]
+```
+
+### EP capability check (matches GQA pattern)
+
+```python
+# In _execution_providers.py EpCapabilities:
+supports_fused_moe: bool = True  # set False for EPs without com.microsoft.MoE
+
+# In model forward():
+from mobius._execution_providers import ep_capabilities
+caps = ep_capabilities()
+if caps.supports_fused_moe:
+    # emit com.microsoft.MoE
+else:
+    # fallback loop
+```
+
+### Fallback: TopKGate + loop dispatch
+
+When `supports_fused_moe` is False, implement a static unroll:
+
+```python
+def _dispatch_moe_fallback(self, op, hidden, router_probs):
+    top_weights, top_indices = op.TopK(router_probs, [self._top_k], axis=-1)
+    top_weights = op.Softmax(top_weights, axis=-1)   # renormalize
+    output = op.CastLike(op.ConstantOfShape(op.Shape(hidden), value=0.0), hidden)
+    for e_idx in range(self._num_experts):
+        w1 = op.Squeeze(op.Gather(self.fc1_experts_weights, [e_idx], axis=0), [0])
+        w2 = op.Squeeze(op.Gather(self.fc2_experts_weights, [e_idx], axis=0), [0])
+        # expert output, gated by routing weight
+        ...
+    return output
+```
