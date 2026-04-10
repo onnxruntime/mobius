@@ -43,7 +43,6 @@ from mobius.components import (
     Mamba2Block,
     RMSNorm,
     create_padding_mask,
-    initialize_rope,
 )
 
 if TYPE_CHECKING:
@@ -228,7 +227,6 @@ class _NemotronHTextModel(nn.Module):
                 self.layers.append(NemotronHAttentionLayer(config))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
 
     def forward(
         self,
@@ -239,8 +237,10 @@ class _NemotronHTextModel(nn.Module):
         past_key_values: list | None = None,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
 
+        # NemotronH does NOT use positional embeddings.  The HF reference
+        # (NemotronHAttention.forward) applies no rotary encoding — the
+        # model relies on Mamba layers' inherent position-awareness.
         attention_bias = create_padding_mask(
             op,
             input_ids=input_ids,
@@ -254,7 +254,7 @@ class _NemotronHTextModel(nn.Module):
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias,
-                position_embeddings=position_embeddings,
+                position_embeddings=None,
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
