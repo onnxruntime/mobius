@@ -127,7 +127,9 @@ class TestCopyTokenizerFilesFromLocal:
 
         dst = tmp_path / "output"
         dst.mkdir()
-        with caplog.at_level(logging.WARNING, logger="mobius.integrations.ort_genai.auto_export"):
+        with caplog.at_level(
+            logging.WARNING, logger="mobius.integrations.ort_genai.auto_export"
+        ):
             copied = _copy_tokenizer_files_from_local(str(tmp_path / "nonexistent"), str(dst))
         assert copied == []
         assert "does not exist" in caplog.text
