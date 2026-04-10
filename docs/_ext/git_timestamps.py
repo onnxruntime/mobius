@@ -8,13 +8,12 @@ For every documentation source file, ``git log --follow`` is queried to find:
 * **Created** - date of the first commit that introduced the file.
 * **Updated** - date of the most-recent commit that touched the file.
 
-Both dates are formatted as ``YYYY-MM-DD`` (UTC) and injected into the Jinja2
-template context as ``git_created_date`` and ``git_updated_date``.  The
-companion template override (``docs/_templates/page.html``) renders them at
-the bottom of every article.
+Both dates are formatted as ``YYYY-MM-DD`` (UTC) and inserted into the
+doctree as a raw HTML node immediately after the page's top-level ``<h1>``
+title, so they appear below the document title on every page.
 
 Pages that have no git history (e.g. auto-generated files that are never
-committed) receive empty strings and the template silently omits the section.
+committed) are silently skipped.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from docutils import nodes
 from sphinx.application import Sphinx
 
 logger = logging.getLogger(__name__)
@@ -84,23 +84,18 @@ def _git_file_dates(rel_path: str, repo_root: str) -> tuple[str, str]:
     return _fmt(lines[-1]), _fmt(lines[0])
 
 
-def _on_html_page_context(
-    app: Sphinx,
-    pagename: str,
-    templatename: str,
-    context: dict[str, Any],
-    doctree: Any,
-) -> None:
-    """``html-page-context`` handler: inject git dates into the template context."""
-    env = app.env
+def _on_doctree_resolved(app: Sphinx, doctree: nodes.document, docname: str) -> None:
+    """``doctree-resolved`` handler: insert git timestamps after the page title.
 
-    # Only process pages that correspond to real source files.
-    if pagename not in env.all_docs:
-        context["git_created_date"] = ""
-        context["git_updated_date"] = ""
+    A raw HTML node is inserted at position 1 in the first top-level section
+    (index 0 is always the title node), so the dates appear directly below the
+    ``<h1>`` heading in the rendered output.
+    """
+    if app.builder.format != "html":
         return
 
-    docpath = Path(env.doc2path(pagename, base=True)).resolve()
+    env = app.env
+    docpath = Path(env.doc2path(docname, base=True)).resolve()
     repo_root = _git_repo_root(app.srcdir)
 
     try:
@@ -111,17 +106,38 @@ def _on_html_page_context(
             docpath,
             repo_root,
         )
-        context["git_created_date"] = ""
-        context["git_updated_date"] = ""
         return
 
     created, updated = _git_file_dates(rel_path, repo_root)
-    context["git_created_date"] = created
-    context["git_updated_date"] = updated
+    if not created and not updated:
+        return
+
+    # Build the HTML snippet
+    parts: list[str] = []
+    if created:
+        parts.append(
+            f'<span class="git-created-date">'
+            f"<strong>Created:</strong> <time>{created}</time>"
+            f"</span>"
+        )
+    if updated:
+        parts.append(
+            f'<span class="git-updated-date">'
+            f"<strong>Last updated:</strong> <time>{updated}</time>"
+            f"</span>"
+        )
+    html = '<div class="page-git-timestamps">' + " · ".join(parts) + "</div>"
+    raw_node = nodes.raw("", html, format="html")
+
+    # Insert after the title node (index 0) of the first top-level section
+    for section in doctree.traverse(nodes.section):
+        if section.children and isinstance(section.children[0], nodes.title):
+            section.insert(1, raw_node)
+        break
 
 
 def setup(app: Sphinx) -> dict[str, Any]:
-    app.connect("html-page-context", _on_html_page_context)
+    app.connect("doctree-resolved", _on_doctree_resolved)
     return {
         "version": "0.1",
         "parallel_read_safe": True,
