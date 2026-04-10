@@ -17,11 +17,12 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_fused_qkv, split_gate_up_proj
+from mobius._weight_utils import split_fused_qkv
 from mobius.components import (
     FCMLP,
     ConformerEncoder,
     Embedding,
+    FusedGateUpMLP,
     InputMixer,
     LayerNorm,
     Linear,
@@ -241,7 +242,7 @@ class _LoRATextModel(TextModel):
         )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=lora_factory)
+                DecoderLayer(config, linear_class=lora_factory, mlp_class=FusedGateUpMLP)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -252,9 +253,17 @@ class _LoRATextModel(TextModel):
 def _preprocess_phi4mm_weights(
     config: ArchitectureConfig, state_dict: dict[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
-    """Shared weight preprocessing for Phi4MM models (LoRA + fused weight splitting)."""
-    intermediate_size = config.intermediate_size
+    """Shared weight preprocessing for Phi4MM models (LoRA + fused QKV splitting).
 
+    Handles:
+    - Stripping ``base_layer.`` from LoRA-wrapped weight names
+    - Splitting fused ``qkv_proj`` into separate q/k/v weights
+
+    ``gate_up_proj`` is NOT split here — the model uses
+    :class:`~mobius.models.base.FusedGateUpCausalLMModel` which keeps the
+    fused weight and splits activations in the MLP forward pass instead.
+    LoRA weights on ``gate_up_proj`` are passed through unchanged.
+    """
     # Strip "base_layer." from LoRA-wrapped weight names
     # HF stores e.g. "qkv_proj.base_layer.weight" → we need "qkv_proj.weight"
     for key in list(state_dict.keys()):
@@ -302,33 +311,8 @@ def _preprocess_phi4mm_weights(
             state_dict[f"{base}k_proj.{suffix}"] = w.clone()
             state_dict[f"{base}v_proj.{suffix}"] = w.clone()
 
-        # Split gate_up_proj base weight/bias
-        elif (
-            "gate_up_proj.weight" in key or "gate_up_proj.bias" in key
-        ) and "lora" not in key:
-            w = state_dict.pop(key)
-            base = key.split("gate_up_proj.")[0]
-            suffix = key.split("gate_up_proj.")[1]
-            gate, up = split_gate_up_proj(w, intermediate_size)
-            state_dict[f"{base}gate_proj.{suffix}"] = gate
-            state_dict[f"{base}up_proj.{suffix}"] = up
-
-        # Split gate_up_proj LoRA B weights (output dim split)
-        elif "gate_up_proj.lora_B." in key:
-            w = state_dict.pop(key)
-            base = key.split("gate_up_proj.")[0]
-            suffix = key.split("gate_up_proj.")[1]
-            gate, up = split_gate_up_proj(w, intermediate_size)
-            state_dict[f"{base}gate_proj.{suffix}"] = gate
-            state_dict[f"{base}up_proj.{suffix}"] = up
-
-        # Split gate_up_proj LoRA A weights (same A for gate/up)
-        elif "gate_up_proj.lora_A." in key:
-            w = state_dict.pop(key)
-            base = key.split("gate_up_proj.")[0]
-            suffix = key.split("gate_up_proj.")[1]
-            state_dict[f"{base}gate_proj.{suffix}"] = w
-            state_dict[f"{base}up_proj.{suffix}"] = w.clone()
+        # gate_up_proj weights (base and LoRA) pass through unchanged —
+        # FusedGateUpMLP keeps the fused weight and splits activations.
 
     # Weight tying
     if config.tie_word_embeddings:
@@ -522,7 +506,7 @@ class _Phi4MMMultiModalTextModel(nn.Module):
         self.embed_tokens_extend = _Phi4MMImageAudioEmbedding(config)
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=lora_factory)
+                DecoderLayer(config, linear_class=lora_factory, mlp_class=FusedGateUpMLP)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -756,7 +740,7 @@ class _Phi4MMDecoderModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=lora_factory)
+                DecoderLayer(config, linear_class=lora_factory, mlp_class=FusedGateUpMLP)
                 for _ in range(config.num_hidden_layers)
             ]
         )

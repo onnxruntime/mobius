@@ -24,56 +24,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._attention import StaticCacheState
 from mobius.components._decoder import DecoderLayer
+from mobius.components._mlp import FusedGateUpMLP
 from mobius.components._rms_norm import RMSNorm
-from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.base import CausalLMModel, FusedGateUpCausalLMModel, TextModel
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def _split_gate_up_proj(
-    state_dict: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Split fused ``gate_up_proj`` into separate ``gate_proj`` + ``up_proj``.
-
-    HF GLM/GLM4 store: ``mlp.gate_up_proj.weight`` [2*intermediate, hidden]
-    ONNX MLP expects: ``mlp.gate_proj.weight`` [intermediate, hidden]
-                      ``mlp.up_proj.weight``   [intermediate, hidden]
-    """
-    new_state_dict: dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        if ".mlp.gate_up_proj." in key:
-            # Split along dim 0: first half = gate, second half = up
-            mid = value.shape[0] // 2
-            gate_key = key.replace(".gate_up_proj.", ".gate_proj.")
-            up_key = key.replace(".gate_up_proj.", ".up_proj.")
-            new_state_dict[gate_key] = value[:mid]
-            new_state_dict[up_key] = value[mid:]
-        else:
-            new_state_dict[key] = value
-    return new_state_dict
-
-
-class GlmCausalLMModel(CausalLMModel):
+class GlmCausalLMModel(FusedGateUpCausalLMModel):
     """GLM text model (standard pre-norm + fused gate_up_proj).
 
     GLM is architecturally identical to LLaMA except for the fused
-    ``gate_up_proj`` in the MLP.  ``preprocess_weights`` splits it into
-    separate ``gate_proj`` + ``up_proj`` tensors.
+    ``gate_up_proj`` in the MLP.  The weight stays fused; activations
+    are split in the MLP forward pass (see
+    :class:`~mobius.models.base.FusedGateUpCausalLMModel`).
     """
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        state_dict = _split_gate_up_proj(state_dict)
-        return super().preprocess_weights(state_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +74,8 @@ class Glm4DecoderLayer(DecoderLayer):
     """
 
     def __init__(self, config: ArchitectureConfig):
-        # Initialize the base DecoderLayer (pre-norm mode) to get
-        # input_layernorm, post_attention_layernorm, self_attn, mlp.
-        super().__init__(config)
+        # Initialize the base DecoderLayer with FusedGateUpMLP
+        super().__init__(config, mlp_class=FusedGateUpMLP)
 
         # Add the two extra post-sub-layer norms
         self.post_self_attn_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -156,8 +127,9 @@ class Glm4DecoderLayer(DecoderLayer):
 class Glm4CausalLMModel(CausalLMModel):
     """GLM4 text model (4-norm decoder + fused gate_up_proj).
 
-    Uses ``Glm4DecoderLayer`` with pre+post norms on both sub-layers,
-    and splits the fused ``gate_up_proj`` in ``preprocess_weights``.
+    Uses ``Glm4DecoderLayer`` with pre+post norms on both sub-layers.
+    ``gate_up_proj`` is kept fused — activations are split in the MLP
+    forward pass (via :class:`FusedGateUpMLP` in ``Glm4DecoderLayer``).
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -168,12 +140,6 @@ class Glm4CausalLMModel(CausalLMModel):
         from mobius.components import Linear
 
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        state_dict = _split_gate_up_proj(state_dict)
-        return super().preprocess_weights(state_dict)
 
 
 class Glm4TextModel(TextModel):
