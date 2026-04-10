@@ -195,8 +195,10 @@ def write_ort_genai_config(
         directory: Output directory (created if needed).
         hf_model_id: HuggingFace model ID. When provided, used to fetch token
             IDs (``bos``/``eos``/``pad``) and download tokenizer files.
-            When ``None``, token IDs default to ``None`` and tokenizer files
-            are not copied.
+            When ``None``, token IDs are read from ``pkg.config`` fields
+            (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
+            by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
+            and tokenizer files are not copied.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
@@ -254,10 +256,11 @@ def write_ort_genai_config(
         ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
-                "Could not determine ORT-GenAI model type: pkg.config has no "
-                "'model_type' attribute. Pass hf_model_id to resolve it from "
-                "the HuggingFace config, or the generated genai_config.json "
-                "may not load correctly."
+                "Could not determine ORT-GenAI model type: pkg.config.model_type "
+                "is missing, None, or not mapped to an ORT-GenAI type (got %r). "
+                "Pass hf_model_id to resolve it from the HuggingFace config, or "
+                "the generated genai_config.json may not load correctly.",
+                raw_type,
             )
         # Read token IDs from ArchitectureConfig (populated by from_transformers()
         # when --config is used with a local directory).
