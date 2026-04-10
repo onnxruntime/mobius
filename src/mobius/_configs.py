@@ -1606,6 +1606,17 @@ class Mamba2Config(BaseModelConfig):
     use_conv_bias: bool = True
     norm_before_gate: bool = True
 
+    def __post_init__(self):
+        # Mamba2 requires d_inner = num_heads * head_dim.
+        if self.intermediate_size != DEFAULT_INT:
+            expected = self.num_heads * self.head_dim
+            if self.intermediate_size != expected:
+                raise ValueError(
+                    f"Mamba2Config: intermediate_size ({self.intermediate_size}) "
+                    f"must equal num_heads * head_dim "
+                    f"({self.num_heads} * {self.head_dim} = {expected})."
+                )
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Mamba2Config:
         del parent_config  # unused
