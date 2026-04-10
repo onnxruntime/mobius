@@ -115,8 +115,6 @@ def test_patch_merger_matches_hf_unfold_ordering():
     the outermost loop). The ONNX implementation must reproduce this
     ordering so the learned ``merging_layer`` projection is correct.
     """
-    import tempfile
-
     import torch
     from onnxscript._internal.builder import GraphBuilder
 
@@ -181,17 +179,21 @@ def test_patch_merger_matches_hf_unfold_ordering():
 
     model = ir.Model(graph, ir_version=11)
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=True) as f:
-        ir.save(model, f.name)
-        sess = ort.InferenceSession(f.name, providers=["CPUExecutionProvider"])
-        onnx_out = sess.run(
-            None,
-            {
-                "x": x,
-                "grid_h": np.array(grid_h, dtype=np.int64),
-                "grid_w": np.array(grid_w, dtype=np.int64),
-            },
-        )[0]
+    # Serialize to protobuf in-memory (avoids Windows PermissionError
+    # from concurrent file access with tempfile + ir.save).
+    proto = ir.serde.serialize_model(model)
+    sess = ort.InferenceSession(
+        proto.SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+    onnx_out = sess.run(
+        None,
+        {
+            "x": x,
+            "grid_h": np.array(grid_h, dtype=np.int64),
+            "grid_w": np.array(grid_w, dtype=np.int64),
+        },
+    )[0]
 
     np.testing.assert_allclose(
         onnx_out.squeeze(0),
