@@ -632,13 +632,15 @@ def main():
         build_flags = {}
         if args.device == "cuda":
             build_flags["ort_cuda_grouped_rmsnorm_workaround"] = True
-        print(f"Building model for {args.model!r} (dtype={args.dtype}) ...")
+        ep = "cuda" if args.device == "cuda" else "cpu"
+        print(f"Building model for {args.model!r} (dtype={args.dtype}, ep={ep}) ...")
         with override_flags(**build_flags):
             pkg = build(
                 args.model,
                 dtype=args.dtype,
                 load_weights=True,
                 trust_remote_code=True,
+                execution_provider=ep,
             )
         config = pkg.config
 
