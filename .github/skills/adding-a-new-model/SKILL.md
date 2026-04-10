@@ -870,12 +870,12 @@ class Gemma4Attention(nn.Module):
             self.kv_shared_layer_index = (
                 len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
-            self.provides_shared_kv = False
+            self.store_full_length_kv = False
         else:
             self.kv_shared_layer_index = None
             # True for the last non-shared layer of each type that has downstream
             # KV-shared layers depending on it — it stores K,V for reuse.
-            self.provides_shared_kv = first_kv_shared_idx > 0 and (
+            self.store_full_length_kv = first_kv_shared_idx > 0 and (
                 layer_idx
                 == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
@@ -919,7 +919,7 @@ def forward(self, op, hidden_states, ..., shared_kv_states, past_key_value):
 
     hidden_out, present_kv = _apply_attention(op, query_states, key_states, ...)
 
-    if self.provides_shared_kv:
+    if self.store_full_length_kv:
         # Store present_kv [B, kv_heads, total_seq, head_dim] for downstream shared layers
         shared_kv_states[self.layer_idx] = (present_kv_key, present_kv_value)
 
