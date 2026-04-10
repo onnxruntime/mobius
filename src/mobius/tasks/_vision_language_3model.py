@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Vision-language 3-model split tasks.
 
@@ -19,9 +19,11 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
+    _make_model,
+)
+from mobius.tasks._cache_utils import (
     _make_hybrid_cache_inputs,
     _make_kv_cache_inputs,
-    _make_model,
     _register_hybrid_cache_outputs,
     _register_kv_cache_outputs,
     _register_linear_attention_functions,

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Shared test configurations for all test tiers.
 
@@ -548,7 +548,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("minicpm", {}, True),
     ("minicpm3", {}, True),
-    ("mistral3", {}, False),
     ("openelm", {}, True),
     (
         "persimmon",

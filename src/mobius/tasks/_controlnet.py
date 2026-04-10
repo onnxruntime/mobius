@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ControlNet task: produces residuals for UNet conditioning."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -20,6 +22,7 @@ class ControlNetTask(ModelTask):
     """Build ONNX graph for ControlNet residual generation."""
 
     name = "controlnet"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

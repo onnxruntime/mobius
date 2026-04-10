@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Defensive security regression tests for the weight loading path.
 
@@ -280,21 +280,25 @@ class TestPathTraversalPrevention:
         assert not basename.startswith("/")
 
     def test_apply_weights_only_modifies_existing_initializers(self):
-        """apply_weights must not create new initializers — only update existing ones."""
-        model, _init_names = _build_model_with_weights()
-        original_count = len(model.graph.initializers)
+        """apply_weights must not inject initializers keyed by untrusted state dict names.
 
-        # Inject a weight with a path-like name that doesn't match any initializer
-        provider = MockWeightProvider(
-            {
-                "../../etc/passwd": torch.zeros(1),
-                "normal_name_not_in_model": torch.zeros(1),
-            }
-        )
+        The fold pipeline (FoldTransposedInitializerPass etc.) is allowed to create new
+        initializers with names derived from existing ones (e.g. ``weight_t``), but no
+        initializer should ever be created whose name came from an untrusted state dict key.
+        """
+        model, _init_names = _build_model_with_weights()
+
+        # Inject weights with a path-like name and an unknown name — neither should
+        # appear as an initializer after apply_weights.
+        malicious_keys = {"../../etc/passwd", "normal_name_not_in_model"}
+        provider = MockWeightProvider({key: torch.zeros(1) for key in malicious_keys})
         apply_weights(model, provider.get_state_dict())
 
-        # No new initializers should be created
-        assert len(model.graph.initializers) == original_count
+        # Injected key names must not appear as initializer names.
+        for key in malicious_keys:
+            assert key not in model.graph.initializers, (
+                f"Untrusted key '{key}' was injected into graph.initializers"
+            )
 
     @pytest.mark.parametrize(
         "malicious_model_id",

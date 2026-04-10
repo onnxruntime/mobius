@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -26,6 +26,10 @@ class Linear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
+        # Transpose weight from [out_features, in_features] → [in_features, out_features]
+        # so MatMul(x, w_t) computes x @ weight.T.
+        # FoldTransposedInitializerPass (applied after weight loading) will
+        # pre-compute this transpose and eliminate the runtime Transpose node.
         w_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, w_t)
         if self.bias is not None:
@@ -184,7 +188,12 @@ def create_attention_bias(
     # For simplicity, use the full indices and let the Attention op handle masking
     # Actually we need to implement this with shape ops
 
-    # Get query_length and total_length from shapes
+    # Get query_length and total_length from shapes.
+    # query_length comes from input_ids dim 1 (the query; e.g. 1 during decode).
+    # total_length comes from attention_mask dim 1 (past + current tokens).
+    # Using input_ids for query_length is semantically correct: during decode
+    # input_ids is (batch, 1), so query_length=1 and start = total_length - 1,
+    # giving the last row of q_indices.
     query_length = op.Shape(input_ids, start=1, end=2)  # 1-D [1]
     total_length = op.Shape(attention_mask, start=1, end=2)  # 1-D [1]
     start = op.Sub(total_length, query_length)
@@ -253,9 +262,13 @@ def create_padding_mask(
     # Unsqueeze to [B, 1, total_len] for broadcasting across q_len.
     mask_3d = op.Unsqueeze(bool_mask, [1])
     # Build target shape [B, q_len, total_len] using explicit slices.
-    # input_ids may be 2D (input_ids) or 3D (hidden_states when
-    # inputs_embeds is used), so we extract dims individually.
+    # input_ids may be 2D (input_ids) or 3D (hidden_states when inputs_embeds is
+    # used), so we extract the batch dimension from it individually.
+    # q_len comes from input_ids (the query, e.g. 1 in decode step); total_len
+    # comes from attention_mask (covers both past and current tokens).
     batch_size = op.Shape(input_ids, start=0, end=1)
+    # q_len comes from input_ids dim 1 (query length, e.g. 1 during decode).
+    # total_len comes from attention_mask dim 1 (past + current tokens).
     q_len = op.Shape(input_ids, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)

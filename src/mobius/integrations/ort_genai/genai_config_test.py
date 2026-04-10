@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for GenaiConfigGenerator."""
 
@@ -480,3 +480,89 @@ class TestGenaiConfigGeneratorMultimodal:
         )
         result = gen.with_vision(image_token_id=200010).with_speech()
         assert result is gen
+
+
+class TestMakeSessionOptions:
+    """Tests for the _make_session_options() helper."""
+
+    def test_cpu_has_empty_provider_options(self):
+        """CPU EP produces empty provider_options (no special session config)."""
+        from mobius.integrations.ort_genai.genai_config import _make_session_options
+
+        opts = _make_session_options("cpu")
+        assert opts["log_id"] == "onnxruntime-genai"
+        assert opts["provider_options"] == []
+
+    def test_cuda_has_cuda_provider_options(self):
+        """CUDA EP produces a provider_options entry for CUDAExecutionProvider."""
+        from mobius.integrations.ort_genai.genai_config import _make_session_options
+
+        opts = _make_session_options("cuda")
+        assert opts["log_id"] == "onnxruntime-genai"
+        assert len(opts["provider_options"]) == 1
+        assert "CUDAExecutionProvider" in opts["provider_options"][0]
+
+    def test_dml_has_dml_provider_options(self):
+        """DML EP produces a provider_options entry for DmlExecutionProvider."""
+        from mobius.integrations.ort_genai.genai_config import _make_session_options
+
+        opts = _make_session_options("dml")
+        assert opts["log_id"] == "onnxruntime-genai"
+        assert len(opts["provider_options"]) == 1
+        assert "DmlExecutionProvider" in opts["provider_options"][0]
+
+
+class TestGenaiConfigGeneratorEp:
+    """Tests for EP threading through all session_options blocks."""
+
+    def _gen(self, ep: str) -> GenaiConfigGenerator:
+        return GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            ep=ep,
+        )
+
+    def test_cpu_ep_decoder_has_empty_provider_options(self):
+        """CPU EP: decoder session_options.provider_options is empty."""
+        config = self._gen("cpu").generate()
+        assert config["model"]["decoder"]["session_options"]["provider_options"] == []
+
+    def test_cuda_ep_decoder_has_cuda_provider_options(self):
+        """CUDA EP: decoder session_options.provider_options has CUDA entry."""
+        config = self._gen("cuda").generate()
+        opts = config["model"]["decoder"]["session_options"]["provider_options"]
+        assert len(opts) == 1
+        assert "CUDAExecutionProvider" in opts[0]
+
+    def test_cuda_ep_all_blocks_have_cuda_session_options(self):
+        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, speech)."""
+        gen = (
+            GenaiConfigGenerator(
+                "phi4mm",
+                vocab_size=200064,
+                hidden_size=3072,
+                num_hidden_layers=32,
+                num_attention_heads=24,
+                num_key_value_heads=8,
+                head_dim=128,
+                ep="cuda",
+            )
+            .with_vision(image_token_id=200010)
+            .with_speech()
+        )
+        config = gen.generate()
+
+        for block in ("decoder", "vision", "embedding", "speech"):
+            if block not in config["model"]:
+                continue
+            session_opts = config["model"][block]["session_options"]
+            provider_options = session_opts["provider_options"]
+            assert len(provider_options) == 1, f"{block} missing CUDA provider options"
+            assert "CUDAExecutionProvider" in provider_options[0], (
+                f"{block} has wrong EP in provider_options"
+            )

@@ -1,11 +1,12 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
+import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
@@ -14,8 +15,39 @@ from mobius.components._common import Linear
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+class GQAContext(NamedTuple):
+    """Context for direct ``com.microsoft::GroupQueryAttention`` emission.
+
+    Created once per graph by :class:`~mobius.models.base.TextModel` when the
+    active EP (from :func:`~mobius._build_context.ep_capabilities`) supports
+    GQA for the current build dtype.  Passed through DecoderLayer as the
+    ``attention_bias`` argument so that :class:`Attention` can detect it and
+    emit ``GroupQueryAttention`` directly instead of the generic
+    ``Attention + RotaryEmbedding`` sequence.
+
+    Using this context skips the post-hoc
+    :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
+    rewrite rule for models that use the standard :class:`TextModel` backbone.
+    The rewrite rule remains as a fallback for models with non-standard RoPE
+    (e.g. Qwen3.5 with 3D mRoPE).
+
+    Fields:
+        seqlens_k: Per-batch last valid KV index ``[batch]`` INT32.
+            Computed as ``ReduceSum(attention_mask, axis=1) - 1``; this is a
+            0-based index into the valid KV tokens, not the KV length itself.
+        total_seq_len: Scalar total sequence length INT32.
+            Computed as ``Shape(attention_mask)[1]``.
+        cos_cache: Full cosine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
+            Taken directly from the model's ``rotary_emb.cos_cache`` parameter.
+        sin_cache: Full sine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
+            Taken directly from the model's ``rotary_emb.sin_cache`` parameter.
+    """
+
+    seqlens_k: ir.Value
+    total_seq_len: ir.Value
+    cos_cache: ir.Value
+    sin_cache: ir.Value
 
 
 class StaticCacheState(NamedTuple):
@@ -51,6 +83,7 @@ def _apply_attention(
     num_attention_heads: int,
     num_key_value_heads: int,
     scale: float,
+    softcap: float = 0.0,
     static_cache: StaticCacheState | None = None,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Apply the ONNX Attention op with internal or static KV cache.
@@ -125,6 +158,7 @@ def _apply_attention(
             q_num_heads=num_attention_heads,
             kv_num_heads=num_key_value_heads,
             scale=scale,
+            softcap=softcap,
             is_causal=1,
             _outputs=3,
         )
@@ -144,6 +178,7 @@ def _apply_attention(
         q_num_heads=num_attention_heads,
         kv_num_heads=num_key_value_heads,
         scale=scale,
+        softcap=softcap,
         is_causal=1,
         _outputs=3,
     )
@@ -187,6 +222,8 @@ class Attention(nn.Module):
             else int(self.head_dim * config.partial_rotary_factor)
         )
         self._rope_interleave = config.rope_interleave
+        # Gemma2-style logit soft-capping; 0.0 means disabled.
+        self._softcap = getattr(config, "attn_logit_softcapping", 0.0) or 0.0
 
         self.q_proj = linear_class(
             self.hidden_size,
@@ -231,7 +268,7 @@ class Attention(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value | None,
+        attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
@@ -253,6 +290,17 @@ class Attention(nn.Module):
                 key_states = self.k_norm(op, key_states)
                 query_states = op.Reshape(query_states, [0, 0, -1])
                 key_states = op.Reshape(key_states, [0, 0, -1])
+
+        # Direct GroupQueryAttention path: skip external RoPE, fuse everything.
+        if isinstance(attention_bias, GQAContext):
+            return self._forward_gqa(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                attention_bias,
+                past_key_value,
+            )
 
         # Apply rotary position embeddings (skip when not provided)
         if position_embeddings is not None:
@@ -284,11 +332,69 @@ class Attention(nn.Module):
             num_attention_heads=self.num_attention_heads,
             num_key_value_heads=self.num_key_value_heads,
             scale=self.scaling,
+            softcap=self._softcap,
             static_cache=static_cache,
         )
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)
+
+    def _forward_gqa(
+        self,
+        op: builder.OpBuilder,
+        query_states: ir.Value,
+        key_states: ir.Value,
+        value_states: ir.Value,
+        gqa_ctx: GQAContext,
+        past_key_value: tuple | None,
+    ):
+        """Emit ``com.microsoft::GroupQueryAttention`` directly.
+
+        Called from :meth:`forward` when ``attention_bias`` is a
+        :class:`GQAContext`.  Bypasses the external
+        :class:`~mobius.components._rotary_embedding.RotaryEmbeddingBase`
+        forward pass and the post-hoc
+        :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
+        rewrite rule; RoPE is handled by the ``do_rotary=1`` attribute instead.
+
+        Returns ``(attn_output, (present_key, present_value))`` in the same
+        shape as the standard :meth:`forward` path.
+        """
+        past_key = past_key_value[0] if past_key_value is not None else None
+        past_value = past_key_value[1] if past_key_value is not None else None
+
+        gqa_attrs: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scaling,
+            "do_rotary": 1,
+            "rotary_interleaved": int(self._rope_interleave),
+        }
+        if self._softcap:
+            gqa_attrs["softcap"] = self._softcap
+        if self.rotary_embedding_dim:
+            # Partial RoPE: only rotate the first rotary_embedding_dim elements.
+            gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+
+        # Emit GroupQueryAttention: RoPE + attention + KV cache in one op.
+        # Outputs: (attn_output [B, S, hidden], present_key, present_value)
+        attn_out, present_key, present_value = op.GroupQueryAttention(
+            query_states,  # [B, S, num_heads * head_dim]
+            key_states,  # [B, S, kv_heads * head_dim]
+            value_states,  # [B, S, kv_heads * head_dim]
+            past_key,  # [B, kv_heads, past_S, head_dim] or None
+            past_value,  # [B, kv_heads, past_S, head_dim] or None
+            gqa_ctx.seqlens_k,  # [B] INT32
+            gqa_ctx.total_seq_len,  # scalar INT32
+            gqa_ctx.cos_cache,  # [max_seq, rotary_dim]
+            gqa_ctx.sin_cache,  # [max_seq, rotary_dim]
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
+        )
+
+        attn_out = self.o_proj(op, attn_out)
+        return attn_out, (present_key, present_value)
 
 
 class Qwen35Attention(nn.Module):

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Denoising task for diffusion models (UNet, DiT, etc.).
 
@@ -8,6 +8,8 @@ and produces noise prediction.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -20,6 +22,7 @@ class DenoisingTask(ModelTask):
     """Build ONNX graph for diffusion denoising."""
 
     name = "denoising"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

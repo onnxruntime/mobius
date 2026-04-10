@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """NemotronH text generation — standalone greedy decoding (no onnxruntime-genai).
 
@@ -606,6 +606,11 @@ def main():
         default=REPETITION_PENALTY,
         help="Repetition penalty (1.0 = none, default: %(default)s).",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     use_chat = not args.no_chat
@@ -725,7 +730,15 @@ def main():
                 print("  ✗ Answers differ:")
                 print(f"    ONNX: {answer_onnx!r}")
                 print(f"    HF:   {answer_hf!r}")
+                if args.ci:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

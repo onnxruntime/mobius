@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Audio feature extraction task.
 
@@ -8,6 +8,8 @@ that take raw waveform input and produce hidden state outputs.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -20,6 +22,7 @@ class AudioFeatureExtractionTask(ModelTask):
     """Build ONNX graph for audio feature extraction (encoder-only)."""
 
     name = "audio-feature-extraction"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

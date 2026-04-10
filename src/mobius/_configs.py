@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -95,6 +95,10 @@ class VisionConfig:
     norm_eps: float = 1e-6
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    # Pixtral / Mistral-3 vision fields
+    model_type: str | None = None
+    head_dim: int | None = None
+    rope_theta: float | None = None
     # Qwen VL-specific
     out_hidden_size: int | None = None
     in_channels: int = 3
@@ -273,7 +277,13 @@ def _extract_rope_config(config) -> RoPEConfig:
             _nested_rope_theta(rope_scaling, "full_attention"),
             default=10_000.0,
         ),
-        rope_scaling=(_normalize_rope_scaling(rope_scaling) or None),
+        # Some models (e.g. Ministral-3) store YaRN config under
+        # rope_parameters instead of rope_scaling; fall back accordingly.
+        rope_scaling=(
+            _normalize_rope_scaling(rope_scaling)
+            or _normalize_rope_scaling(rope_parameters)
+            or None
+        ),
         partial_rotary_factor=_first_not_none(
             getattr(config, "partial_rotary_factor", None),
             rope_scaling.get("partial_rotary_factor", None),
@@ -284,12 +294,11 @@ def _extract_rope_config(config) -> RoPEConfig:
             getattr(config, "rope_local_base_freq", None),
             _nested_rope_theta(rope_scaling, "sliding_attention"),
         ),
-        original_max_position_embeddings=(
-            getattr(
-                config,
-                "original_max_position_embeddings",
-                rope_scaling.get("original_max_position_embeddings", None),
-            )
+        original_max_position_embeddings=_first_not_none(
+            getattr(config, "original_max_position_embeddings", None),
+            rope_scaling.get("original_max_position_embeddings", None),
+            # Also check rope_parameters (see rope_scaling comment above).
+            rope_parameters.get("original_max_position_embeddings", None),
         ),
     )
 
@@ -351,10 +360,22 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             ),
             image_size=getattr(vc, "image_size", None),
             patch_size=getattr(vc, "patch_size", None),
-            norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
+            norm_eps=_first_not_none(
+                getattr(vc, "layer_norm_eps", None),
+                getattr(vc, "norm_eps", None),
+                default=1e-6,
+            ),
+            # Pixtral / Mistral-3 vision fields
+            model_type=getattr(vc, "model_type", None),
+            head_dim=getattr(vc, "head_dim", None),
+            rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
             out_hidden_size=getattr(vc, "out_hidden_size", None),
-            in_channels=getattr(vc, "in_channels", 3),
+            in_channels=_first_not_none(
+                getattr(vc, "in_channels", None),
+                getattr(vc, "num_channels", None),
+                default=3,
+            ),
             spatial_merge_size=getattr(vc, "spatial_merge_size", 2),
             temporal_patch_size=getattr(vc, "temporal_patch_size", 2),
             num_position_embeddings=getattr(vc, "num_position_embeddings", None),
@@ -572,6 +593,11 @@ class QuantizationConfig:
             return None
         method = qc.get("quant_method", "none")
         if method == "none":
+            return None
+        # FP8 per-tensor quantization (float8_e4m3fn + scalar scale)
+        # is handled by dtype casting in _assign_weight(), not by
+        # QuantizedLinear block quantization.
+        if method == "fp8":
             return None
         return cls(
             bits=qc.get("bits", 4),

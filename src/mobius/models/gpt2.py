@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """GPT-2 model with absolute positional embeddings and pre-norm LayerNorm.
 
@@ -123,6 +123,15 @@ class GPT2CausalLMModel(CausalLMModel):
                 name = "transformer.h." + name[len("biogpt.layers.") :]
             elif name.startswith("model.layers."):
                 name = "transformer.h." + name[len("model.layers.") :]
+            # GPT-2 / OpenAI-GPT / GPT-SW3 HF safetensors omit the
+            # "transformer." prefix (e.g. "h.N.*", "wte.*", "ln_f.*").
+            # GPT-Neo and GPT-BigCode already include it.
+            # biogpt.* / model.* / output_projection.* / lm_head.* are
+            # handled separately below and must not be prefixed here.
+            elif not name.startswith(
+                ("transformer.", "biogpt.", "model.", "output_projection.", "lm_head.")
+            ):
+                name = "transformer." + name
 
             # ── 2. Top-level embedding / norm renames ────────────────────────
             # OpenAI-GPT

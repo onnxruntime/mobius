@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Qwen2.5-VL vision encoder components.
 
@@ -8,8 +8,7 @@ Provides modules for the Qwen2.5-VL vision backbone:
 - ``Qwen25VLPatchEmbed``: Conv3d patch tokenisation (14x14x2, no bias).
 - ``Qwen25VLVisionRotaryEmbedding``: 2D rotary embeddings from grid positions.
 - ``Qwen25VLVisionAttention``: Packed MHA with cu_seqlens boundaries.
-- ``Qwen25VLVisionMLP``: Gate-up-down MLP with SiLU activation.
-- ``Qwen25VLVisionBlock``: Pre-norm transformer block (RMSNorm → Attn → MLP).
+- ``Qwen25VLVisionBlock``: Pre-norm transformer block (uses ``GatedMLP``).
 - ``Qwen25VLPatchMerger``: Spatial merge via RMSNorm → reshape → MLP.
 - ``Qwen25VLVisionModel``: Full encoder with windowed + full attention.
 
@@ -28,7 +27,9 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities
 from mobius.components._common import Linear
+from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._scan_utils import (
     compact_scan_output,
@@ -177,6 +178,70 @@ class Qwen25VLVisionAttention(nn.Module):
         q = self._apply_rotary(op, q, cos, sin)
         k = self._apply_rotary(op, k, cos, sin)
 
+        capabilities = ep_capabilities()
+        if capabilities.supports_packed_multi_head_attention:
+            attn_out = self._emit_packed_mha(op, q, k, v, cu_seqlens, seq_len_val)
+        else:
+            attn_out = self._emit_standard_attention(op, q, k, v, cu_seqlens, seq_len_val)
+
+        return self.proj(op, attn_out)
+
+    def _emit_packed_mha(self, op, q, k, v, cu_seqlens, seq_len_val):
+        """Emit com.microsoft.PackedMultiHeadAttention.
+
+        Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+
+        Args:
+            q, k, v: (N, num_heads, head_dim) after rotary embedding
+            cu_seqlens: (num_sub_seqs + 1,) INT32
+            seq_len_val: (1,) shape tensor with N
+        """
+        hidden_size = self.num_heads * self.head_dim
+        # Flatten heads: (N, num_heads, head_dim) → (N, hidden_size)
+        query = op.Reshape(q, op.Concat(seq_len_val, [hidden_size], axis=0))
+        key = op.Reshape(k, op.Concat(seq_len_val, [hidden_size], axis=0))
+        value = op.Reshape(v, op.Concat(seq_len_val, [hidden_size], axis=0))
+
+        # token_offset: identity mapping for packed (no-padding) input.
+        # Shape: (1, token_count) — single batch, positions [0..N-1].
+        token_count_scalar = op.Squeeze(seq_len_val, [0])
+        token_offset = op.Unsqueeze(
+            op.Range(
+                op.Constant(value_int=0),
+                token_count_scalar,
+                op.Constant(value_int=1),
+            ),
+            [0],
+        )
+        token_offset = op.Cast(token_offset, to=6)  # INT32
+
+        cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
+
+        # Emit PackedMultiHeadAttention
+        attn_out = op.PackedMultiHeadAttention(
+            query,
+            key,
+            value,
+            token_offset,
+            cu_seqlens_int32,
+            num_heads=self.num_heads,
+            scale=float(1.0 / math.sqrt(self.head_dim)),
+            _domain="com.microsoft",
+            _outputs=["packed_attn_out"],
+        )  # (token_count, hidden_size)
+
+        return attn_out
+
+    def _emit_standard_attention(self, op, q, k, v, cu_seqlens, seq_len_val):
+        """Emit standard Attention with block-diagonal bias from cu_seqlens.
+
+        Fallback path for EPs without PackedMultiHeadAttention support.
+
+        Args:
+            q, k, v: (N, num_heads, head_dim) after rotary embedding
+            cu_seqlens: (num_sub_seqs + 1,) cumulative lengths
+            seq_len_val: (1,) shape tensor with N
+        """
         # Reshape for attention: add batch dim
         # (N, num_heads, head_dim) → (1, num_heads, N, head_dim)
         q = op.Transpose(q, perm=[1, 0, 2])  # (num_heads, N, head_dim)
@@ -207,7 +272,7 @@ class Qwen25VLVisionAttention(nn.Module):
             attn_out,
             op.Concat(seq_len_val, [-1], axis=0),
         )
-        return self.proj(op, attn_out)
+        return attn_out
 
     def _apply_rotary(self, op, x, cos, sin):
         """Apply rotary embeddings to (N, num_heads, head_dim)."""
@@ -277,25 +342,6 @@ class Qwen25VLVisionAttention(nn.Module):
         return op.Where(same_segment, zero, neg_inf)
 
 
-class Qwen25VLVisionMLP(nn.Module):
-    """Gate-up-down MLP with SiLU activation (bias=True).
-
-    Matches HF Qwen2_5_VLMLP: gate_proj * act(up_proj) → down_proj.
-    """
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=True)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=True)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=True)
-
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        gate = self.gate_proj(op, hidden_states)
-        gate = op.Mul(gate, op.Sigmoid(gate))  # SiLU
-        up = self.up_proj(op, hidden_states)
-        return self.down_proj(op, op.Mul(gate, up))
-
-
 class Qwen25VLVisionBlock(nn.Module):
     """Pre-norm vision transformer block.
 
@@ -307,7 +353,8 @@ class Qwen25VLVisionBlock(nn.Module):
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Qwen25VLVisionAttention(hidden_size, num_heads)
-        self.mlp = Qwen25VLVisionMLP(hidden_size, intermediate_size)
+        # SiLU gated MLP with bias (gate_proj/up_proj/down_proj names match HF)
+        self.mlp = GatedMLP(hidden_size, intermediate_size, activation="silu", bias=True)
 
     def forward(
         self,

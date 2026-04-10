@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for vision encoder components."""
 
@@ -20,7 +20,6 @@ from mobius.components._vision import (
     VisionEncoder,
     VisionEncoderLayer,
     VisionLayerNorm,
-    VisionMLP,
     VisionModel,
 )
 
@@ -70,16 +69,6 @@ class TestVisionAttention:
         result = attn(op, hidden)
         b._adapt_outputs([result])
         assert count_op_type(graph, "Attention") == 1
-
-
-class TestVisionMLP:
-    def test_forward(self):
-        mlp = VisionMLP(hidden_size=64, intermediate_size=128)
-        b, op, graph = create_test_builder()
-        hidden = create_test_input(b, "hidden", [1, 16, 64])
-        result = mlp(op, hidden)
-        b._adapt_outputs([result])
-        assert graph.num_nodes() > 0
 
 
 class TestVisionLayerNorm:

@@ -14,3 +14,16 @@ Public API documentation for `mobius`.
 - [`ModelPackage`](model_package.md) — Collection of named ONNX models
 - [`BaseModelConfig`](base_model_config.md) — Base configuration class
 - [`ModelRegistry`](model_registry.md) — Architecture registry
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+build
+build_from_module
+build_from_gguf
+apply_weights
+model_package
+base_model_config
+model_registry
+```
