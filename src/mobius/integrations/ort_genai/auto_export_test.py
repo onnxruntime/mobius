@@ -256,6 +256,91 @@ class TestExportForOrtGenai:
             if saved is not None:
                 sys.modules["onnxruntime_genai"] = saved
 
+    def test_config_mode_model_type_propagated(self, tmp_path):
+        """model.type in genai_config.json is correct when hf_model_id=None."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # model_type now stored on ArchitectureConfig for --config mode
+            model_type: str = "gemma2"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
+        assert data["model"]["type"] == "gemma"
+
+    def test_config_mode_token_ids_propagated(self, tmp_path):
+        """bos/eos token IDs in genai_config.json come from config fields in --config mode."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "llama"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            bos_token_id: int = 1
+            eos_token_id: int = 2
+            pad_token_id: int = 0
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["bos_token_id"] == 1
+        assert data["model"]["eos_token_id"] == 2
+        assert data["model"]["pad_token_id"] == 0
+
+    def test_config_mode_eos_token_id_as_list(self, tmp_path):
+        """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma2"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            bos_token_id: int = 2
+            eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
+            pad_token_id: int = 0
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["eos_token_id"] == [1, 106]
+
 
 @pytest.mark.integration
 class TestAutoExportEndToEnd:

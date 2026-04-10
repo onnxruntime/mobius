@@ -38,6 +38,8 @@ before the PR is merged.
 - [ ] Tensor shapes are annotated in comments after non-trivial operations
 - [ ] Automated code review (Copilot/PR review) has been run and all
       findings are resolved or explicitly dismissed with a reason
+- [ ] `lintrunner -a` is clean — zero lint errors before merging
+      (`lintrunner f --output oneline --all-files` to auto-fix, then re-run to confirm)
 
 ### 2. L1 — Graph builds
 
@@ -182,6 +184,10 @@ Unchecked items without a waiver are grounds to request changes before merge.
 ## Quick reference commands
 
 ```bash
+# Lint (auto-fix then verify clean)
+lintrunner f --output oneline --all-files
+lintrunner -a
+
 # L1 – graph build
 python -m pytest tests/build_graph_test.py -k "<model_type>"
 
