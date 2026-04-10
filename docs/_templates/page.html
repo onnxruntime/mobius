@@ -1,0 +1,25 @@
+{#- Extend Furo's page template to show per-page git timestamps.
+
+   The ``git_created_date`` and ``git_updated_date`` context variables are
+   injected by the ``git_timestamps`` Sphinx extension.  Both are
+   ``YYYY-MM-DD`` strings (or empty strings for pages with no git history).
+-#}
+{% extends "!page.html" %}
+
+{%- block content %}
+{{ super() }}
+{%- if git_created_date or git_updated_date %}
+<div class="page-git-timestamps">
+  {%- if git_created_date %}
+  <p class="git-created-date">
+    <strong>Created:</strong> <time>{{ git_created_date }}</time>
+  </p>
+  {%- endif %}
+  {%- if git_updated_date %}
+  <p class="git-updated-date">
+    <strong>Last updated:</strong> <time>{{ git_updated_date }}</time>
+  </p>
+  {%- endif %}
+</div>
+{%- endif %}
+{%- endblock content %}
