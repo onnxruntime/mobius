@@ -474,23 +474,65 @@ class TestWeightTying:
         pkg = build_from_module(module, config)
         return pkg["model"], module
 
-    def test_tied_weights_share_single_initializer(self):
-        """When tie_word_embeddings=True, lm_head.weight must NOT be a separate initializer."""
-        model, module = self._build_tied_model()
-        weight = torch.zeros(make_config().vocab_size, make_config().hidden_size)
-        sd = module.preprocess_weights({"model.embed_tokens.weight": weight})
-        assert sd["model.embed_tokens.weight"] is sd["lm_head.weight"], (
-            "preprocess_weights must produce the same tensor object for tied weights"
-        )
+    def test_graph_level_tying_no_lm_head_initializer(self):
+        """With tie_word_embeddings=True, lm_head.weight must not be in the graph — at all.
 
-        apply_weights(model, sd)
-
+        The Parameter aliasing in __init__ ensures a single ir.Value is used for
+        both the embedding Gather and the lm_head MatMul, so no lm_head.weight
+        initializer is ever registered.
+        """
+        model, _ = self._build_tied_model()
         assert "lm_head.weight" not in model.graph.initializers, (
-            "lm_head.weight initializer should be removed — merged into embed_tokens"
+            "lm_head.weight must not be a graph initializer when tie_word_embeddings=True "
+            "(graph-level aliasing should produce a single embed_tokens initializer)"
         )
         assert "model.embed_tokens.weight" in model.graph.initializers, (
-            "embed_tokens initializer must remain as the canonical shared weight"
+            "model.embed_tokens.weight must be registered as the sole embedding initializer"
         )
+
+    def test_graph_level_tying_same_ir_value(self):
+        """The embed Gather and lm_head MatMul must both reference the same ir.Value."""
+        model, _ = self._build_tied_model()
+        embed_initializer = model.graph.initializers["model.embed_tokens.weight"]
+
+        # Collect all ir.Value inputs used across all nodes
+        all_inputs: set[int] = set()
+        for node in model.graph:
+            for inp in node.inputs:
+                if inp is not None:
+                    all_inputs.add(id(inp))
+
+        assert id(embed_initializer) in all_inputs, (
+            "model.embed_tokens.weight initializer must be referenced by at least one node"
+        )
+
+    def test_preprocess_weights_drops_lm_head_key(self):
+        """preprocess_weights must remove lm_head.weight from the state dict when tied."""
+        _, module = self._build_tied_model()
+        vocab_size = make_config().vocab_size
+        hidden_size = make_config().hidden_size
+        weight = torch.zeros(vocab_size, hidden_size)
+
+        # Case 1: checkpoint has only embed_tokens.weight (typical tied checkpoint)
+        sd = module.preprocess_weights({"model.embed_tokens.weight": weight})
+        assert "lm_head.weight" not in sd
+        assert "model.embed_tokens.weight" in sd
+
+        # Case 2: checkpoint has both keys (some checkpoints save both even when tied)
+        lm_head_weight = torch.ones(vocab_size, hidden_size)
+        sd2 = module.preprocess_weights(
+            {
+                "model.embed_tokens.weight": weight,
+                "lm_head.weight": lm_head_weight,
+            }
+        )
+        assert "lm_head.weight" not in sd2
+        assert "model.embed_tokens.weight" in sd2
+
+        # Case 3: checkpoint has only lm_head.weight
+        sd3 = module.preprocess_weights({"lm_head.weight": weight})
+        assert "lm_head.weight" not in sd3
+        assert "model.embed_tokens.weight" in sd3
 
     def test_untied_weights_have_separate_initializers(self):
         """When tie_word_embeddings=False, both initializers remain independent."""
@@ -518,26 +560,11 @@ class TestWeightTying:
         module_tied = CausalLMModel(config_tied)
         pkg_tied = build_from_module(module_tied, config_tied)
         model_tied = pkg_tied["model"]
-        sd_tied = module_tied.preprocess_weights(
-            {
-                "model.embed_tokens.weight": torch.zeros(
-                    config_tied.vocab_size, config_tied.hidden_size
-                )
-            }
-        )
-        apply_weights(model_tied, sd_tied)
 
         config_untied = mc(tie_word_embeddings=False)
         module_untied = CausalLMModel(config_untied)
         pkg_untied = build_from_module(module_untied, config_untied)
         model_untied = pkg_untied["model"]
-        sd_untied = {
-            "model.embed_tokens.weight": torch.zeros(
-                config_untied.vocab_size, config_untied.hidden_size
-            ),
-            "lm_head.weight": torch.zeros(config_untied.vocab_size, config_untied.hidden_size),
-        }
-        apply_weights(model_untied, sd_untied)
 
         n_tied = len(model_tied.graph.initializers)
         n_untied = len(model_untied.graph.initializers)

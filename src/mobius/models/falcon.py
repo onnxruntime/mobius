@@ -515,6 +515,9 @@ class FalconCausalLMModel(nn.Module):
         self.config = config
         self.transformer = _FalconTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # _FalconTextModel uses self.word_embeddings (not embed_tokens)
+            self.lm_head.weight = self.transformer.word_embeddings.weight
 
     def forward(
         self,
@@ -587,12 +590,13 @@ class FalconCausalLMModel(nn.Module):
             for k, v in new_state_dict.items()
         }
 
-        # Handle weight tying
+        # Handle weight tying: lm_head.weight is tied at graph level.
+        # Discard lm_head.weight if present; transformer.word_embeddings.weight covers both.
         if self.config.tie_word_embeddings:
             embed_key = "transformer.word_embeddings.weight"
-            head_key = "lm_head.weight"
-            if head_key not in new_state_dict and embed_key in new_state_dict:
-                new_state_dict[head_key] = new_state_dict[embed_key]
+            if embed_key not in new_state_dict:
+                new_state_dict[embed_key] = new_state_dict["lm_head.weight"]
+            new_state_dict.pop("lm_head.weight", None)
 
         return new_state_dict
 
