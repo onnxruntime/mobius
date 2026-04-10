@@ -167,3 +167,45 @@ components in `components/_multimodal.py`.
 - MoE decoder layers replace the standard `DecoderLayer`; create `MoEDecoderLayer`
   and `MoETextModel` that use `MoELayer` instead of `MLP`.
 - MoE models require `num_local_experts` and `num_experts_per_tok` in config.
+
+## Quality checklist (definition of done)
+
+Before a new model PR is considered **done**, all items in the quality
+checklist must be satisfied (or explicitly waived with a written reason in
+the PR description).  The full checklist with explanations lives in the
+[quality-checklist skill](.github/skills/quality-checklist/SKILL.md).
+
+### Summary checklist
+
+**Code quality**
+- [ ] Microsoft MIT copyright header in every new file
+- [ ] Descriptive class docstring (`default_task`, `category` set if non-standard)
+- [ ] `preprocess_weights()` verified (no dropped or mangled weight names)
+- [ ] No protobuf construction APIs used anywhere in new code
+- [ ] Automated code review run; all findings resolved or dismissed
+
+**Test coverage (L1 – L5)**
+- [ ] **L1** — Graph build: entry in `tests/_test_configs.py` + weight-alignment test passes
+- [ ] **L2** — Config compatible: YAML test case in `testdata/cases/` with `test_model_id`
+- [ ] **L3** — Synthetic parity: test in `tests/synthetic_parity_test.py` passes
+- [ ] **L4** — Golden match: golden file in `testdata/golden/` and `e2e_golden_test` passes
+- [ ] **L5** — Generation verified: generation golden file committed and test passes
+
+> L4 and L5 are the most commonly missed. Graph-build tests (L1) never
+> execute the graph with real data — only L4/L5 catch wrong norms, missing
+> scaling multipliers, and runtime shape errors.
+
+**Multi-dtype correctness**
+- [ ] fp32 (target: exact greedy token match)
+- [ ] fp16 (target: logit parity `atol=1e-2`)
+- [ ] bf16 (target: logit parity `atol=1e-2`)
+
+**Runtime and deployment**
+- [ ] CLI build: `mobius build --model <hf-model-id> /tmp/out` succeeds
+- [ ] ORT GenAI: model loads and generates coherent output; test in `tests/ort_genai_test.py`
+- [ ] Foundry Local: exported package loads and responds to a short prompt
+- [ ] Olive quantization: INT4/INT8 quantization runs to completion; quantized model produces coherent output
+
+**Documentation**
+- [ ] Class docstring (first paragraph) describes the model family and HuggingFace class
+- [ ] README model table updated (if this is a significant new model)

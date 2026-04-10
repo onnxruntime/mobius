@@ -14,8 +14,10 @@ import pytest
 
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
+    _copy_tokenizer_files_from_local,
     _resolve_ort_genai_model_type,
     _write_processor_config,
+    write_ort_genai_config,
 )
 
 
@@ -77,6 +79,146 @@ class TestCopyTokenizerFiles:
         assert (dst / "tokenizer.json").exists()
 
 
+class TestCopyTokenizerFilesFromLocal:
+    """Tests for _copy_tokenizer_files_from_local."""
+
+    def test_copies_present_files(self, tmp_path):
+        """Copies tokenizer files that exist in the source directory."""
+        src = tmp_path / "model"
+        src.mkdir()
+        (src / "tokenizer.json").write_text('{"test": true}')
+        (src / "tokenizer_config.json").write_text('{"model_type": "llama"}')
+
+        dst = tmp_path / "output"
+        dst.mkdir()
+        copied = _copy_tokenizer_files_from_local(str(src), str(dst))
+
+        assert set(copied) == {"tokenizer.json", "tokenizer_config.json"}
+        assert (dst / "tokenizer.json").read_text() == '{"test": true}'
+        assert (dst / "tokenizer_config.json").read_text() == '{"model_type": "llama"}'
+
+    def test_skips_absent_files(self, tmp_path):
+        """Files not present in the source directory are silently skipped."""
+        src = tmp_path / "model"
+        src.mkdir()
+        # Only tokenizer.json present — tokenizer.model (SentencePiece), etc. absent
+
+        (src / "tokenizer.json").write_text("{}")
+
+        dst = tmp_path / "output"
+        dst.mkdir()
+        copied = _copy_tokenizer_files_from_local(str(src), str(dst))
+
+        assert copied == ["tokenizer.json"]
+        assert not (dst / "tokenizer.model").exists()
+
+    def test_empty_source_returns_empty_list(self, tmp_path):
+        """No tokenizer files in source returns an empty list."""
+        src = tmp_path / "model"
+        src.mkdir()
+        dst = tmp_path / "output"
+        dst.mkdir()
+        copied = _copy_tokenizer_files_from_local(str(src), str(dst))
+        assert copied == []
+
+    def test_missing_source_dir_warns_and_returns_empty(self, tmp_path, caplog):
+        """Non-existent source_dir emits a warning and returns empty list."""
+        import logging
+
+        dst = tmp_path / "output"
+        dst.mkdir()
+        with caplog.at_level(
+            logging.WARNING, logger="mobius.integrations.ort_genai.auto_export"
+        ):
+            copied = _copy_tokenizer_files_from_local(str(tmp_path / "nonexistent"), str(dst))
+        assert copied == []
+        assert "does not exist" in caplog.text
+
+
+class TestWriteOrtGenaiConfigLocalDir:
+    """Tests for write_ort_genai_config with local_config_dir."""
+
+    @staticmethod
+    def _make_pkg():
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "llama"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+
+        return ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+
+    def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
+        """When local_config_dir is set, tokenizer files are copied from it."""
+        src = tmp_path / "local_model"
+        src.mkdir()
+        (src / "tokenizer.json").write_text('{"local": true}')
+        (src / "tokenizer_config.json").write_text('{"type": "llama"}')
+
+        out = tmp_path / "output"
+        out.mkdir()
+        pkg = self._make_pkg()
+
+        result = write_ort_genai_config(
+            pkg,
+            str(out),
+            local_config_dir=str(src),
+        )
+
+        assert "tokenizer.json" in result
+        assert (out / "tokenizer.json").read_text() == '{"local": true}'
+        assert "tokenizer_config.json" in result
+
+    def test_hf_model_id_takes_precedence_over_local_dir(self, tmp_path):
+        """When both hf_model_id and local_config_dir are set, HF takes precedence."""
+        src = tmp_path / "local_model"
+        src.mkdir()
+        (src / "tokenizer.json").write_text('{"local": true}')
+
+        out = tmp_path / "output"
+        out.mkdir()
+        pkg = self._make_pkg()
+
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=["tokenizer.json"],
+            ) as mock_hf,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files_from_local",
+                return_value=[],
+            ) as mock_local,
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=mock.MagicMock(
+                    model_type="llama",
+                    bos_token_id=1,
+                    eos_token_id=2,
+                    pad_token_id=0,
+                ),
+            ),
+        ):
+            (out / "tokenizer.json").write_text("{}")  # pretend HF copy happened
+            write_ort_genai_config(
+                pkg,
+                str(out),
+                hf_model_id="meta-llama/Llama-3-8B",
+                local_config_dir=str(src),
+            )
+
+        mock_hf.assert_called_once()
+        mock_local.assert_not_called()
+
+
 class TestExportForOrtGenai:
     """Unit tests for write_ort_genai_config()."""
 
@@ -103,8 +245,6 @@ class TestExportForOrtGenai:
 
     def test_genai_config_json_is_written(self, tmp_path):
         """genai_config.json is always written to the output directory."""
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
         pkg = self._make_pkg()
         result = write_ort_genai_config(pkg, str(tmp_path))
 
@@ -255,6 +395,91 @@ class TestExportForOrtGenai:
         finally:
             if saved is not None:
                 sys.modules["onnxruntime_genai"] = saved
+
+    def test_config_mode_model_type_propagated(self, tmp_path):
+        """model.type in genai_config.json is correct when hf_model_id=None."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            # model_type now stored on ArchitectureConfig for --config mode
+            model_type: str = "gemma2"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
+        assert data["model"]["type"] == "gemma"
+
+    def test_config_mode_token_ids_propagated(self, tmp_path):
+        """bos/eos token IDs in genai_config.json come from config fields in --config mode."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "llama"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            bos_token_id: int = 1
+            eos_token_id: int = 2
+            pad_token_id: int = 0
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["bos_token_id"] == 1
+        assert data["model"]["eos_token_id"] == 2
+        assert data["model"]["pad_token_id"] == 0
+
+    def test_config_mode_eos_token_id_as_list(self, tmp_path):
+        """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma2"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            bos_token_id: int = 2
+            eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
+            pad_token_id: int = 0
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["eos_token_id"] == [1, 106]
 
 
 @pytest.mark.integration

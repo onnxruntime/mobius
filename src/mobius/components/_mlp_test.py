@@ -11,7 +11,7 @@ from mobius._testing import (
     create_test_input,
     make_config,
 )
-from mobius.components._mlp import FCMLP, MLP, GatedMLP
+from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 
 
 class TestMLP:
@@ -229,4 +229,59 @@ class TestGatedMLP:
         assert len(created) == 3
         assert isinstance(mlp.gate_proj, TrackingLinear)
         assert isinstance(mlp.up_proj, TrackingLinear)
+        assert isinstance(mlp.down_proj, TrackingLinear)
+
+
+class TestFusedGateUpMLP:
+    """Tests for FusedGateUpMLP (fused gate_up_proj, split activations)."""
+
+    def test_projection_shapes(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        # gate_up_proj: [2*intermediate, hidden]
+        assert list(mlp.gate_up_proj.weight.shape) == [256, 64]
+        assert list(mlp.down_proj.weight.shape) == [64, 128]
+
+    def test_parameter_count(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        # gate_up_proj.weight + down_proj.weight = 2 (no bias by default)
+        assert len(list(mlp.parameters())) == 2
+
+    def test_forward_builds_graph(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        result = mlp(op, x)
+        builder._adapt_outputs([result])
+        assert graph.num_nodes() > 0
+        # gate_up_proj MatMul + down_proj MatMul = 2
+        assert count_op_type(graph, "MatMul") == 2
+        # Split activations along last axis
+        assert count_op_type(graph, "Split") == 1
+
+    def test_forward_uses_silu_by_default(self):
+        config = make_config(hidden_size=64, intermediate_size=128, hidden_act="silu")
+        mlp = FusedGateUpMLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        mlp(op, x)
+        # SiLU = x * sigmoid(x)
+        assert count_op_type(graph, "Sigmoid") >= 1
+
+    def test_linear_class_applied(self):
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config, linear_class=TrackingLinear)
+        assert len(created) == 2
+        assert isinstance(mlp.gate_up_proj, TrackingLinear)
         assert isinstance(mlp.down_proj, TrackingLinear)

@@ -16,6 +16,7 @@ __all__ = [
     "CLIPVisionModel",
     "CTRLCausalLMModel",
     "CausalLMModel",
+    "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
     "CogVideoXTransformer3DModel",
@@ -125,7 +126,7 @@ from mobius.models.apertus import ApertusCausalLMModel
 from mobius.models.arcee import ArceeCausalLMModel
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
-from mobius.models.base import CausalLMModel, LayerNormCausalLMModel
+from mobius.models.base import CausalLMModel, FusedGateUpCausalLMModel, LayerNormCausalLMModel
 from mobius.models.bert import BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel

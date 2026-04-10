@@ -304,6 +304,12 @@ new model is a significant addition.
 
 ## Checklist
 
+This is the **implementation** checklist — the steps needed to wire up a new
+model in the codebase.  For the full **definition-of-done** quality checklist
+(L1–L5 tests, ORT GenAI, Foundry Local, Olive quantization, multi-dtype,
+code review), see the
+[quality-checklist skill](../quality-checklist/SKILL.md).
+
 - [ ] Model file in `src/mobius/models/` with Microsoft MIT copyright header
 - [ ] Class has `default_task` and `category` attributes (if not standard text-generation)
 - [ ] Class has a descriptive docstring (first paragraph used in generated docs)
@@ -312,8 +318,14 @@ new model is a significant addition.
 - [ ] Exported from `models/__init__.py`
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
-- [ ] Integration test model in `tests/integration_test.py` (if small checkpoint available)
+- [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
+- [ ] L3 synthetic parity passes (`tests/synthetic_parity_test.py -k "<model_type>"`)
+- [ ] Integration test model in `tests/integration_test.py` (real-weight integration suite, if small checkpoint available)
+- [ ] L4 golden file generated and committed (`testdata/golden/`)
+- [ ] L5 generation golden file generated and committed
+- [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)
 - [ ] CLI build works (`mobius build --model ...`)
+- [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
 
 **Note:** Default optimizer passes (CSE, deduplicate initializers, identity
 elimination, remove unused nodes/opsets) are applied automatically by
@@ -819,3 +831,150 @@ When adding a new model, use these files as canonical references:
 | **Minimal** — encoder subclass | `models/layoutlmv3.py` | Extends `BertModel`, only overrides `preprocess_weights()`. Same pattern for encoder-only models. |
 | **Moderate** — custom components | `models/gemma.py` | Adds custom attention (soft-capping), custom MLP (GeGLU), and custom normalization. Good example of component subclassing. |
 | **Complex** — multi-model architecture | `models/qwen3_tts.py` | 4-model TTS split with talker, code predictor, embedding, and speaker encoder sub-modules. Shows how to structure multi-model architectures. |
+
+## KV sharing across layers (num_kv_shared_layers)
+
+Some models (e.g. Gemma 4) reduce parameter count by having the last N
+decoder layers **borrow** Key and Value states from an earlier "source" layer
+of the same type instead of projecting their own K,V. This is controlled by
+`num_kv_shared_layers` in the HuggingFace config.
+
+### What it means
+
+```
+first_kv_shared_idx = num_hidden_layers - num_kv_shared_layers
+
+Layers [0 .. first_kv_shared_idx - 1]:  normal — own k_proj, v_proj, k_norm
+Layers [first_kv_shared_idx .. end]:     shared — NO k_proj/v_proj weights
+```
+
+Each shared layer reuses K,V from the **last non-shared layer of the same
+attention type** (e.g. sliding vs. full attention). Only Q is computed fresh.
+
+### Impact on the checkpoint
+
+Shared layers have **no `k_proj`, `v_proj`, `k_norm`** keys in the
+HuggingFace checkpoint. `preprocess_weights` must not assert these keys
+exist for shared-layer indices — they simply won't be present.
+
+```python
+def preprocess_weights(self, state_dict):
+    # shared layers have no k/v proj — remove them silently if accidentally present
+    first_shared = self.config.num_hidden_layers - self.config.num_kv_shared_layers
+    for i in range(first_shared, self.config.num_hidden_layers):
+        for suffix in ("k_proj.weight", "v_proj.weight", "k_norm.weight"):
+            state_dict.pop(f"model.layers.{i}.self_attn.{suffix}", None)
+    return super().preprocess_weights(state_dict)
+```
+
+### Attention module: is_kv_shared_layer flag
+
+The attention class detects at `__init__` time whether it is a shared layer:
+
+```python
+class Gemma4Attention(nn.Module):
+    def __init__(self, config, layer_idx, layer_types, first_kv_shared_idx, ...):
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_idx > 0
+        prev_layers = layer_types[:first_kv_shared_idx]
+
+        if self.is_kv_shared_layer:
+            # Index of the source layer whose K,V this layer borrows
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+            self.store_full_length_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            # True for the last non-shared layer of each type that has downstream
+            # KV-shared layers depending on it — it stores K,V for reuse.
+            self.store_full_length_kv = first_kv_shared_idx > 0 and (
+                layer_idx
+                == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
+            )
+
+        # All layers have Q projection
+        self.q_proj = Linear(config.hidden_size, num_heads * head_dim)
+        self.q_norm = RMSNorm(head_dim)
+        self.o_proj = Linear(num_heads * head_dim, config.hidden_size)
+
+        # Only non-shared layers have K/V projections
+        if not self.is_kv_shared_layer:
+            self.k_proj = Linear(config.hidden_size, num_kv_heads * head_dim)
+            self.v_proj = Linear(config.hidden_size, num_kv_heads * head_dim)
+            self.k_norm = RMSNorm(head_dim)
+```
+
+### forward(): shared layers consume shared_kv_states dict
+
+Pass a mutable `shared_kv_states` dict through the forward call. Source
+layers populate it; shared layers read from it:
+
+```python
+def forward(self, op, hidden_states, ..., shared_kv_states, past_key_value):
+    # Q projection (all layers)
+    query_states = self.q_proj(op, hidden_states)
+    ...
+
+    if self.is_kv_shared_layer:
+        # Borrow K,V from source layer (already in shared_kv_states)
+        src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+        # Reshape from present_kv 4D [B, kv_heads, total_seq, head_dim]
+        # to Attention input 3D [B, total_seq, kv_heads * head_dim]
+        src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+        key_states = op.Reshape(src_key, ...)
+        value_states = ...
+    else:
+        # Normal K/V projection + norm
+        key_states = self.k_proj(op, hidden_states)
+        value_states = self.v_proj(op, hidden_states)
+        ...
+
+    hidden_out, present_kv = _apply_attention(op, query_states, key_states, ...)
+
+    if self.store_full_length_kv:
+        # Store present_kv [B, kv_heads, total_seq, head_dim] for downstream shared layers
+        shared_kv_states[self.layer_idx] = (present_kv_key, present_kv_value)
+
+    return hidden_out, present_kv
+```
+
+### Text model: KV cache has only num_kv_layers entries
+
+KV-shared layers do **not** append to `present_key_values`. The output list
+has `num_hidden_layers - num_kv_shared_layers` entries, not `num_hidden_layers`:
+
+```python
+# In Gemma4TextModel.forward():
+shared_kv_states: dict = {}
+present_key_values = []
+
+# past_key_values has only num_kv_layers entries (no entry for KV-shared layers).
+# Expand it to a full per-layer list so we can zip cleanly over all layers.
+if past_key_values is not None:
+    kv_iter = iter(past_key_values)
+    past_kvs: list = [
+        None if layer.self_attn.is_kv_shared_layer else next(kv_iter)
+        for layer in self.layers
+    ]
+else:
+    past_kvs = [None] * len(self.layers)
+
+for i, (layer, layer_type, past_kv) in enumerate(
+    zip(self.layers, self.layer_types, past_kvs)
+):
+    hidden_states, present_kv = layer(
+        op,
+        hidden_states=hidden_states,
+        attention_bias=attention_bias_dict[layer_type],
+        position_embeddings=position_embeddings_dict[layer_type],
+        shared_kv_states=shared_kv_states,
+        past_key_value=past_kv,
+    )
+    # KV-shared layers borrow K,V — exclude from present_key_values so the
+    # output has exactly num_kv_layers (not num_hidden_layers) entries.
+    if not layer.self_attn.is_kv_shared_layer:
+        present_key_values.append(present_kv)
+```
+
+The task's KV cache inputs/outputs must use the correct count:
+`num_kv_layers = config.num_hidden_layers - config.num_kv_shared_layers`.

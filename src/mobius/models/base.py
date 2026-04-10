@@ -28,6 +28,7 @@ from mobius._weight_utils import (
 from mobius.components import (
     DecoderLayer,
     Embedding,
+    FusedGateUpMLP,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -42,7 +43,7 @@ from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
         self._dtype = config.dtype
 
@@ -62,7 +63,7 @@ class TextModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=linear_class)
+                DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -277,3 +278,24 @@ class LayerNormCausalLMModel(CausalLMModel):
         super().__init__(config)
         # Replace TextModel with the LayerNorm-based variant.
         self.model = LayerNormTextModel(config)
+
+
+class FusedGateUpCausalLMModel(CausalLMModel):
+    """CausalLM variant that keeps gate_up_proj fused (no weight splitting).
+
+    Use this instead of ``CausalLMModel`` for architectures where HuggingFace
+    stores the gate and up projections as a single fused ``gate_up_proj``
+    weight — e.g. Phi-3, Phi-4, and GLM.
+
+    The MLP forward pass does a single ``gate_up_proj`` MatMul and splits the
+    resulting activations, rather than splitting the weights at load time.
+    This is robust to GPTQ int32-packed weights where dimension 0 is
+    ``original / pack_factor`` and weight splitting would fail.
+
+    ``preprocess_weights`` does NOT need to split ``gate_up_proj``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        # Parameterize TextModel to use FusedGateUpMLP for each decoder layer.
+        self.model = TextModel(config, mlp_class=FusedGateUpMLP)
