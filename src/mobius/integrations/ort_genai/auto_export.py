@@ -195,8 +195,10 @@ def write_ort_genai_config(
         directory: Output directory (created if needed).
         hf_model_id: HuggingFace model ID. When provided, used to fetch token
             IDs (``bos``/``eos``/``pad``) and download tokenizer files.
-            When ``None``, token IDs default to ``None`` and tokenizer files
-            are not copied.
+            When ``None``, token IDs are read from ``pkg.config`` fields
+            (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
+            by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
+            and tokenizer files are not copied.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
@@ -248,19 +250,26 @@ def write_ort_genai_config(
         eos_token_id = getattr(hf_config, "eos_token_id", None)
         pad_token_id = getattr(hf_config, "pad_token_id", None)
     else:
-        # Fall back to model_type from the mobius ArchitectureConfig.
-        # This path is taken when hf_model_id is not provided, so HF config
-        # is unavailable. The ArchitectureConfig.model_type may be absent on
-        # older configs, producing 'unknown' — ORT-GenAI may reject it.
-        raw_type = getattr(config, "model_type", "unknown")
+        # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
+        # This path is taken when hf_model_id is not provided (e.g. --config mode).
+        raw_type = getattr(config, "model_type", None) or "unknown"
         ort_model_type = _resolve_ort_genai_model_type(raw_type)
         if ort_model_type == "unknown":
             logger.warning(
-                "Could not determine ORT-GenAI model type: pkg.config has no "
-                "'model_type' attribute. Pass hf_model_id to resolve it from "
-                "the HuggingFace config, or the generated genai_config.json "
-                "may not load correctly."
+                "Could not determine ORT-GenAI model type: pkg.config.model_type "
+                "is missing, None, or not mapped to an ORT-GenAI type (got %r). "
+                "Pass hf_model_id to resolve it from the HuggingFace config, or "
+                "the generated genai_config.json may not load correctly.",
+                raw_type,
             )
+        # Read token IDs from ArchitectureConfig (populated by from_transformers()
+        # when --config is used with a local directory).
+        bos_token_id = getattr(config, "bos_token_id", None)
+        eos_token_id = getattr(config, "eos_token_id", None)
+        # pad_token_id lives in BaseModelConfig with DEFAULT_INT (-42) as the
+        # "not set" sentinel (negative IDs are never valid token positions).
+        _pad = getattr(config, "pad_token_id", None)
+        pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
     # Detect multimodal capabilities from the package keys
     is_vlm = "vision" in pkg and "embedding" in pkg
