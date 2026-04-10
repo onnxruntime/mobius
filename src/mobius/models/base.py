@@ -23,6 +23,7 @@ from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    tie_word_embeddings,
 )
 from mobius.components import (
     DecoderLayer,
@@ -239,12 +240,15 @@ class CausalLMModel(nn.Module):
                 state_dict, bits=qc.bits, group_size=qc.group_size
             )
         if self.config.tie_word_embeddings:
-            # lm_head.weight is tied at graph level (same ir.Value as embed_tokens.weight).
-            # Ensure embed_tokens.weight is present; remove lm_head.weight if it
-            # was saved separately in the checkpoint to avoid a spurious warning.
-            if "model.embed_tokens.weight" not in state_dict:
-                state_dict["model.embed_tokens.weight"] = state_dict["lm_head.weight"]
-            state_dict.pop("lm_head.weight", None)
+            # Ensure both embed_tokens.weight and lm_head.weight are present so
+            # apply_weights can assign each to its initializer.  For graph-level
+            # tied models (standard CausalLMModel) both ir.Values are the same
+            # object, so apply_weights' id()-dedup redirects lm_head uses to the
+            # embed_tokens canonical and drops the duplicate initializer.  For
+            # subclasses that override self.model after super().__init__ (e.g.
+            # Cohere, GPT-2 family), the ir.Values differ but the dedup still
+            # unifies them at load time via replace_all_uses_with.
+            tie_word_embeddings(state_dict)
         return state_dict
 
 

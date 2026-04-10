@@ -506,19 +506,27 @@ class TestWeightTying:
             "model.embed_tokens.weight initializer must be referenced by at least one node"
         )
 
-    def test_preprocess_weights_drops_lm_head_key(self):
-        """preprocess_weights must remove lm_head.weight from the state dict when tied."""
+    def test_preprocess_weights_ensures_both_tied_keys(self):
+        """preprocess_weights ensures both lm_head.weight and embed_tokens.weight exist.
+
+        tie_word_embeddings(state_dict) adds the missing key rather than removing
+        the present one, so that apply_weights can assign each initializer and the
+        id()-based dedup unifies them at load time via replace_all_uses_with.
+        """
         _, module = self._build_tied_model()
         vocab_size = make_config().vocab_size
         hidden_size = make_config().hidden_size
         weight = torch.zeros(vocab_size, hidden_size)
 
-        # Case 1: checkpoint has only embed_tokens.weight (typical tied checkpoint)
+        # Case 1: checkpoint has only embed_tokens.weight (typical tied checkpoint).
+        # lm_head.weight must be synthesised as an alias.
         sd = module.preprocess_weights({"model.embed_tokens.weight": weight})
-        assert "lm_head.weight" not in sd
         assert "model.embed_tokens.weight" in sd
+        assert "lm_head.weight" in sd
+        # Both point to the same tensor object so apply_weights dedup fires.
+        assert sd["lm_head.weight"] is sd["model.embed_tokens.weight"]
 
-        # Case 2: checkpoint has both keys (some checkpoints save both even when tied)
+        # Case 2: checkpoint has both keys — both must remain (no key is dropped).
         lm_head_weight = torch.ones(vocab_size, hidden_size)
         sd2 = module.preprocess_weights(
             {
@@ -526,13 +534,15 @@ class TestWeightTying:
                 "lm_head.weight": lm_head_weight,
             }
         )
-        assert "lm_head.weight" not in sd2
         assert "model.embed_tokens.weight" in sd2
+        assert "lm_head.weight" in sd2
 
-        # Case 3: checkpoint has only lm_head.weight
+        # Case 3: checkpoint has only lm_head.weight.
+        # embed_tokens.weight must be synthesised as an alias.
         sd3 = module.preprocess_weights({"lm_head.weight": weight})
-        assert "lm_head.weight" not in sd3
+        assert "lm_head.weight" in sd3
         assert "model.embed_tokens.weight" in sd3
+        assert sd3["lm_head.weight"] is sd3["model.embed_tokens.weight"]
 
     def test_apply_weights_dedup_canonical_is_first_insertion_order(self):
         """apply_weights dedup picks the first key in state_dict insertion order as canonical.
