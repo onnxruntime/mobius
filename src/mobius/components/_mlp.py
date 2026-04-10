@@ -98,6 +98,53 @@ class GatedMLP(nn.Module):
         return self.down_proj(op, op.Mul(gate, self.up_proj(op, x)))
 
 
+class FusedGateUpMLP(nn.Module):
+    """Gated MLP that keeps gate and up projections as one fused weight.
+
+    The ``gate_up_proj`` tensor (shape ``[2*intermediate_size, hidden_size]``)
+    is stored as a single parameter, matching HuggingFace checkpoints for
+    Phi-3, Phi-4, and GLM family models. Activations are split after the
+    fused MatMul — no weight splitting is required in ``preprocess_weights``.
+
+    Forward pass::
+
+        gate_up = gate_up_proj(x)           # [*, 2 * intermediate_size]
+        gate, up = split(gate_up, axis=-1)  # each [*, intermediate_size]
+        return down_proj(act(gate) * up)
+
+    Use this instead of :class:`MLP` when the HuggingFace checkpoint stores
+    gate and up projections as a single fused ``gate_up_proj`` weight.  This
+    avoids splitting the weight tensor at load time, which fails for GPTQ
+    int32-packed weights where dim 0 is ``original / pack_factor``.
+
+    Args:
+        config: Architecture configuration.
+        linear_class: Factory callable ``(in_features, out_features, bias=...)``
+            for creating projection layers. Defaults to ``Linear``.
+    """
+
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
+        super().__init__()
+        if linear_class is None:
+            linear_class = Linear
+        # Single fused weight: [2*intermediate_size, hidden_size]
+        self.gate_up_proj = linear_class(
+            config.hidden_size, 2 * config.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = linear_class(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
+        self.act_fn = get_activation(config.hidden_act)
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        # Fused matmul → [*, 2 * intermediate_size]
+        gate_up = self.gate_up_proj(op, x)
+        # Split activations at intermediate_size boundary
+        gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
+        # SwiGLU: act(gate) * up → down_proj
+        return self.down_proj(op, op.Mul(self.act_fn(op, gate), up))
+
+
 class FCMLP(nn.Module):
     """Two-layer fully-connected MLP: ``up_proj → activation → down_proj``.
 
