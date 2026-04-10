@@ -10,6 +10,8 @@ noise prediction of the same shape.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 
 from mobius._diffusers_configs import CogVideoXConfig
@@ -20,7 +22,7 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class VideoDenoisingTask(ModelTask):
     """Build ONNX graph for video diffusion denoising."""
 
-    name = "video-denoising"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
@@ -64,4 +66,4 @@ class VideoDenoisingTask(ModelTask):
         noise_pred.name = "noise_pred"
         graph.outputs.append(noise_pred)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)
