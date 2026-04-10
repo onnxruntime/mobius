@@ -382,8 +382,27 @@ class Gemma4TextAttention(nn.Module):
             )
 
         if self.is_kv_shared_layer:
-            # Borrow full-history K,V from source layer
+            # Borrow full-history K,V from source layer.
+            # present_key/value from the ONNX Attention op is 4D:
+            #   [batch, kv_heads, total_seq, head_dim]
+            # The Attention op expects key/value as 3D:
+            #   [batch, total_seq, kv_heads * head_dim]
+            # Transpose and reshape to match.
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+
+            # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads, head_dim]
+            src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+            src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
+
+            # [B, total_seq, kv_heads, head_dim] → [B, total_seq, kv_heads * head_dim]
+            kv_hidden = self.num_key_value_heads * self.head_dim
+            batch_d = op.Shape(src_key, start=0, end=1)
+            seq_d = op.Shape(src_key, start=1, end=2)
+            kv_h = op.Constant(value_ints=[kv_hidden])
+            tgt_shape = op.Concat(batch_d, seq_d, kv_h, axis=0)
+            src_key = op.Reshape(src_key, tgt_shape)
+            src_value = op.Reshape(src_value, tgt_shape)
+
             attn_output, present_key, present_value = _apply_attention(
                 op,
                 query_states,
@@ -541,7 +560,11 @@ class Gemma4DecoderLayer(nn.Module):
         is_full = layer_type == "full_attention"
 
         head_dim = (config.global_head_dim or config.head_dim) if is_full else config.head_dim
-        rotary_dim = int(head_dim * config.global_partial_rotary_factor) if is_full else 0
+        # ProportionalRope handles partial rotation via zero-padded cos/sin (full head_dim
+        # coverage). The ONNX RotaryEmbedding op must see rotary_embedding_dim=0 (full)
+        # so it pairs dims using the split-half convention over the entire head_dim.
+        # For sliding (DefaultRope, full rotation), rotary_embedding_dim=0 is also correct.
+        rotary_dim = 0
 
         self.self_attn = Gemma4TextAttention(
             config,
@@ -830,14 +853,15 @@ class Gemma4TextModel(nn.Module):
             rope_scaling=None,
             partial_rotary_factor=1.0,
         )
-        # Global (full attention) config — larger head_dim, different RoPE
+        # Global (full attention) config — larger head_dim, proportional RoPE
+        # (partial rotation via zero-padded inv_freq to cover full head_dim)
         global_head_dim = config.global_head_dim or config.head_dim
         global_config = dataclasses.replace(
             config,
             head_dim=global_head_dim,
             rope_theta=config.global_rope_theta,
             partial_rotary_factor=config.global_partial_rotary_factor,
-            rope_type="default",
+            rope_type="proportional",
             rope_scaling=None,
             sliding_window=None,
         )
@@ -998,6 +1022,7 @@ class Gemma4CausalLMModel(CausalLMModel):
 
     config_class: type = Gemma4Config
     category: str = "Text"
+    default_task: str = "gemma4-text-generation"
 
     def __init__(self, config: Gemma4Config):
         nn.Module.__init__(self)

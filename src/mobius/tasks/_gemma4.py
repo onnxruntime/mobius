@@ -80,6 +80,75 @@ def _make_gemma4_kv_cache_inputs(
     return flat, pairs
 
 
+class Gemma4TextCausalLMTask(ModelTask):
+    """Text-only causal LM task for Gemma4 with correct dual head_dim KV cache.
+
+    Identical to :class:`~mobius.tasks.CausalLMTask` but uses
+    :func:`_make_gemma4_kv_cache_inputs` for the KV cache so that:
+
+    - global (full_attention) layers use ``config.global_head_dim`` (512)
+    - local (sliding_attention) layers use ``config.head_dim`` (256)
+    - the last ``config.num_kv_shared_layers`` layers share K,V and have no
+      independent cache entries
+
+    Inputs:
+        - input_ids: [batch, sequence_len] INT64
+        - attention_mask: [batch, past_seq_len + seq_len] INT64
+        - position_ids: [batch, sequence_len] INT64
+        - past_key_values.{i}.key / .value for i in 0..num_kv_layers-1
+    Outputs:
+        - logits: FLOAT
+        - present.{i}.key / present.{i}.value for i in 0..num_kv_layers-1
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: Gemma4Config,
+    ) -> ModelPackage:
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        attention_mask = ir.Value(
+            name="attention_mask",
+            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+        position_ids = ir.Value(
+            name="position_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
+
+        graph_inputs = [input_ids, attention_mask, position_ids]
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
+            config, batch, past_seq_len
+        )
+        graph_inputs.extend(kv_inputs)
+
+        graph, graph_builder = _make_graph(graph_inputs)
+        op = graph_builder.op
+
+        logits, present_key_values = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        logits.name = "logits"
+        graph.outputs.append(logits)
+        _register_kv_cache_outputs(graph, present_key_values)
+
+        return ModelPackage({"model": _make_model(graph)}, config=config)
+
+
 class Gemma4VisionLanguageTask(ModelTask):
     """3-model split task for Gemma4 vision-language models.
 

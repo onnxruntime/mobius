@@ -1529,9 +1529,17 @@ class Gemma4Config(VisionLanguageConfig):
         if moe_intermediate_size is not None:
             base = dataclasses.replace(base, moe_intermediate_size=moe_intermediate_size)
 
-        # Extract dual RoPE parameters from rope_parameters dict
+        # Extract dual RoPE parameters from rope_parameters dict.
+        # NOTE: Gemma4TextConfig exposes rope_parameters == rope_scaling, both being a
+        # nested dict keyed by layer type.  The generic _extract_rope_config extractor
+        # picks up full_attention.rope_theta (1_000_000) via _nested_rope_theta, making
+        # the base rope_theta wrong for local/sliding layers.  Correct it here.
         rope_params = getattr(config, "rope_parameters", {}) or {}
         full_rope = rope_params.get("full_attention", {}) if isinstance(rope_params, dict) else {}
+        sliding_rope = rope_params.get("sliding_attention", {}) if isinstance(rope_params, dict) else {}
+        if "rope_theta" in sliding_rope:
+            # Override with the correct sliding-attention theta (e.g. 10_000 for E2B/E4B).
+            base = dataclasses.replace(base, rope_theta=float(sliding_rope["rope_theta"]))
 
         return cls(
             **_shallow_fields(base),

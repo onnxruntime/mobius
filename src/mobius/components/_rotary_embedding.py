@@ -116,6 +116,49 @@ class DefaultRope(BaseRope):
         super().__init__(cos_cache, sin_cache)
 
 
+class ProportionalRope(BaseRope):
+    """Proportional RoPE as used in Gemma4 full-attention layers.
+
+    Matches HuggingFace ``_compute_proportional_rope_parameters``: the
+    inv_freq table is padded with zeros to ``head_dim // 2`` so that the
+    cos/sin cache has shape ``[max_pos, head_dim]``.  Applying this with
+    ``rotary_embedding_dim=0`` (full head) gives the same result as HF's
+    ``apply_rotary_pos_emb`` with ``rotate_half`` over the full head:
+    - dims 0 .. rope_angles*2-1 actually rotate (non-zero frequencies)
+    - remaining dims map to cos=1, sin=0 → identity transform
+
+    The key difference from ``DefaultRope`` with partial_rotary_factor:
+    ``DefaultRope`` pairs dims {0..k-1} with {k..2k-1} (compact block).
+    ``ProportionalRope`` pairs dims {0..k-1} with {head_dim//2..head_dim//2+k-1}
+    (split-half convention over the full head), matching HF's ``rotate_half``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        head_dim = config.head_dim
+        rope_proportion = config.partial_rotary_factor
+        rope_theta = config.rope_theta
+
+        # Number of rotation pairs: e.g. int(0.25 * 512 // 2) = 64 for Gemma4
+        rope_angles = int(rope_proportion * head_dim // 2)
+        inv_freq_rotated = 1.0 / (
+            rope_theta
+            ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_dim)
+        )  # shape [rope_angles]
+
+        # Pad with zeros so inv_freq covers the full head_dim // 2
+        nope_angles = head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = np.concatenate(
+                [inv_freq_rotated, np.zeros(nope_angles, dtype=np.float32)]
+            )  # shape [head_dim // 2]
+        else:
+            inv_freq = inv_freq_rotated
+
+        # cos/sin cache shape: [max_pos, head_dim] (emb = cat([freqs, freqs]))
+        cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
+        super().__init__(cos_cache, sin_cache)
+
+
 class LinearRope(BaseRope):
     def __init__(self, config: ArchitectureConfig):
         inv_freq = _get_default_inv_freq(config)
@@ -449,6 +492,8 @@ def initialize_rope(config: ArchitectureConfig) -> nn.Module:
         return ChunkedMRope(config)
     if config.rope_type == "default":
         return DefaultRope(config)
+    if config.rope_type == "proportional":
+        return ProportionalRope(config)
     if config.rope_type == "linear":
         return LinearRope(config)
     if config.rope_type == "dynamic":

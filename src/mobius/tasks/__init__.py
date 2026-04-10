@@ -27,6 +27,7 @@ __all__ = [
     "DenoisingTask",
     "FeatureExtractionTask",
     "Gemma4AnyToAnyTask",
+    "Gemma4TextCausalLMTask",
     "Gemma4VisionLanguageTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
@@ -77,7 +78,7 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
-from mobius.tasks._gemma4 import Gemma4AnyToAnyTask, Gemma4VisionLanguageTask
+from mobius.tasks._gemma4 import Gemma4AnyToAnyTask, Gemma4TextCausalLMTask, Gemma4VisionLanguageTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,
@@ -111,6 +112,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma4-any-to-any": Gemma4AnyToAnyTask,
     "gemma4-multimodal": Gemma4VisionLanguageTask,
+    "gemma4-text-generation": Gemma4TextCausalLMTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "speech-language": SpeechLanguageTask,
