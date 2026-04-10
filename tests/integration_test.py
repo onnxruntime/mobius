@@ -5071,3 +5071,112 @@ def test_gemma4_e2b_text_prefill():
     )
 
     assert_logits_close(onnx_logits, hf_logits, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_gemma4_e2b_text_prefill_bf16():
+    """Gemma 4 E2B text-only prefill in bfloat16: ONNX logits match HuggingFace.
+
+    Same as ``test_gemma4_e2b_text_prefill`` but builds the ONNX model in
+    bfloat16 and loads the HuggingFace reference in bfloat16.  Tolerances
+    are relaxed to atol=5e-3 / rtol=1e-2 to account for bfloat16 rounding.
+    """
+    import dataclasses
+
+    import ml_dtypes
+    import onnx_ir as ir
+    from transformers import Gemma4ForConditionalGeneration  # noqa: PLC0415
+
+    from mobius import build_from_module
+    from mobius._configs import Gemma4Config
+    from mobius._weight_loading import apply_weights
+    from mobius.models.gemma4 import Gemma4CausalLMModel
+
+    MODEL_ID = "google/gemma-4-E2B-it"
+
+    if not _model_accessible(MODEL_ID):
+        pytest.skip(f"{MODEL_ID} not accessible (requires HuggingFace authentication)")
+
+    # Load HF multimodal config — text backbone is in hf_config.text_config
+    hf_config = transformers.AutoConfig.from_pretrained(MODEL_ID)
+
+    # Load full Gemma4ForConditionalGeneration in bfloat16.
+    hf_full = Gemma4ForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
+    ).eval()
+    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
+
+    # Build Gemma4Config from text_config sub-config, bfloat16
+    text_cfg = hf_config.text_config
+    gemma4_config = Gemma4Config.from_transformers(text_cfg, parent_config=hf_config)
+    gemma4_config = dataclasses.replace(gemma4_config, dtype=ir.DataType.BFLOAT16)
+
+    # Build ONNX Gemma4CausalLMModel (text-only, bfloat16)
+    onnx_module = Gemma4CausalLMModel(gemma4_config)
+    pkg = build_from_module(onnx_module, gemma4_config, task="gemma4-text-generation")
+    assert "model" in pkg
+
+    # Transfer HF weights → ONNX.
+    preprocessed = onnx_module.preprocess_weights(dict(hf_full.state_dict()))
+    apply_weights(pkg["model"], preprocessed)
+
+    # Tokenize a short prompt
+    prompt = "Hello, world!"
+    tokens = tokenizer(prompt, return_tensors="np")
+    input_ids = tokens["input_ids"].astype(np.int64)
+    attention_mask = tokens["attention_mask"].astype(np.int64)
+    seq_len = input_ids.shape[1]
+    position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+    # HF reference: text-only forward in bfloat16; convert to float32 for numpy comparison
+    with torch.no_grad():
+        hf_out = hf_full(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+        )
+    hf_logits = hf_out.logits.float().numpy()  # [1, seq_len, vocab_size]
+
+    # Build bfloat16 KV cache feeds (empty — prefill has no prior context).
+    # Replicates _make_gemma4_prefill_feeds but uses ml_dtypes.bfloat16 for
+    # the KV tensors to match the model's declared input dtype.
+    local_head_dim = gemma4_config.head_dim
+    global_head_dim = getattr(gemma4_config, "global_head_dim", None) or gemma4_config.head_dim
+    num_kv_shared = getattr(gemma4_config, "num_kv_shared_layers", 0) or 0
+    num_kv_layers = gemma4_config.num_hidden_layers - num_kv_shared
+    layer_types = getattr(gemma4_config, "layer_types", None) or (
+        ["sliding_attention"] * gemma4_config.num_hidden_layers
+    )
+    feeds: dict[str, np.ndarray] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    for i in range(num_kv_layers):
+        lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
+        hd = global_head_dim if lt == "full_attention" else local_head_dim
+        feeds[f"past_key_values.{i}.key"] = np.zeros(
+            (1, gemma4_config.num_key_value_heads, 0, hd), dtype=ml_dtypes.bfloat16
+        )
+        feeds[f"past_key_values.{i}.value"] = np.zeros(
+            (1, gemma4_config.num_key_value_heads, 0, hd), dtype=ml_dtypes.bfloat16
+        )
+
+    # ONNX inference
+    session = OnnxModelSession(pkg["model"])
+    onnx_outputs = session.run(feeds)
+    session.close()
+    # ONNX returns bfloat16; convert to float32 for numerical comparison
+    onnx_logits = onnx_outputs["logits"].astype(np.float32)  # [1, seq_len, vocab_size]
+
+    max_diff = float(np.max(np.abs(onnx_logits - hf_logits)))
+    mean_diff = float(np.mean(np.abs(onnx_logits - hf_logits)))
+    print(
+        f"\nGemma4 E2B bf16 prefill parity — "
+        f"max_abs_diff={max_diff:.6f}, mean_abs_diff={mean_diff:.6f}"
+    )
+
+    assert_logits_close(onnx_logits, hf_logits, rtol=1e-2, atol=5e-3)
