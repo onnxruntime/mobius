@@ -93,7 +93,7 @@ MAX_NEW_TOKENS = 128
 # IMAGE_TOKEN_ID: placeholder inserted once per image in input_ids
 IMAGE_TOKEN_ID = 255999  # <image_soft_token> (same as Gemma 3)
 # AUDIO_TOKEN_ID: placeholder inserted once per audio chunk in input_ids
-AUDIO_TOKEN_ID = 256000  # <audio_soft_token> — update when HF config confirms
+AUDIO_TOKEN_ID = 258881  # <audio_soft_token> — confirmed from google/gemma-4-E2B-it HF config
 EOS_TOKEN_IDS = {1, 107}  # </s> and <end_of_turn>
 
 # Gemma 4 SigLIP vision encoder: 280 soft tokens per image after projection.
