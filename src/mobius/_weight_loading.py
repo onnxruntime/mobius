@@ -103,6 +103,11 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     # Map tensor id → the ir.Value of the first initializer assigned for that tensor.
     # Enables genuine weight sharing: if lm_head.weight IS embed_tokens.weight
     # (same Python object), the second initializer is merged into the first.
+    # Prefer embed_tokens.weight as the canonical name regardless of state_dict
+    # insertion order — this keeps initializer names consistent even when a
+    # checkpoint supplies only lm_head.weight and tie_word_embeddings() adds
+    # model.embed_tokens.weight afterwards (making lm_head appear first).
+    _embed_suffix = "embed_tokens.weight"
     tensor_id_to_value: dict[int, ir.Value] = {}
 
     for name, tensor in state_dict.items():
@@ -117,17 +122,32 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
         tid = id(tensor)
 
         if tid in tensor_id_to_value:
-            # This tensor was already assigned to another initializer.
-            # Redirect all graph uses of this initializer to the canonical one,
-            # then delete this initializer — genuine single-copy weight sharing.
             canonical = tensor_id_to_value[tid]
-            initializer.replace_all_uses_with(canonical)
-            del model.graph.initializers[name]
-            logger.debug(
-                "Weight tying: '%s' shares initializer with '%s'",
-                name,
-                canonical.name,
-            )
+            # If the current initializer has the preferred embedding name but the
+            # existing canonical does not, swap them so embedding is always canonical.
+            if name.endswith(_embed_suffix) and not (canonical.name or "").endswith(
+                _embed_suffix
+            ):
+                # Promote this initializer to canonical; demote the previous one.
+                _assign_weight(initializer, tensor, name)
+                canonical.replace_all_uses_with(initializer)
+                del model.graph.initializers[canonical.name]
+                tensor_id_to_value[tid] = initializer
+                logger.debug(
+                    "Weight tying: '%s' promoted to canonical (was '%s')",
+                    name,
+                    canonical.name,
+                )
+            else:
+                # Redirect all graph uses of this initializer to the canonical one,
+                # then delete this initializer — genuine single-copy weight sharing.
+                initializer.replace_all_uses_with(canonical)
+                del model.graph.initializers[name]
+                logger.debug(
+                    "Weight tying: '%s' shares initializer with '%s'",
+                    name,
+                    canonical.name,
+                )
         else:
             _assign_weight(initializer, tensor, name)
             tensor_id_to_value[tid] = initializer

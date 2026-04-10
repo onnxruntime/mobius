@@ -534,6 +534,38 @@ class TestWeightTying:
         assert "lm_head.weight" not in sd3
         assert "model.embed_tokens.weight" in sd3
 
+    def test_apply_weights_dedup_canonical_is_always_embed_key(self):
+        """apply_weights dedup (safety-net path) must always use embed_tokens as canonical.
+
+        When a model still uses two graph initializers (old-style, no __init__ aliasing),
+        and the state_dict has lm_head.weight before model.embed_tokens.weight (e.g.,
+        from a checkpoint where only lm_head.weight was saved and tie_word_embeddings()
+        added embed_tokens.weight after), the canonical initializer must still be
+        model.embed_tokens.weight — not lm_head.weight.
+        """
+        # Build an untied model so the graph has both initializers.
+        config = make_config(tie_word_embeddings=False)
+        module = CausalLMModel(config)
+        pkg = build_from_module(module, config)
+        model = pkg["model"]
+
+        weight = torch.zeros(config.vocab_size, config.hidden_size)
+        # Simulate: checkpoint only had lm_head.weight; tie_word_embeddings() added
+        # embed_tokens.weight — so lm_head.weight appears first in the dict.
+        sd = {
+            "lm_head.weight": weight,
+            "model.embed_tokens.weight": weight,  # same object, lm_head first
+        }
+        apply_weights(model, sd)
+
+        # Regardless of insertion order, model.embed_tokens.weight must be canonical.
+        assert "model.embed_tokens.weight" in model.graph.initializers, (
+            "model.embed_tokens.weight must be the canonical initializer"
+        )
+        assert "lm_head.weight" not in model.graph.initializers, (
+            "lm_head.weight must be removed — merged into embed_tokens"
+        )
+
     def test_untied_weights_have_separate_initializers(self):
         """When tie_word_embeddings=False, both initializers remain independent."""
         config = make_config(tie_word_embeddings=False)
