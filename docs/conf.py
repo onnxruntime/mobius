@@ -33,6 +33,8 @@ extensions = [
     "models_gen",
     "flags_gen",
     "dashboard",
+    # Annotate each page with git-based creation and last-update dates
+    "git_timestamps",
 ]
 
 myst_enable_extensions = [
