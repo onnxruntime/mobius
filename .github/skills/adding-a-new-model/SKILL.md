@@ -304,6 +304,12 @@ new model is a significant addition.
 
 ## Checklist
 
+This is the **implementation** checklist — the steps needed to wire up a new
+model in the codebase.  For the full **definition-of-done** quality checklist
+(L1–L5 tests, ORT GenAI, Foundry Local, Olive quantization, multi-dtype,
+code review), see the
+[quality-checklist skill](../quality-checklist/SKILL.md).
+
 - [ ] Model file in `src/mobius/models/` with Microsoft MIT copyright header
 - [ ] Class has `default_task` and `category` attributes (if not standard text-generation)
 - [ ] Class has a descriptive docstring (first paragraph used in generated docs)
@@ -312,8 +318,13 @@ new model is a significant addition.
 - [ ] Exported from `models/__init__.py`
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
-- [ ] Integration test model in `tests/integration_test.py` (if small checkpoint available)
+- [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
+- [ ] Integration test model in `tests/integration_test.py` (L3 synthetic parity)
+- [ ] L4 golden file generated and committed (`testdata/golden/`)
+- [ ] L5 generation golden file generated and committed
+- [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)
 - [ ] CLI build works (`mobius build --model ...`)
+- [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
 
 **Note:** Default optimizer passes (CSE, deduplicate initializers, identity
 elimination, remove unused nodes/opsets) are applied automatically by
