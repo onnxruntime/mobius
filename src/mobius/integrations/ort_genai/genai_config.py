@@ -52,20 +52,20 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
 
     Args:
         ep: Execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
-            ``"webgpu"``, ``"trt-rtx"``).  WebGPU sets
-            ``past_present_share_buffer`` to ``True`` because the WebGPU
-            runtime allocates a fixed KV-cache buffer up-front and requires
-            the past and present KV tensors to share the same backing buffer.
+            ``"webgpu"``, ``"trt-rtx"``).  Capability flags are read from
+            :data:`~mobius._execution_providers.ep_registry`.
         context_length: Model context window; used as the default
             ``max_length`` for generation so the limit matches the model.
     """
-    webgpu = ep == "webgpu"
-    if webgpu:
-        # WebGPU pre-allocates KV-cache for the full max_length at load time.
-        # Using the raw context_length (e.g. 128K tokens) would pre-allocate
-        # ~8 GB of GPU memory by default.  Cap at _WEBGPU_MAX_LENGTH_CAP so
-        # the model loads sensibly on consumer hardware; users can override
-        # in genai_config.json for their target device.
+    from mobius._execution_providers import ep_registry
+
+    caps = ep_registry.get(ep)
+    share_buffer = caps.past_present_share_buffer if caps is not None else False
+    if share_buffer:
+        # EPs that pre-allocate KV-cache for the full max_length at load time
+        # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
+        # buffers (~8 GB for 128K-token models) on consumer hardware.  Users
+        # can raise the limit in genai_config.json for their target device.
         max_length = min(context_length, _WEBGPU_MAX_LENGTH_CAP)
     else:
         max_length = context_length
@@ -76,7 +76,7 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
         "min_length": 0,
         "num_beams": 1,
         "num_return_sequences": 1,
-        "past_present_share_buffer": webgpu,
+        "past_present_share_buffer": share_buffer,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_k": 1,

@@ -140,7 +140,7 @@ class TestGenaiConfigGeneratorLLM:
         assert search["past_present_share_buffer"] is False
 
     def test_search_params_webgpu_sets_past_present_share_buffer(self):
-        """WebGPU EP sets past_present_share_buffer=True and caps max_length."""
+        """WebGPU EP sets past_present_share_buffer=True via EpCapabilities and caps max_length."""
         gen = GenaiConfigGenerator(
             "qwen2",
             vocab_size=151936,
@@ -188,6 +188,38 @@ class TestGenaiConfigGeneratorLLM:
         )
         config = gen.generate()
         assert config["search"]["past_present_share_buffer"] is False
+
+    def test_search_params_custom_ep_with_share_buffer(self):
+        """A custom EP registered with past_present_share_buffer=True gets the flag set.
+
+        This proves the value comes from EpCapabilities, not from a hardcoded
+        'ep == webgpu' check.
+        """
+        from mobius._execution_providers import EpCapabilities, ep_registry
+
+        ep_registry.register(
+            EpCapabilities(name="test-custom-ep", past_present_share_buffer=True),
+            overwrite=True,
+        )
+        try:
+            gen = GenaiConfigGenerator(
+                "llama",
+                vocab_size=32000,
+                hidden_size=4096,
+                num_hidden_layers=32,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                ep="test-custom-ep",
+                context_length=8192,
+            )
+            config = gen.generate()
+            assert config["search"]["past_present_share_buffer"] is True
+            # Buffer-sharing EP: max_length capped at 4096
+            assert config["search"]["max_length"] == 4096
+        finally:
+            # Clean up the test EP so it doesn't bleed into other tests
+            ep_registry._entries.pop("test-custom-ep", None)
 
     def test_session_options_present(self):
         """Decoder has session_options with log_id."""
