@@ -315,8 +315,12 @@ class Gemma4VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
-class Gemma4AnyToAnyTask(ModelTask):
+class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
     """4-model split task for Gemma4 Any-to-Any models (E2B, E4B).
+
+    Extends :class:`Gemma4VisionLanguageTask` (inherits ``_build_decoder`` and
+    ``_build_vision``) and adds an audio encoder, overriding ``build`` and
+    ``_build_embedding`` to wire in ``audio_features``.
 
     The module must expose four sub-modules:
 
@@ -341,90 +345,6 @@ class Gemma4AnyToAnyTask(ModelTask):
         models["audio"] = self._build_audio(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
-
-    def _build_decoder(
-        self,
-        decoder: nn.Module,
-        config: Gemma4Config,
-    ) -> ir.Model:
-        """Build text decoder: inputs_embeds -> logits + per-layer KV cache."""
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        past_seq_len = ir.SymbolicDim("past_sequence_len")
-
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
-        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
-            config, batch, past_seq_len
-        )
-        graph_inputs.extend(kv_inputs)
-
-        graph, graph_builder = _make_graph(graph_inputs, name="decoder")
-        op = graph_builder.op
-
-        logits, present_key_values = decoder(
-            op,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
-
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
-        return _make_model(graph)
-
-    def _build_vision(
-        self,
-        vision: nn.Module,
-        config: Gemma4Config,
-    ) -> ir.Model:
-        """Build vision encoder: pixel_values + pixel_position_ids -> image_features."""
-        batch = ir.SymbolicDim("batch")
-        num_patches = ir.SymbolicDim("num_patches")
-        patch_size = config.vision.patch_size or 16 if config.vision else 16
-        pixel_dim = 3 * patch_size * patch_size
-
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, num_patches, pixel_dim]),
-            type=ir.TensorType(config.dtype),
-        )
-        pixel_position_ids = ir.Value(
-            name="pixel_position_ids",
-            shape=ir.Shape([batch, num_patches, 2]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph, graph_builder = _make_graph(
-            [pixel_values, pixel_position_ids], name="vision"
-        )
-        op = graph_builder.op
-
-        image_features = vision(
-            op,
-            pixel_values=pixel_values,
-            pixel_position_ids=pixel_position_ids,
-        )
-        image_features.name = "image_features"
-        graph.outputs.append(image_features)
-        return _make_model(graph)
 
     def _build_audio(
         self,
@@ -498,4 +418,5 @@ class Gemma4AnyToAnyTask(ModelTask):
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
         return _make_model(graph)
+
 
