@@ -1,0 +1,19 @@
+model_id: "mistralai/Ministral-3-3B-Instruct-2512"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "What is in this image?"
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+skip_reason: "Gated repo (mistralai/Ministral-3-3B-Instruct-2512 requires authentication)."
+notes: "Ministral 3-3B (Pixtral VLM). PixtralVisionTower + Mistral3MultiModalProjector + MistralDecoder. 3-model split (vision/embedding/decoder). Uses 2D RoPE for vision, YaRN 1D RoPE for text decoder."

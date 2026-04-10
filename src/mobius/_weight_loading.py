@@ -147,6 +147,56 @@ def _parallel_download(
     return [path_map[f] for f in filenames]
 
 
+def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Dequantize FP8 weights and return a new dict with float tensors.
+
+    Some HuggingFace checkpoints (e.g. Ministral-3-3B) store linear layer
+    weights as float8_e4m3fn with a scalar ``weight_scale_inv`` tensor.
+    The real weight value is ``fp8_weight.to(bfloat16) * weight_scale_inv``.
+
+    Dequantization targets bfloat16 because that is the native training
+    dtype for FP8-quantized checkpoints — the FP8 values represent
+    bfloat16 values scaled into the FP8 range.
+
+    This function detects FP8 tensors, applies the scale, and removes the
+    auxiliary ``weight_scale_inv`` and ``activation_scale`` tensors.
+
+    Returns:
+        A new dict with FP8 weights dequantized to bfloat16 and auxiliary
+        scale tensors removed.
+    """
+    fp8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    fp8_keys = [k for k, v in state_dict.items() if v.dtype in fp8_dtypes]
+    if not fp8_keys:
+        return state_dict
+
+    # Work on a copy to avoid mutating the caller's dict
+    result = dict(state_dict)
+
+    logger.info("Dequantizing %d FP8 weights", len(fp8_keys))
+    for key in fp8_keys:
+        # Derive scale key from weight key using suffix replacement to avoid
+        # replacing '.weight' substrings that appear in the middle of the key
+        # (e.g. 'model.weight_proj.weight' → 'model.weight_proj.weight_scale_inv').
+        if key.endswith(".weight"):
+            scale_key = key[: -len(".weight")] + ".weight_scale_inv"
+        else:
+            scale_key = key + "_scale_inv"
+
+        if scale_key in result:
+            # Cast scale to bfloat16 to guarantee the output dtype is bfloat16,
+            # even when weight_scale_inv is stored as FP32 in the checkpoint.
+            scale = result[scale_key].to(torch.bfloat16)
+            result[key] = result[key].to(torch.bfloat16) * scale
+        else:
+            logger.warning("FP8 weight '%s' has no scale_inv — casting without scaling", key)
+            result[key] = result[key].to(torch.bfloat16)
+
+    # Remove auxiliary FP8 tensors (not needed in the ONNX graph)
+    aux_suffixes = (".weight_scale_inv", ".activation_scale", ".input_scale")
+    return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
+
+
 def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     """Download weights from HuggingFace and return as a state dict.
 
@@ -171,4 +221,6 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
         state_dict.update(safetensors.torch.load_file(path))
+
+    state_dict = _dequantize_fp8_weights(state_dict)
     return state_dict

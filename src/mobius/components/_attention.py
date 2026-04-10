@@ -320,6 +320,12 @@ class Attention(nn.Module):
                 rotary_embedding_dim=self.rotary_embedding_dim,
                 interleaved=self._rope_interleave,
             )
+            # Apply llama_4_attn_scale if present (Ministral3/Mistral4).
+            # The scale is computed from position_ids by the RoPE module
+            # and passed as the 3rd element of position_embeddings.
+            if len(position_embeddings) > 2:
+                attn_scale = position_embeddings[2]
+                query_states = op.Mul(query_states, attn_scale)
 
         attn_output, present_key, present_value = _apply_attention(
             op,

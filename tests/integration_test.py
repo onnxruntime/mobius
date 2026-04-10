@@ -1512,6 +1512,103 @@ class TestMistral3VL3Model:
             atol=2e-1,
         )
 
+    def test_vision_features_parity(self, model_id: str):
+        """Vision model output features match HF PyTorch reference.
+
+        Catches regressions in:
+        - Attention/RotaryEmbedding op attribute types (the swapped INT/FLOAT bug)
+        - Weight dequantization correctness
+        - 2D RoPE positional encoding
+        - PatchMerger spatial reshaping
+        """
+        import math
+
+        pkg = _build_mistral3_3model(model_id)
+        hf_config = transformers.AutoConfig.from_pretrained(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        torch_model.eval()
+
+        # Use the standard test image
+        image = Image.open("testdata/pipeline-cat-chonk.jpeg").convert("RGB")
+        w, h = image.size
+
+        # HF Pixtral resize: scale longest side to max_image_size, ceil to patch_size
+        patch_size = hf_config.vision_config.image_size // (
+            hf_config.vision_config.image_size // hf_config.vision_config.patch_size
+        )
+        max_image_size = hf_config.vision_config.image_size
+        merge_size = getattr(hf_config.vision_config, "spatial_merge_size", 2)
+        effective_patch = patch_size * merge_size
+
+        scale = max_image_size / max(h, w)
+        new_h = math.ceil(h * scale / patch_size) * patch_size
+        new_w = math.ceil(w * scale / patch_size) * patch_size
+        if new_h % effective_patch != 0:
+            new_h = math.ceil(new_h / effective_patch) * effective_patch
+        if new_w % effective_patch != 0:
+            new_w = math.ceil(new_w / effective_patch) * effective_patch
+
+        resized = image.resize((new_w, new_h), Image.BICUBIC)
+        arr = np.array(resized, dtype=np.float32) / 255.0
+        mean = np.array([0.48145466, 0.4578275, 0.40821073])
+        std = np.array([0.26862954, 0.26130258, 0.27577711])
+        arr = (arr - mean) / std
+        pixel_values = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
+
+        # HF reference: vision_tower + multi_modal_projector
+        pv_torch = torch.from_numpy(pixel_values).to(torch_model.dtype)
+        with torch.no_grad():
+            raw = torch_model.model.vision_tower(pv_torch).last_hidden_state.squeeze(0)
+            hf_features = (
+                torch_model.model.multi_modal_projector(raw, torch.tensor([[new_h, new_w]]))
+                .float()
+                .numpy()
+            )
+
+        # ONNX vision model
+        vision_session = OnnxModelSession(pkg["vision"])
+        onnx_out = vision_session.run({"pixel_values": pixel_values.astype(np.float32)})
+        vision_session.close()
+        onnx_features = onnx_out["image_features"].astype(np.float32)
+
+        # Shape check
+        assert hf_features.shape == onnx_features.shape, (
+            f"Shape mismatch: HF={hf_features.shape}, ONNX={onnx_features.shape}"
+        )
+
+        # Cosine similarity (must be very high — catches attribute type bugs)
+        cosine_sim = np.dot(hf_features.flatten(), onnx_features.flatten()) / (
+            np.linalg.norm(hf_features) * np.linalg.norm(onnx_features)
+        )
+        assert cosine_sim > 0.99, (
+            f"Vision cosine similarity {cosine_sim:.6f} < 0.99 — "
+            f"ONNX vision model produces different features than HF. "
+            f"HF norm={np.linalg.norm(hf_features):.2f}, "
+            f"ONNX norm={np.linalg.norm(onnx_features):.2f}"
+        )
+
+        # Norm ratio (catches scale factor bugs like FP8 dequant issues)
+        norm_ratio = np.linalg.norm(onnx_features) / np.linalg.norm(hf_features)
+        assert 0.9 < norm_ratio < 1.1, (
+            f"Vision norm ratio {norm_ratio:.4f} outside [0.9, 1.1] — "
+            f"scale factor mismatch between ONNX and HF"
+        )
+
+        # Random independence check (catches attribute zero bugs)
+        rng = np.random.RandomState(42)
+        r1 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
+        r2 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
+        vision_session = OnnxModelSession(pkg["vision"])
+        o1 = vision_session.run({"pixel_values": r1})["image_features"].flatten()
+        o2 = vision_session.run({"pixel_values": r2})["image_features"].flatten()
+        vision_session.close()
+        random_cosine = np.dot(o1, o2) / (np.linalg.norm(o1) * np.linalg.norm(o2))
+        assert random_cosine < 0.9, (
+            f"Random input cosine similarity {random_cosine:.4f} > 0.9 — "
+            f"vision model is not differentiating inputs (possible broken attention)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Encoder-only models (BERT, DistilBERT, etc.)

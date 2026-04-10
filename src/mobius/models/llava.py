@@ -129,7 +129,20 @@ class _LLaVAEmbeddingModel(nn.Module):
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Pad image_features with one zero row so Gather is valid even when
+        # image_features is empty (text-only input: num_image_tokens == 0).
+        # The Where mask ensures the padding row is never used in the output.
+        pad_row = op.Expand(
+            op.CastLike(op.Constant(value_float=0.0), image_features),
+            op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Shape(image_features, start=1, end=2),
+                axis=0,
+            ),
+        )
+        padded_features = op.Concat(image_features, pad_row, axis=0)
+
+        gathered = op.Gather(padded_features, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(
