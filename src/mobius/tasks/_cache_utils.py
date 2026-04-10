@@ -1,7 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""KV cache and linear attention utility functions for task graph construction."""
+"""KV cache and linear attention utility functions for task graph construction.
+
+Provides helpers for wiring KV cache state tensors (inputs/outputs) into
+ONNX task graphs, and for registering hybrid (DeltaNet) linear-attention
+function bodies.  Only cache-related utilities live here; higher-level
+multi-component graph builders live in :mod:`mobius.tasks._base`.
+"""
 
 from __future__ import annotations
 
