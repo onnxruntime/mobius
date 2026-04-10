@@ -1887,8 +1887,7 @@ class TestBuildGraphWhisper:
         assert any("layer_norm" in n for n in init_names), "Should have LayerNorm initializer"
 
     def test_whisper_decoder_has_initializers(self):
-        """Verify decoder has embedding, attention, cross-attention, and proj_out initializers.
-        """
+        """Verify decoder has embedding, attention, cross-attention, and proj_out initializers."""
         from mobius._builder import build_from_module
         from mobius.models.whisper import WhisperForConditionalGeneration
         from mobius.tasks import SpeechToTextTask

@@ -594,9 +594,7 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
                     subsampling_conv_channels=(
                         list(subsampling) if subsampling is not None else None
                     ),
-                    use_causal_chunked_attn=getattr(
-                        ac, "use_causal_chunked_attn", False
-                    ),
+                    use_causal_chunked_attn=getattr(ac, "use_causal_chunked_attn", False),
                     output_dim=getattr(ac, "output_dim", None),
                     audio_token_id=getattr(composite, "audio_token_id", None),
                 )
@@ -1568,9 +1566,7 @@ class Gemma4Config(VisionLanguageConfig):
             ),
             num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
             use_double_wide_mlp=getattr(config, "use_double_wide_mlp", False),
-            final_logit_softcapping=(
-                getattr(config, "final_logit_softcapping", 0.0) or 0.0
-            ),
+            final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
             enable_moe_block=getattr(config, "enable_moe_block", False),
         )
 

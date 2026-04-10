@@ -132,9 +132,7 @@ class Gemma4TextCausalLMTask(ModelTask):
         )
 
         graph_inputs = [input_ids, attention_mask, position_ids]
-        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
-            config, batch, past_seq_len
-        )
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
         graph_inputs.extend(kv_inputs)
 
         graph, graph_builder = _make_graph(graph_inputs)
@@ -209,9 +207,7 @@ class Gemma4VisionLanguageTask(ModelTask):
 
         graph_inputs = [inputs_embeds, attention_mask, position_ids]
 
-        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
-            config, batch, past_seq_len
-        )
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
         graph_inputs.extend(kv_inputs)
 
         graph, graph_builder = _make_graph(graph_inputs, name="decoder")

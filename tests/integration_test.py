@@ -4994,20 +4994,20 @@ def test_gemma4_e2b_text_prefill():
     import dataclasses
 
     import onnx_ir as ir
-    from transformers import Gemma4ForConditionalGeneration  # noqa: PLC0415
+    from transformers import Gemma4ForConditionalGeneration
 
     from mobius import build_from_module
     from mobius._configs import Gemma4Config
     from mobius._weight_loading import apply_weights
     from mobius.models.gemma4 import Gemma4CausalLMModel
 
-    MODEL_ID = "google/gemma-4-E2B-it"
+    model_id = "google/gemma-4-E2B-it"
 
-    if not _model_accessible(MODEL_ID):
-        pytest.skip(f"{MODEL_ID} not accessible (requires HuggingFace authentication)")
+    if not _model_accessible(model_id):
+        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
 
     # Load HF multimodal config — text backbone is in hf_config.text_config
-    hf_config = transformers.AutoConfig.from_pretrained(MODEL_ID)
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
 
     # Load full Gemma4ForConditionalGeneration in float32.
     # The model hierarchy is: hf_full.model.language_model (backbone) + hf_full.lm_head.
@@ -5015,11 +5015,11 @@ def test_gemma4_e2b_text_prefill():
     # reference logits, and pass the full state_dict to preprocess_weights() which
     # strips the 'language_model.' substring from keys like 'model.language_model.*'.
     hf_full = Gemma4ForConditionalGeneration.from_pretrained(
-        MODEL_ID,
+        model_id,
         torch_dtype=torch.float32,
         device_map="cpu",
     ).eval()
-    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
     # Build Gemma4Config from text_config sub-config, float32
     text_cfg = hf_config.text_config
@@ -5086,28 +5086,28 @@ def test_gemma4_e2b_text_prefill_bf16():
 
     import ml_dtypes
     import onnx_ir as ir
-    from transformers import Gemma4ForConditionalGeneration  # noqa: PLC0415
+    from transformers import Gemma4ForConditionalGeneration
 
     from mobius import build_from_module
     from mobius._configs import Gemma4Config
     from mobius._weight_loading import apply_weights
     from mobius.models.gemma4 import Gemma4CausalLMModel
 
-    MODEL_ID = "google/gemma-4-E2B-it"
+    model_id = "google/gemma-4-E2B-it"
 
-    if not _model_accessible(MODEL_ID):
-        pytest.skip(f"{MODEL_ID} not accessible (requires HuggingFace authentication)")
+    if not _model_accessible(model_id):
+        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
 
     # Load HF multimodal config — text backbone is in hf_config.text_config
-    hf_config = transformers.AutoConfig.from_pretrained(MODEL_ID)
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
 
     # Load full Gemma4ForConditionalGeneration in bfloat16.
     hf_full = Gemma4ForConditionalGeneration.from_pretrained(
-        MODEL_ID,
+        model_id,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
     ).eval()
-    tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 
     # Build Gemma4Config from text_config sub-config, bfloat16
     text_cfg = hf_config.text_config

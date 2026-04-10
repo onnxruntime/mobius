@@ -141,8 +141,7 @@ class ProportionalRope(BaseRope):
         # Number of rotation pairs: e.g. int(0.25 * 512 // 2) = 64 for Gemma4
         rope_angles = int(rope_proportion * head_dim // 2)
         inv_freq_rotated = 1.0 / (
-            rope_theta
-            ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_dim)
+            rope_theta ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_dim)
         )  # shape [rope_angles]
 
         # Pad with zeros so inv_freq covers the full head_dim // 2

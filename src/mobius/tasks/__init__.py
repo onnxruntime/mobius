@@ -74,6 +74,11 @@ from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
+from mobius.tasks._gemma4 import (
+    Gemma4AnyToAnyTask,
+    Gemma4TextCausalLMTask,
+    Gemma4VisionLanguageTask,
+)
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -86,7 +91,6 @@ from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
-from mobius.tasks._gemma4 import Gemma4AnyToAnyTask, Gemma4TextCausalLMTask, Gemma4VisionLanguageTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,

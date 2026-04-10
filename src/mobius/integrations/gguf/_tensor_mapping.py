@@ -274,7 +274,10 @@ def _build_mapping(
             result.update(_QWEN35MOE_EXTRAS)
     else:
         supported = sorted(
-            _LLAMA_FAMILY | _GEMMA_FAMILY | _MOE_FAMILY | {"gemma4", "phi3", "falcon", "gpt2", "mamba"}
+            _LLAMA_FAMILY
+            | _GEMMA_FAMILY
+            | _MOE_FAMILY
+            | {"gemma4", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(
             f"Unsupported GGUF architecture: {architecture!r}. "

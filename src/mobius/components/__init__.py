@@ -117,7 +117,6 @@ from mobius.components._attention import (
     StaticCacheState,
 )
 from mobius.components._audio import ConformerEncoder
-from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._codec_conv import (
     CausalConv1d,
     CausalConvNd,
@@ -175,6 +174,7 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock

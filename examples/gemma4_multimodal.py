@@ -18,7 +18,7 @@ Gemma 4 uses a 4-model split (same pattern as Phi-4 Multimodal):
     - **Vision**:    ``pixel_values`` → ``image_features``
       (SigLIP ViT-like encoder + projector; 280 soft tokens/image)
     - **Audio**:     ``audio_features`` → ``audio_features``
-      (Conformer encoder, 12 layers, hidden 1024; subsampling 4×)
+      (Conformer encoder, 12 layers, hidden 1024; subsampling 4x)
     - **Embedding**: ``input_ids`` + ``image_features`` + ``audio_features``
       → ``inputs_embeds``
       (token embedding + multimodal feature fusion)
@@ -245,9 +245,7 @@ def prepare_decoder_feeds(
         "inputs_embeds": inputs_embeds,
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
-        "position_ids": np.arange(
-            past_seq_len, total_seq_len, dtype=np.int64
-        )[np.newaxis, :],
+        "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
         **past_kv,
     }
 
@@ -273,7 +271,7 @@ def build_input_ids(
 
     Layout when both modalities are present::
 
-        [BOS] [image × num_image_tokens] [audio × num_audio_tokens] [text tokens]
+        [BOS] [image x num_image_tokens] [audio x num_audio_tokens] [text tokens]
 
     Args:
         tokenizer: HuggingFace tokenizer.
@@ -777,11 +775,7 @@ def main() -> int:
         )
 
     max_tokens = args.max_new_tokens
-    modes = (
-        ["text", "vision", "audio", "vision-audio"]
-        if args.mode == "all"
-        else [args.mode]
-    )
+    modes = ["text", "vision", "audio", "vision-audio"] if args.mode == "all" else [args.mode]
 
     for mode in modes:
         if mode == "text":
@@ -790,9 +784,8 @@ def main() -> int:
                 decoder_session=decoder_session,
                 tokenizer=tokenizer,
                 config=config,
-                prompt=args.prompt or (
-                    "Explain the theory of general relativity in simple terms."
-                ),
+                prompt=args.prompt
+                or ("Explain the theory of general relativity in simple terms."),
                 max_new_tokens=max_tokens,
             )
 

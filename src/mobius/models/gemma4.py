@@ -125,7 +125,9 @@ class Gemma4VisionSelfAttention(nn.Module):
 
         # Bidirectional attention (no is_causal, no KV cache)
         attn_output = op.Attention(
-            q, k, v,
+            q,
+            k,
+            v,
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,
             scale=1.0,
@@ -352,8 +354,8 @@ class Gemma4TextAttention(nn.Module):
     def forward(
         self,
         op: builder.OpBuilder,
-        hidden_states: "ir.Value",
-        attention_bias: "ir.Value",
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
         position_embeddings: tuple | None = None,
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
@@ -511,9 +513,9 @@ class _Gemma4MoeRouter(nn.Module):
         """
         # Scale-free RMSNorm using RMSNormalization op (epsilon as attribute avoids
         # graph-level float constant name collisions across multiple decoder layers).
-        H_shape = op.Shape(hidden_states, start=1, end=2)  # [1] containing hidden_size
+        h_shape = op.Shape(hidden_states, start=1, end=2)  # [1] containing hidden_size
         ones = op.CastLike(
-            op.ConstantOfShape(H_shape, value=ir.tensor(np.ones(1, dtype=np.float32))),
+            op.ConstantOfShape(h_shape, value=ir.tensor(np.ones(1, dtype=np.float32))),
             hidden_states,
         )
         x_normed = op.RMSNormalization(hidden_states, ones, epsilon=self._eps, axis=-1)
@@ -646,11 +648,11 @@ class Gemma4DecoderLayer(nn.Module):
     def forward(
         self,
         op: builder.OpBuilder,
-        hidden_states: "ir.Value",
-        attention_bias: "ir.Value",
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
         position_embeddings: tuple,
         shared_kv_states: dict,
-        per_layer_input: "ir.Value | None",
+        per_layer_input: ir.Value | None,
         past_key_value: tuple | None,
     ):
         # Attention block: pre-norm -> attn -> post-norm -> residual
@@ -680,15 +682,15 @@ class Gemma4DecoderLayer(nn.Module):
             dense_out = self.post_feedforward_layernorm_1(op, hidden_states)
 
             # MoE input is the pre-attention residual (flattened to 2D for routing).
-            batch_size = op.Shape(residual, start=0, end=1)    # [1] scalar
-            seq_len = op.Shape(residual, start=1, end=2)       # [1] scalar
-            hidden_size = op.Shape(residual, start=2, end=3)   # [1] scalar
-            num_tokens = op.Mul(batch_size, seq_len)           # [1]
+            batch_size = op.Shape(residual, start=0, end=1)  # [1] scalar
+            seq_len = op.Shape(residual, start=1, end=2)  # [1] scalar
+            hidden_size = op.Shape(residual, start=2, end=3)  # [1] scalar
+            num_tokens = op.Mul(batch_size, seq_len)  # [1]
             flat_shape = op.Concat(num_tokens, hidden_size, axis=0)  # [2]
-            residual_flat = op.Reshape(residual, flat_shape)   # [B*S, H]
+            residual_flat = op.Reshape(residual, flat_shape)  # [B*S, H]
 
             # router_probs: [B*S, E] full softmax over all experts
-            router_probs = self.router(op, residual_flat)       # [B*S, E]
+            router_probs = self.router(op, residual_flat)  # [B*S, E]
 
             # Norm residual before experts
             normed_flat = self.pre_feedforward_layernorm_2(op, residual_flat)  # [B*S, H]
@@ -770,17 +772,17 @@ class Gemma4DecoderLayer(nn.Module):
         # Scale routing weights by per_expert_scale for each selected expert
         # Gather from [E] using [T, K] indices → result [T, K]
         pes_topk = op.Gather(self.router.per_expert_scale, top_indices, axis=0)  # [T, K]
-        top_weights = op.Mul(top_weights, op.CastLike(pes_topk, top_weights))    # [T, K]
+        top_weights = op.Mul(top_weights, op.CastLike(pes_topk, top_weights))  # [T, K]
 
         # Build output accumulator, matching dtype of the input
-        out_shape = op.Shape(normed_flat)                      # [T, H] shape vec
+        out_shape = op.Shape(normed_flat)  # [T, H] shape vec
         output = op.CastLike(
             op.ConstantOfShape(out_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
             normed_flat,
         )
 
         # T_shape: 1-D tensor [T] used for per-expert weight accumulation
-        T_shape = op.Shape(normed_flat, start=0, end=1)        # shape vec of length 1
+        t_shape = op.Shape(normed_flat, start=0, end=1)  # shape vec of length 1
 
         for e_idx in range(self._num_experts):
             # Gather this expert's weight matrices
@@ -792,19 +794,19 @@ class Gemma4DecoderLayer(nn.Module):
             )  # [H, moe_inter]
 
             # Gated SiLU MLP: fc1 produces gate+up concatenated → SwiGLU
-            proj = op.MatMul(normed_flat, op.Transpose(fc1))   # [T, 2*moe_inter]
-            half = op.Shape(fc2, start=1, end=2)               # [moe_inter]
-            gate = op.Slice(proj, [0], half, [1])              # [T, moe_inter] first half
+            proj = op.MatMul(normed_flat, op.Transpose(fc1))  # [T, 2*moe_inter]
+            half = op.Shape(fc2, start=1, end=2)  # [moe_inter]
+            gate = op.Slice(proj, [0], half, [1])  # [T, moe_inter] first half
             up = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
             # SiLU(gate) = gate * sigmoid(gate)
             expert_out = op.MatMul(
-                op.Mul(op.Mul(gate, op.Sigmoid(gate)), up),    # [T, moe_inter]
-                op.Transpose(fc2),                             # → [T, H]
+                op.Mul(op.Mul(gate, op.Sigmoid(gate)), up),  # [T, moe_inter]
+                op.Transpose(fc2),  # → [T, H]
             )
 
             # Accumulate routing weight for expert e_idx across all k slots
             e_weight = op.CastLike(
-                op.ConstantOfShape(T_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
+                op.ConstantOfShape(t_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
                 top_weights,
             )
             for k_idx in range(self._top_k):
@@ -819,11 +821,12 @@ class Gemma4DecoderLayer(nn.Module):
             # Weight expert output by aggregated routing weight and add to output
             e_weight_2d = op.Reshape(
                 e_weight,
-                op.Concat(T_shape, op.Constant(value_ints=[1]), axis=0),  # [T, 1]
+                op.Concat(t_shape, op.Constant(value_ints=[1]), axis=0),  # [T, 1]
             )
             output = op.Add(output, op.Mul(expert_out, op.CastLike(e_weight_2d, expert_out)))
 
         return output
+
 
 # ---------------------------------------------------------------------------
 # Gemma4 text model
@@ -1203,13 +1206,13 @@ class _Gemma4VisionEncoderModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("vision_tower."):
-                new_key = "encoder." + key[len("vision_tower."):]
+                new_key = "encoder." + key[len("vision_tower.") :]
                 # Flatten Gemma4ClippableLinear's .linear. wrapper
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
             elif key.startswith("embed_vision.embedding_projection."):
-                suffix = key[len("embed_vision.embedding_projection."):]
+                suffix = key[len("embed_vision.embedding_projection.") :]
                 renamed["projector." + suffix] = value
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
                 pass  # Scale-free norm: no learnable parameter
@@ -1331,19 +1334,19 @@ class Gemma4MultiModalModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("language_model."):
-                new_key = "decoder." + key[len("language_model."):]
+                new_key = "decoder." + key[len("language_model.") :]
                 renamed[new_key] = value
                 if key == "language_model.model.embed_tokens.weight":
                     renamed["embedding.embed_tokens.weight"] = value
 
             elif key.startswith("vision_tower."):
-                new_key = "vision_encoder.encoder." + key[len("vision_tower."):]
+                new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
 
             elif key.startswith("embed_vision.embedding_projection."):
-                suffix = key[len("embed_vision.embedding_projection."):]
+                suffix = key[len("embed_vision.embedding_projection.") :]
                 renamed["vision_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
@@ -1380,15 +1383,15 @@ class _Gemma4AudioEncoderModel(nn.Module):
         hidden_size = (ac.hidden_size if ac else None) or 1024
         num_layers = (ac.num_layers if ac else None) or 12
         output_proj_dims = (ac.output_dim if ac else None) or config.hidden_size
-        conv_channels = (ac.subsampling_conv_channels if ac else None)
+        conv_channels = ac.subsampling_conv_channels if ac else None
         rms_norm_eps = config.rms_norm_eps or 1e-6
 
         self.encoder = Gemma4AudioEncoder(
             input_size=input_size,
             hidden_size=hidden_size,
-            num_heads=8,               # fixed per Gemma4 audio_config
+            num_heads=8,  # fixed per Gemma4 audio_config
             num_layers=num_layers,
-            conv_kernel_size=5,        # fixed per Gemma4 audio_config
+            conv_kernel_size=5,  # fixed per Gemma4 audio_config
             conv_channels=conv_channels,
             attention_context_left=13,  # fixed per Gemma4 audio_config
             output_proj_dims=output_proj_dims,
@@ -1422,9 +1425,7 @@ class _Gemma4AnyToAnyEmbeddingModel(nn.Module):
             embed_scale=embed_scale,
         )
         self.image_token_id = config.image_token_id or 0
-        self.audio_token_id = (
-            (config.audio.audio_token_id if config.audio else None) or 0
-        )
+        self.audio_token_id = (config.audio.audio_token_id if config.audio else None) or 0
 
     def forward(
         self,
@@ -1522,19 +1523,19 @@ class Gemma4AnyToAnyModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("language_model."):
-                new_key = "decoder." + key[len("language_model."):]
+                new_key = "decoder." + key[len("language_model.") :]
                 renamed[new_key] = value
                 if key == "language_model.model.embed_tokens.weight":
                     renamed["embedding.embed_tokens.weight"] = value
 
             elif key.startswith("vision_tower."):
-                new_key = "vision_encoder.encoder." + key[len("vision_tower."):]
+                new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
 
             elif key.startswith("embed_vision.embedding_projection."):
-                suffix = key[len("embed_vision.embedding_projection."):]
+                suffix = key[len("embed_vision.embedding_projection.") :]
                 renamed["vision_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
@@ -1542,7 +1543,7 @@ class Gemma4AnyToAnyModel(nn.Module):
 
             elif key.startswith("audio_tower."):
                 # Map audio_tower.* -> audio_encoder.encoder.*
-                new_key = "audio_encoder.encoder." + key[len("audio_tower."):]
+                new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
                 renamed[new_key] = value
 
             elif key.startswith("embed_audio.embedding_projection."):

@@ -122,7 +122,9 @@ class TestMapGGUFToHFNames:
             map_gguf_to_hf_names("blk.3.attn_q.weight", "gemma4")
             == "model.layers.3.self_attn.q_proj.weight"
         )
-        assert map_gguf_to_hf_names("token_embd.weight", "gemma4") == "model.embed_tokens.weight"
+        assert (
+            map_gguf_to_hf_names("token_embd.weight", "gemma4") == "model.embed_tokens.weight"
+        )
         assert map_gguf_to_hf_names("output_norm.weight", "gemma4") == "model.norm.weight"
 
     def test_gemma4_ffn_norm_override(self) -> None:
