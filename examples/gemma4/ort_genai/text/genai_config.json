@@ -1,0 +1,55 @@
+{
+    "model": {
+        "type": "gemma4_text",
+        "vocab_size": 262144,
+        "context_length": 131072,
+        "bos_token_id": 2,
+        "eos_token_id": [1, 106],
+        "pad_token_id": 0,
+        "decoder": {
+            "session_options": {
+                "log_id": "onnxruntime-genai",
+                "provider_options": []
+            },
+            "filename": "model.onnx",
+            "hidden_size": 1536,
+            "head_size": 256,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 15,
+            "inputs": {
+                "input_ids": "input_ids",
+                "attention_mask": "attention_mask",
+                "position_ids": "position_ids",
+                "past_key_names": "past_key_values.%d.key",
+                "past_value_names": "past_key_values.%d.value"
+            },
+            "outputs": {
+                "logits": "logits",
+                "present_key_names": "present.%d.key",
+                "present_value_names": "present.%d.value"
+            },
+            "sliding_window": {
+                "window_size": 512,
+                "pad_value": 0,
+                "alignment": "right",
+                "slide_key_value_cache": true,
+                "slide_inputs": true,
+                "layers": [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]
+            }
+        }
+    },
+    "search": {
+        "do_sample": false,
+        "early_stopping": true,
+        "max_length": 8192,
+        "min_length": 0,
+        "num_beams": 1,
+        "num_return_sequences": 1,
+        "past_present_share_buffer": false,
+        "repetition_penalty": 1.0,
+        "temperature": 1.0,
+        "top_k": 1,
+        "top_p": 1.0
+    }
+}
