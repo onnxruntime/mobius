@@ -29,6 +29,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -50,7 +51,7 @@ from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +73,10 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # All-ones scale tensor — no learnable parameter to load.
+        # Use value_floats (static constant) instead of ConstantOfShape so that
+        # ONNX shape inference can resolve the output shape of RMSNormalization.
         # CastLike ensures the scale matches the input dtype (fp16/bf16/fp32).
-        scale = op.ConstantOfShape(op.Constant(value_ints=[self.dim]), value=1.0)
-        scale = op.CastLike(scale, hidden_states)
+        scale = op.CastLike(op.Constant(value_floats=[1.0] * self.dim), hidden_states)
         return op.RMSNormalization(hidden_states, scale, epsilon=self.eps, axis=-1)
 
 
@@ -147,7 +149,9 @@ class Gemma4VisionEncoderLayer(nn.Module):
     Uses standard ``RMSNorm`` throughout (not ``OffsetRMSNorm``).
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int, norm_eps: float):
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, num_heads: int, norm_eps: float
+    ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(hidden_size, num_heads, norm_eps)
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -606,8 +610,12 @@ class Gemma4DecoderLayer(nn.Module):
         self._enable_moe_block = config.enable_moe_block
         if config.enable_moe_block:
             assert config.num_local_experts is not None, "num_local_experts required for MoE"
-            assert config.num_experts_per_tok is not None, "num_experts_per_tok required for MoE"
-            assert config.moe_intermediate_size is not None, "moe_intermediate_size required for MoE"
+            assert config.num_experts_per_tok is not None, (
+                "num_experts_per_tok required for MoE"
+            )
+            assert config.moe_intermediate_size is not None, (
+                "moe_intermediate_size required for MoE"
+            )
 
             self._top_k = config.num_experts_per_tok
             self._num_experts = config.num_local_experts
@@ -627,9 +635,15 @@ class Gemma4DecoderLayer(nn.Module):
                 [config.num_local_experts, config.hidden_size, moe_inter]
             )
             # MoE-specific norms (in addition to the shared pre/post_feedforward norms)
-            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.pre_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
     def forward(
         self,
@@ -780,7 +794,7 @@ class Gemma4DecoderLayer(nn.Module):
             proj = op.MatMul(normed_flat, op.Transpose(fc1))   # [T, 2*moe_inter]
             half = op.Shape(fc2, start=1, end=2)               # [moe_inter]
             gate = op.Slice(proj, [0], half, [1])              # [T, moe_inter] first half
-            up   = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
+            up = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
             # SiLU(gate) = gate * sigmoid(gate)
             expert_out = op.MatMul(
                 op.Mul(op.Mul(gate, op.Sigmoid(gate)), up),    # [T, moe_inter]
@@ -1237,12 +1251,15 @@ class _Gemma4EmbeddingModel(nn.Module):
         # decode steps). ORT evaluates both branches of Where, so Gather would fault
         # on a zero-length tensor even when image_mask is all-false. Non-image
         # positions clip to index 0; Where discards the gathered values anyway.
-        dummy_shape = op.Concat(
-            op.Constant(value_ints=[1]),
-            op.Shape(image_features, start=1, end=2),
-            axis=0,
-        )
-        dummy_row = op.CastLike(op.ConstantOfShape(dummy_shape, value=0.0), image_features)
+        # Use Constant (static) + Unsqueeze to avoid ConstantOfShape, whose
+        # dynamic-shape input blocks ONNX shape inference.
+        dummy_row = op.Unsqueeze(
+            op.CastLike(
+                op.Constant(value_floats=[0.0] * self.config.hidden_size),
+                image_features,
+            ),
+            [0],
+        )  # [1, hidden_size]
         image_features_safe = op.Concat(image_features, dummy_row, axis=0)
 
         gathered = op.Gather(image_features_safe, indices, axis=0)
@@ -1369,7 +1386,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
             num_layers=num_layers,
             conv_kernel_size=5,        # fixed per Gemma4 audio_config
             conv_channels=conv_channels,
-            attention_context_left=13, # fixed per Gemma4 audio_config
+            attention_context_left=13,  # fixed per Gemma4 audio_config
             output_proj_dims=output_proj_dims,
             rms_norm_eps=rms_norm_eps,
         )
@@ -1419,7 +1436,9 @@ class _Gemma4AnyToAnyEmbeddingModel(nn.Module):
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
         img_mask_int = op.Cast(image_mask, to=7)  # INT64
         img_cumsum = op.CumSum(img_mask_int, op.Constant(value_int=1))
-        img_indices = op.Clip(op.Sub(img_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        img_indices = op.Clip(
+            op.Sub(img_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0)
+        )
         img_gathered = op.Gather(image_features, img_indices, axis=0)
         hidden = op.Where(image_mask_3d, img_gathered, text_embeds)
 
@@ -1428,7 +1447,9 @@ class _Gemma4AnyToAnyEmbeddingModel(nn.Module):
         audio_mask_3d = op.Unsqueeze(audio_mask, [-1])
         aud_mask_int = op.Cast(audio_mask, to=7)  # INT64
         aud_cumsum = op.CumSum(aud_mask_int, op.Constant(value_int=1))
-        aud_indices = op.Clip(op.Sub(aud_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        aud_indices = op.Clip(
+            op.Sub(aud_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0)
+        )
         aud_gathered = op.Gather(audio_features, aud_indices, axis=0)
         return op.Where(audio_mask_3d, aud_gathered, hidden)
 
@@ -1485,7 +1506,8 @@ class Gemma4AnyToAnyModel(nn.Module):
         - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free)
         - ``audio_tower.*`` -> ``audio_encoder.encoder.*``
         - ``embed_audio.embedding_projection.*`` -> skip (output_proj is inside encoder)
-        - ``language_model.model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
+        - ``language_model.model.embed_tokens.weight`` also ->
+          ``embedding.embed_tokens.weight``
         """
         if self.config.tie_word_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"

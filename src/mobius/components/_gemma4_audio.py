@@ -87,15 +87,14 @@ class _CausalDepthwiseConv1d(nn.Module):
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
         # x: [B, C, T]
-        # Left-pad to enforce causality (no future context)
-        pads = [0, 0, self._left_pad, 0]  # [pad_C_begin, pad_C_end, pad_T_begin, pad_T_end]
-        x = op.Pad(x, op.Constant(value_ints=pads))
+        # Causal left-pad folded into Conv's pads attribute to avoid a Pad node
+        # whose dynamic pads tensor can block ONNX shape inference.
         return op.Conv(
             x,
             self.weight,
             kernel_shape=[self._kernel_size],
             strides=[1],
-            pads=[0, 0],  # no additional padding (causality handled by explicit pad)
+            pads=[self._left_pad, 0],  # [begin, end] on T — causal (past only)
             group=self._channels,
         )
 
@@ -506,7 +505,8 @@ class Gemma4Attention(nn.Module):
         # Softmax in float32 → attention weights
         attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
 
-        # Weighted sum of values: [B, H, T, T] @ [B, num_heads, T, head_dim] = [B, num_heads, T, head_dim]
+        # Weighted sum of values:
+        # [B, H, T, T] @ [B, num_heads, T, head_dim] = [B, num_heads, T, head_dim]
         context = op.MatMul(attn_weights, v)  # [B, num_heads, T, head_dim]
 
         # Reshape [B, num_heads, T, head_dim] → [B, T, H*D]
