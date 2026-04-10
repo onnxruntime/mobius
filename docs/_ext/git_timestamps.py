@@ -129,11 +129,12 @@ def _on_doctree_resolved(app: Sphinx, doctree: nodes.document, docname: str) -> 
     html = '<div class="page-git-timestamps">' + " · ".join(parts) + "</div>"
     raw_node = nodes.raw("", html, format="html")
 
-    # Insert after the title node (index 0) of the first top-level section
+    # Insert after the title node (index 0) of the first section whose first
+    # child is the page title node.
     for section in doctree.traverse(nodes.section):
         if section.children and isinstance(section.children[0], nodes.title):
             section.insert(1, raw_node)
-        break
+            break
 
 
 def setup(app: Sphinx) -> dict[str, Any]:
