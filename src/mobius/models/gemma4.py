@@ -52,10 +52,6 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 if TYPE_CHECKING:
     import onnx_ir as ir
 
-# ONNX data type constant for float32 (TensorProto.FLOAT = 1).
-# Used with op.Cast when the output type of a custom op is unknown to the type system.
-_ONNX_FLOAT: int = 1
-
 
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
@@ -689,9 +685,10 @@ class Gemma4DecoderLayer(nn.Module):
             if caps.supports_fused_moe:
                 # Fused MoE op: handles top-k selection + expert dispatch internally.
                 # NOTE: per_expert_scale is NOT applied in fused path (ORT op limitation).
-                # Cast restores dtype after op.MoE (custom op, type=None on output)
+                # CastLike restores dtype after op.MoE (custom op, type=None on output)
                 # so downstream ops can correctly infer types and share scalar initializers.
-                moe_out_flat = op.Cast(
+                # Using CastLike(target=normed_flat) preserves bf16/fp16/fp32 from the input.
+                moe_out_flat = op.CastLike(
                     op.MoE(  # type: ignore[attr-defined]
                         normed_flat,
                         router_probs,
@@ -702,7 +699,7 @@ class Gemma4DecoderLayer(nn.Module):
                         normalize_routing_weights=1,
                         _domain="com.microsoft",
                     ),
-                    to=_ONNX_FLOAT,  # Cast to float32: op.MoE has no ONNX schema so output type is untyped
+                    normed_flat,  # match input dtype (bf16/fp16/fp32)
                 )  # [B*S, H]
             else:
                 moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
