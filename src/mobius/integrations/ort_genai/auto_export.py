@@ -333,8 +333,18 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_path is not None:
+        if not os.path.isdir(local_config_path):
+            raise ValueError(
+                f"local_config_path must be an existing directory: {local_config_path}"
+            )
         logger.info("Copying tokenizer files from local path %s", local_config_path)
         tokenizer_files = _copy_tokenizer_files_from_local(local_config_path, directory)
+        if not tokenizer_files:
+            logger.warning(
+                "No tokenizer files were copied from local path %s. "
+                "The export may be missing tokenizer artifacts required by ORT-GenAI.",
+                local_config_path,
+            )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
