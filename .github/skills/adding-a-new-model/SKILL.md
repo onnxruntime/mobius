@@ -319,7 +319,8 @@ code review), see the
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
 - [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
-- [ ] Integration test model in `tests/integration_test.py` (L3 synthetic parity)
+- [ ] L3 synthetic parity passes (`tests/synthetic_parity_test.py -k "<model_type>"`)
+- [ ] Integration test model in `tests/integration_test.py` (real-weight integration suite, if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
 - [ ] L5 generation golden file generated and committed
 - [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)

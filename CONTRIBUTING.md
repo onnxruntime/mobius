@@ -187,7 +187,7 @@ the PR description).  The full checklist with explanations lives in the
 **Test coverage (L1 – L5)**
 - [ ] **L1** — Graph build: entry in `tests/_test_configs.py` + weight-alignment test passes
 - [ ] **L2** — Config compatible: YAML test case in `testdata/cases/` with `test_model_id`
-- [ ] **L3** — Synthetic parity: integration test in `tests/integration_test.py` passes
+- [ ] **L3** — Synthetic parity: test in `tests/synthetic_parity_test.py` passes
 - [ ] **L4** — Golden match: golden file in `testdata/golden/` and `e2e_golden_test` passes
 - [ ] **L5** — Generation verified: generation golden file committed and test passes
 

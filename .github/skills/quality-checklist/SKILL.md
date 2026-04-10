@@ -57,11 +57,12 @@ before the PR is merged.
 
 ### 4. L3 — Synthetic parity
 
-- [ ] Model added to the appropriate parametrized list in
-      `tests/integration_test.py` (e.g. `_TEXT_MODELS`, `_VLM_MODELS`)
-- [ ] `python -m pytest tests/integration_test.py -m integration -k "<model>"` passes
+- [ ] Model type is covered in `tests/synthetic_parity_test.py` (driven by
+      `_test_configs.py`; added automatically for text-generation models)
+- [ ] `python -m pytest tests/synthetic_parity_test.py -k "<model>"` passes
       with `atol=1e-3` / `rtol=1e-3` (or `1e-2` for multimodal)
-- [ ] Decode step tested, not only prefill (single-token KV-cache step)
+- [ ] Real-weight parity also checked via `tests/integration_test.py` (add
+      model to `_TEXT_MODELS` or equivalent if a small checkpoint is available)
 
 ### 5. L4 — Golden match
 
@@ -71,7 +72,7 @@ before the PR is merged.
 - [ ] Golden file generated:
       `python scripts/generate_golden.py --level L4 --filter '<model>*'`
 - [ ] Golden file committed to `testdata/golden/<cat>/<model>.json`
-- [ ] `python -m pytest tests/e2e_golden_test.py -m golden --level L4 -k "<model>"` passes
+- [ ] `python -m pytest tests/e2e_golden_test.py -m golden -k "<model>"` passes
 
 ### 6. L5 — Generation verified
 
@@ -82,7 +83,7 @@ before the PR is merged.
       `python scripts/generate_golden.py --level L5 --filter '<model>*'`
 - [ ] Generation golden file committed to
       `testdata/golden/<cat>/<model>_generation.json`
-- [ ] `python -m pytest tests/e2e_golden_test.py -m golden --level L5 -k "<model>"` passes
+- [ ] `python -m pytest tests/e2e_golden_test.py -m generation -k "<model>"` passes
 
 > **Why L4/L5 matter:** Graph-build tests (L1) only verify ONNX graph
 > construction; they never execute the graph with real data.  A MatMul shape
@@ -190,20 +191,23 @@ python -m pytest tests/weight_alignment_test.py -k "<model_type>"
 # L2 – YAML schema
 python -m pytest tests/yaml_schema_test.py
 
-# L3 – integration / synthetic parity
+# L3 – synthetic parity
+python -m pytest tests/synthetic_parity_test.py -k "<model>" -sv
+
+# L3 – real-weight integration (if small checkpoint available)
 python -m pytest tests/integration_test.py -m integration -k "<model>" -sv
 
 # L4 – generate golden
 python scripts/generate_golden.py --level L4 --filter '<model>*'
 
 # L4 – run golden test
-python -m pytest tests/e2e_golden_test.py -m golden --level L4 -k "<model>" -v
+python -m pytest tests/e2e_golden_test.py -m golden -k "<model>" -v
 
 # L5 – generate generation golden
 python scripts/generate_golden.py --level L5 --filter '<model>*'
 
 # L5 – run generation golden test
-python -m pytest tests/e2e_golden_test.py -m golden --level L5 -k "<model>" -v
+python -m pytest tests/e2e_golden_test.py -m generation -k "<model>" -v
 
 # ORT GenAI runtime
 python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
