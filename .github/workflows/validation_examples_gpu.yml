@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   run-example:
-    name: "${{ matrix.name }}"
+    name: "Validation Example / ${{ matrix.name }}"
     strategy:
       fail-fast: false
       matrix:
