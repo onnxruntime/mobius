@@ -263,7 +263,8 @@ def write_ort_genai_config(
         # when --config is used with a local directory).
         bos_token_id = getattr(config, "bos_token_id", None)
         eos_token_id = getattr(config, "eos_token_id", None)
-        # pad_token_id is in BaseModelConfig; map DEFAULT_INT sentinel to None
+        # pad_token_id lives in BaseModelConfig with DEFAULT_INT (-42) as the
+        # "not set" sentinel (negative IDs are never valid token positions).
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
