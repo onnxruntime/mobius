@@ -99,6 +99,37 @@ def _copy_tokenizer_files(
     return copied
 
 
+def _copy_tokenizer_files_from_local(
+    source_dir: str,
+    output_dir: str,
+) -> list[str]:
+    """Copy tokenizer files from a local model directory.
+
+    Silently skips files that are absent (not all tokenizer variants have
+    all files — e.g. SentencePiece models have ``tokenizer.model`` but not
+    ``merges.txt``).
+
+    Returns list of copied filenames.
+    """
+    tokenizer_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",  # SentencePiece
+        "added_tokens.json",
+        "merges.txt",  # BPE
+        "vocab.json",  # BPE
+    ]
+    copied: list[str] = []
+    for filename in tokenizer_files:
+        src = os.path.join(source_dir, filename)
+        if os.path.isfile(src):
+            dst = os.path.join(output_dir, filename)
+            shutil.copy2(src, dst)
+            copied.append(filename)
+    return copied
+
+
 def _write_processor_config(
     config: Any,
     output_dir: str,
@@ -181,13 +212,15 @@ def write_ort_genai_config(
     hf_model_id: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
+    local_config_path: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
     Writes ``genai_config.json``, optionally copies tokenizer files from
-    HuggingFace Hub, and writes ``processor_config.json`` for VLM models.
-    Does NOT build or save ONNX models — call :meth:`~mobius._model_package.ModelPackage.save`
-    separately before or after this function.
+    HuggingFace Hub or a local directory, and writes ``processor_config.json``
+    for VLM models.  Does NOT build or save ONNX models — call
+    :meth:`~mobius._model_package.ModelPackage.save` separately before or
+    after this function.
 
     Args:
         pkg: Already-built :class:`~mobius._model_package.ModelPackage` with
@@ -196,13 +229,18 @@ def write_ort_genai_config(
         hf_model_id: HuggingFace model ID. When provided, used to fetch token
             IDs (``bos``/``eos``/``pad``) and download tokenizer files.
             When ``None``, token IDs default to ``None`` and tokenizer files
-            are not copied.
+            are not copied unless ``local_config_path`` is set.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
         context_length: Minimum context length written to
             ``genai_config.json``. Overridden upward by
             ``max_position_embeddings`` from ``pkg.config``.
+        local_config_path: Path to a local model directory. When provided
+            and ``hf_model_id`` is ``None``, tokenizer files are copied from
+            this directory instead of downloaded from HuggingFace Hub.
+            Typically set when the CLI ``--config`` flag points to a local
+            directory rather than a HuggingFace model ID.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -288,10 +326,15 @@ def write_ort_genai_config(
 
     result: dict[str, str] = {"genai_config": genai_path}
 
-    # Copy tokenizer files when a HF model ID is available
+    # Copy tokenizer files — from HuggingFace Hub or local directory
     if hf_model_id is not None:
         logger.info("Copying tokenizer files from %s", hf_model_id)
         tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+        for tf in tokenizer_files:
+            result[tf] = os.path.join(directory, tf)
+    elif local_config_path is not None:
+        logger.info("Copying tokenizer files from local path %s", local_config_path)
+        tokenizer_files = _copy_tokenizer_files_from_local(local_config_path, directory)
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 

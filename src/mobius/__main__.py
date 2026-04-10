@@ -236,7 +236,16 @@ def _save_package(
 
         hf_model_id = getattr(args, "model", None)
         ep = getattr(args, "execution_provider", "cpu")
-        artifacts = write_ort_genai_config(pkg, output_dir, hf_model_id=hf_model_id, ep=ep)
+        # When --config (local dir) is used instead of --model, copy tokenizer
+        # files from the local directory rather than downloading from HF.
+        local_config_path = getattr(args, "config", None)
+        artifacts = write_ort_genai_config(
+            pkg,
+            output_dir,
+            hf_model_id=hf_model_id,
+            ep=ep,
+            local_config_path=local_config_path,
+        )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 
@@ -502,8 +511,9 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Generate runtime-specific config files after building. "
             "Currently supports: 'ort-genai' (writes genai_config.json and "
-            "copies tokenizer files). Requires --model (not --config) for "
-            "tokenizer file download."
+            "copies tokenizer files). When used with --model, tokenizer files "
+            "are downloaded from HuggingFace. When used with --config (local "
+            "directory), tokenizer files are copied from that directory."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

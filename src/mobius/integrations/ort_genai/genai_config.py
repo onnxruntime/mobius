@@ -44,16 +44,26 @@ def _default_decoder_outputs() -> dict[str, str]:
     }
 
 
-def _default_search_params() -> dict[str, Any]:
-    """Return sensible default search parameters."""
+def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
+    """Return sensible default search parameters.
+
+    Args:
+        ep: Execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``).  WebGPU sets
+            ``past_present_share_buffer`` to ``True`` because the WebGPU
+            runtime allocates a fixed KV-cache buffer up-front and requires
+            the past and present KV tensors to share the same backing buffer.
+        context_length: Model context window; used as the default
+            ``max_length`` for generation so the limit matches the model.
+    """
     return {
-        "do_sample": False,
+        "do_sample": True,
         "early_stopping": True,
-        "max_length": 4096,
+        "max_length": context_length,
         "min_length": 0,
         "num_beams": 1,
         "num_return_sequences": 1,
-        "past_present_share_buffer": False,
+        "past_present_share_buffer": ep == "webgpu",
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_k": 1,
@@ -347,7 +357,7 @@ class GenaiConfigGenerator:
 
         return {
             "model": model,
-            "search": _default_search_params(),
+            "search": _default_search_params(ep=self.ep, context_length=self.context_length),
         }
 
     def write(self, output_dir: str) -> str:
