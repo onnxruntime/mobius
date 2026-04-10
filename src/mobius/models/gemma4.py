@@ -840,6 +840,11 @@ class Gemma4TextModel(nn.Module):
         )
 
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                f"Gemma4Config.layer_types length ({len(layer_types)}) must match "
+                f"num_hidden_layers ({config.num_hidden_layers})"
+            )
         self.layer_types = layer_types
         self.sliding_window = config.sliding_window
 
@@ -1228,7 +1233,19 @@ class _Gemma4EmbeddingModel(nn.Module):
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
-        gathered = op.Gather(image_features, indices, axis=0)
+        # Append a one-row dummy to guard against empty image_features (text-only /
+        # decode steps). ORT evaluates both branches of Where, so Gather would fault
+        # on a zero-length tensor even when image_mask is all-false. Non-image
+        # positions clip to index 0; Where discards the gathered values anyway.
+        dummy_shape = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Shape(image_features, start=1, end=2),
+            axis=0,
+        )
+        dummy_row = op.CastLike(op.ConstantOfShape(dummy_shape, value=0.0), image_features)
+        image_features_safe = op.Concat(image_features, dummy_row, axis=0)
+
+        gathered = op.Gather(image_features_safe, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
     def preprocess_weights(

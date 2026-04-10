@@ -120,23 +120,25 @@ def prepare_vision_feeds(
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **vision** session.
 
-    Loads the image and runs the HuggingFace image processor to obtain
-    normalised pixel values.
+    Loads the image and runs the HuggingFace processor to obtain
+    pre-patchified pixel values and position IDs.
 
     Args:
         processor: ``AutoProcessor`` loaded for the Gemma 4 model.
         image_path: Path to a local image file (JPEG, PNG, etc.).
 
     Returns:
-        ``{"pixel_values": float32[1, 3, H, W]}``
+        ``{"pixel_values": float32[B, N, 3*P^2], "pixel_position_ids": int64[B, N, 2]}``
     """
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
-    # The HF image processor handles resizing and normalisation for SigLIP.
-    processed = processor.image_processor(images=img, return_tensors="np")
-    pixel_values = processed["pixel_values"].astype(np.float32)  # [1, 3, H, W]
-    return {"pixel_values": pixel_values}
+    # AutoProcessor for Gemma 4 returns pre-patchified pixel_values
+    # [B, N, 3*P^2] and pixel_position_ids [B, N, 2] directly.
+    processed = processor(images=img, return_tensors="np")
+    pixel_values = processed["pixel_values"].astype(np.float32)
+    pixel_position_ids = processed["pixel_position_ids"].astype(np.int64)
+    return {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids}
 
 
 def prepare_audio_feeds(
@@ -737,7 +739,7 @@ def main() -> int:
     vision_session = OnnxModelSession(pkg["vision"])
     audio_session = OnnxModelSession(pkg["audio"])
     embedding_session = OnnxModelSession(pkg["embedding"])
-    decoder_session = OnnxModelSession(pkg["model"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
 
     # ------------------------------------------------------------------
     # Step 3: Load the HuggingFace processor.

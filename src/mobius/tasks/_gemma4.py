@@ -59,6 +59,11 @@ def _make_gemma4_kv_cache_inputs(
     num_kv_shared = config.num_kv_shared_layers or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
     layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
+    if len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"Gemma4Config.layer_types length ({len(layer_types)}) must match "
+            f"num_hidden_layers ({config.num_hidden_layers})"
+        )
 
     flat: list[ir.Value] = []
     pairs: list[tuple[ir.Value, ir.Value]] = []
