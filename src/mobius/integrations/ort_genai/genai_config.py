@@ -44,6 +44,9 @@ def _default_decoder_outputs() -> dict[str, str]:
     }
 
 
+_WEBGPU_MAX_LENGTH_CAP = 4096
+
+
 def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
     """Return sensible default search parameters.
 
@@ -56,14 +59,24 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
         context_length: Model context window; used as the default
             ``max_length`` for generation so the limit matches the model.
     """
+    webgpu = ep == "webgpu"
+    if webgpu:
+        # WebGPU pre-allocates KV-cache for the full max_length at load time.
+        # Using the raw context_length (e.g. 128K tokens) would pre-allocate
+        # ~8 GB of GPU memory by default.  Cap at _WEBGPU_MAX_LENGTH_CAP so
+        # the model loads sensibly on consumer hardware; users can override
+        # in genai_config.json for their target device.
+        max_length = min(context_length, _WEBGPU_MAX_LENGTH_CAP)
+    else:
+        max_length = context_length
     return {
         "do_sample": True,
         "early_stopping": True,
-        "max_length": context_length,
+        "max_length": max_length,
         "min_length": 0,
         "num_beams": 1,
         "num_return_sequences": 1,
-        "past_present_share_buffer": ep == "webgpu",
+        "past_present_share_buffer": webgpu,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_k": 1,

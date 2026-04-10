@@ -140,7 +140,7 @@ class TestGenaiConfigGeneratorLLM:
         assert search["past_present_share_buffer"] is False
 
     def test_search_params_webgpu_sets_past_present_share_buffer(self):
-        """WebGPU EP sets past_present_share_buffer=True."""
+        """WebGPU EP sets past_present_share_buffer=True and caps max_length."""
         gen = GenaiConfigGenerator(
             "qwen2",
             vocab_size=151936,
@@ -154,7 +154,25 @@ class TestGenaiConfigGeneratorLLM:
         )
         config = gen.generate()
         assert config["search"]["past_present_share_buffer"] is True
-        assert config["search"]["max_length"] == 32768
+        # 32768 > 4096 cap, so max_length is capped to avoid pre-allocating huge KV cache
+        assert config["search"]["max_length"] == 4096
+
+    def test_search_params_webgpu_small_context_not_capped(self):
+        """WebGPU max_length is not capped when context_length <= 4096."""
+        gen = GenaiConfigGenerator(
+            "phi3",
+            vocab_size=32064,
+            hidden_size=3072,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            head_dim=96,
+            ep="webgpu",
+            context_length=2048,
+        )
+        config = gen.generate()
+        assert config["search"]["past_present_share_buffer"] is True
+        assert config["search"]["max_length"] == 2048
 
     def test_search_params_cuda_does_not_share_buffer(self):
         """CUDA EP does not set past_present_share_buffer by default."""
