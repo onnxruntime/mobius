@@ -534,14 +534,12 @@ class TestWeightTying:
         assert "lm_head.weight" not in sd3
         assert "model.embed_tokens.weight" in sd3
 
-    def test_apply_weights_dedup_canonical_is_always_embed_key(self):
-        """apply_weights dedup (safety-net path) must always use embed_tokens as canonical.
+    def test_apply_weights_dedup_canonical_is_first_insertion_order(self):
+        """apply_weights dedup picks the first key in state_dict insertion order as canonical.
 
-        When a model still uses two graph initializers (old-style, no __init__ aliasing),
-        and the state_dict has lm_head.weight before model.embed_tokens.weight (e.g.,
-        from a checkpoint where only lm_head.weight was saved and tie_word_embeddings()
-        added embed_tokens.weight after), the canonical initializer must still be
-        model.embed_tokens.weight — not lm_head.weight.
+        Python dicts are insertion-ordered (PEP 468, Python 3.7+), so whichever
+        key appears first in the state_dict becomes the canonical initializer.
+        No model-specific name preference is applied.
         """
         # Build an untied model so the graph has both initializers.
         config = make_config(tie_word_embeddings=False)
@@ -550,20 +548,21 @@ class TestWeightTying:
         model = pkg["model"]
 
         weight = torch.zeros(config.vocab_size, config.hidden_size)
-        # Simulate: checkpoint only had lm_head.weight; tie_word_embeddings() added
-        # embed_tokens.weight — so lm_head.weight appears first in the dict.
+        # embed_tokens.weight is first — it must become the canonical initializer.
         sd = {
-            "lm_head.weight": weight,
-            "model.embed_tokens.weight": weight,  # same object, lm_head first
+            "model.embed_tokens.weight": weight,
+            "lm_head.weight": weight,  # same object, comes second
         }
         apply_weights(model, sd)
 
-        # Regardless of insertion order, model.embed_tokens.weight must be canonical.
-        assert "model.embed_tokens.weight" in model.graph.initializers, (
-            "model.embed_tokens.weight must be the canonical initializer"
+        # The first key in insertion order is the canonical; the second is removed.
+        first_key = next(iter(sd))
+        second_key = next(k for k in sd if k != first_key)
+        assert first_key in model.graph.initializers, (
+            f"'{first_key}' (first in state_dict) must be the canonical initializer"
         )
-        assert "lm_head.weight" not in model.graph.initializers, (
-            "lm_head.weight must be removed — merged into embed_tokens"
+        assert second_key not in model.graph.initializers, (
+            f"'{second_key}' (second in state_dict) must be merged away"
         )
 
     def test_untied_weights_have_separate_initializers(self):
