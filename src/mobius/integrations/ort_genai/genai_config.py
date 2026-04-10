@@ -44,7 +44,7 @@ def _default_decoder_outputs() -> dict[str, str]:
     }
 
 
-_WEBGPU_MAX_LENGTH_CAP = 4096
+_SHARE_BUFFER_MAX_LENGTH_CAP = 4096
 
 
 def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
@@ -66,7 +66,7 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
         # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
         # buffers (~8 GB for 128K-token models) on consumer hardware.  Users
         # can raise the limit in genai_config.json for their target device.
-        max_length = min(context_length, _WEBGPU_MAX_LENGTH_CAP)
+        max_length = min(context_length, _SHARE_BUFFER_MAX_LENGTH_CAP)
     else:
         max_length = context_length
     return {
