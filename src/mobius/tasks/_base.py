@@ -89,6 +89,14 @@ class ComponentSpec:
         """Iterate over ``(output_name, attribute_name)`` pairs."""
         return self._components.items()
 
+    def keys(self):
+        """Return the output model names declared by this spec."""
+        return self._components.keys()
+
+    def __contains__(self, item: str) -> bool:
+        """Return ``True`` if *item* is a declared output model name."""
+        return item in self._components
+
     def __repr__(self) -> str:
         parts = ", ".join(f"{k}={v!r}" for k, v in self._components.items())
         return f"ComponentSpec({parts})"
