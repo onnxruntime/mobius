@@ -794,7 +794,8 @@ class ArchitectureConfig(BaseModelConfig):
     # Falcon config
     alibi: bool = False
     parallel_attn: bool = False
-    dual_ln: bool = False  # True for models with two separate norms in parallel layers (MPT, GPT-NeoX-Falcon)
+    # True for models with two separate norms in parallel layers (MPT, GPT-NeoX-Falcon)
+    dual_ln: bool = False
 
     # Post-norm vs pre-norm architecture toggle (used by OpenAI-GPT vs standard GPT-2)
     post_norm: bool = False
@@ -1535,8 +1536,12 @@ class Gemma4Config(VisionLanguageConfig):
         # picks up full_attention.rope_theta (1_000_000) via _nested_rope_theta, making
         # the base rope_theta wrong for local/sliding layers.  Correct it here.
         rope_params = getattr(config, "rope_parameters", {}) or {}
-        full_rope = rope_params.get("full_attention", {}) if isinstance(rope_params, dict) else {}
-        sliding_rope = rope_params.get("sliding_attention", {}) if isinstance(rope_params, dict) else {}
+        full_rope = (
+            rope_params.get("full_attention", {}) if isinstance(rope_params, dict) else {}
+        )
+        sliding_rope = (
+            rope_params.get("sliding_attention", {}) if isinstance(rope_params, dict) else {}
+        )
         if "rope_theta" in sliding_rope:
             # Override with the correct sliding-attention theta (e.g. 10_000 for E2B/E4B).
             base = dataclasses.replace(base, rope_theta=float(sliding_rope["rope_theta"]))

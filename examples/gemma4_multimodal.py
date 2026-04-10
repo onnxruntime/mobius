@@ -790,7 +790,9 @@ def main() -> int:
                 decoder_session=decoder_session,
                 tokenizer=tokenizer,
                 config=config,
-                prompt=args.prompt or "Explain the theory of general relativity in simple terms.",
+                prompt=args.prompt or (
+                    "Explain the theory of general relativity in simple terms."
+                ),
                 max_new_tokens=max_tokens,
             )
 

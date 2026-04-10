@@ -418,5 +418,3 @@ class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
         return _make_model(graph)
-
-

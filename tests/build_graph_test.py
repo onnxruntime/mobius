@@ -1305,7 +1305,7 @@ class TestBuildGraphVisionLanguage:
         assert "image_features" in emb_input_names
         assert "audio_features" in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
-        # KV cache outputs: exactly num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
+        # KV cache outputs: num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
         decoder_output_names = {o.name for o in decoder.graph.outputs}
         assert "present.0.key" in decoder_output_names
         assert "present.0.value" in decoder_output_names
@@ -1313,14 +1313,14 @@ class TestBuildGraphVisionLanguage:
         assert "present.1.value" not in decoder_output_names  # shared layer excluded
 
     def test_gemma4_kv_shared_layer_tracing(self):
-        """Verify all num_hidden_layers are traced and present_key_values has num_kv_layers entries.
+        """Verify all num_hidden_layers are traced and KV outputs = num_kv_layers.
 
         With num_kv_shared_layers=1 and num_hidden_layers=2:
         - Both layers must be traced (Attention op count = 2)
         - KV cache inputs: 1 entry (only layer 0 has its own K/V)
         - KV cache outputs: 1 entry (shared layer excluded from present_key_values)
         """
-        from mobius._configs import Gemma4Config, Gemma4AudioConfig
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
         from mobius.tasks._gemma4 import Gemma4AnyToAnyTask
 
         config = Gemma4Config(
@@ -1887,7 +1887,8 @@ class TestBuildGraphWhisper:
         assert any("layer_norm" in n for n in init_names), "Should have LayerNorm initializer"
 
     def test_whisper_decoder_has_initializers(self):
-        """Verify decoder has embedding, attention, cross-attention, and proj_out initializers."""
+        """Verify decoder has embedding, attention, cross-attention, and proj_out initializers.
+        """
         from mobius._builder import build_from_module
         from mobius.models.whisper import WhisperForConditionalGeneration
         from mobius.tasks import SpeechToTextTask

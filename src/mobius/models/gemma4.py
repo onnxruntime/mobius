@@ -26,7 +26,6 @@ Key architectural differences from Gemma3:
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx_ir as ir
@@ -49,10 +48,6 @@ from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
-
-if TYPE_CHECKING:
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
@@ -517,7 +512,10 @@ class _Gemma4MoeRouter(nn.Module):
         # Scale-free RMSNorm using RMSNormalization op (epsilon as attribute avoids
         # graph-level float constant name collisions across multiple decoder layers).
         H_shape = op.Shape(hidden_states, start=1, end=2)  # [1] containing hidden_size
-        ones = op.CastLike(op.ConstantOfShape(H_shape, value=1.0), hidden_states)
+        ones = op.CastLike(
+            op.ConstantOfShape(H_shape, value=ir.tensor(np.ones(1, dtype=np.float32))),
+            hidden_states,
+        )
         x_normed = op.RMSNormalization(hidden_states, ones, epsilon=self._eps, axis=-1)
         # Scale: x_normed * self.scale  (hidden_size^-0.5 already folded into scale)
         x_scaled = op.Mul(x_normed, self.scale)
@@ -776,7 +774,10 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Build output accumulator, matching dtype of the input
         out_shape = op.Shape(normed_flat)                      # [T, H] shape vec
-        output = op.CastLike(op.ConstantOfShape(out_shape, value=0.0), normed_flat)
+        output = op.CastLike(
+            op.ConstantOfShape(out_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
+            normed_flat,
+        )
 
         # T_shape: 1-D tensor [T] used for per-expert weight accumulation
         T_shape = op.Shape(normed_flat, start=0, end=1)        # shape vec of length 1
@@ -802,7 +803,10 @@ class Gemma4DecoderLayer(nn.Module):
             )
 
             # Accumulate routing weight for expert e_idx across all k slots
-            e_weight = op.CastLike(op.ConstantOfShape(T_shape, value=0.0), top_weights)
+            e_weight = op.CastLike(
+                op.ConstantOfShape(T_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
+                top_weights,
+            )
             for k_idx in range(self._top_k):
                 # idx_k: [T] — which expert was selected at slot k_idx
                 idx_k = op.Squeeze(op.Slice(top_indices, [k_idx], [k_idx + 1], [1]), [1])
