@@ -76,6 +76,12 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_next",
+    # Models using LinearAttention / CausalConvWithState custom ops
+    # prevent full shape/type propagation through com.microsoft domain.
+    "bamba",
+    "granitemoehybrid",
+    "mamba2",
+    "nemotron_h",
     # VL/Speech models with value_info/shape checker issues
     "qwen2_vl",
     "qwen2_5_vl",

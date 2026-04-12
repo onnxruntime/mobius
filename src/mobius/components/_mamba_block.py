@@ -7,17 +7,11 @@ This module provides:
 
 - **MambaBlock** (Mamba1): standard Mamba layer for Mamba, Jamba,
   FalconMamba, etc.
-- **Mamba2BlockBase**: shared ``__init__`` and helpers for all Mamba2
-  multi-token modes.
-- **Mamba2BlockSingle**: single-token path (seq_len must be 1).
-- **Mamba2Block**: factory function that instantiates the correct
-  subclass based on ``flags.mamba_scan``.
-
-The full set of Mamba2 subclasses is:
-
-- ``Mamba2BlockSingle``  — this file
-- ``Mamba2BlockScan``    — ``_mamba_block_scan.py``
-- ``Mamba2BlockChunkedSSD`` — ``_mamba_block_chunked.py``
+- **Mamba2Block**: Mamba2 layer using ``com.microsoft.LinearAttention``
+  with ``update_rule="gated"`` for the SSM recurrence and
+  ``com.microsoft.CausalConvWithState`` for depthwise Conv1D.
+  Supports both single-token decode (T=1) and multi-token prefill
+  (T>1) in a single code path.
 
 HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
 ``NemotronHMamba2Mixer``.
@@ -29,7 +23,6 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._flags import flags
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
@@ -39,7 +32,7 @@ class _DepthwiseConv1d(nn.Module):
     """Depthwise 1D convolution with optional bias.
 
     Each input channel is convolved with its own kernel (groups=channels).
-    Used for causal convolution in the Mamba block.
+    Used for causal convolution in the Mamba1 block.
     """
 
     def __init__(self, channels: int, kernel_size: int, bias: bool = True):
@@ -180,24 +173,111 @@ class MambaBlock(nn.Module):
 
 
 # =====================================================================
-# Mamba2 base class and subclasses
+# Mamba2 block using LinearAttention
 # =====================================================================
 
 
-class Mamba2BlockBase(nn.Module):
-    """Base class for all Mamba2 block variants.
+class _Mamba2DepthwiseConv1d(nn.Module):
+    """Depthwise 1D convolution via CausalConvWithState function op.
 
-    Shared ``__init__`` defines the parameters (in_proj, conv1d, ssm,
-    norm, out_proj) so that all subclasses produce identical ONNX
-    weight paths.  Subclasses override ``forward()`` with the specific
-    multi-token algorithm.
+    Wraps ``weight`` and optional ``bias`` parameters so that
+    HuggingFace weight names (``conv1d.weight``, ``conv1d.bias``)
+    automatically align with ONNX initializer names.
+
+    The ``forward()`` method calls the ``CausalConvWithState``
+    function op in the ``com.microsoft`` domain.
+    """
+
+    def __init__(self, channels: int, kernel_size: int, bias: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter([channels, 1, kernel_size])
+        self.bias = nn.Parameter([channels]) if bias else None
+        self._channels = channels
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_val: ir.Value,
+        conv_state: ir.Value,
+    ):
+        """Run CausalConvWithState function op.
+
+        Args:
+            op: ONNX op builder.
+            input_val: (B, D, T) — channels-first input.
+            conv_state: (B, D, K-1) — carry state.
+
+        Returns:
+            output: (B, D, T) — convolution output with SiLU.
+            present_state: (B, D, K-1) — updated carry state.
+        """
+        if self.bias is not None:
+            conv_bias = self.bias
+        else:
+            # Zero bias — the function requires a bias input.
+            conv_bias = op.Expand(
+                op.CastLike(op.Constant(value_float=0.0), self.weight),
+                op.Constant(value_ints=[self._channels]),
+            )
+        return op.CausalConvWithState(
+            input_val,
+            self.weight,
+            conv_bias,
+            conv_state,
+            activation="silu",
+            _domain="com.microsoft",
+            _outputs=2,
+        )
+
+
+class Mamba2Block(nn.Module):
+    """Mamba2 block using LinearAttention for the SSM recurrence.
+
+    Uses ``com.microsoft.LinearAttention`` with ``update_rule="gated"``
+    to express the Mamba2 SSD recurrence, and
+    ``com.microsoft.CausalConvWithState`` for the depthwise Conv1D.
+    Supports both single-token decode (T=1) and multi-token prefill
+    (T>1) in a single unified code path.
+
+    The Mamba2 SSD recurrence maps to LinearAttention as:
+
+    - **query** = C (readout matrix), ``(B, T, num_heads * d_state)``
+    - **key** = B (input matrix), ``(B, T, num_heads * d_state)``
+    - **value** = dt * x (discretized input), ``(B, T, num_heads * d_head)``
+    - **decay** = A * dt (log-decay), ``(B, T, num_heads)``
+
+    B and C are expanded from ``n_groups`` to ``num_heads`` before
+    passing to LinearAttention (each group's B/C is shared across
+    ``heads_per_group`` heads).
 
     Key differences from MambaBlock (Mamba1):
+
     - in_proj outputs [gate, xBC, dt] instead of [x, z]
     - Conv1D on wider xBC (conv_dim channels)
     - Multi-head SSM with grouped B/C
     - GatedRMSNorm instead of SiLU gating
     - dt direct from in_proj (no rank reduction), just bias
+
+    Args:
+        d_model: Model hidden dimension.
+        d_inner: Expanded inner dimension (``num_heads * d_head``).
+        num_heads: Number of SSM heads.
+        d_head: Per-head hidden dimension.
+        d_state: SSM state dimension.
+        n_groups: Number of B/C groups (``num_heads // n_groups``
+            heads share the same B/C).
+        chunk_size: Chunk size hint for LinearAttention (does not
+            affect correctness).
+        conv_kernel: Causal Conv1D kernel size (typically 4).
+        conv_bias: Whether conv1d has a bias.
+        proj_bias: Whether in_proj/out_proj have biases.
+        eps: RMSNorm epsilon.
+        norm_group_size: If set, GatedRMSNorm normalizes within
+            groups of this size.
+        time_step_min: Minimum dt clamp value (0 = no clamp).
+
+    HuggingFace reference: ``Mamba2Mixer``, ``BambaMixer``,
+    ``NemotronHMamba2Mixer``.
     """
 
     def __init__(
@@ -232,7 +312,7 @@ class Mamba2BlockBase(nn.Module):
 
         proj_size = d_inner + self.conv_dim + num_heads
         self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
-        self.conv1d = _DepthwiseConv1d(
+        self.conv1d = _Mamba2DepthwiseConv1d(
             self.conv_dim,
             conv_kernel,
             bias=conv_bias,
@@ -254,35 +334,6 @@ class Mamba2BlockBase(nn.Module):
         )
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
-    @staticmethod
-    def _realize_submodule(
-        parent_builder: builder.GraphBuilder,
-        submodule: nn.Module,
-    ) -> None:
-        """Register a submodule's parameters as parent-graph initializers.
-
-        When a forward path references ``self.ssm.A_log`` etc. directly
-        (without calling ``self.ssm(...)``), or when Scan body graphs
-        need parameters as implicit inputs, this helper pushes the
-        naming context and calls ``_realize()`` on every parameter so
-        they appear as graph initializers.
-        """
-        name = submodule._name or ""
-        parent_builder.push_module(name, type(submodule).__qualname__)
-        for param in submodule._parameters.values():
-            param._realize(parent_builder)
-        for child in submodule._modules.values():
-            Mamba2BlockBase._realize_submodule(parent_builder, child)
-        parent_builder.pop_module()
-
-
-class Mamba2BlockSingle(Mamba2BlockBase):
-    """Mamba2 block: single-token path (seq_len must be 1).
-
-    Uses the Mamba2Scan recurrence directly with no chunking or Scan.
-    Useful for debugging numerical issues.
-    """
-
     def forward(
         self,
         op: builder.OpBuilder,
@@ -290,112 +341,132 @@ class Mamba2BlockSingle(Mamba2BlockBase):
         conv_state: ir.Value,
         ssm_state: ir.Value,
     ):
-        """Single-token forward pass (seq_len must be 1).
+        """Forward pass for the Mamba2 block.
 
         Args:
             op: ONNX op builder.
-            hidden_states: (batch, 1, d_model)
+            hidden_states: (batch, seq_len, d_model)
             conv_state: (batch, conv_dim, conv_kernel-1)
-            ssm_state: (batch, num_heads, d_head, d_state)
+            ssm_state: (batch, num_heads, d_state, d_head) — matches
+                LinearAttention state layout (B, H, d_k, d_v).
 
         Returns:
-            output: (batch, 1, d_model)
+            output: (batch, seq_len, d_model)
             new_conv_state: (batch, conv_dim, conv_kernel-1)
-            new_ssm_state: (batch, num_heads, d_head, d_state)
+            new_ssm_state: (batch, num_heads, d_state, d_head)
         """
-        # Step 1: Input projection -> gate, xBC, dt
+        # Step 1: Input projection → gate, xBC, dt
+        # projected: (B, T, d_inner + conv_dim + num_heads)
         projected = self.in_proj(op, hidden_states)
-        gate, x_bc, dt = op.Split(
+        gate, x_bc, dt_raw = op.Split(
             projected,
             [self.d_inner, self.conv_dim, self.num_heads],
             axis=-1,
             _outputs=3,
         )
+        # gate: (B, T, d_inner) — gating signal for GatedRMSNorm
+        # x_bc: (B, T, conv_dim) — input to conv1d
+        # dt_raw: (B, T, num_heads) — raw time step
 
-        # Step 2: Causal Conv1D with state update
+        # Step 2: CausalConvWithState + SiLU
+        # Transpose to channels-first: (B, conv_dim, T)
         x_bc_t = op.Transpose(x_bc, perm=[0, 2, 1])
-        conv_input = op.Concat(conv_state, x_bc_t, axis=2)
-        new_conv_state = op.Slice(
-            conv_input,
-            starts=[1],
-            ends=[INT64_MAX],
-            axes=[2],
-        )
-        conv_out = self.conv1d(op, conv_input)
-
-        # Step 3: SiLU activation
-        conv_out = op.Mul(conv_out, op.Sigmoid(conv_out))
+        conv_out, new_conv_state = self.conv1d(op, x_bc_t, conv_state)
+        # Transpose back: (B, T, conv_dim)
         x_bc_activated = op.Transpose(conv_out, perm=[0, 2, 1])
 
-        # Step 4: Split xBC -> hidden, B, C
+        # Step 3: Split xBC → x, B, C
         gs = self.n_groups * self.d_state
-        hidden_x, b_mat, c_mat = op.Split(
+        x_hidden, b_mat, c_mat = op.Split(
             x_bc_activated,
             [self.d_inner, gs, gs],
             axis=-1,
             _outputs=3,
         )
+        # x_hidden: (B, T, d_inner = num_heads * d_head)
+        # b_mat: (B, T, n_groups * d_state)
+        # c_mat: (B, T, n_groups * d_state)
 
-        # Squeeze seq dim for SSM: (B, 1, D) → (B, D)
-        hidden_flat = op.Squeeze(hidden_x, [1])
-        dt_flat = op.Squeeze(dt, [1])
-        b_flat = op.Squeeze(b_mat, [1])
-        c_flat = op.Squeeze(c_mat, [1])
+        # Step 4: Compute dt and decay for LinearAttention
+        # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
+        dt = op.Softplus(op.Add(dt_raw, self.ssm.dt_bias))
+        if self.time_step_min > 0.0:
+            dt = op.Clip(dt, self.time_step_min)
 
-        # Step 5: Multi-head selective scan
-        y, new_ssm_state = self.ssm(
-            op,
-            hidden_flat,
-            dt_flat,
-            b_flat,
-            c_flat,
+        # decay = A * dt in log-space: g_t where exp(g_t) is the decay
+        # A = -exp(A_log), so decay = -exp(A_log) * dt
+        a_neg = op.Neg(op.Exp(self.ssm.A_log))  # (num_heads,)
+        decay = op.Mul(a_neg, dt)  # (B, T, num_heads)
+
+        # Step 5: Prepare value = dt * x (absorb dt into input)
+        # dt: (B, T, num_heads) → (B, T, num_heads, 1)
+        dt_4d = op.Unsqueeze(dt, [-1])
+        # x: (B, T, d_inner) → (B, T, num_heads, d_head)
+        x_4d = op.Reshape(x_hidden, [0, 0, self.num_heads, self.d_head])
+        # value = dt * x: (B, T, num_heads, d_head)
+        value_4d = op.Mul(dt_4d, x_4d)
+        # Pack back: (B, T, num_heads * d_head)
+        value = op.Reshape(value_4d, [0, 0, self.num_heads * self.d_head])
+
+        # Step 6: Expand B and C from n_groups to num_heads
+        # Each group's B/C vector is shared across heads_per_group heads.
+        b_expanded = self._expand_groups(op, b_mat)
+        c_expanded = self._expand_groups(op, c_mat)
+
+        # Step 7: Call LinearAttention (gated mode)
+        # query = C: (B, T, num_heads * d_state) — d_k = d_state
+        # key = B: (B, T, num_heads * d_state)
+        # value = dt*x: (B, T, num_heads * d_head) — d_v = d_head
+        # decay: (B, T, num_heads) — per-head scalar in log-space
+        # state: (B, num_heads, d_state, d_head) = (B, H, d_k, d_v)
+        la_output, new_ssm_state = op.LinearAttention(
+            c_expanded,
+            b_expanded,
+            value,
             ssm_state,
+            decay,
+            scale=1.0,
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
+            _domain="com.microsoft",
+            _outputs=2,
         )
+        # la_output: (B, T, num_heads * d_head)
+        # new_ssm_state: (B, num_heads, d_state, d_head)
 
-        # Step 6: Gated RMSNorm
-        gate_flat = op.Squeeze(gate, [1])
-        y_normed = self.norm(op, y, gate_flat)
+        # Step 8: D skip connection — y += D * x (per-head broadcast)
+        # D: (num_heads,) → (1, 1, num_heads, 1) for broadcast
+        d_4d = op.Reshape(self.ssm.D, [1, 1, self.num_heads, 1])
+        d_skip = op.Reshape(
+            op.Mul(d_4d, x_4d),
+            [0, 0, self.num_heads * self.d_head],
+        )
+        y = op.Add(la_output, d_skip)
 
-        # Restore seq dim: (B, d_inner) → (B, 1, d_inner)
-        y_3d = op.Unsqueeze(y_normed, [1])
+        # Step 9: GatedRMSNorm
+        y_normed = self.norm(op, y, gate)
 
-        # Step 7: Output projection
-        output = self.out_proj(op, y_3d)
+        # Step 10: Output projection
+        output = self.out_proj(op, y_normed)
 
         return output, new_conv_state, new_ssm_state
 
+    def _expand_groups(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        """Expand grouped B or C from n_groups to num_heads.
 
-# =====================================================================
-# Factory function
-# =====================================================================
+        Args:
+            x: (B, T, n_groups * d_state)
 
-
-def Mamba2Block(*args, **kwargs) -> Mamba2BlockBase:  # noqa: N802
-    """Instantiate the Mamba2 block variant for the current flag.
-
-    Reads ``flags.mamba_scan`` at construction time and returns the
-    matching subclass.  Callers use this exactly like the old
-    ``Mamba2Block`` class — no API change.
-
-    Available modes:
-
-    - ``"single"`` → ``Mamba2BlockSingle`` (this file)
-    - ``"scan"`` → ``Mamba2BlockScan`` (``_mamba_block_scan.py``)
-    - ``"chunked_ssd"`` → ``Mamba2BlockChunkedSSD``
-      (``_mamba_block_chunked.py``)
-    """
-    mode = flags.mamba_scan
-    if mode == "single":
-        return Mamba2BlockSingle(*args, **kwargs)
-    if mode == "scan":
-        from mobius.components._mamba_block_scan import Mamba2BlockScan
-
-        return Mamba2BlockScan(*args, **kwargs)
-    if mode == "chunked_ssd":
-        from mobius.components._mamba_block_chunked import (
-            Mamba2BlockChunkedSSD,
-        )
-
-        return Mamba2BlockChunkedSSD(*args, **kwargs)
-    msg = f"Unknown mamba_scan mode {mode!r}. Expected 'single', 'scan', or 'chunked_ssd'."
-    raise ValueError(msg)
+        Returns:
+            (B, T, num_heads * d_state) with each group's d_state
+            vector replicated ``heads_per_group`` times.
+        """
+        if self.n_groups == self.num_heads:
+            return x  # No expansion needed
+        # (B, T, n_groups, 1, d_state)
+        x_5d = op.Reshape(x, [0, 0, self.n_groups, 1, self.d_state])
+        # Expand → (B, T, n_groups, heads_per_group, d_state)
+        x_expanded = op.Expand(x_5d, [1, 1, 1, self.heads_per_group, 1])
+        # Flatten → (B, T, num_heads * d_state)
+        return op.Reshape(x_expanded, [0, 0, self.num_heads * self.d_state])

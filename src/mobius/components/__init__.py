@@ -52,7 +52,6 @@ __all__ = [
     "Mistral3MultiModalProjector",
     "MLPMultiModalProjector",
     "Mamba2Block",
-    "Mamba2Scan",
     "MambaBlock",
     "MoELayer",
     "OffsetRMSNorm",
@@ -233,7 +232,6 @@ from mobius.components._rms_norm import (
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.components._ssm import (
     JambaSelectiveScan,
-    Mamba2Scan,
     SelectiveScan,
 )
 from mobius.components._vision import (

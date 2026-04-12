@@ -244,7 +244,7 @@ def _make_hybrid_cache_inputs(
             )
             ssm_state = ir.Value(
                 name=f"{prefix}.{i}.ssm_state",
-                shape=ir.Shape([batch, mamba2_n_heads, mamba2_d_head, mamba2_d_state]),
+                shape=ir.Shape([batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head]),
                 type=ir.TensorType(dtype),
             )
             flat.extend([conv_state, ssm_state])
@@ -324,15 +324,17 @@ def _register_linear_attention_functions(
 ) -> None:
     """Register CausalConvWithState and LinearAttention functions.
 
-    Registers functions for DeltaNet (``linear_attention`` layers) and/or
-    Lightning Attention (``lightning_attention`` layers) as needed.
+    Registers functions for DeltaNet (``linear_attention`` layers),
+    Lightning Attention (``lightning_attention`` layers), and/or
+    Mamba2 (``mamba2`` layers) as needed.
     Adds the ``pkg.mobius`` opset import to the graph.
     """
     layer_types = getattr(config, "layer_types", None) or []
     has_deltanet = "linear_attention" in layer_types
     has_lightning = "lightning_attention" in layer_types
+    has_mamba2 = "mamba2" in layer_types
 
-    if not has_deltanet and not has_lightning:
+    if not has_deltanet and not has_lightning and not has_mamba2:
         return
 
     from mobius.functions import (
@@ -369,4 +371,76 @@ def _register_linear_attention_functions(
         )
         model.functions[attn_func_gated.identifier()] = attn_func_gated
 
+    if has_mamba2:
+        mamba2_n_heads = getattr(config, "mamba_n_heads", 0)
+        mamba2_d_head = getattr(config, "mamba_d_head", 0)
+        mamba2_d_state = getattr(config, "mamba_d_state", 0)
+        mamba2_n_groups = getattr(config, "mamba_n_groups", 1)
+        mamba2_d_conv = getattr(config, "mamba_d_conv", 4)
+        mamba_expand = getattr(config, "mamba_expand", 2)
+        mamba2_d_inner = (
+            mamba2_n_heads * mamba2_d_head
+            if mamba2_n_heads and mamba2_d_head
+            else config.hidden_size * mamba_expand
+        )
+        mamba2_conv_dim = mamba2_d_inner + 2 * mamba2_n_groups * mamba2_d_state
+        conv_func = causal_conv_nd_with_state(
+            kernel_size=mamba2_d_conv,
+            channels=mamba2_conv_dim,
+            ndim=1,
+            activation="silu",
+        )
+        attn_func = linear_attention(
+            q_num_heads=mamba2_n_heads,
+            kv_num_heads=mamba2_n_heads,
+            update_rule="gated",
+            scale=1.0,
+            stash_type=config.dtype,
+        )
+        model.functions[conv_func.identifier()] = conv_func
+        model.functions[attn_func.identifier()] = attn_func
+
+    model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1
+
+
+def _register_linear_attention_functions_for_ssm2(
+    model: ir.Model,
+    config: BaseModelConfig,
+) -> None:
+    """Register CausalConvWithState and LinearAttention for pure Mamba2 models.
+
+    Unlike :func:`_register_linear_attention_functions` (which inspects
+    ``layer_types``), this always registers the Mamba2 function ops.
+    Called by :class:`SSM2CausalLMTask` for pure Mamba2 models that don't
+    have a ``layer_types`` attribute.
+    """
+    from mobius._configs import Mamba2Config
+    from mobius.functions import (
+        causal_conv_nd_with_state,
+        linear_attention,
+    )
+
+    assert isinstance(config, Mamba2Config)
+    n_heads = config.num_heads
+    d_state = config.state_size
+    n_groups = config.n_groups
+    d_inner = config.intermediate_size
+    d_conv = config.conv_kernel
+    conv_dim = d_inner + 2 * n_groups * d_state
+
+    conv_func = causal_conv_nd_with_state(
+        kernel_size=d_conv,
+        channels=conv_dim,
+        ndim=1,
+        activation="silu",
+    )
+    attn_func = linear_attention(
+        q_num_heads=n_heads,
+        kv_num_heads=n_heads,
+        update_rule="gated",
+        scale=1.0,
+        stash_type=config.dtype,
+    )
+    model.functions[conv_func.identifier()] = conv_func
+    model.functions[attn_func.identifier()] = attn_func
     model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1
