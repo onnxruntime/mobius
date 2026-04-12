@@ -75,7 +75,7 @@ class SelectiveScan(nn.Module):
         """
         dt_raw, b_mat, c_mat = op.Split(
             x_db,
-            op.Constant(value_ints=[self.dt_rank, self.d_state, self.d_state]),
+            [self.dt_rank, self.d_state, self.d_state],
             axis=-1,
             _outputs=3,
         )
@@ -180,7 +180,7 @@ class JambaSelectiveScan(SelectiveScan):
         """Split + layernorm on dt, B, C."""
         dt_raw, b_mat, c_mat = op.Split(
             x_db,
-            op.Constant(value_ints=[self.dt_rank, self.d_state, self.d_state]),
+            [self.dt_rank, self.d_state, self.d_state],
             axis=-1,
             _outputs=3,
         )
@@ -262,7 +262,7 @@ class Mamba2Scan(nn.Module):
         )
         # Clamp dt to time_step_min (matches HF torch.clamp(dt, min=...))
         if self.time_step_min > 0.0:
-            dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
+            dt = op.Clip(dt, self.time_step_min)
 
         # A = -exp(A_log) in fp32: (num_heads,)
         a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
@@ -274,15 +274,17 @@ class Mamba2Scan(nn.Module):
         da = op.Exp(op.Mul(dt_4d, a_4d))
 
         # Reshape hidden: (batch, num_heads, d_head)
-        hidden_shape = op.Constant(value_ints=[0, self.num_heads, self.d_head])
-        hidden_3d = op.Cast(op.Reshape(hidden_states, hidden_shape), to=ir.DataType.FLOAT)
+        hidden_3d = op.Cast(
+            op.Reshape(hidden_states, [0, self.num_heads, self.d_head]),
+            to=ir.DataType.FLOAT,
+        )
 
         # Expand B from groups to heads (in fp32)
-        b_shape = op.Constant(value_ints=[0, self.n_groups, 1, self.d_state])
+        b_shape = [0, self.n_groups, 1, self.d_state]
         b_4d = op.Reshape(op.Cast(b_mat, to=ir.DataType.FLOAT), b_shape)
-        b_expand_shape = op.Constant(value_ints=[1, 1, self.heads_per_group, 1])
+        b_expand_shape = [1, 1, self.heads_per_group, 1]
         b_expanded = op.Expand(b_4d, b_expand_shape)
-        b_heads_shape = op.Constant(value_ints=[0, self.num_heads, self.d_state])
+        b_heads_shape = [0, self.num_heads, self.d_state]
         b_heads = op.Reshape(b_expanded, b_heads_shape)
         b_ssm = op.Unsqueeze(b_heads, [2])
 
@@ -309,8 +311,10 @@ class Mamba2Scan(nn.Module):
         y = op.Add(y, op.Mul(d_3d, hidden_3d))
 
         # Flatten and cast back to input dtype: (batch, num_heads * d_head)
-        flat_shape = op.Constant(value_ints=[0, self.num_heads * self.d_head])
-        y = op.CastLike(op.Reshape(y, flat_shape), hidden_states)
+        y = op.CastLike(
+            op.Reshape(y, [0, self.num_heads * self.d_head]),
+            hidden_states,
+        )
 
         return y, op.CastLike(new_ssm_state, ssm_state)
 
@@ -329,7 +333,7 @@ class _RMSNorm(nn.Module):
         variance = op.ReduceMean(op.Mul(x_f32, x_f32), [-1], keepdims=True)
         x_normed = op.Div(
             x_f32,
-            op.Sqrt(op.Add(variance, op.Constant(value_float=self._eps))),
+            op.Sqrt(op.Add(variance, self._eps)),
         )
         result = op.Mul(x_normed, op.Cast(self.weight, to=ir.DataType.FLOAT))
         return op.CastLike(result, x)

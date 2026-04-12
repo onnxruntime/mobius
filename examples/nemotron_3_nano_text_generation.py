@@ -601,15 +601,15 @@ def main():
         help="Disable chat template (send raw text).",
     )
     parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
+    parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=REPETITION_PENALTY,
         help="Repetition penalty (1.0 = none, default: %(default)s).",
-    )
-    parser.add_argument(
-        "--ci",
-        action="store_true",
-        help="Exit with non-zero code on failure (for CI pipelines).",
     )
     args = parser.parse_args()
 

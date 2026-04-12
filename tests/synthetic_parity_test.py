@@ -87,6 +87,9 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # NemotronH: Mamba2+Attention+MLP hybrid — Mamba2BlockSingle only handles seq_len=1
+    # but synthetic parity test feeds multiple tokens in a single forward pass.
+    "nemotron_h": "NemotronH Mamba2BlockSingle requires seq_len=1; multi-token prefill not supported",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
