@@ -383,43 +383,51 @@ class Mamba2Block(nn.Module):
         # b_mat: (B, T, n_groups * d_state)
         # c_mat: (B, T, n_groups * d_state)
 
-        # Step 4: Compute dt and decay for LinearAttention
+        # Step 4: Compute dt and decay for LinearAttention.
+        # Upcast to fp32 for softplus/exp to match HuggingFace which
+        # computes the SSM recurrence in float32.
+        dt_raw_f32 = op.Cast(dt_raw, to=ir.DataType.FLOAT)
+        dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
+        a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
+
         # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
-        dt = op.Softplus(op.Add(dt_raw, self.dt_bias))
+        dt = op.Softplus(op.Add(dt_raw_f32, dt_bias_f32))
         if self.time_step_min > 0.0:
             dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
 
         # decay = A * dt in log-space: g_t where exp(g_t) is the decay
         # A = -exp(A_log), so decay = -exp(A_log) * dt
-        a_neg = op.Neg(op.Exp(self.A_log))  # (num_heads,)
-        decay = op.Mul(a_neg, dt)  # (B, T, num_heads)
+        a_neg = op.Neg(op.Exp(a_log_f32))  # (num_heads,)
+        decay = op.Mul(a_neg, dt)  # (B, T, num_heads) in f32
 
-        # Step 5: Prepare value = dt * x (absorb dt into input)
+        # Step 5: Prepare value = dt * x (absorb dt into input, in f32)
         # dt: (B, T, num_heads) → (B, T, num_heads, 1)
         dt_4d = op.Unsqueeze(dt, [-1])
-        # x: (B, T, d_inner) → (B, T, num_heads, d_head)
-        x_4d = op.Reshape(x_hidden, [0, 0, self.num_heads, self.d_head])
+        # x: (B, T, d_inner) → (B, T, num_heads, d_head), cast to f32
+        x_f32 = op.Cast(x_hidden, to=ir.DataType.FLOAT)
+        x_4d = op.Reshape(x_f32, [0, 0, self.num_heads, self.d_head])
         # value = dt * x: (B, T, num_heads, d_head)
         value_4d = op.Mul(dt_4d, x_4d)
         # Pack back: (B, T, num_heads * d_head)
         value = op.Reshape(value_4d, [0, 0, self.num_heads * self.d_head])
 
-        # Step 6: Expand B and C from n_groups to num_heads
+        # Step 6: Expand B and C from n_groups to num_heads (in f32)
         # Each group's B/C vector is shared across heads_per_group heads.
-        b_expanded = self._expand_groups(op, b_mat)
-        c_expanded = self._expand_groups(op, c_mat)
+        b_expanded = self._expand_groups(op, op.Cast(b_mat, to=ir.DataType.FLOAT))
+        c_expanded = self._expand_groups(op, op.Cast(c_mat, to=ir.DataType.FLOAT))
 
-        # Step 7: Call LinearAttention (gated mode)
+        # Step 7: Call LinearAttention (gated mode, all inputs in f32)
         # query = C: (B, T, num_heads * d_state) — d_k = d_state
         # key = B: (B, T, num_heads * d_state)
         # value = dt*x: (B, T, num_heads * d_head) — d_v = d_head
         # decay: (B, T, num_heads) — per-head scalar in log-space
         # state: (B, num_heads, d_state, d_head) = (B, H, d_k, d_v)
+        ssm_state_f32 = op.Cast(ssm_state, to=ir.DataType.FLOAT)
         la_output, new_ssm_state = op.LinearAttention(
             c_expanded,
             b_expanded,
             value,
-            ssm_state,
+            ssm_state_f32,
             decay,
             scale=1.0,
             q_num_heads=self.num_heads,
@@ -428,15 +436,24 @@ class Mamba2Block(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
-        # la_output: (B, T, num_heads * d_head)
-        # new_ssm_state: (B, num_heads, d_state, d_head)
+        # la_output: (B, T, num_heads * d_head) in f32
+        # new_ssm_state: (B, num_heads, d_state, d_head) in f32
+        # Cast back to model dtype for downstream ops and state output
+        la_output = op.CastLike(la_output, hidden_states)
+        new_ssm_state = op.CastLike(new_ssm_state, ssm_state)
 
         # Step 8: D skip connection — y += D * x (per-head broadcast)
         # D: (num_heads,) → (1, 1, num_heads, 1) for broadcast
-        d_4d = op.Reshape(self.D, [1, 1, self.num_heads, 1])
-        d_skip = op.Reshape(
-            op.Mul(d_4d, x_4d),
-            [0, 0, self.num_heads * self.d_head],
+        # x_4d is still f32; cast D to f32 for the multiply, result cast
+        # back via la_output's dtype.
+        d_f32 = op.Cast(self.D, to=ir.DataType.FLOAT)
+        d_4d = op.Reshape(d_f32, [1, 1, self.num_heads, 1])
+        d_skip = op.CastLike(
+            op.Reshape(
+                op.Mul(d_4d, x_4d),
+                [0, 0, self.num_heads * self.d_head],
+            ),
+            hidden_states,
         )
         y = op.Add(la_output, d_skip)
 

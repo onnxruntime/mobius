@@ -17,7 +17,7 @@ import onnx_ir as ir
 
 from mobius._configs import BaseModelConfig
 
-_FUNCTIONS_DOMAIN = "pkg.mobius"
+_FUNCTIONS_DOMAIN = "com.microsoft"
 
 # Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
 # layers; (rec_state,) for lightning/conv attention (single state);
@@ -327,7 +327,7 @@ def _register_linear_attention_functions(
     Registers functions for DeltaNet (``linear_attention`` layers),
     Lightning Attention (``lightning_attention`` layers), and/or
     Mamba2 (``mamba2`` layers) as needed.
-    Adds the ``pkg.mobius`` opset import to the graph.
+    Adds the ``com.microsoft`` opset import to the graph.
     """
     layer_types = getattr(config, "layer_types", None) or []
     has_deltanet = "linear_attention" in layer_types
@@ -395,7 +395,7 @@ def _register_linear_attention_functions(
             kv_num_heads=mamba2_n_heads,
             update_rule="gated",
             scale=1.0,
-            stash_type=config.dtype,
+            stash_type=ir.DataType.FLOAT,
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func
@@ -439,7 +439,7 @@ def _register_linear_attention_functions_for_ssm2(
         kv_num_heads=n_heads,
         update_rule="gated",
         scale=1.0,
-        stash_type=config.dtype,
+        stash_type=ir.DataType.FLOAT,
     )
     model.functions[conv_func.identifier()] = conv_func
     model.functions[attn_func.identifier()] = attn_func

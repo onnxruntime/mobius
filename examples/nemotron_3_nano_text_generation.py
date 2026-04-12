@@ -593,7 +593,11 @@ def main():
         "--device",
         choices=["cpu", "cuda"],
         default="cpu",
-        help="Device for ONNX Runtime inference (default: %(default)s).",
+        help=(
+            "Device for inference (used for ONNX Runtime and for "
+            "HuggingFace comparison when --compare-hf is set) "
+            "(default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--ep",
