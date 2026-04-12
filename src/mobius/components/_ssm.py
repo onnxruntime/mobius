@@ -282,10 +282,10 @@ class Mamba2Scan(nn.Module):
         # Expand B from groups to heads (in fp32)
         b_shape = [0, self.n_groups, 1, self.d_state]
         b_4d = op.Reshape(op.Cast(b_mat, to=ir.DataType.FLOAT), b_shape)
-        b_expand_shape = [1, 1, self.heads_per_group, 1]
-        b_expanded = op.Expand(b_4d, b_expand_shape)
-        b_heads_shape = [0, self.num_heads, self.d_state]
-        b_heads = op.Reshape(b_expanded, b_heads_shape)
+        expand_shape = [1, 1, self.heads_per_group, 1]
+        b_expanded = op.Expand(b_4d, expand_shape)
+        heads_shape = [0, self.num_heads, self.d_state]
+        b_heads = op.Reshape(b_expanded, heads_shape)
         b_ssm = op.Unsqueeze(b_heads, [2])
 
         # dBx: dt * B * x (in fp32)
@@ -298,8 +298,8 @@ class Mamba2Scan(nn.Module):
 
         # Readout: y = C . h + D * x (in fp32)
         c_4d = op.Reshape(op.Cast(c_mat, to=ir.DataType.FLOAT), b_shape)
-        c_expanded = op.Expand(c_4d, b_expand_shape)
-        c_heads = op.Reshape(c_expanded, b_heads_shape)
+        c_expanded = op.Expand(c_4d, expand_shape)
+        c_heads = op.Reshape(c_expanded, heads_shape)
         c_ssm = op.Unsqueeze(c_heads, [2])
 
         y = op.ReduceSum(
