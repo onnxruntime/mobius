@@ -25,7 +25,7 @@ from onnxscript._internal import builder
 
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
-from mobius.components._ssm import Mamba2Scan, SelectiveScan
+from mobius.components._ssm import SelectiveScan
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -317,16 +317,12 @@ class Mamba2Block(nn.Module):
             conv_kernel,
             bias=conv_bias,
         )
-        # SSM parameters live under self.ssm so that ONNX weight paths
-        # stay as ``mamba.ssm.{A_log,D,dt_bias}`` — compatible with all
-        # existing preprocess_weights rename rules.
-        self.ssm = Mamba2Scan(
-            num_heads,
-            d_head,
-            d_state,
-            n_groups,
-            time_step_min=time_step_min,
-        )
+        # SSM parameters directly on this module so they appear as
+        # graph initializers. Weight paths: mamba.{A_log,D,dt_bias}
+        # matching HuggingFace naming (no extra nesting needed).
+        self.A_log = nn.Parameter([num_heads])
+        self.D = nn.Parameter([num_heads])
+        self.dt_bias = nn.Parameter([num_heads])
         self.norm = GatedRMSNorm(
             d_inner,
             eps=eps,
@@ -389,13 +385,13 @@ class Mamba2Block(nn.Module):
 
         # Step 4: Compute dt and decay for LinearAttention
         # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
-        dt = op.Softplus(op.Add(dt_raw, self.ssm.dt_bias))
+        dt = op.Softplus(op.Add(dt_raw, self.dt_bias))
         if self.time_step_min > 0.0:
-            dt = op.Clip(dt, self.time_step_min)
+            dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
 
         # decay = A * dt in log-space: g_t where exp(g_t) is the decay
         # A = -exp(A_log), so decay = -exp(A_log) * dt
-        a_neg = op.Neg(op.Exp(self.ssm.A_log))  # (num_heads,)
+        a_neg = op.Neg(op.Exp(self.A_log))  # (num_heads,)
         decay = op.Mul(a_neg, dt)  # (B, T, num_heads)
 
         # Step 5: Prepare value = dt * x (absorb dt into input)
@@ -437,7 +433,7 @@ class Mamba2Block(nn.Module):
 
         # Step 8: D skip connection — y += D * x (per-head broadcast)
         # D: (num_heads,) → (1, 1, num_heads, 1) for broadcast
-        d_4d = op.Reshape(self.ssm.D, [1, 1, self.num_heads, 1])
+        d_4d = op.Reshape(self.D, [1, 1, self.num_heads, 1])
         d_skip = op.Reshape(
             op.Mul(d_4d, x_4d),
             [0, 0, self.num_heads * self.d_head],

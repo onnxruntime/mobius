@@ -431,35 +431,14 @@ class Mamba2CausalLMModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Map HuggingFace Mamba2ForCausalLM weights to ONNX names.
 
-        HF naming:
+        HF and ONNX naming match directly — no SSM param renaming needed:
             backbone.layers.{i}.norm.weight (same)
-            backbone.layers.{i}.mixer.{A_log,D,dt_bias}
-                -> backbone.layers.{i}.mixer.ssm.{A_log,D,dt_bias}
-            backbone.layers.{i}.mixer.{in_proj,conv1d,norm,out_proj}
+            backbone.layers.{i}.mixer.{A_log,D,dt_bias,in_proj,conv1d,norm,out_proj}
                 (same)
             backbone.embeddings.weight (same)
             backbone.norm_f.weight (same)
             lm_head.weight (same)
         """
-        renames = {}
-        _ssm_params = ("A_log", "D", "dt_bias")
-
-        for key in list(state_dict):
-            new_key = key
-            # mixer.{ssm_param} -> mixer.ssm.{ssm_param}
-            for param in _ssm_params:
-                old_seg = f".mixer.{param}"
-                new_seg = f".mixer.ssm.{param}"
-                if new_key.endswith(old_seg):
-                    new_key = new_key.replace(old_seg, new_seg)
-                    break
-
-            if new_key != key:
-                renames[key] = new_key
-
-        for old_key, new_key in renames.items():
-            state_dict[new_key] = state_dict.pop(old_key)
-
         # Tied embeddings (Mamba2 uses self.backbone, not self.model)
         if self.config.tie_word_embeddings:
             if "lm_head.weight" in state_dict:
