@@ -242,9 +242,9 @@ def init_hybrid_states(config, dtype: np.dtype = np.float32) -> dict[str, np.nda
             states[f"past_key_values.{i}.conv_state"] = np.zeros(
                 (batch_size, conv_dim, d_conv - 1), dtype=dtype
             )
-            # ssm_state: (batch, n_heads, d_head, d_state)
+            # ssm_state: (batch, n_heads, d_state, d_head) — LinearAttention convention
             states[f"past_key_values.{i}.ssm_state"] = np.zeros(
-                (batch_size, n_heads, d_head, d_state),
+                (batch_size, n_heads, d_state, d_head),
                 dtype=dtype,
             )
         elif ltype in ("attention", "full_attention"):
@@ -593,7 +593,18 @@ def main():
         "--device",
         choices=["cpu", "cuda"],
         default="cpu",
-        help="Device for ONNX Runtime and PyTorch inference (default: %(default)s).",
+        help="Device for ONNX Runtime inference (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ep",
+        choices=["cpu", "cuda", "onnx-standard"],
+        default=None,
+        help=(
+            "Execution provider for ONNX model build. "
+            "'onnx-standard' inlines custom ops (LinearAttention, etc.) "
+            "into standard ONNX ops, runnable on any ORT version. "
+            "Defaults to matching --device."
+        ),
     )
     parser.add_argument(
         "--no-chat",
@@ -632,7 +643,7 @@ def main():
         build_flags = {}
         if args.device == "cuda":
             build_flags["ort_cuda_grouped_rmsnorm_workaround"] = True
-        ep = "cuda" if args.device == "cuda" else "cpu"
+        ep = args.ep or ("cuda" if args.device == "cuda" else "cpu")
         print(f"Building model for {args.model!r} (dtype={args.dtype}, ep={ep}) ...")
         with override_flags(**build_flags):
             pkg = build(
