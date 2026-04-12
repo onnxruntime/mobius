@@ -89,6 +89,10 @@ _SKIP_REASONS: dict[str, str] = {
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
     # NemotronH: uses com.microsoft.LinearAttention which requires ORT nightly
     "nemotron_h": "NemotronH uses LinearAttention contrib op not available in stable ORT",
+    # GraniteMoeHybrid: Mamba2+Attention hybrid uses LinearAttention; ORT function
+    # inlining drops initializers inside function ops (pre-existing on main where
+    # the old Mamba2Scan code crashed at runtime with a Squeeze shape error).
+    "granitemoehybrid": "Mamba2 hybrid model — LinearAttention function op inlining drops initializers",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
