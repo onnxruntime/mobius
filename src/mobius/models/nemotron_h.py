@@ -42,8 +42,7 @@ from mobius.components import (
     Linear,
     Mamba2Block,
     RMSNorm,
-    create_attention_bias,
-    initialize_rope,
+    create_padding_mask,
 )
 
 if TYPE_CHECKING:
@@ -82,6 +81,7 @@ class NemotronHMambaLayer(nn.Module):
             # NemotronH uses grouped RMSNorm: normalize within each
             # group of heads_per_group * head_dim dimensions.
             norm_group_size=d_inner // config.mamba_n_groups,
+            time_step_min=config.mamba_time_step_min,
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -227,7 +227,6 @@ class _NemotronHTextModel(nn.Module):
                 self.layers.append(NemotronHAttentionLayer(config))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
 
     def forward(
         self,
@@ -238,13 +237,14 @@ class _NemotronHTextModel(nn.Module):
         past_key_values: list | None = None,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
 
-        attention_bias = create_attention_bias(
+        # NemotronH does NOT use positional embeddings.  The HF reference
+        # (NemotronHAttention.forward) applies no rotary encoding — the
+        # model relies on Mamba layers' inherent position-awareness.
+        attention_bias = create_padding_mask(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            dtype=self._dtype,
         )
 
         present_key_values = []
@@ -254,7 +254,7 @@ class _NemotronHTextModel(nn.Module):
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias,
-                position_embeddings=position_embeddings,
+                position_embeddings=None,
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)

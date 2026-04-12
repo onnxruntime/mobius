@@ -1615,6 +1615,17 @@ class Mamba2Config(BaseModelConfig):
     use_conv_bias: bool = True
     norm_before_gate: bool = True
 
+    def __post_init__(self):
+        # Mamba2 requires d_inner = num_heads * head_dim.
+        if self.intermediate_size != DEFAULT_INT:
+            expected = self.num_heads * self.head_dim
+            if self.intermediate_size != expected:
+                raise ValueError(
+                    f"Mamba2Config: intermediate_size ({self.intermediate_size}) "
+                    f"must equal num_heads * head_dim "
+                    f"({self.num_heads} * {self.head_dim} = {expected})."
+                )
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Mamba2Config:
         del parent_config  # unused
@@ -1824,6 +1835,7 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_expand: int = 2
     mamba_conv_bias: bool = True
     mamba_proj_bias: bool = False
+    mamba_time_step_min: float = 0.001
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
@@ -1875,6 +1887,7 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+            mamba_time_step_min=getattr(config, "time_step_min", 0.001),
         )
 
 

@@ -223,3 +223,4 @@ cache_dir/**
 .worktrees/
 dashboard_preview.html
 docs/feature-flags.md
+.copilot/
