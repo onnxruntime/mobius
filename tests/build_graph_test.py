@@ -1132,7 +1132,13 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
     def test_gemma4_multimodal_graph(self):
-        """Build Gemma4 multimodal model (3-model split: decoder + vision + embedding)."""
+        """Build Gemma4 model via registry (4-model split: decoder+vision+audio+embedding).
+
+        The ``gemma4`` model type maps to Gemma4AnyToAnyModel because all real
+        Gemma4 HuggingFace checkpoints (E2B-it, E4B-it) are any-to-any models
+        with audio support.  When no audio config is supplied the audio encoder
+        uses its default dimensions.
+        """
         from mobius._configs import Gemma4Config
 
         config = Gemma4Config(
@@ -1173,7 +1179,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding", "audio"}
         # Decoder: inputs_embeds -> logits + per-layer KV cache
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
@@ -1184,9 +1190,13 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
-        # Embedding: input_ids + image_features -> inputs_embeds
+        # Embedding: input_ids + image_features + audio_features -> inputs_embeds
         embedding = pkg["embedding"]
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+        # Audio: input_features -> audio_features
+        audio = pkg["audio"]
+        assert "input_features" in {i.name for i in audio.graph.inputs}
+        assert "audio_features" in {o.name for o in audio.graph.outputs}
 
     def test_gemma4_moe_graph(self):
         """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""

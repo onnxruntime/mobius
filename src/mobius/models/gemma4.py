@@ -26,6 +26,7 @@ Key architectural differences from Gemma3:
 from __future__ import annotations
 
 import dataclasses
+from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -1320,6 +1321,15 @@ class Gemma4MultiModalModel(nn.Module):
     default_task: str = "gemma4-multimodal"
     category: str = "Multimodal"
 
+    # Routes renamed weights to the correct sub-model by prefix.
+    # preprocess_weights() produces "decoder.*", "vision_encoder.*", "embedding.*"
+    # keys; this map strips the prefix and routes each to the right model.
+    weight_prefix_map: ClassVar[dict[str, str]] = {
+        "decoder.": "decoder",
+        "vision_encoder.": "vision",
+        "embedding.": "embedding",
+    }
+
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
@@ -1534,6 +1544,17 @@ class Gemma4AnyToAnyModel(nn.Module):
 
     default_task: str = "gemma4-any-to-any"
     category: str = "Multimodal"
+
+    # Routes renamed weights to the correct sub-model by prefix.
+    # preprocess_weights() produces "decoder.*", "vision_encoder.*",
+    # "embedding.*", and "audio_encoder.*" keys; this map strips the prefix
+    # and routes each to the right ONNX model.
+    weight_prefix_map: ClassVar[dict[str, str]] = {
+        "decoder.": "decoder",
+        "vision_encoder.": "vision",
+        "embedding.": "embedding",
+        "audio_encoder.": "audio",
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()

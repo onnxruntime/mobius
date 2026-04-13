@@ -133,9 +133,9 @@ def prepare_vision_feeds(
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
-    # AutoProcessor for Gemma 4 returns pre-patchified pixel_values
-    # [B, N, 3*P^2] and pixel_position_ids [B, N, 2] directly.
-    processed = processor(images=img, return_tensors="np")
+    # Gemma 4 processor requires a text argument alongside images.
+    # Use a placeholder image token so the processor computes correct dims.
+    processed = processor(images=img, text="<image>", return_tensors="np")
     pixel_values = processed["pixel_values"].astype(np.float32)
     pixel_position_ids = processed["pixel_position_ids"].astype(np.int64)
     return {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids}
