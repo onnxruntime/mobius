@@ -138,7 +138,14 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
             replacement = folded[inp.name]
             out_val.replace_all_uses_with(replacement, replace_graph_outputs=True)
-            model.graph.remove(node)
+            # Use safe=True so the node detaches from its inputs before removal.
+            # Without this, `inp.uses()` stays non-zero (pointing to the removed
+            # node), causing RemoveUnusedNodesPass to keep the original `weight`
+            # initializer in the graph even though no live node consumes it.
+            # That orphaned initializer is then serialized into the ONNX file
+            # and triggers an ORT warning:
+            #   "Removing initializer X. It is not used by any node"
+            model.graph.remove(node, safe=True)
             folded_nodes += 1
             modified = True
 

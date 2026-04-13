@@ -72,6 +72,23 @@ class TestFoldTransposedInitializerPass:
         # New initializer registered
         assert "weight_t" in model.graph.initializers
 
+        # Original initializer removed from the graph — but first verify the key
+        # postcondition our safe=True fix provides: the node was detached from
+        # its inputs so uses() drops to 0.  A subsequent RemoveUnusedNodesPass
+        # (run as part of fold_initializers_after_weights) will then prune it.
+        # Without safe=True the removed Transpose still holds a ref, keeping
+        # uses()>0, which prevents RemoveUnusedNodesPass from pruning the
+        # original initializer — that orphaned entry then triggers the ORT
+        # warning: "Removing initializer X. It is not used by any node".
+        orig_weight = model.graph.initializers.get("weight")
+        assert orig_weight is not None, (
+            "Original initializer should still be in graph (RemoveUnused runs later)"
+        )
+        assert len(list(orig_weight.uses())) == 0, (
+            "After fold, original weight must have 0 uses so RemoveUnusedNodesPass "
+            "can prune it — non-zero uses means the removed Transpose still holds a ref"
+        )
+
         # New initializer has correct transposed shape
         t_val = model.graph.initializers["weight_t"]
         assert t_val.shape == ir.Shape([3, 4])
@@ -405,7 +422,36 @@ class TestFoldTransposedInitializerPass:
         assert list(w_t_init.shape) == [3, 2]
 
 
-def test_shared_initializer_not_folded():
+def test_original_weight_pruned_after_full_pipeline():
+    """After fold_initializers_after_weights, original weight is removed from the graph.
+
+    This is the end-to-end regression test for the ORT warning:
+      'Removing initializer X. It is not used by any node'
+
+    Root cause: model.graph.remove(node) without safe=True leaves the Transpose
+    node still referencing the original weight initializer (inp.uses() stays 1).
+    RemoveUnusedNodesPass sees uses()>0 and keeps the weight in graph.initializers.
+    When serialised to ONNX the initializer is present but no node references it
+    → ORT warns.
+
+    Fix: model.graph.remove(node, safe=True) detaches the node from its inputs
+    first, so inp.uses() drops to 0 and RemoveUnusedNodesPass can prune it.
+    """
+    from mobius._optimizations import fold_initializers_after_weights
+
+    data = np.arange(12, dtype=np.float32).reshape(4, 3)
+    model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+    # Run the full pipeline (fold + remove unused) as in apply_weights.
+    fold_initializers_after_weights(model)
+
+    assert "weight_t" in model.graph.initializers, "Folded initializer must be present"
+    assert "weight" not in model.graph.initializers, (
+        "Original weight must be pruned by RemoveUnusedNodesPass after folding. "
+        "If it's still present, the Transpose node wasn't properly detached from "
+        "its inputs (safe=True missing), causing ORT 'unused initializer' warnings."
+    )
+
     """Transpose(initializer) is skipped when the initializer has multiple consumers.
 
     Folding would rename/remove the shared initializer, silently breaking the
