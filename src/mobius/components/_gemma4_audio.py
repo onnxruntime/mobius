@@ -43,8 +43,8 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius.components._common import Linear
-from mobius.components._conv import Conv2dNoBias
+from mobius.components._common import LayerNormNoBias, Linear
+from mobius.components._conv import CausalDepthwiseConv1d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 
 if TYPE_CHECKING:
@@ -54,49 +54,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-class _LayerNormNoBias(nn.Module):
-    """LayerNorm without bias (``elementwise_affine=True, bias=False``)."""
-
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter([channels])
-        self._eps = eps
-        self._channels = channels
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        return op.LayerNormalization(x, self.weight, axis=-1, epsilon=self._eps)
-
-
-class _CausalDepthwiseConv1d(nn.Module):
-    """Causal depthwise Conv1d via explicit left-padding.
-
-    Left-pads by ``kernel_size - 1`` (causal: sees only past frames) then
-    applies a standard depthwise Conv1d with no built-in padding.
-
-    Weight layout: ``[channels, 1, kernel_size]`` (depthwise: groups=channels).
-    """
-
-    def __init__(self, channels: int, kernel_size: int):
-        super().__init__()
-        self.weight = nn.Parameter([channels, 1, kernel_size])
-        self._channels = channels
-        self._kernel_size = kernel_size
-        self._left_pad = kernel_size - 1
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        # x: [B, C, T]
-        # Causal left-pad folded into Conv's pads attribute to avoid a Pad node
-        # whose dynamic pads tensor can block ONNX shape inference.
-        return op.Conv(
-            x,
-            self.weight,
-            kernel_shape=[self._kernel_size],
-            strides=[1],
-            pads=[self._left_pad, 0],  # [begin, end] on T — causal (past only)
-            group=self._channels,
-        )
 
 
 def _gradient_clip(op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
@@ -159,10 +116,10 @@ class Gemma4ConvSubsampling(nn.Module):
             freq = (freq - 3 + 2) // 2 + 1
 
         self.conv0 = Conv2dNoBias(1, c0, kernel_size=3, stride=2, padding=1)
-        self.norm0 = _LayerNormNoBias(c0, eps=norm_eps)
+        self.norm0 = LayerNormNoBias(c0, eps=norm_eps)
 
         self.conv1 = Conv2dNoBias(c0, c1, kernel_size=3, stride=2, padding=1)
-        self.norm1 = _LayerNormNoBias(c1, eps=norm_eps)
+        self.norm1 = LayerNormNoBias(c1, eps=norm_eps)
 
         # Linear: (c1 * freq_after_2_stages) → hidden_size
         self.input_proj_linear = Linear(c1 * freq, hidden_size)
@@ -172,7 +129,7 @@ class Gemma4ConvSubsampling(nn.Module):
         op: builder.OpBuilder,
         x: ir.Value,
         conv: Conv2dNoBias,
-        norm: _LayerNormNoBias,
+        norm: LayerNormNoBias,
     ) -> ir.Value:
         # x: [B, C_in, T, F]
         x = conv(op, x)  # [B, C_out, T', F']
@@ -285,7 +242,7 @@ class Gemma4LightConv1d(nn.Module):
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.linear_start = Linear(hidden_size, hidden_size * 2)
-        self.depthwise_conv1d = _CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
+        self.depthwise_conv1d = CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.linear_end = Linear(hidden_size, hidden_size)
 

@@ -15,5 +15,5 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "Gated repo (google/gemma-4-E2B-it requires authentication). Audio path (Any-to-Any) also requires audio preprocessing pipeline not yet supported in test harness."
-notes: "Gemma 4 E2B Any-to-Any. 4-model split: decoder + vision + audio + embedding. Pre-patchified vision input (pixel_values [B,N,3P^2] + pixel_position_ids). Conformer audio encoder."
+skip_reason: "Gated repo (google/gemma-4-E2B-it requires authentication)."
+notes: "Gemma 4 E2B Vision-Language. 3-model split: decoder + vision + embedding. Pre-patchified vision input (pixel_values [B,N,3P^2] + pixel_position_ids)."

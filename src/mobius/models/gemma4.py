@@ -245,7 +245,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
             hidden_size=vc.hidden_size,
             position_embedding_size=getattr(vc, "_position_embedding_size", 128),
         )
-        self.encoder = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
                 Gemma4VisionEncoderLayer(
                     hidden_size=vc.hidden_size,
@@ -265,7 +265,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
         hidden_states = self.patch_embedder(op, pixel_values, pixel_position_ids)
-        for layer in self.encoder:
+        for layer in self.layers:
             hidden_states = layer(op, hidden_states)
         return self.post_layernorm(op, hidden_states)  # [B, N, vision_hidden]
 
@@ -752,8 +752,12 @@ class Gemma4DecoderLayer(nn.Module):
 
         Iterates over each expert (outer loop), accumulates the routing weight for
         all k slots that select that expert (inner loop), applies the SwiGLU MLP,
-        and accumulates into the output tensor.  O(E * K) unrolled ops — acceptable
-        for small expert counts in the fallback path.
+        and accumulates into the output tensor.
+
+        This produces O(E × K) ONNX nodes (e.g. Gemma4 26B: 256 experts × 2 top-k =
+        512 per layer).  The primary path uses a fused MoE op for supported EPs
+        (CUDA/DML); this fallback is only invoked for CPU/other EPs where the fused
+        op is absent.
 
         Args:
             normed_flat: [T, H] — pre-normed input for the experts (T = B*S).
@@ -1038,6 +1042,11 @@ class Gemma4TextModel(nn.Module):
 class Gemma4CausalLMModel(CausalLMModel):
     """Gemma 4 text-only causal language model.
 
+    Wraps :class:`Gemma4TextModel` (transformer backbone) with an ``lm_head``
+    linear projection to produce next-token logits.  Corresponds to HF
+    ``Gemma4ForCausalLM``, which similarly wraps ``Gemma4Model`` (our
+    :class:`Gemma4TextModel`) and adds the language-model head on top.
+
     Registered as ``gemma4_text`` in the model registry.  Uses hybrid
     local/global attention, standard ``RMSNorm``, and optional per-layer
     input embeddings.
@@ -1207,6 +1216,10 @@ class _Gemma4VisionEncoderModel(nn.Module):
         for key, value in state_dict.items():
             if key.startswith("vision_tower."):
                 new_key = "encoder." + key[len("vision_tower.") :]
+                # HF Gemma4VisionModel wraps its layer list in a Gemma4VisionEncoder
+                # submodule, adding an extra "encoder." level. Our _Gemma4VisionEncoderCore
+                # exposes its layers as "layers" directly, so strip the extra prefix.
+                new_key = new_key.replace("encoder.encoder.", "encoder.", 1)
                 # Flatten Gemma4ClippableLinear's .linear. wrapper
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
@@ -1215,7 +1228,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
                 suffix = key[len("embed_vision.embedding_projection.") :]
                 renamed["projector." + suffix] = value
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
-                pass  # Scale-free norm: no learnable parameter
+                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
         return renamed
 
 
@@ -1341,6 +1354,10 @@ class Gemma4MultiModalModel(nn.Module):
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
+                # HF adds an extra "encoder." level via Gemma4VisionEncoder; strip it
+                new_key = new_key.replace(
+                    "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
+                )
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
@@ -1350,7 +1367,7 @@ class Gemma4MultiModalModel(nn.Module):
                 renamed["vision_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
-                pass  # Scale-free norm: no learnable parameter
+                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
 
             else:
                 renamed[key] = value
@@ -1509,6 +1526,8 @@ class Gemma4AnyToAnyModel(nn.Module):
         - ``vision_tower.*`` -> ``vision_encoder.encoder.*`` (strip .linear. infix)
         - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
         - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free)
+        - ``vision_tower.encoder.*`` -> ``vision_encoder.encoder.*`` (HF's extra
+          ``Gemma4VisionEncoder`` submodule level is stripped)
         - ``audio_tower.*`` -> ``audio_encoder.encoder.*``
         - ``embed_audio.embedding_projection.*`` -> skip (output_proj is inside encoder)
         - ``language_model.model.embed_tokens.weight`` also ->
@@ -1530,6 +1549,10 @@ class Gemma4AnyToAnyModel(nn.Module):
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
+                # HF adds an extra "encoder." level via Gemma4VisionEncoder; strip it
+                new_key = new_key.replace(
+                    "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
+                )
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
@@ -1539,7 +1562,7 @@ class Gemma4AnyToAnyModel(nn.Module):
                 renamed["vision_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
-                pass  # Scale-free norm: no learnable parameter
+                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
 
             elif key.startswith("audio_tower."):
                 # Map audio_tower.* -> audio_encoder.encoder.*

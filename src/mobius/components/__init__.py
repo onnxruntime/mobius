@@ -9,6 +9,7 @@ __all__ = [
     "BertEmbeddings",
     "CausalConv1d",
     "CausalConvNd",
+    "CausalDepthwiseConv1d",
     "CausalTransConv1d",
     "CodecDecoderTransformerModel",
     "CodecEncoderTransformerModel",
@@ -146,6 +147,7 @@ from mobius.components._common import (
 )
 from mobius.components._conv import (
     BatchNorm2d,
+    CausalDepthwiseConv1d,
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
