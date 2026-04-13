@@ -1294,8 +1294,8 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "speech", "embedding"}, (
-            f"AnyToAny Gemma4 should produce 4 models (with 'speech'), got: {set(pkg.keys())}"
+        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}, (
+            f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
         )
         # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
         decoder = pkg["decoder"]
@@ -1310,10 +1310,10 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
-        # Speech (was "audio" before unification)
-        speech = pkg["speech"]
-        assert "input_features" in {i.name for i in speech.graph.inputs}
-        assert "audio_features" in {o.name for o in speech.graph.outputs}
+        # Audio encoder
+        audio = pkg["audio"]
+        assert "input_features" in {i.name for i in audio.graph.inputs}
+        assert "audio_features" in {o.name for o in audio.graph.outputs}
         # Embedding: all three inputs
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}

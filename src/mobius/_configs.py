@@ -580,8 +580,11 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
         audio_fields["audio_end_token_id"] = getattr(tc, "audio_end_token_id", None)
         audio_fields["classify_num"] = getattr(tc, "classify_num", None)
 
-    # Gemma4 audio config (from composite audio_config sub-config)
-    if model_type == "gemma4":
+    # Gemma4 audio config (from composite audio_config sub-config).
+    # model_type may be "gemma4_text" when build() resolves to the text sub-config;
+    # check parent_config to catch that case.
+    parent_model_type = getattr(parent_config, "model_type", "") if parent_config else ""
+    if model_type in ("gemma4", "gemma4_text") or parent_model_type == "gemma4":
         composite = parent_config or config
         hf_audio_config = getattr(composite, "audio_config", None)
         if hf_audio_config is not None:

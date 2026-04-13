@@ -91,9 +91,9 @@ MAX_NEW_TOKENS = 128
 # Gemma 4 special token IDs
 # These match the token ids in the Gemma 4 tokenizer vocabulary.
 # IMAGE_TOKEN_ID: placeholder inserted once per image in input_ids
-IMAGE_TOKEN_ID = 255999  # <image_soft_token> (same as Gemma 3)
+IMAGE_TOKEN_ID = 258880  # <|image|> — Gemma 4 image soft token (config.image_token_id)
 # AUDIO_TOKEN_ID: placeholder inserted once per audio chunk in input_ids
-AUDIO_TOKEN_ID = 258881  # <audio_soft_token> — confirmed from google/gemma-4-E2B-it HF config
+AUDIO_TOKEN_ID = 258881  # <|audio|> — confirmed from google/gemma-4-E2B-it HF config
 EOS_TOKEN_IDS = {1, 106}  # <eos> (1) and <turn|> (106, end-of-turn marker)
 
 # Gemma 4 SigLIP vision encoder: 280 soft tokens per image after projection.
@@ -137,7 +137,8 @@ def prepare_vision_feeds(
     # Use a placeholder image token so the processor computes correct dims.
     processed = processor(images=img, text="<image>", return_tensors="np")
     pixel_values = processed["pixel_values"].astype(np.float32)
-    pixel_position_ids = processed["pixel_position_ids"].astype(np.int64)
+    # The HF processor returns "image_position_ids"; our ONNX vision model input is "pixel_position_ids"
+    pixel_position_ids = processed["image_position_ids"].astype(np.int64)
     return {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids}
 
 
@@ -222,6 +223,7 @@ def prepare_decoder_feeds(
     inputs_embeds: np.ndarray,
     past_seq_len: int,
     past_kv: dict[str, np.ndarray],
+    input_ids: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **decoder** session.
 
@@ -234,6 +236,8 @@ def prepare_decoder_feeds(
         past_seq_len: Number of tokens already stored in the KV cache.
         past_kv: Mapping of ``"past_key_values.{i}.key/value"`` arrays
             from the previous decoder step.
+        input_ids: ``int64[1, cur_seq_len]`` — original token ids (needed for
+            per-layer token embeddings when ``hidden_size_per_layer_input > 0``).
 
     Returns:
         Complete feeds dict for the decoder ONNX model.
@@ -246,6 +250,7 @@ def prepare_decoder_feeds(
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
         "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
+        "input_ids": input_ids,
         **past_kv,
     }
 
@@ -455,7 +460,7 @@ def generate(
 
         # ---- Decoder session ----
         decoder_out = decoder_session.run(
-            prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv)
+            prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv, cur_ids)
         )
 
         # Greedy: pick the token with the highest logit at the last position
@@ -768,7 +773,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
     vision_session = OnnxModelSession(pkg["vision"])
-    audio_session = OnnxModelSession(pkg["speech"]) if "speech" in pkg else None
+    audio_session = OnnxModelSession(pkg["audio"]) if "audio" in pkg else None
     embedding_session = OnnxModelSession(pkg["embedding"])
     decoder_session = OnnxModelSession(pkg["decoder"])
 

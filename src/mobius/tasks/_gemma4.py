@@ -177,7 +177,7 @@ class Gemma4Task(ModelTask):
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision"] = self._build_vision(module.vision_encoder, config)
         if config.audio is not None:
-            models["speech"] = self._build_speech(module.audio_encoder, config)
+            models["audio"] = self._build_speech(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
@@ -186,7 +186,14 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds -> logits + per-layer KV cache."""
+        """Build text decoder: inputs_embeds + input_ids -> logits + per-layer KV cache.
+
+        ``input_ids`` is included alongside ``inputs_embeds`` because models with
+        ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B) need the original token
+        IDs to compute per-layer token embeddings that condition each decoder layer.
+        When ``hidden_size_per_layer_input == 0`` the tensor is passed through but has
+        no effect (``_compute_per_layer_inputs`` short-circuits to ``None``).
+        """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -206,8 +213,13 @@ class Gemma4Task(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
 
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
+        graph_inputs = [inputs_embeds, attention_mask, position_ids, input_ids]
 
         kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
         graph_inputs.extend(kv_inputs)
@@ -220,6 +232,7 @@ class Gemma4Task(ModelTask):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            input_ids=input_ids,
             past_key_values=past_key_values,
         )
 
@@ -298,7 +311,7 @@ class Gemma4Task(ModelTask):
             type=ir.TensorType(config.dtype),
         )
 
-        graph, graph_builder = _make_graph([input_features], name="speech")
+        graph, graph_builder = _make_graph([input_features], name="audio")
         op = graph_builder.op
 
         audio_features = audio(op, input_features)
