@@ -87,12 +87,21 @@ class Gemma4VisionSelfAttention(nn.Module):
     - Per-head QK norms (``RMSNorm`` with learned scale).
     - Per-head V norm (scale-free RMSNorm, no learned parameter).
     - Scale = 1.0 matching HF ``Gemma4VisionAttention``.
+    - 2D RoPE: first ``head_dim//2`` dims rotated by x-coord, last by y-coord.
+      Uses ``rope_theta=100.0`` and a position lookup table of size ``max_position``.
 
     Weight names align with HF after stripping the ``.linear.`` infix from
     ``Gemma4ClippableLinear`` module attributes.
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, norm_eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        norm_eps: float = 1e-6,
+        rope_theta: float = 100.0,
+        max_position: int = 128,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -104,11 +113,37 @@ class Gemma4VisionSelfAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
 
+        # Precompute 2D RoPE cos/sin lookup tables: shape [max_position, head_dim//2].
+        # inv_freq[i] = 1 / (rope_theta ^ (2*i / head_dim))  for i in 0..head_dim//2-1
+        # For vision, rope_theta=100.0 (much smaller than text's 10000).
+        inv_freq = (
+            1.0
+            / (
+                rope_theta
+                ** (np.arange(0, self.head_dim, 2, dtype=np.float32) / self.head_dim)
+            )
+        ).astype(np.float32)  # [head_dim//2]
+        positions = np.arange(max_position, dtype=np.float32)  # [max_position]
+        angles = np.outer(positions, inv_freq).astype(
+            np.float32
+        )  # [max_position, head_dim//2]
+        self.cos_cache = nn.Parameter(
+            list(angles.shape),
+            name="cos_cache",
+            data=ir.tensor(np.cos(angles)),
+        )
+        self.sin_cache = nn.Parameter(
+            list(angles.shape),
+            name="sin_cache",
+            data=ir.tensor(np.sin(angles)),
+        )
+
     def forward(
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
+        pixel_position_ids: ir.Value | None = None,
     ) -> ir.Value:
         # [B, N, hidden] -> project and reshape for per-head norms
         q = self.q_proj(op, hidden_states)
@@ -122,6 +157,64 @@ class Gemma4VisionSelfAttention(nn.Module):
         q = self.q_norm(op, q)
         k = self.k_norm(op, k)
         v = self.v_norm(op, v)
+
+        # Apply 2D RoPE: first head_dim//2 dims use x-coordinate RoPE,
+        # last head_dim//2 dims use y-coordinate RoPE.
+        # Matches HF apply_multidimensional_rope with ndim=2, rope_theta=100.0.
+        if pixel_position_ids is not None:
+            half = self.head_dim // 2
+            quarter = self.head_dim // 4
+
+            # Extract and clamp x/y coords (clamping turns -1 padding into 0)
+            x_coords = op.Clip(
+                op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=2),
+                op.Constant(value_int=0),
+            )  # [B, N]
+            y_coords = op.Clip(
+                op.Gather(pixel_position_ids, op.Constant(value_int=1), axis=2),
+                op.Constant(value_int=0),
+            )  # [B, N]
+
+            # Gather cos/sin from lookup table
+            cos_x = op.Gather(self.cos_cache, x_coords, axis=0)  # [B, N, half]
+            sin_x = op.Gather(self.sin_cache, x_coords, axis=0)  # [B, N, half]
+            cos_y = op.Gather(self.cos_cache, y_coords, axis=0)  # [B, N, half]
+            sin_y = op.Gather(self.sin_cache, y_coords, axis=0)  # [B, N, half]
+
+            # Unsqueeze for num_heads broadcast: [B, N, half] -> [B, N, 1, half]
+            cos_x = op.Unsqueeze(cos_x, [2])
+            sin_x = op.Unsqueeze(sin_x, [2])
+            cos_y = op.Unsqueeze(cos_y, [2])
+            sin_y = op.Unsqueeze(sin_y, [2])
+
+            def apply_rope_half(x_half, cos, sin):
+                """Apply RoPE to a head slice of size `half`: x_half [B, N, nh, half]."""
+                # rotate_half: swap lower and upper quarters with negation on upper
+                # rotate_half([a, b]) = [-b, a] where a, b each have `quarter` dims
+                lower = op.Slice(x_half, [0], [quarter], [3])  # [B, N, nh, quarter]
+                upper = op.Slice(x_half, [quarter], [half], [3])  # [B, N, nh, quarter]
+                neg_upper = op.Neg(upper)
+                rotated = op.Concat(neg_upper, lower, axis=3)  # [B, N, nh, half]
+                # x_rot = x * cos - rotate_half(x) * sin
+                return op.Sub(op.Mul(x_half, cos), op.Mul(rotated, sin))
+
+            # Split q and k into first/second halves of head_dim
+            q_first = op.Slice(q, [0], [half], [3])  # [B, N, nh, half]
+            q_second = op.Slice(q, [half], [self.head_dim], [3])
+            k_first = op.Slice(k, [0], [half], [3])
+            k_second = op.Slice(k, [half], [self.head_dim], [3])
+
+            q = op.Concat(
+                apply_rope_half(q_first, cos_x, sin_x),
+                apply_rope_half(q_second, cos_y, sin_y),
+                axis=3,
+            )
+            k = op.Concat(
+                apply_rope_half(k_first, cos_x, sin_x),
+                apply_rope_half(k_second, cos_y, sin_y),
+                axis=3,
+            )
+
         # Flatten back to [B, N, num_heads * head_dim]
         q = op.Reshape(q, [0, 0, -1])
         k = op.Reshape(k, [0, 0, -1])
@@ -153,20 +246,30 @@ class Gemma4VisionEncoderLayer(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, intermediate_size: int, num_heads: int, norm_eps: float
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        norm_eps: float,
+        hidden_act: str = "gelu_pytorch_tanh",
+        rope_theta: float = 100.0,
+        max_position: int = 128,
     ):
         super().__init__()
-        self.self_attn = Gemma4VisionSelfAttention(hidden_size, num_heads, norm_eps)
+        self.self_attn = Gemma4VisionSelfAttention(
+            hidden_size, num_heads, norm_eps, rope_theta=rope_theta, max_position=max_position
+        )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
-        # Gated MLP with SiLU activation (gate_proj * up_proj -> down_proj)
+        # Gated MLP: gate_proj * activation(up_proj) -> down_proj
+        # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                hidden_act="silu",
+                hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
             )
         )
@@ -176,10 +279,11 @@ class Gemma4VisionEncoderLayer(nn.Module):
         op: builder.OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
+        pixel_position_ids: ir.Value | None = None,
     ) -> ir.Value:
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
-        hidden_states = self.self_attn(op, hidden_states, attention_bias)
+        hidden_states = self.self_attn(op, hidden_states, attention_bias, pixel_position_ids)
         hidden_states = self.post_attention_layernorm(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
 
@@ -189,6 +293,63 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_states = self.post_feedforward_layernorm(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
         return hidden_states
+
+
+class Gemma4VisionPooler(nn.Module):
+    """3×3 spatial average pooling for Gemma4 vision features.
+
+    Reduces the patch sequence from ``[B, N, hidden]`` to ``[B, N/9, hidden]``
+    by reshaping to a 2D grid, applying AveragePool with kernel=stride=3, and
+    flattening back.  Also applies the ``sqrt(hidden)`` scaling that HF performs
+    inside ``Gemma4VisionPooler``.
+
+    Requires N to be a perfect square (H×H) and H to be divisible by ``kernel_size``.
+    This is guaranteed by HF's image preprocessing which pads to a square grid.
+    """
+
+    def __init__(self, hidden_size: int, kernel_size: int = 3):
+        super().__init__()
+        self._kernel_size = kernel_size
+        self._pooler_scale = float(hidden_size**0.5)
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        vision_features: ir.Value,
+    ) -> ir.Value:
+        # vision_features: [B, N, hidden]
+        # Compute spatial grid side: H = sqrt(N) (N is always a perfect square)
+        n_dim = op.Shape(vision_features, start=1, end=2)  # [1]
+        h_dim = op.Cast(
+            op.Sqrt(op.Cast(n_dim, to=ir.DataType.FLOAT)), to=ir.DataType.INT64
+        )  # [1]
+        b_dim = op.Shape(vision_features, start=0, end=1)  # [1]
+        d_dim = op.Shape(vision_features, start=2, end=3)  # [1]
+
+        # Reshape [B, N, D] -> [B, H, H, D]
+        grid_shape = op.Concat(b_dim, h_dim, h_dim, d_dim, axis=0)
+        vision_features = op.Reshape(vision_features, grid_shape)
+
+        # Transpose [B, H, H, D] -> [B, D, H, H] for 2D AveragePool (NCHW format)
+        vision_features = op.Transpose(vision_features, perm=[0, 3, 1, 2])
+
+        # Apply 2D average pool: kernel=stride=kernel_size -> [B, D, H/k, H/k]
+        k = self._kernel_size
+        vision_features = op.AveragePool(
+            vision_features,
+            kernel_shape=[k, k],
+            strides=[k, k],
+        )
+
+        # Transpose back [B, D, H/k, H/k] -> [B, H/k, H/k, D]
+        vision_features = op.Transpose(vision_features, perm=[0, 2, 3, 1])
+
+        # Reshape [B, H/k, H/k, D] -> [B, N/k^2, D]
+        flat_shape = op.Concat(b_dim, op.Constant(value_ints=[-1]), d_dim, axis=0)
+        vision_features = op.Reshape(vision_features, flat_shape)
+
+        # Scale by sqrt(hidden_size) matching HF VisionPooler
+        return op.Mul(vision_features, op.Constant(value_float=self._pooler_scale))
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
@@ -280,6 +441,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     intermediate_size=vc.intermediate_size,
                     num_heads=vc.num_attention_heads,
                     norm_eps=vc.norm_eps,
+                    hidden_act=vc.hidden_act or "gelu_pytorch_tanh",
+                    rope_theta=vc.rope_theta or 100.0,
+                    max_position=vc.position_embedding_size or 128,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -306,7 +470,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
         attn_bias = op.Unsqueeze(attn_bias, [1, 2])  # [B, 1, 1, N]
 
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states, attn_bias)
+            hidden_states = layer(op, hidden_states, attn_bias, pixel_position_ids)
 
         # Zero padding patches after all encoder blocks (matching HF pooler masked_fill).
         is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1]
@@ -1249,7 +1413,9 @@ class _Gemma4VisionEncoderModel(nn.Module):
         super().__init__()
         vc = config.vision
         self.encoder = _Gemma4VisionEncoderCore(config)
-        self._pooler_scale = float(vc.hidden_size**0.5)
+        # Gemma4VisionPooler: 3×3 spatial average pooling + sqrt(hidden) scaling.
+        # Reduces N patches to N/9 before projection.
+        self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
         self.projector_norm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
         self.projector = Linear(vc.hidden_size, config.hidden_size, bias=False)
 
@@ -1262,11 +1428,8 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # [B, N, 3*P^2] -> [B, N, vision_hidden]
         vision_features = self.encoder(op, pixel_values, pixel_position_ids)
 
-        # Scale by sqrt(hidden_size) as in HF VisionPooler
-        vision_features = op.Mul(
-            vision_features,
-            op.Constant(value_float=self._pooler_scale),
-        )
+        # Spatial 3×3 average pooling: [B, N, D] -> [B, N/9, D], scales by sqrt(D)
+        vision_features = self.pooler(op, vision_features)
 
         # Scale-free norm + linear projection -> [B, N, text_hidden]
         vision_features = self.projector_norm(op, vision_features)
