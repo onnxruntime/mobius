@@ -10,6 +10,7 @@ import onnx_ir as ir
 import onnxruntime as ort
 
 from mobius._configs import ArchitectureConfig, VisionConfig
+from mobius._constants import OPSET_VERSION
 from mobius.components._pixtral_vision import (
     Mistral3MultiModalProjector,
     Mistral3PatchMerger,
@@ -154,7 +155,7 @@ def test_patch_merger_matches_hf_unfold_ordering():
         outputs=[],
         nodes=[],
         name="test_merge_ordering",
-        opset_imports={"": 24},
+        opset_imports={"": OPSET_VERSION},
     )
     gb = GraphBuilder(graph)
     op = gb.op
