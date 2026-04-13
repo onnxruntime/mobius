@@ -270,6 +270,52 @@ class TestFoldTransposedInitializerPass:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Transpose" in node_types, "Identity Transpose should not be removed"
 
+    def test_skips_initializer_with_none_const_value(self):
+        """Pass skips (with warning) when initializer has const_value=None.
+
+        This guards against the case where the pass is invoked before weights
+        are loaded, or when a weight is absent from the checkpoint.  The
+        Transpose node must remain in the graph (not silently dropped) so that
+        a later _check_weights call can surface the missing weight clearly.
+        """
+        w = ir.Value(name="w", shape=ir.Shape([4, 8]))
+        w.type = ir.TensorType(ir.DataType.FLOAT)
+        # Deliberately leave const_value as None (no weight loaded)
+
+        out = ir.Value(name="w_t", shape=ir.Shape([8, 4]))
+        out.type = ir.TensorType(ir.DataType.FLOAT)
+        t_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[w],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        t_node.outputs[0].shape = ir.Shape([8, 4])
+
+        x = ir.Value(name="x")
+        mm_node = ir.Node("", "MatMul", inputs=[x, t_node.outputs[0]], num_outputs=1)
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[mm_node.outputs[0]],
+            nodes=[t_node, mm_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.initializers["w"] = (
+            w  # Direct assignment: bypasses the const_value guard in register_initializer
+        )
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        # Pass must skip — no LazyTensor created, Transpose still present.
+        assert not result.modified
+        assert "w_t" not in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" in node_types, "Transpose must remain when const_value is None"
+
     def test_transpose_with_zero_inputs_skipped(self):
         """A Transpose node with no inputs does not cause an error and is not folded."""
         # Build a Transpose node with no inputs (malformed but should be skipped gracefully).
