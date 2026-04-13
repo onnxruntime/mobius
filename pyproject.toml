@@ -135,8 +135,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# SSM math notation uses uppercase variable names (A, B, C, D, H, N, etc.)
-"src/mobius/components/_mamba_block_chunked.py" = ["N803", "N806"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

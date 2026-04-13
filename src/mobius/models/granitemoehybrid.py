@@ -319,15 +319,14 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 
         Handles:
         1. Weight tying (embed_tokens ↔ lm_head)
-        2. Mamba2 SSM params: A_log, D, dt_bias nested under mamba.ssm
-        3. MoE gate: block_sparse_moe.router.layer.weight → block_sparse_moe.gate.weight
-        4. MoE fused input: block_sparse_moe.input_linear [n_experts, 2*mid, hidden]
+        2. MoE gate: block_sparse_moe.router.layer.weight → block_sparse_moe.gate.weight
+        3. MoE fused input: block_sparse_moe.input_linear [n_experts, 2*mid, hidden]
            → per-expert block_sparse_moe.experts.{e}.{gate,up}_proj.weight
-        5. MoE fused output: block_sparse_moe.output_linear [n_experts, hidden, mid]
+        4. MoE fused output: block_sparse_moe.output_linear [n_experts, hidden, mid]
            → per-expert block_sparse_moe.experts.{e}.down_proj.weight
-        6. Shared MLP fused gate+up: shared_mlp.input_linear [2*shared_mid, hidden]
+        5. Shared MLP fused gate+up: shared_mlp.input_linear [2*shared_mid, hidden]
            → shared_mlp.gate_proj.weight + shared_mlp.up_proj.weight
-        7. Shared MLP down proj: shared_mlp.output_linear → shared_mlp.down_proj
+        6. Shared MLP down proj: shared_mlp.output_linear → shared_mlp.down_proj
         """
         if self.config.tie_word_embeddings:
             tie_word_embeddings(state_dict)
@@ -345,9 +344,6 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 # Weight name mapping
 # ---------------------------------------------------------------------------
 
-# Mamba2 SSM params stored flat on HF "mamba" that we nest under "mamba.ssm"
-_MAMBA2_SSM_PARAMS = (".mamba.A_log", ".mamba.D", ".mamba.dt_bias")
-
 
 def _rename_granitemoehybrid_weight(
     key: str,
@@ -359,12 +355,6 @@ def _rename_granitemoehybrid_weight(
     Returns the new key, or None if the weight was handled inline
     (fused tensors split into multiple per-expert outputs).
     """
-    # SSM params: nest A_log, D, dt_bias under mamba.ssm
-    # e.g. "model.layers.0.mamba.A_log" → "model.layers.0.mamba.ssm.A_log"
-    for param in _MAMBA2_SSM_PARAMS:
-        if key.endswith(param):
-            return key.replace(".mamba.", ".mamba.ssm.")
-
     # MoE gate: router.layer.weight → gate.weight
     # e.g. "…block_sparse_moe.router.layer.weight" → "…block_sparse_moe.gate.weight"
     key = key.replace(".block_sparse_moe.router.layer.", ".block_sparse_moe.gate.")

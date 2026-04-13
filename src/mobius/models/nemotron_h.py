@@ -311,7 +311,7 @@ class NemotronHCausalLMModel(nn.Module):
         3. ``backbone.embeddings.`` → ``model.embed_tokens.``
         4. ``backbone.norm_f.`` → ``model.norm.``
         5. Per-layer ``mixer.`` rename based on layer type:
-           - mamba: ``mixer.`` → ``mamba.`` (SSM params nested under ``mamba.ssm.``)
+           - mamba: ``mixer.`` → ``mamba.``
            - attention: ``mixer.`` → ``self_attn.``
            - mlp: ``mixer.`` → ``mlp.``
         """
@@ -336,9 +336,6 @@ class NemotronHCausalLMModel(nn.Module):
 # Layer index regex: backbone.layers.<N>.<rest>
 _LAYER_RE = re.compile(r"^backbone\.layers\.(\d+)\.(.+)$")
 
-# Mamba SSM params that need to be nested under mamba.ssm
-_MAMBA_SSM_PARAMS = ("A_log", "D", "dt_bias")
-
 
 def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
     """Rename a single HF weight key to match ONNX module structure.
@@ -356,8 +353,7 @@ def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
         model.embed_tokens.weight
         model.norm.weight
         model.layers.N.norm.weight
-        model.layers.N.mamba.{in_proj, conv1d, out_proj, norm}   (mamba direct)
-        model.layers.N.mamba.ssm.{A_log, D, dt_bias}            (mamba SSM nested)
+        model.layers.N.mamba.{in_proj, conv1d, out_proj, norm, A_log, D, dt_bias}
         model.layers.N.self_attn.{q_proj, k_proj, v_proj, o_proj}.weight
         model.layers.N.mlp.{up_proj, down_proj}.weight
         lm_head.weight
@@ -378,10 +374,6 @@ def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
         if rest.startswith("mixer."):
             mixer_rest = rest[len("mixer.") :]
             if ltype == "mamba2":
-                # Check if this is an SSM param that needs nesting
-                param_name = mixer_rest.split(".")[0]
-                if param_name in _MAMBA_SSM_PARAMS:
-                    return f"model.layers.{layer_idx}.mamba.ssm.{mixer_rest}"
                 return f"model.layers.{layer_idx}.mamba.{mixer_rest}"
             elif ltype == "full_attention":
                 return f"model.layers.{layer_idx}.self_attn.{mixer_rest}"
