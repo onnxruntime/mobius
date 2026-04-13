@@ -5,10 +5,8 @@
 
 Architecture variants:
 - **Gemma4CausalLMModel**: Text-only causal LM (model_type ``gemma4_text``).
-- **Gemma4MultiModalModel**: Multimodal 3-model split — decoder + vision + embedding
-  (model_type ``gemma4``).  For 26B-A4B and 31B variants (Image-Text-to-Text).
-- **Gemma4AnyToAnyModel**: 4-model split — decoder + vision + audio + embedding
-  (model_type ``gemma4_any_to_any``).  For E2B and E4B variants (vision+audio+text).
+- **Gemma4Model**: Multimodal model — supports Image-Text-to-Text (26B-A4B, 31B)
+  and Any-to-Any audio+vision+text (E2B, E4B) via ``Gemma4Task``.
 
 Key architectural differences from Gemma3:
 - Standard ``RMSNorm`` throughout (no ``OffsetRMSNorm``).

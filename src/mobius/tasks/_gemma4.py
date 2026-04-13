@@ -351,11 +351,3 @@ class Gemma4Task(ModelTask):
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
         return _make_model(graph)
-
-
-# ---------------------------------------------------------------------------
-# Kept for backward compatibility — both alias to Gemma4Task
-# ---------------------------------------------------------------------------
-
-Gemma4VisionLanguageTask = Gemma4Task
-Gemma4AnyToAnyTask = Gemma4Task
