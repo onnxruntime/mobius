@@ -284,6 +284,10 @@ class Gemma4TextAttention(nn.Module):
     - V normalized per-head with parameterless RMS (no learnable scale)
     - head_dim and rotary_embedding_dim differ between sliding/full layers
     - KV-shared layers borrow K,V from a source layer (no k/v projections)
+    - Attention logit softcapping via the native ONNX Attention ``softcap``
+      attribute (opset 24): ``tanh(qk / cap) * cap`` is applied after the
+      QK dot-product and before softmax. The value is taken from
+      ``config.attn_logit_softcapping`` (50.0 for Gemma4; 0.0 = disabled).
 
     Args:
         config: Gemma4Config.
@@ -308,6 +312,9 @@ class Gemma4TextAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = head_dim
         self.scaling = 1.0
+        # attn_logit_softcapping maps directly to the ONNX Attention op's
+        # native ``softcap`` attribute (opset 24). No manual Tanh/scale ops needed.
+        self.softcap = config.attn_logit_softcapping
         self._v_norm_eps = config.rms_norm_eps
         self.rotary_embedding_dim = rotary_embedding_dim
         self._rope_interleave = config.rope_interleave
@@ -411,6 +418,7 @@ class Gemma4TextAttention(nn.Module):
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
+                softcap=self.softcap,
             )
         else:
             # K projection + per-head K norm + optional RoPE
@@ -456,6 +464,7 @@ class Gemma4TextAttention(nn.Module):
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
+                softcap=self.softcap,
             )
 
             # Source layers store K,V for downstream KV-shared layers

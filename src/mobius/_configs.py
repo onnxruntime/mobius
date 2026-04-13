@@ -1491,6 +1491,10 @@ class Gemma4Config(VisionLanguageConfig):
       relative to the standard multiplier.
     - ``final_logit_softcapping``: tanh soft-cap applied to final logits
       (30.0 for Gemma4); 0.0 disables it.
+    - ``attn_logit_softcapping``: tanh soft-cap applied to attention QK
+      logits before softmax (50.0 for Gemma4); 0.0 disables it.
+      Maps directly to the ``softcap`` attribute of the ONNX Attention op
+      (opset 24), so no manual Tanh/scale ops are needed.
     - ``enable_moe_block``: whether any layers use MoE routing.
       MoE hyper-parameters (``num_local_experts``, ``num_experts_per_tok``,
       ``moe_intermediate_size``) are inherited from :class:`ArchitectureConfig`.
@@ -1504,6 +1508,7 @@ class Gemma4Config(VisionLanguageConfig):
     num_kv_shared_layers: int = 0
     use_double_wide_mlp: bool = False
     final_logit_softcapping: float = 0.0
+    attn_logit_softcapping: float = 0.0
     enable_moe_block: bool = False
 
     @classmethod
@@ -1567,6 +1572,7 @@ class Gemma4Config(VisionLanguageConfig):
             num_kv_shared_layers=getattr(config, "num_kv_shared_layers", 0) or 0,
             use_double_wide_mlp=getattr(config, "use_double_wide_mlp", False),
             final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
+            attn_logit_softcapping=(getattr(config, "attn_logit_softcapping", 0.0) or 0.0),
             enable_moe_block=getattr(config, "enable_moe_block", False),
         )
 
