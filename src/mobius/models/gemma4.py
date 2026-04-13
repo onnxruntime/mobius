@@ -216,8 +216,9 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         clamped = op.Clip(pixel_position_ids, op.Constant(value_int=0))
 
         # Extract x and y coordinates: each [B, N]
-        x_coords = op.Squeeze(op.Gather(clamped, op.Constant(value_int=0), axis=2), [-1])
-        y_coords = op.Squeeze(op.Gather(clamped, op.Constant(value_int=1), axis=2), [-1])
+        # op.Gather with a scalar index drops the axis, giving [B, N] directly.
+        x_coords = op.Gather(clamped, op.Constant(value_int=0), axis=2)  # [B, N]
+        y_coords = op.Gather(clamped, op.Constant(value_int=1), axis=2)  # [B, N]
 
         # Look up position embeddings from table
         x_table = op.Gather(self.position_embedding_table, op.Constant(value_int=0), axis=0)
@@ -1133,7 +1134,15 @@ class Gemma4CausalLMModel(CausalLMModel):
 
 
 class _Gemma4DecoderModel(nn.Module):
-    """Gemma4 text decoder sub-model accepting ``inputs_embeds``."""
+    """Gemma4 text decoder sub-model accepting ``inputs_embeds``.
+
+    When ``hidden_size_per_layer_input > 0`` (e.g. E2B), the text model also
+    needs the original ``input_ids`` to compute per-layer token embeddings that
+    condition each decoder layer.  HF's ``Gemma4ForConditionalGeneration``
+    passes *both* ``inputs_embeds`` and ``input_ids`` to the language model for
+    this reason.  We mirror that by accepting ``input_ids`` as an optional
+    ONNX graph input and forwarding it to :class:`Gemma4TextModel`.
+    """
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
@@ -1147,17 +1156,22 @@ class _Gemma4DecoderModel(nn.Module):
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
+        input_ids: ir.Value | None = None,
         past_key_values: list | None = None,
     ) -> tuple[ir.Value, list]:
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=None,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
         logits = self.lm_head(op, hidden_states)
+        # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
+        if self.config.final_logit_softcapping:
+            cap = float(self.config.final_logit_softcapping)
+            logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
         return logits, present_key_values
 
     def preprocess_weights(
@@ -1389,6 +1403,9 @@ class _Gemma4AudioEncoderModel(nn.Module):
             output_proj_dims=output_proj_dims,
             rms_norm_eps=rms_norm_eps,
         )
+        # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
+        # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
+        self.pre_projection_norm = _Gemma4ScaleFreeRMSNorm(output_proj_dims, eps=rms_norm_eps)
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
         self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
@@ -1400,6 +1417,8 @@ class _Gemma4AudioEncoderModel(nn.Module):
     ) -> ir.Value:
         # [B, T, input_size] → encoder → [B, T//4, output_proj_dims]
         audio_features = self.encoder(op, input_features)
+        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
+        audio_features = self.pre_projection_norm(op, audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features)
 
@@ -1471,8 +1490,9 @@ class Gemma4Model(nn.Module):
           (strips ``.linear.`` infix; renames ``subsample_conv_projection.layerN.{conv,norm}``
           to ``{conv,norm}N``)
         - ``embed_audio.embedding_projection.*`` → ``audio_encoder.projector.*``
-        - ``embed_audio.embedding_pre_projection_norm.*`` → skip (scale-free RMSNorm,
-          no learnable scale parameter — identical to ``embed_vision.embedding_pre_projection_norm``)
+        - ``embed_audio.embedding_pre_projection_norm.*`` → skip (``Gemma4RMSNorm`` with
+          ``with_scale=False``; normalises activations but has no learnable ``weight``
+          parameter and produces no checkpoint key — verified against google/gemma-4-E2B-it)
 
         Note: the decoder sub-model takes ``inputs_embeds`` rather than
         ``input_ids``, so ``embed_tokens`` is not a decoder initializer — the
@@ -1554,9 +1574,10 @@ class Gemma4Model(nn.Module):
                 renamed["audio_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_audio."):
-                # embed_audio.embedding_pre_projection_norm.* — scale-free RMSNorm with
-                # no learnable scale; identical treatment to embed_vision's equivalent.
-                # No weight exists in the checkpoint and no ONNX initializer is needed.
+                # embed_audio.embedding_pre_projection_norm.* — Gemma4RMSNorm(with_scale=False):
+                # normalises activations but carries no learnable weight.  No checkpoint key
+                # is saved, so nothing to map here.  The norm IS applied in the ONNX forward
+                # pass via _Gemma4AudioEncoderModel.pre_projection_norm.
                 pass
 
             else:
