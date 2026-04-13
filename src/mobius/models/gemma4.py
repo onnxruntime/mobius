@@ -24,6 +24,7 @@ Key architectural differences from Gemma3:
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 import onnx_ir as ir
@@ -103,7 +104,12 @@ class Gemma4VisionSelfAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None = None,
+    ) -> ir.Value:
         # [B, N, hidden] -> project and reshape for per-head norms
         q = self.q_proj(op, hidden_states)
         k = self.k_proj(op, hidden_states)
@@ -121,11 +127,13 @@ class Gemma4VisionSelfAttention(nn.Module):
         k = op.Reshape(k, [0, 0, -1])
         v = op.Reshape(v, [0, 0, -1])
 
-        # Bidirectional attention (no is_causal, no KV cache)
+        # Bidirectional attention (no is_causal, no KV cache).
+        # attention_bias [B, 1, 1, N] masks out padding patches (value = -1e9).
         attn_output = op.Attention(
             q,
             k,
             v,
+            attention_bias,
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,
             scale=1.0,
@@ -163,10 +171,15 @@ class Gemma4VisionEncoderLayer(nn.Module):
             )
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None = None,
+    ) -> ir.Value:
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
-        hidden_states = self.self_attn(op, hidden_states)
+        hidden_states = self.self_attn(op, hidden_states, attention_bias)
         hidden_states = self.post_attention_layernorm(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
 
@@ -204,7 +217,13 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         op: builder.OpBuilder,
         pixel_values: ir.Value,
         pixel_position_ids: ir.Value,
-    ) -> ir.Value:
+    ) -> tuple[ir.Value, ir.Value]:
+        """Return ``(hidden_states [B, N, hidden], is_padding [B, N bool])``.
+
+        Padding patches are indicated by ``pixel_position_ids == -1``.  Their
+        position embeddings are zeroed exactly as HF does in
+        ``Gemma4VisionPatchEmbedder._position_embeddings``.
+        """
         # pixel_values in [0,1] -> normalize to [-1, 1]: 2*(v - 0.5) = 2v - 1
         pixel_values = op.Sub(
             op.Mul(pixel_values, op.Constant(value_float=2.0)),
@@ -212,11 +231,15 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         )
         hidden_states = self.input_proj(op, pixel_values)  # [B, N, hidden]
 
-        # pixel_position_ids: [B, N, 2] — clamp -1 (padding) to 0
+        # Detect padding patches: x-coord == -1 means the patch is padding.
+        # pixel_position_ids [B, N, 2]; gather x-coord [B, N].
+        x_raw = op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=2)  # [B, N]
+        is_padding = op.Equal(x_raw, op.Constant(value_int=-1))  # [B, N] bool
+
+        # Clamp to ≥0 before embedding lookup (padding → 0 temporarily)
         clamped = op.Clip(pixel_position_ids, op.Constant(value_int=0))
 
         # Extract x and y coordinates: each [B, N]
-        # op.Gather with a scalar index drops the axis, giving [B, N] directly.
         x_coords = op.Gather(clamped, op.Constant(value_int=0), axis=2)  # [B, N]
         y_coords = op.Gather(clamped, op.Constant(value_int=1), axis=2)  # [B, N]
 
@@ -226,7 +249,13 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         x_emb = op.Gather(x_table, x_coords, axis=0)  # [B, N, hidden]
         y_emb = op.Gather(y_table, y_coords, axis=0)  # [B, N, hidden]
 
-        return op.Add(hidden_states, op.Add(x_emb, y_emb))
+        # Zero position embeddings for padding patches (HF: torch.where(padding.unsqueeze(-1), 0.0, pos_emb))
+        pos_emb = op.Add(x_emb, y_emb)  # [B, N, hidden]
+        is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1] — broadcast over hidden
+        zero = op.CastLike(op.Constant(value_float=0.0), pos_emb)
+        pos_emb = op.Where(is_pad_expanded, zero, pos_emb)
+
+        return op.Add(hidden_states, pos_emb), is_padding  # ([B, N, hidden], [B, N])
 
 
 class _Gemma4VisionEncoderCore(nn.Module):
@@ -255,7 +284,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
                 for _ in range(vc.num_hidden_layers)
             ]
         )
-        self.post_layernorm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
+        # No post-encoder norm: HF Gemma4VisionEncoder has none.
+        # The scale-free RMSNorm (embedding_pre_projection_norm) lives in
+        # _Gemma4VisionEncoderModel.projector_norm, applied before the projector.
 
     def forward(
         self,
@@ -263,10 +294,26 @@ class _Gemma4VisionEncoderCore(nn.Module):
         pixel_values: ir.Value,
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
-        hidden_states = self.patch_embedder(op, pixel_values, pixel_position_ids)
+        # Returns hidden_states [B, N, hidden] and is_padding [B, N bool]
+        hidden_states, is_padding = self.patch_embedder(op, pixel_values, pixel_position_ids)
+
+        # Build additive attention bias [B, 1, 1, N] masking out padding columns.
+        # Valid positions get 0 (no effect), padding columns get -1e9 (suppressed).
+        # This matches HF Gemma4VisionEncoder passing attention_mask=~padding_positions.
+        neg_inf = op.CastLike(op.Constant(value_float=-1e9), hidden_states)
+        zero_bias = op.CastLike(op.Constant(value_float=0.0), hidden_states)
+        attn_bias = op.Where(is_padding, neg_inf, zero_bias)  # [B, N]
+        attn_bias = op.Unsqueeze(attn_bias, [1, 2])  # [B, 1, 1, N]
+
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states)
-        return self.post_layernorm(op, hidden_states)  # [B, N, vision_hidden]
+            hidden_states = layer(op, hidden_states, attn_bias)
+
+        # Zero padding patches after all encoder blocks (matching HF pooler masked_fill).
+        is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1]
+        zero = op.CastLike(op.Constant(value_float=0.0), hidden_states)
+        hidden_states = op.Where(is_pad_expanded, zero, hidden_states)
+
+        return hidden_states  # [B, N, vision_hidden]
 
 
 # ---------------------------------------------------------------------------
@@ -778,8 +825,10 @@ class Gemma4DecoderLayer(nn.Module):
         top_weights_raw, top_indices = op.TopK(
             router_probs, op.Constant(value_ints=[self._top_k]), axis=-1
         )
-        # Normalise selected weights (re-softmax over top-k so they sum to 1)
-        top_weights = op.Softmax(top_weights_raw, axis=-1)  # [T, K]
+        # Arithmetic normalisation: weights sum to 1 (matches HF: top_k_weights /= top_k_weights.sum(-1, keepdim=True))
+        top_weights = op.Div(
+            top_weights_raw, op.ReduceSum(top_weights_raw, [1], keepdims=1)
+        )  # [T, K]
 
         # Scale routing weights by per_expert_scale for each selected expert
         # Gather from [E] using [T, K] indices → result [T, K]
@@ -864,7 +913,7 @@ class Gemma4TextModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
 
-        embed_scale = float(np.float16(config.hidden_size**0.5))
+        embed_scale = math.sqrt(config.hidden_size)
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1279,7 +1328,7 @@ class Gemma4EmbeddingModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
-        embed_scale = float(np.float16(config.hidden_size**0.5))
+        embed_scale = math.sqrt(config.hidden_size)
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
