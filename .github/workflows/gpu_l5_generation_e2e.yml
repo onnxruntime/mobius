@@ -10,7 +10,7 @@ on:
       - 'scripts/**'
   schedule:
     # Run weekly on Monday at 5am UTC (after L4 golden tests)
-    - cron: '0 5 * * 1'
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
       - self-hosted
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
       - "JobId=gpu-l5-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
