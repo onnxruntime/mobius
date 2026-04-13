@@ -187,8 +187,8 @@ class Qwen3TTSCodecDecoderModel(nn.Module):
         # 6. Clamp to [-1, 1]
         hidden = op.Clip(
             hidden,
-            op.Constant(value_float=-1.0),
-            op.Constant(value_float=1.0),
+            -1.0,
+            1.0,
         )
 
         return hidden
@@ -598,7 +598,7 @@ class _EncoderVQ(nn.Module):
             op.Unsqueeze(embedding, [0]), [-1], keepdims=0
         )  # (1, codebook_size)
         dot = op.MatMul(x_t, op.Transpose(embedding, perm=[1, 0]))
-        distances = op.Add(op.Sub(x_sq, op.Mul(dot, op.Constant(value_float=2.0))), e_sq)
+        distances = op.Add(op.Sub(x_sq, op.Mul(dot, 2.0)), e_sq)
 
         # ArgMin across codebook dimension
         codes = op.ArgMin(distances, axis=-1, keepdims=0)  # (B, T)

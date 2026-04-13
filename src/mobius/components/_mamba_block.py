@@ -216,7 +216,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
         else:
             # Zero bias — the function requires a bias input.
             conv_bias = op.Expand(
-                op.CastLike(op.Constant(value_float=0.0), self.weight),
+                op.CastLike(0.0, self.weight),
                 op.Constant(value_ints=[self._channels]),
             )
         return op.CausalConvWithState(
@@ -393,7 +393,7 @@ class Mamba2Block(nn.Module):
         # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
         dt = op.Softplus(op.Add(dt_raw_f32, dt_bias_f32))
         if self.time_step_min > 0.0:
-            dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
+            dt = op.Clip(dt, self.time_step_min)
 
         # decay = A * dt in log-space: g_t where exp(g_t) is the decay
         # A = -exp(A_log), so decay = -exp(A_log) * dt

@@ -182,7 +182,7 @@ class InputMixer(nn.Module):
             axis=0,
         )
         zero_pad = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), vision_embeddings),
+            op.CastLike(0.0, vision_embeddings),
             pad_shape,
         )
         # [batch, vision_seq + 1, hidden]

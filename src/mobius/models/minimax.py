@@ -223,11 +223,11 @@ def _scaled_add(
     if math.isclose(alpha, 1.0) and math.isclose(beta, 1.0):
         return op.Add(residual, sub_layer_out)
     scaled_res = op.Mul(
-        op.CastLike(op.Constant(value_float=alpha), residual),
+        op.CastLike(alpha, residual),
         residual,
     )
     scaled_out = op.Mul(
-        op.CastLike(op.Constant(value_float=beta), sub_layer_out),
+        op.CastLike(beta, sub_layer_out),
         sub_layer_out,
     )
     return op.Add(scaled_res, scaled_out)

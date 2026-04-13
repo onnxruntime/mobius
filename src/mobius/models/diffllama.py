@@ -175,7 +175,7 @@ class DiffLlamaAttention(nn.Module):
 
         # Scaled dot-product: Q_4d @ K_4d^T / sqrt(D) → [B, H, S, Sk]
         k_t = op.Transpose(k_4d, perm=[0, 1, 3, 2])  # [B, H, D, Sk]
-        scale = op.Constant(value_float=float(self._scaling))
+        scale = float(self._scaling)
         attn_scores = op.Mul(op.MatMul(q_4d, k_t), scale)
 
         # Causal mask: build [Sk, Sk] lower-triangle via Trilu, then slice
@@ -188,16 +188,16 @@ class DiffLlamaAttention(nn.Module):
         past_len = op.Sub(kv_len, q_len)  # [1]
         causal_slice = op.Slice(lower_tri, past_len, kv_len, [0])  # [S, Sk]
         causal_bool = op.Cast(causal_slice, to=9)  # BOOL (dtype 9)
-        zero_f = op.Constant(value_float=0.0)
-        neg_inf_f = op.Constant(value_float=float("-inf"))
+        zero_f = 0.0
+        neg_inf_f = float("-inf")
         causal_bias = op.Where(causal_bool, zero_f, neg_inf_f)  # [S, Sk]
         # Unsqueeze to [1, 1, S, Sk] and add to scores [B, H, S, Sk]
         attn_scores = op.Add(attn_scores, op.Unsqueeze(causal_bias, [0, 1]))
 
         # Padding mask (3D bool [B, S, Sk]) → additive bias [B, 1, S, Sk]
         if attention_bias is not None:
-            zero_f2 = op.Constant(value_float=0.0)
-            neg_inf_f2 = op.Constant(value_float=float("-inf"))
+            zero_f2 = 0.0
+            neg_inf_f2 = float("-inf")
             pad_bias = op.Where(attention_bias, zero_f2, neg_inf_f2)
             attn_scores = op.Add(attn_scores, op.Unsqueeze(pad_bias, [1]))
 
@@ -213,7 +213,7 @@ class DiffLlamaAttention(nn.Module):
         #   lambda_full = exp(lq1·lk1) - exp(lq2·lk2) + lambda_init
         lam1 = op.Exp(op.ReduceSum(op.Mul(self.lambda_q1, self.lambda_k1), keepdims=False))
         lam2 = op.Exp(op.ReduceSum(op.Mul(self.lambda_q2, self.lambda_k2), keepdims=False))
-        lam_init = op.Constant(value_float=float(self._lambda_init))
+        lam_init = float(self._lambda_init)
         lam_full = op.Add(op.Sub(lam1, lam2), lam_init)
 
         # Differential output: out1 - lambda_full * out2  →  [B, H/2, S, 2D]
@@ -222,9 +222,9 @@ class DiffLlamaAttention(nn.Module):
         # GroupNorm = RMSNorm without learnable affine params (on last dim = 2D)
         #   rms_norm(x) = x / sqrt(mean(x²) + eps)
         x_sq = op.Mul(diff, diff)
-        eps = op.Constant(value_float=float(self._rms_norm_eps))
+        eps = float(self._rms_norm_eps)
         rms = op.Sqrt(op.Add(op.ReduceMean(x_sq, [-1], keepdims=True), eps))
-        scale_norm = op.Constant(value_float=float(1.0 - self._lambda_init))
+        scale_norm = float(1.0 - self._lambda_init)
         normed = op.Mul(op.Div(diff, rms), scale_norm)
 
         # Reshape [B, H/2, S, 2D] → [B, S, H*D]

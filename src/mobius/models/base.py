@@ -126,7 +126,7 @@ class TextModel(nn.Module):
                 to=ir.DataType.INT32,
             )  # [batch] INT32
             total_seq_len = op.Cast(
-                op.Gather(op.Shape(attention_mask), op.Constant(value_int=1)),
+                op.Gather(op.Shape(attention_mask), 1),
                 to=ir.DataType.INT32,
             )  # scalar INT32
 

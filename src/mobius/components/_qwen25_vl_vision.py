@@ -337,8 +337,8 @@ class Qwen25VLVisionAttention(nn.Module):
         same_segment = op.Equal(seg_row, seg_col)
 
         # Convert to attention bias: 0 where same segment, -inf where different
-        neg_inf = op.Constant(value_float=-1e9)
-        zero = op.Constant(value_float=0.0)
+        neg_inf = -1e9
+        zero = 0.0
         return op.Where(same_segment, zero, neg_inf)
 
 

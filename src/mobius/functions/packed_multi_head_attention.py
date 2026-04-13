@@ -123,8 +123,8 @@ def packed_multi_head_attention() -> ir.Function:
     # Convert to attention bias: 0 for same segment, -10000 for different
     attention_bias = op.Where(
         same_segment,
-        op.Constant(value_float=0.0),
-        op.Constant(value_float=-10000.0),
+        0.0,
+        -10000.0,
     )
     # Reshape for Attention: (1, 1, N, N)
     attention_bias = op.Unsqueeze(attention_bias, [0, 1])

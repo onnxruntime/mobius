@@ -125,7 +125,7 @@ class _LLaVAEmbeddingModel(nn.Module):
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
@@ -133,7 +133,7 @@ class _LLaVAEmbeddingModel(nn.Module):
         # image_features is empty (text-only input: num_image_tokens == 0).
         # The Where mask ensures the padding row is never used in the output.
         pad_row = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), image_features),
+            op.CastLike(0.0, image_features),
             op.Concat(
                 op.Constant(value_ints=[1]),
                 op.Shape(image_features, start=1, end=2),

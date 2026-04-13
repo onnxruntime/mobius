@@ -297,7 +297,7 @@ class CLIPTextModel(nn.Module):
         seq_len = op.Shape(input_ids, start=1, end=2)
         _causal_mask = op.Trilu(
             op.Expand(
-                op.Constant(value_float=0.0),
+                0.0,
                 op.Concat(seq_len, seq_len, axis=0),
             ),
             upper=0,
@@ -305,7 +305,7 @@ class CLIPTextModel(nn.Module):
         # Fill upper triangle with -inf
         neg_inf_mask = op.Trilu(
             op.Expand(
-                op.Constant(value_float=-10000.0),
+                -10000.0,
                 op.Concat(seq_len, seq_len, axis=0),
             ),
             upper=1,

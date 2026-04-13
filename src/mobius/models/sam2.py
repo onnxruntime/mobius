@@ -80,13 +80,13 @@ class _Sam2HieraBlock(nn.Module):
         qkv = op.Reshape(qkv, new_shape_5d)
         # Transpose to [3, B, num_heads, S, head_dim]
         qkv = op.Transpose(qkv, perm=[2, 0, 3, 1, 4])
-        q = op.Gather(qkv, op.Constant(value_int=0), axis=0)  # [B, H, S, D]
-        k = op.Gather(qkv, op.Constant(value_int=1), axis=0)
-        v = op.Gather(qkv, op.Constant(value_int=2), axis=0)
+        q = op.Gather(qkv, 0, axis=0)  # [B, H, S, D]
+        k = op.Gather(qkv, 1, axis=0)
+        v = op.Gather(qkv, 2, axis=0)
 
         # Scaled dot-product attention
         scale = self._head_dim**-0.5
-        q = op.Mul(q, op.Constant(value_float=scale))
+        q = op.Mul(q, scale)
         k_t = op.Transpose(k, perm=[0, 1, 3, 2])
         scores = op.MatMul(q, k_t)
         attn_weights = op.Softmax(scores, axis=-1)

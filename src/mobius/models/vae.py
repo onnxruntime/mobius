@@ -104,7 +104,7 @@ class _AttentionBlock(nn.Module):
         value = self.to_v(op, hidden_states)
 
         # Simple scaled dot-product attention
-        scale = op.Constant(value_float=float(self._channels**-0.5))
+        scale = float(self._channels**-0.5)
         query = op.Mul(query, scale)
         attn_weights = op.MatMul(query, op.Transpose(key, perm=[0, 2, 1]))
         attn_weights = op.Softmax(attn_weights, axis=-1)

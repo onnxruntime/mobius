@@ -295,8 +295,8 @@ def _create_alibi_bias(op, num_heads: int, seq_len, total_len):
     # Causal mask: mask future positions with large negative value
     causal_mask = op.Where(
         op.GreaterOrEqual(q_with_offset, kv_expanded),
-        op.Constant(value_float=0.0),
-        op.Constant(value_float=-10000.0),
+        0.0,
+        -10000.0,
     )  # [seq_len, total_len]
     causal_4d = op.Unsqueeze(causal_mask, [0, 1])  # [1, 1, seq_len, total_len]
     return op.Add(alibi, causal_4d)

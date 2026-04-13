@@ -252,7 +252,7 @@ class Qwen3ASREmbeddingModel(nn.Module):
         is_audio_int = op.Cast(is_audio, to=7)  # INT64
         # Flatten across batch for cumsum then reshape
         flat_mask = op.Reshape(is_audio_int, op.Constant(value_ints=[-1]))
-        flat_indices = op.CumSum(flat_mask, op.Constant(value_int=0))
+        flat_indices = op.CumSum(flat_mask, 0)
         flat_indices = op.Mul(flat_indices, flat_mask)
         # Reshape back to (batch, seq_len)
         indices = op.Reshape(flat_indices, op.Shape(input_ids))
