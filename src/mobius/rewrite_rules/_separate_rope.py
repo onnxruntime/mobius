@@ -31,7 +31,7 @@ node back to explicit ``RotaryEmbedding`` ops applied before GQA.
 
 The ``position_ids`` graph input is looked up by name and used to index
 into the cosine/sine cache tables before applying the standard
-``RotaryEmbedding`` op (standard ONNX opset 23).
+``RotaryEmbedding`` op (standard ONNX opset 24).
 
 These rules are applied automatically by
 :func:`~mobius._optimizations.optimize_model` for EPs that do not support

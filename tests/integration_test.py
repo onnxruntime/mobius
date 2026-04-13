@@ -1917,7 +1917,7 @@ class TestQwenImageVAEDecoder:
         )
         module = AutoencoderKLQwenImageModel(config)
         task = QwenImageVAETask()
-        dec_model = task._build_decoder_graph(module, config, 23)
+        dec_model = task._build_decoder_graph(module, config)
         sd = module.preprocess_weights(dict(hf.state_dict()))
         apply_weights(dec_model, sd)
 
@@ -1970,7 +1970,7 @@ class TestQwenImageVAEDecoder:
         )
         module = AutoencoderKLQwenImageModel(config)
         task = QwenImageVAETask()
-        enc_model = task._build_encoder_graph(module, config, 23)
+        enc_model = task._build_encoder_graph(module, config)
         sd = module.preprocess_weights(dict(hf.state_dict()))
         apply_weights(enc_model, sd)
 

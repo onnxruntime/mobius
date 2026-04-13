@@ -11,7 +11,7 @@ from mobius._flags import flags
 
 
 class RMSNorm(nn.Module):
-    """RMS Layer Normalization using the ONNX RMSNormalization op (opset 23)."""
+    """RMS Layer Normalization using the ONNX RMSNormalization op (opset 24)."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()

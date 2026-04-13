@@ -154,7 +154,7 @@ def test_patch_merger_matches_hf_unfold_ordering():
         outputs=[],
         nodes=[],
         name="test_merge_ordering",
-        opset_imports={"": 23},
+        opset_imports={"": 24},
     )
     gb = GraphBuilder(graph)
     op = gb.op

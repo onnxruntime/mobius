@@ -119,7 +119,7 @@ class _CodecDecoderAttention(nn.Module):
     """Multi-head attention with RoPE for the codec decoder transformer.
 
     Uses ``op.RotaryEmbedding`` on Q and K before passing them
-    to the ONNX ``Attention`` op (opset 23).
+    to the ONNX ``Attention`` op (opset 24).
 
     Parameters:
         hidden_size: Model hidden dimension.
