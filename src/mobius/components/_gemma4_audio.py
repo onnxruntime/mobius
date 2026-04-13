@@ -27,7 +27,10 @@ Notes on omissions:
 - ``use_clipped_linears=True``: ``Gemma4ClippableLinear`` buffers are ±inf by
   default (no-op clamping at inference). Implemented as plain ``Linear``.
 - ``attention_logit_cap=50.0``: Soft-capping ``tanh(logits/cap)*cap`` IS
-  implemented using standard ONNX ops.
+  implemented using standard ONNX ops (MatMul/Tanh/Div/Mul). The ONNX
+  Attention op's native ``softcap`` attribute cannot be used because the
+  relative position bias must be added *before* softcap (see
+  ``Gemma4Attention`` docstring for details).
 - The blocked chunked attention is simplified to full offline MHA with a
   causal sliding-window mask — equivalent output for offline (non-streaming)
   inference. The relative position bias is fully implemented.
@@ -279,8 +282,31 @@ class Gemma4Attention(nn.Module):
     original implementation is replaced by full TxT MHA with a local mask,
     which produces identical outputs.
 
-    The ONNX ``Attention`` op cannot express these custom operations; this
-    class uses lower-level ``MatMul``, ``Softmax``, etc.
+    **Why the ONNX Attention op's native ``softcap`` attribute cannot be used:**
+
+    The ONNX ``Attention`` op (opset 24) has a ``softcap`` attribute that applies
+    ``tanh(qk / cap) * cap``, but its internal pipeline is fixed as:
+
+        QK matmul → scale → softcap → attn_mask add → softmax
+
+    This audio encoder requires a **different order**:
+
+        QK matmul → scale → relative_position_bias add → softcap → window_mask add → softmax
+
+    The relative position bias must be inside the softcap (i.e. softcap is applied
+    to ``qk + rel_bias``), but the ONNX op's ``softcap`` fires before the attention
+    mask, with no hook for pre-softcap bias injection.
+
+    Additionally, the non-standard Q/K scaling factors and the ``per_dim_scale``
+    learnable Q scaling cannot be expressed as ONNX Attention op attributes at all.
+
+    Therefore this class uses lower-level ``MatMul``, ``Softmax``, etc. ops to
+    implement the full attention computation manually.
+
+    TODO: If the ONNX Attention spec is extended to support a pre-softcap additive
+    bias input (separate from ``attn_mask``), the manual Tanh/Div/Mul ops (lines
+    ~454-456) could be replaced by the native ``softcap`` attribute. Track at:
+    https://github.com/onnx/onnx/blob/main/docs/Operators.md#Attention
 
     Args:
         hidden_size: Model hidden dimension.
@@ -451,7 +477,10 @@ class Gemma4Attention(nn.Module):
 
         scores = op.Add(scores, rel_bias)  # [B, H, T, T]
 
-        # Soft-capping: tanh(scores / cap) * cap
+        # Soft-capping: tanh(scores / cap) * cap  [B, H, T, T]
+        # Relative bias is already included in scores — this is why we cannot
+        # use the ONNX Attention op's native softcap attribute (it fires before
+        # any mask/bias addition in the op's fixed pipeline).
         cap = op.Constant(value_float=self._attention_logit_cap)
         scores = op.Mul(op.Tanh(op.Div(scores, cap)), cap)
 
