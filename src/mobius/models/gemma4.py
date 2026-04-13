@@ -1471,7 +1471,8 @@ class Gemma4Model(nn.Module):
           (strips ``.linear.`` infix; renames ``subsample_conv_projection.layerN.{conv,norm}``
           to ``{conv,norm}N``)
         - ``embed_audio.embedding_projection.*`` → ``audio_encoder.projector.*``
-        - ``embed_audio.*`` (other) → skip
+        - ``embed_audio.embedding_pre_projection_norm.*`` → skip (scale-free RMSNorm,
+          no learnable scale parameter — identical to ``embed_vision.embedding_pre_projection_norm``)
 
         Note: the decoder sub-model takes ``inputs_embeds`` rather than
         ``input_ids``, so ``embed_tokens`` is not a decoder initializer — the
@@ -1553,7 +1554,10 @@ class Gemma4Model(nn.Module):
                 renamed["audio_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_audio."):
-                pass  # Other embed_audio keys have no corresponding ONNX parameter
+                # embed_audio.embedding_pre_projection_norm.* — scale-free RMSNorm with
+                # no learnable scale; identical treatment to embed_vision's equivalent.
+                # No weight exists in the checkpoint and no ONNX initializer is needed.
+                pass
 
             else:
                 renamed[key] = value
