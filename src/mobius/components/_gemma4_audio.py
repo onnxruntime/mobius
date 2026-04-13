@@ -125,7 +125,9 @@ class Gemma4ConvSubsampling(nn.Module):
         self.norm1 = LayerNormNoBias(c1, eps=norm_eps)
 
         # Linear: (c1 * freq_after_2_stages) → hidden_size
-        self.input_proj_linear = Linear(c1 * freq, hidden_size)
+        # HF Gemma4AudioSubSampleConvProjection uses nn.Linear(bias=False)
+        # for this projection, so no bias initializer should be created.
+        self.input_proj_linear = Linear(c1 * freq, hidden_size, bias=False)
 
     def _conv_norm_relu(
         self,

@@ -762,13 +762,13 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 2: Create ONNX Runtime inference sessions for each sub-model.
     #
-    # Gemma 4 Any-to-Any models produce 4 ONNX graphs (decoder, vision, audio,
-    # embedding). Vision-language-only models produce 3 (no audio). Both cases
+    # Gemma 4 Any-to-Any models produce 4 ONNX graphs (decoder, vision, speech,
+    # embedding). Vision-language-only models produce 3 (no speech). Both cases
     # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
     vision_session = OnnxModelSession(pkg["vision"])
-    audio_session = OnnxModelSession(pkg["audio"]) if "audio" in pkg else None
+    audio_session = OnnxModelSession(pkg["speech"]) if "speech" in pkg else None
     embedding_session = OnnxModelSession(pkg["embedding"])
     decoder_session = OnnxModelSession(pkg["decoder"])
 

@@ -42,8 +42,8 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
-    Gemma4AnyToAnyModel,
     Gemma4CausalLMModel,
+    Gemma4Model,
     GemmaCausalLMModel,
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
@@ -463,12 +463,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
     "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
-    "gemma4": ModelRegistration(
-        Gemma4AnyToAnyModel, task="gemma4-any-to-any", config_class=Gemma4Config
-    ),
-    "gemma4_any_to_any": ModelRegistration(
-        Gemma4AnyToAnyModel, task="gemma4-any-to-any", config_class=Gemma4Config
-    ),
+    "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(MoECausalLMModel),
@@ -796,7 +791,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
     "gemma3_multimodal": "google/gemma-3-4b-it",
     "gemma4": "google/gemma-4-E2B-it",
-    "gemma4_any_to_any": "google/gemma-4-E2B-it",
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",

@@ -26,7 +26,6 @@ from mobius._configs import (
     DepthAnythingConfig,
     Gemma2Config,
     Gemma3nConfig,
-    Gemma4AudioConfig,
     Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
@@ -1922,41 +1921,9 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
-    # --- Gemma4 Any-to-Any (4-model split: decoder + vision + audio + embedding) ---
-    (
-        "gemma4_any_to_any",
-        {
-            "_config_cls": Gemma4Config,
-            "attn_qk_norm": True,
-            "rope_local_base_freq": 10_000.0,
-            "layer_types": ["sliding_attention", "sliding_attention"],
-            "global_head_dim": TINY_HEAD_DIM,
-            "global_rope_theta": 10_000.0,
-            "global_partial_rotary_factor": 0.25,
-            "final_logit_softcapping": 30.0,
-            "num_kv_shared_layers": 1,
-            "vision": VisionConfig(
-                hidden_size=32,
-                intermediate_size=64,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-                image_size=28,
-                patch_size=14,
-                norm_eps=1e-6,
-                mm_tokens_per_image=4,
-            ),
-            "mm_tokens_per_image": 4,
-            "image_token_id": 255999,
-            "audio": Gemma4AudioConfig(
-                input_size=16,
-                hidden_size=32,
-                num_layers=1,
-                output_dim=64,
-                audio_token_id=255998,
-            ),
-        },
-        False,
-    ),
+    # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
+    # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
+    # because it uses the unified "gemma4" registry key, same as the VL-only config above.
     # --- Blip2 (ViT + Q-Former + LLM) ---
     (
         "blip-2",

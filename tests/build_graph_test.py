@@ -1132,12 +1132,10 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
     def test_gemma4_multimodal_graph(self):
-        """Build Gemma4 model via registry (4-model split: decoder+vision+audio+embedding).
+        """Build Gemma4 vision-language model via registry (3-model split: decoder+vision+embedding).
 
-        The ``gemma4`` model type maps to Gemma4AnyToAnyModel because all real
-        Gemma4 HuggingFace checkpoints (E2B-it, E4B-it) are any-to-any models
-        with audio support.  When no audio config is supplied the audio encoder
-        uses its default dimensions.
+        The ``gemma4`` model type maps to Gemma4Model.  Without an audio config,
+        the package has three models: decoder, vision, embedding.
         """
         from mobius._configs import Gemma4Config
 
@@ -1179,7 +1177,9 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding", "audio"}
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+            f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
+        )
         # Decoder: inputs_embeds -> logits + per-layer KV cache
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
@@ -1190,13 +1190,13 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
-        # Embedding: input_ids + image_features + audio_features -> inputs_embeds
+        # Embedding: input_ids + image_features (no audio) -> inputs_embeds
         embedding = pkg["embedding"]
+        emb_input_names = {i.name for i in embedding.graph.inputs}
+        assert "input_ids" in emb_input_names
+        assert "image_features" in emb_input_names
+        assert "audio_features" not in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
-        # Audio: input_features -> audio_features
-        audio = pkg["audio"]
-        assert "input_features" in {i.name for i in audio.graph.inputs}
-        assert "audio_features" in {o.name for o in audio.graph.outputs}
 
     def test_gemma4_moe_graph(self):
         """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""
@@ -1242,7 +1242,11 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in output_names
 
     def test_gemma4_any_to_any_graph(self):
-        """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+audio+embedding)."""
+        """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
+
+        When ``config.audio`` is set, Gemma4Model adds a ``speech`` model and a
+        3-input embedding (input_ids + image_features + audio_features).
+        """
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
 
         config = Gemma4Config(
@@ -1284,13 +1288,15 @@ class TestBuildGraphVisionLanguage:
                 audio_token_id=255998,
             ),
         )
-        model_cls = registry.get("gemma4_any_to_any")
+        model_cls = registry.get("gemma4")
         module = model_cls(config)
-        task_name = _default_task_for_model("gemma4_any_to_any")
+        task_name = _default_task_for_model("gemma4")
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision", "speech", "embedding"}, (
+            f"AnyToAny Gemma4 should produce 4 models (with 'speech'), got: {set(pkg.keys())}"
+        )
         # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
@@ -1304,11 +1310,11 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
-        # Audio
-        audio = pkg["audio"]
-        assert "input_features" in {i.name for i in audio.graph.inputs}
-        assert "audio_features" in {o.name for o in audio.graph.outputs}
-        # Embedding
+        # Speech (was "audio" before unification)
+        speech = pkg["speech"]
+        assert "input_features" in {i.name for i in speech.graph.inputs}
+        assert "audio_features" in {o.name for o in speech.graph.outputs}
+        # Embedding: all three inputs
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
@@ -1331,7 +1337,7 @@ class TestBuildGraphVisionLanguage:
         - KV cache outputs: 1 entry (shared layer excluded from present_key_values)
         """
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
-        from mobius.tasks._gemma4 import Gemma4AnyToAnyTask
+        from mobius.tasks._gemma4 import Gemma4Task
 
         config = Gemma4Config(
             num_hidden_layers=2,
@@ -1371,9 +1377,9 @@ class TestBuildGraphVisionLanguage:
                 audio_token_id=255998,
             ),
         )
-        model_cls = registry.get("gemma4_any_to_any")
+        model_cls = registry.get("gemma4")
         module = model_cls(config)
-        task = Gemma4AnyToAnyTask()
+        task = Gemma4Task()
         pkg = task.build(module, config)
         decoder = pkg["decoder"]
 
@@ -3654,7 +3660,6 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "deepseek_vl_v2",
     "gemma3_multimodal",
     "gemma4",
-    "gemma4_any_to_any",
     "llava",
     "mllama",
     "phi4_multimodal",

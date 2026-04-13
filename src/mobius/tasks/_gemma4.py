@@ -1,18 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Gemma4 task classes (3-model and 4-model splits).
+"""Gemma4 task classes.
 
-3-model split (``Gemma4VisionLanguageTask``):
-1. **decoder** (text decoder): ``inputs_embeds`` -> logits + KV cache
-2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` -> ``image_features``
-3. **embedding**: ``input_ids, image_features`` -> ``inputs_embeds``
+The unified :class:`Gemma4Task` builds a 3- or 4-model package:
 
-4-model split (``Gemma4AnyToAnyTask``):
-1. **decoder** (text decoder): ``inputs_embeds`` -> logits + KV cache
-2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` -> ``image_features``
-3. **audio** (audio encoder): ``input_features`` -> ``audio_features``
-4. **embedding**: ``input_ids, image_features, audio_features`` -> ``inputs_embeds``
+1. **decoder** (text decoder): ``inputs_embeds`` → logits + KV cache
+2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` → ``image_features``
+3. **embedding**: ``input_ids, image_features[, audio_features]`` → ``inputs_embeds``
+4. **speech** (audio encoder, only when ``config.audio is not None``):
+   ``input_features`` → ``audio_features``
 
 The decoder uses per-layer KV cache where local (sliding_attention) layers
 use ``config.head_dim`` and global (full_attention) layers use
@@ -152,14 +149,17 @@ class Gemma4TextCausalLMTask(ModelTask):
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
 
-class Gemma4VisionLanguageTask(ModelTask):
-    """3-model split task for Gemma4 vision-language models.
+class Gemma4Task(ModelTask):
+    """Unified task for Gemma4 multimodal models (3- or 4-model split).
 
-    The module must expose three sub-modules:
-
+    Always builds:
     - ``decoder``: text decoder accepting ``inputs_embeds``
-    - ``vision_encoder``: vision encoder accepting ``pixel_values, pixel_position_ids``
-    - ``embedding``: embedding model fusing ``input_ids`` and ``image_features``
+    - ``vision``: vision encoder accepting ``pixel_values, pixel_position_ids``
+    - ``embedding``: embedding model fusing ``input_ids`` and multimodal features
+
+    When ``config.audio is not None``, also builds:
+    - ``speech``: Conformer audio encoder accepting ``input_features``
+      (and adds ``audio_features`` as a third input to ``embedding``)
 
     Decoder KV cache is per-layer with the correct head_dim for each layer type
     (local vs global), unlike the uniform head_dim in :class:`VisionLanguageTask`.
@@ -176,6 +176,8 @@ class Gemma4VisionLanguageTask(ModelTask):
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision"] = self._build_vision(module.vision_encoder, config)
+        if config.audio is not None:
+            models["speech"] = self._build_speech(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
@@ -273,76 +275,7 @@ class Gemma4VisionLanguageTask(ModelTask):
 
         return _make_model(graph)
 
-    def _build_embedding(
-        self,
-        embedding: nn.Module,
-        config: Gemma4Config,
-    ) -> ir.Model:
-        """Build embedding model: input_ids + image_features -> inputs_embeds."""
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        num_image_tokens = ir.SymbolicDim("num_image_tokens")
-
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        image_features = ir.Value(
-            name="image_features",
-            shape=ir.Shape([num_image_tokens, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
-
-        graph_inputs = [input_ids, image_features]
-
-        graph, graph_builder = _make_graph(graph_inputs, name="embedding")
-        op = graph_builder.op
-
-        inputs_embeds = embedding(
-            op,
-            input_ids=input_ids,
-            image_features=image_features,
-        )
-
-        inputs_embeds.name = "inputs_embeds"
-        graph.outputs.append(inputs_embeds)
-
-        return _make_model(graph)
-
-
-class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
-    """4-model split task for Gemma4 Any-to-Any models (E2B, E4B).
-
-    Extends :class:`Gemma4VisionLanguageTask` (inherits ``_build_decoder`` and
-    ``_build_vision``) and adds an audio encoder, overriding ``build`` and
-    ``_build_embedding`` to wire in ``audio_features``.
-
-    The module must expose four sub-modules:
-
-    - ``decoder``: text decoder accepting ``inputs_embeds``
-    - ``vision_encoder``: vision encoder accepting ``pixel_values, pixel_position_ids``
-    - ``audio_encoder``: Conformer encoder accepting ``input_features``
-    - ``embedding``: embedding model fusing ``input_ids``, ``image_features``,
-      and ``audio_features``
-
-    Decoder KV cache is per-layer with correct head_dim per layer type.
-    KV cache has ``num_hidden_layers - num_kv_shared_layers`` entries.
-    """
-
-    def build(
-        self,
-        module: nn.Module,
-        config: Gemma4Config,
-    ) -> ModelPackage:
-        models: dict[str, ir.Model] = {}
-        models["decoder"] = self._build_decoder(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
-        models["audio"] = self._build_audio(module.audio_encoder, config)
-        models["embedding"] = self._build_embedding(module.embedding, config)
-        return ModelPackage(models, config=config)
-
-    def _build_audio(
+    def _build_speech(
         self,
         audio: nn.Module,
         config: Gemma4Config,
@@ -365,7 +298,7 @@ class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
             type=ir.TensorType(config.dtype),
         )
 
-        graph, graph_builder = _make_graph([input_features], name="audio")
+        graph, graph_builder = _make_graph([input_features], name="speech")
         op = graph_builder.op
 
         audio_features = audio(op, input_features)
@@ -378,11 +311,10 @@ class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
         embedding: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build embedding: input_ids + image_features + audio_features -> inputs_embeds."""
+        """Build embedding: input_ids + image_features [+ audio_features] -> inputs_embeds."""
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         num_image_tokens = ir.SymbolicDim("num_image_tokens")
-        num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
 
         input_ids = ir.Value(
             name="input_ids",
@@ -394,23 +326,36 @@ class Gemma4AnyToAnyTask(Gemma4VisionLanguageTask):
             shape=ir.Shape([num_image_tokens, config.hidden_size]),
             type=ir.TensorType(config.dtype),
         )
-        audio_features = ir.Value(
-            name="audio_features",
-            shape=ir.Shape([num_audio_tokens, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
 
-        graph, graph_builder = _make_graph(
-            [input_ids, image_features, audio_features], name="embedding"
-        )
+        graph_inputs = [input_ids, image_features]
+        audio_features_val: ir.Value | None = None
+
+        if config.audio is not None:
+            num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
+            audio_features_val = ir.Value(
+                name="audio_features",
+                shape=ir.Shape([num_audio_tokens, config.hidden_size]),
+                type=ir.TensorType(config.dtype),
+            )
+            graph_inputs.append(audio_features_val)
+
+        graph, graph_builder = _make_graph(graph_inputs, name="embedding")
         op = graph_builder.op
 
         inputs_embeds = embedding(
             op,
             input_ids=input_ids,
             image_features=image_features,
-            audio_features=audio_features,
+            audio_features=audio_features_val,
         )
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
         return _make_model(graph)
+
+
+# ---------------------------------------------------------------------------
+# Kept for backward compatibility — both alias to Gemma4Task
+# ---------------------------------------------------------------------------
+
+Gemma4VisionLanguageTask = Gemma4Task
+Gemma4AnyToAnyTask = Gemma4Task

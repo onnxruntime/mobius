@@ -26,7 +26,6 @@ Key architectural differences from Gemma3:
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -1242,10 +1241,27 @@ class _Gemma4VisionEncoderModel(nn.Module):
         return renamed
 
 
-class _Gemma4EmbeddingModel(nn.Module):
-    """Gemma4 embedding sub-model: scaled token lookup + image feature fusion.
+class Gemma4EmbeddingModel(nn.Module):
+    """Gemma4 embedding sub-model: scaled token lookup + multimodal feature fusion.
 
-    Scatters vision features into text embeddings at image-token positions.
+    Always scatters vision features at image-token positions.  When the model
+    has audio support (``config.audio is not None``), ``forward()`` also accepts
+    ``audio_features`` and scatters them at audio-token positions.
+
+    Both image and audio use a one-row dummy guard so that ORT's eager
+    evaluation of both ``Where`` branches never ``Gather`` on a zero-length
+    tensor during text-only / decode steps.
+
+    Inputs (image-only variant):
+    - ``input_ids [B, S]`` INT64
+    - ``image_features [num_img_tokens, hidden_size]``
+
+    Inputs (image + audio variant):
+    - ``input_ids [B, S]`` INT64
+    - ``image_features [num_img_tokens, hidden_size]``
+    - ``audio_features [num_aud_tokens, hidden_size]``
+
+    Output: ``inputs_embeds [B, S, hidden_size]``
     """
 
     def __init__(self, config: Gemma4Config):
@@ -1259,41 +1275,71 @@ class _Gemma4EmbeddingModel(nn.Module):
             embed_scale=embed_scale,
         )
         self.image_token_id = config.image_token_id or 0
+        # Audio token ID is only set when the model has an audio encoder.
+        self.audio_token_id: int | None = config.audio.audio_token_id if config.audio else None
+
+    def _scatter_features(
+        self,
+        op: builder.OpBuilder,
+        hidden: ir.Value,
+        input_ids: ir.Value,
+        token_id: int,
+        features: ir.Value,
+    ) -> ir.Value:
+        """Scatter ``features`` into ``hidden`` at positions matching ``token_id``.
+
+        Appends a dummy zero row to ``features`` before Gather so that ORT's
+        eager evaluation of the Where branches never faults on an empty tensor
+        during text-only / decode steps.
+        """
+        mask = op.Equal(input_ids, op.Constant(value_int=token_id))
+        mask_3d = op.Unsqueeze(mask, [-1])
+
+        # CumSum → sub-1 → clip gives 0-based index into features for each token
+        mask_int = op.Cast(mask, to=7)  # INT64
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        indices = op.Clip(op.Sub(cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+
+        # One-row dummy prevents empty-tensor Gather faults during decode steps.
+        # Use Constant (static) + Unsqueeze to avoid ConstantOfShape, whose
+        # dynamic-shape input blocks ONNX shape inference.
+        dummy_row = op.Unsqueeze(
+            op.CastLike(
+                op.Constant(value_floats=[0.0] * self.config.hidden_size),
+                features,
+            ),
+            [0],
+        )  # [1, hidden_size]
+        features_safe = op.Concat(features, dummy_row, axis=0)
+        gathered = op.Gather(features_safe, indices, axis=0)
+        return op.Where(mask_3d, gathered, hidden)
 
     def forward(
         self,
         op: builder.OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
+        audio_features: ir.Value | None = None,
     ) -> ir.Value:
-        text_embeds = self.embed_tokens(op, input_ids)  # [B, S, hidden]
+        # [B, S] → [B, S, hidden]
+        hidden = self.embed_tokens(op, input_ids)
 
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
+        # Scatter image features at image-token positions
+        hidden = self._scatter_features(
+            op, hidden, input_ids, self.image_token_id, image_features
+        )
 
-        # Map each image-token position to its corresponding vision feature row
-        mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
-        indices = op.Sub(cumsum, op.Constant(value_int=1))
-        indices = op.Clip(indices, op.Constant(value_int=0))
+        # Scatter audio features at audio-token positions (only for AnyToAny models)
+        if audio_features is not None:
+            assert self.audio_token_id is not None, (
+                "Gemma4EmbeddingModel received audio_features but audio_token_id is not set. "
+                "Ensure config.audio is provided."
+            )
+            hidden = self._scatter_features(
+                op, hidden, input_ids, self.audio_token_id, audio_features
+            )
 
-        # Append a one-row dummy to guard against empty image_features (text-only /
-        # decode steps). ORT evaluates both branches of Where, so Gather would fault
-        # on a zero-length tensor even when image_mask is all-false. Non-image
-        # positions clip to index 0; Where discards the gathered values anyway.
-        # Use Constant (static) + Unsqueeze to avoid ConstantOfShape, whose
-        # dynamic-shape input blocks ONNX shape inference.
-        dummy_row = op.Unsqueeze(
-            op.CastLike(
-                op.Constant(value_floats=[0.0] * self.config.hidden_size),
-                image_features,
-            ),
-            [0],
-        )  # [1, hidden_size]
-        image_features_safe = op.Concat(image_features, dummy_row, axis=0)
-
-        gathered = op.Gather(image_features_safe, indices, axis=0)
-        return op.Where(image_mask_3d, gathered, text_embeds)
+        return hidden
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -1302,131 +1348,16 @@ class _Gemma4EmbeddingModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Gemma4MultiModalModel (3-model split, Image-Text-to-Text)
-# ---------------------------------------------------------------------------
-
-
-class Gemma4MultiModalModel(nn.Module):
-    """Gemma 4 vision-language model (3-model split).
-
-    Builds three separate ONNX models:
-    - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision_encoder``: SigLIP-style encoder + projector
-    - ``embedding``: scaled word embedding + image feature fusion
-
-    Used for the Image-Text-to-Text variants (26B-A4B, 31B).
-    Registered as ``gemma4`` with task ``gemma4-multimodal``.
-    """
-
-    default_task: str = "gemma4-multimodal"
-    category: str = "Multimodal"
-
-    # Routes renamed weights to the correct sub-model by prefix.
-    # preprocess_weights() produces "decoder.*", "vision_encoder.*", "embedding.*"
-    # keys; this map strips the prefix and routes each to the right model.
-    weight_prefix_map: ClassVar[dict[str, str]] = {
-        "decoder.": "decoder",
-        "vision_encoder.": "vision",
-        "embedding.": "embedding",
-    }
-
-    def __init__(self, config: Gemma4Config):
-        super().__init__()
-        self.config = config
-        self.decoder = _Gemma4DecoderModel(config)
-        self.vision_encoder = _Gemma4VisionEncoderModel(config)
-        self.embedding = _Gemma4EmbeddingModel(config)
-
-    def forward(self, op: builder.OpBuilder, **kwargs):
-        raise NotImplementedError(
-            "Gemma4MultiModalModel uses Gemma4VisionLanguageTask which calls "
-            "each sub-module (decoder, vision_encoder, embedding) separately."
-        )
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Rename HuggingFace weight keys to ONNX initializer names.
-
-        HF multimodal checkpoints prefix every key with ``model.``
-        (e.g. ``model.language_model.*``, ``model.vision_tower.*``).
-
-        Mapping (after stripping the leading ``model.``):
-        - ``language_model.lm_head.*`` -> ``decoder.lm_head.*``
-        - ``language_model.*`` -> ``decoder.model.*``
-        - ``language_model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
-        - ``vision_tower.*`` -> ``vision_encoder.encoder.*``
-          (strips HF's extra ``encoder.`` level and ``.linear.`` infix from
-          ``Gemma4ClippableLinear``)
-        - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
-        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free, no weight)
-
-        Note: the decoder sub-model takes ``inputs_embeds`` rather than
-        ``input_ids``, so ``embed_tokens`` is not a decoder initializer —
-        the token embedding lives only in the ``embedding`` sub-model.
-        ``embed_tokens_per_layer`` is likewise omitted from the decoder graph
-        (the per-layer branch is conditioned on ``input_ids is not None``).
-        """
-        # HF multimodal checkpoints wrap everything under a top-level "model." prefix.
-        state_dict = {
-            (key[len("model.") :] if key.startswith("model.") else key): value
-            for key, value in state_dict.items()
-        }
-
-        # Synthesize lm_head from embed_tokens when weights are tied
-        if self.config.tie_word_embeddings:
-            embed_key = "language_model.embed_tokens.weight"
-            head_key = "language_model.lm_head.weight"
-            if head_key not in state_dict and embed_key in state_dict:
-                state_dict[head_key] = state_dict[embed_key]
-
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith("language_model."):
-                suffix = key[len("language_model.") :]
-                if suffix.startswith("lm_head"):
-                    # lm_head lives directly under decoder (not decoder.model)
-                    renamed["decoder." + suffix] = value
-                else:
-                    # All other text weights nest under decoder.model.*
-                    renamed["decoder.model." + suffix] = value
-                    if suffix == "embed_tokens.weight":
-                        # Token embedding is shared with the embedding sub-model
-                        renamed["embedding.embed_tokens.weight"] = value
-
-            elif key.startswith("vision_tower."):
-                new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
-                # HF wraps the encoder layers under an extra "encoder." sub-module; strip it
-                new_key = new_key.replace(
-                    "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
-                )
-                # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
-                renamed[new_key] = value
-
-            elif key.startswith("embed_vision.embedding_projection."):
-                suffix = key[len("embed_vision.embedding_projection.") :]
-                renamed["vision_encoder.projector." + suffix] = value
-
-            elif key.startswith("embed_vision.embedding_pre_projection_norm."):
-                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
-
-            else:
-                renamed[key] = value
-
-        return renamed
-
-
-# ---------------------------------------------------------------------------
-# Gemma4AnyToAnyModel support classes (4-model split, E2B/E4B)
+# _Gemma4AudioEncoderModel — Conformer encoder + projector sub-model
 # ---------------------------------------------------------------------------
 
 
 class _Gemma4AudioEncoderModel(nn.Module):
     """Gemma4 Conformer audio encoder sub-model.
 
-    Wraps :class:`Gemma4AudioEncoder` for use in the 4-model split.
+    Wraps :class:`Gemma4AudioEncoder` and applies a learned linear projector
+    (``embed_audio.embedding_projection`` in HF) that maps from the encoder
+    output dimension to the text model's hidden size.
 
     Inputs:
     - ``input_features [B, T, input_size]``: mel-spectrogram features
@@ -1438,11 +1369,14 @@ class _Gemma4AudioEncoderModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
-        ac = config.audio  # Gemma4AudioConfig
+        ac = config.audio  # Gemma4AudioConfig (guaranteed non-None when used)
         input_size = (ac.input_size if ac else None) or 128
         hidden_size = (ac.hidden_size if ac else None) or 1024
         num_layers = (ac.num_layers if ac else None) or 12
-        output_proj_dims = (ac.output_dim if ac else None) or config.hidden_size
+        # HF config field is output_proj_dims (not output_dim)
+        output_proj_dims = (
+            getattr(ac, "output_proj_dims", None) if ac else None
+        ) or config.hidden_size
         conv_channels = ac.subsampling_conv_channels if ac else None
         rms_norm_eps = config.rms_norm_eps or 1e-6
 
@@ -1457,117 +1391,64 @@ class _Gemma4AudioEncoderModel(nn.Module):
             output_proj_dims=output_proj_dims,
             rms_norm_eps=rms_norm_eps,
         )
+        # Learned projection from encoder output space → text hidden size.
+        # Corresponds to HF's embed_audio.embedding_projection (no bias).
+        self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
 
     def forward(
         self,
         op: builder.OpBuilder,
         input_features: ir.Value,
     ) -> ir.Value:
-        # input_features: [B, T, input_size] → [B, T//4, text_hidden_size]
-        return self.encoder(op, input_features)
-
-
-class _Gemma4AnyToAnyEmbeddingModel(nn.Module):
-    """Embedding sub-model that fuses vision and audio features into text.
-
-    Scatters image features at ``image_token_id`` positions and audio
-    features at ``audio_token_id`` positions in the token embedding sequence.
-    """
-
-    def __init__(self, config: Gemma4Config):
-        super().__init__()
-        self.config = config
-        embed_scale = float(np.float16(config.hidden_size**0.5))
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
-        )
-        self.image_token_id = config.image_token_id or 0
-        self.audio_token_id = (config.audio.audio_token_id if config.audio else None) or 0
-
-    def forward(
-        self,
-        op: builder.OpBuilder,
-        input_ids: ir.Value,
-        image_features: ir.Value,
-        audio_features: ir.Value,
-    ) -> ir.Value:
-        text_embeds = self.embed_tokens(op, input_ids)  # [B, S, hidden]
-
-        # --- Scatter image features at image-token positions ---
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
-        img_mask_int = op.Cast(image_mask, to=7)  # INT64
-        img_cumsum = op.CumSum(img_mask_int, op.Constant(value_int=1))
-        img_indices = op.Clip(
-            op.Sub(img_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0)
-        )
-        img_gathered = op.Gather(image_features, img_indices, axis=0)
-        hidden = op.Where(image_mask_3d, img_gathered, text_embeds)
-
-        # --- Scatter audio features at audio-token positions ---
-        audio_mask = op.Equal(input_ids, op.Constant(value_int=self.audio_token_id))
-        audio_mask_3d = op.Unsqueeze(audio_mask, [-1])
-        aud_mask_int = op.Cast(audio_mask, to=7)  # INT64
-        aud_cumsum = op.CumSum(aud_mask_int, op.Constant(value_int=1))
-        aud_indices = op.Clip(
-            op.Sub(aud_cumsum, op.Constant(value_int=1)), op.Constant(value_int=0)
-        )
-        aud_gathered = op.Gather(audio_features, aud_indices, axis=0)
-        return op.Where(audio_mask_3d, aud_gathered, hidden)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return vlm_embedding_weights(state_dict)
+        # [B, T, input_size] → encoder → [B, T//4, output_proj_dims]
+        audio_features = self.encoder(op, input_features)
+        # → projector → [B, T//4, text_hidden_size]
+        return self.projector(op, audio_features)
 
 
 # ---------------------------------------------------------------------------
-# Gemma4AnyToAnyModel (4-model split, Any-to-Any, E2B/E4B)
+# Gemma4Model — unified vision-language (+ optional audio) model
 # ---------------------------------------------------------------------------
 
 
-class Gemma4AnyToAnyModel(nn.Module):
-    """Gemma 4 Any-to-Any model (4-model split).
+class Gemma4Model(nn.Module):
+    """Unified Gemma4 multimodal model (3- or 4-model split).
 
-    Builds four separate ONNX models:
+    Builds three or four separate ONNX models depending on whether the config
+    includes an audio sub-config:
+
+    Always produced:
     - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision_encoder``: SigLIP-style encoder + projector
-    - ``audio_encoder``: Conformer audio encoder
-    - ``embedding``: scaled word embedding + image + audio feature fusion
+    - ``vision``: SigLIP-style encoder + projector
+    - ``embedding``: scaled word embedding + multimodal feature fusion
 
-    Used for the Any-to-Any variants (E2B, E4B) that accept vision+audio+text.
-    Registered as ``gemma4_any_to_any`` with task ``gemma4-any-to-any``.
+    Added when ``config.audio is not None``:
+    - ``speech``: Conformer audio encoder + projection to text hidden size
+
+    Covers all Gemma4 variants:
+    - Vision-language (26B-A4B, 31B): ``audio=None``
+    - Any-to-Any (E2B-it, E4B-it): ``audio=Gemma4AudioConfig(...)``
+
+    Registered as ``gemma4`` (and ``gemma4_any_to_any`` for back-compat).
     """
 
-    default_task: str = "gemma4-any-to-any"
+    default_task: str = "gemma4"
     category: str = "Multimodal"
-
-    # Routes renamed weights to the correct sub-model by prefix.
-    # preprocess_weights() produces "decoder.*", "vision_encoder.*",
-    # "embedding.*", and "audio_encoder.*" keys; this map strips the prefix
-    # and routes each to the right ONNX model.
-    weight_prefix_map: ClassVar[dict[str, str]] = {
-        "decoder.": "decoder",
-        "vision_encoder.": "vision",
-        "embedding.": "embedding",
-        "audio_encoder.": "audio",
-    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
         self.decoder = _Gemma4DecoderModel(config)
         self.vision_encoder = _Gemma4VisionEncoderModel(config)
-        self.audio_encoder = _Gemma4AudioEncoderModel(config)
-        self.embedding = _Gemma4AnyToAnyEmbeddingModel(config)
+        self.embedding = Gemma4EmbeddingModel(config)
+        self.audio_encoder: _Gemma4AudioEncoderModel | None = (
+            _Gemma4AudioEncoderModel(config) if config.audio is not None else None
+        )
 
     def forward(self, op: builder.OpBuilder, **kwargs):
         raise NotImplementedError(
-            "Gemma4AnyToAnyModel uses Gemma4AnyToAnyTask which calls each "
-            "sub-module (decoder, vision_encoder, audio_encoder, embedding) separately."
+            "Gemma4Model is a multi-model split; Gemma4Task builds each sub-module "
+            "(decoder, vision_encoder, embedding, and optionally audio_encoder) separately."
         )
 
     def preprocess_weights(
@@ -1579,17 +1460,26 @@ class Gemma4AnyToAnyModel(nn.Module):
         (e.g. ``model.language_model.*``, ``model.vision_tower.*``).
 
         Mapping (after stripping the leading ``model.``):
-        - ``language_model.lm_head.*`` -> ``decoder.lm_head.*``
-        - ``language_model.*`` -> ``decoder.model.*``
-        - ``language_model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
-        - ``vision_tower.*`` -> ``vision_encoder.encoder.*``
-          (strips HF's extra ``encoder.`` level and ``.linear.`` infix)
-        - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
-        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free, no weight)
-        - ``audio_tower.*`` -> ``audio_encoder.encoder.*`` (strips ``.linear.`` infix)
-        - ``embed_audio.*`` -> skip (output proj already inside audio encoder)
+
+        - ``language_model.lm_head.*`` → ``decoder.lm_head.*``
+        - ``language_model.*`` → ``decoder.model.*``
+        - ``language_model.embed_tokens.weight`` also → ``embedding.embed_tokens.weight``
+        - ``vision_tower.*`` → ``vision_encoder.encoder.*``
+          (strips HF's extra ``encoder.`` level and ``.linear.`` infix from
+          ``Gemma4ClippableLinear``)
+        - ``embed_vision.embedding_projection.*`` → ``vision_encoder.projector.*``
+        - ``embed_vision.embedding_pre_projection_norm.*`` → skip (scale-free, no weight)
+        - ``audio_tower.*`` → ``audio_encoder.encoder.*``
+          (strips ``.linear.`` infix; renames ``subsample_conv_projection.layerN.{conv,norm}``
+          to ``{conv,norm}N``)
+        - ``embed_audio.embedding_projection.*`` → ``audio_encoder.projector.*``
+        - ``embed_audio.*`` (other) → skip
+
+        Note: the decoder sub-model takes ``inputs_embeds`` rather than
+        ``input_ids``, so ``embed_tokens`` is not a decoder initializer — the
+        token embedding lives only in the ``embedding`` sub-model.
         """
-        # HF multimodal checkpoints wrap everything under a top-level "model." prefix.
+        # Strip top-level "model." prefix used by HF multimodal checkpoints.
         state_dict = {
             (key[len("model.") :] if key.startswith("model.") else key): value
             for key, value in state_dict.items()
@@ -1618,7 +1508,7 @@ class Gemma4AnyToAnyModel(nn.Module):
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
-                # HF wraps the encoder layers under an extra "encoder." sub-module; strip it
+                # HF wraps encoder layers under an extra "encoder." sub-module; strip it
                 new_key = new_key.replace(
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
@@ -1632,17 +1522,40 @@ class Gemma4AnyToAnyModel(nn.Module):
                 renamed["vision_encoder.projector." + suffix] = value
 
             elif key.startswith("embed_vision.embedding_pre_projection_norm."):
-                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
+                pass  # Scale-free RMSNorm: normalizes without a learnable scale, no weight
 
             elif key.startswith("audio_tower."):
                 new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
                 # HF Conformer linear layers use a ".linear." infix; strip it
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
+                # HF subsample_conv_projection uses "layerN.conv" / "layerN.norm" names;
+                # our ONNX module uses "convN" / "normN" directly.
+                new_key = new_key.replace(
+                    ".subsample_conv_projection.layer0.conv.",
+                    ".subsample_conv_projection.conv0.",
+                )
+                new_key = new_key.replace(
+                    ".subsample_conv_projection.layer0.norm.",
+                    ".subsample_conv_projection.norm0.",
+                )
+                new_key = new_key.replace(
+                    ".subsample_conv_projection.layer1.conv.",
+                    ".subsample_conv_projection.conv1.",
+                )
+                new_key = new_key.replace(
+                    ".subsample_conv_projection.layer1.norm.",
+                    ".subsample_conv_projection.norm1.",
+                )
                 renamed[new_key] = value
 
+            elif key.startswith("embed_audio.embedding_projection."):
+                # Learned audio-to-text projector (embed_audio.embedding_projection in HF)
+                suffix = key[len("embed_audio.embedding_projection.") :]
+                renamed["audio_encoder.projector." + suffix] = value
+
             elif key.startswith("embed_audio."):
-                pass  # Audio output projection is already inside Gemma4AudioEncoder
+                pass  # Other embed_audio keys have no corresponding ONNX parameter
 
             else:
                 renamed[key] = value
