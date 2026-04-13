@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Gemma 4 generation with onnxruntime-genai.
+r"""Gemma 4 generation with onnxruntime-genai.
 
 Builds ONNX models for Gemma 4 (text-only or VLM), saves them in the flat
 layout expected by onnxruntime-genai, and runs text generation.
@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
 
 import onnxruntime_genai as og
@@ -60,231 +59,131 @@ DEFAULT_PROMPT = "The capital of France is"
 DEFAULT_IMAGE_PROMPT = "Describe this image in detail."
 MAX_NEW_TOKENS = 50
 
-# Gemma 4 E2B-it architecture constants (google/gemma-4-E2B-it)
-_VOCAB_SIZE = 262144
-_HIDDEN_SIZE = 1536
-_NUM_ATTENTION_HEADS = 8
-_NUM_KEY_VALUE_HEADS = 1
-_HEAD_SIZE = 256  # local/sliding attention head_dim
-_NUM_TOTAL_LAYERS = 35
-_NUM_KV_SHARED_LAYERS = 20
-_NUM_KV_CACHE_LAYERS = _NUM_TOTAL_LAYERS - _NUM_KV_SHARED_LAYERS  # 15
-_CONTEXT_LENGTH = 131072
-_SLIDING_WINDOW_SIZE = 512
-# Sliding-window layer indices within the 15-entry KV cache
-# (layers 0-3, 5-8, 10-13 are local; layers 4, 9, 14 are global)
-_SLIDING_LAYERS = [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]
-_BOS_TOKEN_ID = 2
-_EOS_TOKEN_IDS = [1, 106]
-_PAD_TOKEN_ID = 0
-_IMAGE_TOKEN_ID = 255999  # boi_token_id
-
-# SigLIP vision encoder constants
-_VISION_IMAGE_SIZE = 448
-_VISION_PATCH_SIZE = 16
-_VISION_TOKENS_PER_IMAGE = 280
-
 
 # ---------------------------------------------------------------------------
-# genai_config.json writers
+# genai_config.json writer (derives all architecture values from config)
 # ---------------------------------------------------------------------------
 
 
-def _write_text_genai_config(output_dir: str) -> None:
-    """Write genai_config.json for text-only decoder.
+def _write_genai_config(
+    config: object,
+    mode: str,
+    output_dir: str,
+    *,
+    bos_token_id: int | None,
+    eos_token_id: int | list[int] | None,
+    pad_token_id: int | None,
+) -> None:
+    """Write genai_config.json, deriving all values from the ArchitectureConfig.
 
-    NOTE: Uses model type ``gemma4_text``.  Until ORT GenAI ships this
-    type, you can try ``gemma3_text`` as an approximation (no KV sharing,
-    no dual head_dim support).
+    Args:
+        config: Gemma4Config populated by ``build()``.
+        mode: ``"text"`` for text-only decoder, ``"vlm"`` for 3-model VLM.
+        output_dir: Directory to write ``genai_config.json``.
+        bos_token_id: BOS token ID (from HuggingFace config).
+        eos_token_id: EOS token ID(s) (from HuggingFace config).
+        pad_token_id: PAD token ID (from HuggingFace config).
+
+    NOTE: Uses model type ``gemma4_text`` (text) or ``gemma4`` (VLM).  These
+    types are not yet in a released ORT GenAI build.  Until support lands,
+    text-only inference can be approximated with ``gemma3_text`` (missing: KV
+    sharing, dual head_dim).  For VLM there is no suitable fallback.
     """
-    config = {
-        "model": {
-            "type": "gemma4_text",
-            "vocab_size": _VOCAB_SIZE,
-            "context_length": _CONTEXT_LENGTH,
-            "bos_token_id": _BOS_TOKEN_ID,
-            "eos_token_id": _EOS_TOKEN_IDS,
-            "pad_token_id": _PAD_TOKEN_ID,
-            "decoder": {
-                "session_options": {
-                    "log_id": "onnxruntime-genai",
-                    "provider_options": [],
-                },
-                "filename": "model.onnx",
-                "hidden_size": _HIDDEN_SIZE,
-                "head_size": _HEAD_SIZE,
-                "num_attention_heads": _NUM_ATTENTION_HEADS,
-                "num_key_value_heads": _NUM_KEY_VALUE_HEADS,
-                # Only 15 layers produce independent KV cache entries;
-                # the remaining 20 share KV projections from earlier layers.
-                "num_hidden_layers": _NUM_KV_CACHE_LAYERS,
-                "inputs": {
-                    "input_ids": "input_ids",
-                    "attention_mask": "attention_mask",
-                    "position_ids": "position_ids",
-                    "past_key_names": "past_key_values.%d.key",
-                    "past_value_names": "past_key_values.%d.value",
-                },
-                "outputs": {
-                    "logits": "logits",
-                    "present_key_names": "present.%d.key",
-                    "present_value_names": "present.%d.value",
-                },
-                "sliding_window": {
-                    "window_size": _SLIDING_WINDOW_SIZE,
-                    "pad_value": 0,
-                    "alignment": "right",
-                    "slide_key_value_cache": True,
-                    "slide_inputs": True,
-                    "layers": _SLIDING_LAYERS,
-                },
+    from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
+
+    # Gemma4 KV cache only covers layers with independent KV projections;
+    # the last num_kv_shared_layers layers re-use KV from earlier layers.
+    num_kv_shared: int = getattr(config, "num_kv_shared_layers", 0) or 0
+    num_hidden_layers: int = getattr(config, "num_hidden_layers", 0)
+    kv_cache_layers = num_hidden_layers - num_kv_shared
+
+    model_type = "gemma4_text" if mode == "text" else "gemma4"
+    generator = GenaiConfigGenerator(
+        model_type,
+        vocab_size=getattr(config, "vocab_size", 0),
+        hidden_size=getattr(config, "hidden_size", 0),
+        # Only layers with independent KV projections have cache entries.
+        num_hidden_layers=kv_cache_layers,
+        num_attention_heads=getattr(config, "num_attention_heads", 0),
+        num_key_value_heads=getattr(config, "num_key_value_heads", 0),
+        head_dim=getattr(config, "head_dim", 0),
+        context_length=getattr(config, "max_position_embeddings", 4096),
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
+
+    if mode == "vlm":
+        vision_cfg = getattr(config, "vision", None)
+        image_token_id: int = (
+            getattr(vision_cfg, "image_token_id", None) or 255999  # boi_token_id
+        )
+        # Gemma4 SigLIP takes pre-patchified inputs (not raw images):
+        #   pixel_values:       [batch, num_patches, 3 * patch_size^2]
+        #   pixel_position_ids: [batch, num_patches, 2]  (row, col tile coords)
+        # spatial_merge_size=None because Gemma4 doesn't use spatial merge.
+        generator.with_vision(
+            image_token_id=image_token_id,
+            filename="vision.onnx",
+            embedding_filename="embedding.onnx",
+            spatial_merge_size=None,
+            input_names={
+                "pixel_values": "pixel_values",
+                "pixel_position_ids": "pixel_position_ids",
             },
-        },
-        "search": {
-            "do_sample": False,
-            "early_stopping": True,
-            "max_length": 8192,
-            "min_length": 0,
-            "num_beams": 1,
-            "num_return_sequences": 1,
-            "past_present_share_buffer": False,
-            "repetition_penalty": 1.0,
-            "temperature": 1.0,
-            "top_k": 1,
-            "top_p": 1.0,
-        },
-    }
-    with open(os.path.join(output_dir, "genai_config.json"), "w") as f:
-        json.dump(config, f, indent=4)
+        )
+
+    cfg = generator.generate()
+
+    # Gemma4-specific: add sliding_window to decoder, derived from layer_types.
+    # Layers at index i (within the kv_cache_layers range) whose type is
+    # "sliding_attention" need the ORT GenAI sliding-window cache treatment.
+    sliding_window: int | None = getattr(config, "sliding_window", None)
+    layer_types: list[str] = getattr(config, "layer_types", None) or []
+    if sliding_window:
+        sliding_layer_indices = [
+            i
+            for i in range(kv_cache_layers)
+            if i >= len(layer_types) or layer_types[i] == "sliding_attention"
+        ]
+        if sliding_layer_indices:
+            cfg["model"]["decoder"]["sliding_window"] = {
+                "window_size": sliding_window,
+                "pad_value": 0,
+                "alignment": "right",
+                "slide_key_value_cache": True,
+                "slide_inputs": True,
+                "layers": sliding_layer_indices,
+            }
+
+    with open(os.path.join(output_dir, "genai_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4)
 
 
-def _write_vlm_genai_config(output_dir: str) -> None:
-    """Write genai_config.json for the 3-model VLM split.
-
-    NOTE: Uses model type ``gemma4``.  This type is not yet in a released
-    ORT GenAI build.  There is no suitable fallback type for VLM inference.
-    """
-    config = {
-        "model": {
-            "type": "gemma4",
-            "vocab_size": _VOCAB_SIZE,
-            "context_length": _CONTEXT_LENGTH,
-            "bos_token_id": _BOS_TOKEN_ID,
-            "eos_token_id": _EOS_TOKEN_IDS,
-            "pad_token_id": _PAD_TOKEN_ID,
-            "image_token_id": _IMAGE_TOKEN_ID,
-            "decoder": {
-                "session_options": {
-                    "log_id": "onnxruntime-genai",
-                    "provider_options": [],
-                },
-                "filename": "model.onnx",
-                "hidden_size": _HIDDEN_SIZE,
-                "head_size": _HEAD_SIZE,
-                "num_attention_heads": _NUM_ATTENTION_HEADS,
-                "num_key_value_heads": _NUM_KEY_VALUE_HEADS,
-                "num_hidden_layers": _NUM_KV_CACHE_LAYERS,
-                "inputs": {
-                    "inputs_embeds": "inputs_embeds",
-                    "attention_mask": "attention_mask",
-                    "position_ids": "position_ids",
-                    "past_key_names": "past_key_values.%d.key",
-                    "past_value_names": "past_key_values.%d.value",
-                },
-                "outputs": {
-                    "logits": "logits",
-                    "present_key_names": "present.%d.key",
-                    "present_value_names": "present.%d.value",
-                },
-                "sliding_window": {
-                    "window_size": _SLIDING_WINDOW_SIZE,
-                    "pad_value": 0,
-                    "alignment": "right",
-                    "slide_key_value_cache": True,
-                    "slide_inputs": True,
-                    "layers": _SLIDING_LAYERS,
-                },
-            },
-            "vision": {
-                "filename": "vision.onnx",
-                "config_filename": "processor_config.json",
-                "session_options": {
-                    "log_id": "onnxruntime-genai",
-                    "provider_options": [],
-                },
-                # Gemma 4 SigLIP takes pre-patchified inputs (not raw images):
-                # pixel_values:      [batch, num_patches, 3 * patch_size^2]
-                # pixel_position_ids:[batch, num_patches, 2]  (row, col coords)
-                "inputs": {
-                    "pixel_values": "pixel_values",
-                    "pixel_position_ids": "pixel_position_ids",
-                },
-                "outputs": {
-                    "image_features": "image_features",
-                },
-            },
-            "embedding": {
-                "filename": "embedding.onnx",
-                "session_options": {
-                    "log_id": "onnxruntime-genai",
-                    "provider_options": [],
-                },
-                "inputs": {
-                    "input_ids": "input_ids",
-                    "image_features": "image_features",
-                },
-                "outputs": {
-                    "inputs_embeds": "inputs_embeds",
-                },
-            },
-        },
-        "search": {
-            "do_sample": False,
-            "early_stopping": True,
-            "max_length": 8192,
-            "min_length": 0,
-            "num_beams": 1,
-            "num_return_sequences": 1,
-            "past_present_share_buffer": False,
-            "repetition_penalty": 1.0,
-            "temperature": 1.0,
-            "top_k": 1,
-            "top_p": 1.0,
-        },
-    }
-    with open(os.path.join(output_dir, "genai_config.json"), "w") as f:
-        json.dump(config, f, indent=4)
-
-
-def _write_processor_config(output_dir: str) -> None:
+def _write_processor_config(config: object, output_dir: str) -> None:
     """Write processor_config.json for the SigLIP vision encoder.
 
-    Gemma 4 uses a SigLIP ViT (patch_size=16, image_size=448) with
-    pan-and-scan tiling.  The ONNX vision model expects pre-patchified
-    inputs; ORT GenAI's ``gemma4`` processor handles the tiling and
-    patchification internally using these parameters.
+    Gemma 4 uses a SigLIP ViT with pan-and-scan tiling.  The ONNX vision
+    model expects pre-patchified inputs; ORT GenAI's ``gemma4`` processor
+    handles tiling and patchification internally using these parameters.
+    All values are derived from the Gemma4Config vision sub-config.
     """
+    vision_cfg = getattr(config, "vision", None)
+    if vision_cfg is None:
+        return
     processor_config = {
         "processor": {
             "name": "gemma4_image_processor",
-            "image_size": _VISION_IMAGE_SIZE,
-            "patch_size": _VISION_PATCH_SIZE,
-            "tokens_per_image": _VISION_TOKENS_PER_IMAGE,
+            "image_size": getattr(vision_cfg, "image_size", 448),
+            "patch_size": getattr(vision_cfg, "patch_size", 16),
+            "tokens_per_image": getattr(vision_cfg, "mm_tokens_per_image", 256),
+            # SigLIP normalisation constants (fixed for all SigLIP checkpoints).
             "mean": [0.5, 0.5, 0.5],
             "std": [0.5, 0.5, 0.5],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+    with open(os.path.join(output_dir, "processor_config.json"), "w", encoding="utf-8") as f:
         json.dump(processor_config, f, indent=4)
-
-
-def _copy_tokenizer(model_id: str, output_dir: str) -> None:
-    """Save tokenizer files from the HuggingFace processor."""
-    from transformers import AutoTokenizer
-
-    print(f"  Saving tokenizer from {model_id!r} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.save_pretrained(output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -295,16 +194,21 @@ def _copy_tokenizer(model_id: str, output_dir: str) -> None:
 def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
     """Build the ONNX model package and write ORT GenAI config files.
 
+    Derives all architecture constants from the Gemma4Config returned by
+    ``build()``.  Token IDs (bos/eos/pad) are fetched from the HuggingFace
+    config so they are never hardcoded in this script.
+
     Args:
         model_id: HuggingFace model ID.
         output_dir: Directory to write all outputs.
         mode: ``"text"`` for text-only decoder, ``"vlm"`` for 3-model VLM.
     """
-    from mobius import build
+    import transformers
 
-    # Select the correct mobius model type
-    hf_model_type = "gemma4_text" if mode == "text" else "gemma4"
-    print(f"Building {model_id!r} (type={hf_model_type}) ...")
+    from mobius import build
+    from mobius.integrations.ort_genai.auto_export import _copy_tokenizer_files
+
+    print(f"Building {model_id!r} (mode={mode}) ...")
     pkg = build(model_id, dtype="f32", load_weights=True)
     print(f"Package components: {list(pkg.keys())}")
 
@@ -312,14 +216,29 @@ def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
     print(f"Saving ONNX models to {output_dir!r} ...")
     pkg.save(output_dir)
 
-    print("Writing genai_config.json ...")
-    if mode == "text":
-        _write_text_genai_config(output_dir)
-    else:
-        _write_vlm_genai_config(output_dir)
-        _write_processor_config(output_dir)
+    # Fetch token IDs from the HuggingFace config (not hardcoded).
+    print(f"  Fetching token IDs from {model_id!r} ...")
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
+    bos_token_id = getattr(hf_config, "bos_token_id", None)
+    eos_token_id = getattr(hf_config, "eos_token_id", None)
+    pad_token_id = getattr(hf_config, "pad_token_id", None)
 
-    _copy_tokenizer(model_id, output_dir)
+    print("Writing genai_config.json ...")
+    _write_genai_config(
+        pkg.config,
+        mode,
+        output_dir,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
+
+    if mode == "vlm":
+        print("Writing processor_config.json ...")
+        _write_processor_config(pkg.config, output_dir)
+
+    print(f"  Copying tokenizer files from {model_id!r} ...")
+    _copy_tokenizer_files(model_id, output_dir)
     print(f"Export complete → {output_dir}")
 
 
@@ -532,8 +451,7 @@ def main() -> None:
         "--mode",
         choices=["text", "vlm"],
         default="text",
-        help="Export/run mode: 'text' (decoder only) or 'vlm' (3-model VLM). "
-        "Default: text.",
+        help="Export/run mode: 'text' (decoder only) or 'vlm' (3-model VLM). Default: text.",
     )
     parser.add_argument(
         "--model-dir",
@@ -607,9 +525,7 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("HuggingFace Transformers")
         print("=" * 60)
-        hf_output = generate_hf(
-            args.model_id, prompt, args.image, args.max_new_tokens
-        )
+        hf_output = generate_hf(args.model_id, prompt, args.image, args.max_new_tokens)
         if onnx_output.strip() == hf_output.strip():
             print("\n\u2713 Outputs match exactly!")
         else:
