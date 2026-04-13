@@ -94,7 +94,7 @@ MAX_NEW_TOKENS = 128
 IMAGE_TOKEN_ID = 255999  # <image_soft_token> (same as Gemma 3)
 # AUDIO_TOKEN_ID: placeholder inserted once per audio chunk in input_ids
 AUDIO_TOKEN_ID = 258881  # <audio_soft_token> — confirmed from google/gemma-4-E2B-it HF config
-EOS_TOKEN_IDS = {1, 107}  # </s> and <end_of_turn>
+EOS_TOKEN_IDS = {1, 106}  # <eos> (1) and <turn|> (106, end-of-turn marker)
 
 # Gemma 4 SigLIP vision encoder: 280 soft tokens per image after projection.
 # This is set in the HF config as mm_tokens_per_image=280.
@@ -267,14 +267,17 @@ def build_input_ids(
     num_image_tokens: int = 0,
     num_audio_tokens: int = 0,
 ) -> np.ndarray:
-    """Tokenize a prompt and insert modality placeholder tokens.
+    """Tokenize a prompt using the chat template and insert modality placeholder tokens.
 
-    Layout when both modalities are present::
+    Applies the Gemma 4 instruction chat template so the instruction-tuned
+    model receives properly formatted input.  Modality placeholder tokens
+    are inserted at the start of the user message content (before the text),
+    matching the HuggingFace processor layout::
 
-        [BOS] [image x num_image_tokens] [audio x num_audio_tokens] [text tokens]
+        <bos><|turn>user\\n[image*N][audio*M]text<turn|>\\n<|turn>model\\n
 
     Args:
-        tokenizer: HuggingFace tokenizer.
+        tokenizer: HuggingFace tokenizer with ``apply_chat_template`` support.
         prompt: The user's text prompt.
         num_image_tokens: Number of image soft tokens to insert (0 = no image).
         num_audio_tokens: Number of audio soft tokens to insert (0 = no audio).
@@ -282,19 +285,36 @@ def build_input_ids(
     Returns:
         ``int64[1, seq_len]`` token ids.
     """
-    input_ids = _tokenize(tokenizer, prompt)
+    # Apply instruction chat template: <bos><|turn>user\\n{prompt}<turn|>\\n<|turn>model\\n
+    messages = [{"role": "user", "content": prompt}]
+    template_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    template_ids = tokenizer(template_text, return_tensors="np")["input_ids"].astype(np.int64)
 
-    parts: list[np.ndarray] = [input_ids[:, :1]]  # BOS
+    if num_image_tokens == 0 and num_audio_tokens == 0:
+        return template_ids
 
+    # Build modality placeholder block
+    modality_parts: list[np.ndarray] = []
     if num_image_tokens > 0:
-        parts.append(np.full((1, num_image_tokens), IMAGE_TOKEN_ID, dtype=np.int64))
-
+        modality_parts.append(np.full((1, num_image_tokens), IMAGE_TOKEN_ID, dtype=np.int64))
     if num_audio_tokens > 0:
-        parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
+        modality_parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
+    modality_ids = np.concatenate(modality_parts, axis=1)
 
-    parts.append(input_ids[:, 1:])  # rest of prompt (after BOS)
+    # Find insertion point: right after the user header "<|turn>user\n"
+    # That sequence is token 105 (<|turn>), 2364 (user), 107 (\n)
+    flat = template_ids[0].tolist()
+    insert_pos = 1  # fallback: right after BOS
+    for i in range(len(flat) - 2):
+        if flat[i] == 105 and flat[i + 1] == 2364 and flat[i + 2] == 107:
+            insert_pos = i + 3
+            break
 
-    return np.concatenate(parts, axis=1)  # [1, seq_len]
+    prefix = template_ids[:, :insert_pos]
+    suffix = template_ids[:, insert_pos:]
+    return np.concatenate([prefix, modality_ids, suffix], axis=1)  # [1, seq_len]
 
 
 # ---------------------------------------------------------------------------
@@ -308,21 +328,30 @@ def _empty_features(hidden_size: int) -> np.ndarray:
 
 
 def _init_kv_cache(config) -> dict[str, np.ndarray]:
-    """Create an empty KV cache for all decoder layers.
+    """Create an empty KV cache for all independent decoder layers.
 
-    Gemma 4 uses separate head_dim values for local-sliding (head_dim=256)
-    and full-attention (global_head_dim=512) layers.  At the KV cache
-    level we use the standard head_dim (the KV heads always use the local
-    head_dim regardless of layer type).
+    Gemma 4 uses:
+    - ``head_dim`` for local (sliding_attention) layers
+    - ``global_head_dim`` for global (full_attention) layers
+    - ``num_kv_shared_layers`` trailing layers that share KV from earlier layers
+      (these have NO independent cache entries)
     """
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
+    num_kv_layers = config.num_hidden_layers - num_kv_shared
+    layer_types = getattr(config, "layer_types", None) or ["sliding_attention"] * config.num_hidden_layers
+    local_hd = config.head_dim
+    global_hd = getattr(config, "global_head_dim", None) or local_hd
+
     past_kv: dict[str, np.ndarray] = {}
-    for i in range(config.num_hidden_layers):
+    for i in range(num_kv_layers):
+        layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
+        hd = global_hd if layer_type == "full_attention" else local_hd
         past_kv[f"past_key_values.{i}.key"] = np.zeros(
-            (1, config.num_key_value_heads, 0, config.head_dim),
+            (1, config.num_key_value_heads, 0, hd),
             dtype=np.float32,
         )
         past_kv[f"past_key_values.{i}.value"] = np.zeros(
-            (1, config.num_key_value_heads, 0, config.head_dim),
+            (1, config.num_key_value_heads, 0, hd),
             dtype=np.float32,
         )
     return past_kv
@@ -392,7 +421,8 @@ def generate(
     Returns:
         The generated text, decoded from token ids (prompt excluded).
     """
-    num_layers = config.num_hidden_layers
+    num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
+    num_kv_layers = config.num_hidden_layers - num_kv_shared
     hidden_size = config.hidden_size
 
     # Zero-length feature tensors used during decode steps (no modality input)
@@ -437,7 +467,7 @@ def generate(
             break
 
         # Advance KV cache and prepare single-token input for next step
-        _update_kv_cache(past_kv, decoder_out, num_layers)
+        _update_kv_cache(past_kv, decoder_out, num_kv_layers)
         past_seq_len += cur_ids.shape[1]
         cur_ids = np.array([[next_token]], dtype=np.int64)
 
@@ -729,13 +759,13 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 2: Create ONNX Runtime inference sessions for each sub-model.
     #
-    # Gemma 4 produces 4 ONNX graphs — decoder, vision, audio, embedding.
-    # Each runs in an independent ORT session so they can use different
-    # execution providers if desired (e.g. vision on CPU, decoder on GPU).
+    # Gemma 4 Any-to-Any models produce 4 ONNX graphs (decoder, vision, audio,
+    # embedding). Vision-language-only models produce 3 (no audio). Both cases
+    # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
     vision_session = OnnxModelSession(pkg["vision"])
-    audio_session = OnnxModelSession(pkg["audio"])
+    audio_session = OnnxModelSession(pkg["audio"]) if "audio" in pkg else None
     embedding_session = OnnxModelSession(pkg["embedding"])
     decoder_session = OnnxModelSession(pkg["decoder"])
 
@@ -761,14 +791,16 @@ def main() -> int:
     import os
 
     has_image = os.path.exists(args.image)
-    has_audio = os.path.exists(args.audio)
+    has_audio = os.path.exists(args.audio) and audio_session is not None
 
     if args.mode in ("vision", "vision-audio", "all") and not has_image:
         print(
             f"⚠️  Image file not found: {args.image!r} — "
             "vision demos will be skipped.  Pass --image PATH to provide one."
         )
-    if args.mode in ("audio", "vision-audio", "all") and not has_audio:
+    if args.mode in ("audio", "vision-audio", "all") and audio_session is None:
+        print("⚠️  Model has no audio component — audio demos will be skipped.")
+    elif args.mode in ("audio", "vision-audio", "all") and not has_audio:
         print(
             f"⚠️  Audio file not found: {args.audio!r} — "
             "audio demos will be skipped.  Pass --audio PATH to provide one."

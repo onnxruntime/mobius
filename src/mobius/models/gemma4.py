@@ -243,7 +243,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
             hidden_size=vc.hidden_size,
-            position_embedding_size=getattr(vc, "_position_embedding_size", 128),
+            position_embedding_size=vc.position_embedding_size or 128,
         )
         self.layers = nn.ModuleList(
             [
@@ -256,7 +256,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
                 for _ in range(vc.num_hidden_layers)
             ]
         )
-        self.post_layernorm = RMSNorm(vc.hidden_size, eps=vc.norm_eps)
+        self.post_layernorm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
 
     def forward(
         self,
@@ -1338,17 +1338,34 @@ class Gemma4MultiModalModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Rename HuggingFace weight keys to ONNX initializer names.
 
-        Mapping:
-        - ``language_model.*`` -> ``decoder.*``
+        HF multimodal checkpoints prefix every key with ``model.``
+        (e.g. ``model.language_model.*``, ``model.vision_tower.*``).
+
+        Mapping (after stripping the leading ``model.``):
+        - ``language_model.lm_head.*`` -> ``decoder.lm_head.*``
+        - ``language_model.*`` -> ``decoder.model.*``
+        - ``language_model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
         - ``vision_tower.*`` -> ``vision_encoder.encoder.*``
+          (strips HF's extra ``encoder.`` level and ``.linear.`` infix from
+          ``Gemma4ClippableLinear``)
         - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
-        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free)
-        - ``language_model.model.embed_tokens.weight`` also goes to
-          ``embedding.embed_tokens.weight``
-        - ``.linear.`` infix from ``Gemma4ClippableLinear`` is stripped
+        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free, no weight)
+
+        Note: the decoder sub-model takes ``inputs_embeds`` rather than
+        ``input_ids``, so ``embed_tokens`` is not a decoder initializer —
+        the token embedding lives only in the ``embedding`` sub-model.
+        ``embed_tokens_per_layer`` is likewise omitted from the decoder graph
+        (the per-layer branch is conditioned on ``input_ids is not None``).
         """
+        # HF multimodal checkpoints wrap everything under a top-level "model." prefix.
+        state_dict = {
+            (key[len("model.") :] if key.startswith("model.") else key): value
+            for key, value in state_dict.items()
+        }
+
+        # Synthesize lm_head from embed_tokens when weights are tied
         if self.config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
+            embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
@@ -1356,17 +1373,24 @@ class Gemma4MultiModalModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("language_model."):
-                new_key = "decoder." + key[len("language_model.") :]
-                renamed[new_key] = value
-                if key == "language_model.model.embed_tokens.weight":
-                    renamed["embedding.embed_tokens.weight"] = value
+                suffix = key[len("language_model.") :]
+                if suffix.startswith("lm_head"):
+                    # lm_head lives directly under decoder (not decoder.model)
+                    renamed["decoder." + suffix] = value
+                else:
+                    # All other text weights nest under decoder.model.*
+                    renamed["decoder.model." + suffix] = value
+                    if suffix == "embed_tokens.weight":
+                        # Token embedding is shared with the embedding sub-model
+                        renamed["embedding.embed_tokens.weight"] = value
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
-                # HF adds an extra "encoder." level via Gemma4VisionEncoder; strip it
+                # HF wraps the encoder layers under an extra "encoder." sub-module; strip it
                 new_key = new_key.replace(
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
+                # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
@@ -1530,20 +1554,29 @@ class Gemma4AnyToAnyModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Rename HuggingFace weight keys to ONNX initializer names.
 
-        Mapping:
-        - ``language_model.*`` -> ``decoder.*``
-        - ``vision_tower.*`` -> ``vision_encoder.encoder.*`` (strip .linear. infix)
+        HF multimodal checkpoints prefix every key with ``model.``
+        (e.g. ``model.language_model.*``, ``model.vision_tower.*``).
+
+        Mapping (after stripping the leading ``model.``):
+        - ``language_model.lm_head.*`` -> ``decoder.lm_head.*``
+        - ``language_model.*`` -> ``decoder.model.*``
+        - ``language_model.embed_tokens.weight`` also -> ``embedding.embed_tokens.weight``
+        - ``vision_tower.*`` -> ``vision_encoder.encoder.*``
+          (strips HF's extra ``encoder.`` level and ``.linear.`` infix)
         - ``embed_vision.embedding_projection.*`` -> ``vision_encoder.projector.*``
-        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free)
-        - ``vision_tower.encoder.*`` -> ``vision_encoder.encoder.*`` (HF's extra
-          ``Gemma4VisionEncoder`` submodule level is stripped)
-        - ``audio_tower.*`` -> ``audio_encoder.encoder.*``
-        - ``embed_audio.embedding_projection.*`` -> skip (output_proj is inside encoder)
-        - ``language_model.model.embed_tokens.weight`` also ->
-          ``embedding.embed_tokens.weight``
+        - ``embed_vision.embedding_pre_projection_norm.*`` -> skip (scale-free, no weight)
+        - ``audio_tower.*`` -> ``audio_encoder.encoder.*`` (strips ``.linear.`` infix)
+        - ``embed_audio.*`` -> skip (output proj already inside audio encoder)
         """
+        # HF multimodal checkpoints wrap everything under a top-level "model." prefix.
+        state_dict = {
+            (key[len("model.") :] if key.startswith("model.") else key): value
+            for key, value in state_dict.items()
+        }
+
+        # Synthesize lm_head from embed_tokens when weights are tied
         if self.config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
+            embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
@@ -1551,17 +1584,24 @@ class Gemma4AnyToAnyModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("language_model."):
-                new_key = "decoder." + key[len("language_model.") :]
-                renamed[new_key] = value
-                if key == "language_model.model.embed_tokens.weight":
-                    renamed["embedding.embed_tokens.weight"] = value
+                suffix = key[len("language_model.") :]
+                if suffix.startswith("lm_head"):
+                    # lm_head lives directly under decoder (not decoder.model)
+                    renamed["decoder." + suffix] = value
+                else:
+                    # All other text weights nest under decoder.model.*
+                    renamed["decoder.model." + suffix] = value
+                    if suffix == "embed_tokens.weight":
+                        # Token embedding is shared with the embedding sub-model
+                        renamed["embedding.embed_tokens.weight"] = value
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
-                # HF adds an extra "encoder." level via Gemma4VisionEncoder; strip it
+                # HF wraps the encoder layers under an extra "encoder." sub-module; strip it
                 new_key = new_key.replace(
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
+                # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
                 new_key = new_key.replace(".linear.weight", ".weight")
                 new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
@@ -1574,16 +1614,14 @@ class Gemma4AnyToAnyModel(nn.Module):
                 pass  # Scale-free RMSNorm: normalizes without a learnable scale, no parameter
 
             elif key.startswith("audio_tower."):
-                # Map audio_tower.* -> audio_encoder.encoder.*
                 new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
+                # HF Conformer linear layers use a ".linear." infix; strip it
+                new_key = new_key.replace(".linear.weight", ".weight")
+                new_key = new_key.replace(".linear.bias", ".bias")
                 renamed[new_key] = value
 
-            elif key.startswith("embed_audio.embedding_projection."):
-                # Audio output_proj is already inside Gemma4AudioEncoder.output_proj
-                pass
-
             elif key.startswith("embed_audio."):
-                pass  # Other embed_audio keys (e.g. scale-free norm)
+                pass  # Audio output projection is already inside Gemma4AudioEncoder
 
             else:
                 renamed[key] = value

@@ -116,6 +116,8 @@ class VisionConfig:
     lora: dict | None = None
     # Gemma4 SigLIP vision encoder uses clipped linear activations
     use_clipped_linears: bool = False
+    # Gemma4 SigLIP patch position embedding table size (HF: position_embedding_size)
+    position_embedding_size: int | None = None
 
 
 @dataclasses.dataclass
@@ -406,6 +408,8 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             window_size=getattr(vc, "window_size", None),
             # Gemma4 SigLIP uses clipped linear activations
             use_clipped_linears=getattr(vc, "use_clipped_linears", False),
+            # Gemma4 SigLIP patch position embedding table size
+            position_embedding_size=getattr(vc, "position_embedding_size", None),
         )
     vision_fields["mm_tokens_per_image"] = getattr(vision_source, "mm_tokens_per_image", None)
     vision_fields["image_token_id"] = getattr(vision_source, "image_token_id", None)
