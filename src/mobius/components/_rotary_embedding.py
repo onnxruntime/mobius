@@ -61,7 +61,7 @@ def apply_rotary_pos_emb(
 ):
     """Apply Rotary Positional Embedding (RoPE) to the input.
 
-    Uses the ONNX opset 23 ``RotaryEmbedding`` op with pre-gathered
+    Uses the ONNX opset 24 ``RotaryEmbedding`` op with pre-gathered
     cos/sin embeddings (3D tensors without position_ids).
 
     Args:

@@ -143,7 +143,7 @@ class Qwen3VLVisionAttention(nn.Module):
     """Packed bidirectional multi-head attention for the vision encoder.
 
     Iterates over sub-sequences delimited by ``cu_seqlens`` and applies
-    standard ONNX Attention (opset 23) to each independently.  This avoids
+    standard ONNX Attention (opset 24) to each independently.  This avoids
     cross-image attention while processing all patches in a single flat
     sequence.
     """

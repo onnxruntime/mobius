@@ -178,7 +178,7 @@ class PixtralAttention(nn.Module):
         # Bidirectional attention (no causal mask, no KV cache).
         # Use com.microsoft.MultiHeadAttention for all EPs that support
         # custom-domain ops (it has fused kernels on CUDA/DML and runs
-        # correctly on CPU). Fall back to standard opset-23 Attention
+        # correctly on CPU). Fall back to standard opset-24 Attention
         # for onnx-standard EP which prohibits custom-domain ops.
         scale = float(1.0 / (self._head_dim**0.5))
         if ep_capabilities().name == "onnx-standard":
