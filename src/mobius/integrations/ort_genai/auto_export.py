@@ -163,11 +163,107 @@ def _copy_tokenizer_files_from_local(
     return copied
 
 
+# Tokenizer class remapping: HF tokenizer classes that ORT GenAI
+# (ort-extensions) does not support, mapped to compatible alternatives.
+_TOKENIZER_CLASS_REMAP: dict[str, str] = {
+    "TokenizersBackend": "LlamaTokenizer",
+}
+
+
+def _fix_tokenizer_config(output_dir: str) -> bool:
+    """Remap unsupported tokenizer classes for ORT GenAI compatibility.
+
+    Some HuggingFace models use tokenizer classes (e.g.
+    ``TokenizersBackend``) that ORT GenAI's ort-extensions
+    tokenizer doesn't support. This fixes tokenizer_config.json
+    to use a compatible class.
+
+    Returns True if a fix was applied, False otherwise.
+    """
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.exists(tc_path):
+        return False
+
+    with open(tc_path, encoding="utf-8") as f:
+        tc = json.load(f)
+
+    original_class = tc.get("tokenizer_class", "")
+    replacement = _TOKENIZER_CLASS_REMAP.get(original_class)
+    if replacement is None:
+        return False
+
+    tc["tokenizer_class"] = replacement
+    with open(tc_path, "w", encoding="utf-8") as f:
+        json.dump(tc, f, indent=2, ensure_ascii=False)
+    logger.info(
+        "Fixed tokenizer_class: %s -> %s",
+        original_class,
+        replacement,
+    )
+    return True
+
+
+def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+    """Ensure chat_template is present in tokenizer_config.json.
+
+    Some HuggingFace models don't store ``chat_template`` in the
+    raw ``tokenizer_config.json`` file — transformers injects it
+    dynamically from the model class at runtime. ORT GenAI reads
+    the file directly and needs it to be present.
+
+    This function loads the tokenizer via transformers (which
+    applies the dynamic template) and writes it back.
+
+    Returns True if the template was added, False otherwise.
+    """
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.exists(tc_path):
+        return False
+
+    with open(tc_path, encoding="utf-8") as f:
+        tc = json.load(f)
+
+    if tc.get("chat_template"):
+        return False
+
+    if hf_model_id is None:
+        return False
+
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            tc["chat_template"] = template
+            with open(tc_path, "w", encoding="utf-8") as f:
+                json.dump(tc, f, indent=2, ensure_ascii=False)
+            logger.info(
+                "Added chat_template to tokenizer_config.json from %s",
+                hf_model_id,
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "Could not load tokenizer for %s to extract chat_template",
+            hf_model_id,
+            exc_info=True,
+        )
+    return False
+
+
 def _write_vision_processor_config(
     config: Any,
     output_dir: str,
+    *,
+    hf_model_id: str | None = None,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
+
+    Generates the ORT-extensions image transform pipeline derived from the
+    HuggingFace image processor config. When ``hf_model_id`` is provided,
+    loads the HF processor to extract normalization values and resize
+    parameters. Otherwise falls back to CLIP-standard defaults.
 
     The output format depends on the model type:
 
@@ -185,6 +281,8 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
+    vision_model_type = getattr(vision, "model_type", None)
+    is_pixtral = vision_model_type == "pixtral"
 
     if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs an onnxruntime-extensions format processor config
@@ -201,7 +299,7 @@ def _write_vision_processor_config(
         )
         patch_size = getattr(vision, "patch_size", None) or 16
         pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
-        processor = {
+        processor_config: dict[str, Any] = {
             "processor": {
                 "name": "gemma_4_image_processing",
                 "transforms": [
@@ -226,15 +324,187 @@ def _write_vision_processor_config(
                 ],
             }
         }
-    else:
-        processor = {
-            "image_size": getattr(vision, "image_size", None) or 448,
-            "patch_size": getattr(vision, "patch_size", None) or 14,
-        }
+        path = os.path.join(output_dir, "image_processor.json")
+    elif is_pixtral:
+        # Pixtral / Mistral3 VLM: full ORT-extensions transform pipeline
+        # with CLIP-standard normalization defaults.
+        patch_size = getattr(vision, "patch_size", 14) or 14
+        merge_size = (
+            getattr(vision, "spatial_merge_size", None)
+            or getattr(config, "spatial_merge_size", 2)
+            or 2
+        )
 
-    path = os.path.join(output_dir, "image_processor.json")
+        # CLIP-standard normalization defaults
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+        rescale_factor = 1.0 / 255.0
+        min_pixels = 784
+        max_pixels = 2371600
+        image_size = getattr(vision, "image_size", None)
+
+        if hf_model_id is not None:
+            try:
+                from transformers import AutoProcessor
+
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                image_processor = getattr(hf_proc, "image_processor", None)
+                if image_processor is not None:
+                    image_mean = list(getattr(image_processor, "image_mean", image_mean))
+                    image_std = list(getattr(image_processor, "image_std", image_std))
+                    rescale_factor = getattr(image_processor, "rescale_factor", rescale_factor)
+                    if hasattr(image_processor, "size"):
+                        size = image_processor.size
+                        if isinstance(size, dict):
+                            if "longest_edge" in size:
+                                image_size = size["longest_edge"]
+                            min_pixels = size.get("shortest_edge", min_pixels)
+                            max_pixels = size.get("longest_edge", max_pixels)
+                        elif isinstance(size, int):
+                            image_size = size
+            except Exception:
+                logger.warning(
+                    "Could not load HF processor for %s; "
+                    "using CLIP-standard normalization defaults",
+                    hf_model_id,
+                    exc_info=True,
+                )
+
+        if image_size is None:
+            image_size = 1540
+
+        transforms: list[dict[str, Any]] = [
+            {
+                "operation": {
+                    "name": "decode_image",
+                    "type": "DecodeImage",
+                    "attrs": {"color_space": "RGB"},
+                }
+            },
+            {
+                "operation": {
+                    "name": "convert_to_rgb",
+                    "type": "ConvertRGB",
+                }
+            },
+            {
+                "operation": {
+                    "name": "resize",
+                    "type": "Resize",
+                    "attrs": {
+                        "height": image_size,
+                        "width": image_size,
+                        "smart_resize": 1,
+                        "min_pixels": min_pixels,
+                        "max_pixels": max_pixels,
+                        "patch_size": patch_size,
+                        "merge_size": merge_size,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "rescale",
+                    "type": "Rescale",
+                    "attrs": {
+                        "rescale_factor": rescale_factor,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "normalize",
+                    "type": "Normalize",
+                    "attrs": {
+                        "mean": image_mean,
+                        "std": image_std,
+                    },
+                }
+            },
+        ]
+
+        processor_config = {
+            "processor": {
+                "name": "pixtral_image_processor",
+                "transforms": transforms,
+            }
+        }
+        path = os.path.join(output_dir, "processor_config.json")
+    else:
+        # Generic VLM: full ORT-extensions transform pipeline with
+        # CLIP-standard normalization defaults.
+        patch_size = getattr(vision, "patch_size", 14) or 14
+        merge_size = (
+            getattr(vision, "spatial_merge_size", None)
+            or getattr(config, "spatial_merge_size", 2)
+            or 2
+        )
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+        rescale_factor = 1.0 / 255.0
+        min_pixels = 784
+        max_pixels = 2371600
+        image_size = getattr(vision, "image_size", None) or 448
+
+        transforms = [
+            {
+                "operation": {
+                    "name": "decode_image",
+                    "type": "DecodeImage",
+                    "attrs": {"color_space": "RGB"},
+                }
+            },
+            {
+                "operation": {
+                    "name": "convert_to_rgb",
+                    "type": "ConvertRGB",
+                }
+            },
+            {
+                "operation": {
+                    "name": "resize",
+                    "type": "Resize",
+                    "attrs": {
+                        "height": image_size,
+                        "width": image_size,
+                        "smart_resize": 1,
+                        "min_pixels": min_pixels,
+                        "max_pixels": max_pixels,
+                        "patch_size": patch_size,
+                        "merge_size": merge_size,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "rescale",
+                    "type": "Rescale",
+                    "attrs": {
+                        "rescale_factor": rescale_factor,
+                    },
+                }
+            },
+            {
+                "operation": {
+                    "name": "normalize",
+                    "type": "Normalize",
+                    "attrs": {
+                        "mean": image_mean,
+                        "std": image_std,
+                    },
+                }
+            },
+        ]
+        processor_config = {
+            "processor": {
+                "name": "image_processor",
+                "transforms": transforms,
+            }
+        }
+        path = os.path.join(output_dir, "processor_config.json")
+
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(processor, f, indent=4)
+        json.dump(processor_config, f, indent=4)
     return path
 
 
@@ -568,7 +838,7 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor config for VLMs
-    processor_path = _write_vision_processor_config(config, directory)
+    processor_path = _write_vision_processor_config(config, directory, hf_model_id=hf_model_id)
     if processor_path:
         result["processor_config"] = processor_path
 
@@ -576,6 +846,12 @@ def write_ort_genai_config(
     audio_proc_path = _write_audio_processor_config(config, directory)
     if audio_proc_path:
         result["audio_processor"] = audio_proc_path
+
+    # Fix unsupported tokenizer classes
+    _fix_tokenizer_config(directory)
+
+    # Ensure chat_template is in tokenizer_config.json
+    _fix_chat_template(directory, hf_model_id)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result

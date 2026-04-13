@@ -158,3 +158,7 @@ See the `adding-a-new-model` skill for the full guide.
 ### Git commits
 
 Linear commit history. Always signoff commits with --signoff.
+
+- **Squash commits before pushing.** Avoid pushing many small/WIP commits — each push triggers CI. Amend and force-push instead of adding fixup commits.
+- **Write descriptive commit messages.** Title should summarize the change; body should explain what and why.
+- **Minimize CI waste.** Each push to a PR triggers the full CI pipeline. Batch your changes into a single well-described commit before pushing.

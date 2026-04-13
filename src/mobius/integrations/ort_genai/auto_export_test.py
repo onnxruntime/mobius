@@ -15,6 +15,8 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _fix_chat_template,
+    _fix_tokenizer_config,
     _graph_input_names,
     _resolve_ort_genai_model_type,
     _write_audio_processor_config,
@@ -80,19 +82,119 @@ class TestWriteProcessorConfig:
         del config.vision  # ensure no vision attribute
         assert _write_vision_processor_config(config, str(tmp_path)) is None
 
-    def test_writes_vision_config(self, tmp_path):
+    def test_writes_transform_pipeline(self, tmp_path):
+        """Generates full transform pipeline for generic VLMs."""
         vision = mock.MagicMock()
-        vision.image_size = 224
-        vision.patch_size = 16
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
         config = mock.MagicMock()
         config.vision = vision
+        config.spatial_merge_size = 2
 
         path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
-        assert data["image_size"] == 224
-        assert data["patch_size"] == 16
+
+        proc = data["processor"]
+        assert proc["name"] == "image_processor"
+        transforms = proc["transforms"]
+        assert len(transforms) == 5
+        assert transforms[0]["operation"]["type"] == "DecodeImage"
+        assert transforms[1]["operation"]["type"] == "ConvertRGB"
+        assert transforms[2]["operation"]["type"] == "Resize"
+        assert transforms[3]["operation"]["type"] == "Rescale"
+        assert transforms[4]["operation"]["type"] == "Normalize"
+
+        # Check resize attrs
+        resize_attrs = transforms[2]["operation"]["attrs"]
+        assert resize_attrs["patch_size"] == 14
+        assert resize_attrs["merge_size"] == 2
+
+        # Check normalization defaults (CLIP-standard)
+        norm_attrs = transforms[4]["operation"]["attrs"]
+        assert len(norm_attrs["mean"]) == 3
+        assert len(norm_attrs["std"]) == 3
+
+    def test_pixtral_vision_config(self, tmp_path):
+        """Generates pixtral-specific processor config."""
+        vision = mock.MagicMock()
+        vision.image_size = 1540
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "pixtral"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.spatial_merge_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "pixtral_image_processor"
+        resize = proc["transforms"][2]["operation"]["attrs"]
+        assert resize["height"] == 1540
+        assert resize["width"] == 1540
+
+
+class TestFixTokenizerConfig:
+    def test_remaps_tokenizers_backend(self, tmp_path):
+        tc = {"tokenizer_class": "TokenizersBackend"}
+        tc_path = tmp_path / "tokenizer_config.json"
+        tc_path.write_text(json.dumps(tc))
+
+        assert _fix_tokenizer_config(str(tmp_path)) is True
+
+        fixed = json.loads(tc_path.read_text())
+        assert fixed["tokenizer_class"] == "LlamaTokenizer"
+
+    def test_no_fix_needed(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+    def test_no_tokenizer_config(self, tmp_path):
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+
+class TestFixChatTemplate:
+    def test_adds_chat_template(self, tmp_path):
+        """Adds chat_template from HF tokenizer when missing."""
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+
+        fake_tokenizer = mock.MagicMock()
+        fake_tokenizer.chat_template = "{{ bos_token }}"
+
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=fake_tokenizer,
+        ):
+            result = _fix_chat_template(str(tmp_path), "fake/model")
+
+        assert result is True
+        fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert fixed["chat_template"] == "{{ bos_token }}"
+
+    def test_skips_when_template_exists(self, tmp_path):
+        tc = {
+            "tokenizer_class": "LlamaTokenizer",
+            "chat_template": "existing",
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
+
+    def test_skips_without_model_id(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), None) is False
+
+    def test_skips_without_file(self, tmp_path):
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
 
     def test_audio_no_audio_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
@@ -315,6 +417,8 @@ class TestExportForOrtGenai:
         class FakeVision:
             image_size: int = 448
             patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str | None = None
 
         @dataclasses.dataclass
         class FakeConfig:
@@ -325,6 +429,7 @@ class TestExportForOrtGenai:
             num_attention_heads: int = 4
             num_key_value_heads: int = 2
             head_dim: int = 16
+            spatial_merge_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
         pkg = ModelPackage(
@@ -341,7 +446,13 @@ class TestExportForOrtGenai:
         assert os.path.isfile(result["processor_config"])
         with open(result["processor_config"]) as f:
             data = json.load(f)
-        assert data["image_size"] == 448
+        # New format: transform pipeline under "processor"
+        assert "processor" in data
+        transforms = data["processor"]["transforms"]
+        assert len(transforms) >= 4
+        # Verify resize uses config values
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["patch_size"] == 14
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
