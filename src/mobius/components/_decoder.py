@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -41,6 +41,10 @@ class DecoderLayer(nn.Module):
         linear_class: Factory callable ``(in_features, out_features, bias=...)``
             for creating projection layers in Attention and MLP. Defaults to
             ``Linear``. Pass a LoRA factory for LoRA-adapted layers.
+        mlp_class: MLP module class to use (default: :class:`~mobius.components.MLP`).
+            Pass :class:`~mobius.components.FusedGateUpMLP` for models that store
+            the gate and up projections as a single fused ``gate_up_proj`` weight
+            (e.g. Phi-3, Phi-4, GLM).
     """
 
     def __init__(
@@ -52,10 +56,13 @@ class DecoderLayer(nn.Module):
         attention_scale: float | None = None,
         post_norm: bool = False,
         linear_class: type | None = None,
+        mlp_class: type | None = None,
     ):
         super().__init__()
         if norm_class is None:
             norm_class = RMSNorm
+        if mlp_class is None:
+            mlp_class = MLP
 
         self._post_norm = post_norm
         self._residual_multiplier = residual_multiplier
@@ -66,7 +73,7 @@ class DecoderLayer(nn.Module):
             scale=attention_scale,
             linear_class=linear_class,
         )
-        self.mlp = MLP(config, linear_class=linear_class)
+        self.mlp = mlp_class(config, linear_class=linear_class)
 
         if post_norm:
             self.post_attention_layernorm = norm_class(
@@ -185,6 +192,7 @@ def create_decoder_layer(
     norm_class: type[nn.Module] | None = None,
     post_norm: bool = False,
     linear_class: type | None = None,
+    mlp_class: type | None = None,
 ) -> DecoderLayer:
     """Config-driven factory for creating decoder layers.
 
@@ -200,6 +208,8 @@ def create_decoder_layer(
         post_norm: If True, use post-norm residual connections (OLMo-2 style).
         linear_class: Factory callable for projection layers. Pass a LoRA
             factory for LoRA-adapted layers.
+        mlp_class: MLP module class override (default: MLP). Pass
+            FusedGateUpMLP for models with fused gate_up_proj weights.
 
     Returns:
         A configured DecoderLayer instance.
@@ -214,6 +224,7 @@ def create_decoder_layer(
         attention_scale=attention_scale,
         post_norm=post_norm,
         linear_class=linear_class,
+        mlp_class=mlp_class,
     )
 
 

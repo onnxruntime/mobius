@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Falcon and Bloom CausalLM models.
 
@@ -576,6 +576,15 @@ class FalconCausalLMModel(nn.Module):
             new_key = new_key.replace(".mlp.dense_h_to_4h.", ".mlp.up_proj.")
             new_key = new_key.replace(".mlp.dense_4h_to_h.", ".mlp.down_proj.")
             new_state_dict[new_key] = value
+
+        # HF Falcon / Bloom safetensors omit the "transformer." prefix
+        # (e.g. "h.N.*", "word_embeddings.*", "ln_f.*").  ONNX initialiser
+        # names include it because the outer attribute is ``self.transformer``.
+        # ``lm_head.*`` is a top-level attribute and stays as-is.
+        new_state_dict = {
+            (k if k.startswith(("transformer.", "lm_head.")) else "transformer." + k): v
+            for k, v in new_state_dict.items()
+        }
 
         # Handle weight tying
         if self.config.tie_word_embeddings:

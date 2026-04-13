@@ -101,6 +101,13 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
 - Use ONNX opset 23 `op.Attention` with `q_num_heads`/`kv_num_heads`
   attributes (not `num_heads`)
 
+### Protobuf prohibition
+
+- **Zero explicit protobuf operations in this repo**
+- Never use `onnx.helper`, `onnx.TensorProto`, `onnx.ModelProto`, or any protobuf construction APIs
+- Always use `onnx_ir` APIs (`ir.Graph`, `ir.Node`, `ir.Function`, `ir.Value`, `ir.Tensor`) — `onnxscript.ir` is a deprecated alias, do not use it
+- This applies to all code: models, components, tasks, tests, utilities, and function bodies
+
 ### Comments and documentation
 
 - **Add inline comments that explain the model architecture**: annotate

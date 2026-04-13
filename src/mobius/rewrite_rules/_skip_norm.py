@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Rewrite rules for fusing Add + RMSNormalization into SkipSimplifiedLayerNormalization.
 
@@ -9,7 +9,10 @@ running residual.  The ``com.microsoft::SkipSimplifiedLayerNormalization``
 custom op fuses these into a single node with two outputs: the normalized
 result and the skip (unnormalized sum).
 
-These rules are **not applied by default**.  Apply them post-export::
+These rules are applied automatically by
+:func:`~mobius._optimizations.optimize_model` for EPs that support
+SkipLayerNormalization (``supports_skip_layer_norm=True``; all EPs except
+TRT-RTX).  They can also be applied manually::
 
     from mobius.rewrite_rules import skip_norm_rules
     from onnxscript.rewriter import rewrite
@@ -56,18 +59,17 @@ class AddRMSNormToSkipNorm(RewriteRuleClassBase):
     def check(self, context, add_out, norm_out, **_):
         result = MatchResult()
 
-        # add_out must come from an Add node
+        # The Add output must come from an Add node
         producer = add_out.producer()
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to RMSNorm is not from an Add node")
 
-        # The Add output must have multiple consumers (RMSNorm + residual)
-        uses = list(add_out.uses())
-        if len(uses) < 2:
-            return result.fail(
-                f"Add output has only {len(uses)} consumer(s), "
-                "expected at least 2 (RMSNorm + downstream residual)"
-            )
+        # Don't fuse if add_out is itself a graph output — that indicates we're inside
+        # an ONNX function body (e.g. SkipSimplifiedLayerNormalization_body) where
+        # replace_all_uses_with would fail, or produce nested fusion.
+        graph = producer.graph
+        if graph is not None and add_out in graph.outputs:
+            return result.fail("Add output is a graph output — skip to avoid nested fusion")
 
         # Verify RMSNormalization has epsilon attribute
         rmsnorm = norm_out.producer()

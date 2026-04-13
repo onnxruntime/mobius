@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """TTS 4-model split task for Qwen3-TTS.
 
@@ -14,16 +14,21 @@ Used by Qwen3TTSForConditionalGeneration.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
     _register_kv_cache_outputs,
 )
 
@@ -31,21 +36,35 @@ from mobius.tasks._base import (
 class TTSTask(ModelTask):
     """4-model split for Qwen3-TTS.
 
-    The module must provide four sub-modules as attributes:
+    The module must provide three required sub-modules and one optional:
 
     - ``talker``: Decoder producing logits + last_hidden_state
     - ``code_predictor``: Small decoder for remaining code groups
     - ``embedding``: Text + codec embedding model
-    - ``speaker_encoder``: ECAPA-TDNN speaker encoder
+    - ``speaker_encoder``: ECAPA-TDNN speaker encoder *(optional — omitted
+      when the model uses a pre-computed speaker embedding instead)*
 
     Each sub-module is wired into its own ONNX graph.
     """
+
+    model_roles: ClassVar[dict[str, str]] = {
+        "talker": "decoder",
+        "code_predictor": "decoder",
+        "embedding": "embedding",
+        "speaker_encoder": "encoder",
+    }
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        talker="talker",
+        code_predictor="code_predictor",
+        embedding="embedding",
+    )
 
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
 
         models["talker"] = self._build_talker(module.talker, config)

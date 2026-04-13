@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Base causal language model for standard decoder-only transformers.
 
@@ -13,12 +13,12 @@ Qwen2ForCausalLM structure.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig, CausalLMConfig
 from mobius._weight_utils import (
     preprocess_awq_weights,
@@ -28,6 +28,7 @@ from mobius._weight_utils import (
 from mobius.components import (
     DecoderLayer,
     Embedding,
+    FusedGateUpMLP,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -35,15 +36,14 @@ from mobius.components import (
     initialize_rope,
     make_quantized_linear_factory,
 )
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
+from mobius.components._attention import GQAContext
+from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 
 
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
         self._dtype = config.dtype
 
@@ -63,7 +63,7 @@ class TextModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, linear_class=linear_class)
+                DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -83,21 +83,79 @@ class TextModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
 
-        # When attention_mask is None (static cache mode), skip mask
-        # creation entirely — the Attention op uses is_causal=1 instead.
-        # When present, create a bool padding mask. Causal masking is
-        # handled by is_causal=1 on the Attention op (set in
-        # _apply_attention), so we only need padding information here.
-        if attention_mask is not None:
-            padding_mask = create_padding_mask(
-                op,
-                input_ids=hidden_states if input_ids is None else input_ids,
-                attention_mask=attention_mask,
+        # Determine whether to emit GroupQueryAttention directly.
+        # Conditions:
+        #  - attention_mask present: static-cache mode passes None; GQA requires seqlens_k.
+        #  - EP gqa_dtypes: EP must declare GQA support for the build dtype (cuda/f16,
+        #    cpu/f32, etc.). Default EP has gqa_dtypes={} so GQA is never emitted.
+        #  - supports_fused_rope: EP must handle do_rotary=1 inside GQA. DML has
+        #    gqa_dtypes={FLOAT16} but supports_fused_rope=False, so it uses the
+        #    RotaryAttentionToGQA rewrite + SeparateRoPE path instead.
+        #  - BaseRope (not _MRopeBase): standard 1D RoPE tables are required.
+        #    _MRopeBase subclasses (ChunkedMRope for Qwen2.5-VL, InterleavedMRope for
+        #    Qwen3-VL/Qwen3.5) use 3D position_ids; GQA do_rotary=1 only implements 1D
+        #    RoPE, so those models must fall through to the RotaryAttentionToGQA rule.
+        caps = ep_capabilities()
+        dtype = get_build_dtype()
+        use_gqa = (
+            attention_mask is not None
+            and dtype in caps.gqa_dtypes
+            and caps.supports_fused_rope
+            and isinstance(self.rotary_emb, BaseRope)
+            and not isinstance(self.rotary_emb, _MRopeBase)
+        )
+
+        if use_gqa:
+            # Call rotary_emb to realize cos_cache / sin_cache as ONNX graph
+            # initializers (onnxscript registers parameters on module __call__).
+            # The returned gathered embeddings are discarded — GroupQueryAttention
+            # will index the full tables itself via do_rotary=1.
+            self.rotary_emb(op, position_ids)
+
+            # Build GQAContext from the cos/sin parameter tables and a
+            # seqlens_k / total_seq_len pair derived from attention_mask.
+            # Access cos_cache / sin_cache directly as ir.Value to avoid
+            # creating dead Gather(cos_cache, position_ids) nodes.
+            #
+            # seqlens_k[b] = sum(attention_mask[b]) - 1 = last valid KV index.
+            # total_seq_len = attention_mask.shape[1] = past + current len.
+            one_i32 = op.Constant(value_int=1)
+            seqlens_k = op.Cast(
+                op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i32),
+                to=ir.DataType.INT32,
+            )  # [batch] INT32
+            total_seq_len = op.Cast(
+                op.Gather(op.Shape(attention_mask), op.Constant(value_int=1)),
+                to=ir.DataType.INT32,
+            )  # scalar INT32
+
+            attention_bias: GQAContext | ir.Value | None = GQAContext(
+                seqlens_k=seqlens_k,
+                total_seq_len=total_seq_len,
+                cos_cache=self.rotary_emb.cos_cache,  # [max_seq, rotary_dim]
+                sin_cache=self.rotary_emb.sin_cache,  # [max_seq, rotary_dim]
             )
+            # position_embeddings not needed: GroupQueryAttention handles RoPE
+            # internally via do_rotary=1. Passing None skips apply_rotary_pos_emb
+            # in Attention.forward() (which checks `if position_embeddings is not None`).
+            position_embeddings = None
         else:
-            padding_mask = None
+            position_embeddings = self.rotary_emb(op, position_ids)
+
+            # When attention_mask is None (static cache mode), skip mask
+            # creation entirely — the Attention op uses is_causal=1 instead.
+            # When present, create a bool padding mask. Causal masking is
+            # handled by is_causal=1 on the Attention op (set in
+            # _apply_attention), so we only need padding information here.
+            if attention_mask is not None:
+                attention_bias = create_padding_mask(
+                    op,
+                    input_ids=hidden_states if input_ids is None else input_ids,
+                    attention_mask=attention_mask,
+                )
+            else:
+                attention_bias = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
@@ -105,7 +163,7 @@ class TextModel(nn.Module):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
-                attention_bias=padding_mask,
+                attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
             )
@@ -220,3 +278,24 @@ class LayerNormCausalLMModel(CausalLMModel):
         super().__init__(config)
         # Replace TextModel with the LayerNorm-based variant.
         self.model = LayerNormTextModel(config)
+
+
+class FusedGateUpCausalLMModel(CausalLMModel):
+    """CausalLM variant that keeps gate_up_proj fused (no weight splitting).
+
+    Use this instead of ``CausalLMModel`` for architectures where HuggingFace
+    stores the gate and up projections as a single fused ``gate_up_proj``
+    weight — e.g. Phi-3, Phi-4, and GLM.
+
+    The MLP forward pass does a single ``gate_up_proj`` MatMul and splits the
+    resulting activations, rather than splitting the weights at load time.
+    This is robust to GPTQ int32-packed weights where dimension 0 is
+    ``original / pack_factor`` and weight splitting would fail.
+
+    ``preprocess_weights`` does NOT need to split ``gate_up_proj``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        # Parameterize TextModel to use FusedGateUpMLP for each decoder layer.
+        self.model = TextModel(config, mlp_class=FusedGateUpMLP)

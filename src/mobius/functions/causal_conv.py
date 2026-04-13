@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Reference ir.Function for the CausalConvWithState operator.
 
@@ -189,7 +189,3 @@ def causal_conv1d_with_state(
         ndim=1,
         activation=activation,
     )
-
-
-# PascalCase alias — matches the ONNX op type name for discoverability.
-CausalConvWithState = causal_conv_nd_with_state

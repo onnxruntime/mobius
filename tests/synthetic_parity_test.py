@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """L3 Synthetic Parity Tests — registered model types.
 
@@ -704,11 +704,17 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]
 
     # 6. HF forward
+    # use_cache=False avoids DynamicCache initialization. In transformers >= 5.4
+    # (HF PR #44950), DynamicCache.has_previous_state() raises ValueError when called
+    # on a cache with only Attention layers (no Mamba/LinearAttention layers). Hybrid
+    # models (jamba, bamba) call this via _update_mamba_mask() even when the test config
+    # uses all-attention layers. Logits are identical with/without cache for a single pass.
     with torch.no_grad():
         hf_out = hf_model(
             input_ids=torch.from_numpy(input_ids),
             attention_mask=torch.from_numpy(attention_mask),
             position_ids=torch.from_numpy(position_ids),
+            use_cache=False,
         )
     hf_logits = hf_out.logits.numpy()
 

@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Seq2Seq task for encoder-decoder models (T5, BART, etc.)."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -11,10 +13,13 @@ from onnxscript import nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
-    _make_kv_cache_inputs,
     _make_model,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
 )
 
 
@@ -29,11 +34,15 @@ class Seq2SeqTask(ModelTask):
     The module must have ``encoder`` and ``decoder`` attributes.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         encoder_model = self._build_encoder_graph(module, config)
         decoder_model = self._build_decoder_graph(module, config)
         return ModelPackage(
@@ -137,7 +146,7 @@ class Seq2SeqTask(ModelTask):
             v.name = f"past_key_values.{idx}.cross.{kv_type}"
         graph_inputs.extend(cross_kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="decoder")
+        graph, builder = _make_graph(graph_inputs)
         op = builder.op
 
         logits, present_self_kvs, present_cross_kvs = module.decoder(

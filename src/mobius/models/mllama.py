@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Mllama (Meta Llama 3.2 Vision) multimodal model.
 
@@ -318,9 +318,15 @@ class _MllamaVisionEncoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return {
-            key: value for key, value in state_dict.items() if key.startswith("vision_model.")
-        }
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if not key.startswith("vision_model."):
+                continue
+            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
+            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
+            renamed[key] = value
+        return renamed
 
 
 class _MllamaEmbeddingModel(nn.Module):

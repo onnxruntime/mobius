@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Model tasks that define graph I/O structure for different use cases.
 
@@ -23,6 +23,7 @@ __all__ = [
     "AudioFeatureExtractionTask",
     "CausalLMTask",
     "CodecTask",
+    "ComponentSpec",
     "ControlNetTask",
     "DenoisingTask",
     "FeatureExtractionTask",
@@ -35,6 +36,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
     "QwenVLTask",
@@ -48,13 +50,20 @@ __all__ = [
     "VAETask",
     "VideoDenoisingTask",
     "VisionLanguageTask",
+    "build_decoder_from_embeds",
+    "build_embedding_from_features",
     "get_task",
 ]
 
 from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
-from mobius.tasks._base import ModelTask
+from mobius.tasks._base import (
+    ComponentSpec,
+    ModelTask,
+    build_decoder_from_embeds,
+    build_embedding_from_features,
+)
 from mobius.tasks._causal_lm import (
     CausalLMTask,
     HybridCausalLMTask,
@@ -79,6 +88,7 @@ from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
+    PixtralVLTask,
     QwenVLTask,
     VisionLanguageTask,
 )
@@ -102,6 +112,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,

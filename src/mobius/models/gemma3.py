@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Gemma3 multimodal model (vision + text) — 3-model split.
 
@@ -94,11 +94,14 @@ class _Gemma3VisionEncoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {
-            key: value
-            for key, value in state_dict.items()
-            if key.startswith(("vision_tower.", "multi_modal_projector."))
-        }
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if not key.startswith(("vision_tower.", "multi_modal_projector.")):
+                continue
+            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
+            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
+            renamed[key] = value
         return renamed
 
 

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Command-line interface for mobius."""
 
@@ -79,7 +79,6 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
 
     from mobius.rewrite_rules import (
         bias_gelu_rules,
-        fused_matmul_rules,
         group_query_attention_rules,
         packed_attention_rules,
         skip_layer_norm_rules,
@@ -88,11 +87,7 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
 
     rule_map = {
         "bias_gelu": bias_gelu_rules,
-        # group_query_attention (incl. QKV packing) must run before
-        # fused_matmul so that projections are still plain MatMul nodes
-        # when the packing pattern matches.
         "group_query_attention": group_query_attention_rules,
-        "fused_matmul": fused_matmul_rules,
         "packed_attention": packed_attention_rules,
         "skip_layer_norm": skip_layer_norm_rules,
         "skip_norm": skip_norm_rules,
@@ -149,6 +144,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     dtype_override = resolve_dtype(args.dtype)
     optimize = args.optimize
     component_filter = args.component
+    execution_provider = args.execution_provider
 
     # Auto-detect diffusers pipelines
     if args.model and not args.config:
@@ -184,7 +180,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
         model_module = module_class(config)
-        pkg = build_from_module(model_module, config, task=task)
+        pkg = build_from_module(
+            model_module, config, task=task, execution_provider=execution_provider
+        )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
@@ -199,6 +197,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             dtype=dtype_override,
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
+            execution_provider=execution_provider,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -207,7 +206,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
-    """Save a ModelPackage to disk, applying optimizations."""
+    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -230,6 +229,25 @@ def _save_package(
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+    runtime = getattr(args, "runtime", None)
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai import write_ort_genai_config
+
+        hf_model_id = getattr(args, "model", None)
+        ep = getattr(args, "execution_provider", "cpu")
+        # When --config (local dir) is used instead of --model, copy tokenizer
+        # files from the local directory rather than downloading from HF.
+        local_config_dir = getattr(args, "config", None)
+        artifacts = write_ort_genai_config(
+            pkg,
+            output_dir,
+            hf_model_id=hf_model_id,
+            ep=ep,
+            local_config_dir=local_config_dir,
+        )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
@@ -258,8 +276,23 @@ def _cmd_list(args: argparse.Namespace) -> None:
                 aliases = [k for k, v in DTYPE_MAP.items() if v == dt]
                 print(f"  {' | '.join(aliases):<25} → {dt.name}")
                 seen.add(dt.name)
+    elif resource == "eps":
+        from mobius._execution_providers import ep_registry
+
+        eps = sorted(ep_registry.names())
+        print(f"Registered execution providers ({len(eps)}):\n")
+        for ep_name in eps:
+            caps = ep_registry.require(ep_name)
+            gqa = ", ".join(dt.name for dt in sorted(caps.gqa_dtypes, key=lambda d: d.name))
+            extras = []
+            if not caps.supports_fused_rope:
+                extras.append("no-fused-rope")
+            if not caps.supports_skip_layer_norm:
+                extras.append("no-skip-layer-norm")
+            flags = f"  [{', '.join(extras)}]" if extras else ""
+            print(f"  {ep_name:<12} gqa_dtypes=[{gqa}]{flags}")
     else:
-        print(f"Unknown resource '{resource}'. Use: models, tasks, dtypes")
+        print(f"Unknown resource '{resource}'. Use: models, tasks, dtypes, eps")
 
 
 def _cmd_build_gguf(args: argparse.Namespace) -> None:
@@ -457,6 +490,32 @@ def main(argv: list[str] | None = None) -> None:
         help="Maximum sequence length for static cache buffers. "
         "Only used with --static-cache. Defaults to max_position_embeddings from config.",
     )
+    build_parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware optimizations "
+            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Use 'mobius list eps' to see available EPs. "
+            "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
+        ),
+    )
+    build_parser.add_argument(
+        "--runtime",
+        default=None,
+        choices=["ort-genai"],
+        metavar="RUNTIME",
+        help=(
+            "Generate runtime-specific config files after building. "
+            "Currently supports: 'ort-genai' (writes genai_config.json and "
+            "copies tokenizer files). When used with --model, tokenizer files "
+            "are downloaded from HuggingFace. When used with --config (local "
+            "directory), tokenizer files are copied from that directory."
+        ),
+    )
     build_parser.set_defaults(func=_cmd_build)
 
     # --- build-gguf ---
@@ -495,11 +554,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- list ---
     list_parser = subparsers.add_parser(
-        "list", help="List supported models, tasks, or dtypes."
+        "list", help="List supported models, tasks, dtypes, or EPs."
     )
     list_parser.add_argument(
         "resource",
-        choices=["models", "tasks", "dtypes"],
+        choices=["models", "tasks", "dtypes", "eps"],
         help="What to list.",
     )
     list_parser.set_defaults(func=_cmd_list)

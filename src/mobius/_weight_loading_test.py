@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Defensive security regression tests for the weight loading path.
 
@@ -280,21 +280,25 @@ class TestPathTraversalPrevention:
         assert not basename.startswith("/")
 
     def test_apply_weights_only_modifies_existing_initializers(self):
-        """apply_weights must not create new initializers — only update existing ones."""
-        model, _init_names = _build_model_with_weights()
-        original_count = len(model.graph.initializers)
+        """apply_weights must not inject initializers keyed by untrusted state dict names.
 
-        # Inject a weight with a path-like name that doesn't match any initializer
-        provider = MockWeightProvider(
-            {
-                "../../etc/passwd": torch.zeros(1),
-                "normal_name_not_in_model": torch.zeros(1),
-            }
-        )
+        The fold pipeline (FoldTransposedInitializerPass etc.) is allowed to create new
+        initializers with names derived from existing ones (e.g. ``weight_t``), but no
+        initializer should ever be created whose name came from an untrusted state dict key.
+        """
+        model, _init_names = _build_model_with_weights()
+
+        # Inject weights with a path-like name and an unknown name — neither should
+        # appear as an initializer after apply_weights.
+        malicious_keys = {"../../etc/passwd", "normal_name_not_in_model"}
+        provider = MockWeightProvider({key: torch.zeros(1) for key in malicious_keys})
         apply_weights(model, provider.get_state_dict())
 
-        # No new initializers should be created
-        assert len(model.graph.initializers) == original_count
+        # Injected key names must not appear as initializer names.
+        for key in malicious_keys:
+            assert key not in model.graph.initializers, (
+                f"Untrusted key '{key}' was injected into graph.initializers"
+            )
 
     @pytest.mark.parametrize(
         "malicious_model_id",
@@ -514,3 +518,108 @@ class TestBuildFromModuleContract:
         module = CausalLMModel(config)
         pkg = build_from_module(module, config, task=StubTask())
         assert pkg["model"].graph.name == "stub"
+
+
+class TestDequantizeFP8Weights:
+    """Tests for _dequantize_fp8_weights."""
+
+    def test_no_fp8_returns_unchanged(self):
+        """Non-FP8 state dicts pass through unchanged."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        state_dict = {
+            "layer.weight": torch.randn(4, 4),
+            "layer.bias": torch.randn(4),
+        }
+        result = _dequantize_fp8_weights(state_dict)
+        assert set(result.keys()) == set(state_dict.keys())
+        assert torch.equal(result["layer.weight"], state_dict["layer.weight"])
+
+    def test_fp8_e4m3fn_dequantized(self):
+        """FP8 weights are multiplied by weight_scale_inv."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.tensor([1.0, 2.0, -1.0, 0.5], dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        scale_inv = torch.tensor(0.5, dtype=torch.bfloat16)
+        state_dict = {
+            "proj.weight": fp8_weight,
+            "proj.weight_scale_inv": scale_inv,
+        }
+        result = _dequantize_fp8_weights(state_dict)
+        assert "proj.weight" in result
+        assert "proj.weight_scale_inv" not in result  # aux tensor removed
+        assert result["proj.weight"].dtype == torch.bfloat16
+        # Verify dequant: fp8→bf16 * scale_inv
+        expected = fp8_weight.to(torch.bfloat16) * scale_inv
+        assert torch.allclose(result["proj.weight"], expected)
+
+    def test_activation_scale_removed(self):
+        """Auxiliary activation_scale tensors are removed."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        state_dict = {
+            "proj.weight": torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn),
+            "proj.weight_scale_inv": torch.tensor(1.0, dtype=torch.bfloat16),
+            "proj.activation_scale": torch.tensor(1.0, dtype=torch.bfloat16),
+        }
+        result = _dequantize_fp8_weights(state_dict)
+        assert "proj.activation_scale" not in result
+
+    def test_suffix_replace_not_greedy(self):
+        """The scale key derivation uses suffix replacement, not global replace.
+
+        For a key like 'model.weight_proj.weight', the scale key should be
+        'model.weight_proj.weight_scale_inv' (not 'model.weight_scale_inv_proj.weight_scale_inv').
+        """
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.tensor(2.0, dtype=torch.bfloat16)
+        state_dict = {
+            "model.weight_proj.weight": fp8_weight,
+            "model.weight_proj.weight_scale_inv": scale,
+        }
+        result = _dequantize_fp8_weights(state_dict)
+        assert "model.weight_proj.weight" in result
+        assert result["model.weight_proj.weight"].dtype == torch.bfloat16
+
+    def test_missing_scale_casts_without_scaling(self):
+        """FP8 weight without scale_inv is cast to bfloat16 without scaling."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
+        state_dict = {"orphan.weight": fp8_weight}
+        result = _dequantize_fp8_weights(state_dict)
+        assert result["orphan.weight"].dtype == torch.bfloat16
+
+    def test_fp32_scale_produces_bf16_output(self):
+        """FP32 weight_scale_inv should still produce bfloat16 output."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
+        # Scale stored as FP32 (common for scalar scales in real checkpoints)
+        scale_inv = torch.tensor(0.5, dtype=torch.float32)
+        state_dict = {
+            "proj.weight": fp8_weight,
+            "proj.weight_scale_inv": scale_inv,
+        }
+        result = _dequantize_fp8_weights(state_dict)
+        assert result["proj.weight"].dtype == torch.bfloat16, (
+            f"Expected bfloat16, got {result['proj.weight'].dtype}"
+        )
+
+    def test_does_not_mutate_input(self):
+        """_dequantize_fp8_weights should not mutate the input dict."""
+        from mobius._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.tensor([1.0], dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.tensor(1.0, dtype=torch.bfloat16)
+        original = {
+            "proj.weight": fp8_weight,
+            "proj.weight_scale_inv": scale,
+        }
+        original_keys = set(original.keys())
+        _dequantize_fp8_weights(original)
+        assert set(original.keys()) == original_keys, "Input dict was mutated"

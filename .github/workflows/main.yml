@@ -84,8 +84,22 @@ jobs:
           pip install -e '.[testing]'
       - name: Run L1 smoke tests (all model configs)
         run: |
-          pytest tests/build_graph_test.py -v --tb=short -n auto
+          pytest tests/build_graph_test.py -v --tb=short -n auto \
+            --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
         timeout-minutes: 10
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: smoke
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: smoke
+          report-type: test_results
 
   synthetic-parity:
     name: L3 Synthetic Parity
@@ -125,7 +139,8 @@ jobs:
              [ "${{ needs.detect-affected.outputs.run_all }}" = "true" ] || \
              [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "Running all synthetic parity tests"
-            pytest tests/synthetic_parity_test.py -v --tb=short -n auto
+            pytest tests/synthetic_parity_test.py -v --tb=short -n auto \
+              --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
           else
             AFFECTED='${{ needs.detect-affected.outputs.affected }}'
             echo "Running parity for affected models: $AFFECTED"
@@ -137,12 +152,26 @@ jobs:
           print(' or '.join(escaped))
           ")
             if [ -n "$FILTER" ]; then
-              pytest tests/synthetic_parity_test.py -v --tb=short -n auto -k "$FILTER"
+              pytest tests/synthetic_parity_test.py -v --tb=short -n auto -k "$FILTER" \
+                --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
             else
               echo "No affected models — skipping"
             fi
           fi
         timeout-minutes: 20
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: synthetic-parity
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: synthetic-parity
+          report-type: test_results
 
   golden-comparison:
     name: L4 Golden Comparison
@@ -200,8 +229,23 @@ jobs:
             exit 0
           fi
           pytest tests/e2e_golden_test.py -m golden -v --tb=short \
+            --cov=src --cov-report=xml --cov-branch \
             --junitxml golden-results.xml
         timeout-minutes: 30
+      - name: Upload coverage to Codecov
+        if: steps.check_golden.outputs.has_golden == 'true'
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: golden
+      - name: Upload test results to Codecov
+        if: steps.check_golden.outputs.has_golden == 'true' && !cancelled()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: golden
+          report-type: test_results
+          files: golden-results.xml
       - name: Upload golden test results
         if: always() && steps.check_golden.outputs.has_golden == 'true'
         uses: actions/upload-artifact@v7
@@ -240,10 +284,26 @@ jobs:
       - name: Run tests
         run: |
           pytest -n auto -m 'not integration and not arch_validation' --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
+          report-type: test_results
 
   integration-fast:
     name: Integration (fast)
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-integration-fast-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
@@ -257,8 +317,8 @@ jobs:
           key: hf-integration-fast-${{ hashFiles('tests/integration_test.py') }}
           restore-keys: |
             hf-integration-fast-
-      - name: Install PyTorch CPU
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PyTorch CUDA
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
@@ -266,8 +326,22 @@ jobs:
       - name: Run fast integration tests
         run: |
           pytest tests/integration_test.py -m integration_fast -v \
-            -k "smollm-135m or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2"
+            -k "smollm-135m or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2" \
+            --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
         timeout-minutes: 15
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: integration
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: integration
+          report-type: test_results
 
   build:
     name: Build

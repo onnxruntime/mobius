@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Static-cache text generation example — greedy decoding with pre-allocated KV buffers.
 
@@ -33,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 import transformers
@@ -200,6 +201,11 @@ def main():
         default=None,
         help=("Save the ONNX model package to DIR and exit (no inference)."),
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Exit with non-zero code on failure (for CI pipelines).",
+    )
     args = parser.parse_args()
 
     # Build the model with static cache
@@ -234,4 +240,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        if "--ci" in sys.argv:
+            print(f"FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        raise

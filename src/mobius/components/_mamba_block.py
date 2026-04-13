@@ -1,40 +1,38 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-"""Mamba block component: Conv1D → SSM → gated output projection.
+"""Mamba block components: Conv1D → SSM → gated output projection.
 
-Implements the standard Mamba layer used in Mamba, Jamba, Bamba,
-FalconMamba, and related architectures. Composes a causal depthwise
-Conv1D with the SelectiveScan SSM and a SiLU-gated output path.
+This module provides:
 
-Architecture per layer:
-    1. in_proj: x → (x_branch, z_gate)  [expansion to d_inner]
-    2. Causal depthwise Conv1D on x_branch
-    3. SiLU activation
-    4. Selective scan (SSM) with recurrent state
-    5. Output gating: y * SiLU(z)
-    6. out_proj: project back to d_model
+- **MambaBlock** (Mamba1): standard Mamba layer for Mamba, Jamba,
+  FalconMamba, etc.
+- **Mamba2BlockBase**: shared ``__init__`` and helpers for all Mamba2
+  multi-token modes.
+- **Mamba2BlockSingle**: single-token path (seq_len must be 1).
+- **Mamba2Block**: factory function that instantiates the correct
+  subclass based on ``flags.mamba_scan``.
 
-State carried across steps:
-    conv_state:  (batch, d_inner, conv_kernel - 1)
-    ssm_state:   (batch, d_inner, d_state)
+The full set of Mamba2 subclasses is:
 
-HuggingFace reference: ``MambaMixer``.
+- ``Mamba2BlockSingle``  — this file
+- ``Mamba2BlockScan``    — ``_mamba_block_scan.py``
+- ``Mamba2BlockChunkedSSD`` — ``_mamba_block_chunked.py``
+
+HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
+``NemotronHMamba2Mixer``.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
+from mobius._flags import flags
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import Mamba2Scan, SelectiveScan
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -135,7 +133,7 @@ class MambaBlock(nn.Module):
         # Split into x_branch and z_gate along last dim
         x_branch, z_gate = op.Split(
             projected,
-            op.Constant(value_ints=[self.d_inner, self.d_inner]),
+            [self.d_inner, self.d_inner],
             axis=-1,
             _outputs=2,
         )
@@ -152,9 +150,9 @@ class MambaBlock(nn.Module):
         # Update conv state: drop oldest, keep last (conv_kernel-1)
         new_conv_state = op.Slice(
             conv_input,
-            op.Constant(value_ints=[1]),
-            op.Constant(value_ints=[INT64_MAX]),
-            op.Constant(value_ints=[2]),
+            starts=[1],
+            ends=[INT64_MAX],
+            axes=[2],
         )
 
         # Apply depthwise conv: (batch, d_inner, 1)
@@ -181,8 +179,18 @@ class MambaBlock(nn.Module):
         return output, new_conv_state, new_ssm_state
 
 
-class Mamba2Block(nn.Module):
-    """Mamba2/SSD block: in_proj -> Conv1D -> multi-head SSM -> gated norm.
+# =====================================================================
+# Mamba2 base class and subclasses
+# =====================================================================
+
+
+class Mamba2BlockBase(nn.Module):
+    """Base class for all Mamba2 block variants.
+
+    Shared ``__init__`` defines the parameters (in_proj, conv1d, ssm,
+    norm, out_proj) so that all subclasses produce identical ONNX
+    weight paths.  Subclasses override ``forward()`` with the specific
+    multi-token algorithm.
 
     Key differences from MambaBlock (Mamba1):
     - in_proj outputs [gate, xBC, dt] instead of [x, z]
@@ -190,8 +198,6 @@ class Mamba2Block(nn.Module):
     - Multi-head SSM with grouped B/C
     - GatedRMSNorm instead of SiLU gating
     - dt direct from in_proj (no rank reduction), just bias
-
-    HuggingFace reference: ``BambaMixer``.
     """
 
     def __init__(
@@ -202,11 +208,13 @@ class Mamba2Block(nn.Module):
         d_head: int,
         d_state: int,
         n_groups: int = 1,
+        chunk_size: int = 256,
         conv_kernel: int = 4,
         conv_bias: bool = True,
         proj_bias: bool = False,
         eps: float = 1e-5,
         norm_group_size: int | None = None,
+        time_step_min: float = 0.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -215,16 +223,65 @@ class Mamba2Block(nn.Module):
         self.d_head = d_head
         self.d_state = d_state
         self.n_groups = n_groups
+        self.chunk_size = chunk_size
         self.conv_kernel = conv_kernel
+        self.heads_per_group = num_heads // n_groups
+        self.time_step_min = time_step_min
 
         self.conv_dim = d_inner + 2 * n_groups * d_state
 
         proj_size = d_inner + self.conv_dim + num_heads
         self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
-        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel, bias=conv_bias)
-        self.ssm = Mamba2Scan(num_heads, d_head, d_state, n_groups)
-        self.norm = GatedRMSNorm(d_inner, eps=eps, group_size=norm_group_size)
+        self.conv1d = _DepthwiseConv1d(
+            self.conv_dim,
+            conv_kernel,
+            bias=conv_bias,
+        )
+        # SSM parameters live under self.ssm so that ONNX weight paths
+        # stay as ``mamba.ssm.{A_log,D,dt_bias}`` — compatible with all
+        # existing preprocess_weights rename rules.
+        self.ssm = Mamba2Scan(
+            num_heads,
+            d_head,
+            d_state,
+            n_groups,
+            time_step_min=time_step_min,
+        )
+        self.norm = GatedRMSNorm(
+            d_inner,
+            eps=eps,
+            group_size=norm_group_size,
+        )
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
+
+    @staticmethod
+    def _realize_submodule(
+        parent_builder: builder.GraphBuilder,
+        submodule: nn.Module,
+    ) -> None:
+        """Register a submodule's parameters as parent-graph initializers.
+
+        When a forward path references ``self.ssm.A_log`` etc. directly
+        (without calling ``self.ssm(...)``), or when Scan body graphs
+        need parameters as implicit inputs, this helper pushes the
+        naming context and calls ``_realize()`` on every parameter so
+        they appear as graph initializers.
+        """
+        name = submodule._name or ""
+        parent_builder.push_module(name, type(submodule).__qualname__)
+        for param in submodule._parameters.values():
+            param._realize(parent_builder)
+        for child in submodule._modules.values():
+            Mamba2BlockBase._realize_submodule(parent_builder, child)
+        parent_builder.pop_module()
+
+
+class Mamba2BlockSingle(Mamba2BlockBase):
+    """Mamba2 block: single-token path (seq_len must be 1).
+
+    Uses the Mamba2Scan recurrence directly with no chunking or Scan.
+    Useful for debugging numerical issues.
+    """
 
     def forward(
         self,
@@ -233,7 +290,7 @@ class Mamba2Block(nn.Module):
         conv_state: ir.Value,
         ssm_state: ir.Value,
     ):
-        """Single-token forward pass for the Mamba2 block.
+        """Single-token forward pass (seq_len must be 1).
 
         Args:
             op: ONNX op builder.
@@ -250,7 +307,7 @@ class Mamba2Block(nn.Module):
         projected = self.in_proj(op, hidden_states)
         gate, x_bc, dt = op.Split(
             projected,
-            op.Constant(value_ints=[self.d_inner, self.conv_dim, self.num_heads]),
+            [self.d_inner, self.conv_dim, self.num_heads],
             axis=-1,
             _outputs=3,
         )
@@ -260,9 +317,9 @@ class Mamba2Block(nn.Module):
         conv_input = op.Concat(conv_state, x_bc_t, axis=2)
         new_conv_state = op.Slice(
             conv_input,
-            op.Constant(value_ints=[1]),
-            op.Constant(value_ints=[INT64_MAX]),
-            op.Constant(value_ints=[2]),
+            starts=[1],
+            ends=[INT64_MAX],
+            axes=[2],
         )
         conv_out = self.conv1d(op, conv_input)
 
@@ -271,31 +328,74 @@ class Mamba2Block(nn.Module):
         x_bc_activated = op.Transpose(conv_out, perm=[0, 2, 1])
 
         # Step 4: Split xBC -> hidden, B, C
-        groups_state = self.n_groups * self.d_state
+        gs = self.n_groups * self.d_state
         hidden_x, b_mat, c_mat = op.Split(
             x_bc_activated,
-            op.Constant(value_ints=[self.d_inner, groups_state, groups_state]),
+            [self.d_inner, gs, gs],
             axis=-1,
             _outputs=3,
         )
 
-        # Squeeze seq dim for SSM
+        # Squeeze seq dim for SSM: (B, 1, D) → (B, D)
         hidden_flat = op.Squeeze(hidden_x, [1])
         dt_flat = op.Squeeze(dt, [1])
         b_flat = op.Squeeze(b_mat, [1])
         c_flat = op.Squeeze(c_mat, [1])
 
         # Step 5: Multi-head selective scan
-        y, new_ssm_state = self.ssm(op, hidden_flat, dt_flat, b_flat, c_flat, ssm_state)
+        y, new_ssm_state = self.ssm(
+            op,
+            hidden_flat,
+            dt_flat,
+            b_flat,
+            c_flat,
+            ssm_state,
+        )
 
         # Step 6: Gated RMSNorm
         gate_flat = op.Squeeze(gate, [1])
         y_normed = self.norm(op, y, gate_flat)
 
-        # Restore seq dim
+        # Restore seq dim: (B, d_inner) → (B, 1, d_inner)
         y_3d = op.Unsqueeze(y_normed, [1])
 
         # Step 7: Output projection
         output = self.out_proj(op, y_3d)
 
         return output, new_conv_state, new_ssm_state
+
+
+# =====================================================================
+# Factory function
+# =====================================================================
+
+
+def Mamba2Block(*args, **kwargs) -> Mamba2BlockBase:  # noqa: N802
+    """Instantiate the Mamba2 block variant for the current flag.
+
+    Reads ``flags.mamba_scan`` at construction time and returns the
+    matching subclass.  Callers use this exactly like the old
+    ``Mamba2Block`` class — no API change.
+
+    Available modes:
+
+    - ``"single"`` → ``Mamba2BlockSingle`` (this file)
+    - ``"scan"`` → ``Mamba2BlockScan`` (``_mamba_block_scan.py``)
+    - ``"chunked_ssd"`` → ``Mamba2BlockChunkedSSD``
+      (``_mamba_block_chunked.py``)
+    """
+    mode = flags.mamba_scan
+    if mode == "single":
+        return Mamba2BlockSingle(*args, **kwargs)
+    if mode == "scan":
+        from mobius.components._mamba_block_scan import Mamba2BlockScan
+
+        return Mamba2BlockScan(*args, **kwargs)
+    if mode == "chunked_ssd":
+        from mobius.components._mamba_block_chunked import (
+            Mamba2BlockChunkedSSD,
+        )
+
+        return Mamba2BlockChunkedSSD(*args, **kwargs)
+    msg = f"Unknown mamba_scan mode {mode!r}. Expected 'single', 'scan', or 'chunked_ssd'."
+    raise ValueError(msg)

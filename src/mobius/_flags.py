@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Runtime feature flags for mobius.
 
@@ -55,6 +55,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_str(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """Read a string from an environment variable.
+
+    Returns *default* if the variable is unset or has an unrecognised value.
+    For backwards compatibility, ``"1"``/``"true"``/``"yes"`` map to the
+    first choice, and ``"0"``/``"false"``/``"no"`` map to the last choice.
+    """
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    # Direct match against choices
+    for c in choices:
+        if val == c.lower():
+            return c
+    # Boolean-style aliases: truthy → first choice, falsy → last choice
+    if val in ("1", "true", "yes"):
+        return choices[0]
+    if val in ("0", "false", "no"):
+        return choices[-1]
+    return default
+
+
 @dataclasses.dataclass
 class _Flags:
     """Runtime feature flags singleton.
@@ -96,6 +118,28 @@ class _Flags:
     """Decompose grouped RMSNormalization into basic ops to work around an
     ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
+    """
+
+    mamba_scan: str = dataclasses.field(
+        default_factory=lambda: _env_str(
+            "MOBIUS_MAMBA_SCAN",
+            "single",
+            ("chunked_ssd", "scan", "single"),
+        )
+    )
+    """Multi-token Mamba2 forward strategy.
+
+    - ``"single"`` (default): single-token-only path (seq_len must
+      be 1).  The simplest and most debuggable mode.
+    - ``"chunked_ssd"``: chunked SSD algorithm — processes the full
+      sequence in parallel within chunks, with cross-chunk state
+      propagation.  Matches HF ``torch_forward``.
+    - ``"scan"``: ONNX Scan op that iterates token-by-token.  Supports
+      arbitrary seq_len but is sequential.
+
+    Set via ``MOBIUS_MAMBA_SCAN=chunked_ssd|scan|single``.
+    For backwards compatibility, ``1``/``true`` → ``chunked_ssd``,
+    ``0``/``false`` → ``single``.
     """
 
 

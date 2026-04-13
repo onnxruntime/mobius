@@ -69,6 +69,7 @@ jobs:
             -v \
             --timeout=300 \
             --junitxml=junit-l4.xml \
+            --cov=src --cov-report=xml --cov-branch \
             --tb=short
         timeout-minutes: 30
 
@@ -81,8 +82,32 @@ jobs:
             -v \
             --timeout=300 \
             --junitxml=junit-l5.xml \
+            --cov=src --cov-report=xml --cov-append --cov-branch \
             --tb=short
         timeout-minutes: 30
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu
+      - name: Upload L4 test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l4
+          report-type: test_results
+          files: junit-l4.xml
+      - name: Upload L5 test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l5
+          report-type: test_results
+          files: junit-l5.xml
 
       - name: Upload test results
         if: always()

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """SAM ViT-B vision encoder for DeepSeek-OCR-2.
 
@@ -25,6 +25,7 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius.components._common import Linear
+from mobius.components._mlp import FCMLP
 
 
 class _SAMPatchEmbed(nn.Module):
@@ -237,18 +238,6 @@ class _SAMAttention(nn.Module):
         )
 
 
-class _SAMMLPBlock(nn.Module):
-    """MLP block for SAM: Linear → GELU → Linear."""
-
-    def __init__(self, embedding_dim: int, mlp_dim: int):
-        super().__init__()
-        self.lin1 = Linear(embedding_dim, mlp_dim, bias=True)
-        self.lin2 = Linear(mlp_dim, embedding_dim, bias=True)
-
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
-        return self.lin2(op, op.Gelu(self.lin1(op, x)))
-
-
 class _SAMBlock(nn.Module):
     """SAM transformer block with optional window attention.
 
@@ -287,7 +276,8 @@ class _SAMBlock(nn.Module):
             input_size=attn_input_size,
         )
         self.norm2 = _SAMLayerNorm(dim)
-        self.mlp = _SAMMLPBlock(dim, int(dim * mlp_ratio))
+        # GELU MLP with bias (HF lin1/lin2 → up_proj/down_proj)
+        self.mlp = FCMLP(dim, int(dim * mlp_ratio), activation="gelu", bias=True)
 
         self._window_size = window_size
         self._input_size = input_size

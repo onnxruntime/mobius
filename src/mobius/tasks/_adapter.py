@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Adapter task for T2I-Adapter and IP-Adapter models."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -14,7 +16,7 @@ from mobius.tasks._base import ModelTask, _make_graph, _make_model
 class AdapterTask(ModelTask):
     """Build ONNX graph for conditioning adapters (T2I, IP-Adapter)."""
 
-    name = "adapter"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
@@ -50,4 +52,4 @@ class AdapterTask(ModelTask):
             outputs.name = "adapter_output"
             graph.outputs.append(outputs)
 
-        return ModelPackage({"model": _make_model(graph)})
+        return ModelPackage({"model": _make_model(graph)}, config=config)

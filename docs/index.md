@@ -8,13 +8,48 @@ Build ONNX models directly from HuggingFace model IDs with automatic weight down
 
 ```{toctree}
 :maxdepth: 2
-:caption: Contents
+:caption: User Guide
 
 getting-started
 cli
+module-architecture
+model-catalog
 models/index
-design
-test-architecture
-ai-model-support-strategy
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Execution Providers
+
+ep_quickstart
+execution_providers
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Reference
+
+api/index
 feature-flags
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Design
+
+design/index
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Contributing
+
+ai-model-support-strategy
+```
+
+```{toctree}
+:maxdepth: 2
+:caption: Research
+
+research/testing-strategy-analysis
 ```

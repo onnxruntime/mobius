@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Codec tokenizer 2-model task for Qwen3-TTS-Tokenizer-12Hz.
 
@@ -10,12 +10,15 @@ Builds two ONNX models:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -32,11 +35,15 @@ class CodecTask(ModelTask):
     Each is wired into its own ONNX graph with no KV cache.
     """
 
+    model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
+    components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["encoder"] = self._build_encoder(module.encoder, config)
@@ -64,7 +71,7 @@ class CodecTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, builder = _make_graph([codes], name="decoder")
+        graph, builder = _make_graph([codes])
         waveform = decoder(builder.op, codes)
 
         waveform.name = "waveform"

@@ -1,12 +1,12 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Base class for model tasks and shared graph construction helpers."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -17,49 +17,89 @@ from mobius._configs import BaseModelConfig
 from mobius._constants import OPSET_VERSION
 from mobius._model_package import ModelPackage
 
-_FUNCTIONS_DOMAIN = "pkg.mobius"
 
-# Cache state pair: (key, value) or (conv_state, ssm_state) for stateful
-# layers.  MLP-only layers are stateless and use (None, None).
-StatePair = tuple[ir.Value, ir.Value] | tuple[None, None]
+class ComponentSpec:
+    """Declares which sub-module attributes a multi-component task requires.
 
+    Used by multi-component tasks (e.g. :class:`VisionLanguageTask`) to
+    validate that a module exposes the expected sub-module attributes before
+    building begins.  This produces a clear :exc:`TypeError` instead of the
+    cryptic ``AttributeError`` that would otherwise surface deep inside
+    ``build()``.
 
-class LinearAttentionDims(NamedTuple):
-    """Dimension sizes for linear attention (DeltaNet) layers."""
+    Map output model names to the module attribute that builds each component::
 
-    num_k_heads: int
-    num_v_heads: int
-    head_k_dim: int
-    head_v_dim: int
-    key_dim: int  # = head_k_dim * num_k_heads
-    value_dim: int  # = head_v_dim * num_v_heads
-    conv_dim: int  # = key_dim * 2 + value_dim
-    conv_kernel: int
+        ComponentSpec(
+            decoder="decoder",
+            vision="vision_encoder",
+            embedding="embedding",
+        )
 
+    The keys are the names used in the output :class:`ModelPackage`; the
+    values are the attribute names on the ``nn.Module`` passed to
+    ``task.build()``.  Dot notation is supported for nested attributes
+    (e.g. ``"model.encoder"``).
 
-def linear_attention_dims(config: BaseModelConfig) -> LinearAttentionDims:
-    """Compute dimension sizes for linear attention from config.
-
-    Raises ``TypeError`` if any required config field is ``None``.
+    Args:
+        **components: Keyword arguments mapping output name → module attribute
+            name.  For example, ``vision="vision_encoder"`` means the task
+            expects ``module.vision_encoder`` and will store the result as
+            ``package["vision"]``.
     """
-    num_k_heads = config.linear_num_key_heads
-    num_v_heads = config.linear_num_value_heads
-    head_k_dim = config.linear_key_head_dim
-    head_v_dim = config.linear_value_head_dim
-    conv_kernel = config.linear_conv_kernel_dim
-    key_dim = head_k_dim * num_k_heads
-    value_dim = head_v_dim * num_v_heads
-    conv_dim = key_dim * 2 + value_dim
-    return LinearAttentionDims(
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim,
-        head_v_dim=head_v_dim,
-        key_dim=key_dim,
-        value_dim=value_dim,
-        conv_dim=conv_dim,
-        conv_kernel=conv_kernel,
-    )
+
+    def __init__(self, **components: str) -> None:
+        self._components: dict[str, str] = dict(components)
+
+    def validate(self, module: nn.Module, task_name: str) -> None:
+        """Check that all required sub-module attributes exist on *module*.
+
+        Args:
+            module: The module passed to ``task.build()``.
+            task_name: Name of the task class (for the error message).
+
+        Raises:
+            TypeError: If any required attribute is absent from *module*.
+        """
+
+        def _has_nested(obj: object, dotted: str) -> bool:
+            for part in dotted.split("."):
+                if not hasattr(obj, part):
+                    return False
+                obj = getattr(obj, part)
+            return True
+
+        missing = [
+            (output_name, attr_name)
+            for output_name, attr_name in self._components.items()
+            if not _has_nested(module, attr_name)
+        ]
+        if not missing:
+            return
+        lines = "\n".join(
+            f"  '{output_name}' component expects module.{attr_name}"
+            for output_name, attr_name in missing
+        )
+        raise TypeError(
+            f"{task_name} requires sub-module attribute(s) that are missing "
+            f"from {type(module).__name__}:\n{lines}\n"
+            f"Ensure each attribute is assigned in the module's __init__()."
+        )
+
+    def items(self):
+        """Iterate over ``(output_name, attribute_name)`` pairs."""
+        return self._components.items()
+
+    def keys(self):
+        """Return the output model names declared by this spec."""
+        return self._components.keys()
+
+    def __contains__(self, item: str) -> bool:
+        """Return ``True`` if *item* is a declared output model name."""
+        return item in self._components
+
+    def __repr__(self) -> str:
+        parts = ", ".join(f"{k}={v!r}" for k, v in self._components.items())
+        return f"ComponentSpec({parts})"
 
 
 def _make_graph(
@@ -76,7 +116,7 @@ def _make_graph(
         [],
         nodes=[],
         name=name,
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
     )
     return graph, GraphBuilder(graph)
 
@@ -89,76 +129,45 @@ def _make_model(graph: ir.Graph) -> ir.Model:
     return model
 
 
-def _make_kv_cache_inputs(
-    num_layers: int,
-    num_kv_heads: int,
-    head_dim: int,
-    dtype: ir.DataType,
-    batch: ir.SymbolicDim,
-    past_seq_len: ir.SymbolicDim,
-    *,
-    prefix: str = "past_key_values",
-    key_head_dim: int | None = None,
-    value_head_dim: int | None = None,
-) -> tuple[list[ir.Value], list[tuple[ir.Value, ir.Value]]]:
-    """Create KV cache input values for ``num_layers`` layers.
-
-    Args:
-        key_head_dim: Head dim for keys. Defaults to ``head_dim``.
-            For MLA attention, this is ``qk_nope_head_dim + qk_rope_head_dim``.
-        value_head_dim: Head dim for values. Defaults to ``head_dim``.
-            For MLA attention, this is ``v_head_dim``.
-
-    Returns:
-        ``(flat_inputs, kv_pairs)`` where *flat_inputs* is a flat list
-        suitable for extending ``graph_inputs`` and *kv_pairs* is a list
-        of ``(key, value)`` tuples for passing to the module.
-    """
-    k_dim = key_head_dim if key_head_dim is not None else head_dim
-    v_dim = value_head_dim if value_head_dim is not None else head_dim
-    flat: list[ir.Value] = []
-    pairs: list[tuple[ir.Value, ir.Value]] = []
-    for i in range(num_layers):
-        past_key = ir.Value(
-            name=f"{prefix}.{i}.key",
-            shape=ir.Shape([batch, num_kv_heads, past_seq_len, k_dim]),
-            type=ir.TensorType(dtype),
-        )
-        past_value = ir.Value(
-            name=f"{prefix}.{i}.value",
-            shape=ir.Shape([batch, num_kv_heads, past_seq_len, v_dim]),
-            type=ir.TensorType(dtype),
-        )
-        flat.extend([past_key, past_value])
-        pairs.append((past_key, past_value))
-    return flat, pairs
-
-
-def _register_kv_cache_outputs(
-    graph: ir.Graph,
-    present_key_values: list[tuple[ir.Value, ir.Value]],
-    *,
-    prefix: str = "present",
-) -> None:
-    """Name and register KV cache outputs on the graph.
-
-    Output shapes and dtypes are inferred by the shape inference pass
-    that runs during model optimization.
-    """
-    for i, (present_key, present_value) in enumerate(present_key_values):
-        present_key.name = f"{prefix}.{i}.key"
-        present_value.name = f"{prefix}.{i}.value"
-
-        graph.outputs.append(present_key)
-        graph.outputs.append(present_value)
-
-
 class ModelTask(ABC):
     """Abstract base defining how to wire a module into an ONNX graph.
 
     Subclass this to support new model tasks (e.g. feature extraction,
     sequence classification). Each task defines its own graph I/O contract.
+
+    Multi-component tasks should declare a class-level :class:`ComponentSpec`
+    and call :meth:`_validate_components` at the start of ``build()``::
+
+        class MyMultiModelTask(ModelTask):
+            components = ComponentSpec(decoder="decoder", vision="vision_encoder")
+
+            def build(self, module, config):
+                self._validate_components(module)
+                ...
     """
+
+    #: Maps package key → optimization role for each model produced by this task.
+    #: The role controls which fusion passes run (e.g. only ``"decoder"`` gets
+    #: GQA fusion). Override in subclasses that produce non-decoder outputs.
+    #: Unrecognised keys fall back to ``_MODEL_ROLE_MAP`` in ``_builder.py``,
+    #: then default to ``"decoder"``.
+    model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}
+
+    #: Optional component spec for multi-component tasks.  When set,
+    #: :meth:`_validate_components` checks that all declared attributes
+    #: exist on the module before building begins.
+    components: ClassVar[ComponentSpec | None] = None
+
+    def _validate_components(self, module: nn.Module) -> None:
+        """Validate that *module* exposes all attributes declared in :attr:`components`.
+
+        Call at the start of :meth:`build` in multi-component tasks.
+
+        Raises:
+            TypeError: If any required sub-module attribute is missing.
+        """
+        if self.components is not None:
+            self.components.validate(module, type(self).__name__)
 
     @abstractmethod
     def build(
@@ -182,227 +191,161 @@ class ModelTask(ABC):
         ...
 
 
-def _make_hybrid_cache_inputs(
-    config: BaseModelConfig,
-    dtype: ir.DataType,
-    batch: ir.SymbolicDim,
-    past_seq_len: ir.SymbolicDim,
-    *,
-    prefix: str = "past_key_values",
-) -> tuple[list[ir.Value], list[StatePair]]:
-    """Create cache inputs for hybrid models with mixed layer types.
+# ---------------------------------------------------------------------------
+# Shared graph-builder helpers for multi-component tasks
+# ---------------------------------------------------------------------------
 
-    Supported layer types:
-        ``"full_attention"`` — standard KV cache (key + value).
-        ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
-        ``"mamba"`` / ``"mamba2"`` — conv_state + ssm_state.
-        ``"mlp"`` — stateless, produces ``(None, None)`` pair.
+
+def build_decoder_from_embeds(
+    decoder,
+    config: BaseModelConfig,
+    *,
+    mrope: bool = False,
+    hybrid: bool = False,
+) -> ir.Model:
+    """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
+
+    This is the shared implementation for the ``_build_decoder`` method that
+    is common to :class:`VisionLanguageTask`, :class:`QwenVLTask`,
+    :class:`HybridQwenVLTask`, :class:`SpeechLanguageTask`, and
+    :class:`Phi4MMMultiModalTask`.
+
+    Args:
+        decoder: The decoder sub-module to invoke.
+        config: Architecture configuration.
+        mrope: If ``True``, uses 3D MRoPE position_ids
+            ``[3, batch, seq_len]`` instead of the standard
+            ``[batch, seq_len]``.
+        hybrid: If ``True``, uses hybrid KV + DeltaNet cache inputs/outputs
+            (for Qwen3.5-VL and similar).  Requires ``config.layer_types``.
 
     Returns:
-        ``(flat_inputs, state_pairs)`` — *flat_inputs* contains only
-        the ``ir.Value`` entries (no graph inputs for MLP layers);
-        *state_pairs* has one entry per layer, with ``(None, None)``
-        for stateless MLP layers.
+        A built :class:`ir.Model` for the decoder.
     """
-    layer_types = config.layer_types or []
-    flat: list[ir.Value] = []
-    pairs: list[StatePair] = []
-
-    # DeltaNet dimensions from config (computed once via shared helper)
-    has_linear = "linear_attention" in layer_types
-    if has_linear:
-        dims = linear_attention_dims(config)
-
-    # Mamba SSM dimensions from config (Jamba-style)
-    mamba_expand = getattr(config, "mamba_expand", 2)
-    mamba_d_inner = config.hidden_size * mamba_expand
-    mamba_d_conv = getattr(config, "mamba_d_conv", 4)
-    mamba_d_state = getattr(config, "mamba_d_state", 16)
-
-    # Mamba2/SSD dimensions from config (Bamba-style).
-    # Defaults are 0 so a missing field produces a clear shape error
-    # rather than silently using model-specific values.
-    mamba2_n_heads = getattr(config, "mamba_n_heads", 0)
-    mamba2_d_head = getattr(config, "mamba_d_head", 0)
-    mamba2_d_state = getattr(config, "mamba_d_state", 0)
-    mamba2_n_groups = getattr(config, "mamba_n_groups", 1)
-    # Prefer n_heads * d_head (NemotronH); fall back to hidden * expand (Bamba)
-    mamba2_d_inner = (
-        mamba2_n_heads * mamba2_d_head
-        if mamba2_n_heads and mamba2_d_head
-        else config.hidden_size * mamba_expand
+    # Import here rather than at module top to keep _base.py focused on base
+    # class definitions.  _cache_utils does NOT import from _base.py, so there
+    # is no circular dependency — this is purely a namespace-clarity choice.
+    from mobius.tasks._cache_utils import (
+        _make_hybrid_cache_inputs,
+        _make_kv_cache_inputs,
+        _register_hybrid_cache_outputs,
+        _register_kv_cache_outputs,
+        _register_linear_attention_functions,
     )
-    mamba2_conv_dim = mamba2_d_inner + 2 * mamba2_n_groups * mamba2_d_state
 
-    for i in range(config.num_hidden_layers):
-        ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+    batch = ir.SymbolicDim("batch")
+    seq_len = ir.SymbolicDim("sequence_len")
+    past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        if ltype == "lightning_attention":
-            # Lightning Attention: single recurrent state only (no conv_state)
-            # State: (B, num_heads, head_dim, head_dim) — square matrix accumulator
-            rec_state = ir.Value(
-                name=f"{prefix}.{i}.recurrent_state",
-                shape=ir.Shape(
-                    [batch, config.num_attention_heads, config.head_dim, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
-            )
-            flat.append(rec_state)
-            pairs.append((rec_state,))  # 1-tuple: lightning has no conv_state
-        elif ltype == "linear_attention":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, dims.conv_dim, dims.conv_kernel - 1]),
-                type=ir.TensorType(dtype),
-            )
-            rec_state = ir.Value(
-                name=f"{prefix}.{i}.recurrent_state",
-                shape=ir.Shape([batch, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim]),
-                type=ir.TensorType(dtype),
-            )
-            flat.extend([conv_state, rec_state])
-            pairs.append((conv_state, rec_state))
-        elif ltype == "mlp":
-            # MLP-only layers are stateless — no cache inputs needed
-            pairs.append((None, None))
-        elif ltype == "mamba":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, mamba_d_inner, mamba_d_conv - 1]),
-                type=ir.TensorType(dtype),
-            )
-            ssm_state = ir.Value(
-                name=f"{prefix}.{i}.ssm_state",
-                shape=ir.Shape([batch, mamba_d_inner, mamba_d_state]),
-                type=ir.TensorType(dtype),
-            )
-            flat.extend([conv_state, ssm_state])
-            pairs.append((conv_state, ssm_state))
-        elif ltype == "mamba2":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, mamba2_conv_dim, mamba_d_conv - 1]),
-                type=ir.TensorType(dtype),
-            )
-            ssm_state = ir.Value(
-                name=f"{prefix}.{i}.ssm_state",
-                shape=ir.Shape([batch, mamba2_n_heads, mamba2_d_head, mamba2_d_state]),
-                type=ir.TensorType(dtype),
-            )
-            flat.extend([conv_state, ssm_state])
-            pairs.append((conv_state, ssm_state))
-        else:
-            past_key = ir.Value(
-                name=f"{prefix}.{i}.key",
-                shape=ir.Shape(
-                    [batch, config.num_key_value_heads, past_seq_len, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
-            )
-            past_value = ir.Value(
-                name=f"{prefix}.{i}.value",
-                shape=ir.Shape(
-                    [batch, config.num_key_value_heads, past_seq_len, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
-            )
-            flat.extend([past_key, past_value])
-            pairs.append((past_key, past_value))
+    inputs_embeds = ir.Value(
+        name="inputs_embeds",
+        shape=ir.Shape([batch, seq_len, config.hidden_size]),
+        type=ir.TensorType(config.dtype),
+    )
+    attention_mask = ir.Value(
+        name="attention_mask",
+        shape=ir.Shape([batch, "past_seq_len + seq_len"]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    # MRoPE: 3D position IDs (temporal, height, width) — shape [3, batch, seq_len]
+    # Standard: shape [batch, seq_len]
+    position_ids = ir.Value(
+        name="position_ids",
+        shape=ir.Shape([3, batch, seq_len] if mrope else [batch, seq_len]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
 
-    return flat, pairs
+    graph_inputs = [inputs_embeds, attention_mask, position_ids]
+
+    if hybrid:
+        cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+            config,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+    else:
+        cache_inputs, past_key_values = _make_kv_cache_inputs(
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+    graph_inputs.extend(cache_inputs)
+
+    graph, builder = _make_graph(graph_inputs)
+    logits, present_key_values = decoder(
+        builder.op,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+    )
+
+    logits.name = "logits"
+    graph.outputs.append(logits)
+
+    if hybrid:
+        _register_hybrid_cache_outputs(
+            graph,
+            present_key_values,
+            config.layer_types or [],
+        )
+        model = _make_model(graph)
+        _register_linear_attention_functions(model, config)
+        return model
+    else:
+        _register_kv_cache_outputs(graph, present_key_values)
+        return _make_model(graph)
 
 
-def _register_hybrid_cache_outputs(
-    graph: ir.Graph,
-    present_key_values: list[tuple[ir.Value, ...]],
-    layer_types: list[str],
-    *,
-    prefix: str = "present",
-) -> None:
-    """Name and register hybrid cache outputs on the graph.
-
-    Uses ``.key``/``.value`` for full attention layers,
-    ``.recurrent_state`` for lightning attention layers (1-tuple),
-    ``.conv_state``/``.recurrent_state`` for linear attention layers,
-    and ``.conv_state``/``.ssm_state`` for mamba/mamba2 layers.
-
-    Output shapes and dtypes are inferred by the shape inference pass
-    that runs during model optimization.
-    """
-    for i, states in enumerate(present_key_values):
-        ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "mlp":
-            continue  # MLP layers produce no cache state
-        if ltype == "lightning_attention":
-            # Single recurrent state only (no conv_state for lightning)
-            (state_a,) = states
-            state_a.name = f"{prefix}.{i}.recurrent_state"
-            graph.outputs.append(state_a)
-        else:
-            state_a, state_b = states
-            if ltype == "linear_attention":
-                state_a.name = f"{prefix}.{i}.conv_state"
-                state_b.name = f"{prefix}.{i}.recurrent_state"
-            elif ltype in ("mamba", "mamba2"):
-                state_a.name = f"{prefix}.{i}.conv_state"
-                state_b.name = f"{prefix}.{i}.ssm_state"
-            else:
-                state_a.name = f"{prefix}.{i}.key"
-                state_b.name = f"{prefix}.{i}.value"
-
-            graph.outputs.append(state_a)
-            graph.outputs.append(state_b)
-
-
-def _register_linear_attention_functions(
-    model: ir.Model,
+def build_embedding_from_features(
+    embedding,
     config: BaseModelConfig,
-) -> None:
-    """Register CausalConvWithState and LinearAttention functions.
+    *,
+    feature_name: str,
+    feature_dim: int,
+) -> ir.Model:
+    """Build an ``input_ids + features → inputs_embeds`` embedding ONNX graph.
 
-    Registers functions for DeltaNet (``linear_attention`` layers) and/or
-    Lightning Attention (``lightning_attention`` layers) as needed.
-    Adds the ``pkg.mobius`` opset import to the graph.
+    This is the shared implementation for ``_build_embedding`` in
+    :class:`VisionLanguageTask` (image features) and
+    :class:`SpeechLanguageTask` (audio features).
+
+    Args:
+        embedding: The embedding sub-module to invoke.
+        config: Architecture configuration.
+        feature_name: Name of the second input (e.g. ``"image_features"`` or
+            ``"audio_features"``).
+        feature_dim: Feature dimension for the second input's last axis.
+
+    Returns:
+        A built :class:`ir.Model` for the embedding model.
     """
-    layer_types = getattr(config, "layer_types", None) or []
-    has_deltanet = "linear_attention" in layer_types
-    has_lightning = "lightning_attention" in layer_types
+    batch = ir.SymbolicDim("batch")
+    seq_len = ir.SymbolicDim("sequence_len")
+    num_feature_tokens = ir.SymbolicDim("num_feature_tokens")
 
-    if not has_deltanet and not has_lightning:
-        return
-
-    from mobius.functions import (
-        causal_conv_nd_with_state,
-        linear_attention,
+    input_ids = ir.Value(
+        name="input_ids",
+        shape=ir.Shape([batch, seq_len]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    features = ir.Value(
+        name=feature_name,
+        shape=ir.Shape([num_feature_tokens, feature_dim]),
+        type=ir.TensorType(config.dtype),
     )
 
-    if has_deltanet:
-        dims = linear_attention_dims(config)
-        conv_func = causal_conv_nd_with_state(
-            kernel_size=dims.conv_kernel,
-            channels=dims.conv_dim,
-            ndim=1,
-            activation="silu",
-        )
-        attn_func = linear_attention(
-            q_num_heads=dims.num_k_heads,
-            kv_num_heads=dims.num_v_heads,
-            update_rule="gated_delta",
-            scale=1.0 / (dims.head_k_dim**0.5),
-            stash_type=config.dtype,
-        )
-        model.functions[conv_func.identifier()] = conv_func
-        model.functions[attn_func.identifier()] = attn_func
+    graph, builder = _make_graph([input_ids, features], name="embedding")
+    inputs_embeds = embedding(
+        builder.op,
+        input_ids=input_ids,
+        **{feature_name: features},
+    )
 
-    if has_lightning:
-        head_dim = config.head_dim
-        attn_func_gated = linear_attention(
-            q_num_heads=config.num_attention_heads,
-            kv_num_heads=config.num_attention_heads,
-            update_rule="gated",
-            scale=1.0 / (head_dim**0.5),
-            stash_type=config.dtype,
-        )
-        model.functions[attn_func_gated.identifier()] = attn_func_gated
-
-    model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1
+    inputs_embeds.name = "inputs_embeds"
+    graph.outputs.append(inputs_embeds)
+    return _make_model(graph)

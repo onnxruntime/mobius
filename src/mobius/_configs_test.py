@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Tests for ArchitectureConfig."""
 
@@ -205,6 +205,32 @@ class TestArchitectureConfig:
         config = ArchitectureConfig.from_transformers(FakeConfig())
         assert config.rope_type == "llama3"
         assert config.original_max_position_embeddings == 8192
+
+    def test_from_transformers_stores_model_type_and_token_ids(self):
+        """model_type, bos_token_id, eos_token_id are preserved on ArchitectureConfig."""
+
+        class FakeConfig:
+            model_type = "gemma2"
+            num_attention_heads = 8
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 256
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            bos_token_id = 2
+            eos_token_id = 1
+            rms_norm_eps = 1e-6
+            rope_theta = 10000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.model_type == "gemma2"
+        assert config.bos_token_id == 2
+        assert config.eos_token_id == 1
 
 
 class TestExtractRopeConfig:
@@ -626,6 +652,15 @@ class TestQuantizationConfig:
 
     def test_from_transformers_method_none_returns_none(self):
         hf = type("HFConfig", (), {"quantization_config": {"quant_method": "none"}})()
+        assert QuantizationConfig.from_transformers(hf) is None
+
+    def test_from_transformers_fp8_returns_none(self):
+        """FP8 per-tensor quantization is not block quantization; returns None."""
+        hf = type(
+            "HFConfig",
+            (),
+            {"quantization_config": {"quant_method": "fp8", "bits": 8}},
+        )()
         assert QuantizationConfig.from_transformers(hf) is None
 
     def test_from_transformers_to_dict_object(self):

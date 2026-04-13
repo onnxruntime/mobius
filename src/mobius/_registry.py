@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Model registry mapping architecture names to module classes.
 
@@ -104,6 +104,7 @@ from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -328,377 +329,328 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
     return ModelRegistration(CausalLMModel)
 
 
-def _create_default_registry() -> ModelRegistry:
-    """Create the default registry with all built-in architectures."""
-    reg = ModelRegistry()
-
+# ---------------------------------------------------------------------------
+# Declarative registration table
+#
+# Each entry maps an architecture name (HF ``config.model_type``) to a
+# ``ModelRegistration``.  Use keyword arguments when ``task`` or
+# ``config_class`` differ from their defaults (``None``).
+#
+# test_model_id, family, and variant are applied separately via
+# ``_apply_test_metadata()`` using the dicts below.
+# ---------------------------------------------------------------------------
+_REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Text Generation (Llama-compatible) ---
-    for name in (
-        "baichuan",
-        "code_llama",
-        "codegen2",
-        "command_r",
-        "csm",
-        "dots1",
-        "evolla",
-        "exaone",
-        "helium",
-        "llama",
-        "llama4_text",
-        "minicpm",
-        "minicpm3",
-        "ministral",
-        "ministral3",
-        "mistral",
-        "mistral3",
-        "open-llama",
-        "openelm",
-        "qwen2",
-        "seed_oss",
-        "solar_open",
-        "yi",
-        "youtu",
-        "zamba",
-        "zamba2",
-    ):
-        reg.register(name, CausalLMModel)
-
+    "baichuan": ModelRegistration(CausalLMModel),
+    "code_llama": ModelRegistration(CausalLMModel),
+    "codegen2": ModelRegistration(CausalLMModel),
+    "command_r": ModelRegistration(CausalLMModel),
+    "csm": ModelRegistration(CausalLMModel),
+    "dots1": ModelRegistration(CausalLMModel),
+    "evolla": ModelRegistration(CausalLMModel),
+    "exaone": ModelRegistration(CausalLMModel),
+    "helium": ModelRegistration(CausalLMModel),
+    "llama": ModelRegistration(CausalLMModel),
+    "minicpm": ModelRegistration(CausalLMModel),
+    "minicpm3": ModelRegistration(CausalLMModel),
+    "ministral": ModelRegistration(CausalLMModel),
+    "ministral3": ModelRegistration(CausalLMModel),
+    "mistral": ModelRegistration(CausalLMModel),
+    "open-llama": ModelRegistration(CausalLMModel),
+    "openelm": ModelRegistration(CausalLMModel),
+    "qwen2": ModelRegistration(CausalLMModel),
+    "seed_oss": ModelRegistration(CausalLMModel),
+    "solar_open": ModelRegistration(CausalLMModel),
+    "yi": ModelRegistration(CausalLMModel),
+    "youtu": ModelRegistration(CausalLMModel),
+    "zamba": ModelRegistration(CausalLMModel),
+    "zamba2": ModelRegistration(CausalLMModel),
     # --- Text Generation (architecture-specific) ---
-    for name, cls in {
-        "apertus": ApertusCausalLMModel,
-        "arcee": ArceeCausalLMModel,
-        "bloom": BloomCausalLMModel,
-        "chatglm": ChatGLMCausalLMModel,
-        "codegen": CodeGenCausalLMModel,
-        "cohere": CohereCausalLMModel,
-        "cohere2": CohereCausalLMModel,
-        "ernie4_5": ErnieCausalLMModel,
-        "exaone4": ExaOne4CausalLMModel,
-        "falcon": FalconCausalLMModel,
-        "falcon_h1": FalconCausalLMModel,
-        "gpt_neox": GPTNeoXCausalLMModel,
-        "gpt_neox_japanese": GPTNeoXJapaneseCausalLMModel,
-        "gptj": GPTJCausalLMModel,
-        "mpt": MPTCausalLMModel,
-        "nanochat": NanoChatCausalLMModel,
-        "persimmon": PersimmonCausalLMModel,
-        "stablelm": LayerNormCausalLMModel,
-        "starcoder2": StarCoder2CausalLMModel,
-        "gemma": GemmaCausalLMModel,
-        "gemma2": Gemma2CausalLMModel,
-        "shieldgemma2": Gemma2CausalLMModel,
-        "gemma3_text": Gemma3CausalLMModel,
-        "gemma3n_text": Gemma3nCausalLMModel,
-        "granite": GraniteCausalLMModel,
-        "diffllama": DiffLlamaCausalLMModel,
-        "doge": DogeCausalLMModel,
-        "internlm2": InternLM2CausalLMModel,
-        "llama4_text": Llama4CausalLMModel,
-        "modernbert-decoder": ModernBertDecoderModel,
-        "nemotron": NemotronCausalLMModel,
-        "olmo": OLMoCausalLMModel,
-        "olmo2": OLMo2CausalLMModel,
-        "olmo3": OLMo2CausalLMModel,
-        "phi": PhiCausalLMModel,
-        "phi3": Phi3CausalLMModel,
-        "phi3small": Phi3SmallCausalLMModel,
-        "qwen": QwenCausalLMModel,
-        "qwen3": Qwen3CausalLMModel,
-        "qwen3_5_text": Qwen35CausalLMModel,
-        "smollm3": SmolLM3CausalLMModel,
-    }.items():
-        reg.register(name, cls)
-
+    "apertus": ModelRegistration(ApertusCausalLMModel),
+    "arcee": ModelRegistration(ArceeCausalLMModel),
+    "bloom": ModelRegistration(BloomCausalLMModel),
+    "chatglm": ModelRegistration(ChatGLMCausalLMModel),
+    "codegen": ModelRegistration(CodeGenCausalLMModel),
+    "cohere": ModelRegistration(CohereCausalLMModel),
+    "cohere2": ModelRegistration(CohereCausalLMModel),
+    "diffllama": ModelRegistration(DiffLlamaCausalLMModel),
+    "doge": ModelRegistration(DogeCausalLMModel),
+    "ernie4_5": ModelRegistration(ErnieCausalLMModel),
+    "exaone4": ModelRegistration(ExaOne4CausalLMModel),
+    "falcon": ModelRegistration(FalconCausalLMModel),
+    "falcon_h1": ModelRegistration(FalconCausalLMModel),
+    "gemma": ModelRegistration(GemmaCausalLMModel),
+    "gemma2": ModelRegistration(Gemma2CausalLMModel),
+    "gemma3": ModelRegistration(Gemma3CausalLMModel),
+    "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
+    "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
+    "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
+    "glm": ModelRegistration(GlmCausalLMModel),
+    "glm4": ModelRegistration(Glm4CausalLMModel),
+    "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
+    "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
+    "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
+    "gptj": ModelRegistration(GPTJCausalLMModel),
+    "granite": ModelRegistration(GraniteCausalLMModel),
+    "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
+    "internlm2": ModelRegistration(InternLM2CausalLMModel),
+    "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
+    "mpt": ModelRegistration(MPTCausalLMModel),
+    "nanochat": ModelRegistration(NanoChatCausalLMModel),
+    "nemotron": ModelRegistration(NemotronCausalLMModel),
+    "olmo": ModelRegistration(OLMoCausalLMModel),
+    "olmo2": ModelRegistration(OLMo2CausalLMModel),
+    "olmo3": ModelRegistration(OLMo2CausalLMModel),
+    "persimmon": ModelRegistration(PersimmonCausalLMModel),
+    "phi": ModelRegistration(PhiCausalLMModel),
+    "phi3": ModelRegistration(Phi3CausalLMModel),
+    "phi3small": ModelRegistration(Phi3SmallCausalLMModel),
+    "qwen": ModelRegistration(QwenCausalLMModel),
+    "qwen3": ModelRegistration(Qwen3CausalLMModel),
+    "qwen3_5_text": ModelRegistration(Qwen35CausalLMModel),
+    "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
+    "smollm3": ModelRegistration(SmolLM3CausalLMModel),
+    "stablelm": ModelRegistration(LayerNormCausalLMModel),
+    "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
     # --- Mixture of Experts ---
-    for name in (
-        "arctic",
-        "dbrx",
-        "flex_olmo",
-        "granitemoe",
-        "granitemoeshared",
-        "mixtral",
-        "olmoe",
-        "qwen3_moe",
-        "qwen3_omni_moe",
-        "qwen3_vl_moe",
-    ):
-        reg.register(name, MoECausalLMModel)
-    reg.register("ernie4_5_moe", Ernie45MoECausalLMModel)
-    reg.register("glm", GlmCausalLMModel)
-    reg.register("glm4", Glm4CausalLMModel)
-    reg.register("glm4_moe", Glm4MoECausalLMModel)
-
-    reg.register("jetmoe", JetMoeCausalLMModel)
-    reg.register("hunyuan_v1_dense", HunYuanV1DenseCausalLMModel)
-    reg.register("hunyuan_v1_moe", HunYuanMoEV1CausalLMModel)
-    reg.register("qwen2_moe", Qwen2MoECausalLMModel)
-
-    reg.register("longcat_flash", LongcatFlashCausalLMModel)
-
-    # --- GraniteMoeHybrid (Mamba2+Attention hybrid with MoE on all layers) ---
-    reg.register("granitemoehybrid", GraniteMoeHybridCausalLMModel)
-
-    reg.register("minimax", MiniMaxCausalLMModel)
-    reg.register("gpt_oss", GPTOSSCausalLMModel)
-    reg.register("phimoe", Phi3MoECausalLMModel)
-    reg.register("qwen3_5_moe", Qwen35MoECausalLMModel)
-    reg.register("qwen3_next", Qwen3NextCausalLMModel)
-
+    "arctic": ModelRegistration(MoECausalLMModel),
+    "dbrx": ModelRegistration(MoECausalLMModel),
+    "ernie4_5_moe": ModelRegistration(Ernie45MoECausalLMModel),
+    "flex_olmo": ModelRegistration(MoECausalLMModel),
+    "glm4_moe": ModelRegistration(Glm4MoECausalLMModel),
+    "granitemoe": ModelRegistration(MoECausalLMModel),
+    "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
+    "granitemoeshared": ModelRegistration(MoECausalLMModel),
+    "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
+    "jetmoe": ModelRegistration(JetMoeCausalLMModel),
+    "minimax": ModelRegistration(MiniMaxCausalLMModel),
+    "mixtral": ModelRegistration(MoECausalLMModel),
+    "olmoe": ModelRegistration(MoECausalLMModel),
+    "phimoe": ModelRegistration(Phi3MoECausalLMModel),
+    "qwen2_moe": ModelRegistration(Qwen2MoECausalLMModel),
+    "qwen3_5_moe": ModelRegistration(Qwen35MoECausalLMModel),
+    "qwen3_moe": ModelRegistration(MoECausalLMModel),
+    "qwen3_next": ModelRegistration(Qwen3NextCausalLMModel),
+    "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
+    "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
     # --- DeepSeek (MLA + MoE) ---
-    for name in (
-        "deepseek_v2",
-        "deepseek_v2_moe",
-        "deepseek_v3",
-    ):
-        reg.register(name, DeepSeekV3CausalLMModel)
-
-    # --- DeepSeek-OCR-2 (VL) ---
-    reg.register("deepseek_vl_v2", DeepSeekOCR2CausalLMModel)
-
+    "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
-    reg.register("mamba", MambaCausalLMModel)
-    reg.register("falcon_mamba", MambaCausalLMModel)
-    reg.register("mamba2", Mamba2CausalLMModel)
-
-    # --- Hybrid SSM+Attention (Jamba) ---
-    reg.register("jamba", JambaCausalLMModel)
-
-    # --- Hybrid Mamba2+Attention (Bamba) ---
-    reg.register("bamba", BambaCausalLMModel)
-
-    # --- Hybrid Mamba2+Attention+MLP (NemotronH) ---
-    from mobius.models.nemotron_h import NemotronHCausalLMModel
-
-    reg.register("nemotron_h", NemotronHCausalLMModel)
-
+    "falcon_mamba": ModelRegistration(MambaCausalLMModel),
+    "mamba": ModelRegistration(MambaCausalLMModel),
+    "mamba2": ModelRegistration(Mamba2CausalLMModel),
+    # --- Hybrid SSM+Attention ---
+    "bamba": ModelRegistration(BambaCausalLMModel),
+    "jamba": ModelRegistration(JambaCausalLMModel),
+    "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    # --- Hybrid linear-attention ---
+    "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
-    for name in (
-        "chameleon",
-        "cohere2_vision",
-        "florence2",
-        "fuyu",
-        "idefics2",
-        "idefics3",
-        "instructblip",
-        "instructblipvideo",
-        "llava",
-        "llava_next",
-        "llava_next_video",
-        "llava_onevision",
-        "molmo",
-        "paligemma",
-        "pixtral",
-        "smolvlm",
-        "video_llava",
-        "aya_vision",
-        "deepseek_vl",
-        "deepseek_vl_hybrid",
-        "got_ocr2",
-        "janus",
-        "ovis2",
-        "vipllava",
-    ):
-        reg.register(name, LLaVAModel, task="vision-language")
-
-    for name in ("internvl_chat", "internvl2", "internvl"):
-        reg.register(name, InternVL2Model, task="vision-language")
-    reg.register("gemma3", Gemma3CausalLMModel)
-    reg.register("gemma3_multimodal", Gemma3MultiModalModel, task="vision-language")
-    reg.register("gemma3n", Gemma3nCausalLMModel)
-    reg.register("glm4v", LLaVAModel, task="vision-language")
-    reg.register("glm4v_moe", LLaVAModel, task="vision-language")
-    reg.register("glm4v_moe_text", MoECausalLMModel)
-    reg.register("glm4v_text", CausalLMModel)
-    reg.register("mllama", MllamaCausalLMModel, task="mllama-vision-language")
-
-    reg.register("blip-2", Blip2Model, task="vision-language")
-    reg.register("phi4mm", Phi4MMMultiModalModel, task="phi4mm-multimodal")
-    reg.register("phi4_multimodal", Phi4MMMultiModalModel, task="phi4mm-multimodal")
-    reg.register("qwen2_vl", Qwen25VLCausalLMModel, task="qwen-vl")
-    reg.register("qwen2_vl_text", Qwen25VLTextModel)
-    reg.register("qwen2_5_vl", Qwen25VLCausalLMModel, task="qwen-vl")
-    reg.register("qwen2_5_vl_text", Qwen25VLTextModel)
-    reg.register("qwen3_vl", Qwen3VL3ModelCausalLMModel, task="qwen-vl")
-    reg.register("qwen3_vl_single", Qwen3VLCausalLMModel, task="qwen3-vl-vision-language")
-    reg.register("qwen3_vl_text", Qwen3VLTextModel)
-    reg.register("qwen3_5", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
-    reg.register("qwen3_5_vl", Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl")
-    reg.register("qwen3_5_vl_text", Qwen35VLTextModel)
-
+    "aya_vision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "blip-2": ModelRegistration(Blip2Model, task="vision-language"),
+    "chameleon": ModelRegistration(LLaVAModel, task="vision-language"),
+    "cohere2_vision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "deepseek_vl": ModelRegistration(LLaVAModel, task="vision-language"),
+    "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
+    "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
+    "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
+    "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
+    "glm4v_moe_text": ModelRegistration(MoECausalLMModel),
+    "glm4v_text": ModelRegistration(CausalLMModel),
+    "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
+    "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
+    "instructblipvideo": ModelRegistration(LLaVAModel, task="vision-language"),
+    "internvl": ModelRegistration(InternVL2Model, task="vision-language"),
+    "internvl2": ModelRegistration(InternVL2Model, task="vision-language"),
+    "internvl_chat": ModelRegistration(InternVL2Model, task="vision-language"),
+    "janus": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_next": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_next_video": ModelRegistration(LLaVAModel, task="vision-language"),
+    "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
+    "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
+    "molmo": ModelRegistration(LLaVAModel, task="vision-language"),
+    "ovis2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
+    "phi4_multimodal": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "phi4mm": ModelRegistration(Phi4MMMultiModalModel, task="phi4mm-multimodal"),
+    "pixtral": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "qwen2_5_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
+    "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
+    "qwen2_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
+    "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
+    "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
+    "qwen3_5_vl_text": ModelRegistration(Qwen35VLTextModel),
+    "qwen3_vl": ModelRegistration(Qwen3VL3ModelCausalLMModel, task="qwen-vl"),
+    "qwen3_vl_single": ModelRegistration(
+        Qwen3VLCausalLMModel, task="qwen3-vl-vision-language"
+    ),
+    "qwen3_vl_text": ModelRegistration(Qwen3VLTextModel),
+    "smolvlm": ModelRegistration(LLaVAModel, task="vision-language"),
+    "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
-    reg.register(
-        "whisper",
+    "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
+    "qwen3_forced_aligner": ModelRegistration(
+        Qwen3ASRForConditionalGeneration, task="speech-language"
+    ),
+    "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
+    "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
+    "whisper": ModelRegistration(
         WhisperForConditionalGeneration,
         task="speech-to-text",
         config_class=WhisperConfig,
-    )
-
-    reg.register("qwen3_asr", Qwen3ASRForConditionalGeneration, task="speech-language")
-    reg.register(
-        "qwen3_forced_aligner", Qwen3ASRForConditionalGeneration, task="speech-language"
-    )
-
-    reg.register("qwen3_tts", Qwen3TTSForConditionalGeneration)
-
-    reg.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Model, task="codec")
-
+    ),
     # --- Encoder-only ---
-    for name in (
-        "albert",
-        "bert",
-        "camembert",
-        "data2vec-text",
-        "deberta",
-        "deberta-v2",
-        "electra",
-        "ernie",
-        "ernie_m",
-        "esm",
-        "flaubert",
-        "ibert",
-        "megatron-bert",
-        "mobilebert",
-        "mpnet",
-        "nezha",
-        "qdqbert",
-        "rembert",
-        "roberta",
-        "roberta-prelayernorm",
-        "roc_bert",
-        "roformer",
-        "splinter",
-        "squeezebert",
-        "xlm-roberta",
-        "xlm-roberta-xl",
-        "xlnet",
-        "xmod",
-        # Document/layout models (BERT-like encoder)
-        "bros",
-        "layoutlm",
-        "layoutlmv2",
-        "lilt",
-        "markuplm",
-        "mega",
-        "mra",
-        "nystromformer",
-        "yoso",
-    ):
-        reg.register(name, BertModel, task="feature-extraction")
-    reg.register("distilbert", DistilBertModel, task="feature-extraction")
-    reg.register("clip_text_model", CLIPTextModel, task="feature-extraction")
-    reg.register("layoutlmv3", LayoutLMv3Model, task="feature-extraction")
-    reg.register("modernbert", ModernBertModel, task="feature-extraction")
-
+    "albert": ModelRegistration(BertModel, task="feature-extraction"),
+    "bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "bros": ModelRegistration(BertModel, task="feature-extraction"),
+    "camembert": ModelRegistration(BertModel, task="feature-extraction"),
+    "clip_text_model": ModelRegistration(CLIPTextModel, task="feature-extraction"),
+    "data2vec-text": ModelRegistration(BertModel, task="feature-extraction"),
+    "deberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "deberta-v2": ModelRegistration(BertModel, task="feature-extraction"),
+    "distilbert": ModelRegistration(DistilBertModel, task="feature-extraction"),
+    "electra": ModelRegistration(BertModel, task="feature-extraction"),
+    "ernie": ModelRegistration(BertModel, task="feature-extraction"),
+    "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
+    "ibert": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlmv2": ModelRegistration(BertModel, task="feature-extraction"),
+    "layoutlmv3": ModelRegistration(LayoutLMv3Model, task="feature-extraction"),
+    "lilt": ModelRegistration(BertModel, task="feature-extraction"),
+    "markuplm": ModelRegistration(BertModel, task="feature-extraction"),
+    "mega": ModelRegistration(BertModel, task="feature-extraction"),
+    "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
+    "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
+    "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
+    "mra": ModelRegistration(BertModel, task="feature-extraction"),
+    "nezha": ModelRegistration(BertModel, task="feature-extraction"),
+    "nystromformer": ModelRegistration(BertModel, task="feature-extraction"),
+    "qdqbert": ModelRegistration(BertModel, task="feature-extraction"),
+    "rembert": ModelRegistration(BertModel, task="feature-extraction"),
+    "roberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "roberta-prelayernorm": ModelRegistration(BertModel, task="feature-extraction"),
+    "roc_bert": ModelRegistration(BertModel, task="feature-extraction"),
+    "roformer": ModelRegistration(BertModel, task="feature-extraction"),
+    "splinter": ModelRegistration(BertModel, task="feature-extraction"),
+    "squeezebert": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlm-roberta": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlm-roberta-xl": ModelRegistration(BertModel, task="feature-extraction"),
+    "xlnet": ModelRegistration(BertModel, task="feature-extraction"),
+    "xmod": ModelRegistration(BertModel, task="feature-extraction"),
+    "yoso": ModelRegistration(BertModel, task="feature-extraction"),
     # --- Absolute positional embeddings (non-RoPE) ---
-    reg.register("gpt2", GPT2CausalLMModel)
-    for name in (
-        "biogpt",
-        "gpt-sw3",
-        "gpt_bigcode",
-        "gpt_neo",
-        "imagegpt",
-        "openai-gpt",
-        "xglm",
-    ):
-        reg.register(name, GPT2CausalLMModel)
-    reg.register("ctrl", CTRLCausalLMModel)
-    reg.register("xlm", XLMCausalLMModel)
-    reg.register("opt", OPTCausalLMModel)
-
+    "biogpt": ModelRegistration(GPT2CausalLMModel),
+    "ctrl": ModelRegistration(CTRLCausalLMModel),
+    "gpt-sw3": ModelRegistration(GPT2CausalLMModel),
+    "gpt2": ModelRegistration(GPT2CausalLMModel),
+    "gpt_bigcode": ModelRegistration(GPT2CausalLMModel),
+    "gpt_neo": ModelRegistration(GPT2CausalLMModel),
+    "imagegpt": ModelRegistration(GPT2CausalLMModel),
+    "openai-gpt": ModelRegistration(GPT2CausalLMModel),
+    "opt": ModelRegistration(OPTCausalLMModel),
+    "xglm": ModelRegistration(GPT2CausalLMModel),
+    "xlm": ModelRegistration(XLMCausalLMModel),
     # --- Encoder-decoder ---
-    for name in (
-        "bart",
-        "bigbird_pegasus",
-        "blenderbot",
-        "blenderbot-small",
-        "fsmt",
-        "led",
-        "m2m_100",
-        "marian",
-        "mbart",
-        "mvp",
-        "nllb-moe",
-        "nllb_moe",
-        "pegasus",
-        "pegasus_x",
-        "plbart",
-        "prophetnet",
-        "xlm-prophetnet",
-    ):
-        reg.register(name, BartForConditionalGeneration, task="seq2seq")
-    for name in ("longt5", "mt5", "switch_transformers", "t5", "umt5"):
-        reg.register(name, T5ForConditionalGeneration, task="seq2seq")
-    reg.register("trocr", TrOCRForConditionalGeneration, task="seq2seq")
-
+    "bart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "bigbird_pegasus": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "blenderbot": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "blenderbot-small": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "fsmt": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "led": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "longt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "m2m_100": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "marian": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "mbart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "mt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "mvp": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "nllb-moe": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "nllb_moe": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "pegasus": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "pegasus_x": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "plbart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
+    "switch_transformers": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "t5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "trocr": ModelRegistration(TrOCRForConditionalGeneration, task="seq2seq"),
+    "umt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "xlm-prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
     # --- Vision ---
-    reg.register("blip", BlipVisionModel, task="image-classification")
-    reg.register(
-        "depth_anything", DepthAnythingForDepthEstimation, task="image-classification"
-    )
-    for name in (
-        "beit",
-        "cvt",
-        "data2vec-vision",
-        "deit",
-        "dinov2",
-        "dinov2_with_registers",
-        "dinov3_vit",
-        "hiera",
-        "ijepa",
-        "mobilevit",
-        "mobilevitv2",
-        "pvt",
-        "pvt_v2",
-        "swin",
-        "swin2sr",
-        "swinv2",
-        "vit",
-        "vit_hybrid",
-        "vit_mae",
-        "vit_msn",
-    ):
-        reg.register(name, ViTModel, task="image-classification")
-    for name in ("clip_vision_model", "siglip_vision_model", "siglip2_vision_model"):
-        reg.register(name, CLIPVisionModel, task="image-classification")
-
-    # --- Object detection ---
-    reg.register("yolos", YolosForObjectDetection, task="object-detection")
-
-    # --- Segmentation ---
-    reg.register("sam2", Sam2VisionModel, task="image-classification")
-    reg.register("segformer", SegformerForSemanticSegmentation, task="image-classification")
-
+    "beit": ModelRegistration(ViTModel, task="image-classification"),
+    "blip": ModelRegistration(BlipVisionModel, task="image-classification"),
+    "clip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "cvt": ModelRegistration(ViTModel, task="image-classification"),
+    "data2vec-vision": ModelRegistration(ViTModel, task="image-classification"),
+    "deit": ModelRegistration(ViTModel, task="image-classification"),
+    "depth_anything": ModelRegistration(
+        DepthAnythingForDepthEstimation, task="image-classification"
+    ),
+    "dinov2": ModelRegistration(ViTModel, task="image-classification"),
+    "dinov2_with_registers": ModelRegistration(ViTModel, task="image-classification"),
+    "dinov3_vit": ModelRegistration(ViTModel, task="image-classification"),
+    "hiera": ModelRegistration(ViTModel, task="image-classification"),
+    "ijepa": ModelRegistration(ViTModel, task="image-classification"),
+    "mobilevit": ModelRegistration(ViTModel, task="image-classification"),
+    "mobilevitv2": ModelRegistration(ViTModel, task="image-classification"),
+    "pvt": ModelRegistration(ViTModel, task="image-classification"),
+    "pvt_v2": ModelRegistration(ViTModel, task="image-classification"),
+    "sam2": ModelRegistration(Sam2VisionModel, task="image-classification"),
+    "segformer": ModelRegistration(
+        SegformerForSemanticSegmentation, task="image-classification"
+    ),
+    "siglip2_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "siglip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "swin": ModelRegistration(ViTModel, task="image-classification"),
+    "swin2sr": ModelRegistration(ViTModel, task="image-classification"),
+    "swinv2": ModelRegistration(ViTModel, task="image-classification"),
+    "vit": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_hybrid": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_mae": ModelRegistration(ViTModel, task="image-classification"),
+    "vit_msn": ModelRegistration(ViTModel, task="image-classification"),
+    "yolos": ModelRegistration(YolosForObjectDetection, task="object-detection"),
     # --- Audio ---
-    for name in (
-        "data2vec-audio",
-        "hubert",
-        "mctct",
-        "musicgen",
-        "seamless_m4t",
-        "seamless_m4t_v2",
-        "sew",
-        "sew-d",
-        "speecht5",
-        "unispeech",
-        "unispeech-sat",
-        "voxtral_encoder",
-        "wav2vec2",
-        "wav2vec2-bert",
-        "wav2vec2-conformer",
-        "wavlm",
-    ):
-        reg.register(name, Wav2Vec2Model, task="audio-feature-extraction")
+    "data2vec-audio": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "hubert": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "mctct": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "musicgen": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "seamless_m4t": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "seamless_m4t_v2": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "sew": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "sew-d": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "speecht5": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "unispeech": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "unispeech-sat": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "voxtral_encoder": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2-bert": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+    "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
+}
 
-    # -----------------------------------------------------------------
-    # Test metadata — applied after all registrations
-    #
-    # test_model_id: HF model whose config.json is used for L2
-    #     architecture validation (full-size graph, no weights).
-    # family: Groups related model_types in the dashboard.
-    # variant: Labels the code-path variant for dashboard display.
-    # -----------------------------------------------------------------
+
+def _create_default_registry() -> ModelRegistry:
+    """Create the default registry with all built-in architectures."""
+    reg = ModelRegistry()
+    for arch, entry in _REGISTRATIONS.items():
+        reg.register(
+            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+        )
+    # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
-
     return reg
 
 
@@ -734,7 +686,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "helium": "kyutai/helium-1-preview-2b",
     "minicpm": "optimum-intel-internal-testing/tiny-random-minicpm",
     "minicpm3": "openbmb/MiniCPM3-4B",
-    "mistral3": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
     "ministral3": "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
     "nanochat": "nanochat-students/nanochat-d20",
     "olmo3": "allenai/Olmo-3-7B-Instruct",
@@ -843,6 +794,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "instructblip": "Salesforce/instructblip-flan-t5-xl",
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
+    "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",

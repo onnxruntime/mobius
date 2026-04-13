@@ -62,8 +62,22 @@ jobs:
             -p no:xdist \
             --timeout=300 \
             --junitxml=junit.xml \
+            --cov=src --cov-report=xml --cov-branch \
             --tb=short
         timeout-minutes: 45
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: arch-validation
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: arch-validation
+          report-type: test_results
 
       - name: Upload test results
         if: always()

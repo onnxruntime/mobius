@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Selective State Space Model (S6) component for Mamba architectures.
 
@@ -214,6 +214,7 @@ class Mamba2Scan(nn.Module):
         d_head: int,
         d_state: int,
         n_groups: int = 1,
+        time_step_min: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -221,6 +222,7 @@ class Mamba2Scan(nn.Module):
         self.d_state = d_state
         self.n_groups = n_groups
         self.heads_per_group = num_heads // n_groups
+        self.time_step_min = time_step_min
 
         self.A_log = nn.Parameter([num_heads])
         self.D = nn.Parameter([num_heads])
@@ -258,6 +260,9 @@ class Mamba2Scan(nn.Module):
                 op.Cast(self.dt_bias, to=ir.DataType.FLOAT),
             )
         )
+        # Clamp dt to time_step_min (matches HF torch.clamp(dt, min=...))
+        if self.time_step_min > 0.0:
+            dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
 
         # A = -exp(A_log) in fp32: (num_heads,)
         a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))

@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Shared test configurations for all test tiers.
 
@@ -548,7 +548,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("minicpm", {}, True),
     ("minicpm3", {}, True),
-    ("mistral3", {}, False),
     ("openelm", {}, True),
     (
         "persimmon",
@@ -1762,12 +1761,14 @@ SSM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     # mamba2: pure Mamba2/SSD (no attention) — requires Mamba2Config
+    # intermediate_size must equal num_heads * head_dim for Mamba2.
     (
         "mamba2",
         {
             "_config_cls": Mamba2Config,
             "num_heads": 4,
             "head_dim": 16,
+            "intermediate_size": 64,
             "state_size": 8,
             "n_groups": 2,
             "conv_kernel": 4,

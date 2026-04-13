@@ -1,9 +1,11 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Feature extraction task for encoder-only models (BERT, RoBERTa, etc.)."""
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import nn
@@ -24,6 +26,8 @@ class FeatureExtractionTask(ModelTask):
     Outputs:
         - last_hidden_state: [batch, sequence_len, hidden_size] FLOAT
     """
+
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,

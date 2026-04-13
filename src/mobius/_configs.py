@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 from __future__ import annotations
 
@@ -95,6 +95,10 @@ class VisionConfig:
     norm_eps: float = 1e-6
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
+    # Pixtral / Mistral-3 vision fields
+    model_type: str | None = None
+    head_dim: int | None = None
+    rope_theta: float | None = None
     # Qwen VL-specific
     out_hidden_size: int | None = None
     in_channels: int = 3
@@ -273,7 +277,13 @@ def _extract_rope_config(config) -> RoPEConfig:
             _nested_rope_theta(rope_scaling, "full_attention"),
             default=10_000.0,
         ),
-        rope_scaling=(_normalize_rope_scaling(rope_scaling) or None),
+        # Some models (e.g. Ministral-3) store YaRN config under
+        # rope_parameters instead of rope_scaling; fall back accordingly.
+        rope_scaling=(
+            _normalize_rope_scaling(rope_scaling)
+            or _normalize_rope_scaling(rope_parameters)
+            or None
+        ),
         partial_rotary_factor=_first_not_none(
             getattr(config, "partial_rotary_factor", None),
             rope_scaling.get("partial_rotary_factor", None),
@@ -284,12 +294,11 @@ def _extract_rope_config(config) -> RoPEConfig:
             getattr(config, "rope_local_base_freq", None),
             _nested_rope_theta(rope_scaling, "sliding_attention"),
         ),
-        original_max_position_embeddings=(
-            getattr(
-                config,
-                "original_max_position_embeddings",
-                rope_scaling.get("original_max_position_embeddings", None),
-            )
+        original_max_position_embeddings=_first_not_none(
+            getattr(config, "original_max_position_embeddings", None),
+            rope_scaling.get("original_max_position_embeddings", None),
+            # Also check rope_parameters (see rope_scaling comment above).
+            rope_parameters.get("original_max_position_embeddings", None),
         ),
     )
 
@@ -351,10 +360,22 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             ),
             image_size=getattr(vc, "image_size", None),
             patch_size=getattr(vc, "patch_size", None),
-            norm_eps=getattr(vc, "layer_norm_eps", 1e-6),
+            norm_eps=_first_not_none(
+                getattr(vc, "layer_norm_eps", None),
+                getattr(vc, "norm_eps", None),
+                default=1e-6,
+            ),
+            # Pixtral / Mistral-3 vision fields
+            model_type=getattr(vc, "model_type", None),
+            head_dim=getattr(vc, "head_dim", None),
+            rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
             out_hidden_size=getattr(vc, "out_hidden_size", None),
-            in_channels=getattr(vc, "in_channels", 3),
+            in_channels=_first_not_none(
+                getattr(vc, "in_channels", None),
+                getattr(vc, "num_channels", None),
+                default=3,
+            ),
             spatial_merge_size=getattr(vc, "spatial_merge_size", 2),
             temporal_patch_size=getattr(vc, "temporal_patch_size", 2),
             num_position_embeddings=getattr(vc, "num_position_embeddings", None),
@@ -573,6 +594,11 @@ class QuantizationConfig:
         method = qc.get("quant_method", "none")
         if method == "none":
             return None
+        # FP8 per-tensor quantization (float8_e4m3fn + scalar scale)
+        # is handled by dtype casting in _assign_weight(), not by
+        # QuantizedLinear block quantization.
+        if method == "fp8":
+            return None
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
@@ -744,6 +770,12 @@ class ArchitectureConfig(BaseModelConfig):
     codec_encoder: CodecEncoderConfig | None = None
     quantization: QuantizationConfig | None = None
 
+    # HuggingFace model_type and special token IDs — populated by from_transformers()
+    # so that genai_config.json can be written without re-fetching the HF config.
+    model_type: str | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
@@ -820,6 +852,9 @@ class ArchitectureConfig(BaseModelConfig):
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
+            model_type=model_type,
+            bos_token_id=getattr(config, "bos_token_id", None),
+            eos_token_id=getattr(config, "eos_token_id", None),
             rms_norm_eps=(
                 getattr(config, "rms_norm_eps", None)
                 or getattr(config, "layer_norm_eps", None)
@@ -1580,6 +1615,17 @@ class Mamba2Config(BaseModelConfig):
     use_conv_bias: bool = True
     norm_before_gate: bool = True
 
+    def __post_init__(self):
+        # Mamba2 requires d_inner = num_heads * head_dim.
+        if self.intermediate_size != DEFAULT_INT:
+            expected = self.num_heads * self.head_dim
+            if self.intermediate_size != expected:
+                raise ValueError(
+                    f"Mamba2Config: intermediate_size ({self.intermediate_size}) "
+                    f"must equal num_heads * head_dim "
+                    f"({self.num_heads} * {self.head_dim} = {expected})."
+                )
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Mamba2Config:
         del parent_config  # unused
@@ -1789,6 +1835,7 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_expand: int = 2
     mamba_conv_bias: bool = True
     mamba_proj_bias: bool = False
+    mamba_time_step_min: float = 0.001
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
@@ -1840,6 +1887,7 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+            mamba_time_step_min=getattr(config, "time_step_min", 0.001),
         )
 
 

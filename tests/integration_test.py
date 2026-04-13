@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Integration tests: numerical accuracy of ONNX models vs HuggingFace PyTorch.
 
@@ -43,6 +43,19 @@ from mobius._testing.torch_reference import (
     torch_forward,
 )
 
+
+def _model_accessible(model_id: str) -> bool:
+    """Check if a HuggingFace model is accessible (not gated/private)."""
+    try:
+        from huggingface_hub import model_info
+
+        model_info(model_id)
+    except Exception:
+        return False
+    else:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Model catalogue: small models for each supported architecture
 #
@@ -84,9 +97,6 @@ _TEXT_MODELS = [
         "openai-community/gpt2",
         False,
         id="gpt2",
-        marks=pytest.mark.xfail(
-            reason="tie_word_embeddings graph reference issue in ORT", strict=False
-        ),
     ),
     # OPT (learned positional embeddings)
     pytest.param(
@@ -100,10 +110,6 @@ _TEXT_MODELS = [
         "bigscience/bloom-560m",
         False,
         id="bloom-560m",
-        marks=pytest.mark.skip(
-            reason="Bloom word_embeddings_layernorm not implemented "
-            "in FalconCausalLMModel — weights silently dropped"
-        ),
     ),
     # Falcon (ALiBi attention, multi-query)
     pytest.param(
@@ -111,6 +117,12 @@ _TEXT_MODELS = [
         False,
         id="falcon-rw-1b",
         marks=pytest.mark.skip(reason="Model only has pytorch_model.bin, no safetensors"),
+    ),
+    # Ministral3 (YaRN RoPE, text-only extraction of Mistral-3 VLM)
+    pytest.param(
+        "Aratako/Ministral-3-3B-Instruct-2512-BF16-TextOnly",
+        False,
+        id="ministral3-3b",
     ),
 ]
 
@@ -1296,6 +1308,305 @@ class TestQwen3VL3Model:
             hf_logits,
             rtol=2e-2,
             atol=2e-1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Encoder-only models (BERT, DistilBERT, etc.)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Mistral3 (Pixtral) 3-model split — LLaVA-style VLM
+# ---------------------------------------------------------------------------
+
+_VL3_MISTRAL3_MODELS = [
+    pytest.param(
+        "mistralai/Ministral-3-3B-Instruct-2512",
+        id="mistral3-3b-3model",
+        marks=pytest.mark.skipif(
+            not _model_accessible("mistralai/Ministral-3-3B-Instruct-2512"),
+            reason="Model is gated — requires HuggingFace token with access",
+        ),
+    ),
+]
+
+
+def _build_mistral3_3model(model_id: str):
+    """Build Mistral3 (Pixtral) 3-model package with real weights."""
+    pkg = build(model_id, dtype="f32", load_weights=True)
+    return pkg
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.parametrize("model_id", _VL3_MISTRAL3_MODELS)
+class TestMistral3VL3Model:
+    """Integration tests for Mistral3 (Pixtral) 3-model split.
+
+    Mistral3 uses a LLaVA-style architecture:
+    - vision: PixtralVisionTower + Mistral3MultiModalProjector
+    - embedding: token lookup + image feature fusion
+    - decoder: standard CausalLM with 1D RoPE (not MRoPE)
+    """
+
+    def test_all_weights_assigned(self, model_id: str):
+        """Verify every ONNX initializer has weights."""
+        pkg = _build_mistral3_3model(model_id)
+
+        assert "decoder" in pkg
+        assert "vision" in pkg
+        assert "embedding" in pkg
+
+        for name, model in pkg.items():
+            for init_name, init in model.graph.initializers.items():
+                if init_name.startswith("const_"):
+                    continue
+                assert init.const_value is not None, (
+                    f"[{name}] Initializer '{init_name}' has no weights"
+                )
+
+    def test_decoder_prefill_logits_match(self, model_id: str):
+        """Decoder + embedding produce logits matching HF text-only forward."""
+        pkg = _build_mistral3_3model(model_id)
+        config = _get_config(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        torch_model.eval()
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+        prompt = "The capital of France is"
+        tokens = tokenizer(prompt, return_tensors="np")
+        input_ids = tokens["input_ids"].astype(np.int64)
+        attention_mask = tokens["attention_mask"].astype(np.int64)
+        seq_len = input_ids.shape[1]
+        # Mistral3 uses standard 1D position_ids (not MRoPE)
+        position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+        # HF reference (text-only forward, no image)
+        with torch.no_grad():
+            hf_out = torch_model(
+                input_ids=torch.from_numpy(input_ids),
+                attention_mask=torch.from_numpy(attention_mask),
+                position_ids=torch.from_numpy(position_ids),
+            )
+        hf_logits = hf_out.logits.numpy()
+
+        # ONNX: embedding (no image features for text-only)
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        image_features = np.zeros((1, config.hidden_size), dtype=np.float32)
+        embed_out = embed_sess.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+            }
+        )
+        embed_sess.close()
+        inputs_embeds = embed_out["inputs_embeds"]
+
+        # ONNX: decoder
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        decoder_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+            decoder_feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
+            decoder_feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
+
+        decoder_out = decoder_sess.run(decoder_feeds)
+        decoder_sess.close()
+
+        assert_logits_close(
+            decoder_out["logits"],
+            hf_logits,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_3model_vision_pipeline(self, model_id: str):
+        """Run full 3-model pipeline (vision→embedding→decoder) with image.
+
+        Processes a real image through all 3 ONNX models and compares
+        the decoder logits against the HuggingFace single-model forward.
+        """
+        pkg = _build_mistral3_3model(model_id)
+        config = _get_config(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        processor = transformers.AutoProcessor.from_pretrained(model_id)
+
+        image = Image.open("testdata/pipeline-cat-chonk.jpeg")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "What is this?"},
+                ],
+            }
+        ]
+        prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+        hf_inputs = processor(
+            text=prompt,
+            images=[image],
+            return_tensors="pt",
+        )
+
+        with torch.no_grad():
+            hf_out = torch_model(**hf_inputs, use_cache=False)
+        hf_logits = hf_out.logits.cpu().numpy()
+
+        # Step 1: ONNX vision model — pixel_values → image_features
+        pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
+
+        vision_session = OnnxModelSession(pkg["vision"])
+        vision_out = vision_session.run({"pixel_values": pixel_values})
+        vision_session.close()
+        image_features = vision_out["image_features"]
+
+        # Step 2: ONNX embedding model — fuse text + image features
+        input_ids = hf_inputs["input_ids"].numpy().astype(np.int64)
+
+        embedding_session = OnnxModelSession(pkg["embedding"])
+        embed_out = embedding_session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+            }
+        )
+        embedding_session.close()
+        inputs_embeds = embed_out["inputs_embeds"]
+
+        assert inputs_embeds.shape == (
+            1,
+            input_ids.shape[1],
+            config.hidden_size,
+        )
+
+        # Step 3: ONNX decoder with standard 1D position_ids
+        attention_mask = hf_inputs["attention_mask"].numpy().astype(np.int64)
+        seq_len = input_ids.shape[1]
+        position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+            decoder_feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
+            decoder_feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
+
+        decoder_out = decoder_session.run(decoder_feeds)
+        decoder_session.close()
+
+        # Looser tolerance for full VL pipeline (vision + embedding + decoder)
+        assert_logits_close(
+            decoder_out["logits"],
+            hf_logits,
+            rtol=2e-2,
+            atol=2e-1,
+        )
+
+    def test_vision_features_parity(self, model_id: str):
+        """Vision model output features match HF PyTorch reference.
+
+        Catches regressions in:
+        - Attention/RotaryEmbedding op attribute types (the swapped INT/FLOAT bug)
+        - Weight dequantization correctness
+        - 2D RoPE positional encoding
+        - PatchMerger spatial reshaping
+        """
+        import math
+
+        pkg = _build_mistral3_3model(model_id)
+        hf_config = transformers.AutoConfig.from_pretrained(model_id)
+
+        torch_model, _, _ = load_torch_multimodal_model(model_id)
+        torch_model.eval()
+
+        # Use the standard test image
+        image = Image.open("testdata/pipeline-cat-chonk.jpeg").convert("RGB")
+        w, h = image.size
+
+        # HF Pixtral resize: scale longest side to max_image_size, ceil to patch_size
+        patch_size = hf_config.vision_config.image_size // (
+            hf_config.vision_config.image_size // hf_config.vision_config.patch_size
+        )
+        max_image_size = hf_config.vision_config.image_size
+        merge_size = getattr(hf_config.vision_config, "spatial_merge_size", 2)
+        effective_patch = patch_size * merge_size
+
+        scale = max_image_size / max(h, w)
+        new_h = math.ceil(h * scale / patch_size) * patch_size
+        new_w = math.ceil(w * scale / patch_size) * patch_size
+        if new_h % effective_patch != 0:
+            new_h = math.ceil(new_h / effective_patch) * effective_patch
+        if new_w % effective_patch != 0:
+            new_w = math.ceil(new_w / effective_patch) * effective_patch
+
+        resized = image.resize((new_w, new_h), Image.BICUBIC)
+        arr = np.array(resized, dtype=np.float32) / 255.0
+        mean = np.array([0.48145466, 0.4578275, 0.40821073])
+        std = np.array([0.26862954, 0.26130258, 0.27577711])
+        arr = (arr - mean) / std
+        pixel_values = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
+
+        # HF reference: vision_tower + multi_modal_projector
+        pv_torch = torch.from_numpy(pixel_values).to(torch_model.dtype)
+        with torch.no_grad():
+            raw = torch_model.model.vision_tower(pv_torch).last_hidden_state.squeeze(0)
+            hf_features = (
+                torch_model.model.multi_modal_projector(raw, torch.tensor([[new_h, new_w]]))
+                .float()
+                .numpy()
+            )
+
+        # ONNX vision model
+        vision_session = OnnxModelSession(pkg["vision"])
+        onnx_out = vision_session.run({"pixel_values": pixel_values.astype(np.float32)})
+        vision_session.close()
+        onnx_features = onnx_out["image_features"].astype(np.float32)
+
+        # Shape check
+        assert hf_features.shape == onnx_features.shape, (
+            f"Shape mismatch: HF={hf_features.shape}, ONNX={onnx_features.shape}"
+        )
+
+        # Cosine similarity (must be very high — catches attribute type bugs)
+        cosine_sim = np.dot(hf_features.flatten(), onnx_features.flatten()) / (
+            np.linalg.norm(hf_features) * np.linalg.norm(onnx_features)
+        )
+        assert cosine_sim > 0.99, (
+            f"Vision cosine similarity {cosine_sim:.6f} < 0.99 — "
+            f"ONNX vision model produces different features than HF. "
+            f"HF norm={np.linalg.norm(hf_features):.2f}, "
+            f"ONNX norm={np.linalg.norm(onnx_features):.2f}"
+        )
+
+        # Norm ratio (catches scale factor bugs like FP8 dequant issues)
+        norm_ratio = np.linalg.norm(onnx_features) / np.linalg.norm(hf_features)
+        assert 0.9 < norm_ratio < 1.1, (
+            f"Vision norm ratio {norm_ratio:.4f} outside [0.9, 1.1] — "
+            f"scale factor mismatch between ONNX and HF"
+        )
+
+        # Random independence check (catches attribute zero bugs)
+        rng = np.random.RandomState(42)
+        r1 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
+        r2 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
+        vision_session = OnnxModelSession(pkg["vision"])
+        o1 = vision_session.run({"pixel_values": r1})["image_features"].flatten()
+        o2 = vision_session.run({"pixel_values": r2})["image_features"].flatten()
+        vision_session.close()
+        random_cosine = np.dot(o1, o2) / (np.linalg.norm(o1) * np.linalg.norm(o2))
+        assert random_cosine < 0.9, (
+            f"Random input cosine similarity {random_cosine:.4f} > 0.9 — "
+            f"vision model is not differentiating inputs (possible broken attention)"
         )
 
 

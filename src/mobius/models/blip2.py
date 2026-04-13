@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """BLIP-2 multimodal model (vision + text) — 3-model split.
 
@@ -126,6 +126,9 @@ class _Blip2VisionEncoderModel(nn.Module):
         for key, value in state_dict.items():
             # Vision model weights (ViT)
             if key.startswith("vision_model."):
+                # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
+                key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
                 renamed[key] = value
             # Language projection (Q-Former output → text dim)
             elif key.startswith("language_projection."):
