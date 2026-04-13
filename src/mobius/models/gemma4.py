@@ -114,19 +114,22 @@ class Gemma4VisionSelfAttention(nn.Module):
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
 
         # Precompute 2D RoPE cos/sin lookup tables: shape [max_position, head_dim//2].
-        # inv_freq[i] = 1 / (rope_theta ^ (2*i / head_dim))  for i in 0..head_dim//2-1
+        # HF computes inv_freq over the *spatial half* (head_dim//2) as the denominator,
+        # then concatenates to fill both halves of each half-head dimension:
+        #   inv_freq[i] = 1 / (rope_theta ^ (2*i / spatial_dim))  for i in 0..spatial_dim//2-1
+        #   angles_base [max_pos, spatial_dim//2] → concat with itself → [max_pos, spatial_dim]
         # For vision, rope_theta=100.0 (much smaller than text's 10000).
+        spatial_dim = self.head_dim // 2  # each spatial dimension (x or y) gets this many dims
         inv_freq = (
             1.0
-            / (
-                rope_theta
-                ** (np.arange(0, self.head_dim, 2, dtype=np.float32) / self.head_dim)
-            )
-        ).astype(np.float32)  # [head_dim//2]
+            / (rope_theta ** (np.arange(0, spatial_dim, 2, dtype=np.float32) / spatial_dim))
+        ).astype(np.float32)  # [spatial_dim//2]
         positions = np.arange(max_position, dtype=np.float32)  # [max_position]
-        angles = np.outer(positions, inv_freq).astype(
+        angles_base = np.outer(positions, inv_freq).astype(
             np.float32
-        )  # [max_position, head_dim//2]
+        )  # [max_pos, spatial_dim//2]
+        # Duplicate frequencies: each freq is used for both the lower and upper quarter
+        angles = np.concatenate([angles_base, angles_base], axis=-1)  # [max_pos, spatial_dim]
         self.cos_cache = nn.Parameter(
             list(angles.shape),
             name="cos_cache",
@@ -195,8 +198,8 @@ class Gemma4VisionSelfAttention(nn.Module):
                 upper = op.Slice(x_half, [quarter], [half], [3])  # [B, N, nh, quarter]
                 neg_upper = op.Neg(upper)
                 rotated = op.Concat(neg_upper, lower, axis=3)  # [B, N, nh, half]
-                # x_rot = x * cos - rotate_half(x) * sin
-                return op.Sub(op.Mul(x_half, cos), op.Mul(rotated, sin))
+                # x_rot = x * cos + rotate_half(x) * sin  (standard HF RoPE formula)
+                return op.Add(op.Mul(x_half, cos), op.Mul(rotated, sin))
 
             # Split q and k into first/second halves of head_dim
             q_first = op.Slice(q, [0], [half], [3])  # [B, N, nh, half]
@@ -263,7 +266,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
-        # Gated MLP: gate_proj * activation(up_proj) -> down_proj
+        # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
         self.mlp = MLP(
             ArchitectureConfig(
@@ -296,15 +299,28 @@ class Gemma4VisionEncoderLayer(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    """3×3 spatial average pooling for Gemma4 vision features.
+    """Position-based spatial pooling for Gemma4 vision features.
 
-    Reduces the patch sequence from ``[B, N, hidden]`` to ``[B, N/9, hidden]``
-    by reshaping to a 2D grid, applying AveragePool with kernel=stride=3, and
-    flattening back.  Also applies the ``sqrt(hidden)`` scaling that HF performs
-    inside ``Gemma4VisionPooler``.
+    Replicates HF ``Gemma4VisionPooler._avg_pool_by_positions``:
 
-    Requires N to be a perfect square (H×H) and H to be divisible by ``kernel_size``.
-    This is guaranteed by HF's image preprocessing which pads to a square grid.
+    1. Mask padding patches (``pixel_position_ids == (-1,-1)``) to zero.
+    2. Compute ``output_length = T // k²`` (k = kernel_size = 3).
+    3. For each patch at position ``(x, y)``, assign it to output bucket
+       ``floor(x/k) + W_out * floor(y/k)`` where ``W_out = (max_x+1) // k``.
+    4. Build a ``[B, T, output_length]`` one-hot weight matrix scaled by ``1/k²``.
+    5. Left-multiply: ``[B, output_length, T] @ [B, T, D]`` → ``[B, output_length, D]``.
+    6. Scale output by ``sqrt(hidden_size)``.
+
+    Unlike the old 2D AveragePool approach, this handles non-square image grids
+    (e.g. a 57×42 = 2394-patch grid produced from a 960×686 pixel image).
+    Padding patches (position ``(-1,-1)``) have their hidden states zeroed before
+    pooling so they contribute nothing to the weighted sum even though they are
+    clamped to bucket 0.
+
+    The output includes ``output_length = T // k²`` tokens.  Buckets that received
+    no real patch (only padding or none at all) are all-zero in the output; callers
+    should consume only ``count(IMAGE_TOKEN_ID)`` features which corresponds to the
+    valid non-padding area of the image.
     """
 
     def __init__(self, hidden_size: int, kernel_size: int = 3):
@@ -316,40 +332,61 @@ class Gemma4VisionPooler(nn.Module):
         self,
         op: builder.OpBuilder,
         vision_features: ir.Value,
+        pixel_position_ids: ir.Value,
     ) -> ir.Value:
-        # vision_features: [B, N, hidden]
-        # Compute spatial grid side: H = sqrt(N) (N is always a perfect square)
-        n_dim = op.Shape(vision_features, start=1, end=2)  # [1]
-        h_dim = op.Cast(
-            op.Sqrt(op.Cast(n_dim, to=ir.DataType.FLOAT)), to=ir.DataType.INT64
-        )  # [1]
-        b_dim = op.Shape(vision_features, start=0, end=1)  # [1]
-        d_dim = op.Shape(vision_features, start=2, end=3)  # [1]
-
-        # Reshape [B, N, D] -> [B, H, H, D]
-        grid_shape = op.Concat(b_dim, h_dim, h_dim, d_dim, axis=0)
-        vision_features = op.Reshape(vision_features, grid_shape)
-
-        # Transpose [B, H, H, D] -> [B, D, H, H] for 2D AveragePool (NCHW format)
-        vision_features = op.Transpose(vision_features, perm=[0, 3, 1, 2])
-
-        # Apply 2D average pool: kernel=stride=kernel_size -> [B, D, H/k, H/k]
+        # vision_features:      [B, T, D]
+        # pixel_position_ids:   [B, T, 2]  — (x, y); (-1,-1) marks padding/CLS patches
         k = self._kernel_size
-        vision_features = op.AveragePool(
-            vision_features,
-            kernel_shape=[k, k],
-            strides=[k, k],
-        )
+        k2 = k * k
 
-        # Transpose back [B, D, H/k, H/k] -> [B, H/k, H/k, D]
-        vision_features = op.Transpose(vision_features, perm=[0, 2, 3, 1])
+        # --- 1. Mask padding patches to zero ---------------------------------
+        # padding if BOTH x AND y are -1
+        neg_one = op.Constant(value_int=-1)
+        x_pos = op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=2)  # [B, T]
+        y_pos = op.Gather(pixel_position_ids, op.Constant(value_int=1), axis=2)  # [B, T]
+        is_padding = op.And(op.Equal(x_pos, neg_one), op.Equal(y_pos, neg_one))  # [B, T] bool
 
-        # Reshape [B, H/k, H/k, D] -> [B, N/k^2, D]
-        flat_shape = op.Concat(b_dim, op.Constant(value_ints=[-1]), d_dim, axis=0)
-        vision_features = op.Reshape(vision_features, flat_shape)
+        # zero out padding hidden states: features * (1 - is_padding)
+        not_padding_f = op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT)
+        not_padding_f = op.Unsqueeze(not_padding_f, [2])  # [B, T, 1]
+        vision_features = op.Mul(vision_features, not_padding_f)  # [B, T, D]
 
-        # Scale by sqrt(hidden_size) matching HF VisionPooler
-        return op.Mul(vision_features, op.Constant(value_float=self._pooler_scale))
+        # --- 2. output_length = T // k² -------------------------------------
+        t_dim = op.Shape(vision_features, start=1, end=2)  # [1]
+        output_length = op.Div(t_dim, op.Constant(value_ints=[k2]))  # [1]
+
+        # --- 3. Clamp positions to [0, ∞) so padding doesn't break Div ------
+        clamped_x = op.Max(x_pos, op.Constant(value_int=0))  # [B, T]
+        clamped_y = op.Max(y_pos, op.Constant(value_int=0))  # [B, T]
+
+        # max_x = max(x) + 1 per batch item  → [B, 1] for broadcasting
+        max_x = op.Add(
+            op.ReduceMax(clamped_x, op.Constant(value_ints=[1]), keepdims=1),
+            op.Constant(value_int=1),
+        )  # [B, 1]
+
+        # --- 4. Kernel bucket index per patch --------------------------------
+        # floor(x/k) + (max_x//k) * floor(y/k)
+        k_c = op.Constant(value_ints=[k])
+        kx = op.Div(clamped_x, k_c)  # [B, T]
+        ky = op.Div(clamped_y, k_c)  # [B, T]
+        w_out = op.Div(max_x, k_c)  # [B, 1]  width of the output grid
+        kernel_idxs = op.Add(kx, op.Mul(w_out, ky))  # [B, T]
+
+        # --- 5. One-hot weight matrix ----------------------------------------
+        # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
+        # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
+        depth = op.Squeeze(output_length, op.Constant(value_ints=[0]))  # scalar
+        on_val = 1.0 / float(k2)
+        one_hot_vals = op.Constant(value_floats=[0.0, on_val])
+        weights = op.OneHot(kernel_idxs, depth, one_hot_vals)  # [B, T, output_length]
+
+        # --- 6. Weighted sum: [B, output_length, T] @ [B, T, D] ---------------
+        weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, output_length, T]
+        output = op.MatMul(weights_t, vision_features)  # [B, output_length, D]
+
+        # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
+        return op.Mul(output, op.Constant(value_float=self._pooler_scale))
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
@@ -428,7 +465,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        vc = config.vision
+        vc = config.vision  # VisionConfig for the SigLIP encoder
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
             hidden_size=vc.hidden_size,
@@ -1411,7 +1448,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
-        vc = config.vision
+        vc = config.vision  # VisionConfig for the SigLIP encoder
         self.encoder = _Gemma4VisionEncoderCore(config)
         # Gemma4VisionPooler: 3×3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
@@ -1428,19 +1465,20 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # [B, N, 3*P^2] -> [B, N, vision_hidden]
         vision_features = self.encoder(op, pixel_values, pixel_position_ids)
 
-        # Spatial 3×3 average pooling: [B, N, D] -> [B, N/9, D], scales by sqrt(D)
-        vision_features = self.pooler(op, vision_features)
+        # Position-based pooling: [B, N, D] -> [B, N/9, D], scales by sqrt(D).
+        # Passes pixel_position_ids so the pooler can assign patches to spatial buckets.
+        vision_features = self.pooler(op, vision_features, pixel_position_ids)
 
-        # Scale-free norm + linear projection -> [B, N, text_hidden]
+        # Scale-free norm + linear projection -> [B, N/9, text_hidden]
         vision_features = self.projector_norm(op, vision_features)
         vision_features = self.projector(op, vision_features)
 
-        # Flatten batch and token dims: [B, N, text_hidden] -> [B*N, text_hidden]
+        # Flatten batch and token dims: [B, N/9, text_hidden] -> [B*(N/9), text_hidden]
         hidden_size = op.Shape(vision_features, start=2, end=3)
         vision_features = op.Reshape(
             vision_features, op.Concat(op.Constant(value_ints=[-1]), hidden_size, axis=0)
         )
-        return vision_features  # [B*N, text_hidden]
+        return vision_features  # [B*(N/9), text_hidden]
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

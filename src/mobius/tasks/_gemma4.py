@@ -8,7 +8,7 @@ The unified :class:`Gemma4Task` builds a 3- or 4-model package:
 1. **decoder** (text decoder): ``inputs_embeds`` → logits + KV cache
 2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` → ``image_features``
 3. **embedding**: ``input_ids, image_features[, audio_features]`` → ``inputs_embeds``
-4. **speech** (audio encoder, only when ``config.audio is not None``):
+4. **audio** (audio encoder, only when ``config.audio is not None``):
    ``input_features`` → ``audio_features``
 
 The decoder uses per-layer KV cache where local (sliding_attention) layers
@@ -158,7 +158,7 @@ class Gemma4Task(ModelTask):
     - ``embedding``: embedding model fusing ``input_ids`` and multimodal features
 
     When ``config.audio is not None``, also builds:
-    - ``speech``: Conformer audio encoder accepting ``input_features``
+    - ``audio``: Conformer audio encoder accepting ``input_features``
       (and adds ``audio_features`` as a third input to ``embedding``)
 
     Decoder KV cache is per-layer with the correct head_dim for each layer type
@@ -177,7 +177,7 @@ class Gemma4Task(ModelTask):
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision"] = self._build_vision(module.vision_encoder, config)
         if config.audio is not None:
-            models["audio"] = self._build_speech(module.audio_encoder, config)
+            models["audio"] = self._build_audio(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
@@ -288,7 +288,7 @@ class Gemma4Task(ModelTask):
 
         return _make_model(graph)
 
-    def _build_speech(
+    def _build_audio(
         self,
         audio: nn.Module,
         config: Gemma4Config,
