@@ -267,7 +267,7 @@ def build_input_ids(
     num_image_tokens: int = 0,
     num_audio_tokens: int = 0,
 ) -> np.ndarray:
-    """Tokenize a prompt using the chat template and insert modality placeholder tokens.
+    r"""Tokenize a prompt using the chat template and insert modality placeholder tokens.
 
     Applies the Gemma 4 instruction chat template so the instruction-tuned
     model receives properly formatted input.  Modality placeholder tokens
@@ -338,7 +338,10 @@ def _init_kv_cache(config) -> dict[str, np.ndarray]:
     """
     num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
-    layer_types = getattr(config, "layer_types", None) or ["sliding_attention"] * config.num_hidden_layers
+    layer_types = (
+        getattr(config, "layer_types", None)
+        or ["sliding_attention"] * config.num_hidden_layers
+    )
     local_hd = config.head_dim
     global_hd = getattr(config, "global_head_dim", None) or local_hd
 

@@ -763,7 +763,7 @@ class Gemma4DecoderLayer(nn.Module):
         all k slots that select that expert (inner loop), applies the SwiGLU MLP,
         and accumulates into the output tensor.
 
-        This produces O(E × K) ONNX nodes (e.g. Gemma4 26B: 256 experts × 2 top-k =
+        This produces O(E x K) ONNX nodes (e.g. Gemma4 26B: 256 experts x 2 top-k =
         512 per layer).  The primary path uses a fused MoE op for supported EPs
         (CUDA/DML); this fallback is only invoked for CPU/other EPs where the fused
         op is absent.
