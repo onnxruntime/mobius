@@ -48,7 +48,12 @@ _SHARED_INFRA_PATTERNS = (
     "src/mobius/models/__init__.py",
 )
 
-_SHARED_INFRA_PREFIXES = (
+_SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
+
+# Traceable infrastructure: component/task files that are analyzed via the
+# import graph to find which models they actually affect, rather than
+# triggering run_all unconditionally.
+_TRACEABLE_PREFIXES = (
     "src/mobius/components/",
     "src/mobius/tasks/",
 )
@@ -57,7 +62,7 @@ _SHARED_INFRA_PREFIXES = (
 def classify_file(path: str) -> str:
     """Classify a changed file path.
 
-    Returns one of: 'model', 'component', 'task', 'shared_infra',
+    Returns one of: 'model', 'traceable', 'shared_infra',
     'test', 'other'.
     """
     normalized = path.replace("\\", "/")
@@ -81,6 +86,11 @@ def classify_file(path: str) -> str:
     for prefix in _SHARED_INFRA_PREFIXES:
         if normalized.startswith(prefix):
             return "shared_infra"
+
+    # Traceable infrastructure (components, tasks) — traced via import graph
+    for prefix in _TRACEABLE_PREFIXES:
+        if normalized.startswith(prefix):
+            return "traceable"
 
     # Model files
     if rel.startswith("models/") and not rel.endswith("_test.py"):
@@ -409,6 +419,7 @@ def detect_affected_models(
 
     # Classify files
     model_files: list[str] = []
+    traceable_files: list[str] = []
     for path in changed_files:
         category = classify_file(path)
         if category == "shared_infra":
@@ -421,11 +432,17 @@ def detect_affected_models(
                 run_all = True
                 break
             model_files.append(path)
+        elif category == "traceable":
+            full_path = _PROJECT_ROOT / path
+            if not full_path.exists():
+                run_all = True
+                break
+            traceable_files.append(path)
 
     if run_all:
         return {"affected": [], "run_all": True}
 
-    if not model_files:
+    if not model_files and not traceable_files:
         return {"affected": [], "run_all": False}
 
     # Build the registry map: source_module → [model_types]
@@ -434,6 +451,7 @@ def detect_affected_models(
     # Build import graph for transitive analysis
     import_graph = _build_import_graph(_SRC_ROOT)
 
+    # Process model files: direct mapping + transitive dependents
     for path in model_files:
         normalized = path.replace("\\", "/")
         rel = normalized[len("src/mobius/") :]
@@ -446,6 +464,22 @@ def detect_affected_models(
             affected.update(registry_map[module_name])
 
         # Transitive: find modules that import from this model file
+        dependents = _find_reverse_dependents(module_name, import_graph)
+        for dep_module in dependents:
+            if dep_module in registry_map:
+                affected.update(registry_map[dep_module])
+
+    # Process traceable files (components, tasks): find which models
+    # transitively import them, then map to registered model_types.
+    for path in traceable_files:
+        normalized = path.replace("\\", "/")
+        # Convert path to module name: src/mobius/components/_attention.py
+        # → mobius.components._attention
+        rel = normalized[len("src/") :]
+        module_name = rel[:-3].replace("/", ".")  # strip .py, dots
+        if not module_name:
+            continue
+
         dependents = _find_reverse_dependents(module_name, import_graph)
         for dep_module in dependents:
             if dep_module in registry_map:
