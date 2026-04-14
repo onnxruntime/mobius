@@ -9,8 +9,8 @@ on:
       - 'testdata/**'
       - 'scripts/**'
   schedule:
-    # Run weekly on Monday at 5am UTC (after L4 golden tests)
-    - cron: '0 5 * * 1'
+    # Run nightly at 5am UTC (after L4 golden tests)
+    - cron: '0 5 * * *'
   workflow_dispatch:
 
 permissions:
