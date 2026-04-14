@@ -434,11 +434,11 @@ class _InternVL2VisionEncoderModel(nn.Module):
 
         # Step 1: view(N, W, H*scale, C/scale)
         h_scaled = op.Cast(
-            op.Mul(op.Cast(h, to=1), op.Constant(value_float=scale)),
+            op.Mul(op.Cast(h, to=1), scale),
             to=7,
         )
         c_over_scale = op.Cast(
-            op.Div(op.Cast(channels, to=1), op.Constant(value_float=scale)),
+            op.Div(op.Cast(channels, to=1), scale),
             to=7,
         )
         shape_step1 = op.Concat(batch, w, h_scaled, c_over_scale, axis=0)
@@ -449,13 +449,13 @@ class _InternVL2VisionEncoderModel(nn.Module):
 
         # Step 3: view(N, H*scale, W*scale, C/(scale^2))
         w_scaled = op.Cast(
-            op.Mul(op.Cast(w, to=1), op.Constant(value_float=scale)),
+            op.Mul(op.Cast(w, to=1), scale),
             to=7,
         )
         c_over_scale2 = op.Cast(
             op.Div(
                 op.Cast(channels, to=1),
-                op.Constant(value_float=scale * scale),
+                scale * scale,
             ),
             to=7,
         )
@@ -521,7 +521,7 @@ class _InternVL2EmbeddingModel(nn.Module):
 
         # Compute indices into image_features via cumulative sum
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 

@@ -96,7 +96,7 @@ class DeepSeekMoEGate(nn.Module):
         # Normalize weights (V3 with norm_topk_prob=True)
         if self.norm_topk_prob:
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = op.Constant(value_float=1e-20)
+            eps = 1e-20
             routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
 
         # Apply routing scale

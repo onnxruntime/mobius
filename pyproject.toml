@@ -134,6 +134,8 @@ ignore = [
     "TRY003",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
 

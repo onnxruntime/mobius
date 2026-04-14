@@ -73,10 +73,15 @@ _shape_inference = SymbolicShapeInferencePass()
 # (e.g. value_info missing type field for custom ops).
 _CHECKER_SKIP_MODELS: set[str] = {
     "minimax",
-    "mamba2",
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_next",
+    # Models using LinearAttention / CausalConvWithState custom ops
+    # prevent full shape/type propagation through com.microsoft domain.
+    "bamba",
+    "granitemoehybrid",
+    "mamba2",
+    "nemotron_h",
     # VL/Speech models with value_info/shape checker issues
     "qwen2_vl",
     "qwen2_5_vl",
@@ -3239,7 +3244,7 @@ class TestBuildMamba2Graph:
             assert f"present.{i}.ssm_state" in output_names
 
     def test_mamba2_preprocess_weights(self):
-        """Verify SSM param nesting: mixer.A_log -> mixer.ssm.A_log."""
+        """Verify SSM params stay at mixer level (no nesting)."""
         from mobius.models.mamba import Mamba2CausalLMModel
 
         config = self._mamba2_config()
@@ -3256,9 +3261,10 @@ class TestBuildMamba2Graph:
         }
         result = module.preprocess_weights(state_dict)
 
-        assert "backbone.layers.0.mixer.ssm.A_log" in result
-        assert "backbone.layers.0.mixer.ssm.D" in result
-        assert "backbone.layers.0.mixer.ssm.dt_bias" in result
+        # SSM params stay directly on mixer (no .ssm. nesting)
+        assert "backbone.layers.0.mixer.A_log" in result
+        assert "backbone.layers.0.mixer.D" in result
+        assert "backbone.layers.0.mixer.dt_bias" in result
         # Non-SSM params stay as-is
         assert "backbone.layers.0.mixer.in_proj.weight" in result
         assert "backbone.layers.0.norm.weight" in result
@@ -3350,7 +3356,7 @@ class TestBuildBambaGraph:
         assert _default_task_for_model("bamba") == "hybrid-text-generation"
 
     def test_bamba_preprocess_weights(self):
-        """Verify preprocess_weights nests SSM params under mamba.ssm."""
+        """Verify preprocess_weights passes SSM params through unchanged."""
         import torch
 
         from mobius.models.bamba import BambaCausalLMModel
@@ -3372,9 +3378,10 @@ class TestBuildBambaGraph:
         }
         result = module.preprocess_weights(state_dict)
 
-        assert "model.layers.0.mamba.ssm.A_log" in result
-        assert "model.layers.0.mamba.ssm.D" in result
-        assert "model.layers.0.mamba.ssm.dt_bias" in result
+        # SSM params stay directly on mamba (no .ssm. nesting)
+        assert "model.layers.0.mamba.A_log" in result
+        assert "model.layers.0.mamba.D" in result
+        assert "model.layers.0.mamba.dt_bias" in result
         assert "model.layers.0.mamba.in_proj.weight" in result
         assert "model.layers.1.self_attn.q_proj.weight" in result
 
@@ -3457,10 +3464,10 @@ class TestBuildNemotronHGraph:
         assert "model.embed_tokens.weight" in result
         assert "model.norm.weight" in result
 
-        # Layer 0 (mamba2): SSM params nested under mamba.ssm
-        assert "model.layers.0.mamba.ssm.A_log" in result
-        assert "model.layers.0.mamba.ssm.D" in result
-        assert "model.layers.0.mamba.ssm.dt_bias" in result
+        # Layer 0 (mamba2): SSM params directly under mamba (no nesting)
+        assert "model.layers.0.mamba.A_log" in result
+        assert "model.layers.0.mamba.D" in result
+        assert "model.layers.0.mamba.dt_bias" in result
         # Non-SSM mamba params stay under mamba.*
         assert "model.layers.0.mamba.in_proj.weight" in result
         assert "model.layers.0.mamba.conv1d.weight" in result

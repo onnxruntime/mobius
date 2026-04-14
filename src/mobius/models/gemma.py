@@ -127,7 +127,7 @@ class Gemma2Attention(Attention):
 
     This bounds attention weights to [-softcap, softcap], preventing
     extreme attention concentrations. Uses the ONNX Attention op's
-    native ``softcap`` attribute (opset 23).
+    native ``softcap`` attribute (opset 24).
 
     Also uses ``query_pre_attn_scalar`` for attention scaling instead
     of the default ``1/sqrt(head_dim)``.
@@ -185,7 +185,7 @@ class Gemma2Attention(Attention):
                 interleaved=self._rope_interleave,
             )
 
-        # ONNX Attention op (opset 23) with native softcap support
+        # ONNX Attention op (opset 24) with native softcap support
         attn_output, present_key, present_value = op.Attention(
             query_states,
             key_states,

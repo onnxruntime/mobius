@@ -105,13 +105,9 @@ class SigmoidTopKGate(nn.Module):
         if self.norm_topk_prob:
             # Renormalize selected weights to sum to 1 (prevents vanishing gradients)
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = op.CastLike(op.Constant(value_float=1e-9), routing_weights)
-            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
+            routing_weights = op.Div(routing_weights, op.Add(weight_sum, 1e-9))
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
-            scale = op.CastLike(
-                op.Constant(value_float=self.routed_scaling_factor), routing_weights
-            )
-            routing_weights = op.Mul(routing_weights, scale)
+            routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
 
 
@@ -145,9 +141,12 @@ class SparseMixerGate(nn.Module):
         factor = op.Max(abs_scores, max_score)
         diff = op.Sub(max_score, scores)
         ratio = op.Div(diff, factor)
-        threshold = op.Constant(value_float=2.0 * jitter_eps)
+        threshold = 2.0 * jitter_eps
         mask = op.Greater(ratio, threshold)
-        neg_inf = op.Constant(value_float=-1e30)
+        # op.CastLike with Python literal: reuses a single constant, avoids cache-key
+        # collision that would occur if -1e30 were used as a plain literal in both
+        # op.Where (auto-cast to typed constant) and op.Expand (unbound → FLOAT).
+        neg_inf = op.CastLike(-1e30, scores)
         masked_scores = op.Where(mask, neg_inf, scores)
         weights = op.Softmax(masked_scores, axis=-1)
         k_one = op.Constant(value_ints=[1])
@@ -169,7 +168,7 @@ class SparseMixerGate(nn.Module):
             )
             all_weights.append(weight_k)
             all_experts.append(expert_k)
-            neg_inf = op.Constant(value_float=-1e30)
+            neg_inf = op.CastLike(-1e30, current_scores)
             current_scores = op.ScatterElements(
                 current_scores,
                 expert_k,

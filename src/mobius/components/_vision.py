@@ -89,7 +89,7 @@ class PatchEmbedding(nn.Module):
 class VisionAttention(nn.Module):
     """Bidirectional multi-head attention for vision encoders.
 
-    Uses the ONNX Attention op (opset 23). Unlike text attention,
+    Uses the ONNX Attention op (opset 24). Unlike text attention,
     this has no causal mask and no KV cache.
     """
 

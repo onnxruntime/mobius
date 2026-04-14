@@ -301,7 +301,7 @@ class Qwen25VLEmbeddingModel(nn.Module):
         # image_features is empty (text-only input: num_image_tokens == 0).
         # The Where mask ensures the padding row is never used in the output.
         pad_row = op.Expand(
-            op.CastLike(op.Constant(value_float=0.0), image_features),
+            op.CastLike(0.0, image_features),
             op.Concat(
                 op.Constant(value_ints=[1]),
                 op.Shape(image_features, start=1, end=2),
@@ -443,7 +443,7 @@ class _Qwen3VLTextModel(nn.Module):
                     op.Where(
                         visual_mask_3d,
                         scattered_ds,
-                        op.CastLike(op.Constant(value_float=0.0), hidden_states),
+                        op.CastLike(0.0, hidden_states),
                     ),
                 )
 

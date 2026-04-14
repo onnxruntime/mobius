@@ -86,7 +86,7 @@ class _AdaLayerNormOutput(nn.Module):
         emb = op.Mul(timestep_emb, op.Sigmoid(timestep_emb))  # SiLU
         emb = self.linear(op, emb)
         shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         hidden_states = self.norm(op, hidden_states)
         hidden_states = op.Mul(hidden_states, op.Add(one, op.Unsqueeze(scale, [1])))
         hidden_states = op.Add(hidden_states, op.Unsqueeze(shift, [1]))
@@ -303,7 +303,7 @@ class _QwenImageTransformerBlock(nn.Module):
     def forward(
         self, op: builder.OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value, temb: ir.Value
     ):
-        one = op.Constant(value_float=1.0)
+        one = 1.0
 
         # Modulation parameters (SiLU → Linear → chunk)
         img_mod = self.img_mod(op, temb)
@@ -447,7 +447,7 @@ class QwenImageTransformer2DModel(nn.Module):
         freqs = np.exp(np.arange(half_dim) * exponent).astype(np.float32)
         freq_const = op.Constant(value_floats=freqs.tolist())
         t = op.Cast(timestep, to=1)  # to float
-        t = op.Mul(t, op.Constant(value_float=1000.0))
+        t = op.Mul(t, 1000.0)
         t = op.Unsqueeze(t, [1])
         args = op.Mul(t, op.Unsqueeze(freq_const, [0]))
         return op.Concat(op.Sin(args), op.Cos(args), axis=-1)

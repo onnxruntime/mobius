@@ -78,14 +78,14 @@ def _relative_position_bucket(
     abs_float = op.Cast(abs_position, to=1)  # FLOAT32
     # Clamp to avoid log(0); doesn't affect result because Where
     # selects the is_small path for abs_position < max_exact
-    abs_clamped = op.Max(abs_float, op.Constant(value_float=1.0))
-    log_ratio = op.Log(op.Div(abs_clamped, op.Constant(value_float=float(max_exact))))
+    abs_clamped = op.Max(abs_float, 1.0)
+    log_ratio = op.Log(op.Div(abs_clamped, float(max_exact)))
     log_scale = math.log(max_distance / max_exact)
     bucket_float = op.Add(
-        op.Constant(value_float=float(max_exact)),
+        float(max_exact),
         op.Mul(
             log_ratio,
-            op.Constant(value_float=float(effective_buckets - max_exact) / log_scale),
+            float(effective_buckets - max_exact) / log_scale,
         ),
     )
     large_bucket = op.Cast(bucket_float, to=7)  # INT64
@@ -421,7 +421,7 @@ class T5Decoder(nn.Module):
         if self._scale_decoder_outputs:
             hidden_states = op.Mul(
                 hidden_states,
-                op.Constant(value_float=float(self._hidden_size**-0.5)),
+                float(self._hidden_size**-0.5),
             )
         logits = self.lm_head(op, hidden_states)
         return logits, present_self_kvs, present_cross_kvs

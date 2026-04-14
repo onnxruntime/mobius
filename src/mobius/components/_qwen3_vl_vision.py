@@ -143,7 +143,7 @@ class Qwen3VLVisionAttention(nn.Module):
     """Packed bidirectional multi-head attention for the vision encoder.
 
     Iterates over sub-sequences delimited by ``cu_seqlens`` and applies
-    standard ONNX Attention (opset 23) to each independently.  This avoids
+    standard ONNX Attention (opset 24) to each independently.  This avoids
     cross-image attention while processing all patches in a single flat
     sequence.
     """
@@ -292,8 +292,8 @@ class Qwen3VLVisionAttention(nn.Module):
         same_segment = op.Equal(segment_row, segment_column)  # (total_seq, total_seq)
         attn_bias = op.Where(
             same_segment,
-            op.Constant(value_float=0.0),
-            op.Constant(value_float=-10000.0),
+            op.CastLike(0.0, query),
+            op.CastLike(-10000.0, query),
         )
         # Reshape for Attention: (1, 1, total_seq, total_seq)
         attn_bias = op.Unsqueeze(attn_bias, [0, 1])
@@ -609,12 +609,12 @@ class Qwen3VLVisionModel(nn.Module):
         )
 
         h_idxs = body_op.Div(
-            body_op.Mul(h_range, body_op.Constant(value_float=n_minus_1)),
-            body_op.Sub(H_f, body_op.Constant(value_float=1.0)),
+            body_op.Mul(h_range, n_minus_1),
+            body_op.Sub(H_f, 1.0),
         )
         w_idxs = body_op.Div(
-            body_op.Mul(w_range, body_op.Constant(value_float=n_minus_1)),
-            body_op.Sub(W_f, body_op.Constant(value_float=1.0)),
+            body_op.Mul(w_range, n_minus_1),
+            body_op.Sub(W_f, 1.0),
         )
 
         # Floor/ceil indices
@@ -648,8 +648,8 @@ class Qwen3VLVisionModel(nn.Module):
         idx_10 = body_op.Reshape(body_op.Add(bh_c2, wf2), [-1])
         idx_11 = body_op.Reshape(body_op.Add(bh_c2, wc2), [-1])
 
-        one_minus_dh = body_op.Sub(body_op.Constant(value_float=1.0), dh)
-        one_minus_dw = body_op.Sub(body_op.Constant(value_float=1.0), dw)
+        one_minus_dh = body_op.Sub(1.0, dh)
+        one_minus_dw = body_op.Sub(1.0, dw)
         dh2 = body_op.Unsqueeze(dh, [1])
         omdh2 = body_op.Unsqueeze(one_minus_dh, [1])
         dw2 = body_op.Unsqueeze(dw, [0])
@@ -704,7 +704,7 @@ class Qwen3VLVisionModel(nn.Module):
             body_op.Constant(value_ints=[0]),
             axis=0,
         )
-        padded = body_op.Pad(pos_embeds, pads, body_op.Constant(value_float=0.0))
+        padded = body_op.Pad(pos_embeds, pads, 0.0)
         padded.name = "padded_pos_embed"
         body_graph.outputs.append(padded)
 

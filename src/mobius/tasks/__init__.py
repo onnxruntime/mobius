@@ -38,6 +38,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
     "QwenVLTask",
@@ -93,6 +94,7 @@ from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     HybridQwenVLTask,
     MllamaVisionLanguageTask,
+    PixtralVLTask,
     QwenVLTask,
     VisionLanguageTask,
 )
@@ -116,6 +118,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,
+    "pixtral-vl": PixtralVLTask,
     "mllama-vision-language": MllamaVisionLanguageTask,
     "qwen-vl": QwenVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,

@@ -86,7 +86,7 @@ class _Sam2HieraBlock(nn.Module):
 
         # Scaled dot-product attention
         scale = self._head_dim**-0.5
-        q = op.Mul(q, op.Constant(value_float=scale))
+        q = op.Mul(q, scale)
         k_t = op.Transpose(k, perm=[0, 1, 3, 2])
         scores = op.MatMul(q, k_t)
         attn_weights = op.Softmax(scores, axis=-1)

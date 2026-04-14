@@ -130,17 +130,18 @@ class SSM2CausalLMTask(ModelTask):
     """Causal language model with Mamba2/SSD state carry.
 
     Like SSMCausalLMTask but with 4D SSM state for Mamba2 multi-head
-    architecture and wider conv_dim.
+    architecture and wider conv_dim.  Uses LinearAttention + CausalConvWithState
+    function ops.
 
     Inputs:
         - input_ids: [batch, sequence_len] INT64
         - past_states.{i}.conv_state: [batch, conv_dim, conv_kernel-1]
-        - past_states.{i}.ssm_state: [batch, num_heads, head_dim, state_size]
+        - past_states.{i}.ssm_state: [batch, num_heads, state_size, head_dim]
 
     Outputs:
         - logits: FLOAT
         - present.{i}.conv_state: [batch, conv_dim, conv_kernel-1]
-        - present.{i}.ssm_state: [batch, num_heads, head_dim, state_size]
+        - present.{i}.ssm_state: [batch, num_heads, state_size, head_dim]
     """
 
     model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}
@@ -156,9 +157,17 @@ class SSM2CausalLMTask(ModelTask):
         n_groups = config.n_groups
         state_size = config.state_size
         conv_dim = config.intermediate_size + 2 * n_groups * state_size
-        return _build_ssm_task(
+        pkg = _build_ssm_task(
             module,
             config,
             conv_state_shape=[conv_dim, config.conv_kernel - 1],
-            ssm_state_shape=[config.num_heads, config.head_dim, state_size],
+            # LinearAttention convention: (H, d_k, d_v) = (H, d_state, d_head)
+            ssm_state_shape=[config.num_heads, state_size, config.head_dim],
         )
+        # Register CausalConvWithState and LinearAttention function ops.
+        from mobius.tasks._cache_utils import (
+            _register_linear_attention_functions_for_ssm2,
+        )
+
+        _register_linear_attention_functions_for_ssm2(pkg["model"], config)
+        return pkg

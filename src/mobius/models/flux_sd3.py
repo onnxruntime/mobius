@@ -119,7 +119,7 @@ class _JointAttentionBlock(nn.Module):
             hidden_states,
             temb,
         )
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         img_input = op.Mul(normed, op.Add(one, op.Unsqueeze(scale_msa, [1])))
         img_input = op.Add(img_input, op.Unsqueeze(shift_msa, [1]))
 
@@ -324,7 +324,7 @@ class _FluxSingleBlock(nn.Module):
             hidden_states,
             temb,
         )
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         attn_input = op.Mul(normed, op.Add(one, op.Unsqueeze(scale_msa, [1])))
         attn_input = op.Add(attn_input, op.Unsqueeze(shift_msa, [1]))
 

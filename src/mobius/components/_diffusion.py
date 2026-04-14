@@ -83,9 +83,8 @@ class AdaLayerNormOutput(nn.Module):
         emb = self._silu(op, timestep_emb)
         emb = self.linear(op, emb)
         shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
-        one = op.Constant(value_float=1.0)
         hidden_states = self.norm(op, hidden_states)
-        hidden_states = op.Mul(hidden_states, op.Add(one, op.Unsqueeze(scale, [1])))
+        hidden_states = op.Mul(hidden_states, op.Add(1.0, op.Unsqueeze(scale, [1])))
         hidden_states = op.Add(hidden_states, op.Unsqueeze(shift, [1]))
         return hidden_states
 
