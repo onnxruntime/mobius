@@ -24,6 +24,7 @@ from detect_affected_models import (  # noqa: E402
     _build_registry_class_to_types,
     _build_source_module_to_types,
     _find_reverse_dependents,
+    _SRC_ROOT,
     classify_file,
     detect_affected_models,
 )
@@ -42,10 +43,10 @@ class TestClassifyFile:
         assert classify_file("src/mobius/models/__init__.py") == "shared_infra"
 
     def test_component_file(self):
-        assert classify_file("src/mobius/components/_attention.py") == "shared_infra"
+        assert classify_file("src/mobius/components/_attention.py") == "traceable"
 
     def test_task_file(self):
-        assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
+        assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
 
     def test_configs_file(self):
         assert classify_file("src/mobius/_configs.py") == "shared_infra"
@@ -116,7 +117,7 @@ class TestRegistryParsing:
         assert "FalconCausalLMModel" in mapping
         types = mapping["FalconCausalLMModel"]
         assert "falcon" in types
-        assert "bloom" in types
+        assert "falcon_h1" in types
 
     def test_source_module_to_types(self):
         mapping = _build_source_module_to_types()
@@ -173,13 +174,19 @@ class TestImportGraph:
 
 
 class TestDetectAffectedModels:
-    def test_component_change_triggers_run_all(self):
+    def test_component_change_traces_affected_models(self):
+        """A component change traces through the import graph to find affected models."""
         result = detect_affected_models(["src/mobius/components/_attention.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        # _attention.py is imported by many models — should find affected types
+        assert len(result["affected"]) > 0
 
-    def test_task_change_triggers_run_all(self):
+    def test_task_change_traces_affected_models(self):
+        """A task change traces through the import graph to find affected models."""
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        # _causal_lm.py is imported by task infrastructure — may affect models
+        # The key point: it does NOT trigger run_all
 
     def test_configs_change_triggers_run_all(self):
         result = detect_affected_models(["src/mobius/_configs.py"])
@@ -260,6 +267,106 @@ class TestDetectAffectedModels:
         result = detect_affected_models([])
         assert result["run_all"] is False
         assert result["affected"] == []
+
+    def test_component_common_affects_many_models(self):
+        """_common.py is foundational — tracing should find many models."""
+        result = detect_affected_models(["src/mobius/components/_common.py"])
+        assert result["run_all"] is False
+        # _common.py defines Linear, Embedding, LayerNorm — used everywhere
+        assert len(result["affected"]) > 10
+
+    def test_shared_infra_still_triggers_run_all(self):
+        """True shared_infra files (_configs, _registry, etc.) still trigger run_all."""
+        for path in [
+            "src/mobius/_configs.py",
+            "src/mobius/_registry.py",
+            "src/mobius/_builder.py",
+            "src/mobius/_weight_loading.py",
+            "src/mobius/_model_package.py",
+            "src/mobius/_exporter.py",
+            "src/mobius/models/__init__.py",
+            "tests/conftest.py",
+            "tests/_test_configs.py",
+        ]:
+            result = detect_affected_models([path])
+            assert result["run_all"] is True, (
+                f"{path} should trigger run_all but didn't"
+            )
+
+    def test_traceable_and_model_combined(self):
+        """A component + model file change returns union of affected types."""
+        result = detect_affected_models(
+            [
+                "src/mobius/models/falcon.py",
+                "src/mobius/components/_attention.py",
+            ]
+        )
+        assert result["run_all"] is False
+        assert "falcon" in result["affected"]
+        # _attention.py dependents should also be included
+        assert len(result["affected"]) > 2
+
+    def test_traceable_overridden_by_shared_infra(self):
+        """If both traceable and shared_infra change, run_all wins."""
+        result = detect_affected_models(
+            [
+                "src/mobius/components/_attention.py",
+                "src/mobius/_configs.py",
+            ]
+        )
+        assert result["run_all"] is True
+
+    def test_deleted_traceable_file_triggers_run_all(self):
+        """A deleted component file triggers run_all (conservative)."""
+        result = detect_affected_models(
+            ["src/mobius/components/_nonexistent_component.py"]
+        )
+        assert result["run_all"] is True
+
+
+# ----------------------------------------------------------------
+# Traceable tracing integration tests
+# ----------------------------------------------------------------
+
+
+class TestTraceableTracing:
+    """Verify the import graph tracing for component/task files."""
+
+    def test_attention_component_finds_model_dependents(self):
+        """_attention.py should trace to models that import it."""
+        import_graph = _build_import_graph(_SRC_ROOT)
+        registry_map = _build_source_module_to_types()
+
+        dependents = _find_reverse_dependents(
+            "mobius.components._attention", import_graph
+        )
+        # At minimum, models that use Attention should appear
+        affected_types: set[str] = set()
+        for dep in dependents:
+            if dep in registry_map:
+                affected_types.update(registry_map[dep])
+        assert len(affected_types) > 0, (
+            "Expected _attention.py to affect at least one model"
+        )
+
+    def test_traceable_result_is_subset_of_all_models(self):
+        """Traceable tracing should return a subset, not all models."""
+        # A niche component should affect fewer models than _common.py
+        result_common = detect_affected_models(
+            ["src/mobius/components/_common.py"]
+        )
+        result_niche = detect_affected_models(
+            ["src/mobius/components/_sam_vision.py"]
+        )
+        assert result_common["run_all"] is False
+        assert result_niche["run_all"] is False
+        # Niche component should affect fewer models
+        assert len(result_niche["affected"]) <= len(
+            result_common["affected"]
+        ), (
+            f"_sam_vision.py ({len(result_niche['affected'])} models) should "
+            f"affect <= models than _common.py ({len(result_common['affected'])})"
+        )
 
 
 # ----------------------------------------------------------------
