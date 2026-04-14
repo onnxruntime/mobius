@@ -252,7 +252,7 @@ class Qwen25VLVisionAttention(nn.Module):
         v = op.Unsqueeze(v, [0])
 
         # Build block-diagonal attention bias from cu_seqlens
-        attn_bias = self._build_block_diagonal_bias(op, cu_seqlens, seq_len_val)
+        attn_bias = self._build_block_diagonal_bias(op, cu_seqlens, seq_len_val, q)
         attn_bias = op.Unsqueeze(attn_bias, [0, 1])  # (1, 1, N, N)
 
         # Scaled dot-product attention
@@ -301,11 +301,14 @@ class Qwen25VLVisionAttention(nn.Module):
 
         return op.Concat(rot_x1, rot_x2, axis=-1)
 
-    def _build_block_diagonal_bias(self, op, cu_seqlens, seq_len):
+    def _build_block_diagonal_bias(self, op, cu_seqlens, seq_len, dtype_ref):
         """Build block-diagonal attention bias from cu_seqlens.
 
         Creates a matrix where positions in the same sub-sequence have 0
         and positions in different sub-sequences have -inf.
+
+        Args:
+            dtype_ref: reference tensor whose dtype the bias should match.
         """
         # Create range indices
         indices = op.Range(
@@ -337,8 +340,9 @@ class Qwen25VLVisionAttention(nn.Module):
         same_segment = op.Equal(seg_row, seg_col)
 
         # Convert to attention bias: 0 where same segment, -inf where different
-        neg_inf = -1e9
-        zero = 0.0
+        # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
+        neg_inf = op.CastLike(-1e9, dtype_ref)
+        zero = op.CastLike(0.0, dtype_ref)
         return op.Where(same_segment, zero, neg_inf)
 
 

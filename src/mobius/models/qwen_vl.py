@@ -292,7 +292,7 @@ class Qwen25VLEmbeddingModel(nn.Module):
         # Cumulative sum to map flat image_features indices
         # image_mask is (batch, seq), cast to int
         mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, 1)
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
         # Zero-based index: subtract 1, clip to 0
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
@@ -422,7 +422,7 @@ class _Qwen3VLTextModel(nn.Module):
                 # ds_embeds: (num_visual_tokens, hidden_size)
                 # Use cumsum of mask to index into ds_embeds
                 mask_int = op.Cast(visual_mask, to=7)  # INT64
-                cumsum = op.CumSum(mask_int, 1)
+                cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
                 indices = op.Sub(cumsum, op.Constant(value_int=1))
                 indices = op.Clip(indices, op.Constant(value_int=0))
                 # Expand ds_embeds with batch dim: (1, num_visual_tokens, hidden_size)

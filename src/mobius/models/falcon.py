@@ -293,10 +293,11 @@ def _create_alibi_bias(op, num_heads: int, seq_len, total_len):
     alibi = op.Mul(slopes_4d, bias_2d)  # [1, num_heads, seq_len, total_len]
 
     # Causal mask: mask future positions with large negative value
+    # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
     causal_mask = op.Where(
         op.GreaterOrEqual(q_with_offset, kv_expanded),
-        0.0,
-        -10000.0,
+        op.CastLike(0.0, neg_distance),
+        op.CastLike(-10000.0, neg_distance),
     )  # [seq_len, total_len]
     causal_4d = op.Unsqueeze(causal_mask, [0, 1])  # [1, 1, seq_len, total_len]
     return op.Add(alibi, causal_4d)

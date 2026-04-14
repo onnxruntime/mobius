@@ -292,8 +292,8 @@ class Qwen3VLVisionAttention(nn.Module):
         same_segment = op.Equal(segment_row, segment_column)  # (total_seq, total_seq)
         attn_bias = op.Where(
             same_segment,
-            0.0,
-            -10000.0,
+            op.CastLike(0.0, query),
+            op.CastLike(-10000.0, query),
         )
         # Reshape for Attention: (1, 1, total_seq, total_seq)
         attn_bias = op.Unsqueeze(attn_bias, [0, 1])

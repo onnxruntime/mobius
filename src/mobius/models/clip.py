@@ -294,10 +294,12 @@ class CLIPTextModel(nn.Module):
         hidden_states = self.embeddings(op, input_ids)
 
         # Build causal attention bias (lower-triangular)
+        # CastLike ensures the bias dtype matches hidden_states (fp16/bf16/fp32)
+        # Cast the scalar *before* Expand so only a single element is cast
         seq_len = op.Shape(input_ids, start=1, end=2)
         _causal_mask = op.Trilu(
             op.Expand(
-                0.0,
+                op.CastLike(0.0, hidden_states),
                 op.Concat(seq_len, seq_len, axis=0),
             ),
             upper=0,
@@ -305,7 +307,7 @@ class CLIPTextModel(nn.Module):
         # Fill upper triangle with -inf
         neg_inf_mask = op.Trilu(
             op.Expand(
-                -10000.0,
+                op.CastLike(-10000.0, hidden_states),
                 op.Concat(seq_len, seq_len, axis=0),
             ),
             upper=1,
