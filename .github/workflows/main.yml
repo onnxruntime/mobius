@@ -130,6 +130,8 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers]'
       - name: Run L3 synthetic parity tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           if [ ! -f tests/synthetic_parity_test.py ]; then
             echo "tests/synthetic_parity_test.py not found — skipping"
@@ -223,6 +225,8 @@ jobs:
           fi
       - name: Run L4 golden comparison tests
         if: steps.check_golden.outputs.has_golden == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           if [ ! -f tests/e2e_golden_test.py ]; then
             echo "tests/e2e_golden_test.py not found — skipping"
@@ -324,6 +328,8 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing]'
       - name: Run fast integration tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           pytest tests/integration_test.py -m integration_fast -v \
             -k "smollm-135m or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2" \
