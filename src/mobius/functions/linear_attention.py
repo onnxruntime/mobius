@@ -189,7 +189,7 @@ def linear_attention(
     # CastLike ensures scale constant matches the input dtype.
     scaled_query = op.Mul(
         query_expanded,
-        op.CastLike(scale, query_expanded),
+        op.CastLike(op.Constant(value_float=scale), query_expanded),
     )
 
     # --- Build Scan for sequential recurrence ---

@@ -113,8 +113,8 @@ def causal_conv_nd_with_state(
     conv_input = op.Concat(conv_state_val, input_val, axis=temporal_axis)
 
     # Step 2: Extract new carry state — last K-1 positions of conv_input.
-    total_len = op.Gather(op.Shape(conv_input), temporal_axis, axis=0)
-    state_start = op.Sub(total_len, state_width)
+    total_len = op.Gather(op.Shape(conv_input), op.Constant(value_int=temporal_axis), axis=0)
+    state_start = op.Sub(total_len, op.Constant(value_int=state_width))
     present_state = op.Slice(
         conv_input,
         op.Reshape(state_start, op.Constant(value_ints=[1])),

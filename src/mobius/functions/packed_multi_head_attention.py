@@ -121,11 +121,10 @@ def packed_multi_head_attention() -> ir.Function:
     same_segment = op.Equal(segment_ids_row, segment_ids_column)  # (N, N)
 
     # Convert to attention bias: 0 for same segment, -10000 for different
-    # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
     attention_bias = op.Where(
         same_segment,
-        op.CastLike(0.0, query_input),
-        op.CastLike(-10000.0, query_input),
+        op.Constant(value_float=0.0),
+        op.Constant(value_float=-10000.0),
     )
     # Reshape for Attention: (1, 1, N, N)
     attention_bias = op.Unsqueeze(attention_bias, [0, 1])

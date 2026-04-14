@@ -120,7 +120,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
             op, hidden_states, conv_state, ssm_state
         )
         # residual + output * residual_multiplier
-        rm = op.CastLike(self._residual_multiplier, mamba_out)
+        rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), mamba_out)
         hidden_states = op.Add(residual, op.Mul(mamba_out, rm))
 
         # MoE + shared-MLP path with pre-norm
@@ -131,7 +131,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
             self.block_sparse_moe(op, hidden_states),
             self.shared_mlp(op, hidden_states),
         )
-        rm = op.CastLike(self._residual_multiplier, hidden_states)
+        rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
         return hidden_states, (new_conv_state, new_ssm_state)
@@ -189,7 +189,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
             position_embeddings=None,  # NoPE: skip rotary embedding application
             past_key_value=past_key_value,
         )
-        rm = op.CastLike(self._residual_multiplier, attn_out)
+        rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), attn_out)
         hidden_states = op.Add(residual, op.Mul(attn_out, rm))
 
         # MoE + shared-MLP path with pre-norm
@@ -199,7 +199,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
             self.block_sparse_moe(op, hidden_states),
             self.shared_mlp(op, hidden_states),
         )
-        rm = op.CastLike(self._residual_multiplier, hidden_states)
+        rm = op.CastLike(op.Constant(value_float=self._residual_multiplier), hidden_states)
         hidden_states = op.Add(residual, op.Mul(hidden_states, rm))
 
         return hidden_states, present_kv

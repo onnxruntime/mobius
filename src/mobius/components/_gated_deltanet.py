@@ -80,7 +80,7 @@ class _DepthwiseConv1d(nn.Module):
         # Zero bias — model has no conv bias; the function requires it.
         # CastLike ensures the bias matches the weight dtype (e.g. f16).
         conv_bias = op.Expand(
-            op.CastLike(0.0, self.weight),
+            op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
         return op.CausalConvWithState(
