@@ -1,4 +1,4 @@
-name: GPU Tests (L4/L5)
+name: "L5: End-to-End Generation (GPU)"
 
 on:
   push:
@@ -9,24 +9,24 @@ on:
       - 'testdata/**'
       - 'scripts/**'
   schedule:
-    # Run weekly on Monday at 4am UTC (after golden regen on Sunday)
-    - cron: '0 4 * * 1'
+    # Run nightly at 5am UTC (after L4 golden tests)
+    - cron: '0 5 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: gpu-tests-${{ github.ref }}
+  group: gpu-l5-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  golden-tests:
-    name: L4/L5 Golden Tests
+  generation-tests:
+    name: L5 - Full token generation and decoding correctness
     runs-on:
       - self-hosted
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
-      - "JobId=gpu-golden-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+      - "JobId=gpu-l5-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -60,19 +60,6 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers]'
 
-      - name: Run L4 checkpoint-verified tests
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          pytest tests/e2e_golden_test.py \
-            -m golden \
-            -v \
-            --timeout=300 \
-            --junitxml=junit-l4.xml \
-            --cov=src --cov-report=xml --cov-branch \
-            --tb=short
-        timeout-minutes: 30
-
       - name: Run L5 generation E2E tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -82,7 +69,7 @@ jobs:
             -v \
             --timeout=300 \
             --junitxml=junit-l5.xml \
-            --cov=src --cov-report=xml --cov-append --cov-branch \
+            --cov=src --cov-report=xml --cov-branch \
             --tb=short
         timeout-minutes: 30
 
@@ -91,15 +78,7 @@ jobs:
         uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          flags: gpu
-      - name: Upload L4 test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          flags: gpu-l4
-          report-type: test_results
-          files: junit-l4.xml
+          flags: gpu-l5
       - name: Upload L5 test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
@@ -113,8 +92,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: gpu-test-results
-          path: |
-            junit-l4.xml
-            junit-l5.xml
+          name: gpu-l5-test-results
+          path: junit-l5.xml
           retention-days: 30
