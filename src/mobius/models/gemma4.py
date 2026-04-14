@@ -57,7 +57,14 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
     """RMSNorm with a constant all-ones scale (no learnable parameter).
 
     Matches ``Gemma4RMSNorm(with_scale=False)`` in HuggingFace.
-    Used for V norms in the vision encoder and the projector pre-norm.
+    Used for V norms in the vision encoder, the vision projector pre-norm,
+    and the audio pre-projection norm.
+
+    Implemented as manual ``x / sqrt(mean(x²) + ε)`` rather than
+    ``op.RMSNormalization`` to prevent ORT's graph optimizer from fusing
+    an upstream ``Add(bias)`` into ``SkipSimplifiedLayerNormalization``,
+    which requires the skip tensor to have the same shape as the input
+    (failing when the bias is 1D or has mismatched temporal dimension).
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -66,12 +73,13 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # All-ones scale tensor — no learnable parameter to load.
-        # Use value_floats (static constant) instead of ConstantOfShape so that
-        # ONNX shape inference can resolve the output shape of RMSNormalization.
-        # CastLike ensures the scale matches the input dtype (fp16/bf16/fp32).
-        scale = op.CastLike(op.Constant(value_floats=[1.0] * self.dim), hidden_states)
-        return op.RMSNormalization(hidden_states, scale, epsilon=self.eps, axis=-1)
+        # Manual RMSNorm: x / sqrt(mean(x²) + ε), scale = 1.0 (scale-free).
+        # Using primitive ops avoids ORT's SkipLayerNorm fusion pattern which
+        # would corrupt the skip shape when an upstream Add uses a 1D bias.
+        square = op.Mul(hidden_states, hidden_states)
+        mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
+        rms = op.Sqrt(op.Add(mean_sq, op.Constant(value_float=self.eps)))
+        return op.Div(hidden_states, rms)
 
 
 # ---------------------------------------------------------------------------
@@ -218,23 +226,33 @@ class Gemma4VisionSelfAttention(nn.Module):
                 axis=3,
             )
 
-        # Flatten back to [B, N, num_heads * head_dim]
-        q = op.Reshape(q, [0, 0, -1])
-        k = op.Reshape(k, [0, 0, -1])
-        v = op.Reshape(v, [0, 0, -1])
+        # Transpose to [B, num_heads, N, head_dim] for manual attention.
+        # The ONNX Attention op has a bug for N > ~2430 (ORT core dump / NaN),
+        # so we implement Q@K^T/softmax/V explicitly.
+        q = op.Transpose(q, perm=[0, 2, 1, 3])  # [B, nh, N, hd]
+        k = op.Transpose(k, perm=[0, 2, 1, 3])
+        v = op.Transpose(v, perm=[0, 2, 1, 3])
 
-        # Bidirectional attention (no is_causal, no KV cache).
-        # attention_bias [B, 1, 1, N] masks out padding patches (value = -1e9).
-        attn_output = op.Attention(
-            q,
-            k,
-            v,
-            attention_bias,
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
-            scale=1.0,
-            _outputs=1,
-        )
+        # Scaled dot-product attention with scale=1.0 (matches HF Gemma4VisionAttention).
+        # scores [B, nh, N, N] = q @ k^T (scale=1.0 so no division needed)
+        k_t = op.Transpose(k, perm=[0, 1, 3, 2])  # [B, nh, hd, N]
+        scores = op.MatMul(q, k_t)  # [B, nh, N, N]
+
+        # Add additive attention bias (masks padding key positions with -1e9)
+        if attention_bias is not None:
+            # attention_bias: [B, 1, 1, N] broadcast over heads and queries
+            scores = op.Add(scores, attention_bias)
+
+        # Softmax over the key dimension
+        attn_weights = op.Softmax(scores, axis=-1)  # [B, nh, N, N]
+
+        # Weighted sum over values
+        attn_output = op.MatMul(attn_weights, v)  # [B, nh, N, hd]
+
+        # Reshape back to [B, N, num_heads * head_dim]
+        attn_output = op.Transpose(attn_output, perm=[0, 2, 1, 3])  # [B, N, nh, hd]
+        attn_output = op.Reshape(attn_output, [0, 0, -1])  # [B, N, nh*hd]
+
         return self.o_proj(op, attn_output)
 
 
@@ -304,23 +322,18 @@ class Gemma4VisionPooler(nn.Module):
     Replicates HF ``Gemma4VisionPooler._avg_pool_by_positions``:
 
     1. Mask padding patches (``pixel_position_ids == (-1,-1)``) to zero.
-    2. Compute ``output_length = T // k²`` (k = kernel_size = 3).
+    2. Compute ``w_out = (max_x+1) // k``, ``h_out = (max_y+1) // k``,
+       ``valid_depth = w_out * h_out`` — only occupied pool bins.
     3. For each patch at position ``(x, y)``, assign it to output bucket
-       ``floor(x/k) + W_out * floor(y/k)`` where ``W_out = (max_x+1) // k``.
-    4. Build a ``[B, T, output_length]`` one-hot weight matrix scaled by ``1/k²``.
-    5. Left-multiply: ``[B, output_length, T] @ [B, T, D]`` → ``[B, output_length, D]``.
+       ``floor(x/k) + w_out * floor(y/k)``.
+    4. Build a ``[B, T, valid_depth]`` one-hot weight matrix scaled by ``1/k²``.
+    5. Left-multiply: ``[B, valid_depth, T] @ [B, T, D]`` → ``[B, valid_depth, D]``.
     6. Scale output by ``sqrt(hidden_size)``.
 
-    Unlike the old 2D AveragePool approach, this handles non-square image grids
-    (e.g. a 57×42 = 2394-patch grid produced from a 960×686 pixel image).
-    Padding patches (position ``(-1,-1)``) have their hidden states zeroed before
-    pooling so they contribute nothing to the weighted sum even though they are
-    clamped to bucket 0.
-
-    The output includes ``output_length = T // k²`` tokens.  Buckets that received
-    no real patch (only padding or none at all) are all-zero in the output; callers
-    should consume only ``count(IMAGE_TOKEN_ID)`` features which corresponds to the
-    valid non-padding area of the image.
+    Unlike using ``T // k²`` as the output length, using ``w_out * h_out``
+    avoids creating empty trailing pool bins that HF strips after pooling.
+    For a 57×42 image (2520 patches, k=3): ``valid_depth = 19×14 = 266``
+    rather than ``2520 // 9 = 280``.
     """
 
     def __init__(self, hidden_size: int, kernel_size: int = 3):
@@ -351,39 +364,49 @@ class Gemma4VisionPooler(nn.Module):
         not_padding_f = op.Unsqueeze(not_padding_f, [2])  # [B, T, 1]
         vision_features = op.Mul(vision_features, not_padding_f)  # [B, T, D]
 
-        # --- 2. output_length = T // k² -------------------------------------
-        t_dim = op.Shape(vision_features, start=1, end=2)  # [1]
-        output_length = op.Div(t_dim, op.Constant(value_ints=[k2]))  # [1]
-
-        # --- 3. Clamp positions to [0, ∞) so padding doesn't break Div ------
+        # --- 2. Clamp positions to [0, ∞) so padding doesn't break Div ------
         clamped_x = op.Max(x_pos, op.Constant(value_int=0))  # [B, T]
         clamped_y = op.Max(y_pos, op.Constant(value_int=0))  # [B, T]
 
-        # max_x = max(x) + 1 per batch item  → [B, 1] for broadcasting
+        # max valid coords (padding patches are clamped to 0 but are zeroed out above)
+        # max_x = max(x_coord for non-padding) + 1 → [B, 1]
         max_x = op.Add(
             op.ReduceMax(clamped_x, op.Constant(value_ints=[1]), keepdims=1),
             op.Constant(value_int=1),
         )  # [B, 1]
+        max_y = op.Add(
+            op.ReduceMax(clamped_y, op.Constant(value_ints=[1]), keepdims=1),
+            op.Constant(value_int=1),
+        )  # [B, 1]
+
+        # --- 3. valid_depth = w_out * h_out (only occupied pool bins) --------
+        # HF strips empty trailing pool bins; using w_out*h_out as the OneHot
+        # depth avoids creating those empty bins in the first place.
+        # For a 57×42 image with k=3: w_out=19, h_out=14, valid_depth=266
+        # (vs T//k²=280 which includes 14 empty bins that would need stripping).
+        k_c = op.Constant(value_ints=[k])
+        w_out = op.Div(max_x, k_c)  # [B, 1]  pooled width
+        h_out = op.Div(max_y, k_c)  # [B, 1]  pooled height
+        # Squeeze batch dim (B=1 for inference) to get scalar valid_depth
+        valid_depth_2d = op.Mul(w_out, h_out)  # [B, 1]
+        valid_depth = op.Squeeze(valid_depth_2d, op.Constant(value_ints=[0, 1]))  # scalar
 
         # --- 4. Kernel bucket index per patch --------------------------------
-        # floor(x/k) + (max_x//k) * floor(y/k)
-        k_c = op.Constant(value_ints=[k])
+        # floor(x/k) + w_out * floor(y/k)  in range [0, valid_depth)
         kx = op.Div(clamped_x, k_c)  # [B, T]
         ky = op.Div(clamped_y, k_c)  # [B, T]
-        w_out = op.Div(max_x, k_c)  # [B, 1]  width of the output grid
         kernel_idxs = op.Add(kx, op.Mul(w_out, ky))  # [B, T]
 
         # --- 5. One-hot weight matrix ----------------------------------------
         # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
         # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
-        depth = op.Squeeze(output_length, op.Constant(value_ints=[0]))  # scalar
         on_val = 1.0 / float(k2)
         one_hot_vals = op.Constant(value_floats=[0.0, on_val])
-        weights = op.OneHot(kernel_idxs, depth, one_hot_vals)  # [B, T, output_length]
+        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth]
 
-        # --- 6. Weighted sum: [B, output_length, T] @ [B, T, D] ---------------
-        weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, output_length, T]
-        output = op.MatMul(weights_t, vision_features)  # [B, output_length, D]
+        # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
+        weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, valid_depth, T]
+        output = op.MatMul(weights_t, vision_features)  # [B, valid_depth, D]
 
         # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
         return op.Mul(output, op.Constant(value_float=self._pooler_scale))
@@ -1162,6 +1185,14 @@ class Gemma4TextModel(nn.Module):
         # Per-layer input embeddings (optional feature)
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         self._hidden_size = config.hidden_size
+        # Multimodal token IDs to mask before per-layer embedding lookup.
+        # HF masks these to pad_token_id (0) so image/audio slots don't contribute
+        # arbitrary large-ID embeddings to the per-layer gate (see
+        # Gemma4Model.forward lines 39-46 in HuggingFace transformers).
+        self._image_token_id: int = config.image_token_id or 0
+        self._audio_token_id: int | None = (
+            config.audio.audio_token_id if config.audio is not None else None
+        )
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
@@ -1186,7 +1217,15 @@ class Gemma4TextModel(nn.Module):
         input_ids: ir.Value | None,
         inputs_embeds: ir.Value,
     ) -> ir.Value | None:
-        """Compute per-layer input embeddings ``[B, S, num_layers, per_layer_dim]``."""
+        """Compute per-layer input embeddings ``[B, S, num_layers, per_layer_dim]``.
+
+        HF's ``Gemma4Model.forward`` replaces image/audio token positions with
+        ``pad_token_id`` (0) *before* calling ``embed_tokens_per_layer``.  We
+        replicate that masking here so each layer's per-layer gate sees a PAD
+        embedding at multimodal positions rather than the raw soft-token IDs
+        (258880 / 258881), which are semantically meaningless in the text
+        per-layer vocabulary.
+        """
         if not self._per_layer_dim:
             return None
 
@@ -1199,7 +1238,24 @@ class Gemma4TextModel(nn.Module):
         proj = self.per_layer_projection_norm(op, proj)
 
         if input_ids is not None:
-            token_emb = self.embed_tokens_per_layer(op, input_ids)
+            # Mask multimodal positions to pad_token_id (0) so image/audio slots
+            # use PAD embeddings in the per-layer path — matching HF line 40:
+            #   llm_input_ids[multimodal_mask] = pad_token_id
+            pad = op.Constant(value_int=0)
+            masked_ids = input_ids
+            if self._image_token_id:
+                masked_ids = op.Where(
+                    op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
+                    pad,
+                    masked_ids,
+                )
+            if self._audio_token_id is not None:
+                masked_ids = op.Where(
+                    op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
+                    pad,
+                    masked_ids,
+                )
+            token_emb = self.embed_tokens_per_layer(op, masked_ids)
             token_emb = op.Reshape(
                 token_emb,
                 op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),

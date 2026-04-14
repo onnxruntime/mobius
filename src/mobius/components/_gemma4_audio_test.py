@@ -108,12 +108,12 @@ class TestGemma4FeedForward:
         assert "ffw_layer_1.weight" in names
         assert "ffw_layer_2.weight" in names
 
-    def test_has_bias(self):
-        """Feed-forward linears have bias=True (matches HF Gemma4ClippableLinear default)."""
+    def test_no_bias(self):
+        """Feed-forward linears have bias=False (HF Gemma4ClippableLinear has no bias in checkpoint)."""
         comp = Gemma4FeedForward(hidden_size=HIDDEN)
         names = {n for n, _ in comp.named_parameters()}
-        assert "ffw_layer_1.bias" in names
-        assert "ffw_layer_2.bias" in names
+        assert "ffw_layer_1.bias" not in names
+        assert "ffw_layer_2.bias" not in names
 
     def test_linear_shapes(self):
         """FF1 expands h→4h, FF2 contracts 4h→h. ONNX weight is (out, in)."""
@@ -221,9 +221,9 @@ class TestGemma4Attention:
         assert p.const_value is not None
 
     def test_no_qkv_bias(self):
-        """Q/K/V projections have no bias (HF: nn.Linear(..., bias=False)).
+        """Q/K/V projections and output projection all have no bias.
 
-        Output projection (post) does have bias (HF Gemma4ClippableLinear default).
+        (HF checkpoint has no bias for any self_attn linear in audio tower).
         """
         comp = Gemma4Attention(
             hidden_size=HIDDEN, num_heads=HEADS, attention_context_left=CTX_LEFT
@@ -233,7 +233,7 @@ class TestGemma4Attention:
         assert "k_proj.bias" not in names
         assert "v_proj.bias" not in names
         assert "relative_k_proj.bias" not in names
-        assert "post.bias" in names  # post uses ClippableLinear (bias=True)
+        assert "post.bias" not in names  # HF checkpoint has no self_attn.post bias
 
 
 # ---------------------------------------------------------------------------

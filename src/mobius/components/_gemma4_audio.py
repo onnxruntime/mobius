@@ -195,8 +195,8 @@ class Gemma4FeedForward(nn.Module):
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.ffw_layer_1 = Linear(hidden_size, hidden_size * 4)
-        self.ffw_layer_2 = Linear(hidden_size * 4, hidden_size)
+        self.ffw_layer_1 = Linear(hidden_size, hidden_size * 4, bias=False)
+        self.ffw_layer_2 = Linear(hidden_size * 4, hidden_size, bias=False)
         self.post_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
@@ -246,10 +246,10 @@ class Gemma4LightConv1d(nn.Module):
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_start = Linear(hidden_size, hidden_size * 2)
+        self.linear_start = Linear(hidden_size, hidden_size * 2, bias=False)
         self.depthwise_conv1d = CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_end = Linear(hidden_size, hidden_size)
+        self.linear_end = Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
         residual = x
@@ -339,8 +339,8 @@ class Gemma4Attention(nn.Module):
         self.q_proj = Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = Linear(hidden_size, hidden_size, bias=False)
-        # post: bias=True (HF Gemma4ClippableLinear default)
-        self.post = Linear(hidden_size, hidden_size)
+        # post: no bias (HF has no .bias key for self_attn.post in checkpoint)
+        self.post = Linear(hidden_size, hidden_size, bias=False)
 
         # Learnable per-head-dim scale applied to Q after projection
         self.per_dim_scale = nn.Parameter([self._head_dim])
@@ -594,7 +594,11 @@ class Gemma4AudioEncoder(nn.Module):
         → Linear(hidden_size, output_proj_dims, bias=True)  [B, T//4, output_proj_dims]
 
     Default values match ``google/gemma-4-E2B-it`` audio_config.
-    The output projection has bias=True (matching ``nn.Linear(..., bias=True)`` in HF).
+    The output projection has bias=True in HF (``nn.Linear(..., bias=True)``), but
+    since ORT fuses ``Add(1D bias) + SimplifiedLayerNorm`` into
+    ``SkipSimplifiedLayerNorm`` with the 1D bias as the skip — which ORT rejects
+    (requires 2D+) — we store the bias separately as ``output_proj_bias [1, 1, D]``
+    and add it after the weight matmul.
 
     Args:
         input_size: Mel-spectrogram frequency bins.
@@ -648,7 +652,11 @@ class Gemma4AudioEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        # HF uses nn.Linear(..., bias=True) for the output projection
+        # HF uses nn.Linear(..., bias=True) for the output projection.
+        # The bias would normally cause ORT to fuse Add(1D bias) + LayerNorm into
+        # SkipSimplifiedLayerNorm (with 1D skip, which ORT rejects).  This is avoided
+        # because _Gemma4ScaleFreeRMSNorm uses manual primitive ops rather than
+        # op.RMSNormalization, preventing ORT from recognizing the fusion pattern.
         self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
 
     def forward(self, op: builder.OpBuilder, input_features: ir.Value):

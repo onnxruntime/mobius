@@ -68,6 +68,10 @@ Usage::
 
     # Build graph skeleton only (no weight download):
     python examples/gemma4_multimodal.py --save-to output/gemma4/ --no-weights
+
+    # Compare ONNX Runtime vs HuggingFace PyTorch output side-by-side:
+    python examples/gemma4_multimodal.py --mode text --compare-hf
+    python examples/gemma4_multimodal.py --mode vision --compare-hf
 """
 
 from __future__ import annotations
@@ -159,16 +163,18 @@ def prepare_audio_feeds(
         n_mels: Number of mel filterbank bins (128 for Gemma 4).
 
     Returns:
-        ``{"audio_features": float32[1, T, n_mels]}``
+        ``{"input_features": float32[1, T, n_mels]}``
     """
-    import torchaudio
+    import scipy.signal
+    import soundfile as sf
 
-    waveform, sr = torchaudio.load(audio_path)
+    raw, sr = sf.read(audio_path, always_2d=True)  # [frames, channels]
+    # Average channels to mono
+    audio_np = raw.mean(axis=1).astype(np.float32)
     if sr != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
-
-    # Average to mono, convert to numpy
-    audio_np = waveform.mean(dim=0).numpy().astype(np.float32)
+        # Resample using scipy to avoid torchaudio/torchcodec dependency issues
+        num_samples = int(len(audio_np) * sample_rate / sr)
+        audio_np = scipy.signal.resample(audio_np, num_samples).astype(np.float32)
 
     # Compute log-mel spectrogram using the HuggingFace feature extractor.
     # Gemma 4 uses the same interface as WhisperFeatureExtractor.
@@ -188,7 +194,7 @@ def prepare_audio_feeds(
     # out["input_features"]: [1, n_mels, time_frames]
     # Transpose to [1, time_frames, n_mels] for the Conformer encoder
     audio_features = out["input_features"].astype(np.float32).transpose(0, 2, 1)
-    return {"audio_features": audio_features}  # [1, T, n_mels]
+    return {"input_features": audio_features}  # [1, T, n_mels]
 
 
 def prepare_embedding_feeds(
@@ -667,6 +673,105 @@ def demo_vision_audio(
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace comparison
+# ---------------------------------------------------------------------------
+
+
+def _hf_generate_text(model_id: str, prompt: str, max_new_tokens: int) -> str:
+    """Run text-only generation with HuggingFace PyTorch and return the output."""
+    import torch
+    from transformers import AutoProcessor, Gemma4ForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model.eval()
+
+    messages = [{"role": "user", "content": prompt}]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True, return_tensors="pt"
+    )
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_len = inputs["input_ids"].shape[1]
+    return processor.decode(out[0][prompt_len:], skip_special_tokens=True)
+
+
+def _hf_generate_vision(
+    model_id: str, image_path: str, prompt: str, max_new_tokens: int
+) -> str:
+    """Run vision generation with HuggingFace PyTorch and return the output."""
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, Gemma4ForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model.eval()
+
+    image = Image.open(image_path).convert("RGB")
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": prompt}],
+        }
+    ]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=text, images=image, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_len = inputs["input_ids"].shape[1]
+    return processor.decode(out[0][prompt_len:], skip_special_tokens=True)
+
+
+def _print_side_by_side(label: str, onnx_out: str, hf_out: str) -> None:
+    """Print ONNX and HuggingFace outputs side by side for easy comparison."""
+    divider = "─" * 64
+    print(f"\n{'=' * 64}")
+    print(f"  COMPARISON: {label}")
+    print(f"{'=' * 64}")
+    print(f"\n[ONNX Runtime]\n{divider}")
+    print(onnx_out.strip())
+    print(f"\n[HuggingFace PyTorch]\n{divider}")
+    print(hf_out.strip())
+    print()
+
+
+def run_compare_hf(
+    model_id: str,
+    onnx_outputs: dict[str, str],
+    has_image: bool,
+    image_path: str,
+    max_new_tokens: int,
+    text_prompt: str,
+    vision_prompt: str,
+) -> None:
+    """Run HF PyTorch inference for each completed ONNX demo and compare outputs.
+
+    Args:
+        model_id: HuggingFace model ID.
+        onnx_outputs: Mapping of mode name (``"text"``, ``"vision"``) to ONNX text output.
+        has_image: Whether the image asset is available.
+        image_path: Path to the image file.
+        max_new_tokens: Max tokens for generation.
+        text_prompt: Prompt used for text demo.
+        vision_prompt: Prompt used for vision demo.
+    """
+    print("\n" + "=" * 64)
+    print("🔍  --compare-hf: loading HuggingFace model for comparison ...")
+    print("=" * 64)
+
+    if "text" in onnx_outputs:
+        print("Running HF text generation ...")
+        hf_text = _hf_generate_text(model_id, text_prompt, max_new_tokens)
+        _print_side_by_side("TEXT", onnx_outputs["text"], hf_text)
+
+    if "vision" in onnx_outputs and has_image:
+        print("Running HF vision generation ...")
+        hf_vision = _hf_generate_vision(model_id, image_path, vision_prompt, max_new_tokens)
+        _print_side_by_side("VISION", onnx_outputs["vision"], hf_vision)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -732,6 +837,14 @@ def parse_args() -> argparse.Namespace:
         choices=["f32", "f16"],
         default="f32",
         help="Weight/activation dtype to use (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--compare-hf",
+        action="store_true",
+        help=(
+            "Run the same prompts through HuggingFace PyTorch and show a side-by-side "
+            "comparison with the ONNX Runtime output.  Requires transformers + torch."
+        ),
     )
     return parser.parse_args()
 
@@ -817,22 +930,28 @@ def main() -> int:
     max_tokens = args.max_new_tokens
     modes = ["text", "vision", "audio", "vision-audio"] if args.mode == "all" else [args.mode]
 
+    text_prompt = args.prompt or "Explain the theory of general relativity in simple terms."
+    vision_prompt = args.prompt or "Describe what you see in this image in detail."
+
+    # Collect ONNX outputs for optional --compare-hf side-by-side display
+    onnx_outputs: dict[str, str] = {}
+
     for mode in modes:
         if mode == "text":
-            demo_text(
+            result = demo_text(
                 embedding_session=embedding_session,
                 decoder_session=decoder_session,
                 tokenizer=tokenizer,
                 config=config,
-                prompt=args.prompt
-                or ("Explain the theory of general relativity in simple terms."),
+                prompt=text_prompt,
                 max_new_tokens=max_tokens,
             )
+            onnx_outputs["text"] = result
 
         elif mode == "vision":
             if not has_image:
                 continue
-            demo_vision(
+            result = demo_vision(
                 vision_session=vision_session,
                 embedding_session=embedding_session,
                 decoder_session=decoder_session,
@@ -840,9 +959,10 @@ def main() -> int:
                 processor=processor,
                 config=config,
                 image_path=args.image,
-                prompt=args.prompt or "Describe what you see in this image in detail.",
+                prompt=vision_prompt,
                 max_new_tokens=max_tokens,
             )
+            onnx_outputs["vision"] = result
 
         elif mode == "audio":
             if not has_audio:
@@ -874,6 +994,17 @@ def main() -> int:
                 prompt=args.prompt or "Describe the image and transcribe the audio.",
                 max_new_tokens=max_tokens,
             )
+
+    if args.compare_hf and onnx_outputs:
+        run_compare_hf(
+            model_id=args.model_id,
+            onnx_outputs=onnx_outputs,
+            has_image=has_image,
+            image_path=args.image,
+            max_new_tokens=max_tokens,
+            text_prompt=text_prompt,
+            vision_prompt=vision_prompt,
+        )
 
     return 0
 
