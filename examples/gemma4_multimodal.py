@@ -16,7 +16,7 @@ input modalities:
 Gemma 4 uses a 4-model split (same pattern as Phi-4 Multimodal):
 
     - **Vision**:    ``pixel_values`` → ``image_features``
-      (SigLIP ViT-like encoder + projector; 280 soft tokens/image)
+      (SigLIP ViT-like encoder + projector; ~256 soft tokens/image)
     - **Audio**:     ``audio_features`` → ``audio_features``
       (Conformer encoder, 12 layers, hidden 1024; subsampling 4x)
     - **Embedding**: ``input_ids`` + ``image_features`` + ``audio_features``
@@ -94,15 +94,18 @@ MAX_NEW_TOKENS = 128
 
 # Gemma 4 special token IDs
 # These match the token ids in the Gemma 4 tokenizer vocabulary.
-# IMAGE_TOKEN_ID: placeholder inserted once per image in input_ids
-IMAGE_TOKEN_ID = 258880  # <|image|> — Gemma 4 image soft token (config.image_token_id)
-# AUDIO_TOKEN_ID: placeholder inserted once per audio chunk in input_ids
-AUDIO_TOKEN_ID = 258881  # <|audio|> — confirmed from google/gemma-4-E2B-it HF config
+# IMAGE_TOKEN_ID: placeholder inserted N times (once per soft token) in input_ids
+IMAGE_TOKEN_ID = 258880  # <|image|>  — Gemma 4 image soft token (config.image_token_id)
+IMAGE_OPEN_TOKEN_ID = 255999  # <|image>   — opening boundary marker before image tokens
+IMAGE_CLOSE_TOKEN_ID = 258882  # <image|>   — closing boundary marker after image tokens
+# AUDIO_TOKEN_ID: placeholder inserted N times (once per audio frame) in input_ids
+AUDIO_TOKEN_ID = 258881  # <|audio|>  — confirmed from google/gemma-4-E2B-it HF config
 EOS_TOKEN_IDS = {1, 106}  # <eos> (1) and <turn|> (106, end-of-turn marker)
 
-# Gemma 4 SigLIP vision encoder: 280 soft tokens per image after projection.
-# This is set in the HF config as mm_tokens_per_image=280.
-NUM_IMAGE_TOKENS = 280
+# Gemma 4 SigLIP vision encoder: default output length from vc.default_output_length.
+# The actual number of soft tokens depends on the input image resolution and
+# pooling kernel size; computed dynamically from image_features.shape[0] at runtime.
+NUM_IMAGE_TOKENS = 256  # approximate; actual count is image-size dependent
 
 # Gemma 4 Conformer audio encoder subsampling: two 2D conv layers with
 # stride 2 each → total time reduction factor of 4.
@@ -285,7 +288,11 @@ def build_input_ids(
     are inserted at the start of the user message content (before the text),
     matching the HuggingFace processor layout::
 
-        <bos><|turn>user\\n[image*N][audio*M]text<turn|>\\n<|turn>model\\n
+        <bos><|turn>user\\n<|image>[image×N]<image|>[audio×M]text<turn|>\\n<|turn>model\\n
+
+    Image tokens are wrapped in boundary markers ``<|image>`` (255999) and
+    ``<image|>`` (258882) — the HuggingFace processor always inserts these, and
+    the model has been trained to expect them around the soft image tokens.
 
     Args:
         tokenizer: HuggingFace tokenizer with ``apply_chat_template`` support.
@@ -309,7 +316,12 @@ def build_input_ids(
     # Build modality placeholder block
     modality_parts: list[np.ndarray] = []
     if num_image_tokens > 0:
-        modality_parts.append(np.full((1, num_image_tokens), IMAGE_TOKEN_ID, dtype=np.int64))
+        # Wrap image soft tokens with boundary markers, matching HF processor layout:
+        # <|image>(255999) + N×<|image|>(258880) + <image|>(258882)
+        open_marker = np.array([[IMAGE_OPEN_TOKEN_ID]], dtype=np.int64)
+        soft_tokens = np.full((1, num_image_tokens), IMAGE_TOKEN_ID, dtype=np.int64)
+        close_marker = np.array([[IMAGE_CLOSE_TOKEN_ID]], dtype=np.int64)
+        modality_parts.extend([open_marker, soft_tokens, close_marker])
     if num_audio_tokens > 0:
         modality_parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
     modality_ids = np.concatenate(modality_parts, axis=1)
@@ -686,10 +698,9 @@ def _hf_generate_text(model_id: str, prompt: str, max_new_tokens: int) -> str:
     model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
     model.eval()
 
-    messages = [{"role": "user", "content": prompt}]
-    inputs = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True, return_tensors="pt"
-    )
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    inputs = processor(text=text, return_tensors="pt")
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     prompt_len = inputs["input_ids"].shape[1]
@@ -880,8 +891,8 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 2: Create ONNX Runtime inference sessions for each sub-model.
     #
-    # Gemma 4 Any-to-Any models produce 4 ONNX graphs (decoder, vision, speech,
-    # embedding). Vision-language-only models produce 3 (no speech). Both cases
+    # Gemma 4 Any-to-Any models produce 4 ONNX graphs (decoder, vision, audio,
+    # embedding). Vision-language-only models produce 3 (no audio). Both cases
     # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
