@@ -246,10 +246,11 @@ def _build_class_to_source_module() -> dict[str, str]:
 def _build_registry_class_to_types() -> dict[str, list[str]]:
     """Parse _registry.py to map class names to registered model_types.
 
-    Handles three patterns:
+    Handles four patterns:
     1. Direct: reg.register("name", ClassName)
     2. For-loop: for name in (...): reg.register(name, ClassName)
     3. Dict-loop: for name, cls in {...}.items(): reg.register(name, cls)
+    4. Declarative dict: _REGISTRATIONS = {"name": ModelRegistration(ClassName, ...)}
     """
     registry_file = _SRC_ROOT / "_registry.py"
     class_to_types: dict[str, list[str]] = {}
@@ -270,6 +271,21 @@ def _build_registry_class_to_types() -> dict[str, list[str]]:
         # Pattern 2 & 3: For-loop with reg.register in body
         if isinstance(node, ast.For):
             _process_for_loop(node, class_to_types)
+
+        # Pattern 4: _REGISTRATIONS = {"name": ModelRegistration(Cls, ...)}
+        # Handles both plain assignment and type-annotated assignment
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_REGISTRATIONS":
+                    if isinstance(node.value, ast.Dict):
+                        _process_registrations_dict(node.value, class_to_types)
+        if isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == "_REGISTRATIONS"
+                and isinstance(node.value, ast.Dict)
+            ):
+                _process_registrations_dict(node.value, class_to_types)
 
     return {c: sorted(set(t)) for c, t in class_to_types.items()}
 
@@ -346,6 +362,22 @@ def _process_for_loop(
                 and isinstance(value, ast.Name)
             ):
                 class_to_types.setdefault(value.id, []).append(key.value)
+
+
+def _process_registrations_dict(
+    dict_node: ast.Dict,
+    class_to_types: dict[str, list[str]],
+) -> None:
+    """Extract model_type → class from _REGISTRATIONS = {"name": ModelRegistration(Cls)}."""
+    for key, value in zip(dict_node.keys, dict_node.values):
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            continue
+        arch_name = key.value
+        # value is ModelRegistration(ClassName, ...) — extract the first arg
+        if isinstance(value, ast.Call) and value.args:
+            cls_arg = value.args[0]
+            if isinstance(cls_arg, ast.Name):
+                class_to_types.setdefault(cls_arg.id, []).append(arch_name)
 
 
 def _extract_string_constants(node: ast.expr) -> list[str]:
