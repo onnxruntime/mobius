@@ -313,7 +313,7 @@ class AttentiveStatisticsPooling(nn.Module):
             op.ReduceSum(op.Mul(diff, diff), [2], keepdims=True),
             seq_length_float,
         )
-        eps_const = op.Constant(value_float=self._eps)
+        eps_const = self._eps
         std = op.Sqrt(op.Add(variance, eps_const))
 
         # Expand mean and std to (batch, channels, time) for concatenation

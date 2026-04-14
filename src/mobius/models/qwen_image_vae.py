@@ -83,7 +83,7 @@ class _CausalConv3d(nn.Module):
             x = op.Pad(
                 x,
                 op.Constant(value_ints=self._onnx_pads),
-                op.Constant(value_float=0.0),
+                0.0,
             )
         return op.Conv(
             x,
@@ -113,10 +113,10 @@ class _RMSNorm3d(nn.Module):
         # F.normalize(x, dim=1) * scale * gamma
         # L2 normalize along channel dimension
         norm = op.ReduceL2(x, [1], keepdims=True)
-        eps = op.Constant(value_float=1e-12)
+        eps = 1e-12
         norm = op.Max(norm, eps)
         x_normalized = op.Div(x, norm)
-        scale = op.Constant(value_float=self._scale)
+        scale = self._scale
         return op.Mul(op.Mul(x_normalized, scale), self.gamma)
 
 
@@ -258,7 +258,7 @@ class _SequentialConv2d(nn.Module):
             x = op.Pad(
                 x,
                 op.Constant(value_ints=[0, 0, 0, 0, 0, 0, 1, 1]),
-                op.Constant(value_float=0.0),
+                0.0,
             )
         conv = getattr(self, "1")
         return conv(op, x)
@@ -482,7 +482,7 @@ class _Decoder3d(nn.Module):
         x = self.norm_out(op, x)
         x = self._silu(op, x)
         x = self.conv_out(op, x)
-        return op.Clip(x, op.Constant(value_float=-1.0), op.Constant(value_float=1.0))
+        return op.Clip(x, -1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------

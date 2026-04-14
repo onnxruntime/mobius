@@ -166,7 +166,7 @@ class _Blip2EmbeddingModel(nn.Module):
 
         # Build indices to scatter image features into text positions
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 

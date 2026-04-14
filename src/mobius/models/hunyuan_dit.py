@@ -109,7 +109,7 @@ class _LayerNormNoAffine(nn.Module):
         mean = op.ReduceMean(x, [-1], keepdims=True)
         diff = op.Sub(x, mean)
         var = op.ReduceMean(op.Mul(diff, diff), [-1], keepdims=True)
-        eps = op.Constant(value_float=self._eps)
+        eps = self._eps
         return op.Div(diff, op.Sqrt(op.Add(var, eps)))
 
 
@@ -383,7 +383,7 @@ class _AdaLayerNormContinuous(nn.Module):
         scale, shift = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
         # Norm → (1 + scale) * normed + shift
         normed = self.norm(op, hidden_states)
-        one = op.Constant(value_float=1.0)
+        one = 1.0
         normed = op.Mul(normed, op.Add(one, op.Unsqueeze(scale, [1])))
         return op.Add(normed, op.Unsqueeze(shift, [1]))
 

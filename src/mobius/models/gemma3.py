@@ -135,7 +135,7 @@ class _Gemma3EmbeddingModel(nn.Module):
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 

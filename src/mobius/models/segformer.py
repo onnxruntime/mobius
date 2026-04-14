@@ -119,7 +119,7 @@ class _EfficientSelfAttention(nn.Module):
 
         # Attention: Q @ K^T / sqrt(d) → softmax → @ V
         attn_scores = op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2]))
-        attn_scores = op.Mul(attn_scores, op.Constant(value_float=self.scale))
+        attn_scores = op.Mul(attn_scores, self.scale)
         attn_probs = op.Softmax(attn_scores, axis=-1)
         context = op.MatMul(attn_probs, value)
 

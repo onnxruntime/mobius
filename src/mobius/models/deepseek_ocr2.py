@@ -396,13 +396,13 @@ class DeepSeekOCR2EmbeddingModel(nn.Module):
 
         # Cumulative sum to map flat image_features indices
         mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        cumsum = op.CumSum(mask_int, 1)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
 
         # Pad image_features for text-only safety
         pad_row = op.Expand(
-            op.Constant(value_float=0.0),
+            0.0,
             op.Concat(
                 op.Constant(value_ints=[1]),
                 op.Shape(image_features, start=1, end=2),
