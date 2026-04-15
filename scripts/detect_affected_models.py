@@ -38,10 +38,14 @@ _SRC_ROOT = _PROJECT_ROOT / "src" / "mobius"
 # Shared infrastructure paths — any change triggers run_all
 #
 # DISABLED: shared_infra is disabled to enforce model-specific CI.
-# All src/mobius/ files are traced via the import graph or classified
-# as model files. This means changes to _configs.py, _registry.py,
-# etc. will NOT trigger run_all — only affected models are tested.
-# Re-enable once the codebase is mature enough for full-suite gating.
+# Currently, only model files and selected infrastructure prefixes are
+# handled specially: model files are classified directly, and
+# src/mobius/components/ plus src/mobius/tasks/ are traced via the
+# import graph. Other src/mobius/*.py infrastructure files currently
+# classify as "other" rather than shared_infra.
+# Re-enable shared_infra once the codebase is mature enough for
+# full-suite gating, or expand classification if those files should
+# participate in affected-model detection.
 # ----------------------------------------------------------------
 _SHARED_INFRA_PATTERNS: tuple[str, ...] = ()
 _SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
