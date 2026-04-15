@@ -84,6 +84,10 @@ def classify_file(path: str) -> str:
 
     rel = normalized[len("src/mobius/") :]
 
+    # Test files within the source tree (check before infra prefixes)
+    if rel.endswith("_test.py"):
+        return "test"
+
     # Shared infrastructure patterns
     if normalized in _SHARED_INFRA_PATTERNS:
         return "shared_infra"
@@ -99,10 +103,6 @@ def classify_file(path: str) -> str:
     # Model files
     if rel.startswith("models/") and not rel.endswith("_test.py"):
         return "model"
-
-    # Test files within the source tree
-    if rel.endswith("_test.py"):
-        return "test"
 
     return "other"
 
