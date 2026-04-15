@@ -148,6 +148,9 @@ def _module_name_from_path(filepath: Path) -> str | None:
         return None
 
     parts = list(rel.with_suffix("").parts)
+    # __init__.py represents the package itself, not a submodule
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
     return ".".join(parts)
 
 
@@ -161,8 +164,6 @@ def _build_import_graph(
     """
     graph: dict[str, set[str]] = {}
     for pyfile in search_dir.rglob("*.py"):
-        if pyfile.name.startswith("__"):
-            continue
         if pyfile.name.endswith("_test.py"):
             continue
         mod_name = _module_name_from_path(pyfile)
@@ -511,8 +512,12 @@ def detect_affected_models(
         normalized = path.replace("\\", "/")
         # Convert path to module name: src/mobius/components/_attention.py
         # → mobius.components._attention
+        # Special case: __init__.py → package name (mobius.components)
         rel = normalized[len("src/") :]
-        module_name = rel[:-3].replace("/", ".")  # strip .py, dots
+        if rel.endswith("/__init__.py"):
+            module_name = rel[: -len("/__init__.py")].replace("/", ".")
+        else:
+            module_name = rel[:-3].replace("/", ".")  # strip .py
         if not module_name:
             continue
 
