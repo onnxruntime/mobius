@@ -46,7 +46,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/components/_attention.py") == "traceable"
 
     def test_task_file(self):
-        assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
+        assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
 
     def test_configs_file(self):
         assert classify_file("src/mobius/_configs.py") == "shared_infra"
@@ -181,12 +181,10 @@ class TestDetectAffectedModels:
         # _attention.py is imported by many models — should find affected types
         assert len(result["affected"]) > 0
 
-    def test_task_change_traces_affected_models(self):
-        """A task change traces through the import graph to find affected models."""
+    def test_task_change_triggers_run_all(self):
+        """Task files use string-based lookup, not imports — must trigger run_all."""
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
-        assert result["run_all"] is False
-        # _causal_lm.py is imported by task infrastructure — may affect models
-        # The key point: it does NOT trigger run_all
+        assert result["run_all"] is True
 
     def test_configs_change_triggers_run_all(self):
         result = detect_affected_models(["src/mobius/_configs.py"])

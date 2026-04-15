@@ -48,12 +48,18 @@ _SHARED_INFRA_PATTERNS = (
     "src/mobius/models/__init__.py",
 )
 
-# Traceable infrastructure: component/task files that are analyzed via the
+# Task files are resolved by string-based lookup at runtime (not Python
+# imports), so the import graph cannot trace task → model dependencies.
+# Keep tasks/ as shared_infra until a task→model_type mapping exists.
+_SHARED_INFRA_PREFIXES = (
+    "src/mobius/tasks/",
+)
+
+# Traceable infrastructure: component files that are analyzed via the
 # import graph to find which models they actually affect, rather than
 # triggering run_all unconditionally.
 _TRACEABLE_PREFIXES = (
     "src/mobius/components/",
-    "src/mobius/tasks/",
 )
 
 
@@ -81,8 +87,11 @@ def classify_file(path: str) -> str:
     # Shared infrastructure patterns
     if normalized in _SHARED_INFRA_PATTERNS:
         return "shared_infra"
+    for prefix in _SHARED_INFRA_PREFIXES:
+        if normalized.startswith(prefix):
+            return "shared_infra"
 
-    # Traceable infrastructure (components, tasks) — traced via import graph
+    # Traceable infrastructure (components) — traced via import graph
     for prefix in _TRACEABLE_PREFIXES:
         if normalized.startswith(prefix):
             return "traceable"
