@@ -251,11 +251,9 @@ def _build_class_to_source_module() -> dict[str, str]:
 def _build_registry_class_to_types() -> dict[str, list[str]]:
     """Parse _registry.py to map class names to registered model_types.
 
-    Handles four patterns:
-    1. Direct: reg.register("name", ClassName)
-    2. For-loop: for name in (...): reg.register(name, ClassName)
-    3. Dict-loop: for name, cls in {...}.items(): reg.register(name, cls)
-    4. Declarative dict: _REGISTRATIONS = {"name": ModelRegistration(ClassName, ...)}
+    Parses the declarative ``_REGISTRATIONS`` dict::
+
+        _REGISTRATIONS = {"name": ModelRegistration(ClassName, ...)}
     """
     registry_file = _SRC_ROOT / "_registry.py"
     class_to_types: dict[str, list[str]] = {}
@@ -267,17 +265,7 @@ def _build_registry_class_to_types() -> dict[str, list[str]]:
         return class_to_types
 
     for node in ast.walk(tree):
-        # Pattern 1: Direct reg.register("name", ClassName)
-        if isinstance(node, ast.Call):
-            cls_name, arch_name = _match_register_call(node)
-            if cls_name and arch_name:
-                class_to_types.setdefault(cls_name, []).append(arch_name)
-
-        # Pattern 2 & 3: For-loop with reg.register in body
-        if isinstance(node, ast.For):
-            _process_for_loop(node, class_to_types)
-
-        # Pattern 4: _REGISTRATIONS = {"name": ModelRegistration(Cls, ...)}
+        # _REGISTRATIONS = {"name": ModelRegistration(Cls, ...)}
         # Handles both plain assignment and type-annotated assignment
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -295,80 +283,6 @@ def _build_registry_class_to_types() -> dict[str, list[str]]:
     return {c: sorted(set(t)) for c, t in class_to_types.items()}
 
 
-def _match_register_call(
-    node: ast.Call,
-) -> tuple[str | None, str | None]:
-    """Match a reg.register("name", ClassName) call.
-
-    Returns (class_name, arch_name) or (None, None).
-    """
-    func = node.func
-    if not (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "reg"
-    ):
-        return None, None
-    if len(node.args) < 2:
-        return None, None
-
-    name_node = node.args[0]
-    cls_node = node.args[1]
-
-    if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
-        return None, None
-    if not isinstance(cls_node, ast.Name):
-        return None, None
-
-    return cls_node.id, name_node.value
-
-
-def _process_for_loop(
-    node: ast.For,
-    class_to_types: dict[str, list[str]],
-) -> None:
-    """Extract model_type → class mappings from for-loop patterns."""
-    # Pattern 2: for name in ("llama", "qwen2", ...): reg.register(name, Cls)
-    string_names = _extract_string_constants(node.iter)
-    if string_names:
-        for stmt in node.body:
-            if not isinstance(stmt, ast.Expr):
-                continue
-            call = stmt.value
-            if not isinstance(call, ast.Call):
-                continue
-            func = call.func
-            if not (
-                isinstance(func, ast.Attribute)
-                and func.attr == "register"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "reg"
-            ):
-                continue
-            if len(call.args) >= 2 and isinstance(call.args[1], ast.Name):
-                cls_name = call.args[1].id
-                class_to_types.setdefault(cls_name, []).extend(string_names)
-        return
-
-    # Pattern 3: for name, cls in {...}.items(): reg.register(name, cls)
-    iter_node = node.iter
-    if (
-        isinstance(iter_node, ast.Call)
-        and isinstance(iter_node.func, ast.Attribute)
-        and iter_node.func.attr == "items"
-        and isinstance(iter_node.func.value, ast.Dict)
-    ):
-        dict_node = iter_node.func.value
-        for key, value in zip(dict_node.keys, dict_node.values):
-            if (
-                isinstance(key, ast.Constant)
-                and isinstance(key.value, str)
-                and isinstance(value, ast.Name)
-            ):
-                class_to_types.setdefault(value.id, []).append(key.value)
-
-
 def _process_registrations_dict(
     dict_node: ast.Dict,
     class_to_types: dict[str, list[str]],
@@ -383,17 +297,6 @@ def _process_registrations_dict(
             cls_arg = value.args[0]
             if isinstance(cls_arg, ast.Name):
                 class_to_types.setdefault(cls_arg.id, []).append(arch_name)
-
-
-def _extract_string_constants(node: ast.expr) -> list[str]:
-    """Extract string constants from a Tuple or List AST node."""
-    if isinstance(node, (ast.Tuple, ast.List)):
-        result = []
-        for elt in node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                result.append(elt.value)
-        return result
-    return []
 
 
 def _build_source_module_to_types() -> dict[str, list[str]]:
