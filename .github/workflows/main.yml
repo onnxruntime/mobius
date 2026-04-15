@@ -280,6 +280,100 @@ jobs:
           path: golden-results.xml
           retention-days: 7
 
+  generation-e2e:
+    name: L5 Generation E2E
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=gpu-generation-e2e-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}"
+    needs: [detect-affected]
+    if: >-
+      always() && !cancelled() &&
+      (needs.detect-affected.result == 'failure' ||
+       needs.detect-affected.outputs.has_affected == 'true' ||
+       github.event_name != 'pull_request')
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-generation-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
+          restore-keys: |
+            pip-generation-
+      - name: Cache HuggingFace models
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-generation-${{ hashFiles('testdata/cases/**/*.yaml') }}
+          restore-keys: |
+            hf-generation-
+      - name: Install PyTorch (CUDA)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
+      - name: Install dependencies
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install -e '.[testing,transformers]'
+      - name: Run L5 generation E2E tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ ! -f tests/e2e_golden_test.py ]; then
+            echo "tests/e2e_golden_test.py not found — skipping"
+            exit 0
+          fi
+          if [ "${{ needs.detect-affected.result }}" = "failure" ] || \
+             [ "${{ needs.detect-affected.outputs.run_all }}" = "true" ] || \
+             [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Running all L5 generation E2E tests"
+            pytest tests/e2e_golden_test.py -m generation -v --tb=short \
+              --cov=src --cov-report=xml --cov-branch \
+              --junitxml generation-results.xml
+          else
+            AFFECTED='${{ needs.detect-affected.outputs.affected }}'
+            echo "Running L5 generation tests for affected models: $AFFECTED"
+            FILTER=$(echo "$AFFECTED" | python -c "
+          import json, sys, re
+          names = json.load(sys.stdin)
+          escaped = [re.sub(r'[^a-zA-Z0-9_]', '_', n) for n in names]
+          print(' or '.join(escaped))
+          ")
+            if [ -n "$FILTER" ]; then
+              pytest tests/e2e_golden_test.py -m generation -v --tb=short \
+                -k "$FILTER" \
+                --cov=src --cov-report=xml --cov-branch \
+                --junitxml generation-results.xml
+            else
+              echo "No affected models — skipping"
+            fi
+          fi
+        timeout-minutes: 30
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l5
+      - name: Upload L5 test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: gpu-l5
+          report-type: test_results
+          files: generation-results.xml
+      - name: Upload generation test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: generation-test-results
+          path: generation-results.xml
+          retention-days: 7
+
   test:
     name: test
     strategy:
