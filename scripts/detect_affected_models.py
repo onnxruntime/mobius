@@ -36,27 +36,22 @@ _SRC_ROOT = _PROJECT_ROOT / "src" / "mobius"
 
 # ----------------------------------------------------------------
 # Shared infrastructure paths — any change triggers run_all
+#
+# DISABLED: shared_infra is disabled to enforce model-specific CI.
+# All src/mobius/ files are traced via the import graph or classified
+# as model files. This means changes to _configs.py, _registry.py,
+# etc. will NOT trigger run_all — only affected models are tested.
+# Re-enable once the codebase is mature enough for full-suite gating.
 # ----------------------------------------------------------------
-_SHARED_INFRA_PATTERNS = (
-    "src/mobius/_configs.py",
-    "src/mobius/_registry.py",
-    "src/mobius/_builder.py",
-    "src/mobius/_weight_loading.py",
-    "src/mobius/_model_package.py",
-    "src/mobius/_exporter.py",
-    # Re-export hub for all model classes — any change here affects all models
-    "src/mobius/models/__init__.py",
+_SHARED_INFRA_PATTERNS: tuple[str, ...] = ()
+_SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
+
+# Traceable infrastructure: files analyzed via the import graph to find
+# which models they actually affect.
+_TRACEABLE_PREFIXES = (
+    "src/mobius/components/",
+    "src/mobius/tasks/",
 )
-
-# Task files are resolved by string-based lookup at runtime (not Python
-# imports), so the import graph cannot trace task → model dependencies.
-# Keep tasks/ as shared_infra until a task→model_type mapping exists.
-_SHARED_INFRA_PREFIXES = ("src/mobius/tasks/",)
-
-# Traceable infrastructure: component files that are analyzed via the
-# import graph to find which models they actually affect, rather than
-# triggering run_all unconditionally.
-_TRACEABLE_PREFIXES = ("src/mobius/components/",)
 
 
 def classify_file(path: str) -> str:
@@ -68,12 +63,6 @@ def classify_file(path: str) -> str:
     normalized = path.replace("\\", "/")
 
     if not normalized.startswith("src/mobius/"):
-        # Test infrastructure files that affect all models
-        if normalized in (
-            "tests/conftest.py",
-            "tests/_test_configs.py",
-        ):
-            return "shared_infra"
         if normalized.endswith("_test.py") or normalized.startswith("tests/"):
             return "test"
         return "other"
