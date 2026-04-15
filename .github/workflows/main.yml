@@ -232,9 +232,31 @@ jobs:
             echo "tests/e2e_golden_test.py not found — skipping"
             exit 0
           fi
-          pytest tests/e2e_golden_test.py -m golden -v --tb=short \
-            --cov=src --cov-report=xml --cov-branch \
-            --junitxml golden-results.xml
+          if [ "${{ needs.detect-affected.result }}" = "failure" ] || \
+             [ "${{ needs.detect-affected.outputs.run_all }}" = "true" ] || \
+             [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Running all L4 golden comparison tests"
+            pytest tests/e2e_golden_test.py -m golden -v --tb=short \
+              --cov=src --cov-report=xml --cov-branch \
+              --junitxml golden-results.xml
+          else
+            AFFECTED='${{ needs.detect-affected.outputs.affected }}'
+            echo "Running L4 golden tests for affected models: $AFFECTED"
+            FILTER=$(echo "$AFFECTED" | python -c "
+          import json, sys, re
+          names = json.load(sys.stdin)
+          escaped = [re.sub(r'[^a-zA-Z0-9_]', '_', n) for n in names]
+          print(' or '.join(escaped))
+          ")
+            if [ -n "$FILTER" ]; then
+              pytest tests/e2e_golden_test.py -m golden -v --tb=short \
+                -k "$FILTER" \
+                --cov=src --cov-report=xml --cov-branch \
+                --junitxml golden-results.xml
+            else
+              echo "No affected models — skipping"
+            fi
+          fi
         timeout-minutes: 30
       - name: Upload coverage to Codecov
         if: steps.check_golden.outputs.has_golden == 'true'
