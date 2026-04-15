@@ -19,12 +19,12 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from detect_affected_models import (  # noqa: E402
+    _SRC_ROOT,
     _build_class_to_source_module,
     _build_import_graph,
     _build_registry_class_to_types,
     _build_source_module_to_types,
     _find_reverse_dependents,
-    _SRC_ROOT,
     classify_file,
     detect_affected_models,
 )
@@ -287,9 +287,7 @@ class TestDetectAffectedModels:
             "tests/_test_configs.py",
         ]:
             result = detect_affected_models([path])
-            assert result["run_all"] is True, (
-                f"{path} should trigger run_all but didn't"
-            )
+            assert result["run_all"] is True, f"{path} should trigger run_all but didn't"
 
     def test_traceable_and_model_combined(self):
         """A component + model file change returns union of affected types."""
@@ -316,9 +314,7 @@ class TestDetectAffectedModels:
 
     def test_deleted_traceable_file_triggers_run_all(self):
         """A deleted component file triggers run_all (conservative)."""
-        result = detect_affected_models(
-            ["src/mobius/components/_nonexistent_component.py"]
-        )
+        result = detect_affected_models(["src/mobius/components/_nonexistent_component.py"])
         assert result["run_all"] is True
 
 
@@ -335,33 +331,23 @@ class TestTraceableTracing:
         import_graph = _build_import_graph(_SRC_ROOT)
         registry_map = _build_source_module_to_types()
 
-        dependents = _find_reverse_dependents(
-            "mobius.components._attention", import_graph
-        )
+        dependents = _find_reverse_dependents("mobius.components._attention", import_graph)
         # At minimum, models that use Attention should appear
         affected_types: set[str] = set()
         for dep in dependents:
             if dep in registry_map:
                 affected_types.update(registry_map[dep])
-        assert len(affected_types) > 0, (
-            "Expected _attention.py to affect at least one model"
-        )
+        assert len(affected_types) > 0, "Expected _attention.py to affect at least one model"
 
     def test_traceable_result_is_subset_of_all_models(self):
         """Traceable tracing should return a subset, not all models."""
         # A niche component should affect fewer models than _common.py
-        result_common = detect_affected_models(
-            ["src/mobius/components/_common.py"]
-        )
-        result_niche = detect_affected_models(
-            ["src/mobius/components/_sam_vision.py"]
-        )
+        result_common = detect_affected_models(["src/mobius/components/_common.py"])
+        result_niche = detect_affected_models(["src/mobius/components/_sam_vision.py"])
         assert result_common["run_all"] is False
         assert result_niche["run_all"] is False
         # Niche component should affect fewer models
-        assert len(result_niche["affected"]) <= len(
-            result_common["affected"]
-        ), (
+        assert len(result_niche["affected"]) <= len(result_common["affected"]), (
             f"_sam_vision.py ({len(result_niche['affected'])} models) should "
             f"affect <= models than _common.py ({len(result_common['affected'])})"
         )
