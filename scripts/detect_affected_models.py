@@ -48,16 +48,21 @@ _SHARED_INFRA_PATTERNS = (
     "src/mobius/models/__init__.py",
 )
 
-_SHARED_INFRA_PREFIXES = (
-    "src/mobius/components/",
-    "src/mobius/tasks/",
-)
+# Task files are resolved by string-based lookup at runtime (not Python
+# imports), so the import graph cannot trace task → model dependencies.
+# Keep tasks/ as shared_infra until a task→model_type mapping exists.
+_SHARED_INFRA_PREFIXES = ("src/mobius/tasks/",)
+
+# Traceable infrastructure: component files that are analyzed via the
+# import graph to find which models they actually affect, rather than
+# triggering run_all unconditionally.
+_TRACEABLE_PREFIXES = ("src/mobius/components/",)
 
 
 def classify_file(path: str) -> str:
     """Classify a changed file path.
 
-    Returns one of: 'model', 'component', 'task', 'shared_infra',
+    Returns one of: 'model', 'traceable', 'shared_infra',
     'test', 'other'.
     """
     normalized = path.replace("\\", "/")
@@ -75,6 +80,10 @@ def classify_file(path: str) -> str:
 
     rel = normalized[len("src/mobius/") :]
 
+    # Test files within the source tree (check before infra prefixes)
+    if rel.endswith("_test.py"):
+        return "test"
+
     # Shared infrastructure patterns
     if normalized in _SHARED_INFRA_PATTERNS:
         return "shared_infra"
@@ -82,13 +91,14 @@ def classify_file(path: str) -> str:
         if normalized.startswith(prefix):
             return "shared_infra"
 
+    # Traceable infrastructure (components) — traced via import graph
+    for prefix in _TRACEABLE_PREFIXES:
+        if normalized.startswith(prefix):
+            return "traceable"
+
     # Model files
     if rel.startswith("models/") and not rel.endswith("_test.py"):
         return "model"
-
-    # Test files within the source tree
-    if rel.endswith("_test.py"):
-        return "test"
 
     return "other"
 
@@ -134,6 +144,9 @@ def _module_name_from_path(filepath: Path) -> str | None:
         return None
 
     parts = list(rel.with_suffix("").parts)
+    # __init__.py represents the package itself, not a submodule
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
     return ".".join(parts)
 
 
@@ -147,8 +160,6 @@ def _build_import_graph(
     """
     graph: dict[str, set[str]] = {}
     for pyfile in search_dir.rglob("*.py"):
-        if pyfile.name.startswith("__"):
-            continue
         if pyfile.name.endswith("_test.py"):
             continue
         mod_name = _module_name_from_path(pyfile)
@@ -236,10 +247,9 @@ def _build_class_to_source_module() -> dict[str, str]:
 def _build_registry_class_to_types() -> dict[str, list[str]]:
     """Parse _registry.py to map class names to registered model_types.
 
-    Handles three patterns:
-    1. Direct: reg.register("name", ClassName)
-    2. For-loop: for name in (...): reg.register(name, ClassName)
-    3. Dict-loop: for name, cls in {...}.items(): reg.register(name, cls)
+    Parses the declarative ``_REGISTRATIONS`` dict::
+
+        _REGISTRATIONS = {"name": ModelRegistration(ClassName, ...)}
     """
     registry_file = _SRC_ROOT / "_registry.py"
     class_to_types: dict[str, list[str]] = {}
@@ -251,102 +261,38 @@ def _build_registry_class_to_types() -> dict[str, list[str]]:
         return class_to_types
 
     for node in ast.walk(tree):
-        # Pattern 1: Direct reg.register("name", ClassName)
-        if isinstance(node, ast.Call):
-            cls_name, arch_name = _match_register_call(node)
-            if cls_name and arch_name:
-                class_to_types.setdefault(cls_name, []).append(arch_name)
-
-        # Pattern 2 & 3: For-loop with reg.register in body
-        if isinstance(node, ast.For):
-            _process_for_loop(node, class_to_types)
+        # _REGISTRATIONS = {"name": ModelRegistration(Cls, ...)}
+        # Handles both plain assignment and type-annotated assignment
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_REGISTRATIONS":
+                    if isinstance(node.value, ast.Dict):
+                        _process_registrations_dict(node.value, class_to_types)
+        if isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == "_REGISTRATIONS"
+                and isinstance(node.value, ast.Dict)
+            ):
+                _process_registrations_dict(node.value, class_to_types)
 
     return {c: sorted(set(t)) for c, t in class_to_types.items()}
 
 
-def _match_register_call(
-    node: ast.Call,
-) -> tuple[str | None, str | None]:
-    """Match a reg.register("name", ClassName) call.
-
-    Returns (class_name, arch_name) or (None, None).
-    """
-    func = node.func
-    if not (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "reg"
-    ):
-        return None, None
-    if len(node.args) < 2:
-        return None, None
-
-    name_node = node.args[0]
-    cls_node = node.args[1]
-
-    if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
-        return None, None
-    if not isinstance(cls_node, ast.Name):
-        return None, None
-
-    return cls_node.id, name_node.value
-
-
-def _process_for_loop(
-    node: ast.For,
+def _process_registrations_dict(
+    dict_node: ast.Dict,
     class_to_types: dict[str, list[str]],
 ) -> None:
-    """Extract model_type → class mappings from for-loop patterns."""
-    # Pattern 2: for name in ("llama", "qwen2", ...): reg.register(name, Cls)
-    string_names = _extract_string_constants(node.iter)
-    if string_names:
-        for stmt in node.body:
-            if not isinstance(stmt, ast.Expr):
-                continue
-            call = stmt.value
-            if not isinstance(call, ast.Call):
-                continue
-            func = call.func
-            if not (
-                isinstance(func, ast.Attribute)
-                and func.attr == "register"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "reg"
-            ):
-                continue
-            if len(call.args) >= 2 and isinstance(call.args[1], ast.Name):
-                cls_name = call.args[1].id
-                class_to_types.setdefault(cls_name, []).extend(string_names)
-        return
-
-    # Pattern 3: for name, cls in {...}.items(): reg.register(name, cls)
-    iter_node = node.iter
-    if (
-        isinstance(iter_node, ast.Call)
-        and isinstance(iter_node.func, ast.Attribute)
-        and iter_node.func.attr == "items"
-        and isinstance(iter_node.func.value, ast.Dict)
-    ):
-        dict_node = iter_node.func.value
-        for key, value in zip(dict_node.keys, dict_node.values):
-            if (
-                isinstance(key, ast.Constant)
-                and isinstance(key.value, str)
-                and isinstance(value, ast.Name)
-            ):
-                class_to_types.setdefault(value.id, []).append(key.value)
-
-
-def _extract_string_constants(node: ast.expr) -> list[str]:
-    """Extract string constants from a Tuple or List AST node."""
-    if isinstance(node, (ast.Tuple, ast.List)):
-        result = []
-        for elt in node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                result.append(elt.value)
-        return result
-    return []
+    """Extract model_type → class from _REGISTRATIONS = {"name": ModelRegistration(Cls)}."""
+    for key, value in zip(dict_node.keys, dict_node.values):
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            continue
+        arch_name = key.value
+        # value is ModelRegistration(ClassName, ...) — extract the first arg
+        if isinstance(value, ast.Call) and value.args:
+            cls_arg = value.args[0]
+            if isinstance(cls_arg, ast.Name):
+                class_to_types.setdefault(cls_arg.id, []).append(arch_name)
 
 
 def _build_source_module_to_types() -> dict[str, list[str]]:
@@ -409,6 +355,7 @@ def detect_affected_models(
 
     # Classify files
     model_files: list[str] = []
+    traceable_files: list[str] = []
     for path in changed_files:
         category = classify_file(path)
         if category == "shared_infra":
@@ -421,11 +368,17 @@ def detect_affected_models(
                 run_all = True
                 break
             model_files.append(path)
+        elif category == "traceable":
+            full_path = _PROJECT_ROOT / path
+            if not full_path.exists():
+                run_all = True
+                break
+            traceable_files.append(path)
 
     if run_all:
         return {"affected": [], "run_all": True}
 
-    if not model_files:
+    if not model_files and not traceable_files:
         return {"affected": [], "run_all": False}
 
     # Build the registry map: source_module → [model_types]
@@ -434,6 +387,7 @@ def detect_affected_models(
     # Build import graph for transitive analysis
     import_graph = _build_import_graph(_SRC_ROOT)
 
+    # Process model files: direct mapping + transitive dependents
     for path in model_files:
         normalized = path.replace("\\", "/")
         rel = normalized[len("src/mobius/") :]
@@ -446,6 +400,26 @@ def detect_affected_models(
             affected.update(registry_map[module_name])
 
         # Transitive: find modules that import from this model file
+        dependents = _find_reverse_dependents(module_name, import_graph)
+        for dep_module in dependents:
+            if dep_module in registry_map:
+                affected.update(registry_map[dep_module])
+
+    # Process traceable files (components, tasks): find which models
+    # transitively import them, then map to registered model_types.
+    for path in traceable_files:
+        normalized = path.replace("\\", "/")
+        # Convert path to module name: src/mobius/components/_attention.py
+        # → mobius.components._attention
+        # Special case: __init__.py → package name (mobius.components)
+        rel = normalized[len("src/") :]
+        if rel.endswith("/__init__.py"):
+            module_name = rel[: -len("/__init__.py")].replace("/", ".")
+        else:
+            module_name = rel[:-3].replace("/", ".")  # strip .py
+        if not module_name:
+            continue
+
         dependents = _find_reverse_dependents(module_name, import_graph)
         for dep_module in dependents:
             if dep_module in registry_map:
