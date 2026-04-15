@@ -207,8 +207,8 @@ jobs:
           key: hf-golden-${{ hashFiles('testdata/cases/**/*.yaml') }}
           restore-keys: |
             hf-golden-
-      - name: Install PyTorch CPU
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PyTorch (CUDA)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
