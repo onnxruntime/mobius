@@ -936,8 +936,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ep",
-        choices=["cpu", "cuda", "webgpu", "onnx-standard", "trt-rtx"],
-        default=None,
+        choices=["default", "cpu", "cuda", "webgpu", "onnx-standard", "trt-rtx"],
+        default="default",
         help=(
             "Execution provider for ONNX model build. "
             "Defaults to matching --device."
@@ -965,7 +965,8 @@ def main() -> int:
     # and returns a ModelPackage containing all sub-models.
     # ------------------------------------------------------------------
     load_weights = not args.no_weights
-    ep = args.ep or args.device
+    ep = args.ep
+    device = args.device
     print(f"Building ONNX models from {args.model_id!r} (dtype={args.dtype}, ep={ep}) ...")
     pkg = build(
         args.model_id,
