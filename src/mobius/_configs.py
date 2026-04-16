@@ -118,7 +118,7 @@ class VisionConfig:
     use_clipped_linears: bool = False
     # Gemma4 SigLIP patch position embedding table size (HF: position_embedding_size)
     position_embedding_size: int | None = None
-    # Gemma4 VisionPooler spatial average pooling kernel size (3 → 3×3 pooling, N→N/9 tokens)
+    # Gemma4 VisionPooler spatial average pooling kernel size (3 → 3x3 pooling, N→N/9 tokens)
     pooling_kernel_size: int | None = None
     # MLP activation for vision encoder layers (e.g. "gelu_pytorch_tanh" for Gemma4 SigLIP)
     hidden_act: str | None = None

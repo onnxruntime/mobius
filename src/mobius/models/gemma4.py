@@ -332,7 +332,7 @@ class Gemma4VisionPooler(nn.Module):
 
     Unlike using ``T // k²`` as the output length, using ``w_out * h_out``
     avoids creating empty trailing pool bins that HF strips after pooling.
-    For a 57×42 image (2520 patches, k=3): ``valid_depth = 19×14 = 266``
+    For a 57x42 image (2520 patches, k=3): ``valid_depth = 19x14 = 266``
     rather than ``2520 // 9 = 280``.
     """
 
@@ -382,7 +382,7 @@ class Gemma4VisionPooler(nn.Module):
         # --- 3. valid_depth = w_out * h_out (only occupied pool bins) --------
         # HF strips empty trailing pool bins; using w_out*h_out as the OneHot
         # depth avoids creating those empty bins in the first place.
-        # For a 57×42 image with k=3: w_out=19, h_out=14, valid_depth=266
+        # For a 57x42 image with k=3: w_out=19, h_out=14, valid_depth=266
         # (vs T//k²=280 which includes 14 empty bins that would need stripping).
         k_c = op.Constant(value_ints=[k])
         w_out = op.Div(max_x, k_c)  # [B, 1]  pooled width
@@ -1506,7 +1506,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
         self.encoder = _Gemma4VisionEncoderCore(config)
-        # Gemma4VisionPooler: 3×3 spatial average pooling + sqrt(hidden) scaling.
+        # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
         self.projector_norm = _Gemma4ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)

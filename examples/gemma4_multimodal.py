@@ -288,7 +288,7 @@ def build_input_ids(
     are inserted at the start of the user message content (before the text),
     matching the HuggingFace processor layout::
 
-        <bos><|turn>user\\n<|image>[image×N]<image|>[audio×M]text<turn|>\\n<|turn>model\\n
+        <bos><|turn>user\\n<|image>[imagexN]<image|>[audioxM]text<turn|>\\n<|turn>model\\n
 
     Image tokens are wrapped in boundary markers ``<|image>`` (255999) and
     ``<image|>`` (258882) — the HuggingFace processor always inserts these, and
@@ -317,7 +317,7 @@ def build_input_ids(
     modality_parts: list[np.ndarray] = []
     if num_image_tokens > 0:
         # Wrap image soft tokens with boundary markers, matching HF processor layout:
-        # <|image>(255999) + N×<|image|>(258880) + <image|>(258882)
+        # <|image>(255999) + Nx<|image|>(258880) + <image|>(258882)
         open_marker = np.array([[IMAGE_OPEN_TOKEN_ID]], dtype=np.int64)
         soft_tokens = np.full((1, num_image_tokens), IMAGE_TOKEN_ID, dtype=np.int64)
         close_marker = np.array([[IMAGE_CLOSE_TOKEN_ID]], dtype=np.int64)
