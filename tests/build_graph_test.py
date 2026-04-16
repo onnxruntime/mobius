@@ -1136,6 +1136,277 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
+    def test_gemma4_multimodal_graph(self):
+        """Build Gemma4 vision-language model via registry (3-model split: decoder+vision+embedding).
+
+        The ``gemma4`` model type maps to Gemma4Model.  Without an audio config,
+        the package has three models: decoder, vision, embedding.
+        """
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            # Dual layer types: 1 local + 1 global
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            # Global attention config (same head_dim in test for simplicity)
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+            f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
+        )
+        # Decoder: inputs_embeds -> logits + per-layer KV cache
+        decoder = pkg["decoder"]
+        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+        # Vision: pixel_values + pixel_position_ids -> image_features
+        vision = pkg["vision"]
+        vision_input_names = {i.name for i in vision.graph.inputs}
+        assert "pixel_values" in vision_input_names
+        assert "pixel_position_ids" in vision_input_names
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+        # Embedding: input_ids + image_features (no audio) -> inputs_embeds
+        embedding = pkg["embedding"]
+        emb_input_names = {i.name for i in embedding.graph.inputs}
+        assert "input_ids" in emb_input_names
+        assert "image_features" in emb_input_names
+        assert "audio_features" not in emb_input_names
+        assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+
+    def test_gemma4_moe_graph(self):
+        """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            # MoE config: every layer has a parallel MoE block
+            enable_moe_block=True,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+        model_cls = registry.get("gemma4_text")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4_text")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert "model" in pkg
+        model = pkg["model"]
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        assert "input_ids" in input_names
+        assert "logits" in output_names
+
+    def test_gemma4_any_to_any_graph(self):
+        """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
+
+        When ``config.audio`` is set, Gemma4Model adds a ``speech`` model and a
+        3-input embedding (input_ids + image_features + audio_features).
+        """
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            # num_kv_shared_layers=1 → layer 1 shares KV from layer 0 (same type)
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                audio_token_id=255998,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}, (
+            f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
+        )
+        # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
+        decoder = pkg["decoder"]
+        decoder_input_names = {i.name for i in decoder.graph.inputs}
+        assert "inputs_embeds" in decoder_input_names
+        assert "past_key_values.0.key" in decoder_input_names
+        assert "past_key_values.1.key" not in decoder_input_names  # shared layer
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+        # Vision
+        vision = pkg["vision"]
+        vision_input_names = {i.name for i in vision.graph.inputs}
+        assert "pixel_values" in vision_input_names
+        assert "pixel_position_ids" in vision_input_names
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+        # Audio encoder
+        audio = pkg["audio"]
+        assert "input_features" in {i.name for i in audio.graph.inputs}
+        assert "audio_features" in {o.name for o in audio.graph.outputs}
+        # Embedding: all three inputs
+        embedding = pkg["embedding"]
+        emb_input_names = {i.name for i in embedding.graph.inputs}
+        assert "input_ids" in emb_input_names
+        assert "image_features" in emb_input_names
+        assert "audio_features" in emb_input_names
+        assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+        # KV cache outputs: num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
+        decoder_output_names = {o.name for o in decoder.graph.outputs}
+        assert "present.0.key" in decoder_output_names
+        assert "present.0.value" in decoder_output_names
+        assert "present.1.key" not in decoder_output_names  # shared layer excluded
+        assert "present.1.value" not in decoder_output_names  # shared layer excluded
+
+    def test_gemma4_kv_shared_layer_tracing(self):
+        """Verify all num_hidden_layers are traced and KV outputs = num_kv_layers.
+
+        With num_kv_shared_layers=1 and num_hidden_layers=2:
+        - Both layers must be traced (Attention op count = 2)
+        - KV cache inputs: 1 entry (only layer 0 has its own K/V)
+        - KV cache outputs: 1 entry (shared layer excluded from present_key_values)
+        """
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                audio_token_id=255998,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task = Gemma4Task()
+        pkg = task.build(module, config)
+        decoder = pkg["decoder"]
+
+        # All num_hidden_layers=2 layers must be traced: each produces one Attention op.
+        attention_nodes = [n for n in decoder.graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == config.num_hidden_layers, (
+            f"Expected {config.num_hidden_layers} Attention ops (all layers traced), "
+            f"got {len(attention_nodes)}"
+        )
+
+        # KV cache inputs: exactly num_kv_layers = 1 (shared layer has no own KV)
+        input_names = {i.name for i in decoder.graph.inputs}
+        assert "past_key_values.0.key" in input_names
+        assert "past_key_values.1.key" not in input_names
+
+        # KV cache outputs: exactly num_kv_layers = 1 (shared layer excluded)
+        output_names = {o.name for o in decoder.graph.outputs}
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+        assert "present.1.key" not in output_names
+        assert "present.1.value" not in output_names
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -3395,6 +3666,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "blip-2",
     "deepseek_vl_v2",
     "gemma3_multimodal",
+    "gemma4",
     "llava",
     "mllama",
     "phi4_multimodal",

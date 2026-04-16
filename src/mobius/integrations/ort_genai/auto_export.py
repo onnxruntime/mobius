@@ -58,6 +58,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "phi4_multimodal": "phi4mm",
     "gemma": "gemma",
     "gemma2": "gemma",
+    "gemma4": "gemma4",
+    "gemma4_text": "gemma4_text",
     "mistral": "mistral",
 }
 

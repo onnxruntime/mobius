@@ -534,45 +534,48 @@ gathered = op.Gather(padded, indices, axis=0)
 result = op.Where(image_mask, gathered, text_embeddings)
 ```
 
-## Any-to-Any 4-model task (vision+audio+text)
+## Conditional 3-or-4-model task (vision+audio+text)
 
 Some models come in two tiers: small variants support vision **and** audio
 (Any-to-Any), while large variants support vision only (Image-Text-to-Text).
-Each tier uses a different number of exported ONNX models.
+A **single unified task class** handles both tiers by checking whether
+`config.audio is not None` to decide whether to include the speech encoder.
 
 ### Tier split
 
 | Tier | Models | ONNX split | Example |
 |------|--------|-----------|---------|
-| Small Any-to-Any | E2B, E4B | 4 models: decoder + vision + **audio** + embedding | `google/gemma-4-E2B-it` |
+| Small Any-to-Any | E2B, E4B | 4 models: decoder + vision + **speech** + embedding | `google/gemma-4-E2B-it` |
 | Large Image-Text-to-Text | 26B-A4B, 31B | 3 models: decoder + vision + embedding | `google/gemma-4-26B-A4B-it` |
 
-The task class detects which tier to use from the config (e.g. whether
-`config.audio is not None` — `ArchitectureConfig.from_transformers` populates
-the `audio` field when the HuggingFace config contains an audio sub-config).
+`ArchitectureConfig.from_transformers` populates the `audio` field when the
+HuggingFace config contains an audio sub-config; otherwise it is `None`.
 
-### 4-model task structure
+### 4-model task structure (when audio is present)
 
 ```
-decoder          inputs_embeds [B, S, H] → logits + KV cache
-vision_encoder   pixel_values [B, 3, H, W] → image_features [num_image_tokens, H]
-audio_encoder    input_features [B, T, mel] → audio_features [num_audio_tokens, H]
-embedding        input_ids + image_features + audio_features → inputs_embeds [B, S, H]
+decoder   inputs_embeds [B, S, H] → logits + KV cache
+vision    pixel_values [B, N, 3*P^2] → image_features [B*N, H]
+speech    input_features [B, T, mel] → audio_features [num_audio_tokens, H]
+embedding input_ids + image_features + audio_features → inputs_embeds [B, S, H]
 ```
 
-Reference implementation: `Gemma4AnyToAnyTask` in
-`src/mobius/tasks/_gemma4.py`. This follows the same 4-model structural pattern as
+Reference implementation: `Gemma4Task` in `src/mobius/tasks/_gemma4.py`.
+This follows the same multi-model structural pattern as
 `Phi4MMMultiModalTask` in `src/mobius/tasks/_phi4mm_multimodal.py`
 (each modality is a separate ONNX model; embedding splices features at placeholder
 positions), though the exact I/O shapes differ per architecture.
 
-### Audio encoder wiring
+`Gemma4VisionLanguageTask` and `Gemma4AnyToAnyTask` are backward-compatible
+aliases pointing to `Gemma4Task`.
 
-The audio encoder takes raw mel-spectrogram frames and outputs token-level
-features at the text hidden size:
+### Speech encoder wiring
+
+The speech (audio) encoder takes raw mel-spectrogram frames and outputs
+token-level features at the text hidden size:
 
 ```python
-# In Gemma4AnyToAnyTask._build_audio():
+# In Gemma4Task._build_speech():
 input_features = ir.Value(
     name="input_features",
     shape=ir.Shape([batch, time, input_size]),   # [B, T, 128]
@@ -583,37 +586,37 @@ audio_features = audio_encoder(op, input_features)
 ```
 
 The audio encoder (`Gemma4AudioEncoder` / `_Gemma4AudioEncoderModel`) is
-its own `nn.Module` subgraph exported as the `"audio"` key in the
+its own `nn.Module` subgraph exported as the `"speech"` key in the
 `ModelPackage`.
 
 ### Embedding model fuses all modalities
 
-The embedding model receives `input_ids`, `image_features`, and
-`audio_features` as separate inputs and splices them into the token
-embedding sequence at the placeholder positions:
+The embedding model receives `input_ids`, `image_features`, and optionally
+`audio_features` as inputs and splices them into the token embedding sequence
+at the placeholder positions:
 
 ```python
-# In Gemma4AnyToAnyTask._build_embedding():
+# In Gemma4Task._build_embedding():
 inputs_embeds = embedding(
     op,
     input_ids=input_ids,            # [B, S]
     image_features=image_features,  # [num_image_tokens, H]
-    audio_features=audio_features,  # [num_audio_tokens, H]
+    audio_features=audio_features,  # [num_audio_tokens, H] — only when audio present
 )
 # returns inputs_embeds: [B, S, H]
 ```
 
-### Task class tier detection
+### Task class conditional pattern
 
 ```python
-class MyAnyToAnyTask(ModelTask):
+class MyConditionalTask(ModelTask):
     def build(self, module, config):
         models = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision"] = self._build_vision(module.vision_encoder, config)
-        models["embedding"] = self._build_embedding(module.embedding, config)
-        # Build audio encoder only when audio config is present
+        # Build speech encoder only when audio config is present
         if config.audio is not None:
-            models["audio"] = self._build_audio(module.audio_encoder, config)
+            models["speech"] = self._build_speech(module.audio_encoder, config)
+        models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 ```

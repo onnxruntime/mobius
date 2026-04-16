@@ -9,6 +9,7 @@ __all__ = [
     "BertEmbeddings",
     "CausalConv1d",
     "CausalConvNd",
+    "CausalDepthwiseConv1d",
     "CausalTransConv1d",
     "CodecDecoderTransformerModel",
     "CodecEncoderTransformerModel",
@@ -34,6 +35,7 @@ __all__ = [
     "GatedMLP",
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
+    "Gemma4AudioEncoder",
     "GroupNorm",
     "GQAContext",
     "INT64_MAX",
@@ -144,6 +146,7 @@ from mobius.components._common import (
 )
 from mobius.components._conv import (
     BatchNorm2d,
+    CausalDepthwiseConv1d,
     Conv2d,
     Conv2dNoBias,
     ConvTranspose2d,
@@ -172,6 +175,7 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock

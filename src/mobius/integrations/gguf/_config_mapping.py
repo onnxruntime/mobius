@@ -42,6 +42,9 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "qwen35moe": "qwen3_5_moe",
     "gemma2": "gemma2",
     "gemma3": "gemma3_text",
+    # Gemma 4 GGUF contains the text backbone only — no vision or audio encoder.
+    # Vision and audio encoders are exported separately from the HuggingFace checkpoint.
+    "gemma4": "gemma4",
     "phi3": "phi3",
     "falcon": "falcon",
     "gpt2": "gpt2",

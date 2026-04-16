@@ -72,6 +72,23 @@ class TestFoldTransposedInitializerPass:
         # New initializer registered
         assert "weight_t" in model.graph.initializers
 
+        # Original initializer removed from the graph — but first verify the key
+        # postcondition our safe=True fix provides: the node was detached from
+        # its inputs so uses() drops to 0.  A subsequent RemoveUnusedNodesPass
+        # (run as part of fold_initializers_after_weights) will then prune it.
+        # Without safe=True the removed Transpose still holds a ref, keeping
+        # uses()>0, which prevents RemoveUnusedNodesPass from pruning the
+        # original initializer — that orphaned entry then triggers the ORT
+        # warning: "Removing initializer X. It is not used by any node".
+        orig_weight = model.graph.initializers.get("weight")
+        assert orig_weight is not None, (
+            "Original initializer should still be in graph (RemoveUnused runs later)"
+        )
+        assert len(list(orig_weight.uses())) == 0, (
+            "After fold, original weight must have 0 uses so RemoveUnusedNodesPass "
+            "can prune it — non-zero uses means the removed Transpose still holds a ref"
+        )
+
         # New initializer has correct transposed shape
         t_val = model.graph.initializers["weight_t"]
         assert t_val.shape == ir.Shape([3, 4])
@@ -270,6 +287,52 @@ class TestFoldTransposedInitializerPass:
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Transpose" in node_types, "Identity Transpose should not be removed"
 
+    def test_skips_initializer_with_none_const_value(self):
+        """Pass skips (with warning) when initializer has const_value=None.
+
+        This guards against the case where the pass is invoked before weights
+        are loaded, or when a weight is absent from the checkpoint.  The
+        Transpose node must remain in the graph (not silently dropped) so that
+        a later _check_weights call can surface the missing weight clearly.
+        """
+        w = ir.Value(name="w", shape=ir.Shape([4, 8]))
+        w.type = ir.TensorType(ir.DataType.FLOAT)
+        # Deliberately leave const_value as None (no weight loaded)
+
+        out = ir.Value(name="w_t", shape=ir.Shape([8, 4]))
+        out.type = ir.TensorType(ir.DataType.FLOAT)
+        t_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[w],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        t_node.outputs[0].shape = ir.Shape([8, 4])
+
+        x = ir.Value(name="x")
+        mm_node = ir.Node("", "MatMul", inputs=[x, t_node.outputs[0]], num_outputs=1)
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[mm_node.outputs[0]],
+            nodes=[t_node, mm_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.initializers["w"] = (
+            w  # Direct assignment: bypasses the const_value guard in register_initializer
+        )
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        # Pass must skip — no LazyTensor created, Transpose still present.
+        assert not result.modified
+        assert "w_t" not in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" in node_types, "Transpose must remain when const_value is None"
+
     def test_transpose_with_zero_inputs_skipped(self):
         """A Transpose node with no inputs does not cause an error and is not folded."""
         # Build a Transpose node with no inputs (malformed but should be skipped gracefully).
@@ -359,7 +422,36 @@ class TestFoldTransposedInitializerPass:
         assert list(w_t_init.shape) == [3, 2]
 
 
-def test_shared_initializer_not_folded():
+def test_original_weight_pruned_after_full_pipeline():
+    """After fold_initializers_after_weights, original weight is removed from the graph.
+
+    This is the end-to-end regression test for the ORT warning:
+      'Removing initializer X. It is not used by any node'
+
+    Root cause: model.graph.remove(node) without safe=True leaves the Transpose
+    node still referencing the original weight initializer (inp.uses() stays 1).
+    RemoveUnusedNodesPass sees uses()>0 and keeps the weight in graph.initializers.
+    When serialised to ONNX the initializer is present but no node references it
+    → ORT warns.
+
+    Fix: model.graph.remove(node, safe=True) detaches the node from its inputs
+    first, so inp.uses() drops to 0 and RemoveUnusedNodesPass can prune it.
+    """
+    from mobius._optimizations import fold_initializers_after_weights
+
+    data = np.arange(12, dtype=np.float32).reshape(4, 3)
+    model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+    # Run the full pipeline (fold + remove unused) as in apply_weights.
+    fold_initializers_after_weights(model)
+
+    assert "weight_t" in model.graph.initializers, "Folded initializer must be present"
+    assert "weight" not in model.graph.initializers, (
+        "Original weight must be pruned by RemoveUnusedNodesPass after folding. "
+        "If it's still present, the Transpose node wasn't properly detached from "
+        "its inputs (safe=True missing), causing ORT 'unused initializer' warnings."
+    )
+
     """Transpose(initializer) is skipped when the initializer has multiple consumers.
 
     Folding would rename/remove the shared initializer, silently breaking the

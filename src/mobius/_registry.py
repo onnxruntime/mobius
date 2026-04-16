@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Gemma4Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -41,6 +42,8 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4CausalLMModel,
+    Gemma4Model,
     GemmaCausalLMModel,
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
@@ -385,6 +388,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
     "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
+    "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
@@ -459,6 +463,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
     "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(MoECausalLMModel),
@@ -703,6 +708,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma3_text": "google/gemma-3-1b-pt",
     "gemma3n": "google/gemma-3n-E2B-pt",
     "gemma3n_text": "google/gemma-3n-E2B-pt",
+    "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
     "nemotron": "nvidia/Nemotron-Mini-4B-Instruct",
@@ -784,6 +790,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
     "gemma3_multimodal": "google/gemma-3-4b-it",
+    "gemma4": "google/gemma-4-E2B-it",
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",

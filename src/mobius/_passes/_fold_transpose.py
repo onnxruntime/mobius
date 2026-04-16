@@ -89,6 +89,22 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             out_val = node.outputs[0]
 
             if inp.name not in folded:
+                # Guard: if the source initializer has no weight data yet, the
+                # LazyTensor closure would crash during serialization.  This can
+                # happen when the pass is invoked before weights are fully loaded
+                # (violating the documented precondition), or when an initializer
+                # is missing from the checkpoint.  Skip with a warning so the
+                # graph retains the Transpose node; _check_weights will surface
+                # the missing weight with a clear error message.
+                if inp.const_value is None:
+                    logger.warning(
+                        "FoldTransposedInitializer: skipping %r — const_value is None "
+                        "(pass may have run before weights were loaded, or the weight "
+                        "is missing from the checkpoint)",
+                        inp.name,
+                    )
+                    continue
+
                 new_name = f"{inp.name}_t"
 
                 # Derive shape of the transposed tensor from the Transpose output.
@@ -106,7 +122,7 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 # avoiding holding a second copy of the weight in memory.
                 src = inp  # captured for the closure below
                 new_val.const_value = ir.LazyTensor(
-                    lambda s=src: ir.tensor(s.const_value.numpy().T),
+                    lambda s=src: ir.tensor(s.const_value.numpy().T),  # type: ignore[union-attr]
                     dtype=inp.dtype or ir.DataType.FLOAT,
                     shape=t_shape,
                     name=new_val.name,
@@ -122,7 +138,14 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
             replacement = folded[inp.name]
             out_val.replace_all_uses_with(replacement, replace_graph_outputs=True)
-            model.graph.remove(node)
+            # Use safe=True so the node detaches from its inputs before removal.
+            # Without this, `inp.uses()` stays non-zero (pointing to the removed
+            # node), causing RemoveUnusedNodesPass to keep the original `weight`
+            # initializer in the graph even though no live node consumes it.
+            # That orphaned initializer is then serialized into the ONNX file
+            # and triggers an ORT warning:
+            #   "Removing initializer X. It is not used by any node"
+            model.graph.remove(node, safe=True)
             folded_nodes += 1
             modified = True
 

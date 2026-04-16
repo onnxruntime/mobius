@@ -71,6 +71,42 @@ _GEMMA2_EXTRAS: dict[str, str] = {
     "blk.{bid}.post_ffn_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
 }
 
+# Gemma 4 extras on top of the Llama base + Gemma2 extras.
+# Gemma 4 GGUF tensor names are taken from llama.cpp constants (gguf-py/gguf/constants.py).
+#
+# Key differences from Gemma 2/3:
+#   - blk.{bid}.ffn_norm → pre_feedforward_layernorm (overrides Llama mapping of post_attn_layernorm)
+#   - blk.{bid}.post_attention_norm → post_attention_layernorm (ATTN_POST_NORM, new in Gemma 4)
+#   - Q/K/V norms on attention heads
+#   - Per-layer scalar gate (all variants)
+#   - MoE path norms (26B-A4B with enable_moe_block=True)
+#   - Per-layer input embeddings (E2B/E4B with hidden_size_per_layer_input>0)
+#
+# Note: Gemma 4 GGUF contains the text backbone only. Vision and audio encoders
+# are not present in the GGUF file and must be loaded from the HF checkpoint.
+_GEMMA4_EXTRAS: dict[str, str] = {
+    # Override _LLAMA_MAPPING: ffn_norm is the pre-feedforward norm, not post-attention.
+    "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
+    # Post-attention layernorm (ATTN_POST_NORM, present in all Gemma 4 variants).
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    # Post-feedforward layernorm (FFN_POST_NORM).
+    "blk.{bid}.post_ffw_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
+    # Per-head Q/K/V norms (all variants).
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    # Per-layer scalar gate applied after the residual (all variants).
+    # GGUF: LAYER_OUT_SCALE → HF: Gemma4TextDecoderLayer.layer_scalar
+    "blk.{bid}.layer_output_scale": "model.layers.{bid}.layer_scalar",
+    # MoE path norms (models with enable_moe_block=True, e.g. 26B-A4B).
+    "blk.{bid}.pre_ffw_norm_2": ("model.layers.{bid}.pre_feedforward_layernorm_2"),
+    "blk.{bid}.post_ffw_norm_1": ("model.layers.{bid}.post_feedforward_layernorm_1"),
+    "blk.{bid}.post_ffw_norm_2": ("model.layers.{bid}.post_feedforward_layernorm_2"),
+    # Per-layer input embedding path (models with hidden_size_per_layer_input>0, e.g. E2B/E4B).
+    "blk.{bid}.inp_gate": "model.layers.{bid}.per_layer_input_gate",
+    "blk.{bid}.proj": "model.layers.{bid}.per_layer_projection",
+    "blk.{bid}.post_norm": "model.layers.{bid}.post_per_layer_input_norm",
+}
+
 # Phi-3 uses fused QKV and gate-up projections.
 _PHI3_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
@@ -216,6 +252,13 @@ def _build_mapping(
     elif arch in _GEMMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA2_EXTRAS)
+    elif arch == "gemma4":
+        # Gemma 4 starts from the Llama base but needs several overrides and
+        # many new tensor types for Q/K norms, per-layer scalars, MoE norms,
+        # and per-layer input embeddings. Use a dedicated extras dict rather
+        # than extending _GEMMA_FAMILY to avoid contaminating Gemma 2/3.
+        result = dict(_LLAMA_MAPPING)
+        result.update(_GEMMA4_EXTRAS)
     elif arch == "phi3":
         result = dict(_PHI3_MAPPING)
     elif arch == "falcon":
@@ -231,7 +274,10 @@ def _build_mapping(
             result.update(_QWEN35MOE_EXTRAS)
     else:
         supported = sorted(
-            _LLAMA_FAMILY | _GEMMA_FAMILY | _MOE_FAMILY | {"phi3", "falcon", "gpt2", "mamba"}
+            _LLAMA_FAMILY
+            | _GEMMA_FAMILY
+            | _MOE_FAMILY
+            | {"gemma4", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(
             f"Unsupported GGUF architecture: {architecture!r}. "

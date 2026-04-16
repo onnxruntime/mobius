@@ -26,6 +26,7 @@ from mobius._configs import (
     DepthAnythingConfig,
     Gemma2Config,
     Gemma3nConfig,
+    Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
     JetMoeConfig,
@@ -286,6 +287,20 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["full_attention", "sliding_attention"],
+        },
+        True,
+    ),
+    (
+        "gemma4_text",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            # 2-layer test: 1 sliding + 1 full (must match TINY_LAYERS=2)
+            "layer_types": ["sliding_attention", "full_attention"],
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "final_logit_softcapping": 30.0,
         },
         True,
     ),
@@ -1881,6 +1896,36 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # --- Gemma4 multimodal (3-model split: decoder + vision + embedding) ---
+    (
+        "gemma4",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                mm_tokens_per_image=4,
+            ),
+            "mm_tokens_per_image": 4,
+            "image_token_id": 255999,
+        },
+        False,
+    ),
+    # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
+    # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
+    # because it uses the unified "gemma4" registry key, same as the VL-only config above.
     # --- Blip2 (ViT + Q-Former + LLM) ---
     (
         "blip-2",
