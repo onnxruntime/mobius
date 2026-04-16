@@ -9,6 +9,7 @@ dtypes transparently.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -16,7 +17,46 @@ import numpy as np
 import onnx_ir as ir
 import onnxruntime_easy as ort_easy
 
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
+
+logger = logging.getLogger(__name__)
+
+# Maximum default-domain ONNX opset that ORT ≤1.24.x CUDA/TRT EPs
+# register kernels for.  Models built with a higher opset can be
+# loaded after lowering the declared import — the op semantics have
+# not changed, only the version label.
+_MAX_EP_OPSET = 23
+
+
+def _should_lower_opset(model: ir.Model, device: str) -> bool:
+    """Return True when lowering the opset import is safe and needed.
+
+    Lowering is only attempted when
+    :attr:`~mobius._flags._Flags.ort_lower_opset_for_ep` is enabled and the
+    target device is non-CPU with a default-domain opset exceeding
+    ``_MAX_EP_OPSET``.
+
+    Lowering is *not* safe when the graph contains ops that were first
+    introduced in a post-23 opset (e.g. ``TensorScatter``).  In that
+    case the model requires genuine opset 24+ support and lowering
+    would produce an invalid model.
+    """
+    if not flags.ort_lower_opset_for_ep:
+        return False
+    if device == "cpu":
+        return False
+    current_opset = model.opset_imports.get("", 0)
+    if current_opset <= _MAX_EP_OPSET:
+        return False
+
+    # Ops that were *introduced* in opset 24 and have no opset 23
+    # equivalent.  If any appear in the graph, lowering is unsafe.
+    opset_24_only_ops = {"TensorScatter"}
+    for node in model.graph:
+        if node.domain == "" and node.op_type in opset_24_only_ops:
+            return False
+    return True
 
 
 class OnnxModelSession:
@@ -47,9 +87,30 @@ class OnnxModelSession:
                 )
             model = next(iter(model.values()))
 
+        # Workaround: ORT ≤1.24.x CUDA/TRT EPs don't register kernels
+        # for ONNX opset 24 standard ops (Squeeze, Reshape, etc.).  The
+        # op semantics are identical to opset 23, so lowering the import
+        # declaration lets the EP find its existing kernels.  The model
+        # object is restored to its original opset after saving.
+        device = load_kwargs.get("device", "cpu")
+        lower_opset = _should_lower_opset(model, device)
+        original_opset = model.opset_imports.get("", 0) if lower_opset else 0
+        if lower_opset:
+            logger.info(
+                "Lowering default-domain opset from %d to %d for %s",
+                original_opset,
+                _MAX_EP_OPSET,
+                device,
+            )
+            model.opset_imports[""] = _MAX_EP_OPSET
+
         self._tmpdir = tempfile.TemporaryDirectory()
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
-        ir.save(model, self._model_path, external_data="model.onnx.data")
+        try:
+            ir.save(model, self._model_path, external_data="model.onnx.data")
+        finally:
+            if lower_opset:
+                model.opset_imports[""] = original_opset
 
         self._session = ort_easy.load(self._model_path, **load_kwargs)
         self._input_names = [inp.name for inp in self._session.get_inputs()]

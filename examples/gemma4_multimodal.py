@@ -111,10 +111,6 @@ NUM_IMAGE_TOKENS = 256  # approximate; actual count is image-size dependent
 # stride 2 each → total time reduction factor of 4.
 AUDIO_SUBSAMPLING_FACTOR = 4
 
-# Mel spectrogram parameters for the Gemma 4 audio encoder input
-AUDIO_SAMPLE_RATE = 16_000
-AUDIO_N_MELS = 128  # Gemma 4 uses 128-dim mel (vs Whisper's 80)
-
 
 # ---------------------------------------------------------------------------
 # Input preprocessing — one function per ONNX session
@@ -150,53 +146,40 @@ def prepare_vision_feeds(
 
 
 def prepare_audio_feeds(
+    processor,
     audio_path: str,
-    sample_rate: int = AUDIO_SAMPLE_RATE,
-    n_mels: int = AUDIO_N_MELS,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **audio** session.
 
-    Loads the audio file, resamples to 16 kHz if needed, computes a
-    128-dim log-mel spectrogram, and transposes to ``(1, time, n_mels)``
-    layout expected by the Conformer encoder.
+    Loads the audio file and uses the Gemma 4 processor's built-in
+    ``Gemma4AudioFeatureExtractor`` to compute the 128-dim log-mel
+    spectrogram in ``(1, time, n_mels)`` layout expected by the
+    Conformer encoder.
 
     Args:
+        processor: ``AutoProcessor`` loaded for the Gemma 4 model.
         audio_path: Path to an audio file (WAV, FLAC, MP3, etc.).
-        sample_rate: Target sample rate (16 000 Hz for Gemma 4).
-        n_mels: Number of mel filterbank bins (128 for Gemma 4).
 
     Returns:
         ``{"input_features": float32[1, T, n_mels]}``
     """
-    import scipy.signal
     import soundfile as sf
 
     raw, sr = sf.read(audio_path, always_2d=True)  # [frames, channels]
     # Average channels to mono
     audio_np = raw.mean(axis=1).astype(np.float32)
-    if sr != sample_rate:
-        # Resample using scipy to avoid torchaudio/torchcodec dependency issues
-        num_samples = int(len(audio_np) * sample_rate / sr)
-        audio_np = scipy.signal.resample(audio_np, num_samples).astype(np.float32)
 
-    # Compute log-mel spectrogram using the HuggingFace feature extractor.
-    # Gemma 4 uses the same interface as WhisperFeatureExtractor.
-    feature_extractor = transformers.WhisperFeatureExtractor(
-        feature_size=n_mels,
-        sampling_rate=sample_rate,
-        # Use a wider window than Whisper to match the Conformer receptive field
-        hop_length=160,
-        chunk_length=30,
-    )
-    out = feature_extractor(
-        audio_np,
-        sampling_rate=sample_rate,
+    # Use the processor's Gemma4AudioFeatureExtractor for correct mel computation.
+    # The feature extractor handles resampling internally.
+    fe = processor.feature_extractor
+    out = fe(
+        [audio_np],
+        sampling_rate=sr,
         return_tensors="np",
         padding=False,
     )
-    # out["input_features"]: [1, n_mels, time_frames]
-    # Transpose to [1, time_frames, n_mels] for the Conformer encoder
-    audio_features = out["input_features"].astype(np.float32).transpose(0, 2, 1)
+    # out["input_features"]: [1, T, n_mels]  (already in correct layout)
+    audio_features = out["input_features"].astype(np.float32)
     return {"input_features": audio_features}  # [1, T, n_mels]
 
 
@@ -258,9 +241,7 @@ def prepare_decoder_feeds(
         "inputs_embeds": inputs_embeds,
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
-        "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[
-            np.newaxis, :
-        ],
+        "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
         "input_ids": input_ids,
         **past_kv,
     }
@@ -310,9 +291,7 @@ def build_input_ids(
     template_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    template_ids = tokenizer(template_text, return_tensors="np")["input_ids"].astype(
-        np.int64
-    )
+    template_ids = tokenizer(template_text, return_tensors="np")["input_ids"].astype(np.int64)
 
     if num_image_tokens == 0 and num_audio_tokens == 0:
         return template_ids
@@ -327,9 +306,7 @@ def build_input_ids(
         close_marker = np.array([[IMAGE_CLOSE_TOKEN_ID]], dtype=np.int64)
         modality_parts.extend([open_marker, soft_tokens, close_marker])
     if num_audio_tokens > 0:
-        modality_parts.append(
-            np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64)
-        )
+        modality_parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
     modality_ids = np.concatenate(modality_parts, axis=1)
 
     # Find insertion point: right after the user header "<|turn>user\n"
@@ -595,6 +572,7 @@ def demo_audio(
     embedding_session: OnnxModelSession,
     decoder_session: OnnxModelSession,
     tokenizer,
+    processor,
     config,
     audio_path: str,
     prompt: str = "Transcribe the following audio.",
@@ -611,7 +589,7 @@ def demo_audio(
     # Step 1: Encode audio through the Conformer encoder.
     # Input:  audio_features [1, T, n_mels]  (mel spectrogram)
     # Output: audio_features [1, T', hidden_size]  (T' = T / subsampling_factor)
-    audio_out = audio_session.run(prepare_audio_feeds(audio_path))
+    audio_out = audio_session.run(prepare_audio_feeds(processor, audio_path))
     audio_features: np.ndarray = audio_out["audio_features"]
     if audio_features.ndim == 3:
         audio_features = audio_features[0]  # [T', hidden_size]
@@ -663,7 +641,7 @@ def demo_vision_audio(
         image_features = image_features[0]
 
     # Step 2: Encode audio
-    audio_out = audio_session.run(prepare_audio_feeds(audio_path))
+    audio_out = audio_session.run(prepare_audio_feeds(processor, audio_path))
     audio_features: np.ndarray = audio_out["audio_features"]
     if audio_features.ndim == 3:
         audio_features = audio_features[0]
@@ -701,15 +679,11 @@ def _hf_generate_text(model_id: str, prompt: str, max_new_tokens: int) -> str:
     from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = Gemma4ForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=torch.float32
-    )
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
     model.eval()
 
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-    text = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
+    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     inputs = processor(text=text, return_tensors="pt")
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -726,9 +700,7 @@ def _hf_generate_vision(
     from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = Gemma4ForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=torch.float32
-    )
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
     model.eval()
 
     image = Image.open(image_path).convert("RGB")
@@ -740,6 +712,80 @@ def _hf_generate_vision(
     ]
     text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(text=text, images=image, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_len = inputs["input_ids"].shape[1]
+    return processor.decode(out[0][prompt_len:], skip_special_tokens=True)
+
+
+def _hf_generate_audio(
+    model_id: str, audio_path: str, prompt: str, max_new_tokens: int
+) -> str:
+    """Run audio generation with HuggingFace PyTorch and return the output."""
+    import soundfile as sf
+    import torch
+    from transformers import AutoProcessor, Gemma4ForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model.eval()
+
+    raw, sr = sf.read(audio_path, always_2d=True)
+    audio_np = raw.mean(axis=1).astype(np.float32)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "audio"}, {"type": "text", "text": prompt}],
+        }
+    ]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    inputs = processor(text=text, audio=audio_np, sampling_rate=sr, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    prompt_len = inputs["input_ids"].shape[1]
+    return processor.decode(out[0][prompt_len:], skip_special_tokens=True)
+
+
+def _hf_generate_vision_audio(
+    model_id: str,
+    image_path: str,
+    audio_path: str,
+    prompt: str,
+    max_new_tokens: int,
+) -> str:
+    """Run combined vision + audio generation with HuggingFace PyTorch."""
+    import soundfile as sf
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, Gemma4ForConditionalGeneration
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model.eval()
+
+    image = Image.open(image_path).convert("RGB")
+    raw, sr = sf.read(audio_path, always_2d=True)
+    audio_np = raw.mean(axis=1).astype(np.float32)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "audio"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    inputs = processor(
+        text=text,
+        images=image,
+        audio=audio_np,
+        sampling_rate=sr,
+        return_tensors="pt",
+    )
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     prompt_len = inputs["input_ids"].shape[1]
@@ -763,21 +809,30 @@ def run_compare_hf(
     model_id: str,
     onnx_outputs: dict[str, str],
     has_image: bool,
+    has_audio: bool,
     image_path: str,
+    audio_path: str,
     max_new_tokens: int,
     text_prompt: str,
     vision_prompt: str,
+    audio_prompt: str,
+    vision_audio_prompt: str,
 ) -> None:
     """Run HF PyTorch inference for each completed ONNX demo and compare outputs.
 
     Args:
         model_id: HuggingFace model ID.
-        onnx_outputs: Mapping of mode name (``"text"``, ``"vision"``) to ONNX text output.
+        onnx_outputs: Mapping of mode name (``"text"``, ``"vision"``,
+            ``"audio"``, ``"vision-audio"``) to ONNX text output.
         has_image: Whether the image asset is available.
+        has_audio: Whether audio is available (file exists and model has audio).
         image_path: Path to the image file.
+        audio_path: Path to the audio file.
         max_new_tokens: Max tokens for generation.
         text_prompt: Prompt used for text demo.
         vision_prompt: Prompt used for vision demo.
+        audio_prompt: Prompt used for audio demo.
+        vision_audio_prompt: Prompt used for vision-audio demo.
     """
     print("\n" + "=" * 64)
     print("🔍  --compare-hf: loading HuggingFace model for comparison ...")
@@ -790,10 +845,20 @@ def run_compare_hf(
 
     if "vision" in onnx_outputs and has_image:
         print("Running HF vision generation ...")
-        hf_vision = _hf_generate_vision(
-            model_id, image_path, vision_prompt, max_new_tokens
-        )
+        hf_vision = _hf_generate_vision(model_id, image_path, vision_prompt, max_new_tokens)
         _print_side_by_side("VISION", onnx_outputs["vision"], hf_vision)
+
+    if "audio" in onnx_outputs and has_audio:
+        print("Running HF audio generation ...")
+        hf_audio = _hf_generate_audio(model_id, audio_path, audio_prompt, max_new_tokens)
+        _print_side_by_side("AUDIO", onnx_outputs["audio"], hf_audio)
+
+    if "vision-audio" in onnx_outputs and has_image and has_audio:
+        print("Running HF vision + audio generation ...")
+        hf_va = _hf_generate_vision_audio(
+            model_id, image_path, audio_path, vision_audio_prompt, max_new_tokens
+        )
+        _print_side_by_side("VISION + AUDIO", onnx_outputs["vision-audio"], hf_va)
 
 
 # ---------------------------------------------------------------------------
@@ -972,16 +1037,12 @@ def main() -> int:
         )
 
     max_tokens = args.max_new_tokens
-    modes = (
-        ["text", "vision", "audio", "vision-audio"]
-        if args.mode == "all"
-        else [args.mode]
-    )
+    modes = ["text", "vision", "audio", "vision-audio"] if args.mode == "all" else [args.mode]
 
-    text_prompt = (
-        args.prompt or "Explain the theory of general relativity in simple terms."
-    )
+    text_prompt = args.prompt or "Explain the theory of general relativity in simple terms."
     vision_prompt = args.prompt or "Describe what you see in this image in detail."
+    audio_prompt = args.prompt or "Transcribe the following audio."
+    vision_audio_prompt = args.prompt or "Describe the image and transcribe the audio."
 
     # Collect ONNX outputs for optional --compare-hf side-by-side display
     onnx_outputs: dict[str, str] = {}
@@ -1017,21 +1078,23 @@ def main() -> int:
         elif mode == "audio":
             if not has_audio:
                 continue
-            demo_audio(
+            result = demo_audio(
                 audio_session=audio_session,
                 embedding_session=embedding_session,
                 decoder_session=decoder_session,
                 tokenizer=tokenizer,
+                processor=processor,
                 config=config,
                 audio_path=args.audio,
-                prompt=args.prompt or "Transcribe the following audio.",
+                prompt=audio_prompt,
                 max_new_tokens=max_tokens,
             )
+            onnx_outputs["audio"] = result
 
         elif mode == "vision-audio":
             if not has_image or not has_audio:
                 continue
-            demo_vision_audio(
+            result = demo_vision_audio(
                 vision_session=vision_session,
                 audio_session=audio_session,
                 embedding_session=embedding_session,
@@ -1041,19 +1104,24 @@ def main() -> int:
                 config=config,
                 image_path=args.image,
                 audio_path=args.audio,
-                prompt=args.prompt or "Describe the image and transcribe the audio.",
+                prompt=vision_audio_prompt,
                 max_new_tokens=max_tokens,
             )
+            onnx_outputs["vision-audio"] = result
 
     if args.compare_hf and onnx_outputs:
         run_compare_hf(
             model_id=args.model_id,
             onnx_outputs=onnx_outputs,
             has_image=has_image,
+            has_audio=has_audio,
             image_path=args.image,
+            audio_path=args.audio,
             max_new_tokens=max_tokens,
             text_prompt=text_prompt,
             vision_prompt=vision_prompt,
+            audio_prompt=audio_prompt,
+            vision_audio_prompt=vision_audio_prompt,
         )
 
     return 0

@@ -23,9 +23,10 @@ Default config (google/gemma-4-E2B-it audio_config)::
     attention_context_left=13, output_proj_dims=1536, rms_norm_eps=1e-6,
     residual_weight=0.5, gradient_clipping=1e10
 
-Notes on omissions:
-- ``use_clipped_linears=True``: ``Gemma4ClippableLinear`` buffers are ±inf by
-  default (no-op clamping at inference). Implemented as plain ``Linear``.
+Notes:
+- ``use_clipped_linears=True``: ``Gemma4ClippableLinear`` has learned
+  ``input_{min,max}`` and ``output_{min,max}`` buffers that clamp activations
+  before and after the linear projection. Implemented as ``ClippableLinear``.
 - ``attention_logit_cap=50.0``: Soft-capping ``tanh(logits/cap)*cap`` IS
   implemented using standard ONNX ops (MatMul/Tanh/Div/Mul). The ONNX
   Attention op's native ``softcap`` attribute cannot be used because the
@@ -78,6 +79,50 @@ def _swish(op: builder.OpBuilder, x: ir.Value) -> ir.Value:
 # ---------------------------------------------------------------------------
 # Public components
 # ---------------------------------------------------------------------------
+
+
+class ClippableLinear(nn.Module):
+    """Linear layer with learned input/output activation clamping.
+
+    Matches ``Gemma4ClippableLinear`` in HuggingFace transformers.
+    The checkpoint stores learned ``input_{min,max}`` and ``output_{min,max}``
+    scalars that clamp activations before and after the linear projection::
+
+        x = clamp(x, input_min, input_max)
+        x = x @ weight.T [+ bias]
+        x = clamp(x, output_min, output_max)
+
+    Args:
+        in_features: Input feature dimension.
+        out_features: Output feature dimension.
+        bias: Whether to include a bias term (default: False).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter([out_features, in_features])
+        self.bias = nn.Parameter([out_features]) if bias else None
+        # Learned activation clipping bounds (scalar)
+        self.input_min = nn.Parameter([])
+        self.input_max = nn.Parameter([])
+        self.output_min = nn.Parameter([])
+        self.output_max = nn.Parameter([])
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        # Clamp input activations
+        x = op.Clip(x, self.input_min, self.input_max)
+        # Linear: x @ weight.T [+ bias]
+        w_t = op.Transpose(self.weight, perm=[1, 0])
+        result = op.MatMul(x, w_t)
+        if self.bias is not None:
+            result = op.Add(result, self.bias)
+        # Clamp output activations
+        return op.Clip(result, self.output_min, self.output_max)
 
 
 class Gemma4ConvSubsampling(nn.Module):
@@ -195,8 +240,8 @@ class Gemma4FeedForward(nn.Module):
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.ffw_layer_1 = Linear(hidden_size, hidden_size * 4, bias=False)
-        self.ffw_layer_2 = Linear(hidden_size * 4, hidden_size, bias=False)
+        self.ffw_layer_1 = ClippableLinear(hidden_size, hidden_size * 4, bias=False)
+        self.ffw_layer_2 = ClippableLinear(hidden_size * 4, hidden_size, bias=False)
         self.post_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
@@ -246,10 +291,10 @@ class Gemma4LightConv1d(nn.Module):
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_start = Linear(hidden_size, hidden_size * 2, bias=False)
+        self.linear_start = ClippableLinear(hidden_size, hidden_size * 2, bias=False)
         self.depthwise_conv1d = CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_end = Linear(hidden_size, hidden_size, bias=False)
+        self.linear_end = ClippableLinear(hidden_size, hidden_size, bias=False)
 
     def forward(self, op: builder.OpBuilder, x: ir.Value):
         residual = x
@@ -336,11 +381,11 @@ class Gemma4Attention(nn.Module):
         self._k_scale = math.log(1 + math.e) / math.log(2)
 
         # Q/K/V: no bias (HF nn.Linear(..., bias=False))
-        self.q_proj = Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = Linear(hidden_size, hidden_size, bias=False)
+        self.q_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.k_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.v_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
         # post: no bias (HF has no .bias key for self_attn.post in checkpoint)
-        self.post = Linear(hidden_size, hidden_size, bias=False)
+        self.post = ClippableLinear(hidden_size, hidden_size, bias=False)
 
         # Learnable per-head-dim scale applied to Q after projection
         self.per_dim_scale = nn.Parameter([self._head_dim])
@@ -383,8 +428,10 @@ class Gemma4Attention(nn.Module):
 
         # Causal: j ≤ i  ↔  diff ≥ 0
         causal = op.GreaterOrEqual(diff, zero)  # bool [T, T]
-        # In window: j ≥ i - (context_left - 1)  ↔  diff < context_left
-        ctx = op.Constant(value_int=self._attention_context_left)
+        # In window: j ≥ i - (context_left - 2)  ↔  diff < context_left - 1
+        # HF uses left_window_size = attention_context_left - 1 (e.g. 12 for
+        # config value 13) so the window covers positions [i-11, i] (12 frames).
+        ctx = op.Constant(value_int=self._attention_context_left - 1)
         in_window = op.Less(diff, ctx)  # bool [T, T]
 
         allowed = op.And(causal, in_window)
