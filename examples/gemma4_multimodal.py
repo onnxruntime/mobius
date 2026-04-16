@@ -938,7 +938,7 @@ def parse_args() -> argparse.Namespace:
         "--ep",
         choices=["default", "onnx-standard", "cuda", "webgpu", "trt-rtx"],
         default="default",
-        help="Generate ep specific graphs",
+        help="Generate EP-specific graphs.",
     )
     parser.add_argument(
         "--compare-hf",
