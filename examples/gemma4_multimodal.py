@@ -845,9 +845,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=["f32", "f16"],
+        choices=["f32", "f16", "bf16"],
         default="f32",
         help="Weight/activation dtype to use (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda", "webgpu"],
+        default="cpu",
+        help="ONNX Runtime execution provider (default: %(default)s).",
     )
     parser.add_argument(
         "--compare-hf",
@@ -896,10 +902,10 @@ def main() -> int:
     # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"])
-    audio_session = OnnxModelSession(pkg["audio"]) if "audio" in pkg else None
-    embedding_session = OnnxModelSession(pkg["embedding"])
-    decoder_session = OnnxModelSession(pkg["decoder"])
+    vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+    audio_session = OnnxModelSession(pkg["audio"], device=args.device) if "audio" in pkg else None
+    embedding_session = OnnxModelSession(pkg["embedding"], device=args.device)
+    decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
 
     # ------------------------------------------------------------------
     # Step 3: Load the HuggingFace processor.
