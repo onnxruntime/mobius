@@ -258,7 +258,9 @@ def prepare_decoder_feeds(
         "inputs_embeds": inputs_embeds,
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
-        "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
+        "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[
+            np.newaxis, :
+        ],
         "input_ids": input_ids,
         **past_kv,
     }
@@ -308,7 +310,9 @@ def build_input_ids(
     template_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    template_ids = tokenizer(template_text, return_tensors="np")["input_ids"].astype(np.int64)
+    template_ids = tokenizer(template_text, return_tensors="np")["input_ids"].astype(
+        np.int64
+    )
 
     if num_image_tokens == 0 and num_audio_tokens == 0:
         return template_ids
@@ -323,7 +327,9 @@ def build_input_ids(
         close_marker = np.array([[IMAGE_CLOSE_TOKEN_ID]], dtype=np.int64)
         modality_parts.extend([open_marker, soft_tokens, close_marker])
     if num_audio_tokens > 0:
-        modality_parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
+        modality_parts.append(
+            np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64)
+        )
     modality_ids = np.concatenate(modality_parts, axis=1)
 
     # Find insertion point: right after the user header "<|turn>user\n"
@@ -695,11 +701,15 @@ def _hf_generate_text(model_id: str, prompt: str, max_new_tokens: int) -> str:
     from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model = Gemma4ForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.float32
+    )
     model.eval()
 
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    text = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
     inputs = processor(text=text, return_tensors="pt")
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -716,7 +726,9 @@ def _hf_generate_vision(
     from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(model_id)
-    model = Gemma4ForConditionalGeneration.from_pretrained(model_id, torch_dtype=torch.float32)
+    model = Gemma4ForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.float32
+    )
     model.eval()
 
     image = Image.open(image_path).convert("RGB")
@@ -778,7 +790,9 @@ def run_compare_hf(
 
     if "vision" in onnx_outputs and has_image:
         print("Running HF vision generation ...")
-        hf_vision = _hf_generate_vision(model_id, image_path, vision_prompt, max_new_tokens)
+        hf_vision = _hf_generate_vision(
+            model_id, image_path, vision_prompt, max_new_tokens
+        )
         _print_side_by_side("VISION", onnx_outputs["vision"], hf_vision)
 
 
@@ -856,6 +870,12 @@ def parse_args() -> argparse.Namespace:
         help="ONNX Runtime execution provider (default: %(default)s).",
     )
     parser.add_argument(
+        "--ep",
+        choices=["default", "onnx-standard", "cuda", "webgpu", "trt-rtx"],
+        default="default",
+        help="Generate ep specific graphs",
+    )
+    parser.add_argument(
         "--compare-hf",
         action="store_true",
         help=(
@@ -878,7 +898,12 @@ def main() -> int:
     # ------------------------------------------------------------------
     load_weights = not args.no_weights
     print(f"Building ONNX models from {args.model_id!r} (dtype={args.dtype}) ...")
-    pkg = build(args.model_id, dtype=args.dtype, load_weights=load_weights)
+    pkg = build(
+        args.model_id,
+        dtype=args.dtype,
+        load_weights=load_weights,
+        execution_provider=args.ep,
+    )
     config = pkg.config
     print(f"Package components: {list(pkg.keys())}")
     print(
@@ -903,7 +928,9 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
     vision_session = OnnxModelSession(pkg["vision"], device=args.device)
-    audio_session = OnnxModelSession(pkg["audio"], device=args.device) if "audio" in pkg else None
+    audio_session = (
+        OnnxModelSession(pkg["audio"], device=args.device) if "audio" in pkg else None
+    )
     embedding_session = OnnxModelSession(pkg["embedding"], device=args.device)
     decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
 
@@ -945,9 +972,15 @@ def main() -> int:
         )
 
     max_tokens = args.max_new_tokens
-    modes = ["text", "vision", "audio", "vision-audio"] if args.mode == "all" else [args.mode]
+    modes = (
+        ["text", "vision", "audio", "vision-audio"]
+        if args.mode == "all"
+        else [args.mode]
+    )
 
-    text_prompt = args.prompt or "Explain the theory of general relativity in simple terms."
+    text_prompt = (
+        args.prompt or "Explain the theory of general relativity in simple terms."
+    )
     vision_prompt = args.prompt or "Describe what you see in this image in detail."
 
     # Collect ONNX outputs for optional --compare-hf side-by-side display
