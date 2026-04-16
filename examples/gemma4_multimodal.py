@@ -932,13 +932,16 @@ def parse_args() -> argparse.Namespace:
         "--device",
         choices=["cpu", "cuda", "webgpu"],
         default="cpu",
-        help="ONNX Runtime execution provider (default: %(default)s).",
+        help="Device for inference (default: %(default)s).",
     )
     parser.add_argument(
         "--ep",
-        choices=["default", "onnx-standard", "cuda", "webgpu", "trt-rtx"],
-        default="default",
-        help="Generate EP-specific graphs.",
+        choices=["cpu", "cuda", "webgpu", "onnx-standard", "trt-rtx"],
+        default=None,
+        help=(
+            "Execution provider for ONNX model build. "
+            "Defaults to matching --device."
+        ),
     )
     parser.add_argument(
         "--compare-hf",
@@ -962,12 +965,13 @@ def main() -> int:
     # and returns a ModelPackage containing all sub-models.
     # ------------------------------------------------------------------
     load_weights = not args.no_weights
-    print(f"Building ONNX models from {args.model_id!r} (dtype={args.dtype}) ...")
+    ep = args.ep or args.device
+    print(f"Building ONNX models from {args.model_id!r} (dtype={args.dtype}, ep={ep}) ...")
     pkg = build(
         args.model_id,
         dtype=args.dtype,
         load_weights=load_weights,
-        execution_provider=args.ep,
+        execution_provider=ep,
     )
     config = pkg.config
     print(f"Package components: {list(pkg.keys())}")
