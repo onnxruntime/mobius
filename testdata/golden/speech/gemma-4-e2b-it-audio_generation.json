@@ -1,0 +1,19 @@
+{
+  "model_id": "google/gemma-4-E2B-it",
+  "prompt": "Transcribe this audio.",
+  "generated_tokens": [
+    9366,
+    2847,
+    506,
+    9855,
+    611,
+    1093,
+    1133,
+    786,
+    531,
+    226476,
+    236761,
+    106
+  ],
+  "generated_text": "Please provide the audio you would like me to transcribe."
+}

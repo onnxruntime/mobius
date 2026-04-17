@@ -465,6 +465,89 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
         )
 
 
+def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a speech-language model (Gemma4 audio).
+
+    Similar to vision-language but with audio inputs.  Uses the multimodal
+    pipeline (``AutoProcessor`` + ``AutoModelForImageTextToText``).
+    """
+    import librosa
+    import torch
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+    from mobius._testing.torch_reference import load_torch_multimodal_model
+
+    model, _tokenizer, processor = load_torch_multimodal_model(case.model_id, device=device)
+
+    # Load audio
+    audio_path = Path("testdata") / case.audio[0]
+    audio_array, _sample_rate = librosa.load(str(audio_path), sr=16000)
+
+    # Build chat-formatted prompt with audio placeholder
+    prompt_text = case.prompts[0]
+    if hasattr(processor, "apply_chat_template"):
+        content: list[dict[str, str]] = [
+            {"type": "audio", "audio": str(audio_path)},
+            {"type": "text", "text": prompt_text},
+        ]
+        messages = [{"role": "user", "content": content}]
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    processed = processor(
+        text=prompt_text,
+        audios=[audio_array],
+        return_tensors="pt",
+    ).to(device)
+
+    # L4: single forward pass
+    with torch.no_grad():
+        outputs = model(**processed)
+
+    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+    input_ids_np = processed["input_ids"].cpu().numpy()
+
+    # L5: greedy generation
+    generated_ids = None
+    if "L5" in case.level:
+        with torch.no_grad():
+            gen = model.generate(
+                **processed,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 50),
+                do_sample=False,
+            )
+        input_len = processed["input_ids"].shape[1]
+        generated_ids = gen[0, input_len:].cpu().numpy()
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids_np,
+    )
+
+    if generated_ids is not None:
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else None
+        generated_text = (
+            tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
+            if tokenizer is not None
+            else None
+        )
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0],
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
+
+
 def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for audio feature extraction (Wav2Vec2 etc.).
 
@@ -565,6 +648,7 @@ _GENERATORS = {
     "image-text-to-text": _generate_vision_language,
     "image-classification": _generate_image_classification,
     "speech-to-text": _generate_speech_to_text,
+    "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
 }
 
