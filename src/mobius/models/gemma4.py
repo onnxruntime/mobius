@@ -1268,9 +1268,8 @@ class Gemma4TextModel(nn.Module):
         # to avoid ORT CUDA Gather int32 overflow (onnxruntime#28107).
         per_layer_results: list[ir.Value] = []
         for i in range(self._num_layers):
-            # Slice proj along axis 2 for this layer: [B, S, 1, D] → [B, S, D]
-            idx = op.Constant(value_ints=[i])
-            proj_i = op.Squeeze(op.Gather(proj, idx, axis=2), [2])
+            # Slice proj along axis 2 for this layer: [B, S, L, D] → [B, S, D]
+            proj_i = op.Squeeze(op.Slice(proj, starts=[i], ends=[i + 1], axes=[2]), [2])
 
             if masked_ids is not None:
                 token_emb_i = self.embed_tokens_per_layer[i](op, masked_ids)
