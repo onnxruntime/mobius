@@ -12,6 +12,9 @@ Run::
     pytest tests/e2e_golden_test.py -k "qwen2_5-0_5b"    # by model
     pytest tests/e2e_golden_test.py -m golden              # L4 only
     pytest tests/e2e_golden_test.py -m generation          # L5 only
+
+    # Run on CUDA GPU:
+    MOBIUS_TEST_DEVICE=cuda pytest tests/e2e_golden_test.py -v
 """
 
 from __future__ import annotations
@@ -43,6 +46,75 @@ from mobius._testing.parity import ParityResult, compare_golden
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+
+
+def _get_test_device_kwargs() -> dict[str, str]:
+    """Return OnnxModelSession kwargs from environment variables.
+
+    Set ``MOBIUS_TEST_DEVICE`` to ``cuda`` to run on GPU.
+    Set ``MOBIUS_TEST_EP`` to override the execution provider
+    (e.g. ``CUDAExecutionProvider``).
+    """
+    kwargs: dict[str, str] = {}
+    device = os.environ.get("MOBIUS_TEST_DEVICE", "").lower()
+    if device:
+        kwargs["device"] = device
+    ep = os.environ.get("MOBIUS_TEST_EP", "")
+    if ep:
+        kwargs["providers"] = ep
+    return kwargs
+
+
+def _make_empty_kv_cache(
+    session: OnnxModelSession,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Create empty KV cache feeds using the ORT session's declared shapes.
+
+    Uses the model's own shape declarations so that per-layer dimension
+    variations (e.g. KV sharing in Gemma4) are handled correctly.
+    The sequence/time dimension is set to 0.
+    """
+    feeds: dict[str, np.ndarray] = {}
+    # Fallback values from config
+    default_kv_heads = getattr(config, "num_key_value_heads", 1)
+    default_head_dim = getattr(config, "head_dim", 64)
+    layer_types = getattr(config, "layer_types", None) or []
+
+    for name in session.input_names:
+        if not name.startswith("past_key_values."):
+            continue
+        shape = session.get_input_shape(name)
+        if shape is not None and len(shape) >= 2:
+            # Use declared shape; set dynamic/zero dims appropriately
+            parts = name.split(".")
+            layer_idx = int(parts[1]) if len(parts) >= 3 and parts[1].isdigit() else 0
+            ltype = (
+                layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
+            )
+            if ltype in ("linear_attention", "mamba", "mamba2"):
+                # Fixed-size recurrent state: replace symbolic dims with 1
+                static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
+            else:
+                # KV cache: use declared dims but seq=0
+                static = []
+                for i, d in enumerate(shape):
+                    if isinstance(d, int) and d > 0:
+                        static.append(d)
+                    elif i == 0:
+                        static.append(1)  # batch
+                    elif i == 2:
+                        static.append(0)  # seq dim
+                    else:
+                        static.append(default_kv_heads if i == 1 else default_head_dim)
+            feeds[name] = np.zeros(static, dtype=np.float32)
+        else:
+            # Fallback: standard shape
+            feeds[name] = np.zeros(
+                (1, default_kv_heads, 0, default_head_dim),
+                dtype=np.float32,
+            )
+    return feeds
 
 
 @pytest.fixture(autouse=True)
@@ -146,12 +218,13 @@ def _open_decoder_session(pkg: ModelPackage) -> OnnxModelSession:
     which is the decoder component that produces logits.
     Seq2seq packages: uses the ``"decoder"`` key.
     """
+    device_kwargs = _get_test_device_kwargs()
     if len(pkg) == 1:
-        return OnnxModelSession(pkg)
+        return OnnxModelSession(pkg, **device_kwargs)
     if "model" in pkg:
-        return OnnxModelSession(pkg["model"])
+        return OnnxModelSession(pkg["model"], **device_kwargs)
     if "decoder" in pkg:
-        return OnnxModelSession(pkg["decoder"])
+        return OnnxModelSession(pkg["decoder"], **device_kwargs)
     raise KeyError(f"Cannot find decoder model in package. Keys: {sorted(pkg.keys())}")
 
 
@@ -170,7 +243,7 @@ def _run_seq2seq_prefill(
     seq_len = input_ids.shape[1]
 
     # Step 1: Run encoder
-    enc_session = OnnxModelSession(pkg["encoder"])
+    enc_session = OnnxModelSession(pkg["encoder"], **_get_test_device_kwargs())
     try:
         enc_feeds = {
             "input_ids": input_ids,
@@ -192,7 +265,7 @@ def _run_seq2seq_prefill(
         )
 
     # Step 2: Run decoder with encoder output + decoder start token
-    dec_session = OnnxModelSession(pkg["decoder"])
+    dec_session = OnnxModelSession(pkg["decoder"], **_get_test_device_kwargs())
     try:
         decoder_start_id = getattr(config, "decoder_start_token_id", 0) or 0
         dec_input_ids = np.array([[decoder_start_id]], dtype=np.int64)
@@ -511,13 +584,20 @@ def _run_vision_language_prefill(
     }
 
     # --- Step 1: Run vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"])
+    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
     try:
         vis_feeds: dict[str, np.ndarray] = {}
         for name in vis_session.input_names:
             if name in processed:
                 val = processed[name]
                 vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+            else:
+                # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
+                # vs ONNX "pixel_position_ids").
+                for hf_key, val in processed.items():
+                    if hf_key.replace("image_", "pixel_") == name:
+                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        break
         vis_out = vis_session.run(vis_feeds)
     finally:
         vis_session.close()
@@ -527,7 +607,7 @@ def _run_vision_language_prefill(
     vis_hidden = vis_out[vis_hidden_key]
 
     # --- Step 2: Run embedding model ---
-    emb_session = OnnxModelSession(pkg["embedding"])
+    emb_session = OnnxModelSession(pkg["embedding"], **_get_test_device_kwargs())
     try:
         emb_feeds: dict[str, np.ndarray] = {
             "input_ids": processed["input_ids"].astype(np.int64),
@@ -538,6 +618,11 @@ def _run_vision_language_prefill(
                 emb_feeds[name] = vis_out[name]
             elif name == "image_features":
                 emb_feeds[name] = vis_hidden
+            elif name not in emb_feeds:
+                # Provide empty tensor for unused modalities (e.g. audio_features)
+                shape = emb_session.get_input_shape(name) or []
+                static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
         emb_out = emb_session.run(emb_feeds)
     finally:
         emb_session.close()
@@ -549,11 +634,13 @@ def _run_vision_language_prefill(
     # --- Step 3: Run decoder ---
     # VL packages may use "model" or "decoder" for the text decoder.
     dec_key = "model" if "model" in pkg else "decoder"
-    dec_session = OnnxModelSession(pkg[dec_key])
+    dec_session = OnnxModelSession(pkg[dec_key], **_get_test_device_kwargs())
     try:
         seq_len = inputs_embeds.shape[1]
+        kv_cache = _make_empty_kv_cache(dec_session, config)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
+            **kv_cache,
         }
         # Pass through processor outputs that match decoder inputs
         # (e.g., attention_mask, position_ids with model-specific shapes)
@@ -577,13 +664,6 @@ def _run_vision_language_prefill(
                     )
                 else:
                     dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
-            elif name.startswith("past_key_values."):
-                num_kv_heads = getattr(config, "num_key_value_heads", 1)
-                head_dim = getattr(config, "head_dim", 64)
-                dec_feeds[name] = np.zeros(
-                    (1, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
@@ -689,11 +769,18 @@ def _run_vl_generation(
     }
 
     # --- Step 1: vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"])
+    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
     try:
-        vis_feeds: dict[str, np.ndarray] = {
-            name: processed[name] for name in vis_session.input_names if name in processed
-        }
+        vis_feeds: dict[str, np.ndarray] = {}
+        for name in vis_session.input_names:
+            if name in processed:
+                vis_feeds[name] = processed[name]
+            else:
+                # HF↔ONNX name mismatch (e.g. image_position_ids → pixel_position_ids)
+                for hf_key, val in processed.items():
+                    if hf_key.replace("image_", "pixel_") == name:
+                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        break
         vis_out = vis_session.run(vis_feeds)
     finally:
         vis_session.close()
@@ -703,12 +790,12 @@ def _run_vl_generation(
     # --- Step 2: embedding (prefill) ---
     # VL packages use "decoder" as the decoder key
     dec_key = "decoder" if "decoder" in pkg else "model"
-    dec_session = OnnxModelSession(pkg[dec_key])
-    emb_session = OnnxModelSession(pkg["embedding"])
+    dec_session = OnnxModelSession(pkg[dec_key], **_get_test_device_kwargs())
+    emb_session = OnnxModelSession(pkg["embedding"], **_get_test_device_kwargs())
 
     # Find the image features input name on the embedding model
     image_feat_input = next(
-        (n for n in emb_session.input_names if n != "input_ids"),
+        (n for n in emb_session.input_names if "image" in n),
         None,
     )
 
@@ -718,6 +805,12 @@ def _run_vl_generation(
         }
         if image_feat_input is not None:
             emb_feeds[image_feat_input] = vis_hidden
+        # Provide empty tensors for unused modalities (e.g. audio_features)
+        for name in emb_session.input_names:
+            if name not in emb_feeds:
+                shape = emb_session.get_input_shape(name) or []
+                static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
 
@@ -731,12 +824,15 @@ def _run_vl_generation(
         spatial_merge = getattr(config, "spatial_merge_size", 2)
 
         # --- Step 4: prefill decoder ---
-        past_cache = _make_vl_decoder_cache_feeds(dec_session, config)
+        past_cache = _make_empty_kv_cache(dec_session, config)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
             **past_cache,
         }
+        # Gemma4 decoder requires input_ids alongside inputs_embeds
+        if "input_ids" in dec_session.input_names:
+            dec_feeds["input_ids"] = processed["input_ids"].astype(np.int64)
         # Track the next decode position (may differ from token count for MRoPE
         # because image tokens consume fewer positions than tokens: image group
         # advances current_pos by max(H, W), not by num_image_tokens).
@@ -782,6 +878,12 @@ def _run_vl_generation(
             step_emb_feeds: dict[str, np.ndarray] = {"input_ids": next_token}
             if image_feat_input is not None:
                 step_emb_feeds[image_feat_input] = empty_image
+            # Provide empty tensors for other modalities
+            for name in emb_session.input_names:
+                if name not in step_emb_feeds:
+                    shape = emb_session.get_input_shape(name) or []
+                    static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
 
@@ -791,6 +893,9 @@ def _run_vl_generation(
                 "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
                 **past_cache,
             }
+            # Gemma4 decoder requires input_ids alongside inputs_embeds
+            if "input_ids" in dec_session.input_names:
+                step_feeds["input_ids"] = next_token
             if "position_ids" in dec_session.input_names:
                 if uses_mrope:
                     # Use the true MRoPE position (not the token count), since
@@ -814,6 +919,252 @@ def _run_vl_generation(
         emb_session.close()
 
     return np.concatenate(generated, axis=1)[0]  # [generated_len]
+
+
+# ---------------------------------------------------------------------------
+# Multimodal prefill helpers (speech-to-text, speech-language, text-only VL)
+# ---------------------------------------------------------------------------
+
+
+def _run_speech_to_text_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run encoder → decoder for speech-to-text models (e.g. Whisper).
+
+    Unlike seq2seq text models, the encoder takes ``input_features``
+    (mel spectrogram) rather than ``input_ids``.
+    """
+    import librosa
+    import transformers
+
+    # Load audio and extract features
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+    processed = processor(audio_array, sampling_rate=16000, return_tensors="np")
+
+    # Step 1: Run encoder
+    enc_session = OnnxModelSession(pkg["encoder"], **_get_test_device_kwargs())
+    try:
+        enc_feeds: dict[str, np.ndarray] = {}
+        for name in enc_session.input_names:
+            if name in processed:
+                enc_feeds[name] = processed[name].astype(np.float32)
+        enc_outputs = enc_session.run(enc_feeds)
+    finally:
+        enc_session.close()
+
+    enc_hidden = None
+    for key in ("encoder_hidden_states", "last_hidden_state"):
+        if key in enc_outputs:
+            enc_hidden = enc_outputs[key]
+            break
+    if enc_hidden is None:
+        raise KeyError(
+            f"Encoder output missing hidden states. Keys: {sorted(enc_outputs.keys())}"
+        )
+
+    # Step 2: Run decoder with encoder output + decoder start token
+    dec_session = OnnxModelSession(pkg["decoder"], **_get_test_device_kwargs())
+    try:
+        decoder_start_id = getattr(config, "decoder_start_token_id", 0) or 0
+        dec_input_ids = np.array([[decoder_start_id]], dtype=np.int64)
+
+        dec_feeds: dict[str, np.ndarray] = {
+            "encoder_hidden_states": enc_hidden,
+        }
+
+        # Map decoder inputs by name — whisper uses "decoder_input_ids"
+        for name in dec_session.input_names:
+            if name in dec_feeds:
+                continue
+            if name in ("input_ids", "decoder_input_ids"):
+                dec_feeds[name] = dec_input_ids
+            elif name == "encoder_attention_mask":
+                enc_seq_len = enc_hidden.shape[1]
+                dec_feeds[name] = np.ones((1, enc_seq_len), dtype=np.int64)
+            elif name == "position_ids":
+                dec_feeds[name] = np.zeros((1, 1), dtype=np.int64)
+            elif name.startswith("past_key_values."):
+                num_kv_heads = getattr(config, "num_key_value_heads", None) or getattr(
+                    config, "num_attention_heads", 1
+                )
+                head_dim = getattr(config, "head_dim", None) or (
+                    getattr(config, "d_model", 256)
+                    // getattr(config, "decoder_attention_heads", 1)
+                )
+                dec_feeds[name] = np.zeros(
+                    (1, num_kv_heads, 0, head_dim),
+                    dtype=np.float32,
+                )
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
+
+
+def _run_text_only_multimodel_prefill(
+    pkg: ModelPackage,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run embedding → decoder for text-only input on a multi-model package.
+
+    Multi-model packages (e.g. Gemma4 VL) require text to go through the
+    embedding model first since the decoder only accepts ``inputs_embeds``.
+    """
+    device_kwargs = _get_test_device_kwargs()
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Step 1: Run embedding with text-only input (no image/audio features)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+    try:
+        emb_feeds: dict[str, np.ndarray] = {"input_ids": input_ids}
+        # Provide empty features for any non-text inputs
+        for name in emb_session.input_names:
+            if name not in emb_feeds:
+                shape = emb_session.get_input_shape(name) or []
+                static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+        emb_out = emb_session.run(emb_feeds)
+    finally:
+        emb_session.close()
+
+    inputs_embeds = emb_out[next(iter(emb_out))]
+
+    # Step 2: Run decoder
+    dec_key = "model" if "model" in pkg else "decoder"
+    dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
+    try:
+        seq_len = inputs_embeds.shape[1]
+        kv_cache = _make_empty_kv_cache(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            **kv_cache,
+        }
+        for name in dec_session.input_names:
+            if name in dec_feeds:
+                continue
+            if name == "input_ids":
+                dec_feeds[name] = input_ids
+            elif name == "attention_mask":
+                dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
+            elif name == "position_ids":
+                dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
+
+
+def _run_speech_language_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run audio encoder → embedding → decoder for speech-language models.
+
+    The audio encoder produces audio features which are fed to the
+    embedding model along with input_ids, then the decoder runs on
+    inputs_embeds.
+    """
+    import librosa
+    import transformers
+
+    device_kwargs = _get_test_device_kwargs()
+
+    # Load audio and extract features
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+
+    # Use the feature extractor component for audio
+    fe = getattr(processor, "feature_extractor", processor)
+    audio_processed = fe(
+        [audio_array],
+        sampling_rate=16000,
+        return_tensors="np",
+        padding=False,
+    )
+
+    # Step 1: Run audio encoder
+    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
+    try:
+        audio_feeds: dict[str, np.ndarray] = {}
+        for name in audio_session.input_names:
+            if name in audio_processed:
+                audio_feeds[name] = audio_processed[name].astype(np.float32)
+            elif name == "input_features" and "input_features" in audio_processed:
+                audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
+        audio_out = audio_session.run(audio_feeds)
+    finally:
+        audio_session.close()
+
+    audio_hidden = audio_out[next(iter(audio_out))]
+    # Audio encoder output is [batch, seq, hidden]; embedding expects
+    # [num_tokens, hidden] (no batch dim).
+    if audio_hidden.ndim == 3:
+        audio_hidden = audio_hidden[0]  # squeeze batch
+
+    # Build input_ids from golden reference
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Step 2: Run embedding with input_ids + audio features
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+    try:
+        emb_feeds: dict[str, np.ndarray] = {"input_ids": input_ids}
+        for name in emb_session.input_names:
+            if name in emb_feeds:
+                continue
+            if name == "audio_features":
+                emb_feeds[name] = audio_hidden
+            elif name in audio_out:
+                emb_feeds[name] = audio_out[name]
+            else:
+                # Empty features for unused modalities (e.g. image)
+                shape = emb_session.get_input_shape(name) or []
+                static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+        emb_out = emb_session.run(emb_feeds)
+    finally:
+        emb_session.close()
+
+    inputs_embeds = emb_out[next(iter(emb_out))]
+
+    # Step 3: Run decoder
+    dec_key = "model" if "model" in pkg else "decoder"
+    dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
+    try:
+        seq_len = inputs_embeds.shape[1]
+        kv_cache = _make_empty_kv_cache(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            **kv_cache,
+        }
+        for name in dec_session.input_names:
+            if name in dec_feeds:
+                continue
+            if name == "input_ids":
+                dec_feeds[name] = input_ids
+            elif name == "attention_mask":
+                dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
+            elif name == "position_ids":
+                dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +1199,10 @@ class TestL4CheckpointVerified:
         # Seq2seq models require running encoder → decoder
         if case.task_type == "seq2seq":
             outputs = _run_seq2seq_prefill(pkg, golden, config)
+        elif case.task_type == "speech-to-text":
+            outputs = _run_speech_to_text_prefill(pkg, case, golden, config)
+        elif case.task_type == "speech-language":
+            outputs = _run_speech_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-text-to-text":
             outputs = _run_vision_language_prefill(pkg, case, config)
         elif case.task_type == "image-classification":
@@ -864,6 +1219,9 @@ class TestL4CheckpointVerified:
                 outputs = session.run(feeds)
             finally:
                 session.close()
+        elif len(pkg) > 1 and "embedding" in pkg:
+            # Multi-model text-generation (e.g. Gemma4 VL text-only)
+            outputs = _run_text_only_multimodel_prefill(pkg, golden, config)
         else:
             session = _open_decoder_session(pkg)
             try:
@@ -1020,17 +1378,23 @@ class TestL5GenerationE2E:
             "cannot determine KV cache dimensions for generation"
         )
 
-        new_tokens = (
-            _run_vl_generation(
+        if case.task_type == "image-text-to-text":
+            new_tokens = _run_vl_generation(
                 pkg,
                 case,
                 config,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
-            if case.task_type == "image-text-to-text"
-            else _run_causal_lm_generation(pkg, case, golden)
-        )
+        elif len(pkg) > 1 and "embedding" in pkg:
+            # Multi-model text-generation (e.g. Gemma4) — L5 generation
+            # requires embedding → decoder loop, not yet implemented.
+            pytest.skip(
+                f"L5 generation for multi-model text-generation "
+                f"not yet implemented ({case.case_id})"
+            )
+        else:
+            new_tokens = _run_causal_lm_generation(pkg, case, golden)
 
         # --- Diagnostics ---
         expected_tokens = np.array(expected_token_ids, dtype=np.int64)
