@@ -1,4 +1,4 @@
-model_id: "Qwen/Qwen3-ASR"
+model_id: "Qwen/Qwen3-ASR-0.6B"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"
@@ -13,5 +13,5 @@ generation:
 
 level: "L4+L5"
 
-skip_reason: "Requires audio preprocessing pipeline not yet supported in test harness."
+skip_reason: "Qwen3-ASR model_type not in installed transformers; needs trust_remote_code or newer HF."
 notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."
