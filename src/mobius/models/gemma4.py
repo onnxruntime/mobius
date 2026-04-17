@@ -1826,7 +1826,13 @@ class Gemma4Model(nn.Module):
                     renamed["decoder." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
-                    renamed["decoder.model." + suffix] = value
+                    onnx_key = "decoder.model." + suffix
+                    if suffix == "embed_tokens_per_layer.weight":
+                        # Shard if the Embedding was built with sharding
+                        emb = self.decoder.model.embed_tokens_per_layer
+                        renamed.update(emb.shard_weight_dict(onnx_key, value))
+                    else:
+                        renamed[onnx_key] = value
                     if suffix == "embed_tokens.weight":
                         # Token embedding is shared with the embedding sub-model
                         renamed["embedding.embed_tokens.weight"] = value

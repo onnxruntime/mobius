@@ -10,7 +10,6 @@ dtypes transparently.
 from __future__ import annotations
 
 import logging
-import math
 import tempfile
 from pathlib import Path
 
@@ -28,12 +27,6 @@ logger = logging.getLogger(__name__)
 # loaded after lowering the declared import — the op semantics have
 # not changed, only the version label.
 _MAX_EP_OPSET = 23
-
-# ORT ≤1.24.x CUDA Gather kernel uses int32 for element offset
-# computation (CUDA_LONG = int32_t).  Tensors with >2^31 elements
-# cause integer overflow → cudaErrorIllegalAddress.
-# See: https://github.com/microsoft/onnxruntime/issues/28107
-_MAX_GATHER_ELEMENTS = 2**31 - 1
 
 
 def _should_lower_opset(model: ir.Model, device: str) -> bool:
@@ -64,217 +57,6 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
         if node.domain == "" and node.op_type in opset_24_only_ops:
             return False
     return True
-
-
-def _split_large_gathers(model: ir.Model) -> None:
-    """Split Gather ops whose data tensor exceeds the CUDA int32 limit.
-
-    ORT ≤1.24.x CUDA Gather kernel uses ``int32_t`` for element offset
-    computation.  When ``row_index * row_stride + col_offset`` exceeds
-    ``INT32_MAX``, the kernel produces an illegal memory access
-    (cudaError 700).  This affects any rank-2 initializer-backed
-    embedding table with more than ~2.15 billion elements.
-
-    This transform shards the data tensor along axis 0 into chunks
-    that each stay under the int32 limit, then routes indices to the
-    correct shard using ``Less`` / ``Where`` / ``Sub`` ops and merges
-    the results.
-
-    The model is mutated **in-place**.  Only axis-0 Gather on rank-2
-    initializers is handled — other cases are left untouched.
-
-    See: https://github.com/microsoft/onnxruntime/issues/28107
-    """
-    graph = model.graph
-    nodes_to_replace: list[ir.Node] = []
-
-    for node in graph:
-        if node.op_type != "Gather" or node.domain not in ("", None):
-            continue
-        axis = node.attributes.get("axis")
-        axis_val = axis.as_int() if axis is not None else 0
-        if axis_val != 0:
-            continue
-        data_val = node.inputs[0]
-        if data_val is None or data_val.shape is None or len(data_val.shape) != 2:
-            continue
-        rows, cols = data_val.shape
-        if not isinstance(rows, int) or not isinstance(cols, int):
-            continue
-        if rows * cols <= _MAX_GATHER_ELEMENTS:
-            continue
-        # Only handle initializer-backed data (embedding weights)
-        if data_val.const_value is None:
-            continue
-        nodes_to_replace.append(node)
-
-    if not nodes_to_replace:
-        return
-
-    for node in nodes_to_replace:
-        data_val = node.inputs[0]
-        indices_val = node.inputs[1]
-        output_val = node.outputs[0]
-        rows, cols = data_val.shape  # type: ignore[misc]
-
-        # Determine number of shards so each has ≤ _MAX_GATHER_ELEMENTS
-        max_rows_per_shard = _MAX_GATHER_ELEMENTS // cols
-        num_shards = math.ceil(rows / max_rows_per_shard)
-        shard_size = math.ceil(rows / num_shards)
-
-        logger.info(
-            "Splitting Gather %r: data [%d, %d] (%s elems) into %d shards of ≤%d rows each",
-            node.name,
-            rows,
-            cols,
-            f"{rows * cols:,}",
-            num_shards,
-            shard_size,
-        )
-
-        # Shard the initializer data along axis 0
-        weight_np = data_val.const_value.numpy()
-        shard_values: list[ir.Value] = []
-        boundaries: list[int] = []
-        for i in range(num_shards):
-            start = i * shard_size
-            end = min(start + shard_size, rows)
-            boundaries.append(start)
-            shard_np = weight_np[start:end]
-            shard_tensor = ir.Tensor(shard_np, name=f"{data_val.name}_shard{i}")
-            shard_val = ir.Value(
-                name=f"{data_val.name}_shard{i}",
-                type=ir.TensorType(data_val.dtype),
-                shape=ir.Shape(shard_np.shape),
-                const_value=shard_tensor,
-            )
-            graph.register_initializer(shard_val)
-            shard_values.append(shard_val)
-
-        # Build routing subgraph:
-        # For each shard i with boundary[i]:
-        #   is_shard_i = (boundary[i] <= indices) & (indices < boundary[i+1])
-        #   local_idx = indices - boundary[i]
-        #   shard_result = Gather(shard_data, local_idx)
-        # Final result = nested Where(is_shard_0, shard_0_result, Where(...))
-
-        idx_dtype = indices_val.dtype if indices_val.dtype is not None else ir.DataType.INT64
-
-        # Start from the last shard and work backwards with Where
-        result: ir.Value | None = None
-        for i in reversed(range(num_shards)):
-            boundary = boundaries[i]
-
-            # local_idx = indices - boundary (or just indices for shard 0)
-            if boundary == 0:
-                local_idx = indices_val
-            else:
-                boundary_const = _make_scalar_constant(
-                    graph,
-                    boundary,
-                    idx_dtype,
-                    f"{node.name}_boundary{i}",
-                )
-                sub_node = ir.Node(
-                    "",
-                    "Sub",
-                    inputs=[indices_val, boundary_const],
-                    num_outputs=1,
-                    name=f"{node.name}_sub_shard{i}",
-                )
-                graph.append(sub_node)
-                local_idx = sub_node.outputs[0]
-
-            # Gather from this shard
-            gather_node = ir.Node(
-                "",
-                "Gather",
-                inputs=[shard_values[i], local_idx],
-                attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
-                num_outputs=1,
-                name=f"{node.name}_gather_shard{i}",
-            )
-            graph.append(gather_node)
-            shard_result = gather_node.outputs[0]
-
-            if result is None:
-                # Last shard — this is the fallback
-                result = shard_result
-            else:
-                # is_this_shard = indices < boundary[i+1]
-                next_boundary = boundaries[i + 1]
-                bound_const = _make_scalar_constant(
-                    graph,
-                    next_boundary,
-                    idx_dtype,
-                    f"{node.name}_bound{i}",
-                )
-                less_node = ir.Node(
-                    "",
-                    "Less",
-                    inputs=[indices_val, bound_const],
-                    num_outputs=1,
-                    name=f"{node.name}_less_shard{i}",
-                )
-                graph.append(less_node)
-                cond = less_node.outputs[0]
-
-                # Unsqueeze condition for broadcasting: [B, S] → [B, S, 1]
-                neg_one = _make_scalar_constant(
-                    graph,
-                    -1,
-                    ir.DataType.INT64,
-                    f"{node.name}_neg1_shard{i}",
-                )
-                unsq_node = ir.Node(
-                    "",
-                    "Unsqueeze",
-                    inputs=[cond, neg_one],
-                    num_outputs=1,
-                    name=f"{node.name}_unsq_shard{i}",
-                )
-                graph.append(unsq_node)
-
-                where_node = ir.Node(
-                    "",
-                    "Where",
-                    inputs=[unsq_node.outputs[0], shard_result, result],
-                    num_outputs=1,
-                    name=f"{node.name}_where_shard{i}",
-                )
-                graph.append(where_node)
-                result = where_node.outputs[0]
-
-        # Replace all uses of the original Gather output
-        assert result is not None
-        output_val.replace_all_uses_with(result)
-        graph.remove(node, safe=True)
-
-    logger.info("Split %d large Gather node(s)", len(nodes_to_replace))
-
-
-def _make_scalar_constant(
-    graph: ir.Graph,
-    value: int,
-    dtype: ir.DataType,
-    name: str,
-) -> ir.Value:
-    """Create a scalar constant value and register it as an initializer."""
-    if dtype == ir.DataType.INT64:
-        np_val = np.array(value, dtype=np.int64)
-    elif dtype == ir.DataType.INT32:
-        np_val = np.array(value, dtype=np.int32)
-    else:
-        np_val = np.array(value, dtype=np.int64)
-    tensor = ir.Tensor(np_val, name=name)
-    val = ir.Value(
-        name=name,
-        type=ir.TensorType(dtype),
-        shape=ir.Shape(np_val.shape),
-        const_value=tensor,
-    )
-    graph.register_initializer(val)
-    return val
 
 
 class OnnxModelSession:
@@ -321,12 +103,6 @@ class OnnxModelSession:
                 device,
             )
             model.opset_imports[""] = _MAX_EP_OPSET
-
-        # Workaround: ORT ≤1.24.x CUDA Gather kernel uses int32 for
-        # element offset computation.  Split oversized Gather ops so
-        # each shard stays under INT32_MAX elements.
-        if device == "cuda":
-            _split_large_gathers(model)
 
         self._tmpdir = tempfile.TemporaryDirectory()
         self._model_path = str(Path(self._tmpdir.name) / "model.onnx")
