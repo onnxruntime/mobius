@@ -1,10 +1,11 @@
 ---
 name: debugging-vl-pipeline
 description: >
-  How to debug vision-language (VL) model output issues in mobius.
-  Covers the systematic pipeline isolation methodology, common failure modes,
-  stage-by-stage comparison with HuggingFace, and numerical tolerance
-  expectations. Use this skill when ORT GenAI multimodal output is wrong,
+  How to debug vision-language (VL) and multimodal (vision + audio) model
+  output issues in mobius.  Covers the systematic pipeline isolation
+  methodology, common failure modes, stage-by-stage comparison with
+  HuggingFace, numerical tolerance expectations, and CUDA EP-specific
+  issues. Use this skill when ORT GenAI multimodal output is wrong,
   garbled, or doesn't match HuggingFace.
 ---
 
@@ -18,6 +19,8 @@ Use this skill when:
 - ONNX model logits diverge significantly from HuggingFace
 - The model generates text-only descriptions ignoring the image
 - Image features appear correct but decoder output is wrong
+- Audio transcription is garbled or wrong despite correct encoder output
+- CUDA EP crashes or produces different results than CPU
 
 ## Debugging methodology: isolate each stage
 
@@ -433,6 +436,88 @@ spatial_merge_size = getattr(vc, "spatial_merge_size", 2)
 temporal_patch_size = getattr(vc, "temporal_patch_size", 2)
 ```
 
+### 6. ClippableLinear divergence (Gemma4)
+
+**Symptoms:** Vision or audio encoder output has large max diff (> 1.0)
+against HuggingFace, even though weights are loaded correctly.
+
+**Root cause:** Gemma4 uses `Gemma4ClippableLinear` with learned finite
+input/output activation clamping for ALL linear layers in its vision and
+audio encoders. Using plain `Linear` misses the clamping.
+
+**Detection:** Check if the HuggingFace model uses `ClippableLinear`:
+```bash
+grep -n "ClippableLinear" transformers/models/<model>/modeling_<model>.py
+```
+
+**Fix:** Use `ClippableLinear` (from `mobius.components`) for all
+affected linear layers. For vision attention: q/k/v/o_proj. For MLP:
+pass `linear_class=ClippableLinear` to the MLP component.
+
+**Impact:**
+- Audio: max diff 52.68 → 0.0003 after fix
+- Vision: max diff 3.92 → 0.00007 after fix
+
+### 7. Missing audio boundary markers
+
+**Symptoms:** Audio transcription is garbled or completely wrong, even
+though the audio encoder output matches HuggingFace.
+
+**Root cause:** HuggingFace wraps audio placeholder tokens with boundary
+markers in `input_ids`:
+```
+<|audio> (256000) + N × <|audio|> (258881) + <audio|> (258883)
+```
+If boundary markers are missing, the model cannot distinguish audio
+regions from text, producing wrong output.
+
+**Fix:** Add boundary markers to `build_input_ids()` when constructing
+audio inputs, matching HuggingFace's token wrapping.
+
+### 8. CUDA EP: ORT Gather int32 overflow
+
+**Symptoms:** CUDA EP crashes or produces incorrect results for models
+with large embedding tables. CPU EP works correctly.
+
+**Root cause:** ORT CUDA `gather_impl.cu` uses `int32` for element
+offset computation: `input_index = idx * cols + col_offset`. For
+tensors with > 2^31 elements (e.g. Gemma4 per-layer embedding
+[262144, 8960] = 2.35B elements), this overflows.
+
+**ORT bug:** microsoft/onnxruntime#28107
+
+**Workaround:** Split large embeddings into smaller tables via
+`nn.ModuleList` so each individual Gather stays under the int32 limit.
+Use Slice instead of Gather for column-wise indexing on large tensors.
+
+### 9. CUDA EP: opset 24 kernel registration
+
+**Symptoms:** ORT CUDA EP fails to find kernels for standard ops
+(Squeeze, Reshape, etc.) even though they work on CPU.
+
+**Root cause:** ORT ≤1.24.x CUDA/TRT EPs don't register kernels for
+opset 24, even though the op semantics are unchanged from opset 23.
+
+**Fix:** Use the `ort_lower_opset_for_ep` feature flag (enabled by
+default) which lowers the declared opset import from 24 to 23 for
+non-CPU EPs. See `src/mobius/_flags.py` and
+`src/mobius/_testing/ort_inference.py`.
+
+### 10. Wrong audio feature extractor
+
+**Symptoms:** Audio model produces completely wrong output. Audio
+encoder features don't match HuggingFace at all.
+
+**Root cause:** Using `WhisperFeatureExtractor` instead of the
+model-specific feature extractor (e.g. `Gemma4AudioFeatureExtractor`).
+Different extractors produce different mel spectrograms.
+
+**Fix:** Always use the correct feature extractor for the model:
+```python
+from transformers import AutoFeatureExtractor
+feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
+```
+
 ## Reference files
 
 - **Integration tests:** `tests/integration_test.py`
@@ -440,7 +525,9 @@ temporal_patch_size = getattr(vc, "temporal_patch_size", 2)
 - **ORT GenAI tests:** `tests/ort_genai_test.py`
   (`TestOrtGenaiQwen25VL.test_multimodal_image_generation`)
 - **Example scripts:** `examples/qwen25_vl_ort_genai.py`,
-  `examples/qwen3_vl_ort_genai.py`
+  `examples/qwen3_vl_ort_genai.py`, `examples/gemma4_multimodal.py`
 - **genai_config reference:** `.github/skills/ort-genai-config/SKILL.md`
 - **ORT GenAI position_ids code (external):**
   `onnxruntime-genai/src/models/position_inputs.cpp:617-814`
+- **Feature flags:** `src/mobius/_flags.py`
+  (`ort_lower_opset_for_ep`, `ort_cuda_grouped_rmsnorm_workaround`)

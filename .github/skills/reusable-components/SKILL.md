@@ -28,6 +28,7 @@ components/
 ├── _attention.py          # Multi-head / GQA attention with KV cache; Qwen35Attention (gated GQA)
 ├── _audio.py              # ConformerEncoder (NeMo subsampling, T5 bias, Conformer layers)
 ├── _common.py             # Embedding, Linear, LayerNorm, LayerNormNoAffine, GroupNorm, create_attention_bias
+├── _gemma4_audio.py       # Gemma4 audio encoder: ClippableLinear, ConvSubsampling, SlidingWindowAttention
 ├── _conv.py               # Conv2d (2D convolution with bias and groups)
 ├── _decoder.py            # DecoderLayer (pre-norm residual block)
 ├── _encoder.py            # BertEmbeddings, EncoderAttention, EncoderLayer
@@ -333,6 +334,42 @@ module with a `forward()` method.  For functional use, call
 Linear(in_features, out_features, bias=False)
 # Uses MatMul (+ optional Add for bias)
 ```
+
+### ClippableLinear
+
+```python
+ClippableLinear(in_features, out_features, bias=False)
+# Linear with learned input/output activation clamping
+# Matches HuggingFace Gemma4ClippableLinear
+```
+
+Wraps a standard `Linear` with 4 learned scalar parameters:
+`input_min`, `input_max`, `output_min`, `output_max`.  Inputs are clamped
+before the linear projection and outputs are clamped after:
+
+```python
+x = Clip(x, input_min, input_max)
+x = MatMul(x, weight.T) [+ bias]
+x = Clip(x, output_min, output_max)
+```
+
+**Critical:** HuggingFace `Gemma4ClippableLinear` stores *finite* learned
+bounds (not ±inf).  Using plain `Linear` instead of `ClippableLinear` causes
+large numerical divergence in Gemma4 vision and audio encoders:
+
+- Audio encoder: max diff 52.68 → 0.0003 after fix
+- Vision encoder: max diff 3.92 → 0.00007 after fix
+
+The component is exported from the public API: `from mobius.components
+import ClippableLinear`.
+
+**Weight mapping:** HF stores `<prefix>.linear.weight` for the actual
+weight (the `.linear.` segment is stripped by `preprocess_weights`), and
+`<prefix>.input_min`, `<prefix>.input_max`, `<prefix>.output_min`,
+`<prefix>.output_max` as direct scalar buffers.
+
+The MLP component accepts a `linear_class` parameter, so you can pass
+`linear_class=ClippableLinear` to use it for all projections in the MLP.
 
 ### Embedding
 

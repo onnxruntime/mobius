@@ -87,6 +87,14 @@ before the PR is merged.
       `testdata/golden/<cat>/<model>_generation.json`
 - [ ] `python -m pytest tests/e2e_golden_test.py -m generation -k "<model>"` passes
 
+> **Speech-language models:** The golden generation script supports the
+> `speech-language` task type for models that process audio inputs (e.g.,
+> Gemma4). The `_generate_speech_language()` function in
+> `scripts/generate_golden.py` handles audio feature extraction and input
+> construction for these models. Ensure the correct feature extractor
+> (e.g. `Gemma4AudioFeatureExtractor`, not `WhisperFeatureExtractor`) is
+> auto-detected via `AutoFeatureExtractor.from_pretrained()`.
+
 > **Why L4/L5 matter:** Graph-build tests (L1) only verify ONNX graph
 > construction; they never execute the graph with real data.  A MatMul shape
 > mismatch that crashes at runtime, a wrong normalisation type, or a missing
@@ -112,6 +120,15 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 - [ ] `mobius build --model <hf-model-id> /tmp/out` completes without error
 - [ ] Output directory contains the expected ONNX files and `genai_config.json`
+
+### 8a. Multi-EP correctness (CUDA)
+
+- [ ] Model runs correctly with `--ep cuda` (or `--device cuda`)
+- [ ] CUDA results match CPU results (compare generation output)
+- [ ] No crashes from large tensor operations (see ORT Gather int32
+      overflow: microsoft/onnxruntime#28107)
+- [ ] `ort_lower_opset_for_ep` flag handles opset 24→23 lowering for
+      CUDA EP (enabled by default in `src/mobius/_flags.py`)
 
 ### 9. ORT GenAI runtime
 
