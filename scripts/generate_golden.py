@@ -465,45 +465,55 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
         )
 
 
-def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> None:
-    """Generate golden data for a speech-language model (Gemma4 audio).
+def _try_register_qwen3_asr() -> None:
+    """Register Qwen3-ASR config with transformers if available.
 
-    Similar to vision-language but with audio inputs.  Uses the multimodal
-    pipeline (``AutoProcessor`` + ``AutoModelForImageTextToText``).
+    The ``qwen_asr`` pip package provides the config and model classes
+    but does not auto-register with transformers' ``AutoConfig``.  We
+    do that here so ``AutoConfig.from_pretrained`` can load the config
+    from HuggingFace without ``auto_map`` in the repo.
+    """
+    try:
+        from qwen_asr.core.transformers_backend.configuration_qwen3_asr import (
+            Qwen3ASRConfig,
+        )
+        from transformers import AutoConfig
+
+        # register() is a no-op if already registered.
+        AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+    except ImportError:
+        pass
+
+
+def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a speech-language model.
+
+    Supports two architectures:
+
+    * **Gemma4-style**: Uses ``AutoModelForImageTextToText`` with a
+      multimodal processor that combines text prompts and audio.
+    * **Qwen3-ASR-style**: Uses the ``qwen_asr`` package with its own
+      processor and chat template (``trust_remote_code`` required).
+
+    The model type is auto-detected from the HuggingFace config.
     """
     import librosa
     import torch
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
-    from mobius._testing.torch_reference import load_torch_multimodal_model
 
-    model, _tokenizer, processor = load_torch_multimodal_model(case.model_id, device=device)
-
-    # Load audio
     audio_path = Path("testdata") / case.audio[0]
     audio_array, _sample_rate = librosa.load(str(audio_path), sr=16000)
 
-    # Build chat-formatted prompt with audio placeholder
-    prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = [
-            {"type": "audio", "audio": str(audio_path)},
-            {"type": "text", "text": prompt_text},
-        ]
-        messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    model, processor, forward_model = _load_speech_language_model(case, device)
 
-    processed = processor(
-        text=prompt_text,
-        audio=[audio_array],
-        return_tensors="pt",
-    ).to(device)
+    processed, prompt_for_golden = _prepare_speech_language_inputs(
+        case, model, processor, audio_array, audio_path, device
+    )
 
     # L4: single forward pass
     with torch.no_grad():
-        outputs = model(**processed)
+        outputs = forward_model(**processed)
 
     last_logits = outputs.logits[0, -1, :].cpu().numpy()
     golden = _extract_logits_golden(last_logits)
@@ -519,7 +529,8 @@ def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> N
                 do_sample=False,
             )
         input_len = processed["input_ids"].shape[1]
-        generated_ids = gen[0, input_len:].cpu().numpy()
+        gen_seq = gen.sequences if hasattr(gen, "sequences") else gen
+        generated_ids = gen_seq[0, input_len:].cpu().numpy()
 
     save_golden_ref(
         json_path,
@@ -532,20 +543,122 @@ def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> N
     )
 
     if generated_ids is not None:
-        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else None
-        generated_text = (
-            tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
-            if tokenizer is not None
-            else None
-        )
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        generated_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True)
         gen_path = json_path.with_name(json_path.stem + "_generation.json")
         save_generation_json(
             gen_path,
             model_id=case.model_id,
-            prompt=case.prompts[0],
+            prompt=prompt_for_golden,
             generated_tokens=generated_ids.tolist(),
             generated_text=generated_text,
         )
+
+
+def _load_speech_language_model(case: TestCase, device: str) -> tuple:
+    """Load a speech-language model and processor.
+
+    Returns ``(model, processor, forward_model)`` where
+    *forward_model* is the module whose ``forward()`` produces logits
+    (may differ from *model* for nested architectures like Qwen3-ASR).
+    """
+    import torch
+    import transformers
+
+    # Try to register qwen3_asr classes before loading config,
+    # since the HF repo lacks auto_map and trust_remote_code alone
+    # won't resolve it.
+    _try_register_qwen3_asr()
+
+    config = transformers.AutoConfig.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    model_type = getattr(config, "model_type", "")
+
+    if model_type == "qwen3_asr":
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            case.model_id, torch_dtype=torch.float32
+        )
+        model = model.to(device).eval()
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        # Qwen3-ASR wraps a thinker; the thinker produces logits.
+        forward_model = model.thinker
+    else:
+        # Gemma4-style: AutoModelForImageTextToText
+        from mobius._testing.torch_reference import (
+            load_torch_multimodal_model,
+        )
+
+        model, _tokenizer, processor = load_torch_multimodal_model(
+            case.model_id, device=device
+        )
+        forward_model = model
+
+    return model, processor, forward_model
+
+
+def _prepare_speech_language_inputs(
+    case: TestCase,
+    model: object,
+    processor: object,
+    audio_array: np.ndarray,
+    audio_path: Path,
+    device: str,
+) -> tuple:
+    """Build model inputs and a prompt string for the golden file.
+
+    Returns ``(processed, prompt_for_golden)`` where *processed* is a
+    dict/BatchEncoding ready for ``model(**processed)`` and
+    *prompt_for_golden* is the string saved in the generation JSON.
+    """
+    # Detect Qwen3-ASR by processor class name (avoids redundant
+    # config download).
+    is_qwen3_asr = "Qwen3ASR" in type(processor).__name__
+
+    if is_qwen3_asr:
+        # Qwen3-ASR prompt: system + user with audio placeholder
+        messages = [
+            {"role": "system", "content": ""},
+            {
+                "role": "user",
+                "content": [{"type": "audio", "audio": ""}],
+            },
+        ]
+        text_prompt = processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        processed = processor(
+            text=text_prompt,
+            audio=[audio_array],
+            return_tensors="pt",
+        ).to(device)
+        prompt_for_golden = str(audio_path)
+    else:
+        # Gemma4-style: text prompt + audio
+        prompt_text = case.prompts[0]
+        if hasattr(processor, "apply_chat_template"):
+            content: list[dict[str, str]] = [
+                {"type": "audio", "audio": str(audio_path)},
+                {"type": "text", "text": prompt_text},
+            ]
+            messages = [{"role": "user", "content": content}]
+            prompt_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        processed = processor(
+            text=prompt_text,
+            audio=[audio_array],
+            return_tensors="pt",
+        ).to(device)
+        prompt_for_golden = case.prompts[0]
+
+    return processed, prompt_for_golden
 
 
 def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: str) -> None:
