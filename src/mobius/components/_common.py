@@ -3,27 +3,13 @@
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING
-
 import numpy as np
 import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._flags import flags
-
-if TYPE_CHECKING:
-    import torch
-
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
-
-# ORT ≤1.24.x CUDA Gather kernel uses int32 for element offset
-# computation (CUDA_LONG = int32_t).  Tensors with >2^31 elements
-# cause integer overflow → cudaErrorIllegalAddress.
-# See: https://github.com/microsoft/onnxruntime/issues/28107
-_MAX_GATHER_ELEMENTS = 2**31 - 1
 
 
 class Linear(nn.Module):
@@ -52,13 +38,7 @@ class Linear(nn.Module):
 
 
 class Embedding(nn.Module):
-    """Embedding layer using ONNX Gather op.
-
-    When :attr:`~mobius._flags._Flags.ort_shard_large_gathers` is enabled
-    and the embedding table exceeds ~2.1B elements, creates sharded weight
-    parameters and emits a sharded Gather subgraph to work around the ORT
-    CUDA int32 overflow (onnxruntime#28107).
-    """
+    """Embedding layer using ONNX Gather op."""
 
     def __init__(
         self,
@@ -67,95 +47,11 @@ class Embedding(nn.Module):
         padding_idx: int | None = None,
     ):
         super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
+        self.weight = nn.Parameter([num_embeddings, embedding_dim])
         self.padding_idx = padding_idx
 
-        total_elements = num_embeddings * embedding_dim
-        if flags.ort_shard_large_gathers and total_elements > _MAX_GATHER_ELEMENTS:
-            max_rows = _MAX_GATHER_ELEMENTS // embedding_dim
-            self._num_shards = math.ceil(num_embeddings / max_rows)
-            self._shard_size = math.ceil(num_embeddings / self._num_shards)
-
-            self.weight = None  # type: ignore[assignment]
-            for i in range(self._num_shards):
-                start = i * self._shard_size
-                end = min(start + self._shard_size, num_embeddings)
-                setattr(self, f"weight_shard{i}", nn.Parameter([end - start, embedding_dim]))
-        else:
-            self._num_shards = 0
-            self._shard_size = 0
-            self.weight = nn.Parameter([num_embeddings, embedding_dim])
-
     def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
-        if self._num_shards == 0:
-            return op.Gather(self.weight, input_ids)
-        return self._sharded_gather(op, input_ids)
-
-    def _sharded_gather(self, op: builder.OpBuilder, input_ids: ir.Value):
-        """Emit a sharded Gather that avoids int32 offset overflow.
-
-        Splits the embedding lookup across N shards.  Routes indices to
-        the correct shard using ``Less`` / ``Where`` / ``Sub`` ops.
-        """
-        # Build routing: nested Where from the last shard backwards
-        boundaries = [i * self._shard_size for i in range(self._num_shards)]
-        result: ir.Value | None = None
-
-        for i in reversed(range(self._num_shards)):
-            boundary = boundaries[i]
-            shard_weight = getattr(self, f"weight_shard{i}")
-
-            # local_idx = input_ids - boundary
-            if boundary == 0:
-                local_idx = input_ids
-            else:
-                local_idx = op.Sub(input_ids, op.Constant(value_int=boundary))
-
-            shard_result = op.Gather(shard_weight, local_idx)
-
-            if result is None:
-                # Last shard is the fallback
-                result = shard_result
-            else:
-                # cond = input_ids < boundary[i+1]
-                next_boundary = boundaries[i + 1]
-                cond = op.Less(input_ids, op.Constant(value_int=next_boundary))
-                # Unsqueeze for broadcasting: e.g. [B, S] → [B, S, 1]
-                cond = op.Unsqueeze(cond, op.Constant(value_int=-1))
-                result = op.Where(cond, shard_result, result)
-
-        assert result is not None
-        return result
-
-    def shard_weight_dict(
-        self, original_key: str, tensor: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Split an embedding weight tensor into shard key/tensor pairs.
-
-        Call this from ``preprocess_weights`` to map the single HF embedding
-        weight into the per-shard parameter names expected by the ONNX model.
-
-        Args:
-            original_key: The ONNX parameter name for the unsplit weight
-                (e.g. ``"decoder.model.embed_tokens_per_layer.weight"``).
-            tensor: The full embedding weight tensor [V, D].
-
-        Returns:
-            Dict mapping shard keys to sliced tensors.  If sharding is
-            inactive, returns ``{original_key: tensor}`` unchanged.
-        """
-        if self._num_shards == 0:
-            return {original_key: tensor}
-
-        # Replace ".weight" suffix with ".weight_shardN"
-        prefix = original_key.rsplit(".weight", 1)[0]
-        result: dict[str, torch.Tensor] = {}
-        for i in range(self._num_shards):
-            start = i * self._shard_size
-            end = min(start + self._shard_size, self.num_embeddings)
-            result[f"{prefix}.weight_shard{i}"] = tensor[start:end]
-        return result
+        return op.Gather(self.weight, input_ids)
 
 
 class LayerNorm(nn.Module):

@@ -84,11 +84,6 @@ class _Flags:
          - ``True``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT ≤1.24.x workaround).
-       * - ``ort_shard_large_gathers``
-         - ``MOBIUS_ORT_SHARD_LARGE_GATHERS``
-         - ``True``
-         - Shard large Embedding Gather ops to avoid ORT CUDA int32
-           overflow (ORT ≤1.24.x workaround).
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -119,22 +114,6 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
     opset 24 kernel support.
-    """
-
-    ort_shard_large_gathers: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_ORT_SHARD_LARGE_GATHERS", True)
-    )
-    """Shard large Embedding Gather ops to avoid ORT CUDA int32 overflow.
-
-    ORT ≤1.24.x CUDA Gather kernel uses int32 for element offset
-    computation.  Embedding tables with more than ~2.1 billion elements
-    (e.g. Gemma4 ``embed_tokens_per_layer`` [262144, 8960] = 2.35B)
-    cause integer overflow → illegal memory access on CUDA.
-
-    When enabled, the :class:`~mobius.components.Embedding` component
-    emits a sharded Gather subgraph that keeps each shard under the
-    int32 limit.  Set ``MOBIUS_ORT_SHARD_LARGE_GATHERS=0`` to disable
-    once ORT fixes the kernel (see onnxruntime#28107).
     """
 
 
