@@ -805,7 +805,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
-    "qwen3_asr": "Qwen/Qwen3-ASR-2B-Instruct",
+    "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
