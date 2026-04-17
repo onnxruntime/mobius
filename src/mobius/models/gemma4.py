@@ -37,6 +37,7 @@ from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
+    ClippableLinear,
     Linear,
     RMSNorm,
     create_attention_bias,
@@ -113,10 +114,10 @@ class Gemma4VisionSelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -286,13 +287,15 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
+        # Vision encoder uses ClippableLinear for all projections.
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
-            )
+            ),
+            linear_class=ClippableLinear,
         )
 
     def forward(

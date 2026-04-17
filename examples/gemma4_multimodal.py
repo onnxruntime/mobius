@@ -100,6 +100,8 @@ IMAGE_OPEN_TOKEN_ID = 255999  # <|image>   — opening boundary marker before im
 IMAGE_CLOSE_TOKEN_ID = 258882  # <image|>   — closing boundary marker after image tokens
 # AUDIO_TOKEN_ID: placeholder inserted N times (once per audio frame) in input_ids
 AUDIO_TOKEN_ID = 258881  # <|audio|>  — confirmed from google/gemma-4-E2B-it HF config
+AUDIO_OPEN_TOKEN_ID = 256000  # <|audio>   — opening boundary marker before audio tokens
+AUDIO_CLOSE_TOKEN_ID = 258883  # <audio|>   — closing boundary marker after audio tokens
 EOS_TOKEN_IDS = {1, 106}  # <eos> (1) and <turn|> (106, end-of-turn marker)
 
 # Gemma 4 SigLIP vision encoder: default output length from vc.default_output_length.
@@ -306,7 +308,12 @@ def build_input_ids(
         close_marker = np.array([[IMAGE_CLOSE_TOKEN_ID]], dtype=np.int64)
         modality_parts.extend([open_marker, soft_tokens, close_marker])
     if num_audio_tokens > 0:
-        modality_parts.append(np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64))
+        # Wrap audio soft tokens with boundary markers, matching HF processor layout:
+        # <|audio>(256000) + Nx<|audio|>(258881) + <audio|>(258883)
+        audio_open = np.array([[AUDIO_OPEN_TOKEN_ID]], dtype=np.int64)
+        audio_soft = np.full((1, num_audio_tokens), AUDIO_TOKEN_ID, dtype=np.int64)
+        audio_close = np.array([[AUDIO_CLOSE_TOKEN_ID]], dtype=np.int64)
+        modality_parts.extend([audio_open, audio_soft, audio_close])
     modality_ids = np.concatenate(modality_parts, axis=1)
 
     # Find insertion point: right after the user header "<|turn>user\n"
