@@ -15,5 +15,5 @@ generation:
   max_new_tokens: 50
   do_sample: false
 
-skip_reason: "Gated repo (google/gemma-4-E4B-it requires authentication)."
+skip_reason: "Large model, requires significant compute."
 notes: "Gemma 4 E4B audio input. 4-model split: decoder + vision + audio + embedding. Gemma4AudioEncoder with ClippableLinear layers."

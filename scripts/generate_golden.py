@@ -497,7 +497,7 @@ def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> N
 
     processed = processor(
         text=prompt_text,
-        audios=[audio_array],
+        audio=[audio_array],
         return_tensors="pt",
     ).to(device)
 
