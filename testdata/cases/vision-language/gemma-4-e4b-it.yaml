@@ -1,0 +1,19 @@
+model_id: "google/gemma-4-E4B-it"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+skip_reason: "Gated repo (google/gemma-4-E4B-it requires authentication)."
+notes: "Gemma 4 E4B Vision-Language. 3-model split: decoder + vision + embedding. Pre-patchified vision input (pixel_values [B,N,3P^2] + pixel_position_ids). Audio encoder also present."
