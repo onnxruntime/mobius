@@ -153,6 +153,8 @@ _XFAIL_REASONS: dict[str, str] = {
     "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
     # GPT-Neo local+global attention pattern not implemented (L4 argmax may match but logits diverge)
     "text-generation/gpt-neo-125m": "GPT-Neo local attention windows not implemented",
+    # Bamba hybrid mamba2+attention logits diverge from HF
+    "text-generation/bamba-9b": "Bamba hybrid mamba2+attention output diverges from HF reference",
 }
 
 

@@ -319,7 +319,10 @@ class _GPT2TextModel(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # OpenAI-GPT (post_norm) has no final layer norm — each decoder
+        # layer already applies post-attention and post-MLP norms.
+        if not post_norm:
+            self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

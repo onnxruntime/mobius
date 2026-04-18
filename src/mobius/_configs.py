@@ -944,6 +944,7 @@ class ArchitectureConfig(BaseModelConfig):
                                     in (
                                         "gpt2",
                                         "gpt_bigcode",
+                                        "openai-gpt",
                                         "phi",
                                         "bloom",
                                         "qwen2",
@@ -974,6 +975,7 @@ class ArchitectureConfig(BaseModelConfig):
                                     "gpt2",
                                     "gpt_bigcode",
                                     "gpt_neo",
+                                    "openai-gpt",
                                     "phi",
                                     "bloom",
                                 ),
@@ -1013,6 +1015,7 @@ class ArchitectureConfig(BaseModelConfig):
                             "gpt_bigcode",
                             "gpt_neox",
                             "gpt_neox_japanese",
+                            "openai-gpt",
                             "phi",
                         ),
                     ),
@@ -1079,6 +1082,8 @@ class ArchitectureConfig(BaseModelConfig):
             image_size=_as_int(getattr(config, "image_size", 224)),
             patch_size=_as_int(getattr(config, "patch_size", 16)),
             num_channels=getattr(config, "num_channels", 3),
+            # OpenAI-GPT uses post-norm (no final LayerNorm); GPT-2 uses pre-norm.
+            post_norm=model_type == "openai-gpt",
             # Granite scaling multipliers
             embedding_multiplier=getattr(config, "embedding_multiplier", 1.0),
             attention_multiplier=getattr(config, "attention_multiplier", None),
