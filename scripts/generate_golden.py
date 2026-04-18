@@ -482,6 +482,8 @@ def _try_register_qwen3_asr() -> None:
         # register() is a no-op if already registered.
         AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
     except ImportError:
+        # Optional dependency is not installed; skip registration and
+        # let speech-language generation proceed via other supported paths.
         pass
 
 
