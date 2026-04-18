@@ -73,10 +73,7 @@ class OnnxGenerator:
                 for suffix in suffixes:
                     name = f"past_key_values.{i}.{suffix}"
                     shape = self.session.get_input_shape(name) or []
-                    static = [
-                        d if isinstance(d, int) and d > 0 else 1
-                        for d in shape
-                    ]
+                    static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
                     past_kv[name] = np.zeros(static, dtype=np.float32)
             else:
                 past_kv[f"past_key_values.{i}.key"] = np.zeros(

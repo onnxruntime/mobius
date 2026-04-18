@@ -19,9 +19,8 @@ from mobius.components import (
 from mobius.models.base import CausalLMModel, Linear
 
 if TYPE_CHECKING:
-    import torch
-
     import onnx_ir as ir
+    import torch
 
 
 class GraniteTextModel(nn.Module):
