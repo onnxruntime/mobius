@@ -943,6 +943,8 @@ class ArchitectureConfig(BaseModelConfig):
                                     model_type
                                     in (
                                         "gpt2",
+                                        "gpt_bigcode",
+                                        "phi",
                                         "bloom",
                                         "qwen2",
                                         "qwen2_5_vl_text",
@@ -967,7 +969,14 @@ class ArchitectureConfig(BaseModelConfig):
                             getattr(
                                 config,
                                 "use_bias",
-                                model_type in ("gpt2", "bloom"),
+                                model_type
+                                in (
+                                    "gpt2",
+                                    "gpt_bigcode",
+                                    "gpt_neo",
+                                    "phi",
+                                    "bloom",
+                                ),
                             ),
                         ),
                     ),
@@ -995,7 +1004,18 @@ class ArchitectureConfig(BaseModelConfig):
                 getattr(
                     config,
                     "use_mlp_bias",
-                    getattr(config, "use_bias", False),
+                    getattr(
+                        config,
+                        "use_bias",
+                        model_type
+                        in (
+                            "gpt_neo",
+                            "gpt_bigcode",
+                            "gpt_neox",
+                            "gpt_neox_japanese",
+                            "phi",
+                        ),
+                    ),
                 )
             ),
             rope=rope_config,
