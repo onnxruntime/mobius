@@ -61,7 +61,7 @@ def _get_test_device_kwargs() -> dict[str, str]:
         kwargs["device"] = device
     ep = os.environ.get("MOBIUS_TEST_EP", "")
     if ep:
-        kwargs["providers"] = ep
+        kwargs["providers"] = [ep]
     return kwargs
 
 
@@ -1088,8 +1088,14 @@ def _run_speech_language_prefill(
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
 
-    # Use the feature extractor component for audio
-    fe = getattr(processor, "feature_extractor", processor)
+    # Use the feature extractor component for audio.
+    # For Qwen3-ASR, AutoProcessor returns a tokenizer (not the
+    # full Qwen3ASRProcessor) because the HF repo lacks auto_map.
+    # Fall back to WhisperFeatureExtractor which is what Qwen3-ASR
+    # actually uses under the hood.
+    fe = getattr(processor, "feature_extractor", None)
+    if fe is None or not hasattr(fe, "sampling_rate"):
+        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
     audio_processed = fe(
         [audio_array],
         sampling_rate=16000,
@@ -1098,7 +1104,8 @@ def _run_speech_language_prefill(
     )
 
     # Step 1: Run audio encoder
-    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
+    audio_key = "audio" if "audio" in pkg else "audio_encoder"
+    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
@@ -1118,6 +1125,33 @@ def _run_speech_language_prefill(
 
     # Build input_ids from golden reference
     input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Adjust audio placeholder count to match encoder output.
+    # The HF processor may generate a different number of audio tokens
+    # than the ONNX encoder actually produces.  Re-build input_ids so
+    # the placeholder count matches the encoder output exactly.
+    num_encoder_tokens = audio_hidden.shape[0]
+    audio_token_id = getattr(config, "audio_token_id", None)
+    if audio_token_id is None:
+        thinker_cfg = getattr(config, "thinker_config", None)
+        if thinker_cfg is not None:
+            audio_token_id = getattr(thinker_cfg, "audio_token_id", None)
+    if audio_token_id is not None:
+        flat = input_ids[0].tolist()
+        num_placeholders = flat.count(audio_token_id)
+        if num_placeholders != num_encoder_tokens:
+            # Replace existing placeholders with correct count
+            new_ids: list[int] = []
+            replaced = False
+            for tok in flat:
+                if tok == audio_token_id:
+                    if not replaced:
+                        new_ids.extend([audio_token_id] * num_encoder_tokens)
+                        replaced = True
+                    # Skip remaining old placeholders
+                else:
+                    new_ids.append(tok)
+            input_ids = np.array(new_ids, dtype=np.int64).reshape(1, -1)
 
     # Step 2: Run embedding with input_ids + audio features
     emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
@@ -1159,7 +1193,13 @@ def _run_speech_language_prefill(
             elif name == "attention_mask":
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
             elif name == "position_ids":
-                dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+                pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+                # MRoPE models expect 3D position_ids: (dims, batch, seq)
+                pos_shape = dec_session.get_input_shape(name)
+                if pos_shape and len(pos_shape) == 3:
+                    ndims = pos_shape[0] if isinstance(pos_shape[0], int) else 3
+                    pos = np.tile(pos, (ndims, 1, 1))
+                dec_feeds[name] = pos
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
