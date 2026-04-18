@@ -19,7 +19,13 @@ from mobius._configs import (
 
 
 def _fake_hf_config(model_type: str, **overrides):
-    """Create a minimal HF-config-like object for testing."""
+    """Create a minimal HF-config-like object for testing.
+
+    ``rope_parameters`` is present by default so the resolver treats the
+    fake config as a RoPE-capable model (matching how real HuggingFace
+    configs populate this field in ``PretrainedConfig.__post_init__``).
+    Pass ``rope_parameters=None`` explicitly to exercise the NoPE path.
+    """
     defaults = {
         "model_type": model_type,
         "vocab_size": 100,
@@ -35,6 +41,7 @@ def _fake_hf_config(model_type: str, **overrides):
         "rms_norm_eps": 1e-6,
         "rope_theta": 10_000.0,
         "rope_scaling": None,
+        "rope_parameters": {"rope_type": "default"},
     }
     defaults.update(overrides)
     return type("FakeHFConfig", (), defaults)()
@@ -141,6 +148,9 @@ class TestConfigFromHfGemma:
         hf = _fake_hf_config(
             "gemma3_text",
             rope_theta=None,  # force fallback to nested lookup
+            # Disable the default rope_parameters so the nested
+            # rope_scaling entries are used for rope_type resolution.
+            rope_parameters=None,
             rope_scaling={
                 "full_attention": {
                     "rope_type": "linear",
@@ -280,6 +290,10 @@ class TestDeepSeekMLA:
             rms_norm_eps=1e-6,
             rope_theta=10000.0,
             rope_scaling=None,
+            # Real HF DeepSeek configs populate rope_parameters in
+            # __post_init__; include it here so _extract_rope_config
+            # treats this as a RoPE-capable model (not NoPE).
+            rope_parameters={"rope_type": "default"},
             # MLA-specific fields
             q_lora_rank=1536,
             kv_lora_rank=512,

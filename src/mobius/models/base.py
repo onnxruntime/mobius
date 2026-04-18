@@ -141,7 +141,15 @@ class TextModel(nn.Module):
             # in Attention.forward() (which checks `if position_embeddings is not None`).
             position_embeddings = None
         else:
-            position_embeddings = self.rotary_emb(op, position_ids)
+            # NoPE models (e.g. NemotronH, GraniteMoeHybrid) have
+            # ``rotary_emb = None`` because ``initialize_rope`` returned
+            # ``None`` for ``config.rope_type is None``. Skip building
+            # position_embeddings so that Attention.forward sees
+            # ``position_embeddings=None`` and does not apply rotary encoding.
+            if self.rotary_emb is not None:
+                position_embeddings = self.rotary_emb(op, position_ids)
+            else:
+                position_embeddings = None
 
             # When attention_mask is None (static cache mode), skip mask
             # creation entirely — the Attention op uses is_causal=1 instead.

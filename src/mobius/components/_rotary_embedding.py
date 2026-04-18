@@ -517,12 +517,24 @@ class InterleavedMRope(_MRopeBase):
         super().__init__(config, h_mask, w_mask)
 
 
-def initialize_rope(config: ArchitectureConfig) -> nn.Module:
-    """Factory function to create the appropriate RoPE variant."""
+def initialize_rope(config: ArchitectureConfig) -> nn.Module | None:
+    """Factory function to create the appropriate RoPE variant.
+
+    Returns ``None`` when the model does not use RoPE at all — detected by
+    the absence of both ``config.mrope_section`` (multimodal RoPE signal)
+    and ``config.rope_type`` (standard RoPE signal).
+    :meth:`ArchitectureConfig.from_transformers` populates ``rope_type`` as
+    ``None`` when the source HuggingFace config has no ``rope_parameters`` /
+    ``rope_scaling`` / legacy rotary fields. Callers (e.g. :class:`TextModel`)
+    must handle the ``None`` return by passing ``position_embeddings=None``
+    to every attention layer.
+    """
     if config.mrope_section is not None:
         if config.mrope_interleaved:
             return InterleavedMRope(config)
         return ChunkedMRope(config)
+    if config.rope_type is None:
+        return None
     if config.rope_type == "default":
         return DefaultRope(config)
     if config.rope_type == "proportional":

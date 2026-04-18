@@ -281,14 +281,42 @@ def _first_not_none(*values, default=None):
     return default
 
 
-def _extract_rope_config(config) -> RoPEConfig:
+def _extract_rope_config(config) -> RoPEConfig | None:
     """Extract and normalize RoPE-related config fields.
 
     Reads ``rope_scaling``, ``rope_parameters``, and related attributes
     from a HuggingFace config and returns a :class:`RoPEConfig`.
+
+    Returns ``None`` when the source config has no RoPE signal at all —
+    i.e. it declares neither the modern ``rope_parameters``/``rope_scaling``
+    fields nor the legacy ``rotary_dim``/``rotary_pct``/``rotary_emb_base``
+    fields. This is the "NoPE" case (e.g. NemotronH, GraniteMoeHybrid,
+    GPT-2 family, BERT family, OPT) — the model does not use rotary
+    position embeddings at all, and callers should treat RoPE as absent
+    rather than manufacturing defaults that would silently introduce RoPE
+    operations into the ONNX graph.
+
+    Note: ``rope_theta`` alone is NOT a sufficient RoPE signal because
+    models like NemotronH carry ``rope_theta`` in their config as dead
+    data despite not using RoPE. HuggingFace's ``rope_parameters`` field
+    (populated by ``PretrainedConfig.__post_init__``) is the authoritative
+    modern signal; legacy GPT-J / GPT-NeoX / CodeGen models predate it
+    and use the ``rotary_*`` fields instead.
     """
-    rope_scaling = getattr(config, "rope_scaling", None) or {}
-    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    # Check for RoPE signals BEFORE the `or {}` fallback below —
+    # `or {}` converts None to empty dict, destroying the absence signal.
+    raw_rope_scaling = getattr(config, "rope_scaling", None)
+    raw_rope_parameters = getattr(config, "rope_parameters", None)
+    has_legacy_rope = (
+        getattr(config, "rotary_dim", None) is not None
+        or getattr(config, "rotary_pct", None) is not None
+        or getattr(config, "rotary_emb_base", None) is not None
+    )
+    if raw_rope_scaling is None and raw_rope_parameters is None and not has_legacy_rope:
+        return None
+
+    rope_scaling = raw_rope_scaling or {}
+    rope_parameters = raw_rope_parameters or {}
 
     return RoPEConfig(
         rope_type=_first_not_none(
@@ -711,11 +739,27 @@ class ArchitectureConfig(BaseModelConfig):
 
     rms_norm_eps: float = 1e-6
 
-    # Rotary embedding config
-    rope_type: str = "default"
-    rope_theta: float = 10_000.0
+    # Rotary embedding config.
+    #
+    # ``rope_type`` is the structural signal: ``None`` means "this model
+    # does not use RoPE". ``from_transformers`` populates ``rope_type``
+    # (and the other flat RoPE fields below) from the HuggingFace config
+    # only when RoPE is actually declared — see :func:`_extract_rope_config`.
+    # For NoPE models (NemotronH, GraniteMoeHybrid, GPT-2 family, BERT, OPT,
+    # ...) ``from_transformers`` sets every flat RoPE field to ``None`` so
+    # downstream code (``initialize_rope``, ``TextModel``, ``Attention``) can
+    # structurally detect the absence of RoPE instead of spuriously applying
+    # a "default" rotary encoding.
+    #
+    # The non-``rope_type`` fields keep inert numeric defaults at the
+    # dataclass level so that code that constructs ``ArchitectureConfig``
+    # directly with just ``rope_type="default"`` (e.g. tests, small reproducer
+    # configs) works without having to spell out every RoPE parameter. These
+    # defaults are only consumed when ``rope_type`` is non-``None``.
+    rope_type: str | None = None
+    rope_theta: float | None = 10_000.0
     rope_scaling: dict | None = None
-    partial_rotary_factor: float = 1.0
+    partial_rotary_factor: float | None = 1.0
     rope_local_base_freq: float | None = None
     original_max_position_embeddings: int | None = None
 
@@ -860,14 +904,18 @@ class ArchitectureConfig(BaseModelConfig):
             or 0
         )
 
-        # rope_interleave depends on model_type / qk_rope_head_dim
+        # rope_interleave depends on model_type / qk_rope_head_dim.
+        # Only compute it when RoPE is actually in use — for NoPE models
+        # (rope_config is None) we leave the flat ``rope_interleave`` at
+        # its inert ``False`` default.
         rope_interleave = getattr(
             config,
             "rope_interleave",
             (getattr(config, "qk_rope_head_dim", None) or 0) > 0
             or model_type in ("glm", "glm4", "glm4_moe", "chatglm"),
         )
-        rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)
+        if rope_config is not None:
+            rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)
 
         options = dict(
             head_dim=(
@@ -980,14 +1028,26 @@ class ArchitectureConfig(BaseModelConfig):
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(getattr(config, "use_mlp_bias", False)),
             rope=rope_config,
-            # Set flat rope fields for direct access by components
-            rope_type=rope_config.rope_type,
-            rope_theta=rope_config.rope_theta,
-            rope_scaling=rope_config.rope_scaling,
-            partial_rotary_factor=rope_config.partial_rotary_factor,
-            rope_local_base_freq=rope_config.rope_local_base_freq,
-            original_max_position_embeddings=rope_config.original_max_position_embeddings,
-            rope_interleave=rope_config.rope_interleave,
+            # Flat rope field copies: ``None`` for NoPE models so that
+            # ``initialize_rope`` / ``TextModel`` / ``Attention`` can detect
+            # "this model has no RoPE" structurally.
+            rope_type=rope_config.rope_type if rope_config is not None else None,
+            rope_theta=rope_config.rope_theta if rope_config is not None else None,
+            rope_scaling=rope_config.rope_scaling if rope_config is not None else None,
+            partial_rotary_factor=(
+                rope_config.partial_rotary_factor if rope_config is not None else None
+            ),
+            rope_local_base_freq=(
+                rope_config.rope_local_base_freq if rope_config is not None else None
+            ),
+            original_max_position_embeddings=(
+                rope_config.original_max_position_embeddings
+                if rope_config is not None
+                else None
+            ),
+            rope_interleave=(
+                rope_config.rope_interleave if rope_config is not None else False
+            ),
             **mrope_fields,
             max_position_embeddings=getattr(config, "max_position_embeddings", 0),
             tie_word_embeddings=(
