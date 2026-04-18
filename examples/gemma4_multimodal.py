@@ -945,10 +945,7 @@ def parse_args() -> argparse.Namespace:
         "--ep",
         choices=["default", "cpu", "cuda", "webgpu", "onnx-standard", "trt-rtx"],
         default="default",
-        help=(
-            "Execution provider for ONNX model build. "
-            "Defaults to matching --device."
-        ),
+        help="Execution provider for ONNX model build.",
     )
     parser.add_argument(
         "--compare-hf",
