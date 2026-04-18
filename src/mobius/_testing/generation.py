@@ -58,16 +58,33 @@ class OnnxGenerator:
         num_layers = self.config.num_hidden_layers
         num_kv_heads = self.config.num_key_value_heads
         head_dim = self.config.head_dim
+        layer_types = self.config.layer_types or []
 
-        # Initialize empty past KV cache: [batch, num_kv_heads, 0, head_dim]
-        past_kv = {}
+        # Initialize empty past KV / recurrent state per layer
+        past_kv: dict[str, np.ndarray] = {}
         for i in range(num_layers):
-            past_kv[f"past_key_values.{i}.key"] = np.zeros(
-                (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
-            )
-            past_kv[f"past_key_values.{i}.value"] = np.zeros(
-                (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
-            )
+            ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+            if ltype in ("mamba", "mamba2", "linear_attention"):
+                # Recurrent states: use shapes declared by the ONNX model
+                if ltype == "linear_attention":
+                    suffixes = ("conv_state", "recurrent_state")
+                else:
+                    suffixes = ("conv_state", "ssm_state")
+                for suffix in suffixes:
+                    name = f"past_key_values.{i}.{suffix}"
+                    shape = self.session.get_input_shape(name) or []
+                    static = [
+                        d if isinstance(d, int) and d > 0 else 1
+                        for d in shape
+                    ]
+                    past_kv[name] = np.zeros(static, dtype=np.float32)
+            else:
+                past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                    (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+                )
+                past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                    (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+                )
 
         all_ids = input_ids.copy()
 
@@ -104,10 +121,22 @@ class OnnxGenerator:
             if eos_token_id is not None and np.all(next_token == eos_token_id):
                 break
 
-            # Update past KV from present outputs
+            # Update past KV / recurrent state from present outputs
             for i in range(num_layers):
-                past_kv[f"past_key_values.{i}.key"] = outputs[f"present.{i}.key"]
-                past_kv[f"past_key_values.{i}.value"] = outputs[f"present.{i}.value"]
+                ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+                if ltype in ("mamba", "mamba2", "linear_attention"):
+                    if ltype == "linear_attention":
+                        suffixes = ("conv_state", "recurrent_state")
+                    else:
+                        suffixes = ("conv_state", "ssm_state")
+                    for suffix in suffixes:
+                        src = f"present.{i}.{suffix}"
+                        dst = f"past_key_values.{i}.{suffix}"
+                        if src in outputs:
+                            past_kv[dst] = outputs[src]
+                else:
+                    past_kv[f"past_key_values.{i}.key"] = outputs[f"present.{i}.key"]
+                    past_kv[f"past_key_values.{i}.value"] = outputs[f"present.{i}.value"]
 
             # Next step: only the new token
             cur_input_ids = next_token.astype(np.int64)

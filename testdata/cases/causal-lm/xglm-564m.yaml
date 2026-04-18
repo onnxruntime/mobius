@@ -13,4 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 notes: "XGLM 564M. Multilingual GPT variant with sinusoidal position embeddings."

@@ -899,6 +899,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "activation_function", None)
                 or getattr(config, "dense_act_fn", None)
                 or getattr(config, "activation", None)
+                or getattr(config, "afn", None)
                 # Qwen v1 configs have no activation attr; default to silu
                 or ("silu" if model_type in ("qwen",) else None)
             ),
@@ -933,13 +934,21 @@ class ArchitectureConfig(BaseModelConfig):
                         getattr(
                             config,
                             "bias",
-                            model_type
-                            in (
-                                "gpt2",
-                                "bloom",
-                                "qwen2",
-                                "qwen2_5_vl_text",
-                                "qwen2_moe",
+                            getattr(
+                                config,
+                                "use_qkv_bias",
+                                getattr(
+                                    config,
+                                    "use_bias",
+                                    model_type
+                                    in (
+                                        "gpt2",
+                                        "bloom",
+                                        "qwen2",
+                                        "qwen2_5_vl_text",
+                                        "qwen2_moe",
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -955,7 +964,11 @@ class ArchitectureConfig(BaseModelConfig):
                         getattr(
                             config,
                             "bias",
-                            model_type in ("gpt2", "bloom"),
+                            getattr(
+                                config,
+                                "use_bias",
+                                model_type in ("gpt2", "bloom"),
+                            ),
                         ),
                     ),
                 )
@@ -978,7 +991,13 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "use_qk_norm", False)
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
-            mlp_bias=(getattr(config, "use_mlp_bias", False)),
+            mlp_bias=(
+                getattr(
+                    config,
+                    "use_mlp_bias",
+                    getattr(config, "use_bias", False),
+                )
+            ),
             rope=rope_config,
             # Set flat rope fields for direct access by components
             rope_type=rope_config.rope_type,

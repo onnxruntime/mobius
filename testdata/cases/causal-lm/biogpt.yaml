@@ -13,4 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 notes: "BioGPT 347M. Biomedical domain GPT-2 variant with standard causal attention."

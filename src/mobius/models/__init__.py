@@ -49,6 +49,7 @@ __all__ = [
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
     "GraniteCausalLMModel",
+    "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
@@ -160,7 +161,7 @@ from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.gptoss import GPTOSSCausalLMModel
-from mobius.models.granite import GraniteCausalLMModel
+from mobius.models.granite import GraniteCausalLMModel, GraniteMoECausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.hunyuan_v1 import HunYuanV1DenseCausalLMModel
