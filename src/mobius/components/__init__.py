@@ -36,6 +36,7 @@ __all__ = [
     "GatedRMSNorm",
     "Gemma3MultiModalProjector",
     "Gemma4AudioEncoder",
+    "ClippableLinear",
     "GroupNorm",
     "GQAContext",
     "INT64_MAX",
@@ -175,7 +176,7 @@ from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
-from mobius.components._gemma4_audio import Gemma4AudioEncoder
+from mobius.components._gemma4_audio import ClippableLinear, Gemma4AudioEncoder
 from mobius.components._lightning_attention import LightningAttention
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block, MambaBlock

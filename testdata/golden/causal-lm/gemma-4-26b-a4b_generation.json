@@ -1,0 +1,27 @@
+{
+  "model_id": "google/gemma-4-26B-A4B-it",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    563,
+    1041,
+    27355,
+    236787,
+    563,
+    1041,
+    27355,
+    236787,
+    563,
+    1041,
+    27355,
+    236787,
+    563,
+    1041,
+    27355,
+    236787,
+    563,
+    1041,
+    27355,
+    236787
+  ],
+  "generated_text": " is my poem: is my poem: is my poem: is my poem: is my poem:"
+}

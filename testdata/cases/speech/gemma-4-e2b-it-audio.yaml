@@ -1,8 +1,7 @@
-model_id: "Qwen/Qwen3-ASR-0.6B"
+model_id: "google/gemma-4-E2B-it"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"
-trust_remote_code: true
 
 inputs:
   prompts:
@@ -10,11 +9,10 @@ inputs:
   audio:
     - "652-129742-0006.flac"
 
+level: "L4+L5"
+
 generation:
   max_new_tokens: 50
   do_sample: false
 
-level: "L4+L5"
-
-skip_reason: ""
-notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."
+notes: "Gemma 4 E2B audio input. 4-model split: decoder + vision + audio + embedding. Gemma4AudioEncoder with ClippableLinear layers."

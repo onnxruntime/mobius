@@ -5,9 +5,10 @@ description: >
   embedding/projector, text decoder) matches HuggingFace output. Covers pipeline
   isolation methodology, common failure modes from real debugging experience,
   step-by-step debugging process, and integration test patterns. Applicable to
-  any multimodal model with similar architecture (Phi4MM, future audio+vision
-  models). Use this skill when multimodal ONNX model output diverges from
-  HuggingFace, or when adding a new multimodal model with multiple encoders.
+  any multimodal model with similar architecture (Phi4MM, Gemma4, future
+  audio+vision models). Use this skill when multimodal ONNX model output
+  diverges from HuggingFace, or when adding a new multimodal model with
+  multiple encoders.
 ---
 
 # Skill: Multimodal Component Parity Debugging
@@ -371,6 +372,46 @@ the actual sequence includes fused image/audio tokens, the lengths diverge.
 **Fix:** Always derive `seq_len` from `inputs_embeds.shape[1]` when the
 model uses inputs_embeds as input.
 
+### 8. ClippableLinear not used in encoder (Gemma4)
+
+**Symptoms:** Encoder output has large numerical divergence (max diff > 1.0)
+from HuggingFace, despite all weights loading correctly.
+
+**Root cause:** Some HuggingFace models (e.g. Gemma4) use
+`ClippableLinear` — a linear layer with learned finite input/output
+activation clipping — for ALL linear layers in their vision and audio
+encoders (attention q/k/v/o projections AND MLP gate/up/down projections).
+Using plain `Linear` misses the clamping and causes divergence.
+
+**Detection:** Check HF source for `ClippableLinear`:
+```bash
+grep -n "ClippableLinear" transformers/models/<model>/modeling_<model>.py
+```
+
+**Fix:** Use `ClippableLinear` from `mobius.components`:
+- For attention: use `ClippableLinear` for q/k/v/o_proj
+- For MLP: pass `linear_class=ClippableLinear` parameter
+
+**Impact (Gemma4):**
+- Audio: max diff 52.68 → 0.0003
+- Vision: max diff 3.92 → 0.00007
+
+### 9. Missing audio/image boundary tokens
+
+**Symptoms:** Audio transcription or vision description is garbled, but
+encoder output matches HuggingFace.
+
+**Root cause:** HuggingFace wraps modality placeholder tokens with
+boundary markers:
+- Image: `<|image>` (open) + N × `<|image|>` (pad) + `<image|>` (close)
+- Audio: `<|audio>` (open) + N × `<|audio|>` (pad) + `<audio|>` (close)
+
+Missing boundary markers prevent the model from correctly identifying
+modality regions in the input sequence.
+
+**Fix:** Ensure `build_input_ids` wraps placeholder tokens with the
+correct open/close marker token IDs.
+
 ## Step-by-step debugging process
 
 ### Phase 1: Text-only baseline
@@ -562,11 +603,16 @@ image_sizes = np.array([[384, 384]], dtype=np.int64)
 - **Integration tests:** `tests/phi4mm_integration_test.py`,
   `tests/integration_test.py`
 - **VL debugging skill:** `.github/skills/debugging-vl-pipeline/SKILL.md`
-- **Model implementation:** `src/mobius/models/phi.py`
-- **Audio components:** `src/mobius/components/_audio.py`
+- **Model implementation:** `src/mobius/models/phi.py`,
+  `src/mobius/models/gemma4.py`
+- **Audio components:** `src/mobius/components/_audio.py`,
+  `src/mobius/components/_gemma4_audio.py`
 - **Vision components:** `src/mobius/components/_vision.py`
+- **ClippableLinear:** `src/mobius/components/_gemma4_audio.py`
 - **LoRA component:** `src/mobius/components/_lora.py`
 - **Weight loading:** `src/mobius/_weight_loading.py`
+- **Feature flags:** `src/mobius/_flags.py`
 - **ORT GenAI config skill:** `.github/skills/ort-genai-config/SKILL.md`
 - **Weight name alignment skill:**
   `.github/skills/weight-name-alignment/SKILL.md`
+- **Gemma4 example:** `examples/gemma4_multimodal.py`

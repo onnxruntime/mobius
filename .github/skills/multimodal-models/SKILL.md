@@ -1,20 +1,21 @@
 ---
 name: multimodal-models
 description: >
-  How to add multimodal (vision + language) models to mobius.
+  How to add multimodal (vision + language + audio) models to mobius.
   Covers projector variants (Gemma3, MLP, Linear), the VisionModel encoder,
-  InputMixer, VisionLanguageTask, image token handling, and weight name
-  mappings. Use this skill when adding a model that processes both images and
-  text.
+  InputMixer, VisionLanguageTask, image/audio token handling, ClippableLinear,
+  and weight name mappings. Use this skill when adding a model that processes
+  images, audio, or both alongside text.
 ---
 
-# Skill: Multimodal (Vision + Language) Models
+# Skill: Multimodal (Vision + Language + Audio) Models
 
 ## When to use
 
 Use this skill when adding a model that processes both images and text — such
-as Gemma3, LLaVA, LLaVA-NeXT, Phi-3-Vision, PaliGemma, InternVL2, Pixtral,
-Idefics2/3, Molmo, Florence2, or Video-LLaVA.
+as Gemma3, Gemma4, LLaVA, LLaVA-NeXT, Phi-3-Vision, PaliGemma, InternVL2,
+Pixtral, Idefics2/3, Molmo, Florence2, or Video-LLaVA — or a model that
+also processes audio (e.g. Gemma4 with speech/audio inputs).
 
 ## Architecture overview
 
@@ -389,6 +390,90 @@ Uses `InterleavedMRope` (not `ChunkedMRope`) with:
 The vision pipeline is completely shared with Qwen3-VL — only the text
 decoder differs (hybrid DeltaNet + full attention). This means vision
 encoder bugs/fixes apply to both models equally.
+
+## Gemma4: vision + audio multimodal
+
+Gemma4 models (E2B, E4B, 26B-A4B, 31B) support **both vision and audio**
+inputs. The architecture has 4 sub-models: decoder, vision encoder, audio
+encoder, and embedding.
+
+### Architecture
+
+```
+pixel_values ──► [Vision Encoder] ──► image_features ──┐
+                                                        │
+audio_features ─► [Audio Encoder] ──► audio_features ──┤
+                                                        │
+input_ids ──────► [Embedding] ◄────────────────────────┘
+                       │
+                       ▼
+                 [Text Decoder] ──► logits
+```
+
+### ClippableLinear (critical for Gemma4)
+
+Gemma4's vision and audio encoders use `Gemma4ClippableLinear` — a
+`Linear` with learned finite input/output activation clamping:
+
+```python
+x = Clip(x, input_min, input_max)
+x = x @ weight.T [+ bias]
+x = Clip(x, output_min, output_max)
+```
+
+**This is the single most common source of Gemma4 divergence.** Using
+plain `Linear` instead of `ClippableLinear` causes:
+- Audio encoder max diff: 52.68 → 0.0003 after fix
+- Vision encoder max diff: 3.92 → 0.00007 after fix
+
+Vision encoder uses ClippableLinear for ALL linear layers:
+- Q/K/V/O projections in `Gemma4VisionSelfAttention`
+- gate/up/down projections in MLP (via `linear_class=ClippableLinear`)
+
+Audio encoder uses ClippableLinear for its linear layers as well.
+
+See `reusable-components` skill for full `ClippableLinear` API reference.
+
+### Audio boundary markers
+
+HuggingFace wraps audio tokens with boundary markers that must be present
+in `input_ids` for correct generation:
+
+```
+<|audio>  (256000) + N × <|audio|> (258881) + <audio|> (258883)
+```
+
+This parallels the image token pattern:
+```
+<|image>  (255999) + N × <|image|> (258880) + <image|> (258882)
+```
+
+**Missing audio boundary markers** cause garbled audio transcription output
+even when the audio encoder output is numerically correct.
+
+### Per-layer embeddings (CUDA ORT workaround)
+
+Gemma4 uses per-layer embedding: `embed_tokens_per_layer` with shape
+`[V, L*D]` where V=vocab_size, L=num_layers, D=per_layer_dim. For large
+models this creates a single Gather on a 2.35B-element tensor, which
+**overflows ORT's CUDA Gather kernel** (int32 offset computation in
+`gather_impl.cu`).
+
+**Workaround:** Split into L separate `Embedding([V, D])` tables via
+`nn.ModuleList`. In `preprocess_weights`, split the HF weight column-wise:
+```python
+for i in range(num_layers):
+    renamed[f"embed_tokens_per_layer.{i}.weight"] = value[:, i*D:(i+1)*D]
+```
+
+Use `Slice` instead of `Gather` for per-layer projection indexing to
+avoid the large-tensor issue entirely.
+
+### Audio feature extraction
+
+Gemma4 uses `Gemma4AudioFeatureExtractor` (not `WhisperFeatureExtractor`).
+Using the wrong feature extractor produces completely different mel features
+and the model fails silently (produces garbage transcription).
 
 ## Testing multimodal models
 

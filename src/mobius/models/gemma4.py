@@ -37,6 +37,7 @@ from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
+    ClippableLinear,
     Linear,
     RMSNorm,
     create_attention_bias,
@@ -113,10 +114,10 @@ class Gemma4VisionSelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -286,13 +287,15 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
+        # Vision encoder uses ClippableLinear for all projections.
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
-            )
+            ),
+            linear_class=ClippableLinear,
         )
 
     def forward(
@@ -1196,11 +1199,20 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
-                vocab_per_layer,
-                config.num_hidden_layers * self._per_layer_dim,
-                config.pad_token_id,
-                embed_scale=float(self._per_layer_dim**0.5),
+            # Use per-layer embedding tables instead of one giant [V, L*D] table.
+            # Each [V, D] table has only V*D elements (e.g. 262144*256 = 67M),
+            # well under the ORT CUDA Gather int32 limit (~2.1B).  This also
+            # avoids the post-Gather reshape and per-layer axis-2 slicing.
+            self.embed_tokens_per_layer = nn.ModuleList(
+                [
+                    Gemma3TextScaledWordEmbedding(
+                        vocab_per_layer,
+                        self._per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=float(self._per_layer_dim**0.5),
+                    )
+                    for _ in range(config.num_hidden_layers)
+                ]
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -1216,8 +1228,8 @@ class Gemma4TextModel(nn.Module):
         op: builder.OpBuilder,
         input_ids: ir.Value | None,
         inputs_embeds: ir.Value,
-    ) -> ir.Value | None:
-        """Compute per-layer input embeddings ``[B, S, num_layers, per_layer_dim]``.
+    ) -> list[ir.Value] | None:
+        """Compute per-layer input embeddings, one ``[B, S, per_layer_dim]`` per layer.
 
         HF's ``Gemma4Model.forward`` replaces image/audio token positions with
         ``pad_token_id`` (0) *before* calling ``embed_tokens_per_layer``.  We
@@ -1237,10 +1249,9 @@ class Gemma4TextModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
+        # Mask multimodal token IDs to pad_token_id (0)
+        masked_ids: ir.Value | None = None
         if input_ids is not None:
-            # Mask multimodal positions to pad_token_id (0) so image/audio slots
-            # use PAD embeddings in the per-layer path — matching HF line 40:
-            #   llm_input_ids[multimodal_mask] = pad_token_id
             pad = op.Constant(value_int=0)
             masked_ids = input_ids
             if self._image_token_id:
@@ -1255,15 +1266,21 @@ class Gemma4TextModel(nn.Module):
                     pad,
                     masked_ids,
                 )
-            token_emb = self.embed_tokens_per_layer(op, masked_ids)
-            token_emb = op.Reshape(
-                token_emb,
-                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-            )
-            proj = op.Add(proj, token_emb)
 
-        # Scale combined result by 2**-0.5 (matches HF project_per_layer_inputs)
-        return op.Mul(proj, float(0.5**0.5))
+        # Per-layer embeddings: each table is [V, per_layer_dim] — small enough
+        # to avoid ORT CUDA Gather int32 overflow (onnxruntime#28107).
+        per_layer_results: list[ir.Value] = []
+        for i in range(self._num_layers):
+            # Slice proj along axis 2 for this layer: [B, S, L, D] → [B, S, D]
+            proj_i = op.Squeeze(op.Slice(proj, starts=[i], ends=[i + 1], axes=[2]), [2])
+
+            if masked_ids is not None:
+                token_emb_i = self.embed_tokens_per_layer[i](op, masked_ids)
+                proj_i = op.Add(proj_i, token_emb_i)
+
+            per_layer_results.append(op.Mul(proj_i, float(0.5**0.5)))
+
+        return per_layer_results
 
     def forward(
         self,
@@ -1324,12 +1341,7 @@ class Gemma4TextModel(nn.Module):
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
-            if per_layer_inputs is not None:
-                idx = op.Constant(value_ints=[i])
-                pli = op.Gather(per_layer_inputs, idx, axis=2)
-                per_layer_input = op.Squeeze(pli, [2])
-            else:
-                per_layer_input = None
+            per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -1826,7 +1838,17 @@ class Gemma4Model(nn.Module):
                     renamed["decoder." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
-                    renamed["decoder.model." + suffix] = value
+                    onnx_key = "decoder.model." + suffix
+                    if suffix == "embed_tokens_per_layer.weight":
+                        # HF stores one [V, L*D] weight; split into L separate
+                        # [V, D] tables matching our nn.ModuleList layout.
+                        num_layers = self.config.num_hidden_layers
+                        per_layer_dim = self.decoder.model._per_layer_dim
+                        for i in range(num_layers):
+                            shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
+                            renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = shard
+                    else:
+                        renamed[onnx_key] = value
                     if suffix == "embed_tokens.weight":
                         # Token embedding is shared with the embedding sub-model
                         renamed["embedding.embed_tokens.weight"] = value
