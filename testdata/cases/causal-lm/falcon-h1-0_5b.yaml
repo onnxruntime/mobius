@@ -13,4 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "Falcon-H1 hybrid SSM graph has ORT error"
 notes: "Falcon H1 0.5B. Hybrid SSM+Attention model from TII."

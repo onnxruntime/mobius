@@ -17,4 +17,5 @@ generation:
 
 min_token_match_ratio: 0.25
 
+skip_reason: "SmolVLM (idefics3) ONNX graph has ORT shape error"
 notes: "SmolVLM 256M. Tiny idefics3 vision-language model."

@@ -145,27 +145,6 @@ def _use_temp_hf_cache(tmp_path):
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
 _XFAIL_REASONS: dict[str, str] = {
-    # Weight loading bugs: preprocess_weights doesn't map all HF names
-    "text-generation/mamba-130m": "Mamba conv_state requires rank-3 tensors (not standard KV cache)",
-    "feature-extraction/albert-base-v2": "ALBERT shared-parameter weight loading incomplete",
-    "feature-extraction/modernbert-base": "ModernBERT preprocess_weights incomplete",
-    # VL multi-model inference: test infra needs model-specific position_ids
-    "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
-    "image-text-to-text/llava-onevision-0_5b": "LLaVA-OneVision ONNX graph has ORT error",
-    "image-text-to-text/smolvlm-256m": "SmolVLM (idefics3) ONNX graph has ORT error",
-    # ORT shape/type errors in ONNX graph (model or component bugs)
-    "image-classification/beit-base": "BEiT ONNX graph has shape error in ORT",
-    "image-classification/dinov2-small": "DINOv2 ONNX graph has shape error in ORT",
-    "image-classification/dinov2-with-registers-base": "DINOv2 with registers ONNX graph has shape error in ORT",
-    "feature-extraction/esm2-8m": "ESM2 ONNX graph has shape error in ORT",
-    "image-classification/hiera-tiny": "Hiera ONNX graph has shape error in ORT",
-    "feature-extraction/layoutlm-base": "LayoutLM ONNX graph has shape error in ORT",
-    "feature-extraction/mpnet-base": "MPNet ONNX graph has shape error in ORT",
-    "image-classification/pvt-tiny": "PVT ONNX graph has shape error in ORT",
-    "feature-extraction/squeezebert-tiny": "SqueezeBERT ONNX graph has shape error in ORT",
-    "image-classification/swin-tiny": "Swin ONNX graph has shape error in ORT",
-    "text-generation/falcon-h1-0_5b": "Falcon-H1 hybrid SSM graph has ORT error",
-    "feature-extraction/xlnet-base": "XLNet config extraction KeyError",
     # Argmax mismatch (model logic bug)
     "image-classification/vit-mae-base": "ViT-MAE argmax mismatch vs golden (model logic bug)",
     # Weight shape mismatch (MLA architecture not yet supported)

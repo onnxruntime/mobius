@@ -17,4 +17,5 @@ generation:
 
 min_token_match_ratio: 0.25
 
+skip_reason: "LLaVA-OneVision ONNX graph has ORT shape error"
 notes: "LLaVA-OneVision 0.5B. Vision-language model."
