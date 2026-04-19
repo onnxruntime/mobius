@@ -5,7 +5,7 @@ dtype: "float32"
 
 inputs:
   prompts:
-    - "Once upon a time"
+    - "Here is my poem:"
 
 level: "L4+L5"
 
