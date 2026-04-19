@@ -151,12 +151,19 @@ _XFAIL_REASONS: dict[str, str] = {
     "feature-extraction/modernbert-base": "ModernBERT preprocess_weights incomplete",
     # VL multi-model inference: test infra needs model-specific position_ids
     "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
-    # Bamba hybrid mamba2+attention logits diverge from HF
-    "text-generation/bamba-9b": "Bamba hybrid mamba2+attention output diverges from HF reference",
+}
+
+# Failures that only apply to L5 (generation loop), not L4 (single forward).
+_L5_ONLY_XFAIL_REASONS: dict[str, str] = {
+    # Mamba2 SSM state accumulation diverges from HF during autoregressive decode
+    "text-generation/bamba-9b": "Mamba2 SSM recurrence accumulates numerical differences across decode steps",
 }
 
 
-def _discover_cases(level: str) -> list[pytest.ParameterSet]:
+def _discover_cases(
+    level: str,
+    extra_xfails: dict[str, str] | None = None,
+) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
 
     Missing golden files or explicit ``skip_reason`` fields produce
@@ -164,6 +171,7 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
+    all_xfails = {**_XFAIL_REASONS, **(extra_xfails or {})}
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -175,8 +183,8 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in _XFAIL_REASONS:
-            marks.append(pytest.mark.xfail(reason=_XFAIL_REASONS[test_id], strict=False))
+        elif test_id in all_xfails:
+            marks.append(pytest.mark.xfail(reason=all_xfails[test_id], strict=False))
 
         params.append(
             pytest.param(
@@ -189,7 +197,7 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
 
 
 _L4_CASES = _discover_cases("L4")
-_L5_CASES = _discover_cases("L5")
+_L5_CASES = _discover_cases("L5", extra_xfails=_L5_ONLY_XFAIL_REASONS)
 
 
 # ---------------------------------------------------------------------------
