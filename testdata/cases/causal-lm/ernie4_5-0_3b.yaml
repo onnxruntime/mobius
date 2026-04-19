@@ -1,0 +1,16 @@
+model_id: "baidu/ERNIE-4.5-0.3B-PT"
+revision: "b565cf6caebd"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Once upon a time"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "ERNIE 4.5 0.3B. Baidu dense language model."

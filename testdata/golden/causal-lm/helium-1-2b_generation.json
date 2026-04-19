@@ -1,0 +1,27 @@
+{
+  "model_id": "kyutai/helium-1-preview-2b",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    362,
+    502,
+    387,
+    369,
+    1394,
+    7061,
+    1401,
+    7825,
+    364,
+    812,
+    387,
+    369,
+    666,
+    12690,
+    7061,
+    362,
+    370,
+    673,
+    1272,
+    3130
+  ],
+  "generated_text": ", there was a little girl named Alice. She was a very curious girl, and she always wanted"
+}

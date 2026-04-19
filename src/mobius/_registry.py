@@ -618,6 +618,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "segformer": ModelRegistration(
         SegformerForSemanticSegmentation, task="image-classification"
     ),
+    "siglip": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "siglip2": ModelRegistration(CLIPVisionModel, task="image-classification"),
     "siglip2_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
     "siglip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
     "swin": ModelRegistration(ViTModel, task="image-classification"),
@@ -948,6 +950,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mobilevitv2": "apple/mobilevitv2-1.0-imagenet1k-256",
     "pvt": "Zetatech/pvt-tiny-224",
     "pvt_v2": "OpenGVLab/pvt_v2_b0",
+    "siglip": "google/siglip-base-patch16-224",
+    "siglip2": "google/siglip2-base-patch16-224",
     "siglip_vision_model": "google/siglip-base-patch16-224",
     "siglip2_vision_model": "google/siglip2-base-patch16-224",
     "swin2sr": "caidas/swin2SR-classical-sr-x2-64",
@@ -1071,6 +1075,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "swinv2": "swin",
     "clip_text_model": "clip",
     "clip_vision_model": "clip",
+    "siglip": "clip",
+    "siglip2": "clip",
     "siglip_vision_model": "clip",
     "siglip2_vision_model": "clip",
 }

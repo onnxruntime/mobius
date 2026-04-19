@@ -1,0 +1,16 @@
+model_id: "tencent/Youtu-LLM-2B-Base"
+revision: "7b32c99715f9"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Once upon a time"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Youtu LLM 2B. Tencent dense language model."

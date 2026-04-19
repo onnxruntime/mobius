@@ -151,6 +151,8 @@ _XFAIL_REASONS: dict[str, str] = {
     "feature-extraction/modernbert-base": "ModernBERT preprocess_weights incomplete",
     # VL multi-model inference: test infra needs model-specific position_ids
     "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
+    "image-text-to-text/llava-onevision-0_5b": "LLaVA-OneVision ONNX graph has ORT error",
+    "image-text-to-text/smolvlm-256m": "SmolVLM (idefics3) ONNX graph has ORT error",
     # ORT shape/type errors in ONNX graph (model or component bugs)
     "image-classification/beit-base": "BEiT ONNX graph has shape error in ORT",
     "image-classification/dinov2-small": "DINOv2 ONNX graph has shape error in ORT",
@@ -162,18 +164,25 @@ _XFAIL_REASONS: dict[str, str] = {
     "image-classification/pvt-tiny": "PVT ONNX graph has shape error in ORT",
     "feature-extraction/squeezebert-tiny": "SqueezeBERT ONNX graph has shape error in ORT",
     "image-classification/swin-tiny": "Swin ONNX graph has shape error in ORT",
-    # Registry or config issues
-    "image-classification/siglip-base": "SigLIP model_type not registered",
-    "image-classification/siglip2-base": "SigLIP2 model_type not registered",
+    "text-generation/falcon-h1-0_5b": "Falcon-H1 hybrid SSM graph has ORT error",
+    # SigLIP: registered but position_embedding shape mismatch (no CLS token)
+    "image-classification/siglip-base": "SigLIP position_embedding shape mismatch (196 vs 197, no CLS)",
+    "image-classification/siglip2-base": "SigLIP2 position_embedding shape mismatch (no CLS)",
     "feature-extraction/xlnet-base": "XLNet config extraction KeyError",
     # Argmax mismatch (model logic bug)
     "image-classification/vit-mae-base": "ViT-MAE argmax mismatch vs golden (model logic bug)",
+    # Weight shape mismatch (MLA architecture not yet supported)
+    "text-generation/youtu-2b": "Youtu uses MLA (v_head_dim != head_dim), needs DeepSeek-V2 model",
 }
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
 _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     # Mamba2 SSM state accumulation diverges from HF during autoregressive decode
     "text-generation/bamba-9b": "Mamba2 SSM recurrence accumulates numerical differences across decode steps",
+    # Generation loop divergence (L4 prefill passes, but decode loop drifts)
+    "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
+    "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
+    "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
 }
 
 

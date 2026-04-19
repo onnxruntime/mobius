@@ -1,0 +1,27 @@
+{
+  "model_id": "tencent/Youtu-LLM-2B-Base",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    11,
+    1118,
+    614,
+    261,
+    10341,
+    1017,
+    1199,
+    261,
+    4707,
+    10385,
+    13,
+    576,
+    10341,
+    8217,
+    1028,
+    10385,
+    1513,
+    1631,
+    11,
+    716
+  ],
+  "generated_text": ", there was a king who had a beautiful daughter. The king loved his daughter very much, so"
+}
