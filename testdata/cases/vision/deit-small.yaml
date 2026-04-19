@@ -8,5 +8,6 @@ inputs:
     - "pipeline-cat-chonk.jpeg"
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "DeiT small patch16. Data-efficient image transformer."
