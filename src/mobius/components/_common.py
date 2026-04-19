@@ -312,9 +312,7 @@ def create_sliding_window_mask(
     q_len = op.Shape(input_ids, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
     start = op.Sub(total_len, q_len)
-    q_indices = op.Unsqueeze(
-        op.Slice(all_indices, start, total_len, [1]), [2]
-    )
+    q_indices = op.Unsqueeze(op.Slice(all_indices, start, total_len, [1]), [2])
 
     # Sliding window: distance < window_size
     # dist = q_pos - kv_pos; within window when dist < window_size
@@ -322,7 +320,5 @@ def create_sliding_window_mask(
     within_window = op.Less(dist, op.Constant(value_int=window_size))
 
     # Combine with padding mask
-    padding_mask = op.Cast(
-        op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL
-    )
+    padding_mask = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
     return op.And(within_window, padding_mask)

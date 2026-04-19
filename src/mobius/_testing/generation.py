@@ -73,31 +73,19 @@ class OnnxGenerator:
                 for suffix in suffixes:
                     name = f"past_key_values.{i}.{suffix}"
                     shape = self.session.get_input_shape(name) or []
-                    static = [
-                        d if isinstance(d, int) and d > 0
-                        else batch_size
-                        for d in shape
-                    ]
+                    static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
                     past_kv[name] = np.zeros(static, dtype=np.float32)
             elif ltype == "lightning_attention":
                 # Single recurrent state only (no conv_state)
                 name = f"past_key_values.{i}.recurrent_state"
                 shape = self.session.get_input_shape(name) or []
-                static = [
-                    d if isinstance(d, int) and d > 0
-                    else batch_size
-                    for d in shape
-                ]
+                static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
                 past_kv[name] = np.zeros(static, dtype=np.float32)
             elif ltype == "conv":
                 # ShortConv conv_state only (no SSM state)
                 name = f"past_key_values.{i}.conv_state"
                 shape = self.session.get_input_shape(name) or []
-                static = [
-                    d if isinstance(d, int) and d > 0
-                    else batch_size
-                    for d in shape
-                ]
+                static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
                 past_kv[name] = np.zeros(static, dtype=np.float32)
             else:
                 past_kv[f"past_key_values.{i}.key"] = np.zeros(

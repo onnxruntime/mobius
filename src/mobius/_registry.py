@@ -87,7 +87,7 @@ from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.bert import BertModel
 from mobius.models.blip import BlipVisionModel
 from mobius.models.blip2 import Blip2Model
-from mobius.models.clip import CLIPTextModel, CLIPVisionModel
+from mobius.models.clip import CLIPTextModel, CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
@@ -618,10 +618,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "segformer": ModelRegistration(
         SegformerForSemanticSegmentation, task="image-classification"
     ),
-    "siglip": ModelRegistration(CLIPVisionModel, task="image-classification"),
-    "siglip2": ModelRegistration(CLIPVisionModel, task="image-classification"),
-    "siglip2_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
-    "siglip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "siglip": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
     "swin": ModelRegistration(ViTModel, task="image-classification"),
     "swin2sr": ModelRegistration(ViTModel, task="image-classification"),
     "swinv2": ModelRegistration(ViTModel, task="image-classification"),

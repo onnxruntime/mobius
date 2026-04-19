@@ -60,9 +60,7 @@ class MoEDecoderLayer(nn.Module):
         self.self_attn = Attention(config, scale=attention_scale)
         self.mlp = MoELayer(config, gate=gate)
         residual_multiplier = getattr(config, "residual_multiplier", None)
-        self._residual_multiplier = (
-            1.0 if residual_multiplier is None else residual_multiplier
-        )
+        self._residual_multiplier = 1.0 if residual_multiplier is None else residual_multiplier
         if not self._post_feedforward_norm:
             # Pre-norm style: norm before attention input and before MLP input
             self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)

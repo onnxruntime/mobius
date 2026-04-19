@@ -1649,7 +1649,27 @@ VISION_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "siglip",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
         "siglip2_vision_model",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "siglip2",
         {
             "hidden_act": "gelu",
             "image_size": 32,

@@ -165,14 +165,13 @@ _XFAIL_REASONS: dict[str, str] = {
     "feature-extraction/squeezebert-tiny": "SqueezeBERT ONNX graph has shape error in ORT",
     "image-classification/swin-tiny": "Swin ONNX graph has shape error in ORT",
     "text-generation/falcon-h1-0_5b": "Falcon-H1 hybrid SSM graph has ORT error",
-    # SigLIP: registered but position_embedding shape mismatch (no CLS token)
-    "image-classification/siglip-base": "SigLIP position_embedding shape mismatch (196 vs 197, no CLS)",
-    "image-classification/siglip2-base": "SigLIP2 position_embedding shape mismatch (no CLS)",
     "feature-extraction/xlnet-base": "XLNet config extraction KeyError",
     # Argmax mismatch (model logic bug)
     "image-classification/vit-mae-base": "ViT-MAE argmax mismatch vs golden (model logic bug)",
     # Weight shape mismatch (MLA architecture not yet supported)
     "text-generation/youtu-2b": "Youtu uses MLA (v_head_dim != head_dim), needs DeepSeek-V2 model",
+    # Qwen2-VL vision uses FCMLP (fc1/fc2) but model uses GatedMLP (gate_proj/up_proj/down_proj)
+    "image-text-to-text/qwen2-vl-2b": "Qwen2-VL vision MLP architecture differs from Qwen2.5-VL",
 }
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
@@ -183,6 +182,7 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
     "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
     "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
+    "text-generation/smollm3-3b": "SmolLM3 3B decode loop diverges from HF (FP32 precision with 3B params)",
 }
 
 

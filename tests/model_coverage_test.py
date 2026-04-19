@@ -323,8 +323,7 @@ class TestL1L3GraphBuildCoverage:
         covered = len([mt for mt in all_reg if mt in l13])
         pct = 100.0 * covered / len(all_reg) if all_reg else 0
         assert pct >= 90.0, (
-            f"L1/L3 coverage {covered}/{len(all_reg)} "
-            f"= {pct:.1f}% (target ≥ 95%)"
+            f"L1/L3 coverage {covered}/{len(all_reg)} = {pct:.1f}% (target ≥ 95%)"
         )
 
     @pytest.mark.parametrize("arch", _all_registered())

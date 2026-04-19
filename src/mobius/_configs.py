@@ -375,9 +375,29 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             if not isinstance(hf_vision_config, dict)
             else type("VC", (), hf_vision_config)()
         )
+        # Qwen2-VL uses ``embed_dim`` for the actual block hidden size and
+        # ``hidden_size`` for the projection output.  When ``embed_dim``
+        # exists and ``out_hidden_size`` does not, remap the fields so the
+        # block dimension is used as ``hidden_size``.
+        _embed_dim = getattr(vc, "embed_dim", None)
+        _hf_hidden = getattr(vc, "hidden_size", None)
+        _out_hidden = getattr(vc, "out_hidden_size", None)
+        if _embed_dim is not None and _out_hidden is None and _embed_dim != _hf_hidden:
+            _vis_hidden = _embed_dim
+            _vis_out_hidden = _hf_hidden
+        else:
+            _vis_hidden = _hf_hidden
+            _vis_out_hidden = _out_hidden
+
+        _intermediate = getattr(vc, "intermediate_size", None)
+        if _intermediate is None:
+            _mlp_ratio = getattr(vc, "mlp_ratio", None)
+            if _mlp_ratio is not None and _vis_hidden is not None:
+                _intermediate = int(_vis_hidden * _mlp_ratio)
+
         vision_fields.update(
-            hidden_size=getattr(vc, "hidden_size", None),
-            intermediate_size=getattr(vc, "intermediate_size", None),
+            hidden_size=_vis_hidden,
+            intermediate_size=_intermediate,
             num_hidden_layers=(
                 getattr(vc, "num_hidden_layers", None) or getattr(vc, "depth", None)
             ),
@@ -398,7 +418,7 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             head_dim=getattr(vc, "head_dim", None),
             rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
-            out_hidden_size=getattr(vc, "out_hidden_size", None),
+            out_hidden_size=_vis_out_hidden,
             in_channels=_first_not_none(
                 getattr(vc, "in_channels", None),
                 getattr(vc, "num_channels", None),
@@ -699,6 +719,7 @@ class ArchitectureConfig(BaseModelConfig):
 
     # attention config
     layer_types: list[str] | None = None
+    no_rope_layers: list[int] | None = None
     full_attention_interval: int | None = None
     sliding_window: int | None = None
 
@@ -903,11 +924,15 @@ class ArchitectureConfig(BaseModelConfig):
                 # Qwen v1 configs have no activation attr; default to silu
                 or ("silu" if model_type in ("qwen",) else None)
             ),
-            layer_types=(getattr(config, "layer_types", None)
-                        or getattr(config, "attention_layers", None)),
+            layer_types=(
+                getattr(config, "layer_types", None)
+                or getattr(config, "attention_layers", None)
+            ),
+            no_rope_layers=getattr(config, "no_rope_layers", None),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(getattr(config, "sliding_window", None)
-                           or getattr(config, "window_size", None)),
+            sliding_window=(
+                getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
+            ),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),

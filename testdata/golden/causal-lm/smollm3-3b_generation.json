@@ -1,0 +1,27 @@
+{
+  "model_id": "HuggingFaceTB/SmolLM3-3B",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    11,
+    304,
+    264,
+    2678,
+    6424,
+    11,
+    1070,
+    574,
+    264,
+    6875,
+    13,
+    578,
+    6875,
+    574,
+    539,
+    1120,
+    264,
+    2035,
+    311,
+    17636
+  ],
+  "generated_text": ", in a small town, there was a library. The library was not just a place to borrow"
+}
