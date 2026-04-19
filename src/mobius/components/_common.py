@@ -273,3 +273,56 @@ def create_padding_mask(
     total_len = op.Shape(attention_mask, start=1, end=2)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
     return op.Expand(mask_3d, target_shape)
+
+
+def create_sliding_window_mask(
+    op: builder.OpBuilder,
+    input_ids: ir.Value,
+    attention_mask: ir.Value,
+    window_size: int,
+):
+    """Create a bool mask combining padding and sliding-window constraints.
+
+    When used with ``is_causal=1`` on the Attention op, causality is
+    handled by the op.  This mask encodes two additional constraints:
+
+    1. **Padding**: tokens with ``attention_mask == 0`` are masked out.
+    2. **Sliding window**: each query position only attends to the
+       ``window_size`` most recent key positions.
+
+    The output is a 3D ``(batch_size, q_len, total_length)`` bool tensor.
+
+    Args:
+        op: The OpBuilder.
+        input_ids: ``(batch_size, q_length)`` — used for query length.
+        attention_mask: ``(batch_size, total_length)`` INT64 (1=valid).
+        window_size: The number of recent tokens each position attends to.
+
+    Returns:
+        Bool mask ``(batch_size, q_len, total_length)``.
+    """
+    # Position indices via cumsum on attention_mask
+    # CumSum gives 1-based indices for non-padding tokens, 0 stays 0
+    all_indices = op.CumSum(attention_mask, op.Constant(value_int=1))
+
+    # kv_indices: (batch, 1, total_len)
+    kv_indices = op.Unsqueeze(all_indices, [1])
+
+    # q_indices: last q_len positions → (batch, q_len, 1)
+    q_len = op.Shape(input_ids, start=1, end=2)
+    total_len = op.Shape(attention_mask, start=1, end=2)
+    start = op.Sub(total_len, q_len)
+    q_indices = op.Unsqueeze(
+        op.Slice(all_indices, start, total_len, [1]), [2]
+    )
+
+    # Sliding window: distance < window_size
+    # dist = q_pos - kv_pos; within window when dist < window_size
+    dist = op.Sub(q_indices, kv_indices)
+    within_window = op.Less(dist, op.Constant(value_int=window_size))
+
+    # Combine with padding mask
+    padding_mask = op.Cast(
+        op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL
+    )
+    return op.And(within_window, padding_mask)

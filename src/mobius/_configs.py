@@ -903,9 +903,11 @@ class ArchitectureConfig(BaseModelConfig):
                 # Qwen v1 configs have no activation attr; default to silu
                 or ("silu" if model_type in ("qwen",) else None)
             ),
-            layer_types=(getattr(config, "layer_types", None)),
+            layer_types=(getattr(config, "layer_types", None)
+                        or getattr(config, "attention_layers", None)),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(getattr(config, "sliding_window", None)),
+            sliding_window=(getattr(config, "sliding_window", None)
+                           or getattr(config, "window_size", None)),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),
@@ -1086,7 +1088,11 @@ class ArchitectureConfig(BaseModelConfig):
             post_norm=model_type == "openai-gpt",
             # Granite scaling multipliers
             embedding_multiplier=getattr(config, "embedding_multiplier", 1.0),
-            attention_multiplier=getattr(config, "attention_multiplier", None),
+            attention_multiplier=(
+                getattr(config, "attention_multiplier", None)
+                # GPT-Neo computes Q @ K^T without 1/sqrt(head_dim) scaling
+                or (1.0 if model_type == "gpt_neo" else None)
+            ),
             logits_scaling=getattr(config, "logits_scaling", 1.0),
             residual_multiplier=getattr(config, "residual_multiplier", 1.0),
             # Cohere logit scale
