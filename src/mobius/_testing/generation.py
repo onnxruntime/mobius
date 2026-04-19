@@ -73,8 +73,32 @@ class OnnxGenerator:
                 for suffix in suffixes:
                     name = f"past_key_values.{i}.{suffix}"
                     shape = self.session.get_input_shape(name) or []
-                    static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
+                    static = [
+                        d if isinstance(d, int) and d > 0
+                        else batch_size
+                        for d in shape
+                    ]
                     past_kv[name] = np.zeros(static, dtype=np.float32)
+            elif ltype == "lightning_attention":
+                # Single recurrent state only (no conv_state)
+                name = f"past_key_values.{i}.recurrent_state"
+                shape = self.session.get_input_shape(name) or []
+                static = [
+                    d if isinstance(d, int) and d > 0
+                    else batch_size
+                    for d in shape
+                ]
+                past_kv[name] = np.zeros(static, dtype=np.float32)
+            elif ltype == "conv":
+                # ShortConv conv_state only (no SSM state)
+                name = f"past_key_values.{i}.conv_state"
+                shape = self.session.get_input_shape(name) or []
+                static = [
+                    d if isinstance(d, int) and d > 0
+                    else batch_size
+                    for d in shape
+                ]
+                past_kv[name] = np.zeros(static, dtype=np.float32)
             else:
                 past_kv[f"past_key_values.{i}.key"] = np.zeros(
                     (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
@@ -131,6 +155,16 @@ class OnnxGenerator:
                         dst = f"past_key_values.{i}.{suffix}"
                         if src in outputs:
                             past_kv[dst] = outputs[src]
+                elif ltype == "lightning_attention":
+                    src = f"present.{i}.recurrent_state"
+                    dst = f"past_key_values.{i}.recurrent_state"
+                    if src in outputs:
+                        past_kv[dst] = outputs[src]
+                elif ltype == "conv":
+                    src = f"present.{i}.conv_state"
+                    dst = f"past_key_values.{i}.conv_state"
+                    if src in outputs:
+                        past_kv[dst] = outputs[src]
                 else:
                     past_kv[f"past_key_values.{i}.key"] = outputs[f"present.{i}.key"]
                     past_kv[f"past_key_values.{i}.value"] = outputs[f"present.{i}.value"]

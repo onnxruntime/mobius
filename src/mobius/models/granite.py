@@ -120,7 +120,7 @@ class GraniteMoETextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        from mobius.components._moe import TopKGate
+        from mobius.components import TopKGate
         from mobius.models.moe import MoEDecoderLayer
 
         self._dtype = config.dtype
