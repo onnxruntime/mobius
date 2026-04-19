@@ -319,18 +319,26 @@ class TestL1L3GraphBuildCoverage:
                 + "\n\nFix: add a config entry to "
                 "tests/_test_configs.py or add to _COVERAGE_SKIP."
             )
+        # Report coverage percentage
+        covered = len([mt for mt in all_reg if mt in l13])
+        pct = 100.0 * covered / len(all_reg) if all_reg else 0
+        assert pct >= 90.0, (
+            f"L1/L3 coverage {covered}/{len(all_reg)} "
+            f"= {pct:.1f}% (target ≥ 95%)"
+        )
 
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_l1_l3_config(self, arch: str):
         """Per-model check for L1/L3 test config."""
+        l13 = _l1_l3_model_types()
+        if arch in l13:
+            return  # Has config — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
-        l13 = _l1_l3_model_types()
-        if arch not in l13:
-            pytest.fail(
-                f"Model '{arch}' has no test config in "
-                f"tests/_test_configs.py. Add one for L1/L3 coverage."
-            )
+        pytest.fail(
+            f"Model '{arch}' has no test config in "
+            f"tests/_test_configs.py. Add one for L1/L3 coverage."
+        )
 
 
 class TestL2ConfigValidation:
@@ -359,13 +367,14 @@ class TestL2ConfigValidation:
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_test_model_id(self, arch: str):
         """Per-model check for test_model_id (L2)."""
+        if arch in _TEST_MODEL_IDS:
+            return  # Has test_model_id — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
-        if arch not in _TEST_MODEL_IDS:
-            pytest.fail(
-                f"Model '{arch}' has no test_model_id in "
-                f"_TEST_MODEL_IDS. Add one for L2 config validation."
-            )
+        pytest.fail(
+            f"Model '{arch}' has no test_model_id in "
+            f"_TEST_MODEL_IDS. Add one for L2 config validation."
+        )
 
 
 class TestL4L5GoldenDataCoverage:

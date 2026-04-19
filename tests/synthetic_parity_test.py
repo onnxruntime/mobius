@@ -93,6 +93,10 @@ _SKIP_REASONS: dict[str, str] = {
     # inlining drops initializers inside function ops (pre-existing on main where
     # the old Mamba2Scan code crashed at runtime with a Squeeze shape error).
     "granitemoehybrid": "Mamba2 hybrid model — LinearAttention function op inlining drops initializers",
+    # VL text sub-models with incompatible weight names: GLM4 uses fused gate_up_proj
+    # and extra post-layernorms that our CausalLMModel doesn't have.
+    "glm4v_text": "GLM4 uses fused gate_up_proj and extra post-layernorms; incompatible with CausalLMModel",
+    "glm4v_moe_text": "GLM4-MoE uses fused gate_up_proj and extra post-layernorms; incompatible with CausalLMModel",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -143,6 +147,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
     "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
+    # Qwen3 VL/Omni MoE text sub-models: same MoE FP accumulation as qwen3_moe.
+    "qwen3_vl_moe": 0.025,
+    "qwen3_omni_moe": 0.025,
     # Gemma v1: OffsetRMSNorm (+1 weight) FP accumulation → ~0.089 max diff.
     # Argmax correct, cosine=0.984 — model is functionally correct.
     "gemma": 0.10,
@@ -413,6 +420,10 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "head_dim": TINY_HEAD_DIM,
         "layer_types": ["sliding_attention", "full_attention"],
     },
+    # VL MoE text sub-models: need same HF extras as their base model types.
+    # qwen3_vl_moe, qwen3_omni_moe → qwen3_moe (needs head_dim + moe_intermediate_size)
+    "qwen3_vl_moe": {"head_dim": TINY_HEAD_DIM, "moe_intermediate_size": TINY_INTERMEDIATE},
+    "qwen3_omni_moe": {"head_dim": TINY_HEAD_DIM, "moe_intermediate_size": TINY_INTERMEDIATE},
 }
 
 
@@ -428,6 +439,11 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
+    # code_llama reuses the llama architecture; HF only recognizes "llama".
+    "code_llama": "llama",
+    # VL text sub-models: use the base text model type for CausalLM parity testing.
+    "qwen3_vl_moe": "qwen3_moe",
+    "qwen3_omni_moe": "qwen3_moe",
 }
 
 

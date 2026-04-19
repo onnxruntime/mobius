@@ -4007,6 +4007,7 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
+    "audio-feature-extraction": {"model"},
 }
 
 
