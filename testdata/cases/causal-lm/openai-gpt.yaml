@@ -5,15 +5,12 @@ dtype: "float32"
 
 inputs:
   prompts:
-    - "Here is my poem:"
+    - "The quick brown fox"
 
 level: "L4+L5"
 
 generation:
   max_new_tokens: 20
   do_sample: false
-
-# Near-tie at generation step 10 (top2_gap=0.000076) causes divergence.
-min_token_match_ratio: 0.45
 
 notes: "GPT-1 117M. Original OpenAI transformer, learned position embeddings, no causal mask in HF (uses position IDs)."
