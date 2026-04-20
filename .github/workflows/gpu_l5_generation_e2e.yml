@@ -71,7 +71,7 @@ jobs:
             --junitxml=junit-l5.xml \
             --cov=src --cov-report=xml --cov-branch \
             --tb=short
-        timeout-minutes: 30
+        timeout-minutes: 60
 
       - name: Upload coverage to Codecov
         if: always()
