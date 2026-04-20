@@ -91,10 +91,7 @@ jobs:
           else
             echo "Running L5 generation tests for affected models: $AFFECTED"
             # Convert JSON array to comma-separated list for --models
-            MODELS=$(echo "$AFFECTED" | python -c "
-          import json, sys
-          print(','.join(json.load(sys.stdin)))
-          ")
+            MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
             if [ -n "$MODELS" ]; then
               pytest tests/e2e_golden_test.py \
                 -m generation \
