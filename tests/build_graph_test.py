@@ -1686,13 +1686,17 @@ class TestBuildGraphVisionLanguage:
             Qwen35VL3ModelCausalLMModel,
         )
         from mobius.models.qwen_vl import (
+            Qwen2VLCausalLMModel,
             Qwen25VLCausalLMModel,
             Qwen25VLTextModel,
         )
 
-        assert registry.get("qwen2_vl") is Qwen25VLCausalLMModel
-        assert registry.get("qwen2_vl") is registry.get("qwen2_5_vl")
+        # Qwen2-VL has its own model class (LayerNorm + FCMLP vision)
+        assert registry.get("qwen2_vl") is Qwen2VLCausalLMModel
         assert _default_task_for_model("qwen2_vl") == "qwen-vl"
+
+        # Qwen2.5-VL is separate (RMSNorm + GatedMLP vision)
+        assert registry.get("qwen2_5_vl") is Qwen25VLCausalLMModel
 
         assert registry.get("qwen2_vl_text") is Qwen25VLTextModel
         assert registry.get("qwen2_vl_text") is registry.get("qwen2_5_vl_text")

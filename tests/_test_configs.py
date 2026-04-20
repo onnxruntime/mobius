@@ -1112,12 +1112,13 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
-    # nemotron_h: hybrid Mamba2+Attention+MLP (requires NemotronHConfig)
+    # nemotron_h: hybrid Mamba2+Attention (requires NemotronHConfig)
+    # NemotronH's "moe" layers are not yet implemented — use only mamba2+attention.
     (
         "nemotron_h",
         {
             "hidden_act": "relu2",
-            "layer_types": ["mamba2", "mlp", "full_attention", "mlp"],
+            "layer_types": ["mamba2", "mlp", "full_attention", "mamba2"],
             "_config_cls": NemotronHConfig,
             "num_hidden_layers": 4,
             "mamba_n_heads": TINY_KV_HEADS,

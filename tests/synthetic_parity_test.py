@@ -89,8 +89,6 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
-    # NemotronH: uses com.microsoft.LinearAttention which requires ORT nightly
-    "nemotron_h": "NemotronH uses LinearAttention contrib op not available in stable ORT",
     # GraniteMoeHybrid: Mamba2+Attention hybrid uses LinearAttention; ORT function
     # inlining drops initializers inside function ops (pre-existing on main where
     # the old Mamba2Scan code crashed at runtime with a Squeeze shape error).
@@ -204,6 +202,10 @@ _XFAIL_REASONS: dict[str, str] = {
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
     "zamba2": "Zamba2 HF modeling bug (list index out of range)",
+    # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
+    # recurrence on CPU produces different results than HF's naive Mamba2.
+    # Attention-only layers match perfectly (cos=0.9999).
+    "nemotron_h": "Mamba2 SSM recurrence diverges on CPU (LinearAttention vs HF naive)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
@@ -535,10 +537,29 @@ def _create_hf_config(model_type: str, config_overrides: dict):
 
     # NemotronH uses layers_block_type with HF values {"mamba", "attention", "moe"}.
     # Convert our internal layer_types names (mamba2, full_attention, mlp) to HF names.
+    # Also translate mobius Mamba field names to HF NemotronHConfig field names.
     if hf_model_type in ("nemotron_h",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
         _nemotron_type_map = {"mamba2": "mamba", "full_attention": "attention", "mlp": "moe"}
         hf_kwargs["layers_block_type"] = [_nemotron_type_map.get(lt, lt) for lt in layer_types]
+        # Mobius NemotronHConfig → HF NemotronHConfig field name mapping
+        _nemotron_field_map = {
+            "mamba_n_heads": "mamba_num_heads",
+            "mamba_d_head": "mamba_head_dim",
+            "mamba_d_state": "ssm_state_size",
+            "mamba_n_groups": "n_groups",
+            "mamba_d_conv": "conv_kernel",
+            "mamba_expand": "expand",
+        }
+        for old_name, new_name in _nemotron_field_map.items():
+            if old_name in hf_kwargs:
+                hf_kwargs[new_name] = hf_kwargs.pop(old_name)
+        # HF NemotronH has an explicit head_dim (default 128) that is not
+        # derived from hidden_size / num_attention_heads. Set it to match.
+        if "head_dim" not in hf_kwargs:
+            hf_kwargs["head_dim"] = (
+                hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
+            )
 
     # Some models use different field names for num_local_experts and num_experts_per_tok.
     # Maps hf_model_type -> {our_field: hf_field} for field name translation.

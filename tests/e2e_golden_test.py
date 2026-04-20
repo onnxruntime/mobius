@@ -145,8 +145,6 @@ def _use_temp_hf_cache(tmp_path):
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
 _XFAIL_REASONS: dict[str, str] = {
-    # Qwen2-VL vision uses FCMLP (fc1/fc2) but model uses GatedMLP (gate_proj/up_proj/down_proj)
-    "image-text-to-text/qwen2-vl-2b": "Qwen2-VL vision MLP architecture differs from Qwen2.5-VL",
     # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
     "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
 }

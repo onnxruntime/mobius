@@ -73,6 +73,8 @@ __all__ = [
     "Qwen25VLVisionBlock",
     "Qwen25VLVisionModel",
     "Qwen25VLVisionRotaryEmbedding",
+    "Qwen2VLVisionBlock",
+    "Qwen2VLVisionModel",
     "Qwen35Attention",
     "Qwen3ASRAudioAttention",
     "Qwen3ASRAudioEncoderLayer",
@@ -222,6 +224,8 @@ from mobius.components._qwen3_vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
 )
 from mobius.components._qwen25_vl_vision import (
+    Qwen2VLVisionBlock,
+    Qwen2VLVisionModel,
     Qwen25VLPatchEmbed,
     Qwen25VLPatchMerger,
     Qwen25VLVisionAttention,
