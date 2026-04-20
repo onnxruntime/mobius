@@ -366,7 +366,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "seed_oss": ModelRegistration(CausalLMModel),
     "solar_open": ModelRegistration(CausalLMModel),
     "yi": ModelRegistration(CausalLMModel),
-    "youtu": ModelRegistration(CausalLMModel),
+    "youtu": ModelRegistration(DeepSeekV3CausalLMModel),
     "zamba": ModelRegistration(CausalLMModel),
     "zamba2": ModelRegistration(CausalLMModel),
     # --- Text Generation (architecture-specific) ---

@@ -9,5 +9,5 @@ inputs:
 
 level: "L4"
 
-skip_reason: "BEiT ONNX graph has ORT shape error"
+skip_reason: "Architecture-specific differences from generic ViT (weight shapes, missing biases, or extra params)."
 notes: "BEiT base patch16. BERT-style masked image modeling pre-training."

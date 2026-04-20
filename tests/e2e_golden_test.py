@@ -145,10 +145,6 @@ def _use_temp_hf_cache(tmp_path):
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
 _XFAIL_REASONS: dict[str, str] = {
-    # Argmax mismatch (model logic bug)
-    "image-classification/vit-mae-base": "ViT-MAE argmax mismatch vs golden (model logic bug)",
-    # Weight shape mismatch (MLA architecture not yet supported)
-    "text-generation/youtu-2b": "Youtu uses MLA (v_head_dim != head_dim), needs DeepSeek-V2 model",
     # Qwen2-VL vision uses FCMLP (fc1/fc2) but model uses GatedMLP (gate_proj/up_proj/down_proj)
     "image-text-to-text/qwen2-vl-2b": "Qwen2-VL vision MLP architecture differs from Qwen2.5-VL",
     # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
@@ -162,6 +158,8 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
     "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
     "text-generation/smollm3-3b": "SmolLM3 3B decode loop diverges from HF (FP32 precision with 3B params)",
+    # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
+    "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
 
 

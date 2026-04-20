@@ -187,7 +187,18 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {"hidden_act": "gelu_pytorch_tanh", "tie_word_embeddings": True},
         True,
     ),
-    ("youtu", {"tie_word_embeddings": True}, False),
+    (
+        "youtu",
+        {
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
     # === Absolute positional embeddings (non-RoPE) ===
     (
         "ctrl",
