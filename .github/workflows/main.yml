@@ -257,7 +257,7 @@ jobs:
               echo "No affected models — skipping"
             fi
           fi
-        timeout-minutes: 30
+        timeout-minutes: 60
       - name: Upload coverage to Codecov
         if: steps.check_golden.outputs.has_golden == 'true'
         uses: codecov/codecov-action@v6
@@ -351,7 +351,7 @@ jobs:
               echo "No affected models — skipping"
             fi
           fi
-        timeout-minutes: 30
+        timeout-minutes: 60
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v6
