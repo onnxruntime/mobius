@@ -351,7 +351,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "codegen2": ModelRegistration(CausalLMModel),
     "command_r": ModelRegistration(CausalLMModel),
     "csm": ModelRegistration(CausalLMModel),
-    "dots1": ModelRegistration(CausalLMModel),
+    "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
     "evolla": ModelRegistration(CausalLMModel),
     "exaone": ModelRegistration(CausalLMModel),
     "helium": ModelRegistration(CausalLMModel),
