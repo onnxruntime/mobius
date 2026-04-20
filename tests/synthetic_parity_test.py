@@ -81,9 +81,11 @@ _SKIP_REASONS: dict[str, str] = {
     "evolla": "EvollaConfig not registered with AutoModelForCausalLM (multimodal VLM)",
     # Architectural mismatches: ONNX uses CausalLMModel but HF uses a fundamentally
     # different architecture (MoE or MLA) that cannot be directly compared.
-    "youtu": "Youtu uses MLA (Multi-head Latent Attention); incompatible weight layout with CausalLMModel",
     "solar_open": "HF solar_open uses MoE with packed experts; ONNX uses dense CausalLMModel",
     "dots1": "HF dots1 (Dots.LLM1) is always MoE; ONNX uses dense CausalLMModel",
+    # Youtu is dense-only MLA; HF deepseek_v2 always creates MoE layers so
+    # synthetic parity doesn't produce a fair comparison.
+    "youtu": "Youtu is dense-only MLA; HF deepseek_v2 model always creates MoE layers",
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
