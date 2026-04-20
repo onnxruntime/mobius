@@ -92,11 +92,6 @@ _SKIP_REASONS: dict[str, str] = {
     # GraniteMoeHybrid: Mamba2+Attention hybrid uses LinearAttention; ORT function
     # inlining drops initializers inside function ops (pre-existing on main where
     # the old Mamba2Scan code crashed at runtime with a Squeeze shape error).
-    "granitemoehybrid": "Mamba2 hybrid model — LinearAttention function op inlining drops initializers",
-    # VL text sub-models with incompatible weight names: GLM4 uses fused gate_up_proj
-    # and extra post-layernorms that our CausalLMModel doesn't have.
-    "glm4v_text": "GLM4 uses fused gate_up_proj and extra post-layernorms; incompatible with CausalLMModel",
-    "glm4v_moe_text": "GLM4-MoE uses fused gate_up_proj and extra post-layernorms; incompatible with CausalLMModel",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -190,6 +185,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # accumulates small FP differences vs HF batched computation → ~0.05 max diff.
     # Argmax correct, cosine≥0.999 — model is functionally correct.
     "gpt_oss": 0.05,
+    # GraniteMoeHybrid: Mamba2 + MoE + shared-MLP FP accumulation differences.
+    # Argmax correct, cosine=0.999870 — model is functionally correct.
+    "granitemoehybrid": 0.02,
 }
 
 # Model types with known ONNX-vs-HF divergences, tracked as xfail.
@@ -224,6 +222,8 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "qwen3_vl_text",
         "qwen2_vl_text",
         "qwen2_5_vl_text",
+        "glm4v_text",
+        "glm4v_moe_text",
         # Not in HF CONFIG_MAPPING at all — purely mobius-internal aliases.
         "command_r",  # real HF type is cohere
         "codegen2",  # real HF type is codegen

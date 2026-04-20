@@ -872,7 +872,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     (
         "glm4v_text",
-        {},
+        {"attn_qkv_bias": True},
         False,
     ),
     (
@@ -880,6 +880,8 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         {
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
         },
         False,
     ),
@@ -2254,10 +2256,7 @@ _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 # Internal aliases removed from test configs — they are still registered in
 # the registry but should not appear in any test parametrization.  Their real
 # HF model_type counterpart (or the underlying model class) is already tested.
-_EXCLUDED_ALIASES: set[str] = {
-    "glm4v_moe_text",  # VL MoE text; no HF AutoModelForCausalLM support
-    "glm4v_text",  # VL text; GLM architecture incompatible with CausalLMModel
-}
+_EXCLUDED_ALIASES: set[str] = set()
 
 
 # ---------------------------------------------------------------------------

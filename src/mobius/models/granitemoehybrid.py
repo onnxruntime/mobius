@@ -24,7 +24,6 @@ HuggingFace reference: ``GraniteMoeHybridForCausalLM``.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,19 +33,156 @@ from onnxscript._internal import builder
 from mobius._configs import GraniteMoeHybridConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
-    MLP,
     Attention,
     Embedding,
     Linear,
     Mamba2Block,
-    MoELayer,
     RMSNorm,
     TopKGate,
     create_attention_bias,
+    get_activation,
 )
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+# ---------------------------------------------------------------------------
+# Fused MoE and shared-MLP blocks
+# ---------------------------------------------------------------------------
+
+
+class _Linear3D(nn.Module):
+    """3D stacked-expert linear layer.
+
+    Stores a single weight tensor ``[n_experts, out_features, in_features]``.
+    ``forward`` selects one expert slice by index and applies ``x @ W[e].T``,
+    equivalent to a per-expert :class:`Linear` without bias.
+    """
+
+    def __init__(self, n_experts: int, out_features: int, in_features: int):
+        super().__init__()
+        self.weight = nn.Parameter([n_experts, out_features, in_features])
+
+    def forward(
+        self, op: builder.OpBuilder, x: ir.Value, expert_index: int
+    ) -> ir.Value:
+        """Select expert *expert_index* and compute ``x @ W[expert_index].T``."""
+        # W[e]: [out_features, in_features]
+        w_e = op.Squeeze(
+            op.Gather(self.weight, [expert_index], axis=0), [0]
+        )
+        return op.MatMul(x, op.Transpose(w_e))
+
+
+class _FusedMoEBlock(nn.Module):
+    """MoE block with fused 3D expert weights matching HuggingFace naming.
+
+    HF stores expert weights as fused 3D tensors:
+
+    * ``input_linear.weight``  — shape ``[n_experts, 2*intermediate, hidden]``
+      (gate + up projections concatenated along dim-1)
+    * ``output_linear.weight`` — shape ``[n_experts, hidden, intermediate]``
+      (down projection per expert)
+
+    Dispatch: loop over static expert indices, Gather from 3D tensors,
+    apply gated SiLU MLP, accumulate routing-weighted results.
+
+    This avoids splitting fused weights in ``preprocess_weights``.
+    """
+
+    def __init__(self, config: GraniteMoeHybridConfig):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        self._num_experts = config.num_local_experts
+        self._intermediate_size = config.intermediate_size
+        self._top_k = config.num_experts_per_tok
+        self._act_fn = get_activation(config.hidden_act)
+
+        # Routing gate: HF name is router.layer, renamed to gate in preprocess_weights
+        self.gate = TopKGate(
+            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+        )
+
+        # Fused 3D expert weights — names match HF directly
+        # input_linear: [n_experts, 2*intermediate, hidden] (gate+up fused)
+        self.input_linear = _Linear3D(
+            config.num_local_experts,
+            2 * config.intermediate_size,
+            config.hidden_size,
+        )
+        # output_linear: [n_experts, hidden, intermediate] (down projection)
+        self.output_linear = _Linear3D(
+            config.num_local_experts,
+            config.hidden_size,
+            config.intermediate_size,
+        )
+
+    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+        """Route tokens to experts and accumulate weighted outputs."""
+        # routing_weights: [batch*seq, top_k], selected_experts: [batch*seq, top_k]
+        routing_weights, selected_experts = self.gate(op, hidden_states)
+
+        result = None
+        for e_idx in range(self._num_experts):
+            # Gated MLP per expert:
+            # input_linear selects expert e → x @ W[e].T → [T, 2*inter]
+            proj = self.input_linear(op, hidden_states, e_idx)
+            gate, up = op.Split(proj, axis=-1, num_outputs=2, _outputs=2)
+            activated = op.Mul(self._act_fn(op, gate), up)  # [T, inter]
+            # output_linear selects expert e → activated @ W[e].T → [T, hidden]
+            expert_output = self.output_linear(op, activated, e_idx)
+
+            # Mask and weight: accumulate only for tokens routed to this expert
+            expert_id = op.Constant(value_int=e_idx)
+            match = op.Equal(selected_experts, expert_id)
+            match_float = op.CastLike(match, routing_weights)
+            weighted = op.Mul(routing_weights, match_float)
+            weight = op.ReduceSum(weighted, [-1], keepdims=True)
+            contribution = op.Mul(expert_output, weight)
+
+            if result is None:
+                result = contribution
+            else:
+                result = op.Add(result, contribution)
+
+        return result
+
+
+class _FusedSharedMLP(nn.Module):
+    """Shared MLP with fused gate+up matching HuggingFace naming.
+
+    HF stores shared-MLP weights as:
+
+    * ``input_linear.weight``  — shape ``[2*shared_intermediate, hidden]``
+    * ``output_linear.weight`` — shape ``[hidden, shared_intermediate]``
+
+    Forward::
+
+        gate_up = x @ input_linear.T       # [*, 2*shared_intermediate]
+        gate, up = split(gate_up, axis=-1)
+        return act(gate) * up @ output_linear.T  # [*, hidden]
+    """
+
+    def __init__(self, config: GraniteMoeHybridConfig):
+        super().__init__()
+        self.input_linear = Linear(
+            config.hidden_size,
+            2 * config.shared_intermediate_size,
+            bias=config.mlp_bias,
+        )
+        self.output_linear = Linear(
+            config.shared_intermediate_size,
+            config.hidden_size,
+            bias=config.mlp_bias,
+        )
+        self.act_fn = get_activation(config.hidden_act)
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        gate_up = self.input_linear(op, x)  # [*, 2*shared_intermediate]
+        gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
+        return self.output_linear(op, op.Mul(self.act_fn(op, gate), up))
+
 
 # ---------------------------------------------------------------------------
 # Decoder layers
@@ -82,17 +218,11 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE: top-k expert selection with softmax weighting
-        gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
-        )
-        self.block_sparse_moe = MoELayer(config, gate=gate)
+        # Routed MoE with fused 3D expert weights
+        self.block_sparse_moe = _FusedMoEBlock(config)
 
-        # Dense shared MLP: runs on every token unconditionally
-        shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_intermediate_size
-        )
-        self.shared_mlp = MLP(shared_config)
+        # Dense shared MLP with fused gate+up weight
+        self.shared_mlp = _FusedSharedMLP(config)
 
         self._residual_multiplier = config.residual_multiplier
 
@@ -154,17 +284,11 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.self_attn = Attention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Routed MoE: top-k expert selection with softmax weighting
-        gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
-        )
-        self.block_sparse_moe = MoELayer(config, gate=gate)
+        # Routed MoE with fused 3D expert weights
+        self.block_sparse_moe = _FusedMoEBlock(config)
 
-        # Dense shared MLP: runs on every token unconditionally
-        shared_config = dataclasses.replace(
-            config, intermediate_size=config.shared_intermediate_size
-        )
-        self.shared_mlp = MLP(shared_config)
+        # Dense shared MLP with fused gate+up weight
+        self.shared_mlp = _FusedSharedMLP(config)
 
         self._residual_multiplier = config.residual_multiplier
 
@@ -233,7 +357,7 @@ class _GraniteMoeHybridTextModel(nn.Module):
             else:
                 self.layers.append(_GraniteMoeHybridAttentionDecoderLayer(config))
 
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # No rotary_emb: GraniteMoeHybrid uses NoPE (no positional encodings)
 
     def forward(
@@ -267,7 +391,7 @@ class _GraniteMoeHybridTextModel(nn.Module):
             )
             present_key_values.append(present_kv)
 
-        hidden_states = self.final_layernorm(op, hidden_states)
+        hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
 
 
@@ -320,22 +444,22 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
         Handles:
         1. Weight tying (embed_tokens ↔ lm_head)
         2. MoE gate: block_sparse_moe.router.layer.weight → block_sparse_moe.gate.weight
-        3. MoE fused input: block_sparse_moe.input_linear [n_experts, 2*mid, hidden]
-           → per-expert block_sparse_moe.experts.{e}.{gate,up}_proj.weight
-        4. MoE fused output: block_sparse_moe.output_linear [n_experts, hidden, mid]
-           → per-expert block_sparse_moe.experts.{e}.down_proj.weight
-        5. Shared MLP fused gate+up: shared_mlp.input_linear [2*shared_mid, hidden]
-           → shared_mlp.gate_proj.weight + shared_mlp.up_proj.weight
-        6. Shared MLP down proj: shared_mlp.output_linear → shared_mlp.down_proj
+
+        Fused expert weights (``input_linear``, ``output_linear``) and shared-MLP
+        weights pass through directly — the ONNX model stores them in the same
+        fused layout as HuggingFace.
         """
         if self.config.tie_word_embeddings:
             tie_word_embeddings(state_dict)
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            new_key = _rename_granitemoehybrid_weight(key, value, new_state_dict)
-            if new_key is not None:
-                new_state_dict[new_key] = value
+            # MoE gate: router.layer.weight → gate.weight
+            new_key = key.replace(
+                ".block_sparse_moe.router.layer.",
+                ".block_sparse_moe.gate.",
+            )
+            new_state_dict[new_key] = value
 
         return new_state_dict
 
@@ -343,117 +467,3 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight name mapping
 # ---------------------------------------------------------------------------
-
-
-def _rename_granitemoehybrid_weight(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> str | None:
-    """Rename a single HF GraniteMoeHybrid weight key to our ONNX naming.
-
-    Returns the new key, or None if the weight was handled inline
-    (fused tensors split into multiple per-expert outputs).
-    """
-    # MoE gate: router.layer.weight → gate.weight
-    # e.g. "…block_sparse_moe.router.layer.weight" → "…block_sparse_moe.gate.weight"
-    key = key.replace(".block_sparse_moe.router.layer.", ".block_sparse_moe.gate.")
-
-    # MoE fused input_linear [n_experts, 2*intermediate, hidden]
-    # → per-expert {gate,up}_proj.weight
-    if ".block_sparse_moe.input_linear" in key:
-        _split_moe_fused_gate_up(key, value, out)
-        return None  # handled inline
-
-    # MoE fused output_linear [n_experts, hidden, intermediate]
-    # → per-expert down_proj.weight
-    if ".block_sparse_moe.output_linear" in key:
-        _split_moe_fused_down(key, value, out)
-        return None  # handled inline
-
-    # Shared MLP fused input_linear [2*shared_intermediate, hidden]
-    # → gate_proj.weight + up_proj.weight
-    if ".shared_mlp.input_linear" in key:
-        _split_shared_mlp_fused_gate_up(key, value, out)
-        return None  # handled inline
-
-    # Shared MLP down proj: output_linear → down_proj
-    # e.g. "…shared_mlp.output_linear.weight" → "…shared_mlp.down_proj.weight"
-    if ".shared_mlp.output_linear" in key:
-        return key.replace(".shared_mlp.output_linear", ".shared_mlp.down_proj")
-
-    return key
-
-
-def _split_moe_fused_gate_up(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused MoE input_linear into per-expert gate_proj + up_proj.
-
-    HF stores:
-        ``layers.{i}.block_sparse_moe.input_linear.weight``
-        with shape ``[n_experts, 2*intermediate, hidden]``
-
-    We need per-expert:
-        ``layers.{i}.block_sparse_moe.experts.{e}.gate_proj.weight``
-        ``layers.{i}.block_sparse_moe.experts.{e}.up_proj.weight``
-    """
-    # Derive the base path: e.g. "model.layers.0.block_sparse_moe"
-    sep = ".block_sparse_moe.input_linear"
-    prefix = key[: key.index(sep)]
-    base = f"{prefix}.block_sparse_moe"
-
-    n_experts = value.shape[0]
-    intermediate = value.shape[1] // 2
-    for e in range(n_experts):
-        expert_w = value[e]  # [2*intermediate, hidden]
-        out[f"{base}.experts.{e}.gate_proj.weight"] = expert_w[:intermediate]
-        out[f"{base}.experts.{e}.up_proj.weight"] = expert_w[intermediate:]
-
-
-def _split_moe_fused_down(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused MoE output_linear into per-expert down_proj.
-
-    HF stores:
-        ``layers.{i}.block_sparse_moe.output_linear.weight``
-        with shape ``[n_experts, hidden, intermediate]``
-
-    We need per-expert:
-        ``layers.{i}.block_sparse_moe.experts.{e}.down_proj.weight``
-    """
-    sep = ".block_sparse_moe.output_linear"
-    prefix = key[: key.index(sep)]
-    base = f"{prefix}.block_sparse_moe"
-
-    n_experts = value.shape[0]
-    for e in range(n_experts):
-        out[f"{base}.experts.{e}.down_proj.weight"] = value[e]
-
-
-def _split_shared_mlp_fused_gate_up(
-    key: str,
-    value: torch.Tensor,
-    out: dict[str, torch.Tensor],
-) -> None:
-    """Expand fused shared_mlp input_linear into gate_proj + up_proj.
-
-    HF stores:
-        ``layers.{i}.shared_mlp.input_linear.weight``
-        with shape ``[2*shared_intermediate, hidden]``
-
-    We need:
-        ``layers.{i}.shared_mlp.gate_proj.weight``
-        ``layers.{i}.shared_mlp.up_proj.weight``
-    """
-    sep = ".shared_mlp.input_linear"
-    prefix = key[: key.index(sep)]
-
-    intermediate = value.shape[0] // 2
-    out[f"{prefix}.shared_mlp.gate_proj.weight"] = value[:intermediate]
-    out[f"{prefix}.shared_mlp.up_proj.weight"] = value[intermediate:]
