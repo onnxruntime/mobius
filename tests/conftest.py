@@ -62,6 +62,23 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 # ---------------------------------------------------------------------------
 # Collection hooks
 # ---------------------------------------------------------------------------
+
+
+def _build_model_id_to_types() -> dict[str, set[str]]:
+    """Build reverse map from HF model_id to model_type strings.
+
+    Uses ``_TEST_MODEL_IDS`` from the registry which maps
+    ``model_type → HF model_id``.  We invert it so golden test cases
+    (keyed by ``model_id``) can be matched to ``--models`` selections.
+    """
+    from mobius._registry import _TEST_MODEL_IDS
+
+    result: dict[str, set[str]] = {}
+    for model_type, model_id in _TEST_MODEL_IDS.items():
+        result.setdefault(model_id, set()).add(model_type)
+    return result
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
@@ -84,14 +101,25 @@ def pytest_collection_modifyitems(
     if models_opt:
         selected_models = {m.strip() for m in models_opt.split(",") if m.strip()}
         skip_model = pytest.mark.skip(reason="not in --models selection")
+        model_id_to_types = _build_model_id_to_types()
         for item in items:
             if not hasattr(item, "callspec"):
                 continue
-            if "model_type" not in item.callspec.params:
+            # Direct model_type parameter (build_graph_test, etc.)
+            if "model_type" in item.callspec.params:
+                model_type = item.callspec.params["model_type"]
+                if model_type not in selected_models:
+                    item.add_marker(skip_model)
                 continue
-            model_type = item.callspec.params["model_type"]
-            if model_type not in selected_models:
-                item.add_marker(skip_model)
+            # Golden test cases: resolve model_id → model_type via
+            # _TEST_MODEL_IDS reverse map.
+            if "case" in item.callspec.params:
+                case = item.callspec.params["case"]
+                model_id = getattr(case, "model_id", None)
+                if model_id is not None:
+                    case_types = model_id_to_types.get(model_id, set())
+                    if not (case_types & selected_models):
+                        item.add_marker(skip_model)
 
     # --- --fast filter ---
     if not config.getoption("--fast"):

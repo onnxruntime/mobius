@@ -102,21 +102,21 @@ jobs:
               --tb=short
           else
             echo "Running L4 golden tests for affected models: $AFFECTED"
-            FILTER=$(echo "$AFFECTED" | python -c "
-          import json, sys, re
-          names = json.load(sys.stdin)
-          escaped = [re.sub(r'[^a-zA-Z0-9_]', '_', n) for n in names]
-          print(' or '.join(escaped))
+            # Convert JSON array to comma-separated list for --models
+            MODELS=$(echo "$AFFECTED" | python -c "
+          import json, sys
+          print(','.join(json.load(sys.stdin)))
           ")
-            if [ -n "$FILTER" ]; then
+            if [ -n "$MODELS" ]; then
               pytest tests/e2e_golden_test.py \
                 -m golden \
                 -v \
-                -k "$FILTER" \
+                --models "$MODELS" \
                 --timeout=300 \
                 --junitxml=junit-l4.xml \
                 --cov=src --cov-report=xml --cov-branch \
-                --tb=short
+                --tb=short \
+                || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
             else
               echo "No affected models — skipping"
             fi
