@@ -64,6 +64,7 @@ jobs:
       - name: Run L4 checkpoint-verified tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
         run: |
           pytest tests/e2e_golden_test.py \
             -m golden \
