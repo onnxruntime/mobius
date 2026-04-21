@@ -278,7 +278,8 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
     # Prepare decoder input (pad token for autoregressive start)
     decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
     if decoder_start_id is None:
-        decoder_start_id = getattr(model.generation_config, "decoder_start_token_id", 0) or 0
+        generation_config = getattr(model, "generation_config", None)
+        decoder_start_id = getattr(generation_config, "decoder_start_token_id", None) or 0
     decoder_start = np.array([[decoder_start_id]], dtype=np.int64)
 
     # L4: single forward pass through full model
@@ -747,11 +748,20 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
 
     # Forward pass → last_hidden_state
     hidden_states = torch_vision_forward(model, pixel_values)
-    # Some vision models (CvT, MobileViT, PVT) return 4-D feature maps
-    # [B, C, H, W] instead of [B, seq_len, hidden].  Flatten everything
-    # into a 1-D vector for top-k extraction.
+    # Vision models return different output shapes:
+    # - ViT-like: [B, seq_len, hidden] → select first token (CLS)
+    # - CNN-like (CvT, MobileViT, PVT): [B, C, H, W] → flatten feature map
+    # - Classification head: [B, num_classes] → 1-D logits
     batch_hidden = hidden_states[0]  # drop batch dim
-    last_hidden = batch_hidden.reshape(-1) if batch_hidden.ndim > 1 else batch_hidden
+    if batch_hidden.ndim == 2:
+        # (seq_len, hidden) — take CLS token
+        last_hidden = batch_hidden[0]
+    elif batch_hidden.ndim >= 3:
+        # (C, H, W) feature map — flatten
+        last_hidden = batch_hidden.reshape(-1)
+    else:
+        # 1-D logits or already flat
+        last_hidden = batch_hidden
     golden = _extract_logits_golden(last_hidden)
 
     # Image classification is L4-only (no generation)

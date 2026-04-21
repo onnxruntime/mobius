@@ -435,10 +435,18 @@ def torch_vision_forward(
     # Some models (DepthAnything) return predicted_depth or similar.
     if hasattr(outputs, "predicted_depth") and outputs.predicted_depth is not None:
         return outputs.predicted_depth.cpu().numpy()
-    # Generic fallback: first tensor in the output.
-    for v in outputs.values():
-        if hasattr(v, "cpu"):
-            return v.cpu().numpy()
+    # Generic fallback: accept dict-like ModelOutput, tuple, or list returns.
+    if hasattr(outputs, "cpu"):
+        return outputs.cpu().numpy()
+    values = None
+    if hasattr(outputs, "values"):
+        values = outputs.values()
+    elif isinstance(outputs, (tuple, list)):
+        values = outputs
+    if values is not None:
+        for v in values:
+            if hasattr(v, "cpu"):
+                return v.cpu().numpy()
     raise ValueError(f"No usable tensor in model outputs: {type(outputs)}")
 
 
