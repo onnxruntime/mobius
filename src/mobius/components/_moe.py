@@ -217,7 +217,7 @@ class MoELayer(nn.Module):
             expert_output = expert(op, hidden_states)
             expert_id = op.Constant(value_int=expert_idx)
             match = op.Equal(selected_experts, expert_id)
-            match_float = op.Cast(match, to=1)  # FLOAT
+            match_float = op.CastLike(match, routing_weights)
             weighted = op.Mul(routing_weights, match_float)
             weight = op.ReduceSum(weighted, [-1], keepdims=True)
             contribution = op.Mul(expert_output, weight)

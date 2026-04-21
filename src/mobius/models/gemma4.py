@@ -1422,6 +1422,17 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict[new_key] = state_dict.pop(key)
             elif "vision_tower" in key or "embed_vision" in key:
                 state_dict.pop(key, None)
+        # Split fused per-layer embedding: HF stores one [V, L*D] tensor;
+        # we use nn.ModuleList of L separate [V, D] Embedding tables.
+        per_layer_dim = self.config.hidden_size_per_layer_input
+        if per_layer_dim > 0:
+            fused_key = "model.embed_tokens_per_layer.weight"
+            if fused_key in state_dict:
+                value = state_dict.pop(fused_key)
+                num_layers = self.config.num_hidden_layers
+                for i in range(num_layers):
+                    shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
+                    state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = shard
         # Map HF expert weight names to our 3D stacked parameter names.
         # HF stores: layers.N.experts.gate_up_proj [E, 2*inter, H]
         #             layers.N.experts.down_proj     [E, H, inter]

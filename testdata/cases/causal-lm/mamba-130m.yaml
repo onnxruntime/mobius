@@ -13,4 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "Mamba conv_state requires rank-3 tensors; weight loading fails"
 notes: "Mamba 130M. Pure state-space model (SSM) architecture, no attention."

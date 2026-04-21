@@ -22,6 +22,7 @@ from mobius.components import (
     LayerNorm,
     Linear,
     create_padding_mask,
+    create_sliding_window_mask,
 )
 from mobius.components._attention import Attention
 from mobius.models.base import CausalLMModel
@@ -311,6 +312,9 @@ class _GPT2TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig, post_norm: bool = False):
         super().__init__()
         self.post_norm = post_norm
+        # Per-layer attention type ("global" vs "local") for GPT-Neo
+        self.layer_types = config.layer_types
+        self.sliding_window = config.sliding_window
         self.wte = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.wpe = Embedding(config.max_position_embeddings, config.hidden_size)
         self.h = nn.ModuleList(
@@ -319,7 +323,10 @@ class _GPT2TextModel(nn.Module):
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # OpenAI-GPT (post_norm) has no final layer norm — each decoder
+        # layer already applies post-attention and post-MLP norms.
+        if not post_norm:
+            self.ln_f = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -338,15 +345,37 @@ class _GPT2TextModel(nn.Module):
         position_embeds = self.wpe(op, position_ids)
         hidden_states = op.Add(hidden_states, position_embeds)
 
-        attention_bias = create_padding_mask(
+        # Default mask: bool padding mask (causal handled by Attention op)
+        global_mask = create_padding_mask(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
+        # GPT-Neo local attention: sliding window mask for "local" layers
+        local_mask = None
+        if self.layer_types and self.sliding_window:
+            local_mask = create_sliding_window_mask(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                window_size=self.sliding_window,
+            )
+
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.h)
-        for layer, past_kv in zip(self.h, past_kvs):
+        for i, (layer, past_kv) in enumerate(zip(self.h, past_kvs)):
+            # Select mask: local layers use sliding window, global use standard
+            if (
+                local_mask is not None
+                and self.layer_types is not None
+                and i < len(self.layer_types)
+                and self.layer_types[i] == "local"
+            ):
+                attention_bias = local_mask
+            else:
+                attention_bias = global_mask
+
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,

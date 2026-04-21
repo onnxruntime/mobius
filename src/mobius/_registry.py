@@ -50,6 +50,7 @@ from mobius.models import (
     GlmCausalLMModel,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
+    GraniteMoECausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
     InternLM2CausalLMModel,
@@ -66,6 +67,7 @@ from mobius.models import (
     Phi4MMMultiModalModel,
     PhiCausalLMModel,
     Qwen2MoECausalLMModel,
+    Qwen2VLCausalLMModel,
     Qwen3CausalLMModel,
     Qwen3NextCausalLMModel,
     Qwen3VL3ModelCausalLMModel,
@@ -86,7 +88,7 @@ from mobius.models.bart import BartForConditionalGeneration
 from mobius.models.bert import BertModel
 from mobius.models.blip import BlipVisionModel
 from mobius.models.blip2 import Blip2Model
-from mobius.models.clip import CLIPTextModel, CLIPVisionModel
+from mobius.models.clip import CLIPTextModel, CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
@@ -122,6 +124,7 @@ from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
+from mobius.models.zamba2 import Zamba2CausalLMModel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -349,7 +352,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "codegen2": ModelRegistration(CausalLMModel),
     "command_r": ModelRegistration(CausalLMModel),
     "csm": ModelRegistration(CausalLMModel),
-    "dots1": ModelRegistration(CausalLMModel),
+    "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
     "evolla": ModelRegistration(CausalLMModel),
     "exaone": ModelRegistration(CausalLMModel),
     "helium": ModelRegistration(CausalLMModel),
@@ -365,9 +368,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "seed_oss": ModelRegistration(CausalLMModel),
     "solar_open": ModelRegistration(CausalLMModel),
     "yi": ModelRegistration(CausalLMModel),
-    "youtu": ModelRegistration(CausalLMModel),
+    "youtu": ModelRegistration(DeepSeekV3CausalLMModel),
     "zamba": ModelRegistration(CausalLMModel),
-    "zamba2": ModelRegistration(CausalLMModel),
+    "zamba2": ModelRegistration(Zamba2CausalLMModel),
     # --- Text Generation (architecture-specific) ---
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),
@@ -423,9 +426,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "ernie4_5_moe": ModelRegistration(Ernie45MoECausalLMModel),
     "flex_olmo": ModelRegistration(MoECausalLMModel),
     "glm4_moe": ModelRegistration(Glm4MoECausalLMModel),
-    "granitemoe": ModelRegistration(MoECausalLMModel),
+    "granitemoe": ModelRegistration(GraniteMoECausalLMModel),
     "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
-    "granitemoeshared": ModelRegistration(MoECausalLMModel),
+    "granitemoeshared": ModelRegistration(GraniteMoECausalLMModel),
     "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
     "jetmoe": ModelRegistration(JetMoeCausalLMModel),
     "minimax": ModelRegistration(MiniMaxCausalLMModel),
@@ -466,8 +469,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
-    "glm4v_moe_text": ModelRegistration(MoECausalLMModel),
-    "glm4v_text": ModelRegistration(CausalLMModel),
+    "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
+    "glm4v_text": ModelRegistration(Glm4CausalLMModel),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -491,7 +494,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "pixtral": ModelRegistration(LLaVAModel, task="pixtral-vl"),
     "qwen2_5_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
     "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
-    "qwen2_vl": ModelRegistration(Qwen25VLCausalLMModel, task="qwen-vl"),
+    "qwen2_vl": ModelRegistration(Qwen2VLCausalLMModel, task="qwen-vl"),
     "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
     "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_vl": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
@@ -617,8 +620,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "segformer": ModelRegistration(
         SegformerForSemanticSegmentation, task="image-classification"
     ),
-    "siglip2_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
-    "siglip_vision_model": ModelRegistration(CLIPVisionModel, task="image-classification"),
+    "siglip": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip2_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
+    "siglip_vision_model": ModelRegistration(SigLIPVisionModel, task="image-classification"),
     "swin": ModelRegistration(ViTModel, task="image-classification"),
     "swin2sr": ModelRegistration(ViTModel, task="image-classification"),
     "swinv2": ModelRegistration(ViTModel, task="image-classification"),
@@ -698,6 +703,15 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "youtu": "tencent/Youtu-LLM-2B-Base",
     "zamba": "Zyphra/Zamba-7B-v1",
     "zamba2": "Zyphra/Zamba2-1.2B",
+    "codegen2": "Salesforce/codegen2-1B",
+    "command_r": "CohereForAI/c4ai-command-r-v01",
+    "csm": "sesame/csm-1b",
+    "evolla": "westlake-repl/Evolla-10B-hf",
+    "nemotron_h": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "open-llama": "openlm-research/open_llama_3b",
+    "persimmon": "adept/persimmon-8b-base",
+    "shieldgemma2": "google/shieldgemma-2b",
+    "solar_open": "upstage/solar-pro-preview-instruct",
 
     # --- CausalLM (architecture-specific) ---
     "falcon": "tiiuae/falcon-7b",
@@ -802,6 +816,33 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
     "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
+    "aya_vision": "CohereForAI/aya-vision-8b",
+    "chameleon": "facebook/chameleon-7b",
+    "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",
+    "deepseek_vl": "deepseek-ai/deepseek-vl2-tiny",
+    "deepseek_vl_hybrid": "deepseek-ai/deepseek-vl2-tiny",
+    "deepseek_vl_v2": "deepseek-ai/deepseek-vl2-tiny",
+    "fuyu": "adept/fuyu-8b",
+    "glm4v": "THUDM/glm-4v-9b",
+    "glm4v_moe": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_text": "THUDM/glm-4v-9b",
+    "got_ocr2": "stepfun-ai/GOT-OCR2_0",
+    "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
+    "internvl": "OpenGVLab/InternVL2-1B",
+    "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
+    "janus": "deepseek-ai/Janus-Pro-1B",
+    "llava_next_video": "llava-hf/LLaVA-NeXT-Video-7B-hf",
+    "ovis2": "AIDC-AI/Ovis2-1B",
+    "paligemma": "google/paligemma-3b-pt-224",
+    "pixtral": "mistralai/Pixtral-12B-2409",
+    "qwen3_5_vl": "Qwen/Qwen3.5-2B",
+    "qwen3_5_vl_text": "Qwen/Qwen3.5-2B",
+    "qwen3_vl_single": "Qwen/Qwen3-VL-2B-Instruct",
+    "sam2": "facebook/sam2-hiera-base-plus",
+    "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "video_llava": "LanguageBind/Video-LLaVA-7B-hf",
+    "vipllava": "llava-hf/vip-llava-7b-hf",
 
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
@@ -817,6 +858,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "musicgen": "facebook/musicgen-small",
     "seamless_m4t": "facebook/hf-seamless-m4t-medium",
     "seamless_m4t_v2": "facebook/seamless-m4t-v2-large",
+    "mctct": "speechbrain/m-ctc-t-large",
+    "qwen3_forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "qwen3_tts": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "qwen3_tts_tokenizer_12hz": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "voxtral_encoder": "mistralai/Ministral-3-3B-Instruct-2512",
 
     # --- Encoder-only ---
     "bert": "google-bert/bert-base-uncased",
@@ -828,6 +874,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deberta-v2": "microsoft/deberta-v3-base",
     "xlm-roberta": "FacebookAI/xlm-roberta-base",
     "modernbert": "answerdotai/ModernBERT-base",
+    "modernbert-decoder": "answerdotai/ModernBERT-base",
+    "megatron-bert": "nvidia/megatron-bert-uncased-345m",
+    "qdqbert": "google-bert/bert-base-uncased",
     "clip_text_model": "openai/clip-vit-base-patch32",
     "bros": "naver-clova-ocr/bros-base-uncased",
     "camembert": "almanach/camembert-base",
@@ -880,6 +929,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "switch_transformers": "google/switch-base-8",
     "umt5": "IMISLab/GreekT5-umt5-small-greeksum",
     "xlm-prophetnet": "microsoft/xprophetnet-large-wiki100-cased",
+    "nllb-moe": "facebook/nllb-moe-54b",
+    "nllb_moe": "facebook/nllb-moe-54b",
 
     # --- Vision ---
     "vit": "google/vit-base-patch16-224",
@@ -901,12 +952,17 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mobilevitv2": "apple/mobilevitv2-1.0-imagenet1k-256",
     "pvt": "Zetatech/pvt-tiny-224",
     "pvt_v2": "OpenGVLab/pvt_v2_b0",
+    "siglip": "google/siglip-base-patch16-224",
+    "siglip2": "google/siglip2-base-patch16-224",
     "siglip_vision_model": "google/siglip-base-patch16-224",
     "siglip2_vision_model": "google/siglip2-base-patch16-224",
     "swin2sr": "caidas/swin2SR-classical-sr-x2-64",
     "swinv2": "microsoft/swinv2-tiny-patch4-window16-256",
     "vit_mae": "facebook/vit-mae-base",
     "vit_msn": "facebook/vit-msn-small",
+    "dinov3_vit": "facebook/dinov2-small",
+    "ijepa": "facebook/ijepa_vith14_1k",
+    "vit_hybrid": "google/vit-hybrid-base-bit-384",
 
     # --- Audio ---
     "wav2vec2": "facebook/wav2vec2-base",
@@ -1021,6 +1077,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "swinv2": "swin",
     "clip_text_model": "clip",
     "clip_vision_model": "clip",
+    "siglip": "clip",
+    "siglip2": "clip",
     "siglip_vision_model": "clip",
     "siglip2_vision_model": "clip",
 }

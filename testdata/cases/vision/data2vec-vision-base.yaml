@@ -8,5 +8,6 @@ inputs:
     - "pipeline-cat-chonk.jpeg"
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "Data2Vec vision base. Self-supervised vision encoder fine-tuned on ImageNet."

@@ -145,21 +145,26 @@ def _use_temp_hf_cache(tmp_path):
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
 _XFAIL_REASONS: dict[str, str] = {
-    # Weight loading bugs: preprocess_weights doesn't map all HF names
-    "text-generation/mamba-130m": "Mamba conv_state requires rank-3 tensors (not standard KV cache)",
-    "text-generation/olmoe-1b-7b": "OLMoE MoE weight mapping incomplete",
-    "text-generation/qwen1_5-moe": "Qwen1.5-MoE weight mapping incomplete",
-    "feature-extraction/albert-base-v2": "ALBERT shared-parameter weight loading incomplete",
-    "feature-extraction/modernbert-base": "ModernBERT preprocess_weights incomplete",
-    # Real parity failures: weights load but argmax doesn't match
-    "text-generation/gemma-2-2b": "Gemma-2 L5 generation diverges (10% token match ratio)",
-    # VL multi-model inference: test infra needs model-specific position_ids
-    "image-text-to-text/qwen3_5-2b": "LpNormalization(22) not supported in installed ORT version",
-    "image-text-to-text/llava-1_5-7b": "VL multi-model prefill pipeline not yet implemented for LLaVA",
+    # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
+    "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
+}
+
+# Failures that only apply to L5 (generation loop), not L4 (single forward).
+_L5_ONLY_XFAIL_REASONS: dict[str, str] = {
+    # Generation loop divergence (L4 prefill passes, but decode loop drifts)
+    "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
+    "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
+    "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
+    "text-generation/smollm3-3b": "SmolLM3 3B decode loop diverges from HF (FP32 precision with 3B params)",
+    # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
+    "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
 
 
-def _discover_cases(level: str) -> list[pytest.ParameterSet]:
+def _discover_cases(
+    level: str,
+    extra_xfails: dict[str, str] | None = None,
+) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
 
     Missing golden files or explicit ``skip_reason`` fields produce
@@ -167,6 +172,7 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
+    all_xfails = {**_XFAIL_REASONS, **(extra_xfails or {})}
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -178,8 +184,8 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in _XFAIL_REASONS:
-            marks.append(pytest.mark.xfail(reason=_XFAIL_REASONS[test_id], strict=False))
+        elif test_id in all_xfails:
+            marks.append(pytest.mark.xfail(reason=all_xfails[test_id], strict=False))
 
         params.append(
             pytest.param(
@@ -192,7 +198,7 @@ def _discover_cases(level: str) -> list[pytest.ParameterSet]:
 
 
 _L4_CASES = _discover_cases("L4")
-_L5_CASES = _discover_cases("L5")
+_L5_CASES = _discover_cases("L5", extra_xfails=_L5_ONLY_XFAIL_REASONS)
 
 
 # ---------------------------------------------------------------------------
@@ -344,14 +350,7 @@ def _prepare_prefill_feeds(
         assert hasattr(config, "head_dim"), (
             f"Config {type(config).__name__} missing 'head_dim' — cannot build KV cache feeds"
         )
-        num_kv_heads = config.num_key_value_heads  # type: ignore[union-attr]
-        head_dim = config.head_dim  # type: ignore[union-attr]
-        for name in session.input_names:
-            if name.startswith("past_key_values."):
-                feeds[name] = np.zeros(
-                    (1, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
+        feeds.update(_make_empty_kv_cache(session, config))
 
     return feeds
 

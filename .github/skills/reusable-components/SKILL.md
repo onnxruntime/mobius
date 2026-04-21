@@ -629,3 +629,70 @@ The generation loop extracts the weights once via a dummy inference:
 weights = session.run(dummy_inputs)["codec_embeddings"]  # (N, vocab, H)
 # Use as numpy lookup: embed = weights[step, code_id, :]
 ```
+
+## Shared weights with per-layer adapters
+
+Some architectures reuse the same transformer block across multiple layers,
+with per-layer low-rank adapters that differentiate each usage (e.g. Zamba2,
+which shares one transformer across 6 hybrid layers).
+
+### The scope challenge
+
+`onnxscript.nn` determines ONNX initializer names from the module call stack.
+A single module instance called multiple times produces the **same** initializer
+names each time — which is exactly what we want for shared weights.  But
+per-layer adapters need **different** names for each layer.
+
+### Pattern: split shared + per-instance modules
+
+```python
+class _TextModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # Shared weights: ONE instance → single set of ONNX initializers
+        self.shared_transformer = SharedAttentionLayer(config)
+
+        # Per-layer adapters: ModuleList → "adapters.0.*", "adapters.1.*"
+        self.adapters = nn.ModuleList([
+            AdapterModule(config) for _ in range(num_layers)
+        ])
+
+        # Shared MLP at model scope if adapter output must mix with MLP
+        self.gate_proj = Linear(hidden, intermediate)
+```
+
+### Critical: use `__call__` for per-index scope
+
+When iterating over adapter ModuleList elements, you **must** call the
+element (triggering `__call__`) rather than accessing its sub-attributes:
+
+```python
+# ❌ Broken: adapter_out gets "q_adapter.weight" scope (same for all idx!)
+adapter_out = self.adapters[idx].q_adapter(op, x)
+
+# ✅ Correct: adapter_out gets "adapters.{idx}.q_adapter.weight" scope
+adapter_out = self.adapters[idx](op, x)
+```
+
+### Handling the MLP circular dependency
+
+When per-layer adapter output must be combined with shared MLP weights, and
+the adapter input comes from inside the shared module, split the shared
+module into phases:
+
+1. **Phase 1 — Shared attention:** `shared_transformer(op, x)` → returns
+   `mlp_input` (pre-MLP hidden states) + KV cache
+2. **Phase 2 — Per-layer adapter:** `self.adapters[idx](op, mlp_input)` →
+   per-layer contribution (correct `adapters.{idx}` scope)
+3. **Phase 3 — Shared MLP at caller scope:** Apply gate/up/down projections
+   registered on the caller module, combining with adapter output
+
+```python
+# In _TextModel.forward():
+mlp_input, kv = self.shared_transformer(op, x)           # shared scope
+adapter_out = self.mlp_adapters[idx](op, mlp_input)       # per-layer scope
+gate = op.Add(self.gate_proj(op, mlp_input), adapter_out) # model scope
+```
+
+**Reference implementation:** `models/zamba2.py` — Zamba2 hybrid Mamba2 +
+shared attention with Q/K/V/MLP low-rank adapters.

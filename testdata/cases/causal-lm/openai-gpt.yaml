@@ -5,7 +5,7 @@ dtype: "float32"
 
 inputs:
   prompts:
-    - "Here is my poem:"
+    - "The quick brown fox"
 
 level: "L4+L5"
 

@@ -258,6 +258,103 @@ if self.config.tie_word_embeddings:
 Some HF weights are not needed (e.g. `rotary_emb.inv_freq` — RoPE
 frequencies are computed at runtime).
 
+## ⚠️ Scope mechanism pitfalls
+
+Understanding how `onnxscript.nn` builds parameter names is critical.  Names
+come from the **call-stack of `__call__` invocations**, not from the Python
+attribute chain used to *reach* a module.
+
+### Rule: only `__call__` pushes scope
+
+When you call `module(op, x)`, the base `nn.Module.__call__` method:
+1. Pushes `module._name` onto the scope stack
+2. Calls `module.forward(op, x)`
+3. Pops the scope
+
+**Accessing a child and calling its method directly bypasses the parent scope:**
+
+```python
+# ❌ BAD — self.shared.child(op, x) only pushes "child", NOT "shared"
+result = self.shared.child(op, x)
+# Parameter name: "child.weight" (missing "shared." prefix!)
+
+# ✅ GOOD — call shared's forward, which internally calls child
+result = self.shared(op, x)
+# Parameter name: "shared.child.weight" ✓
+```
+
+### ModuleList indexing requires `__call__`
+
+The same rule applies to `nn.ModuleList`.  `self.items[i]` returns the
+module object — its `_name` is `"items.{i}"` — but that scope is only
+pushed when you call it:
+
+```python
+# ❌ BAD — sub_module's scope is pushed, but items.0 scope is NOT
+result = self.items[0].sub_module(op, x)
+# Parameter name: "sub_module.weight" (missing "items.0." prefix!)
+
+# ✅ GOOD — items[0].__call__ pushes "items.0", then forward calls sub_module
+result = self.items[0](op, x)
+# Parameter name: "items.0.sub_module.weight" ✓
+```
+
+**Key takeaway:** If you need per-index distinct parameter names (e.g.
+per-layer adapters), you **must** call the ModuleList element via
+`self.items[idx](op, ...)`, not reach into its sub-attributes.
+
+### Shared weights via single module instance
+
+When multiple layers reuse the same weights (e.g. Zamba2's shared
+transformer), register ONE module instance.  Calling it multiple times
+produces the same initializer names — ONNX uses a single initializer:
+
+```python
+class _TextModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # ONE shared module → ONE set of initializers
+        self.shared_transformer = SharedLayer(config)
+
+    def forward(self, op, x):
+        for i in range(num_uses):
+            # Same scope "shared_transformer.*" each time → same initializer
+            x = self.shared_transformer(op, x)
+```
+
+### Circular dependency: shared weights + per-instance data
+
+When shared weights and per-instance data (e.g. adapters) must interact in
+the same computation, the scope model creates a tension:
+
+- **Shared weights** must be inside a shared module (for correct scope)
+- **Per-instance data** must be outside (different scope per use)
+
+**Solution: split the computation.** Have the shared module return an
+intermediate value.  The caller computes per-instance contributions at its
+scope, then continues the computation with shared weights at its level:
+
+```python
+class _TextModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.shared_attn = SharedAttention(config)   # shared weights
+        self.adapters = nn.ModuleList([...])          # per-layer
+        self.gate_proj = Linear(...)                  # shared MLP at model scope
+
+    def forward(self, op, hidden):
+        for idx in range(num_layers):
+            # Phase 1: shared attention (inside shared module scope)
+            intermediate = self.shared_attn(op, hidden)
+            # Phase 2: per-layer adapter (at "adapters.{idx}" scope)
+            adapter_out = self.adapters[idx](op, intermediate)
+            # Phase 3: shared MLP at model scope (gate_proj is model attr)
+            hidden = self.gate_proj(op, op.Add(intermediate, adapter_out))
+```
+
+**Reference implementation:** `models/zamba2.py` — Zamba2 hybrid model with
+shared transformer + per-layer Q/K/V/MLP low-rank adapters.
+
 ## How to analyze a model's preprocess_weights
 
 1. **Compare HF names to ONNX names:**
@@ -315,3 +412,5 @@ work (e.g., different forward logic, or HF Sequential wraps padding + conv).
 | Conv1D transpose | GPT-2 | `models/gpt2.py` |
 | MoE expert remapping | MoE models | `models/moe.py` |
 | Deep structural renames | BERT, T5 | `models/bert.py`, `models/t5.py` |
+| Shared weights + per-layer adapters | Zamba2 | `models/zamba2.py` |
+| Scope-aware ModuleList adapters | Zamba2 | `models/zamba2.py` |

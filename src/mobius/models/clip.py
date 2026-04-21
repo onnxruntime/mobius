@@ -208,6 +208,130 @@ def _rename_clip_vision_weight(name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# SigLIP Vision Model (no CLS token, no pre-layernorm)
+# ---------------------------------------------------------------------------
+
+
+class _SigLIPVisionEmbeddings(nn.Module):
+    """SigLIP vision embeddings: Conv2d patch + position embeddings (no CLS token)."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        patch_size = config.patch_size
+        image_size = config.image_size
+
+        self.patch_embedding = _Conv2dPatchEmbed(
+            config.num_channels,
+            hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        num_patches = (image_size // patch_size) ** 2
+        self.position_embedding = Embedding(num_patches, hidden_size)
+
+    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+        patch_embeds = self.patch_embedding(op, pixel_values)
+        # Position IDs: [0, 1, ..., num_patches-1]
+        seq_len = op.Shape(patch_embeds, start=1, end=2)
+        position_ids = op.Range(op.Constant(value_int=0), seq_len, op.Constant(value_int=1))
+        position_ids = op.Cast(position_ids, to=7)
+        position_ids = op.Unsqueeze(position_ids, [0])
+        embeddings = op.Add(patch_embeds, self.position_embedding(op, position_ids))
+        return embeddings
+
+
+class SigLIPVisionModel(nn.Module):
+    """SigLIP vision model for standalone image feature extraction.
+
+    SigLIP is similar to CLIP but without a CLS token and without
+    pre-layernorm.  The position embedding size matches num_patches
+    exactly (no +1 for CLS).
+    """
+
+    default_task = "image-classification"
+    category = "vision"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.embeddings = _SigLIPVisionEmbeddings(config)
+        self.encoder = nn.ModuleList(
+            [_CLIPVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+        hidden_states = self.embeddings(op, pixel_values)
+
+        for layer in self.encoder:
+            hidden_states = layer(op, hidden_states)
+
+        hidden_states = self.post_layernorm(op, hidden_states)
+        return hidden_states
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        new_state_dict = {}
+        for name, tensor in state_dict.items():
+            new_name = _rename_siglip_vision_weight(name)
+            if new_name is not None:
+                new_state_dict[new_name] = tensor
+        return new_state_dict
+
+
+def _rename_siglip_vision_weight(name: str) -> str | None:
+    """Rename a HF SigLIP vision weight to our naming convention."""
+    for prefix in ("vision_model.", "model.vision_model."):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+
+    # Skip non-vision weights
+    if name.startswith(
+        ("text_model.", "text_projection.", "visual_projection.", "logit_scale")
+    ):
+        return None
+
+    # Embeddings — SigLIP uses flat patch_embedding.weight/bias,
+    # but our _Conv2dPatchEmbed wraps Conv2d in a .projection sub-module
+    if name.startswith("embeddings."):
+        name = name.replace(
+            "embeddings.patch_embedding.", "embeddings.patch_embedding.projection."
+        )
+        return name
+
+    # Post layer norm (SigLIP has no pre-layernorm)
+    if name.startswith("post_layernorm."):
+        return name
+    if name.startswith("layernorm."):
+        return name.replace("layernorm.", "post_layernorm.", 1)
+
+    # Encoder layers (same as CLIP)
+    if name.startswith("encoder.layers."):
+        parts = name.split(".", 3)
+        if len(parts) < 4:
+            return None
+        layer_idx = parts[2]
+        remainder = parts[3]
+
+        for old, new in _CLIP_LAYER_RENAMES.items():
+            if remainder.startswith(old):
+                suffix = remainder[len(old) :]
+                return f"encoder.{layer_idx}.{new}{suffix}"
+
+        remainder = remainder.replace("mlp.fc1.", "mlp.up_proj.")
+        remainder = remainder.replace("mlp.fc2.", "mlp.down_proj.")
+        return f"encoder.{layer_idx}.{remainder}"
+
+    # Head weights (e.g., classifier head for image classification)
+    if name.startswith("head."):
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CLIP Text Model
 # ---------------------------------------------------------------------------
 

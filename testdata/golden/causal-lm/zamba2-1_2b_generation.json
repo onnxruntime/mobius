@@ -1,0 +1,27 @@
+{
+  "model_id": "Zyphra/Zamba2-1.2B",
+  "prompt": "To explain General Relativity,",
+  "generated_tokens": [
+    478,
+    927,
+    298,
+    2380,
+    272,
+    5935,
+    302,
+    668,
+    323,
+    6244,
+    28723,
+    1670,
+    323,
+    6244,
+    349,
+    264,
+    2308,
+    28733,
+    13267,
+    5012
+  ],
+  "generated_text": "we need to understand the concept of spacetime. Spacetime is a four-dimensional continu"
+}

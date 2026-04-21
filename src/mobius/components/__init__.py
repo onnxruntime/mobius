@@ -73,6 +73,8 @@ __all__ = [
     "Qwen25VLVisionBlock",
     "Qwen25VLVisionModel",
     "Qwen25VLVisionRotaryEmbedding",
+    "Qwen2VLVisionBlock",
+    "Qwen2VLVisionModel",
     "Qwen35Attention",
     "Qwen3ASRAudioAttention",
     "Qwen3ASRAudioEncoderLayer",
@@ -105,6 +107,7 @@ __all__ = [
     "create_attention_bias",
     "create_decoder_layer",
     "create_padding_mask",
+    "create_sliding_window_mask",
     "get_activation",
     "initialize_rope",
     "make_quantized_linear_factory",
@@ -144,6 +147,7 @@ from mobius.components._common import (
     OffsetLayerNorm,
     create_attention_bias,
     create_padding_mask,
+    create_sliding_window_mask,
 )
 from mobius.components._conv import (
     BatchNorm2d,
@@ -220,6 +224,8 @@ from mobius.components._qwen3_vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
 )
 from mobius.components._qwen25_vl_vision import (
+    Qwen2VLVisionBlock,
+    Qwen2VLVisionModel,
     Qwen25VLPatchEmbed,
     Qwen25VLPatchMerger,
     Qwen25VLVisionAttention,
