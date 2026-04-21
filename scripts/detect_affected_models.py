@@ -48,15 +48,15 @@ _SHARED_INFRA_PATTERNS = (
     "src/mobius/models/__init__.py",
 )
 
-# Task files are resolved by string-based lookup at runtime (not Python
-# imports), so the import graph cannot trace task → model dependencies.
-# Keep tasks/ as shared_infra until a task→model_type mapping exists.
-_SHARED_INFRA_PREFIXES = ("src/mobius/tasks/",)
+_SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
 
 # Traceable infrastructure: component files that are analyzed via the
 # import graph to find which models they actually affect, rather than
 # triggering run_all unconditionally.
-_TRACEABLE_PREFIXES = ("src/mobius/components/",)
+_TRACEABLE_PREFIXES = (
+    "src/mobius/components/",
+    "src/mobius/tasks/",
+)
 
 
 def classify_file(path: str) -> str:
@@ -108,12 +108,24 @@ def classify_file(path: str) -> str:
 # ----------------------------------------------------------------
 
 
-def _parse_imports(filepath: Path) -> set[str]:
+def _parse_imports(
+    filepath: Path,
+    reexport_map: dict[tuple[str, str], str] | None = None,
+) -> set[str]:
     """Extract imported module names from a Python file using AST.
 
     Returns a set of dotted module names that appear in import
     statements. Only collects imports from within the
     mobius package.
+
+    When ``reexport_map`` is provided, ``from pkg import sym`` statements
+    are resolved through the re-export map to the underlying source
+    module that defines ``sym``. This avoids spurious dependencies on
+    re-export hubs like ``mobius.components/__init__.py``: a model that
+    imports ``Attention`` from ``mobius.components`` is recorded as
+    depending on ``mobius.components._attention`` (the actual source),
+    not on the package itself. Symbols not found in the re-export map
+    fall back to recording the package name.
     """
     try:
         source = filepath.read_text(encoding="utf-8")
@@ -129,8 +141,75 @@ def _parse_imports(filepath: Path) -> set[str]:
                     imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module.startswith("mobius"):
-                imports.add(node.module)
+                unresolved = False
+                for alias in node.names:
+                    if alias.name == "*":
+                        # Wildcard imports can't be resolved — fall back
+                        # to depending on the package itself.
+                        unresolved = True
+                        continue
+                    source_mod = (
+                        reexport_map.get((node.module, alias.name))
+                        if reexport_map is not None
+                        else None
+                    )
+                    if source_mod:
+                        imports.add(source_mod)
+                    else:
+                        unresolved = True
+                # Only record the package itself when at least one
+                # imported symbol could not be resolved through the
+                # re-export map. This avoids spurious dependencies on
+                # re-export hubs like ``mobius.components/__init__.py``.
+                if unresolved:
+                    imports.add(node.module)
     return imports
+
+
+def _build_reexport_map(search_dir: Path) -> dict[tuple[str, str], str]:
+    """Build a (package, symbol) → source_module map from ``__init__.py`` files.
+
+    Parses each ``__init__.py`` in the source tree for ``from .submodule
+    import Symbol`` and ``from mobius.pkg.submodule import Symbol``
+    statements. The resulting map lets us resolve re-exported symbols
+    back to their defining module so changes to a re-export hub don't
+    spuriously invalidate every importer.
+    """
+    reexport: dict[tuple[str, str], str] = {}
+    for init_file in search_dir.rglob("__init__.py"):
+        package = _module_name_from_path(init_file)
+        if not package:
+            continue
+        try:
+            source = init_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(init_file))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            # Resolve relative imports like ``from . import x`` or
+            # ``from .sub import X`` against the current package.
+            if node.level:
+                base_parts = package.split(".") if package else []
+                # ``from .`` keeps us at the same package; ``from ..`` goes up.
+                if node.level - 1 > len(base_parts):
+                    continue
+                base = ".".join(base_parts[: len(base_parts) - (node.level - 1)])
+                if node.module:
+                    src_module = f"{base}.{node.module}" if base else node.module
+                else:
+                    src_module = base
+            else:
+                src_module = node.module or ""
+            if not src_module.startswith("mobius"):
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                exported_name = alias.asname or alias.name
+                reexport[(package, exported_name)] = src_module
+    return reexport
 
 
 def _module_name_from_path(filepath: Path) -> str | None:
@@ -159,12 +238,13 @@ def _build_import_graph(
     modules it directly imports.
     """
     graph: dict[str, set[str]] = {}
+    reexport_map = _build_reexport_map(search_dir)
     for pyfile in search_dir.rglob("*.py"):
         if pyfile.name.endswith("_test.py"):
             continue
         mod_name = _module_name_from_path(pyfile)
         if mod_name:
-            graph[mod_name] = _parse_imports(pyfile)
+            graph[mod_name] = _parse_imports(pyfile, reexport_map)
     return graph
 
 
