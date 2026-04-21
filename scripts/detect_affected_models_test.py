@@ -18,7 +18,6 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-import detect_affected_models as _dam  # noqa: E402
 from detect_affected_models import (  # noqa: E402
     _SRC_ROOT,
     _build_class_to_source_module,
