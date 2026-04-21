@@ -89,6 +89,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime-gpu
           pip install -e '.[testing,transformers,ort-genai]'
           pip install soundfile librosa ml_dtypes
 
