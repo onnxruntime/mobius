@@ -2066,6 +2066,101 @@ class GraniteMoeHybridConfig(BambaConfig):
 
 
 @dataclasses.dataclass
+class Zamba2Config(ArchitectureConfig):
+    """Configuration for Zamba2 hybrid Mamba2+Attention models.
+
+    Zamba2 is a hybrid architecture where most layers are Mamba2 (SSM) and a
+    subset are "hybrid" layers containing BOTH a shared attention block AND a
+    Mamba2 block.  The attention block is tied (shared weights) across all
+    hybrid layers.
+
+    In the ONNX representation, each physical hybrid layer is expanded into
+    two logical layers:
+    - ``"full_attention"`` for the shared transformer (attention + MLP + linear)
+    - ``"mamba2"`` for the Mamba block with transformer injection
+
+    This keeps the cache system aligned (one entry per logical layer).
+    """
+
+    hidden_act: str = "gelu"
+
+    mamba_n_heads: int = 8
+    mamba_d_head: int = 64
+    mamba_d_state: int = 64
+    mamba_n_groups: int = 1
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    mamba_time_step_min: float = 0.001
+
+    # Zamba2-specific: attention operates on 2*hidden_size input
+    attention_hidden_size: int = DEFAULT_INT
+
+    # Number of physical hybrid layers (for weight sharing bookkeeping)
+    num_mem_blocks: int = 1
+
+    # Physical layer indices that are hybrid (for preprocess_weights mapping)
+    hybrid_layer_indices: list[int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Zamba2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # Extract physical layer types from HF config
+        layers_block_type = getattr(config, "layers_block_type", None) or []
+        hybrid_layer_indices = [i for i, t in enumerate(layers_block_type) if t == "hybrid"]
+
+        # Expand to logical layer_types: hybrid → [full_attention, mamba2]
+        layer_types: list[str] = []
+        for t in layers_block_type:
+            if t == "hybrid":
+                layer_types.append("full_attention")
+                layer_types.append("mamba2")
+            else:
+                layer_types.append("mamba2")
+
+        num_hidden_layers = len(layer_types)
+
+        mamba_expand = getattr(config, "mamba_expand", 2)
+        d_inner = config.hidden_size * mamba_expand
+        n_mamba_heads = getattr(config, "n_mamba_heads", 8)
+        mamba_headdim = getattr(config, "mamba_headdim", None)
+        if mamba_headdim is None:
+            mamba_headdim = d_inner // n_mamba_heads
+
+        attention_hidden_size = getattr(
+            config, "attention_hidden_size", 2 * config.hidden_size
+        )
+        # head_dim for attention is based on attention_hidden_size
+        head_dim = attention_hidden_size // config.num_attention_heads
+
+        base_fields = {
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("layer_types", "num_hidden_layers", "head_dim")
+        }
+        return cls(
+            **base_fields,
+            num_hidden_layers=num_hidden_layers,
+            head_dim=head_dim,
+            layer_types=layer_types,
+            mamba_n_heads=n_mamba_heads,
+            mamba_d_head=mamba_headdim,
+            mamba_d_state=getattr(config, "mamba_d_state", 64),
+            mamba_n_groups=getattr(config, "mamba_ngroups", 1),
+            mamba_d_conv=getattr(config, "mamba_d_conv", 4),
+            mamba_expand=mamba_expand,
+            mamba_conv_bias=getattr(config, "use_conv_bias", True),
+            mamba_proj_bias=getattr(config, "add_bias_linear", False),
+            mamba_time_step_min=getattr(config, "time_step_min", 0.001),
+            attention_hidden_size=attention_hidden_size,
+            num_mem_blocks=getattr(config, "num_mem_blocks", 1),
+            hybrid_layer_indices=hybrid_layer_indices,
+        )
+
+
+@dataclasses.dataclass
 class NemotronHConfig(ArchitectureConfig):
     """Configuration for NemotronH hybrid Mamba2+Attention+MLP models.
 

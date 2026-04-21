@@ -124,6 +124,7 @@ from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.yolos import YolosForObjectDetection
+from mobius.models.zamba2 import Zamba2CausalLMModel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,7 +370,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "yi": ModelRegistration(CausalLMModel),
     "youtu": ModelRegistration(DeepSeekV3CausalLMModel),
     "zamba": ModelRegistration(CausalLMModel),
-    "zamba2": ModelRegistration(CausalLMModel),
+    "zamba2": ModelRegistration(Zamba2CausalLMModel),
     # --- Text Generation (architecture-specific) ---
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),

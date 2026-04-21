@@ -267,7 +267,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen": "CausalLM — YAML not yet created",
     "youtu": "CausalLM — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
-    "zamba2": "CausalLM — YAML not yet created",
+    "zamba2": "HybridCausalLM — YAML not yet created",
 }
 
 

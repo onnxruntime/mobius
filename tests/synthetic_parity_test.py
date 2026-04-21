@@ -72,10 +72,6 @@ _SKIP_REASONS: dict[str, str] = {
     "imagegpt": "ImageGPTConfig not registered with AutoModelForCausalLM",
     # ShieldGemma2: safety model, not registered with AutoModelForCausalLM
     "shieldgemma2": "ShieldGemma2Config not registered with AutoModelForCausalLM",
-    # Zamba2 is a Mamba2+Attention hybrid; ONNX model uses standard transformer layers
-    # without Mamba SSM. The default HF config has no attention layers, causing
-    # Zamba2HybridDynamicCache to crash on init (transformer_layers[0] out of range).
-    "zamba2": "Zamba2 is Mamba2+Attention hybrid — ONNX CausalLMModel lacks Mamba SSM layers",
     # Non-CausalLM models: their config class is not registered with AutoModelForCausalLM
     "csm": "CsmConfig not registered with AutoModelForCausalLM (speech model)",
     "evolla": "EvollaConfig not registered with AutoModelForCausalLM (multimodal VLM)",
@@ -202,7 +198,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
     # Additional divergences (newly registered models)
-    "zamba2": "Zamba2 HF modeling bug (list index out of range)",
     # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
     # recurrence on CPU produces different results than HF's naive Mamba2.
     # Attention-only layers match perfectly (cos=0.9999).
@@ -571,6 +566,39 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             hf_kwargs["head_dim"] = (
                 hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
             )
+
+    # Zamba2 uses layers_block_type with HF values {"mamba", "hybrid"}.
+    # Convert our expanded logical layer_types back to physical layers_block_type.
+    # Also translate mobius Mamba field names to HF Zamba2Config field names.
+    if hf_model_type in ("zamba2",) and "layer_types" in hf_kwargs:
+        layer_types = hf_kwargs.pop("layer_types")
+        # Convert expanded [mamba2, mamba2, full_attention, mamba2, mamba2]
+        # back to physical [mamba, mamba, hybrid, mamba]
+        physical_types = []
+        i = 0
+        while i < len(layer_types):
+            if layer_types[i] == "full_attention":
+                physical_types.append("hybrid")
+                i += 2  # skip the following mamba2 (part of hybrid)
+            else:
+                physical_types.append("mamba")
+                i += 1
+        hf_kwargs["layers_block_type"] = physical_types
+        hf_kwargs["num_hidden_layers"] = len(physical_types)
+        # Remove mobius-internal fields not recognized by HF Zamba2Config
+        hf_kwargs.pop("hybrid_layer_indices", None)
+        hf_kwargs.pop("num_mem_blocks", None)
+        hf_kwargs.pop("attention_hidden_size", None)
+        # Mobius Zamba2Config → HF Zamba2Config field name mapping
+        _zamba2_field_map = {
+            "mamba_n_heads": "n_mamba_heads",
+            "mamba_d_head": "mamba_headdim",
+            "mamba_n_groups": "mamba_ngroups",
+            "mamba_time_step_min": "time_step_min",
+        }
+        for old_name, new_name in _zamba2_field_map.items():
+            if old_name in hf_kwargs:
+                hf_kwargs[new_name] = hf_kwargs.pop(old_name)
 
     # Some models use different field names for num_local_experts and num_experts_per_tok.
     # Maps hf_model_type -> {our_field: hf_field} for field name translation.

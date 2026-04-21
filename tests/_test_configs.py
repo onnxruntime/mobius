@@ -41,6 +41,7 @@ from mobius._configs import (
     VisionConfig,
     WhisperConfig,
     YolosConfig,
+    Zamba2Config,
 )
 
 # ---------------------------------------------------------------------------
@@ -765,7 +766,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # seed_oss uses attention_bias=True by default (HF always has q/k/v biases).
     # Set attn_qkv_bias=True so our ONNX model also has these biases for parity.
     ("seed_oss", {"attn_qkv_bias": True}, False),
-    ("zamba2", {}, False),
+    # zamba2: hybrid Mamba2+Attention (requires Zamba2Config)
+    # Physical layers [mamba, mamba, hybrid, mamba] expand to 5 logical layers.
+    # head_dim = attention_hidden_size / num_attention_heads (not hidden_size / heads)
+    (
+        "zamba2",
+        {
+            "_config_cls": Zamba2Config,
+            "num_hidden_layers": 5,
+            "layer_types": [
+                "mamba2",
+                "mamba2",
+                "full_attention",
+                "mamba2",
+                "mamba2",
+            ],
+            "head_dim": 2 * TINY_HIDDEN // TINY_HEADS,
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "attention_hidden_size": 2 * TINY_HIDDEN,
+            "num_mem_blocks": 1,
+            "hybrid_layer_indices": [2],
+            "num_key_value_heads": TINY_HEADS,
+            "mamba_time_step_min": 0.001,
+        },
+        True,
+    ),
     # === Additional GPT2 aliases ===
     # num_key_value_heads=TINY_HEADS: GPT-2 family never uses GQA; setting
     # kv_heads = num_heads ensures ONNX KV-cache and HF weight shapes agree.

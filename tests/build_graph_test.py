@@ -82,6 +82,7 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "granitemoehybrid",
     "mamba2",
     "nemotron_h",
+    "zamba2",
     # VL/Speech models with value_info/shape checker issues
     "qwen2_vl",
     "qwen2_5_vl",
