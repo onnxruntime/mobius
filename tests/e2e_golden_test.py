@@ -65,6 +65,9 @@ def _get_test_device_kwargs() -> dict[str, str]:
     return kwargs
 
 
+_IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
 def _make_empty_kv_cache(
     session: OnnxModelSession,
     config: object,
@@ -180,6 +183,8 @@ def _discover_cases(
 
         if case.skip_reason:
             marks.append(pytest.mark.skip(reason=case.skip_reason))
+        elif case.ci_skip_reason and _IN_CI:
+            marks.append(pytest.mark.skip(reason=f"[CI] {case.ci_skip_reason}"))
         elif not has_golden(case):
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))

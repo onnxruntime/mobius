@@ -13,5 +13,4 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "4B parameter model — too large for CI golden generation."
 notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MLP architecture from NVIDIA."

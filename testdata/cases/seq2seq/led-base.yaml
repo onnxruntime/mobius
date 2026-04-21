@@ -10,5 +10,4 @@ inputs:
 
 level: "L4"
 
-skip_reason: "LED base supports 16384 token context — too large for CI golden generation."
 notes: "LED base. Longformer encoder-decoder for long documents."

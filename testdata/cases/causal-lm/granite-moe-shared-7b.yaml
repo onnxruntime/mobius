@@ -13,5 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Model is 7B — too large for CI golden data generation."
+ci_skip_reason: "Model is 7B — too large for CI."
 notes: "GraniteMoE Shared 7B (1B active). Shared expert MoE variant with FP accumulation differences (atol=0.025)."

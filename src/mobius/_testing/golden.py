@@ -100,6 +100,11 @@ class GoldenTestCase:
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
 
+    ci_skip_reason: str | None
+    """If set, the test is skipped in CI (GITHUB_ACTIONS=true) but runs
+    locally.  Used for models that are too large for CI hardware but can
+    be tested on a local GPU.  Does NOT block golden data generation."""
+
     min_token_match_ratio: float | None
     """Per-case override for the L5 token match tolerance (0-1).
     When ``None``, the global tolerance from ``default_tolerances.yaml`` is used.
@@ -225,6 +230,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
         skip_reason=data.get("skip_reason"),
+        ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
         yaml_path=yaml_path,
     )

@@ -10,5 +10,4 @@ inputs:
 
 level: "L4"
 
-skip_reason: "XLM-ProphetNet large is large — too large for CI golden generation."
 notes: "XLM-ProphetNet large. Multilingual future n-gram prediction."

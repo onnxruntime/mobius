@@ -14,4 +14,4 @@ generation:
   do_sample: false
 
 notes: "Cohere Command R 7B. Llama-compatible with layernorm differences."
-skip_reason: "Gated repo, requires HF token."
+ci_skip_reason: "Model too large for CI (7B params)."
