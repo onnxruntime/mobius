@@ -29,7 +29,7 @@ Adding a new model?
 3. Add YAML in ``testdata/cases/``             →  L4
 4. Generate golden JSON (or add ``skip_reason`` to YAML)  →  L5
 
-See ``.github/skills/writing-tests/SKILL.md`` for the full guide.
+See ``.agents/skills/writing-tests/SKILL.md`` for the full guide.
 """
 
 from __future__ import annotations

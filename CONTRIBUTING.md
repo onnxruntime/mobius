@@ -173,7 +173,7 @@ components in `components/_multimodal.py`.
 Before a new model PR is considered **done**, all items in the quality
 checklist must be satisfied (or explicitly waived with a written reason in
 the PR description).  The full checklist with explanations lives in the
-[quality-checklist skill](.github/skills/quality-checklist/SKILL.md).
+[quality-checklist skill](.agents/skills/quality-checklist/SKILL.md).
 
 ### Summary checklist
 

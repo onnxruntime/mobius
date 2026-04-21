@@ -229,7 +229,7 @@ mobius info meta-llama/Llama-3.2-1B
 
 ### Adding a new model
 
-See the [adding-a-new-model skill](../.github/skills/adding-a-new-model/SKILL.md)
+See the [adding-a-new-model skill](../.agents/skills/adding-a-new-model/SKILL.md)
 for copy-paste examples and step-by-step instructions.
 
 ## Output Format
