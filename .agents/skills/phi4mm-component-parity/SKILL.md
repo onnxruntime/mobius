@@ -1,12 +1,14 @@
 ---
 name: phi4mm-component-parity
 description: >
-  Debug multimodal ONNX model output that diverges from HuggingFace.
-  Use when isolating which component (vision encoder, speech encoder,
-  embedding, or decoder) causes numerical divergence; when integration
-  tests fail with large differences; or when adding a new multimodal
-  model and verifying each stage independently. Applicable to Phi4MM,
-  Gemma4, and any multi-encoder architecture.
+  Use this skill when building or adding a new multi-encoder multimodal
+  model (vision + language + audio) and verifying component-by-component
+  parity with HuggingFace. Covers pipeline isolation methodology, common
+  failure modes from real debugging experience (Phi4MM, Gemma4), the
+  step-by-step process for isolating which component (vision encoder,
+  speech encoder, embedding, or decoder) causes numerical divergence,
+  and integration test patterns. For debugging an existing deployed ORT
+  GenAI pipeline, use the debugging-vl-pipeline skill instead.
 ---
 
 # Skill: Multimodal Component Parity Debugging
