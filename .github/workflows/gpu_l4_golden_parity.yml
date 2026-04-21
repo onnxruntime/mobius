@@ -58,11 +58,13 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime-gpu
           pip install -e '.[testing,transformers]'
 
       - name: Run L4 checkpoint-verified tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
         run: |
           pytest tests/e2e_golden_test.py \
             -m golden \
@@ -71,7 +73,7 @@ jobs:
             --junitxml=junit-l4.xml \
             --cov=src --cov-report=xml --cov-branch \
             --tb=short
-        timeout-minutes: 30
+        timeout-minutes: 60
 
       - name: Upload coverage to Codecov
         if: always()

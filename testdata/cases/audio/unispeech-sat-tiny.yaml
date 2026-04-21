@@ -10,3 +10,5 @@ inputs:
 level: "L4"
 
 notes: "UniSpeechSat tiny random. Speaker-aware self-supervised audio encoder."
+
+skip_reason: "Model only has .bin weights (no safetensors)"

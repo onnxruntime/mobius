@@ -136,8 +136,12 @@ def torch_forward(
     cache = getattr(outputs, "past_key_values", None)
     if cache is not None and hasattr(cache, "layers"):
         for layer_idx in range(len(cache.layers)):
-            k = cache.layers[layer_idx].keys.cpu().numpy()
-            v = cache.layers[layer_idx].values.cpu().numpy()
+            layer_cache = cache.layers[layer_idx]
+            # Mamba layers use LinearAttentionLayer without keys/values
+            if not hasattr(layer_cache, "keys"):
+                continue
+            k = layer_cache.keys.cpu().numpy()
+            v = layer_cache.values.cpu().numpy()
             present_kv.append((k, v))
 
     return logits, present_kv

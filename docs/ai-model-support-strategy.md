@@ -211,7 +211,7 @@ Add the field to the `ArchitectureConfig` dataclass.
 #### A.3. Variant (subclass)
 
 Create a new model file. The agent should follow the **adding-a-new-model**
-skill (`.github/skills/adding-a-new-model/SKILL.md`) which provides:
+skill (`.agents/skills/adding-a-new-model/SKILL.md`) which provides:
 
 1. A complete model file template
 2. Common variation patterns with solutions
@@ -362,7 +362,7 @@ asked to add a new model.
 ### Inputs
 
 - **Model identifier**: HuggingFace model ID (e.g. `meta-llama/Llama-4-Scout-17B-16E`)
-- **Skills**: The agent should read the relevant skill files from `.github/skills/`
+- **Skills**: The agent should read the relevant skill files from `.agents/skills/`
 
 ### Workflow
 

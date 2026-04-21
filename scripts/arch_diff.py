@@ -38,7 +38,7 @@ _GITHUB_REPO_URL = "https://github.com/onnxruntime/mobius"
 # Model build configs — mirrors the benchmark / test infrastructure
 # ------------------------------------------------------------------
 # Each entry: (model_type, config_overrides, task_name, build_kind)
-#   build_kind is "standard", "whisper", "mamba", or "qwen3_5_vl".
+#   build_kind is "standard", "whisper", "mamba", "qwen3_5_vl", or "gemma4".
 _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
     ("llama", {}, "text-generation", "standard"),
     ("llama", {}, "static-cache", "standard"),
@@ -206,6 +206,35 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         "seq2seq",
         "standard",
     ),
+    (
+        "gemma4_text",
+        {
+            "_config_cls": "Gemma4Config",
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "global_head_dim": 16,
+            "global_rope_theta": 10_000.0,
+            "final_logit_softcapping": 30.0,
+        },
+        "text-generation",
+        "standard",
+    ),
+    (
+        "gemma4_text",
+        {
+            "_config_cls": "Gemma4Config",
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "global_head_dim": 16,
+            "global_rope_theta": 10_000.0,
+            "final_logit_softcapping": 30.0,
+        },
+        "static-cache",
+        "standard",
+    ),
+    ("gemma4", {}, "gemma4", "gemma4"),
     ("qwen3_5_vl", {}, "hybrid-qwen-vl", "qwen3_5_vl"),
     ("whisper", {}, "speech-to-text", "whisper"),
     ("mamba", {}, "ssm-text-generation", "mamba"),
@@ -450,12 +479,57 @@ _BUILDER_SCRIPT = textwrap.dedent("""\
         task = get_task("hybrid-qwen-vl")
         return task.build(module, config)
 
+    def _build_gemma4():
+        from mobius._configs import Gemma4Config, VisionConfig
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+        config = Gemma4Config(
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            head_dim=TINY_HEAD_DIM,
+            num_hidden_layers=TINY_LAYERS,
+            vocab_size=TINY_VOCAB,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10_000.0,
+            pad_token_id=0,
+            attn_qk_norm=True,
+            rope_local_base_freq=10_000.0,
+            layer_types=["sliding_attention", "full_attention"],
+            global_head_dim=TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                mm_tokens_per_image=4,
+            ),
+            mm_tokens_per_image=4,
+            image_token_id=255999,
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task = get_task("gemma4")
+        return task.build(module, config)
+
     if build_kind == "whisper":
         pkg = _build_whisper()
     elif build_kind == "mamba":
         pkg = _build_mamba()
     elif build_kind == "qwen3_5_vl":
         pkg = _build_qwen3_5_vl()
+    elif build_kind == "gemma4":
+        pkg = _build_gemma4()
     else:
         pkg = _build_standard()
 

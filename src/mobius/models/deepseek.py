@@ -300,6 +300,9 @@ class DeepSeekV3TextModel(nn.Module):
 
         # Build layers: dense for first k, MoE for rest
         first_k = config.first_k_dense_replace
+        # If no experts are configured, force all layers to be dense
+        if not config.num_local_experts:
+            first_k = config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
                 LayerClass(config, is_moe=(i >= first_k))

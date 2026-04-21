@@ -1,0 +1,27 @@
+{
+  "model_id": "tiiuae/Falcon-H1-0.5B-Base",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    535,
+    784,
+    2388,
+    1179,
+    774,
+    3207,
+    813,
+    7580,
+    823,
+    11980,
+    537,
+    1007,
+    6136,
+    1079,
+    1107,
+    12389,
+    885,
+    535,
+    823,
+    784
+  ],
+  "generated_text": ", the world was a place of wonder and discovery. The sun shone brightly, and the"
+}

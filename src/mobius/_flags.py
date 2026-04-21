@@ -79,6 +79,11 @@ class _Flags:
          - ``True``
          - Suppress "has no constant value" warnings from the initializer
            deduplication pass.
+       * - ``ort_lower_opset_for_ep``
+         - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
+         - ``True``
+         - Lower the ONNX opset declaration to 23 for non-CPU EPs
+           (ORT ≤1.24.x workaround).
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -96,6 +101,19 @@ class _Flags:
     """Decompose grouped RMSNormalization into basic ops to work around an
     ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
+    """
+
+    ort_lower_opset_for_ep: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_ORT_LOWER_OPSET_FOR_EP", True)
+    )
+    """Lower the ONNX default-domain opset declaration to 23 when creating
+    ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
+
+    ORT ≤1.24.x EPs don't register kernels for opset 24 standard ops
+    (Squeeze, Reshape, etc.) even though the semantics are unchanged.
+    Lowering the import declaration lets the EP find its existing kernels.
+    Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
+    opset 24 kernel support.
     """
 
 

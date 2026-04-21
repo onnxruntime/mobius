@@ -403,9 +403,29 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             if not isinstance(hf_vision_config, dict)
             else type("VC", (), hf_vision_config)()
         )
+        # Qwen2-VL uses ``embed_dim`` for the actual block hidden size and
+        # ``hidden_size`` for the projection output.  When ``embed_dim``
+        # exists and ``out_hidden_size`` does not, remap the fields so the
+        # block dimension is used as ``hidden_size``.
+        _embed_dim = getattr(vc, "embed_dim", None)
+        _hf_hidden = getattr(vc, "hidden_size", None)
+        _out_hidden = getattr(vc, "out_hidden_size", None)
+        if _embed_dim is not None and _out_hidden is None and _embed_dim != _hf_hidden:
+            _vis_hidden = _embed_dim
+            _vis_out_hidden = _hf_hidden
+        else:
+            _vis_hidden = _hf_hidden
+            _vis_out_hidden = _out_hidden
+
+        _intermediate = getattr(vc, "intermediate_size", None)
+        if _intermediate is None:
+            _mlp_ratio = getattr(vc, "mlp_ratio", None)
+            if _mlp_ratio is not None and _vis_hidden is not None:
+                _intermediate = int(_vis_hidden * _mlp_ratio)
+
         vision_fields.update(
-            hidden_size=getattr(vc, "hidden_size", None),
-            intermediate_size=getattr(vc, "intermediate_size", None),
+            hidden_size=_vis_hidden,
+            intermediate_size=_intermediate,
             num_hidden_layers=(
                 getattr(vc, "num_hidden_layers", None) or getattr(vc, "depth", None)
             ),
@@ -426,7 +446,7 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             head_dim=getattr(vc, "head_dim", None),
             rope_theta=getattr(vc, "rope_theta", None),
             # Qwen VL-specific vision fields
-            out_hidden_size=getattr(vc, "out_hidden_size", None),
+            out_hidden_size=_vis_out_hidden,
             in_channels=_first_not_none(
                 getattr(vc, "in_channels", None),
                 getattr(vc, "num_channels", None),
@@ -727,6 +747,7 @@ class ArchitectureConfig(BaseModelConfig):
 
     # attention config
     layer_types: list[str] | None = None
+    no_rope_layers: list[int] | None = None
     full_attention_interval: int | None = None
     sliding_window: int | None = None
 
@@ -947,12 +968,19 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "activation_function", None)
                 or getattr(config, "dense_act_fn", None)
                 or getattr(config, "activation", None)
+                or getattr(config, "afn", None)
                 # Qwen v1 configs have no activation attr; default to silu
                 or ("silu" if model_type in ("qwen",) else None)
             ),
-            layer_types=(getattr(config, "layer_types", None)),
+            layer_types=(
+                getattr(config, "layer_types", None)
+                or getattr(config, "attention_layers", None)
+            ),
+            no_rope_layers=getattr(config, "no_rope_layers", None),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(getattr(config, "sliding_window", None)),
+            sliding_window=(
+                getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
+            ),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),
@@ -981,13 +1009,25 @@ class ArchitectureConfig(BaseModelConfig):
                         getattr(
                             config,
                             "bias",
-                            model_type
-                            in (
-                                "gpt2",
-                                "bloom",
-                                "qwen2",
-                                "qwen2_5_vl_text",
-                                "qwen2_moe",
+                            getattr(
+                                config,
+                                "use_qkv_bias",
+                                getattr(
+                                    config,
+                                    "use_bias",
+                                    model_type
+                                    in (
+                                        "gpt2",
+                                        "gpt_bigcode",
+                                        "openai-gpt",
+                                        "phi",
+                                        "bloom",
+                                        "qwen2",
+                                        "qwen2_5_vl_text",
+                                        "qwen2_moe",
+                                        "qwen2_vl_text",
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -1003,7 +1043,19 @@ class ArchitectureConfig(BaseModelConfig):
                         getattr(
                             config,
                             "bias",
-                            model_type in ("gpt2", "bloom"),
+                            getattr(
+                                config,
+                                "use_bias",
+                                model_type
+                                in (
+                                    "gpt2",
+                                    "gpt_bigcode",
+                                    "gpt_neo",
+                                    "openai-gpt",
+                                    "phi",
+                                    "bloom",
+                                ),
+                            ),
                         ),
                     ),
                 )
@@ -1026,7 +1078,25 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "use_qk_norm", False)
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
-            mlp_bias=(getattr(config, "use_mlp_bias", False)),
+            mlp_bias=(
+                getattr(
+                    config,
+                    "use_mlp_bias",
+                    getattr(
+                        config,
+                        "use_bias",
+                        model_type
+                        in (
+                            "gpt_neo",
+                            "gpt_bigcode",
+                            "gpt_neox",
+                            "gpt_neox_japanese",
+                            "openai-gpt",
+                            "phi",
+                        ),
+                    ),
+                )
+            ),
             rope=rope_config,
             # Flat rope field copies: ``None`` for NoPE models so that
             # ``initialize_rope`` / ``TextModel`` / ``Attention`` can detect
@@ -1100,9 +1170,15 @@ class ArchitectureConfig(BaseModelConfig):
             image_size=_as_int(getattr(config, "image_size", 224)),
             patch_size=_as_int(getattr(config, "patch_size", 16)),
             num_channels=getattr(config, "num_channels", 3),
+            # OpenAI-GPT uses post-norm (no final LayerNorm); GPT-2 uses pre-norm.
+            post_norm=model_type == "openai-gpt",
             # Granite scaling multipliers
             embedding_multiplier=getattr(config, "embedding_multiplier", 1.0),
-            attention_multiplier=getattr(config, "attention_multiplier", None),
+            attention_multiplier=(
+                getattr(config, "attention_multiplier", None)
+                # GPT-Neo computes Q @ K^T without 1/sqrt(head_dim) scaling
+                or (1.0 if model_type == "gpt_neo" else None)
+            ),
             logits_scaling=getattr(config, "logits_scaling", 1.0),
             residual_multiplier=getattr(config, "residual_multiplier", 1.0),
             # Cohere logit scale
@@ -2046,6 +2122,105 @@ class GraniteMoeHybridConfig(BambaConfig):
         return cls(
             **bamba_fields,
             shared_intermediate_size=getattr(config, "shared_intermediate_size", 1024),
+        )
+
+
+@dataclasses.dataclass
+class Zamba2Config(ArchitectureConfig):
+    """Configuration for Zamba2 hybrid Mamba2+Attention models.
+
+    Zamba2 is a hybrid architecture where most layers are Mamba2 (SSM) and a
+    subset are "hybrid" layers containing BOTH a shared attention block AND a
+    Mamba2 block.  The attention block is tied (shared weights) across all
+    hybrid layers.
+
+    In the ONNX representation, each physical hybrid layer is expanded into
+    two logical layers:
+    - ``"full_attention"`` for the shared transformer (attention + MLP + linear)
+    - ``"mamba2"`` for the Mamba block with transformer injection
+
+    This keeps the cache system aligned (one entry per logical layer).
+    """
+
+    hidden_act: str = "gelu"
+
+    mamba_n_heads: int = 8
+    mamba_d_head: int = 64
+    mamba_d_state: int = 64
+    mamba_n_groups: int = 1
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    mamba_time_step_min: float = 0.001
+
+    # Zamba2-specific: attention operates on 2*hidden_size input
+    attention_hidden_size: int = DEFAULT_INT
+
+    # Number of physical hybrid layers (for weight sharing bookkeeping)
+    num_mem_blocks: int = 1
+
+    # Low-rank adapter rank for per-layer differentiation
+    adapter_rank: int = 128
+
+    # Physical layer indices that are hybrid (for preprocess_weights mapping)
+    hybrid_layer_indices: list[int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Zamba2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # Extract physical layer types from HF config
+        layers_block_type = getattr(config, "layers_block_type", None) or []
+        hybrid_layer_indices = [i for i, t in enumerate(layers_block_type) if t == "hybrid"]
+
+        # Expand to logical layer_types: hybrid → [full_attention, mamba2]
+        layer_types: list[str] = []
+        for t in layers_block_type:
+            if t == "hybrid":
+                layer_types.append("full_attention")
+                layer_types.append("mamba2")
+            else:
+                layer_types.append("mamba2")
+
+        num_hidden_layers = len(layer_types)
+
+        mamba_expand = getattr(config, "mamba_expand", 2)
+        d_inner = config.hidden_size * mamba_expand
+        n_mamba_heads = getattr(config, "n_mamba_heads", 8)
+        mamba_headdim = getattr(config, "mamba_headdim", None)
+        if mamba_headdim is None:
+            mamba_headdim = d_inner // n_mamba_heads
+
+        attention_hidden_size = getattr(
+            config, "attention_hidden_size", 2 * config.hidden_size
+        )
+        # head_dim for attention is based on attention_hidden_size
+        head_dim = attention_hidden_size // config.num_attention_heads
+
+        base_fields = {
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("layer_types", "num_hidden_layers", "head_dim")
+        }
+        return cls(
+            **base_fields,
+            num_hidden_layers=num_hidden_layers,
+            head_dim=head_dim,
+            layer_types=layer_types,
+            mamba_n_heads=n_mamba_heads,
+            mamba_d_head=mamba_headdim,
+            mamba_d_state=getattr(config, "mamba_d_state", 64),
+            mamba_n_groups=getattr(config, "mamba_ngroups", 1),
+            mamba_d_conv=getattr(config, "mamba_d_conv", 4),
+            mamba_expand=mamba_expand,
+            mamba_conv_bias=getattr(config, "use_conv_bias", True),
+            mamba_proj_bias=getattr(config, "add_bias_linear", False),
+            mamba_time_step_min=getattr(config, "time_step_min", 0.001),
+            attention_hidden_size=attention_hidden_size,
+            num_mem_blocks=getattr(config, "num_mem_blocks", 1),
+            adapter_rank=getattr(config, "adapter_rank", 128),
+            hybrid_layer_indices=hybrid_layer_indices,
         )
 
 

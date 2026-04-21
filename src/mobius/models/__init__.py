@@ -14,6 +14,7 @@ __all__ = [
     "Blip2Model",
     "BloomCausalLMModel",
     "CLIPVisionModel",
+    "SigLIPVisionModel",
     "CTRLCausalLMModel",
     "CausalLMModel",
     "FusedGateUpCausalLMModel",
@@ -49,6 +50,7 @@ __all__ = [
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
     "GraniteCausalLMModel",
+    "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
@@ -86,6 +88,8 @@ __all__ = [
     "Qwen25VLTextModel",
     "Qwen25VLVisionEncoderModel",
     "Qwen2MoECausalLMModel",
+    "Qwen2VLCausalLMModel",
+    "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
@@ -121,6 +125,7 @@ __all__ = [
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
     "XLMCausalLMModel",
+    "Zamba2CausalLMModel",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -132,7 +137,7 @@ from mobius.models.base import CausalLMModel, FusedGateUpCausalLMModel, LayerNor
 from mobius.models.bert import BertModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
-from mobius.models.clip import CLIPVisionModel
+from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
@@ -160,7 +165,7 @@ from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.gptoss import GPTOSSCausalLMModel
-from mobius.models.granite import GraniteCausalLMModel
+from mobius.models.granite import GraniteCausalLMModel, GraniteMoECausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.hunyuan_v1 import HunYuanV1DenseCausalLMModel
@@ -224,6 +229,8 @@ from mobius.models.qwen35 import (
 from mobius.models.qwen_image import QwenImageTransformer2DModel
 from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
 from mobius.models.qwen_vl import (
+    Qwen2VLCausalLMModel,
+    Qwen2VLVisionEncoderModel,
     Qwen3VL3ModelCausalLMModel,
     Qwen3VLCausalLMModel,
     Qwen3VLDecoderModel,
@@ -246,3 +253,4 @@ from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.models.xlm import XLMCausalLMModel
+from mobius.models.zamba2 import Zamba2CausalLMModel

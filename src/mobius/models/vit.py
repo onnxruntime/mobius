@@ -89,7 +89,7 @@ class _ViTEmbeddings(nn.Module):
         # Expand CLS token to batch size
         cls_tokens = op.Expand(
             self.cls_token,
-            op.Concat(batch_size, op.Constant(value_ints=[1, 1]), axis=0),
+            op.Concat(batch_size, [1], [1], axis=0),
         )
         # Prepend CLS token to patch embeddings
         hidden_states = op.Concat(cls_tokens, patch_embeds, axis=1)
@@ -111,7 +111,7 @@ class _Conv2dPatchEmbed(nn.Module):
         # Flatten spatial dims and transpose: [batch, hidden, num_patches] -> [batch, num_patches, hidden]
         batch = op.Shape(x, start=0, end=1)
         hidden = op.Shape(x, start=1, end=2)
-        x = op.Reshape(x, op.Concat(batch, hidden, op.Constant(value_ints=[-1]), axis=0))
+        x = op.Reshape(x, op.Concat(batch, hidden, [-1], axis=0))
         x = op.Transpose(x, perm=[0, 2, 1])
         return x
 
@@ -178,9 +178,15 @@ _LAYER_PATTERN = re.compile(r"^encoder\.layer\.(\d+)\.(.+)$")
 
 def _rename_vit_weight(name: str) -> str | None:
     """Rename HF ViT weight to our naming convention."""
-    # Strip vit. prefix if present
-    if name.startswith("vit."):
-        name = name[4:]
+    # Strip model-type prefix (e.g. vit., beit., deit., dinov2., swin., hiera.)
+    # HF safetensors use the model class prefix before embeddings/encoder.
+    first_dot = name.find(".")
+    if first_dot > 0:
+        after = name[first_dot + 1 :]
+        if after.startswith(
+            ("embeddings.", "encoder.", "layernorm.", "pooler.", "classifier.")
+        ):
+            name = after
 
     # Skip pooler and classifier heads
     if name.startswith(("pooler.", "classifier.")):

@@ -10,3 +10,5 @@ inputs:
 level: "L4"
 
 notes: "UniSpeech tiny random. Multi-task audio pre-training encoder."
+
+skip_reason: "Model only has .bin weights (no safetensors)"

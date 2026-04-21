@@ -13,5 +13,4 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Gated repo (google/gemma-4-E2B-it requires authentication). Model is 2B but gated."
 notes: "Gemma 4 E2B Any-to-Any (text-only path). Dual RoPE, KV sharing (num_kv_shared_layers=20), double-wide MLP, sliding+global attention, logit softcapping."

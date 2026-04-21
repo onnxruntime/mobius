@@ -8,5 +8,6 @@ inputs:
     - "pipeline-cat-chonk.jpeg"
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "Swin Transformer V2 tiny. Scaled cosine attention hierarchy."

@@ -186,7 +186,7 @@ class _BertEmbeddings(nn.Module):
         seq_len = op.Shape(input_ids, start=1, end=2)
         position_ids = op.Range(
             op.Constant(value_int=0),
-            op.Squeeze(seq_len),
+            seq_len,
             op.Constant(value_int=1),
         )
         position_ids = op.Cast(position_ids, to=7)  # INT64
@@ -291,19 +291,21 @@ _PARAM_RENAMES = {"gamma": "weight", "beta": "bias"}
 def _rename_bert_weight(name: str) -> str | None:
     """Rename a single HF BERT weight to our convention.
 
-    Strips model prefixes (bert./roberta.), collapses nested HF naming
-    (.self./.output.) to match the flat ONNX initializer paths, and
-    handles old-BERT gamma/beta compat. Returns None for pooler/cls
-    weights we don't need.
+    Strips model prefixes (bert./roberta./esm./mpnet./etc.), collapses
+    nested HF naming (.self./.output.) to match the flat ONNX initializer
+    paths, and handles old-BERT gamma/beta compat. Returns None for
+    pooler/cls weights we don't need.
     """
-    # Strip "bert." or "roberta." prefix if present
-    if name.startswith("bert."):
-        name = name[5:]
-    elif name.startswith("roberta."):
-        name = name[8:]
+    # Strip model-type prefix (e.g. bert., roberta., esm., mpnet., squeezebert.)
+    # HF safetensors use the model class prefix before embeddings/encoder.
+    first_dot = name.find(".")
+    if first_dot > 0:
+        after = name[first_dot + 1 :]
+        if after.startswith(("embeddings.", "encoder.", "pooler.", "cls.", "lm_head.")):
+            name = after
 
-    # Skip pooler and classification heads
-    if name.startswith(("pooler.", "cls.")):
+    # Skip pooler, classification heads, and lm_head
+    if name.startswith(("pooler.", "cls.", "lm_head.")):
         return None
 
     # Collapse nested HF naming to match flat ONNX paths:

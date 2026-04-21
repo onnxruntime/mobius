@@ -1,9 +1,12 @@
-model_id: "Qwen/Qwen3-ASR"
+model_id: "Qwen/Qwen3-ASR-0.6B"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"
+trust_remote_code: true
 
 inputs:
+  prompts:
+    - "Transcribe this audio."
   audio:
     - "652-129742-0006.flac"
 
@@ -13,5 +16,5 @@ generation:
 
 level: "L4+L5"
 
-skip_reason: "Requires audio preprocessing pipeline not yet supported in test harness."
+skip_reason: ""
 notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."

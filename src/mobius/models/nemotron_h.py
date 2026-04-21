@@ -318,10 +318,15 @@ class NemotronHCausalLMModel(nn.Module):
         layer_types = self.config.layer_types or []
 
         if self.config.tie_word_embeddings:
-            # Tie before renaming so both old-name keys exist
+            # Detect old "backbone.*" vs new "model.*" prefix
+            embed_key = (
+                "backbone.embeddings.weight"
+                if "backbone.embeddings.weight" in state_dict
+                else "model.embeddings.weight"
+            )
             tie_word_embeddings(
                 state_dict,
-                embed_key="backbone.embeddings.weight",
+                embed_key=embed_key,
                 head_key="lm_head.weight",
             )
 
@@ -333,20 +338,21 @@ class NemotronHCausalLMModel(nn.Module):
         return new_state_dict
 
 
-# Layer index regex: backbone.layers.<N>.<rest>
-_LAYER_RE = re.compile(r"^backbone\.layers\.(\d+)\.(.+)$")
+# Layer index regex: {backbone|model}.layers.<N>.<rest>
+# Older HF checkpoints use "backbone.*"; newer ones use "model.*".
+_LAYER_RE = re.compile(r"^(?:backbone|model)\.layers\.(\d+)\.(.+)$")
 
 
 def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
     """Rename a single HF weight key to match ONNX module structure.
 
-    HF NemotronHForCausalLM weight naming:
-        backbone.embeddings.weight
-        backbone.norm_f.weight
-        backbone.layers.N.norm.weight
-        backbone.layers.N.mixer.{in_proj, conv1d, out_proj, norm, A_log, D, dt_bias}  (mamba)
-        backbone.layers.N.mixer.{q_proj, k_proj, v_proj, o_proj}.weight              (attention)
-        backbone.layers.N.mixer.{up_proj, down_proj}.weight                          (mlp)
+    HF NemotronHForCausalLM weight naming (old ``backbone.*`` / new ``model.*``):
+        {backbone|model}.embeddings.weight
+        {backbone|model}.norm_f.weight
+        {backbone|model}.layers.N.norm.weight
+        {backbone|model}.layers.N.mixer.{in_proj, conv1d, out_proj, norm, A_log, D, dt_bias}  (mamba)
+        {backbone|model}.layers.N.mixer.{q_proj, k_proj, v_proj, o_proj}.weight              (attention)
+        {backbone|model}.layers.N.mixer.{up_proj, down_proj}.weight                          (mlp)
         lm_head.weight
 
     ONNX parameter naming:
@@ -358,11 +364,12 @@ def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
         model.layers.N.mlp.{up_proj, down_proj}.weight
         lm_head.weight
     """
-    # Global prefix renames
-    if key.startswith("backbone.embeddings."):
-        return key.replace("backbone.embeddings.", "model.embed_tokens.", 1)
-    if key.startswith("backbone.norm_f."):
-        return key.replace("backbone.norm_f.", "model.norm.", 1)
+    # Global prefix renames (handle both backbone.* and model.* HF names)
+    for prefix in ("backbone.", "model."):
+        if key.startswith(f"{prefix}embeddings."):
+            return key.replace(f"{prefix}embeddings.", "model.embed_tokens.", 1)
+        if key.startswith(f"{prefix}norm_f."):
+            return key.replace(f"{prefix}norm_f.", "model.norm.", 1)
 
     # Per-layer renames
     m = _LAYER_RE.match(key)

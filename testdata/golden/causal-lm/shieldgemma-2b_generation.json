@@ -1,0 +1,27 @@
+{
+  "model_id": "google/shieldgemma-2b",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    235269,
+    575,
+    476,
+    2840,
+    10545,
+    675,
+    118926,
+    209550,
+    578,
+    56189,
+    27836,
+    235269,
+    11012,
+    476,
+    3486,
+    4602,
+    8602,
+    2810,
+    1610,
+    235265
+  ],
+  "generated_text": ", in a land filled with whispering willows and sparkling rivers, lived a young girl named Elara."
+}

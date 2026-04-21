@@ -9,6 +9,7 @@ inputs:
   decoder_prompt: ""
 
 level: "L4+L5"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 generation:
   max_new_tokens: 20

@@ -8,5 +8,6 @@ inputs:
     - "pipeline-cat-chonk.jpeg"
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "ViT-MSN small. Masked siamese network self-supervised vision."

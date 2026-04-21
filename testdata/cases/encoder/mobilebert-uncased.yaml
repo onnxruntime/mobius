@@ -8,5 +8,6 @@ inputs:
     - "The quick brown fox jumps over the lazy dog."
 
 level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
 
 notes: "MobileBERT uncased. Knowledge-distilled compact BERT."

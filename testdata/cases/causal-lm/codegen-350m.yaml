@@ -13,4 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 notes: "CodeGen 350M mono. Multi-query attention, code generation, no RoPE."

@@ -81,6 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime
           pip install -e '.[testing]'
       - name: Run L1 smoke tests (all model configs)
         run: |
@@ -128,6 +129,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime
           pip install -e '.[testing,transformers]'
       - name: Run L3 synthetic parity tests
         env:
@@ -207,11 +209,12 @@ jobs:
           key: hf-golden-${{ hashFiles('testdata/cases/**/*.yaml') }}
           restore-keys: |
             hf-golden-
-      - name: Install PyTorch CPU
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PyTorch CUDA
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime-gpu
           pip install -e '.[testing,transformers]'
       - name: Check for golden test data
         id: check_golden
@@ -227,6 +230,7 @@ jobs:
         if: steps.check_golden.outputs.has_golden == 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
         run: |
           if [ ! -f tests/e2e_golden_test.py ]; then
             echo "tests/e2e_golden_test.py not found — skipping"
@@ -235,7 +239,7 @@ jobs:
           pytest tests/e2e_golden_test.py -m golden -v --tb=short \
             --cov=src --cov-report=xml --cov-branch \
             --junitxml golden-results.xml
-        timeout-minutes: 30
+        timeout-minutes: 60
       - name: Upload coverage to Codecov
         if: steps.check_golden.outputs.has_golden == 'true'
         uses: codecov/codecov-action@v6
@@ -284,6 +288,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime
           pip install -e '.[testing]'
       - name: Run tests
         run: |
@@ -326,6 +331,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime-gpu
           pip install -e '.[testing]'
       - name: Run fast integration tests
         env:

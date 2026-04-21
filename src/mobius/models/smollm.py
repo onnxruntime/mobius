@@ -43,6 +43,7 @@ class SmolLM3TextModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
         self.layer_types = config.layer_types
+        self.no_rope_layers = config.no_rope_layers
         self.sliding_window = config.sliding_window
 
     def forward(
@@ -77,12 +78,20 @@ class SmolLM3TextModel(nn.Module):
             attn_bias = (
                 sliding_attn_bias if layer_type == "sliding_attention" else full_attn_bias
             )
+            # SmolLM3 uses no_rope_layers to gate RoPE per layer:
+            # no_rope_layers[i] == 1 → skip RoPE, 0 → apply RoPE
+            skip_rope = (
+                self.no_rope_layers is not None
+                and i < len(self.no_rope_layers)
+                and self.no_rope_layers[i] == 1
+            )
+            rope = None if skip_rope else position_embeddings
 
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attn_bias,
-                position_embeddings=position_embeddings,
+                position_embeddings=rope,
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)

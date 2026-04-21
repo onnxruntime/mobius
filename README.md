@@ -170,7 +170,7 @@ lintrunner f --all-files
 ### Adding a new model
 
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
-and the developer skills in `.github/skills/`:
+and the developer skills in `.agents/skills/`:
 
 | Skill | Use when |
 |-------|----------|

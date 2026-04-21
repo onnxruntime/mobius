@@ -12,6 +12,7 @@ from onnxscript._internal import builder
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
     InputMixer,
+    Qwen2VLVisionModel,
     Qwen3VLVisionModel,
     Qwen25VLVisionModel,
 )
@@ -334,6 +335,103 @@ class Qwen25VLEmbeddingModel(nn.Module):
                 if new_key.startswith("model."):
                     new_key = new_key[len("model.") :]
                 renamed[new_key] = value
+        return renamed
+
+
+class Qwen2VLVisionEncoderModel(Qwen25VLVisionEncoderModel):
+    """Qwen2-VL vision encoder for the 3-model split.
+
+    Uses Qwen2VLVisionModel (LayerNorm + FCMLP) instead of Qwen2.5-VL's
+    RMSNorm + GatedMLP.  All attention blocks are full (no windowing).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        # Skip Qwen25VLVisionEncoderModel.__init__ to use our own model
+        nn.Module.__init__(self)
+        vc = config.vision
+        assert vc is not None and vc.hidden_size is not None
+        assert vc.num_hidden_layers is not None
+        assert vc.num_attention_heads is not None
+        self.visual = Qwen2VLVisionModel(
+            depth=vc.num_hidden_layers,
+            hidden_size=vc.hidden_size,
+            intermediate_size=vc.intermediate_size or vc.hidden_size * 4,
+            num_heads=vc.num_attention_heads,
+            patch_size=vc.patch_size or 14,
+            temporal_patch_size=config.temporal_patch_size,
+            in_channels=vc.in_channels,
+            out_hidden_size=vc.out_hidden_size or config.hidden_size,
+            spatial_merge_size=config.spatial_merge_size,
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Keep only visual.* weights and rename fc1/fc2 → up_proj/down_proj."""
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("visual."):
+                new_key = key
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
+                new_key = new_key.replace(".merger.mlp.0.", ".merger.mlp_0.")
+                new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
+                renamed[new_key] = value
+        return renamed
+
+
+class Qwen2VLCausalLMModel(nn.Module):
+    """Qwen2-VL vision-language model (3-model split).
+
+    Same 3-model architecture as Qwen2.5-VL but with:
+    - Qwen2VLVisionModel (LayerNorm + FCMLP, no windowed attention)
+    - Same text decoder and embedding model
+    """
+
+    default_task: str = "qwen-vl"
+    category: str = "Multimodal"
+    config_class: type = ArchitectureConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = Qwen25VLDecoderModel(config)
+        self.vision_encoder = Qwen2VLVisionEncoderModel(config)
+        self.embedding = Qwen25VLEmbeddingModel(config)
+
+    def forward(self, op: builder.OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Qwen2VLCausalLMModel uses Qwen25VL3ModelTask which calls "
+            "each sub-module (decoder, vision_encoder, embedding) "
+            "separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route HF weights to the correct sub-model ONNX initializer names.
+
+        Vision weights get fc1→up_proj, fc2→down_proj renames for FCMLP.
+        """
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("visual."):
+                new_key = f"vision_encoder.{key}"
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
+                new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
+                new_key = new_key.replace(".merger.mlp.0.", ".merger.mlp_0.")
+                new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
+                renamed[new_key] = value
+            elif key.startswith("model.embed_tokens."):
+                renamed[f"decoder.{key}"] = value
+                stripped = key[len("model.") :]
+                renamed[f"embedding.{stripped}"] = value
+                if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
+                    renamed["decoder.lm_head.weight"] = value
+            elif key.startswith("model."):
+                renamed[f"decoder.{key}"] = value
+            elif key.startswith("lm_head."):
+                renamed[f"decoder.{key}"] = value
         return renamed
 
 

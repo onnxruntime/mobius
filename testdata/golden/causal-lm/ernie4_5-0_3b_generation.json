@@ -1,0 +1,27 @@
+{
+  "model_id": "baidu/ERNIE-4.5-0.3B-PT",
+  "prompt": "Once upon a time",
+  "generated_tokens": [
+    93938,
+    354,
+    511,
+    307,
+    274,
+    1914,
+    4644,
+    27842,
+    93938,
+    326,
+    354,
+    511,
+    1914,
+    31683,
+    1071,
+    851,
+    5425,
+    93937,
+    23,
+    23
+  ],
+  "generated_text": ", I was in a very bad mood, and I was very worried about my future.\n\n"
+}
