@@ -216,7 +216,7 @@ Compare ONNX outputs against pre-computed golden files in `testdata/golden/`.
 | fp16/bf16 logits | `1e-2` / `1e-2` |
 
 Key rules:
-- `assert_logits_close` checks shape + dtype match (`strict=True`)
+- `assert_logits_close` checks shape + dtype match via `np.testing.assert_allclose(..., strict=True)`
 - If max abs diff > 0.5 → likely a norm or scaling bug
 - If max abs diff > 10 → weights loaded to wrong parameters
 

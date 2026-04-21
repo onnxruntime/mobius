@@ -1,42 +1,12 @@
 # Extracting Intermediate ONNX Values
 
-Three methods for extracting intermediate values from ONNX models to
+Two methods for extracting intermediate values from ONNX models to
 compare block-by-block against HuggingFace. Used when a pipeline stage
 (e.g., vision encoder) diverges and you need to narrow down the root cause.
 
 ---
 
-## Method 1: Add intermediate outputs to the ONNX graph
-
-The most reliable approach — expose any internal node's output as a graph
-output so ORT returns it alongside normal outputs.
-
-```python
-import onnx
-
-model = onnx.load("vision.onnx")
-graph = model.graph
-
-# Find the node whose output you want to inspect
-for node in graph.node:
-    if node.op_type == "RMSNormalization" and "block_0" in node.output[0]:
-        # Name the output (if unnamed, give it a name)
-        target_output = node.output[0]
-        break
-
-# Add as a graph output
-graph.output.append(
-    onnx.helper.make_tensor_value_info(target_output, onnx.TensorProto.FLOAT, None)
-)
-onnx.save(model, "vision_debug.onnx")
-
-# Now ORT will return this value alongside image_features
-session = ort.InferenceSession("vision_debug.onnx")
-results = session.run(None, feeds)
-# results[-1] is the intermediate value
-```
-
-## Method 2: Use `ir.Model` graph manipulation (preferred for mobius)
+## Method 1: Add intermediate outputs to the `ir.Model` graph
 
 When working with `ir.Model` objects from the build pipeline, manipulate
 the graph directly without saving/loading:
@@ -65,7 +35,7 @@ block_0_out = out["block_0_output"]
 session.close()
 ```
 
-## Method 3: Hook HuggingFace model for reference values
+## Method 2: Hook HuggingFace model for reference values
 
 Use PyTorch hooks to extract intermediate values from HuggingFace at
 the same points:

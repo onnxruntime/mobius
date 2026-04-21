@@ -458,6 +458,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SkipNorm fusion.
 - 10 examples covering text generation, multimodal, ASR, TTS, and
   ORT-GenAI integration.
-- 11 contribution skills (`.agents/skills/`) for AI-agent-assisted
+- 12 contribution skills (`.agents/skills/`) for AI-agent-assisted
   development: adding models, writing tests, debugging VL pipelines,
   rewrite rules, and more.

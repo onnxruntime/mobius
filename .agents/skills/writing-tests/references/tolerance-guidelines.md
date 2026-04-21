@@ -21,8 +21,8 @@ introduces additional floating-point variance.
 
 ## `assert_logits_close` behavior
 
-`assert_logits_close` uses `strict=True` in `np.testing.assert_allclose`,
-which also checks shape and dtype match.
+`assert_logits_close` uses `np.testing.assert_allclose(..., strict=True)`,
+which checks shape, dtype, and value equality within tolerance.
 
 ## Tolerance failure checklist
 
@@ -96,7 +96,7 @@ for Exp/Softplus in fp16 models:
 ```python
 x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
 result = op.Exp(x_f32)
-result = op.Cast(result, to=x.dtype)  # cast back
+result = op.CastLike(result, x)  # cast back to x's dtype
 ```
 
 ### bf16

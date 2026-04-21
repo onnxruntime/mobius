@@ -43,7 +43,7 @@ token_ids = generator.generate(input_ids, max_new_tokens=10, eos_token_id=...)
 ### `assert_logits_close(actual, expected, rtol, atol)`
 
 Uses `np.testing.assert_allclose` with `strict=True` (checks shape + dtype).
-On failure, prints diagnostic info including max/mean abs diff.
+On failure, numpy prints diagnostic info including max abs diff.
 
 ### `assert_generation_match(actual_ids, expected_ids)`
 
