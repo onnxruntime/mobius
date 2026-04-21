@@ -23,8 +23,8 @@ from detect_affected_models import (  # noqa: E402
     _SRC_ROOT,
     _build_class_to_source_module,
     _build_import_graph,
-    _build_registry_class_to_types,
     _build_reexport_map,
+    _build_registry_class_to_types,
     _build_source_module_to_types,
     _find_reverse_dependents,
     _parse_imports,
@@ -405,9 +405,7 @@ class TestReexportResolution:
         )
         return src
 
-    def test_resolves_symbol_to_source_module(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_resolves_symbol_to_source_module(self, tmp_path: Path, monkeypatch) -> None:
         """``from mobius.components import Attention`` → depends on _attention."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
@@ -435,9 +433,7 @@ class TestReexportResolution:
         assert "mobius.components._mlp" in imports
         assert "mobius.components" not in imports
 
-    def test_unknown_symbol_falls_back_to_package(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_unknown_symbol_falls_back_to_package(self, tmp_path: Path, monkeypatch) -> None:
         """Symbols not in the re-export map fall back to the hub package."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
@@ -451,9 +447,7 @@ class TestReexportResolution:
         # And no spurious source-module resolution
         assert "mobius.components._attention" not in imports
 
-    def test_wildcard_import_falls_back_to_package(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_wildcard_import_falls_back_to_package(self, tmp_path: Path, monkeypatch) -> None:
         """``from mobius.components import *`` cannot be resolved — fall back."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
@@ -470,9 +464,7 @@ class TestReexportResolution:
         """Mix of known + unknown symbols records resolved sources AND the hub."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
-        importer.write_text(
-            "from mobius.components import Attention, NotExported\n"
-        )
+        importer.write_text("from mobius.components import Attention, NotExported\n")
 
         reexport = _build_reexport_map(src)
         imports = _parse_imports(importer, reexport)
@@ -481,9 +473,7 @@ class TestReexportResolution:
         # Unresolved symbol keeps the hub as a conservative dependency
         assert "mobius.components" in imports
 
-    def test_plain_import_statement_records_module(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_plain_import_statement_records_module(self, tmp_path: Path, monkeypatch) -> None:
         """``import mobius.components`` (no ``from``) records the module directly."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
@@ -494,9 +484,7 @@ class TestReexportResolution:
 
         assert "mobius.components" in imports
 
-    def test_no_reexport_map_records_module(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_no_reexport_map_records_module(self, tmp_path: Path, monkeypatch) -> None:
         """When no map is passed, the hub is always recorded (legacy behavior)."""
         self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
@@ -507,16 +495,12 @@ class TestReexportResolution:
         assert "mobius.components" in imports
         assert "mobius.components._attention" not in imports
 
-    def test_non_mobius_imports_ignored(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_non_mobius_imports_ignored(self, tmp_path: Path, monkeypatch) -> None:
         """Imports outside the mobius package are not recorded."""
         src = self._write_pkg(tmp_path, monkeypatch)
         importer = tmp_path / "importer.py"
         importer.write_text(
-            "import os\n"
-            "from typing import Any\n"
-            "from mobius.components import Attention\n"
+            "import os\nfrom typing import Any\nfrom mobius.components import Attention\n"
         )
 
         reexport = _build_reexport_map(src)
@@ -531,11 +515,8 @@ class TestReexportResolution:
         src = self._write_pkg(tmp_path, monkeypatch)
         reexport = _build_reexport_map(src)
 
-        assert reexport[("mobius.components", "Attention")] == (
-            "mobius.components._attention"
-        )
+        assert reexport[("mobius.components", "Attention")] == ("mobius.components._attention")
         assert reexport[("mobius.components", "MLP")] == "mobius.components._mlp"
-
 
 
 class TestCLI:
