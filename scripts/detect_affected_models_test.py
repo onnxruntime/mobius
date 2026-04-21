@@ -399,7 +399,7 @@ class TestReexportResolution:
         (src / "components" / "_mlp.py").write_text("class MLP: ...\n")
         # _module_name_from_path uses _PROJECT_ROOT to resolve dotted names;
         # point it at our synthetic tree for the duration of the test.
-        monkeypatch.setattr(_dam, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr("detect_affected_models._PROJECT_ROOT", tmp_path)
         return src
 
     def test_resolves_symbol_to_source_module(self, tmp_path: Path, monkeypatch) -> None:
