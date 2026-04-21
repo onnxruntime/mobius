@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Requires detectron2 + bbox/image inputs not in test harness."
 level: "L4"
 
 notes: "LayoutLMv2 base. Multi-modal document understanding."

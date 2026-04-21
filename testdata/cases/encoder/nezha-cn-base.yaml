@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Model type not recognized by current transformers version."
 level: "L4"
 
 notes: "NEZHA Chinese base. Relative position attention Chinese encoder."

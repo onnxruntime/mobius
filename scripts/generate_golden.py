@@ -230,6 +230,15 @@ def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
 
     model, tokenizer = load_torch_encoder_model(case.model_id, device=device)
 
+    # CLIP-like multimodal models wrap a text sub-model that can be
+    # called with text-only inputs (pixel_values not required).
+    if hasattr(model, "text_model"):
+        model = model.text_model
+
+    # X-MOD requires setting a default language before inference.
+    if hasattr(model, "set_default_language"):
+        model.set_default_language("en_XX")
+
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
@@ -267,7 +276,10 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
     input_ids = encoded["input_ids"]
 
     # Prepare decoder input (pad token for autoregressive start)
-    decoder_start = np.array([[model.config.decoder_start_token_id or 0]], dtype=np.int64)
+    decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
+    if decoder_start_id is None:
+        decoder_start_id = getattr(model.generation_config, "decoder_start_token_id", 0) or 0
+    decoder_start = np.array([[decoder_start_id]], dtype=np.int64)
 
     # L4: single forward pass through full model
     torch_device = next(model.parameters()).device
@@ -735,10 +747,11 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
 
     # Forward pass → last_hidden_state
     hidden_states = torch_vision_forward(model, pixel_values)
-    # Use the last patch token rather than the CLS token (index 0) because
-    # patch-based ViT models aggregate spatial context into trailing tokens;
-    # the last token provides a stable, architecture-neutral summary vector.
-    last_hidden = hidden_states[0, -1, :]  # (hidden_size,)
+    # Some vision models (CvT, MobileViT, PVT) return 4-D feature maps
+    # [B, C, H, W] instead of [B, seq_len, hidden].  Flatten everything
+    # into a 1-D vector for top-k extraction.
+    batch_hidden = hidden_states[0]  # drop batch dim
+    last_hidden = batch_hidden.reshape(-1) if batch_hidden.ndim > 1 else batch_hidden
     golden = _extract_logits_golden(last_hidden)
 
     # Image classification is L4-only (no generation)
@@ -765,6 +778,11 @@ _GENERATORS = {
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
+    # Vision tasks that produce last_hidden_state — reuse image classification.
+    "depth-estimation": _generate_image_classification,
+    "image-segmentation": _generate_image_classification,
+    "image-to-image": _generate_image_classification,
+    "object-detection": _generate_image_classification,
 }
 
 

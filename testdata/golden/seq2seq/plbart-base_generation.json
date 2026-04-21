@@ -1,0 +1,19 @@
+{
+  "model_id": "uclanlp/plbart-base",
+  "prompt": "def add(a, b): return a + b",
+  "generated_tokens": [
+    0,
+    236,
+    33460,
+    33441,
+    33463,
+    56,
+    988,
+    111,
+    14,
+    163,
+    56,
+    2
+  ],
+  "generated_text": "add(a, b): return a + b"
+}

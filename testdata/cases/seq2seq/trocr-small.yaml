@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Vision-encoder-decoder requires pixel_values input; not a text seq2seq model."
 level: "L4"
 
 notes: "TrOCR small handwritten. OCR with vision encoder + text decoder."

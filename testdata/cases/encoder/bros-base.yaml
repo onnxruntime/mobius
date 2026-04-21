@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Requires bbox input not supported in test harness."
 level: "L4"
 
 notes: "BROS base. Document understanding with spatial layout."
