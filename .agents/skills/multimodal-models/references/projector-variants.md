@@ -120,7 +120,7 @@ class VisionConfig:
 
 Both vision encoders support multiple images via the ONNX `Scan` op.
 Per-image values (position IDs, window indices, cu_seqlens) are computed
-in a Scan body and concatenated. See `.agents/skills/scan-and-multi-image/SKILL.md`.
+in a Scan body and concatenated. See `references/scan-pattern.md`.
 
 ### Spatial merge (post-encoder)
 

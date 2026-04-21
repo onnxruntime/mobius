@@ -141,6 +141,10 @@ Multimodal HF models often prefix text weights differently. Implement
 > instructions for adding a new multimodal model, vision config extraction
 > code, or the full model class template with InputMixer wiring.
 
+> Read `references/scan-pattern.md` when building multi-image support using
+> the ONNX Scan op, especially for variable-length per-image outputs that
+> need the Scan + Padding + Compaction pattern.
+
 ## genai_config.json required fields for VLMs
 
 **Required fields** (without these, VLM output is wrong):
@@ -149,7 +153,7 @@ Multimodal HF models often prefix text weights differently. Implement
 - `spatial_merge_size`: Grid merge factor (2 for Qwen2.5-VL)
 
 See `.agents/skills/ort-genai-config/SKILL.md` for the complete reference
-and `.agents/skills/debugging-vl-pipeline/SKILL.md` for troubleshooting.
+and `.agents/skills/debugging-multimodal/SKILL.md` for troubleshooting.
 
 ### processor_config.json for image preprocessing
 
@@ -169,9 +173,7 @@ instead of `Gather` for per-layer projection indexing.
 
 ## Cross-references
 
-- **VL debugging:** `.agents/skills/debugging-vl-pipeline/SKILL.md`
+- **Multimodal debugging:** `.agents/skills/debugging-multimodal/SKILL.md`
 - **ORT GenAI config:** `.agents/skills/ort-genai-config/SKILL.md`
 - **Weight name alignment:** `.agents/skills/weight-name-alignment/SKILL.md`
-- **Multi-image Scan pattern:** `.agents/skills/scan-and-multi-image/SKILL.md`
-- **Component parity debugging:** `.agents/skills/phi4mm-component-parity/SKILL.md`
 - **Reusable components (ClippableLinear):** `.agents/skills/reusable-components/SKILL.md`

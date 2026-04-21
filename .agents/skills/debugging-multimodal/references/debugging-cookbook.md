@@ -1,5 +1,10 @@
 # Debugging Cookbook — Step-by-Step Procedures
 
+Detailed step-by-step debugging procedures for multimodal model parity
+issues. For the high-level methodology, see the parent `SKILL.md`.
+
+---
+
 ## Step-by-step debugging process
 
 ### Phase 1: Text-only baseline
@@ -22,7 +27,8 @@
 6. **Disable LoRA** — if the model uses LoRA, zero out adapter weights and
    compare base model output against HF with adapters disabled.
 7. **Layer-by-layer** — add intermediate outputs to the ONNX graph (see
-   `debugging-vl-pipeline` skill) to find which decoder layer first diverges.
+   `references/extraction-methods.md`) to find which decoder layer first
+   diverges.
 
 ### Phase 3: Add modalities
 
@@ -112,17 +118,7 @@ def test_audio_prefill_logits_match(self):
     assert_logits_close(onnx_logits, hf_logits)
 ```
 
-### Tolerance guidelines
-
-| Precision | atol | rtol | Notes |
-|-----------|------|------|-------|
-| float32 | 1e-4 | 2e-2 | Standard for single-forward-pass |
-| float32 (deep model, 32+ layers) | 1e-3 | 5e-2 | Error compounds over layers |
-| float16 / bfloat16 | 0.01 | 0.05 | Wider tolerance for mixed precision |
-| Cosine similarity (last token) | > 0.98 | — | Primary correctness metric |
-| Argmax match (first prediction) | exact | — | Should always match |
-
-### Weight loading verification
+## Weight loading verification
 
 After `apply_weights`, check the statistics:
 ```python

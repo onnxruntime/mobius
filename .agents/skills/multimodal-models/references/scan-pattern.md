@@ -1,16 +1,10 @@
----
-name: scan-and-multi-image
-description: >
-  Use this skill when building ONNX Scan or Loop subgraphs, or adding
-  multi-image support to a vision model. Covers the Scan + Padding +
-  Compaction pattern for variable-length per-image outputs, building Scan
-  body subgraphs with implicit inputs and carry states, the
-  rename-to-avoid-SSA-violations workaround, and the compact_scan_output
-  helper. Primary use case: multi-image vision models where per-image
-  computations produce variable output sizes.
----
+# ONNX Scan Op & Multi-Image Vision
 
-# Skill: ONNX Scan Op & Multi-Image Vision
+Reference for using the ONNX Scan op in multi-image vision models.
+Covers the Scan + Padding + Compaction pattern for variable-length
+per-image outputs, building Scan body subgraphs with implicit inputs
+and carry states, the rename-to-avoid-SSA-violations workaround, and
+the `compact_scan_output` helper.
 
 ## When to use
 
