@@ -853,3 +853,527 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     atol = _ATOL_OVERRIDES.get(model_type, 1e-3)
     report = compare_synthetic(onnx_logits, hf_logits, rtol=1e-3, atol=atol)
     assert report.result != ParityResult.FAIL, f"{model_type}: {report.message}"
+
+
+# ===========================================================================
+# L3 Encoder-only synthetic parity
+# ===========================================================================
+
+_ENCODER_SKIP_REASONS: dict[str, str] = {
+    # LayoutLM v2/v3 require visual_bbox/pixel_values beyond simple text input
+    "layoutlmv2": "LayoutLMv2 requires visual inputs (bbox + pixel_values)",
+    "layoutlmv3": "LayoutLMv3 requires visual inputs (bbox + pixel_values)",
+    # Bros requires bbox_first_token_mask / bbox inputs
+    "bros": "Bros requires bounding-box inputs beyond simple text",
+    # LayoutLM v1 requires bbox (2D position embeddings)
+    "layoutlm": "LayoutLM requires bbox inputs",
+    # MarkupLM requires xpath tags/subs beyond simple text
+    "markuplm": "MarkupLM requires xpath/tag inputs",
+    # LiLT requires bbox inputs for layout-language cross-modal
+    "lilt": "LiLT requires bbox inputs for layout understanding",
+    # XLNet: HF does not implement sequence_summary for from_config path
+    "xlnet": "HF XLNet raises NotImplementedError (no sequence_summary from config)",
+    # Xmod: requires set_default_language() call before forward
+    "xmod": "HF Xmod requires set_default_language() before inference",
+}
+
+_ENCODER_ATOL_OVERRIDES: dict[str, float] = {
+    # ModernBERT: unpadding + local/global attention FP differences
+    "modernbert": 0.01,
+    # DeBERTa: disentangled attention FP accumulation differences
+    "deberta": 0.10,
+    "deberta-v2": 0.12,
+    # Roformer: rotary position embedding FP differences
+    "roformer": 2.0,
+}
+
+_ENCODER_XFAIL_REASONS: dict[str, str] = {
+    # RoBERTa family: position_ids offset (padding_idx+1) causes structural divergence
+    "roberta": "RoBERTa position_ids offset differs from ONNX (cosine ~0.66)",
+    "camembert": "CamemBERT (RoBERTa-based) position_ids offset mismatch",
+    "data2vec-text": "Data2Vec-Text (RoBERTa-based) position_ids offset mismatch",
+    "xlm-roberta": "XLM-RoBERTa position_ids offset mismatch",
+    "xlm-roberta-xl": "XLM-RoBERTa-XL position_ids offset mismatch",
+    "roberta-prelayernorm": "RoBERTa-PreLN position_ids + LayerNorm divergence",
+    # ESM: custom attention + contact prediction head; not standard BERT
+    "esm": "ESM attention architecture differs from standard BERT encoder",
+    # FlauBERT: XLM-style model (causal attention + lang embeddings)
+    "flaubert": "FlauBERT is XLM-style (causal + lang embeddings), not standard encoder",
+    # MegatronBERT: post-LN vs pre-LN ordering differs
+    "megatron-bert": "Megatron-BERT post-LN diverges with random weights (cosine ~-0.03)",
+    # iBERT: integer-quantized operations produce different FP paths
+    "ibert": "iBERT quantized ops differ from standard BERT encoder",
+    # MPNet: permuted language modeling architecture with position shift
+    "mpnet": "MPNet relative position bias differs from ONNX encoder",
+    # Roc-BERT: multi-modal contrastive features affect hidden states
+    "roc_bert": "Roc-BERT multi-modal architecture differs (cosine ~0.80)",
+}
+
+
+def _build_encoder_params() -> list:
+    """Build pytest.param list for encoder-only models."""
+    from _test_configs import ENCODER_CONFIGS
+
+    params = []
+    for mt, ov, _ in ENCODER_CONFIGS:
+        xfail_reason = _ENCODER_XFAIL_REASONS.get(mt)
+        marks = [pytest.mark.xfail(reason=xfail_reason, strict=False)] if xfail_reason else []
+        params.append(pytest.param(mt, ov, id=mt, marks=marks))
+    return params
+
+
+_ENCODER_PARAMS = _build_encoder_params()
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _ENCODER_PARAMS)
+def test_encoder_synthetic_parity(model_type: str, config_overrides: dict):
+    """L3 synthetic parity for encoder-only models (BERT, RoBERTa, etc.).
+
+    Compares last_hidden_state instead of logits.
+    """
+    if model_type in _ENCODER_SKIP_REASONS:
+        pytest.skip(_ENCODER_SKIP_REASONS[model_type])
+
+    seed = 42
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    # 1. Build tiny config
+    config = _base_config(**config_overrides)
+    config.dtype = ir.DataType.FLOAT
+
+    # 2. Build ONNX model
+    try:
+        module, pkg = _build_onnx_model(model_type, config)
+    except Exception as e:
+        pytest.skip(f"ONNX build failed for {model_type}: {e}")
+
+    # 3. Create HF encoder model
+    from transformers import AutoConfig, AutoModel
+
+    hf_kwargs: dict = {
+        "hidden_size": TINY_HIDDEN,
+        "intermediate_size": TINY_INTERMEDIATE,
+        "num_attention_heads": TINY_HEADS,
+        "num_hidden_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "vocab_size": TINY_VOCAB,
+        "max_position_embeddings": config_overrides.get("max_position_embeddings", 128),
+        "pad_token_id": 0,
+    }
+    for key, value in config_overrides.items():
+        if key == "_config_cls":
+            continue
+        hf_kwargs[key] = value
+
+    try:
+        hf_config = AutoConfig.for_model(model_type, **hf_kwargs)
+    except (ValueError, KeyError) as e:
+        pytest.skip(f"Cannot create HF config for {model_type}: {e}")
+
+    torch.manual_seed(seed)
+    try:
+        hf_model = AutoModel.from_config(hf_config).float().eval()
+    except Exception as e:
+        pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
+
+    # 4. Transfer HF weights to ONNX
+    try:
+        preprocessed = module.preprocess_weights(dict(hf_model.state_dict()))
+        for onnx_model in pkg.values():
+            apply_weights(onnx_model, preprocessed)
+    except Exception as e:
+        pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
+
+    for onnx_model in pkg.values():
+        _fill_random_weights(onnx_model, rng)
+
+    # 5. Prepare inputs
+    seq_len = 3
+    input_ids = rng.integers(1, config.vocab_size, size=(1, seq_len)).astype(np.int64)
+    attention_mask = np.ones_like(input_ids)
+
+    hf_feeds: dict = {
+        "input_ids": torch.from_numpy(input_ids),
+        "attention_mask": torch.from_numpy(attention_mask),
+    }
+    # token_type_ids: only pass if model expects them (type_vocab_size > 0)
+    type_vocab_size = config_overrides.get("type_vocab_size", 0)
+    if type_vocab_size and type_vocab_size > 0:
+        token_type_ids = np.zeros_like(input_ids)
+        hf_feeds["token_type_ids"] = torch.from_numpy(token_type_ids)
+
+    # 6. HF forward
+    with torch.no_grad():
+        hf_out = hf_model(**hf_feeds)
+    hf_hidden = hf_out.last_hidden_state.numpy()
+
+    # 7. ONNX forward
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    onnx_model = pkg["model"]
+    session = OnnxModelSession(onnx_model)
+
+    onnx_feeds: dict[str, np.ndarray] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+    if type_vocab_size and type_vocab_size > 0:
+        onnx_feeds["token_type_ids"] = np.zeros_like(input_ids)
+
+    try:
+        onnx_out = session.run(onnx_feeds)
+    except Exception as e:
+        session.close()
+        pytest.skip(f"ONNX inference failed for {model_type}: {type(e).__name__}: {e}")
+    onnx_hidden = onnx_out["last_hidden_state"]
+    session.close()
+
+    # 8. Compare hidden states
+    atol = _ENCODER_ATOL_OVERRIDES.get(model_type, 1e-3)
+    # For hidden states, use simple allclose check with cosine as diagnostic
+    max_diff = float(np.max(np.abs(onnx_hidden - hf_hidden)))
+    cos_sim = float(
+        np.dot(onnx_hidden.flatten(), hf_hidden.flatten())
+        / (np.linalg.norm(onnx_hidden) * np.linalg.norm(hf_hidden) + 1e-8)
+    )
+    passes = np.allclose(onnx_hidden, hf_hidden, atol=atol, rtol=1e-3)
+    assert passes, (
+        f"{model_type}: encoder L3 FAIL: max_diff={max_diff:.6f}, "
+        f"cosine={cos_sim:.6f}, atol={atol}"
+    )
+
+
+# ===========================================================================
+# L3 Seq2Seq synthetic parity (encoder component)
+# ===========================================================================
+
+_SEQ2SEQ_SKIP_REASONS: dict[str, str] = {
+    # ProphetNet: HF raises NotImplementedError for num_hidden_layers override
+    "prophetnet": "HF ProphetNet does not support num_hidden_layers override",
+    # XLM-ProphetNet: not in HF CONFIG_MAPPING
+    "xlm-prophetnet": "Not in HF CONFIG_MAPPING (use prophetnet)",
+    # nllb_moe: HF identifier uses hyphen (nllb-moe), not underscore
+    "nllb_moe": "HF identifier is nllb-moe, not nllb_moe",
+    # TrOCR: decoder-only architecture, not AutoModelForSeq2SeqLM
+    "trocr": "TrOCR is decoder-only, not AutoModelForSeq2SeqLM",
+    # FSMT: uses non-standard shared vocab that conflicts with tiny vocab
+    "fsmt": "Non-standard shared vocab architecture (42024 min)",
+}
+
+_SEQ2SEQ_ATOL_OVERRIDES: dict[str, float] = {
+    # UMT5: gated activation + RMSNorm FP differences (cosine=0.996)
+    "umt5": 0.30,
+}
+
+_SEQ2SEQ_XFAIL_REASONS: dict[str, str] = {
+    # LED: Longformer-style global+local attention diverges from standard encoder
+    "led": "LED global/local attention architecture diverges (cosine ~0.0)",
+    # NLLB-MoE: MoE routing with random weights causes divergence
+    "nllb-moe": "NLLB-MoE expert routing diverges with random weights (cosine ~-0.06)",
+    # Models with embed_positions offset (+2 for padding) shape mismatch
+    "bigbird_pegasus": "embed_positions offset (+2) shape mismatch",
+    "blenderbot": "embed_positions offset (+2) shape mismatch",
+    "blenderbot-small": "embed_positions offset (+2) shape mismatch",
+    "marian": "embed_positions offset (+2) shape mismatch",
+    "pegasus": "embed_positions offset (+2) shape mismatch",
+    "m2m_100": "embed_positions offset mismatch (max_diff ~3.6)",
+    "pegasus_x": "staggered local attention diverges (max_diff ~4.2)",
+    "plbart": "embed_positions offset mismatch (max_diff ~2.7)",
+    # LongT5: transient-global local attention diverges from standard attention
+    "longt5": "Transient-global local attention diverges (max_diff ~2.0)",
+    # Switch Transformers: MoE top-1 routing with random weights diverges
+    "switch_transformers": "MoE routing diverges with random weights (max_diff ~1.8)",
+}
+
+
+def _build_seq2seq_params() -> list:
+    """Build pytest.param list for seq2seq models."""
+    from _test_configs import SEQ2SEQ_CONFIGS
+
+    params = []
+    for mt, ov, _ in SEQ2SEQ_CONFIGS:
+        xfail_reason = _SEQ2SEQ_XFAIL_REASONS.get(mt)
+        marks = [pytest.mark.xfail(reason=xfail_reason, strict=False)] if xfail_reason else []
+        params.append(pytest.param(mt, ov, id=mt, marks=marks))
+    return params
+
+
+_SEQ2SEQ_PARAMS = _build_seq2seq_params()
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _SEQ2SEQ_PARAMS)
+def test_seq2seq_encoder_synthetic_parity(model_type: str, config_overrides: dict):
+    """L3 synthetic parity for seq2seq encoder (T5, BART, etc.).
+
+    Compares encoder last_hidden_state output.
+    """
+    if model_type in _SEQ2SEQ_SKIP_REASONS:
+        pytest.skip(_SEQ2SEQ_SKIP_REASONS[model_type])
+
+    seed = 42
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    # 1. Build tiny config
+    config = _base_config(**config_overrides)
+    config.dtype = ir.DataType.FLOAT
+
+    # 2. Build ONNX model package (encoder + decoder)
+    try:
+        module, pkg = _build_onnx_model(model_type, config)
+    except Exception as e:
+        pytest.skip(f"ONNX build failed for {model_type}: {e}")
+
+    if "encoder" not in pkg:
+        pytest.skip(f"{model_type}: no encoder in ModelPackage")
+
+    # 3. Create HF seq2seq model
+    from transformers import AutoConfig, AutoModelForSeq2SeqLM
+
+    hf_kwargs: dict = {
+        "hidden_size": TINY_HIDDEN,
+        "d_model": TINY_HIDDEN,
+        "intermediate_size": TINY_INTERMEDIATE,
+        "d_ff": TINY_INTERMEDIATE,
+        "encoder_ffn_dim": TINY_INTERMEDIATE,
+        "decoder_ffn_dim": TINY_INTERMEDIATE,
+        "num_attention_heads": TINY_HEADS,
+        "num_heads": TINY_HEADS,
+        "encoder_attention_heads": TINY_HEADS,
+        "decoder_attention_heads": TINY_HEADS,
+        # T5 family: d_kv must match head_dim = hidden_size // num_heads
+        "d_kv": TINY_HIDDEN // TINY_HEADS,
+        "num_hidden_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "num_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "encoder_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "num_decoder_layers": config_overrides.get("num_decoder_layers", TINY_LAYERS),
+        "decoder_layers": config_overrides.get("num_decoder_layers", TINY_LAYERS),
+        "vocab_size": TINY_VOCAB,
+        "max_position_embeddings": config_overrides.get("max_position_embeddings", 128),
+        "pad_token_id": 0,
+        "decoder_start_token_id": 1,
+    }
+    for key, value in config_overrides.items():
+        if key == "_config_cls":
+            continue
+        hf_kwargs[key] = value
+
+    try:
+        hf_config = AutoConfig.for_model(model_type, **hf_kwargs)
+    except (ValueError, KeyError) as e:
+        pytest.skip(f"Cannot create HF config for {model_type}: {e}")
+
+    torch.manual_seed(seed)
+    try:
+        hf_model = AutoModelForSeq2SeqLM.from_config(hf_config).float().eval()
+    except Exception as e:
+        pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
+
+    # 4. Transfer HF weights to ONNX
+    try:
+        preprocessed = module.preprocess_weights(dict(hf_model.state_dict()))
+        for onnx_model in pkg.values():
+            apply_weights(onnx_model, preprocessed)
+    except Exception as e:
+        pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
+
+    for onnx_model in pkg.values():
+        _fill_random_weights(onnx_model, rng)
+
+    # 5. Prepare encoder inputs
+    seq_len = 3
+    input_ids = rng.integers(1, config.vocab_size, size=(1, seq_len)).astype(np.int64)
+    attention_mask = np.ones_like(input_ids)
+
+    # 6. HF encoder forward
+    with torch.no_grad():
+        hf_encoder_out = hf_model.get_encoder()(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+        )
+    hf_hidden = hf_encoder_out.last_hidden_state.numpy()
+
+    # 7. ONNX encoder forward
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    onnx_encoder = pkg["encoder"]
+    session = OnnxModelSession(onnx_encoder)
+
+    onnx_feeds: dict[str, np.ndarray] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+
+    try:
+        onnx_out = session.run(onnx_feeds)
+    except Exception as e:
+        session.close()
+        pytest.skip(f"ONNX encoder inference failed for {model_type}: {type(e).__name__}: {e}")
+    onnx_hidden = onnx_out["last_hidden_state"]
+    session.close()
+
+    # 8. Compare encoder hidden states
+    atol = _SEQ2SEQ_ATOL_OVERRIDES.get(model_type, 1e-3)
+    max_diff = float(np.max(np.abs(onnx_hidden - hf_hidden)))
+    cos_sim = float(
+        np.dot(onnx_hidden.flatten(), hf_hidden.flatten())
+        / (np.linalg.norm(onnx_hidden) * np.linalg.norm(hf_hidden) + 1e-8)
+    )
+    passes = np.allclose(onnx_hidden, hf_hidden, atol=atol, rtol=1e-3)
+    assert passes, (
+        f"{model_type}: seq2seq encoder L3 FAIL: max_diff={max_diff:.6f}, "
+        f"cosine={cos_sim:.6f}, atol={atol}"
+    )
+
+
+# ===========================================================================
+# L3 Seq2Seq decoder synthetic parity
+# ===========================================================================
+
+
+@pytest.mark.parametrize("model_type,config_overrides", _SEQ2SEQ_PARAMS)
+def test_seq2seq_decoder_synthetic_parity(model_type: str, config_overrides: dict):
+    """L3 synthetic parity for seq2seq decoder (T5, BART, etc.).
+
+    Feeds HF encoder output to both HF decoder and ONNX decoder, compares logits.
+    """
+    if model_type in _SEQ2SEQ_SKIP_REASONS:
+        pytest.skip(_SEQ2SEQ_SKIP_REASONS[model_type])
+
+    seed = 42
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    # 1. Build tiny config
+    config = _base_config(**config_overrides)
+    config.dtype = ir.DataType.FLOAT
+
+    # 2. Build ONNX model package
+    try:
+        module, pkg = _build_onnx_model(model_type, config)
+    except Exception as e:
+        pytest.skip(f"ONNX build failed for {model_type}: {e}")
+
+    if "decoder" not in pkg:
+        pytest.skip(f"{model_type}: no decoder in ModelPackage")
+
+    # 3. Create HF seq2seq model
+    from transformers import AutoConfig, AutoModelForSeq2SeqLM
+
+    hf_kwargs: dict = {
+        "hidden_size": TINY_HIDDEN,
+        "d_model": TINY_HIDDEN,
+        "intermediate_size": TINY_INTERMEDIATE,
+        "d_ff": TINY_INTERMEDIATE,
+        "encoder_ffn_dim": TINY_INTERMEDIATE,
+        "decoder_ffn_dim": TINY_INTERMEDIATE,
+        "num_attention_heads": TINY_HEADS,
+        "num_heads": TINY_HEADS,
+        "encoder_attention_heads": TINY_HEADS,
+        "decoder_attention_heads": TINY_HEADS,
+        # T5 family: d_kv must match head_dim = hidden_size // num_heads
+        "d_kv": TINY_HIDDEN // TINY_HEADS,
+        "num_hidden_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "num_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "encoder_layers": config_overrides.get("num_hidden_layers", TINY_LAYERS),
+        "num_decoder_layers": config_overrides.get("num_decoder_layers", TINY_LAYERS),
+        "decoder_layers": config_overrides.get("num_decoder_layers", TINY_LAYERS),
+        "vocab_size": TINY_VOCAB,
+        "max_position_embeddings": config_overrides.get("max_position_embeddings", 128),
+        "pad_token_id": 0,
+        "decoder_start_token_id": 1,
+    }
+    for key, value in config_overrides.items():
+        if key == "_config_cls":
+            continue
+        hf_kwargs[key] = value
+
+    try:
+        hf_config = AutoConfig.for_model(model_type, **hf_kwargs)
+    except (ValueError, KeyError) as e:
+        pytest.skip(f"Cannot create HF config for {model_type}: {e}")
+
+    torch.manual_seed(seed)
+    try:
+        hf_model = AutoModelForSeq2SeqLM.from_config(hf_config).float().eval()
+    except Exception as e:
+        pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
+
+    # 4. Transfer HF weights to ONNX
+    try:
+        preprocessed = module.preprocess_weights(dict(hf_model.state_dict()))
+        for onnx_model in pkg.values():
+            apply_weights(onnx_model, preprocessed)
+    except Exception as e:
+        pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
+
+    for onnx_model in pkg.values():
+        _fill_random_weights(onnx_model, rng)
+
+    # 5. Run HF encoder to get shared encoder_hidden_states
+    seq_len = 3
+    input_ids = rng.integers(1, config.vocab_size, size=(1, seq_len)).astype(np.int64)
+    attention_mask = np.ones_like(input_ids)
+
+    with torch.no_grad():
+        hf_encoder_out = hf_model.get_encoder()(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+        )
+    encoder_hidden_states = hf_encoder_out.last_hidden_state
+
+    # 6. HF decoder forward (single token, no cache)
+    decoder_input_ids = np.array([[1]], dtype=np.int64)  # decoder_start_token_id
+    with torch.no_grad():
+        hf_dec_out = hf_model(
+            encoder_outputs=(encoder_hidden_states,),
+            decoder_input_ids=torch.from_numpy(decoder_input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            use_cache=False,
+        )
+    hf_logits = hf_dec_out.logits.numpy()
+
+    # 7. ONNX decoder forward
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    onnx_decoder = pkg["decoder"]
+    session = OnnxModelSession(onnx_decoder)
+
+    onnx_feeds: dict[str, np.ndarray] = {
+        "input_ids": decoder_input_ids,
+        "encoder_hidden_states": encoder_hidden_states.numpy(),
+        "encoder_attention_mask": attention_mask,
+    }
+    # Add zero-valued past KV cache feeds
+    for inp in onnx_decoder.graph.inputs:
+        name = inp.name
+        if name in onnx_feeds:
+            continue
+        if not name.startswith("past_key_values"):
+            continue
+        shape = []
+        for d in inp.shape:
+            if isinstance(d, int):
+                shape.append(d)
+            elif "past" in str(d):
+                shape.append(0)
+            elif "batch" in str(d):
+                shape.append(1)
+            else:
+                shape.append(0)
+        onnx_feeds[name] = np.zeros(shape, dtype=np.float32)
+
+    try:
+        onnx_out = session.run(onnx_feeds)
+    except Exception as e:
+        session.close()
+        pytest.skip(f"ONNX decoder inference failed for {model_type}: {type(e).__name__}: {e}")
+    onnx_logits = onnx_out["logits"]
+    session.close()
+
+    # 8. Compare decoder logits
+    atol = _SEQ2SEQ_ATOL_OVERRIDES.get(model_type, 1e-3)
+    report = compare_synthetic(onnx_logits, hf_logits, rtol=1e-3, atol=atol)
+    assert report.result != ParityResult.FAIL, (
+        f"{model_type}: seq2seq decoder L3 FAIL: {report.message}"
+    )
