@@ -17,7 +17,7 @@ on:
       affected_models:
         description: >-
           JSON array of affected model names (e.g. '["qwen2", "llama"]').
-          Empty string means run all models.
+          Empty string or empty array means run all models.
         required: false
         type: string
         default: ""
