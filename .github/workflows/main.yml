@@ -230,6 +230,7 @@ jobs:
         if: steps.check_golden.outputs.has_golden == 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
         run: |
           if [ ! -f tests/e2e_golden_test.py ]; then
             echo "tests/e2e_golden_test.py not found — skipping"
