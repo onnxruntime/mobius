@@ -19,6 +19,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from detect_affected_models import (  # noqa: E402
+    _PROJECT_ROOT,
     _SRC_ROOT,
     _build_class_to_source_module,
     _build_import_graph,
@@ -399,9 +400,9 @@ class TestReexportResolution:
         (src / "components" / "_mlp.py").write_text("class MLP: ...\n")
         # _module_name_from_path uses _PROJECT_ROOT to resolve dotted names;
         # point it at our synthetic tree for the duration of the test.
-        import detect_affected_models as _dam
-
-        monkeypatch.setattr(_dam, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            sys.modules[_PROJECT_ROOT.__module__], "_PROJECT_ROOT", tmp_path
+        )
         return src
 
     def test_resolves_symbol_to_source_module(
