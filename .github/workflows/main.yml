@@ -148,15 +148,9 @@ jobs:
           else
             AFFECTED='${{ needs.detect-affected.outputs.affected }}'
             echo "Running parity for affected models: $AFFECTED"
-            # Escape hyphens to underscores for pytest -k compatibility
-            FILTER=$(echo "$AFFECTED" | python -c "
-          import json, sys, re
-          names = json.load(sys.stdin)
-          escaped = [re.sub(r'[^a-zA-Z0-9_]', '_', n) for n in names]
-          print(' or '.join(escaped))
-          ")
-            if [ -n "$FILTER" ]; then
-              pytest tests/synthetic_parity_test.py -v --tb=short -n auto -k "$FILTER" \
+            MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
+            if [ -n "$MODELS" ]; then
+              pytest tests/synthetic_parity_test.py -v --tb=short -n auto --models "$MODELS" \
                 --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
             else
               echo "No affected models — skipping"
