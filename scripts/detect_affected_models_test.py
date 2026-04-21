@@ -183,10 +183,16 @@ class TestDetectAffectedModels:
         # _attention.py is imported by many models — should find affected types
         assert len(result["affected"]) > 0
 
-    def test_task_change_traces_affected_models(self):
-        """Task files are traced via the import graph rather than triggering run_all."""
+    def test_task_change_does_not_trigger_run_all(self):
+        """Task files are traceable but produce an empty affected set.
+
+        No model imports ``mobius.tasks`` directly (tasks are looked up at
+        runtime by string keys), so tracing through the import graph finds
+        no dependents. Documented limitation — see PR description.
+        """
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
         assert result["run_all"] is False
+        assert result["affected"] == []
 
     def test_configs_change_triggers_run_all(self):
         result = detect_affected_models(["src/mobius/_configs.py"])
