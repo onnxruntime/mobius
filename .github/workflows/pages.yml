@@ -45,6 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime
           pip install -r docs/requirements.txt
           pip install -e '.[testing]'
 

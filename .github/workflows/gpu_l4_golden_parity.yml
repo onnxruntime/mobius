@@ -58,6 +58,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime-gpu
           pip install -e '.[testing,transformers]'
 
       - name: Run L4 checkpoint-verified tests
