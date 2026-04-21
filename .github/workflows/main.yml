@@ -191,6 +191,20 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  generation-e2e:
+    name: L5 Generation E2E
+    needs: [detect-affected]
+    if: >-
+      always() && !cancelled() &&
+      (needs.detect-affected.outputs.has_affected == 'true' ||
+       github.event_name != 'pull_request')
+    uses: ./.github/workflows/gpu_l5_generation_e2e.yml
+    with:
+      affected_models: ${{ needs.detect-affected.outputs.affected }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
   test:
     name: test
     strategy:
