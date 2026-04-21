@@ -790,6 +790,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_expand": 2,
             "attention_hidden_size": 2 * TINY_HIDDEN,
             "num_mem_blocks": 1,
+            "adapter_rank": 8,
             "hybrid_layer_indices": [2],
             "num_key_value_heads": TINY_HEADS,
             "mamba_time_step_min": 0.001,

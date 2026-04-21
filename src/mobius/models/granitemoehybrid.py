@@ -63,14 +63,10 @@ class _Linear3D(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([n_experts, out_features, in_features])
 
-    def forward(
-        self, op: builder.OpBuilder, x: ir.Value, expert_index: int
-    ) -> ir.Value:
+    def forward(self, op: builder.OpBuilder, x: ir.Value, expert_index: int) -> ir.Value:
         """Select expert *expert_index* and compute ``x @ W[expert_index].T``."""
         # W[e]: [out_features, in_features]
-        w_e = op.Squeeze(
-            op.Gather(self.weight, [expert_index], axis=0), [0]
-        )
+        w_e = op.Squeeze(op.Gather(self.weight, [expert_index], axis=0), [0])
         return op.MatMul(x, op.Transpose(w_e))
 
 

@@ -153,19 +153,11 @@ class _Zamba2QKVAdapters(nn.Module):
         head_dim = config.head_dim
         rank = config.adapter_rank
 
-        self.q_adapter = _Adapter(
-            attn_hidden, config.num_attention_heads * head_dim, rank
-        )
-        self.k_adapter = _Adapter(
-            attn_hidden, config.num_key_value_heads * head_dim, rank
-        )
-        self.v_adapter = _Adapter(
-            attn_hidden, config.num_key_value_heads * head_dim, rank
-        )
+        self.q_adapter = _Adapter(attn_hidden, config.num_attention_heads * head_dim, rank)
+        self.k_adapter = _Adapter(attn_hidden, config.num_key_value_heads * head_dim, rank)
+        self.v_adapter = _Adapter(attn_hidden, config.num_key_value_heads * head_dim, rank)
 
-    def forward(
-        self, op: builder.OpBuilder, attn_input: ir.Value
-    ) -> tuple:
+    def forward(self, op: builder.OpBuilder, attn_input: ir.Value) -> tuple:
         """Compute Q/K/V adapter outputs from layer-normed concat hidden."""
         return (
             self.q_adapter(op, attn_input),
@@ -184,13 +176,9 @@ class _Zamba2MLPAdapter(nn.Module):
     def __init__(self, config: Zamba2Config):
         super().__init__()
         rank = config.adapter_rank
-        self.mlp_adapter = _Adapter(
-            config.hidden_size, 2 * config.intermediate_size, rank
-        )
+        self.mlp_adapter = _Adapter(config.hidden_size, 2 * config.intermediate_size, rank)
 
-    def forward(
-        self, op: builder.OpBuilder, mlp_input: ir.Value
-    ) -> ir.Value:
+    def forward(self, op: builder.OpBuilder, mlp_input: ir.Value) -> ir.Value:
         """Compute MLP adapter output from pre-FFN hidden states."""
         return self.mlp_adapter(op, mlp_input)
 
@@ -463,8 +451,10 @@ class _Zamba2TextModel(nn.Module):
             [_Zamba2MLPAdapter(config) for _ in range(num_hybrid)]
         )
         self.linears = nn.ModuleList(
-            [Linear(config.hidden_size, config.hidden_size, bias=False)
-             for _ in range(num_hybrid)]
+            [
+                Linear(config.hidden_size, config.hidden_size, bias=False)
+                for _ in range(num_hybrid)
+            ]
         )
 
         # Shared MLP projections (used by all hybrid layers, lives at model
@@ -543,18 +533,12 @@ class _Zamba2TextModel(nn.Module):
             if ltype == "full_attention":
                 # Compute concat + layer_norm at this scope level so that
                 # adapter modules (registered here) get correct ONNX names
-                concat_hidden = op.Concat(
-                    hidden_states, original_hidden_states, axis=-1
-                )
-                concat_hidden = self.input_layernorm(
-                    op, concat_hidden
-                )
+                concat_hidden = op.Concat(hidden_states, original_hidden_states, axis=-1)
+                concat_hidden = self.input_layernorm(op, concat_hidden)
 
                 # Compute per-layer QKV adapter outputs (correct scope via
                 # __call__ which pushes "qkv_adapters.N" prefix)
-                q_out, k_out, v_out = self.qkv_adapters[hybrid_idx](
-                    op, concat_hidden
-                )
+                q_out, k_out, v_out = self.qkv_adapters[hybrid_idx](op, concat_hidden)
 
                 # Shared transformer attention phase → returns pre-MLP hidden
                 mlp_input, present_kv = self.shared_transformer(
@@ -569,9 +553,7 @@ class _Zamba2TextModel(nn.Module):
                 )
 
                 # Compute per-layer MLP adapter (correct scope via __call__)
-                mlp_adapter_out = self.mlp_adapters[hybrid_idx](
-                    op, mlp_input
-                )
+                mlp_adapter_out = self.mlp_adapters[hybrid_idx](op, mlp_input)
 
                 # Apply shared MLP with per-layer adapter
                 gate_adapter, up_adapter = op.Split(
@@ -583,9 +565,7 @@ class _Zamba2TextModel(nn.Module):
                 transformer_out = self.down_proj(op, op.Mul(gate, up))
 
                 # Per-layer linear projection for injection into Mamba
-                transformer_hidden_states = self.linears[hybrid_idx](
-                    op, transformer_out
-                )
+                transformer_hidden_states = self.linears[hybrid_idx](op, transformer_out)
                 present_key_values.append(present_kv)
                 hybrid_idx += 1
             elif ltype == "mamba2" and transformer_hidden_states is not None:
@@ -723,9 +703,7 @@ class Zamba2CausalLMModel(nn.Module):
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
 # Regex for adapter keys within shared_transformer
-_ADAPTER_RE = re.compile(
-    r"^self_attn\.linear_(q|k|v)_adapter_list\.(\d+)\.(0|1)\.weight$"
-)
+_ADAPTER_RE = re.compile(r"^self_attn\.linear_(q|k|v)_adapter_list\.(\d+)\.(0|1)\.weight$")
 _MLP_ADAPTER_RE = re.compile(
     r"^feed_forward\.gate_up_proj_adapter_list\.(\d+)\.(0|1)\.weight$"
 )
@@ -803,16 +781,14 @@ def _remap_weight_key(
         hybrid_idx = hybrid_indices.index(phys_idx)
 
         if rest.startswith("shared_transformer."):
-            sub = rest[len("shared_transformer."):]
+            sub = rest[len("shared_transformer.") :]
 
             # Check if this is a QKV adapter key
             adapter_m = _ADAPTER_RE.match(sub)
             if adapter_m:
                 proj_type = adapter_m.group(1)  # q, k, or v
                 adapter_idx = int(adapter_m.group(2))
-                down_or_up = (
-                    "down" if adapter_m.group(3) == "0" else "up"
-                )
+                down_or_up = "down" if adapter_m.group(3) == "0" else "up"
                 return [
                     f"model.qkv_adapters.{adapter_idx}.{proj_type}_adapter.{down_or_up}.weight"
                 ]
@@ -821,12 +797,8 @@ def _remap_weight_key(
             mlp_adapter_m = _MLP_ADAPTER_RE.match(sub)
             if mlp_adapter_m:
                 adapter_idx = int(mlp_adapter_m.group(1))
-                down_or_up = (
-                    "down" if mlp_adapter_m.group(2) == "0" else "up"
-                )
-                return [
-                    f"model.mlp_adapters.{adapter_idx}.mlp_adapter.{down_or_up}.weight"
-                ]
+                down_or_up = "down" if mlp_adapter_m.group(2) == "0" else "up"
+                return [f"model.mlp_adapters.{adapter_idx}.mlp_adapter.{down_or_up}.weight"]
 
             # Shared transformer weight — only take from canonical source
             if phys_idx == first_hybrid_physical:
@@ -835,7 +807,7 @@ def _remap_weight_key(
                     return [f"model.{sub}"]
                 # MLP projections are at model level
                 if sub.startswith("feed_forward."):
-                    mlp_sub = sub[len("feed_forward."):]
+                    mlp_sub = sub[len("feed_forward.") :]
                     return [f"model.{mlp_sub}"]
                 # Everything else stays under shared_transformer
                 return [f"model.shared_transformer.{sub}"]
@@ -845,12 +817,12 @@ def _remap_weight_key(
 
         elif rest.startswith("linear."):
             # Per-hybrid-layer linear projection
-            sub = rest[len("linear."):]
+            sub = rest[len("linear.") :]
             return [f"model.linears.{hybrid_idx}.{sub}"]
 
         elif rest.startswith("mamba_decoder."):
             # Mamba decoder in hybrid layer → mamba_layers
-            sub = rest[len("mamba_decoder."):]
+            sub = rest[len("mamba_decoder.") :]
             return [f"model.mamba_layers.{mamba_idx}.{sub}"]
 
         else:

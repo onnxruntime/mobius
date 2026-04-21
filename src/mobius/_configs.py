@@ -2100,6 +2100,9 @@ class Zamba2Config(ArchitectureConfig):
     # Number of physical hybrid layers (for weight sharing bookkeeping)
     num_mem_blocks: int = 1
 
+    # Low-rank adapter rank for per-layer differentiation
+    adapter_rank: int = 128
+
     # Physical layer indices that are hybrid (for preprocess_weights mapping)
     hybrid_layer_indices: list[int] | None = None
 
@@ -2156,6 +2159,7 @@ class Zamba2Config(ArchitectureConfig):
             mamba_time_step_min=getattr(config, "time_step_min", 0.001),
             attention_hidden_size=attention_hidden_size,
             num_mem_blocks=getattr(config, "num_mem_blocks", 1),
+            adapter_rank=getattr(config, "adapter_rank", 128),
             hybrid_layer_indices=hybrid_layer_indices,
         )
 
