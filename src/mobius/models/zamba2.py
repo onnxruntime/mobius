@@ -48,12 +48,12 @@ from onnxscript._internal import builder
 from mobius._configs import Zamba2Config
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
-    MLP,
     Embedding,
     Linear,
     Mamba2Block,
     RMSNorm,
     create_attention_bias,
+    get_activation,
     initialize_rope,
 )
 
@@ -123,6 +123,78 @@ class Zamba2MambaDecoderLayer(nn.Module):
         return hidden_states, (new_conv_state, new_ssm_state)
 
 
+class _Adapter(nn.Module):
+    """Low-rank adapter: down_proj → up_proj (no bias, no activation).
+
+    Computes: adapter(x) = up(down(x))
+    where down: (in_features → rank) and up: (rank → out_features).
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.down = Linear(in_features, rank, bias=False)
+        self.up = Linear(rank, out_features, bias=False)
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        return self.up(op, self.down(op, x))
+
+
+class _Zamba2QKVAdapters(nn.Module):
+    """Per-hybrid-layer Q/K/V adapters.
+
+    Computes low-rank adapter contributions for query, key, and value
+    projections. Must be called via __call__ so onnxscript correctly
+    pushes this module's scope prefix for initializer naming.
+    """
+
+    def __init__(self, config: Zamba2Config):
+        super().__init__()
+        attn_hidden = config.attention_hidden_size
+        head_dim = config.head_dim
+        rank = config.adapter_rank
+
+        self.q_adapter = _Adapter(
+            attn_hidden, config.num_attention_heads * head_dim, rank
+        )
+        self.k_adapter = _Adapter(
+            attn_hidden, config.num_key_value_heads * head_dim, rank
+        )
+        self.v_adapter = _Adapter(
+            attn_hidden, config.num_key_value_heads * head_dim, rank
+        )
+
+    def forward(
+        self, op: builder.OpBuilder, attn_input: ir.Value
+    ) -> tuple:
+        """Compute Q/K/V adapter outputs from layer-normed concat hidden."""
+        return (
+            self.q_adapter(op, attn_input),
+            self.k_adapter(op, attn_input),
+            self.v_adapter(op, attn_input),
+        )
+
+
+class _Zamba2MLPAdapter(nn.Module):
+    """Per-hybrid-layer MLP adapter.
+
+    Computes low-rank adapter contribution for the fused gate+up MLP
+    projection. Must be called via __call__ for correct scope naming.
+    """
+
+    def __init__(self, config: Zamba2Config):
+        super().__init__()
+        rank = config.adapter_rank
+        self.mlp_adapter = _Adapter(
+            config.hidden_size, 2 * config.intermediate_size, rank
+        )
+
+    def forward(
+        self, op: builder.OpBuilder, mlp_input: ir.Value
+    ) -> ir.Value:
+        """Compute MLP adapter output from pre-FFN hidden states."""
+        return self.mlp_adapter(op, mlp_input)
+
+
 class _Zamba2AttentionProjections(nn.Module):
     """Q/K/V/O projections for Zamba2 attention (grouped under self_attn).
 
@@ -165,11 +237,10 @@ class Zamba2SharedTransformerLayer(nn.Module):
 
     Concatenates hidden_states with original_hidden_states to form
     attention_hidden_size (2 * hidden_size) input, then:
-        LayerNorm → Attention → LayerNorm → MLP → Linear projection
+        LayerNorm → Attention (+ adapters) → LayerNorm → MLP (+ adapter)
 
-    The output is a transformer_hidden_states tensor of shape
-    (batch, seq_len, hidden_size) that will be injected into the
-    subsequent Mamba layer.
+    Weights in this module are SHARED across all hybrid layers.
+    Per-layer differentiation is achieved via adapters passed to forward().
 
     This layer produces the attention KV cache.
 
@@ -179,7 +250,6 @@ class Zamba2SharedTransformerLayer(nn.Module):
 
     def __init__(self, config: Zamba2Config):
         super().__init__()
-        attn_hidden = config.attention_hidden_size
         head_dim = config.head_dim
 
         # Attention projections grouped under self_attn for naming
@@ -191,43 +261,48 @@ class Zamba2SharedTransformerLayer(nn.Module):
         # Zamba2 uses scaling = (head_dim / 2) ** -0.5
         self.scaling = (head_dim / 2) ** -0.5
 
-        # Layer norms
-        self.input_layernorm = RMSNorm(attn_hidden, eps=config.rms_norm_eps)
+        # Pre-FFN norm (stays inside shared_transformer for correct scope)
         self.pre_ff_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # MLP (gate_up_proj fused → split in forward)
-        self.feed_forward = MLP(config)
-
-        # Linear projection after MLP (projects transformer output for injection)
-        self.linear = Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(
         self,
         op: builder.OpBuilder,
-        hidden_states: ir.Value,
-        original_hidden_states: ir.Value,
+        concat_hidden: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple | None,
         past_key_value: tuple | None,
+        q_adapter_out: ir.Value | None = None,
+        k_adapter_out: ir.Value | None = None,
+        v_adapter_out: ir.Value | None = None,
     ):
-        """Forward pass. Returns (transformer_hidden_states, (key, value)).
+        """Attention phase only. Returns (mlp_input, (key, value)).
+
+        Handles: Q/K/V projections + adapters → RoPE → Attention → O proj
+        → pre_ff_layernorm. Returns the pre-MLP hidden states so the caller
+        can apply the MLP with per-layer adapter at the correct scope.
 
         Args:
-            hidden_states: Current hidden states (batch, seq, hidden_size)
-            original_hidden_states: Embedding output (batch, seq, hidden_size)
+            concat_hidden: Layer-normed concat input (batch, seq, attn_hidden)
             attention_bias: Causal attention mask
-            position_embeddings: RoPE embeddings (unused when use_mem_rope=False)
-            past_key_value: (past_key, past_value) KV cache
+            position_embeddings: RoPE (cos, sin) or None
+            past_key_value: (past_key, past_value) or None
+            q_adapter_out: Q adapter contribution (or None)
+            k_adapter_out: K adapter contribution (or None)
+            v_adapter_out: V adapter contribution (or None)
+
+        Returns:
+            (mlp_input, (present_key, present_value))
         """
-        # Concatenate hidden_states with original embedding output
-        # Result: (batch, seq, 2 * hidden_size) = (batch, seq, attention_hidden_size)
-        concat_hidden = op.Concat(hidden_states, original_hidden_states, axis=-1)
-
-        # Pre-attention layer norm on concatenated input
-        concat_hidden = self.input_layernorm(op, concat_hidden)
-
-        # Q/K/V projections from attention_hidden_size via self_attn module
+        # Q/K/V projections from attention_hidden_size
         query_states, key_states, value_states = self.self_attn(op, concat_hidden)
+
+        # Add adapter contributions to Q/K/V
+        if q_adapter_out is not None:
+            query_states = op.Add(query_states, q_adapter_out)
+        if k_adapter_out is not None:
+            key_states = op.Add(key_states, k_adapter_out)
+        if v_adapter_out is not None:
+            value_states = op.Add(value_states, v_adapter_out)
 
         # Apply RoPE if position_embeddings provided
         if position_embeddings is not None:
@@ -272,14 +347,10 @@ class Zamba2SharedTransformerLayer(nn.Module):
         # Output projection: num_heads * head_dim → hidden_size
         attn_output = self.self_attn(op, concat_hidden, attn_output=attn_output)
 
-        # Pre-FFN layer norm and MLP
-        attn_output = self.pre_ff_layernorm(op, attn_output)
-        attn_output = self.feed_forward(op, attn_output)
+        # Pre-FFN layer norm — returns hidden states ready for MLP
+        mlp_input = self.pre_ff_layernorm(op, attn_output)
 
-        # Linear projection for injection into Mamba
-        transformer_hidden_states = self.linear(op, attn_output)
-
-        return transformer_hidden_states, (present_key, present_value)
+        return mlp_input, (present_key, present_value)
 
 
 class Zamba2InjectedMambaLayer(nn.Module):
@@ -352,41 +423,82 @@ class Zamba2InjectedMambaLayer(nn.Module):
 class _Zamba2TextModel(nn.Module):
     """Zamba2 text backbone: embedding → N x (Mamba2|SharedTransformer+Mamba2) → norm.
 
-    Mamba2 and hybrid layers are selected based on ``layer_types``.
-    Hybrid layers are expanded into (SharedTransformer, InjectedMamba) pairs.
+    Architecture:
+    - ONE shared transformer (attention + norms + MLP) — weights shared across
+      all hybrid layers
+    - Per-hybrid-layer adapters (Q/K/V/MLP low-rank) that differentiate each
+      usage of the shared transformer
+    - Per-hybrid-layer linear projection (NOT shared)
+    - Per-layer Mamba2 blocks (pure or injected)
+
+    The ``layers`` ModuleList contains only Mamba layers (pure and injected).
+    The shared transformer and adapters are separate attributes.
     """
 
     def __init__(self, config: Zamba2Config):
         super().__init__()
         self._dtype = config.dtype
-        self._use_rope = config.attention_hidden_size != 2 * config.hidden_size  # proxy
+        self._use_rope = config.attention_hidden_size != 2 * config.hidden_size
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
 
         layer_types = config.layer_types or []
-        self.layers = nn.ModuleList([])
+
+        # ONE shared transformer for all hybrid layers
+        self.shared_transformer = Zamba2SharedTransformerLayer(config)
+
+        # Input layernorm for hybrid attention (operates on concat_hidden
+        # which has attention_hidden_size). Lives at TextModel scope because
+        # it's called from the forward loop (ONNX name: model.input_layernorm)
+        attn_hidden = config.attention_hidden_size or 2 * config.hidden_size
+        self.input_layernorm = RMSNorm(attn_hidden, eps=config.rms_norm_eps)
+
+        # Per-hybrid-layer adapters and linear projections
+        num_hybrid = sum(1 for t in layer_types if t == "full_attention")
+        self.qkv_adapters = nn.ModuleList(
+            [_Zamba2QKVAdapters(config) for _ in range(num_hybrid)]
+        )
+        self.mlp_adapters = nn.ModuleList(
+            [_Zamba2MLPAdapter(config) for _ in range(num_hybrid)]
+        )
+        self.linears = nn.ModuleList(
+            [Linear(config.hidden_size, config.hidden_size, bias=False)
+             for _ in range(num_hybrid)]
+        )
+
+        # Shared MLP projections (used by all hybrid layers, lives at model
+        # scope for correct ONNX naming: model.gate_proj, model.up_proj, etc.)
+        self.gate_proj = Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
+        self._act_fn = get_activation(config.hidden_act)
+
+        # Mamba layers only — attention is handled by shared_transformer.
+        # We use _layer_types to drive forward iteration and cache alignment.
+        self.mamba_layers = nn.ModuleList([])
         i = 0
         while i < len(layer_types):
-            ltype = layer_types[i]
-            if ltype == "full_attention":
-                # This is the attention part of a hybrid layer;
-                # next layer must be mamba2 (the injected mamba part)
-                self.layers.append(Zamba2SharedTransformerLayer(config))
+            if layer_types[i] == "full_attention":
+                # Skip attention slot; next must be injected mamba2
                 i += 1
-                # The mamba2 part immediately follows
                 assert i < len(layer_types) and layer_types[i] == "mamba2"
-                self.layers.append(Zamba2InjectedMambaLayer(config))
+                self.mamba_layers.append(Zamba2InjectedMambaLayer(config))
                 i += 1
             else:
                 # Pure mamba layer
-                self.layers.append(Zamba2MambaDecoderLayer(config))
+                self.mamba_layers.append(Zamba2MambaDecoderLayer(config))
                 i += 1
 
+        self._layer_types = layer_types
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # RoPE only when use_mem_rope=True (default: False in Zamba2)
-        self._use_rope = config.attention_hidden_size != 2 * config.hidden_size
         if self._use_rope:
             self.rotary_emb = initialize_rope(config)
 
@@ -415,27 +527,70 @@ class _Zamba2TextModel(nn.Module):
             dtype=self._dtype,
         )
 
+        num_logical_layers = len(self._layer_types)
         present_key_values = []
-        past_kvs = past_key_values or [None] * len(self.layers)
+        past_kvs = past_key_values or [None] * num_logical_layers
 
         # Track transformer output for injection into mamba layers
         transformer_hidden_states = None
+        hybrid_idx = 0  # Counter for adapters/linears
+        mamba_idx = 0  # Counter into self.mamba_layers
 
-        for layer, past_kv in zip(self.layers, past_kvs):
-            if isinstance(layer, Zamba2SharedTransformerLayer):
-                # Shared transformer: produces transformer_hidden_states + KV cache
-                transformer_hidden_states, present_kv = layer(
+        for logical_idx in range(num_logical_layers):
+            ltype = self._layer_types[logical_idx]
+            past_kv = past_kvs[logical_idx]
+
+            if ltype == "full_attention":
+                # Compute concat + layer_norm at this scope level so that
+                # adapter modules (registered here) get correct ONNX names
+                concat_hidden = op.Concat(
+                    hidden_states, original_hidden_states, axis=-1
+                )
+                concat_hidden = self.input_layernorm(
+                    op, concat_hidden
+                )
+
+                # Compute per-layer QKV adapter outputs (correct scope via
+                # __call__ which pushes "qkv_adapters.N" prefix)
+                q_out, k_out, v_out = self.qkv_adapters[hybrid_idx](
+                    op, concat_hidden
+                )
+
+                # Shared transformer attention phase → returns pre-MLP hidden
+                mlp_input, present_kv = self.shared_transformer(
                     op,
-                    hidden_states=hidden_states,
-                    original_hidden_states=original_hidden_states,
+                    concat_hidden=concat_hidden,
                     attention_bias=attention_bias,
                     position_embeddings=position_embeddings,
                     past_key_value=past_kv,
+                    q_adapter_out=q_out,
+                    k_adapter_out=k_out,
+                    v_adapter_out=v_out,
+                )
+
+                # Compute per-layer MLP adapter (correct scope via __call__)
+                mlp_adapter_out = self.mlp_adapters[hybrid_idx](
+                    op, mlp_input
+                )
+
+                # Apply shared MLP with per-layer adapter
+                gate_adapter, up_adapter = op.Split(
+                    mlp_adapter_out, num_outputs=2, axis=-1, _outputs=2
+                )
+                gate = op.Add(self.gate_proj(op, mlp_input), gate_adapter)
+                gate = self._act_fn(op, gate)
+                up = op.Add(self.up_proj(op, mlp_input), up_adapter)
+                transformer_out = self.down_proj(op, op.Mul(gate, up))
+
+                # Per-layer linear projection for injection into Mamba
+                transformer_hidden_states = self.linears[hybrid_idx](
+                    op, transformer_out
                 )
                 present_key_values.append(present_kv)
-            elif isinstance(layer, Zamba2InjectedMambaLayer):
-                # Injected Mamba: uses transformer_hidden_states from previous layer
-                assert transformer_hidden_states is not None
+                hybrid_idx += 1
+            elif ltype == "mamba2" and transformer_hidden_states is not None:
+                # Injected Mamba: follows a full_attention layer
+                layer = self.mamba_layers[mamba_idx]
                 hidden_states, present_kv = layer(
                     op,
                     hidden_states=hidden_states,
@@ -444,8 +599,10 @@ class _Zamba2TextModel(nn.Module):
                 )
                 present_key_values.append(present_kv)
                 transformer_hidden_states = None
+                mamba_idx += 1
             else:
                 # Pure Mamba layer
+                layer = self.mamba_layers[mamba_idx]
                 hidden_states, present_kv = layer(
                     op,
                     hidden_states=hidden_states,
@@ -454,6 +611,7 @@ class _Zamba2TextModel(nn.Module):
                     past_key_value=past_kv,
                 )
                 present_key_values.append(present_kv)
+                mamba_idx += 1
 
         hidden_states = self.final_layernorm(op, hidden_states)
         return hidden_states, present_key_values
@@ -501,61 +659,48 @@ class Zamba2CausalLMModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Map HuggingFace Zamba2ForCausalLM weights to ONNX parameters.
 
-        Handles:
+        New structure (shared weights + unfused adapters):
         1. Weight tying (embed_tokens ↔ lm_head)
-        2. MLP adapter fusion (gate_up_proj += adapter[1] @ adapter[0])
-        3. Physical→logical layer index remapping
-        4. Shared transformer weight duplication to all hybrid attention layers
-        5. Fused gate_up_proj splitting into gate_proj + up_proj
+        2. Shared transformer attn → model.shared_transformer.self_attn.*
+        3. Shared norms → model.input_layernorm, model.shared_transformer.pre_ff_layernorm
+        4. Shared MLP → model.gate_proj, model.up_proj, model.down_proj
+        5. Per-hybrid QKV adapters → model.qkv_adapters.{idx}.*
+        6. Per-hybrid MLP adapters → model.mlp_adapters.{idx}.*
+        7. Per-hybrid-layer linear → model.linears.{idx}.weight
+        8. Mamba layers → model.mamba_layers.{idx}.*
+        9. Split fused gate_up_proj into gate_proj + up_proj
         """
         if self.config.tie_word_embeddings:
             tie_word_embeddings(state_dict)
 
-        # Fuse MLP adapters into gate_up_proj before any renaming.
-        # HF forward: gate_up = gate_up_proj(x) + adapter(x)
-        # Since both operate on same input, we can fuse:
-        #   combined_weight = gate_up_proj.weight + adapter[1].weight @ adapter[0].weight
-        _fuse_mlp_adapters(state_dict)
-
         hybrid_indices = self.config.hybrid_layer_indices or []
         layer_types = self.config.layer_types or []
 
-        # Build physical→logical index mapping
-        physical_to_logical = _build_physical_to_logical_map(layer_types)
+        # Build HF physical index → mamba_layers index mapping.
+        # mamba_layers is a dense list of ALL mamba layers (pure + injected).
+        hf_to_mamba = _build_hf_to_mamba_map(layer_types)
 
-        # Find the first hybrid layer index (canonical shared weights source)
+        # Canonical source: first hybrid physical layer for shared weights
         first_hybrid_physical = hybrid_indices[0] if hybrid_indices else -1
 
-        # Collect shared transformer weights from the first hybrid layer
-        shared_prefix = f"model.layers.{first_hybrid_physical}.shared_transformer."
-        shared_weights: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith(shared_prefix):
-                rest = key[len(shared_prefix) :]
-                shared_weights[rest] = value
-
         new_state_dict: dict[str, torch.Tensor] = {}
+
+        # Process all keys
         for key, value in state_dict.items():
-            new_keys = _rename_zamba2_weight(
-                key, physical_to_logical, hybrid_indices, layer_types
+            new_keys = _remap_weight_key(
+                key,
+                hf_to_mamba=hf_to_mamba,
+                hybrid_indices=hybrid_indices,
+                first_hybrid_physical=first_hybrid_physical,
             )
             for new_key in new_keys:
                 new_state_dict[new_key] = value
 
-        # Duplicate shared transformer weights to all hybrid attention layers
-        for phys_idx in hybrid_indices:
-            logical_attn_idx = physical_to_logical[phys_idx][0]  # attention layer
-            for rest, value in shared_weights.items():
-                new_key = _map_shared_transformer_key(rest, logical_attn_idx)
-                if new_key and new_key not in new_state_dict:
-                    new_state_dict[new_key] = value
-
-        # Split fused gate_up_proj into gate_proj + up_proj for all attention layers
+        # Split fused gate_up_proj into gate_proj + up_proj for shared transformer
         keys_to_remove = []
         keys_to_add = {}
         for key, value in list(new_state_dict.items()):
-            if "feed_forward.gate_up_proj.weight" in key:
-                # Split along dim 0: first half = gate, second half = up
+            if "gate_up_proj.weight" in key:
                 gate, up = value.chunk(2, dim=0)
                 gate_key = key.replace("gate_up_proj", "gate_proj")
                 up_key = key.replace("gate_up_proj", "up_proj")
@@ -574,101 +719,73 @@ class Zamba2CausalLMModel(nn.Module):
 # Weight mapping helpers
 # ---------------------------------------------------------------------------
 
-
-def _fuse_mlp_adapters(state_dict: dict[str, torch.Tensor]) -> None:
-    """Fuse MLP adapter weights into gate_up_proj in-place.
-
-    HF Zamba2 MLP forward:
-        gate_up = gate_up_proj(x) + adapter(x)
-    where adapter is Sequential(Linear_down, Linear_up):
-        adapter(x) = up_weight @ down_weight @ x
-
-    Since both operate on the same input:
-        combined = gate_up_proj.weight + up_weight @ down_weight
-
-    After fusion, adapter keys are removed from state_dict.
-    """
-    import re as _re
-
-    # Pattern: model.layers.N.shared_transformer.feed_forward.gate_up_proj_adapter_list.M.0.weight
-    adapter_pattern = _re.compile(
-        r"^(model\.layers\.\d+\.shared_transformer\.feed_forward\.)"
-        r"gate_up_proj_adapter_list\.(\d+)\.0\.weight$"
-    )
-    # Group adapters by their gate_up_proj key
-    adapters: dict[str, list[tuple[str, str]]] = {}  # gate_up_key -> [(down_key, up_key)]
-    for key in list(state_dict.keys()):
-        m = adapter_pattern.match(key)
-        if m:
-            prefix = m.group(1)
-            idx = m.group(2)
-            gate_up_key = f"{prefix}gate_up_proj.weight"
-            down_key = f"{prefix}gate_up_proj_adapter_list.{idx}.0.weight"
-            up_key = f"{prefix}gate_up_proj_adapter_list.{idx}.1.weight"
-            if gate_up_key not in adapters:
-                adapters[gate_up_key] = []
-            adapters[gate_up_key].append((down_key, up_key))
-
-    # Fuse each adapter into its corresponding gate_up_proj
-    keys_to_remove = []
-    for gate_up_key, adapter_pairs in adapters.items():
-        if gate_up_key not in state_dict:
-            continue
-        gate_up_weight = state_dict[gate_up_key]
-        for down_key, up_key in adapter_pairs:
-            if down_key in state_dict and up_key in state_dict:
-                down_w = state_dict[down_key]  # (adapter_rank, hidden_size)
-                up_w = state_dict[up_key]  # (2*intermediate, adapter_rank)
-                # Fuse: gate_up_proj.weight += up_w @ down_w
-                gate_up_weight = gate_up_weight + up_w @ down_w
-                keys_to_remove.extend([down_key, up_key])
-        state_dict[gate_up_key] = gate_up_weight
-
-    for k in keys_to_remove:
-        state_dict.pop(k, None)
-
-
 # Regex for HF layer keys: model.layers.<N>.<rest>
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
+# Regex for adapter keys within shared_transformer
+_ADAPTER_RE = re.compile(
+    r"^self_attn\.linear_(q|k|v)_adapter_list\.(\d+)\.(0|1)\.weight$"
+)
+_MLP_ADAPTER_RE = re.compile(
+    r"^feed_forward\.gate_up_proj_adapter_list\.(\d+)\.(0|1)\.weight$"
+)
 
-def _build_physical_to_logical_map(
-    layer_types: list[str],
-) -> dict[int, tuple[int, ...]]:
-    """Build mapping from physical layer index to logical layer index(es).
 
-    Physical layers that are hybrid expand into 2 logical layers.
-    Returns a dict: physical_idx → tuple of logical indices.
+def _build_hf_to_mamba_map(layer_types: list[str]) -> dict[int, int]:
+    """Build mapping from HF physical layer index to mamba_layers index.
+
+    The mamba_layers ModuleList contains ALL mamba layers in order:
+    pure mamba layers AND injected mamba layers from hybrid pairs.
+
+    HF physical layer indices are derived from layer_types by iterating
+    and grouping [full_attention, mamba2] pairs as one physical layer.
+
+    Returns: {hf_physical_idx: mamba_layers_idx}
     """
-    mapping: dict[int, tuple[int, ...]] = {}
-    logical_idx = 0
-    physical_idx = 0
+    mapping: dict[int, int] = {}
+    mamba_idx = 0
+    hf_idx = 0
     i = 0
     while i < len(layer_types):
         if layer_types[i] == "full_attention":
-            # This is the attention part of a hybrid; next is mamba2
-            mapping[physical_idx] = (logical_idx, logical_idx + 1)
-            logical_idx += 2
-            i += 2  # skip the mamba2 entry
-        else:
-            mapping[physical_idx] = (logical_idx,)
-            logical_idx += 1
+            # Hybrid pair: full_attention + mamba2 = one HF physical layer
+            # The mamba2 part is an injected mamba layer
+            i += 1  # skip to the mamba2 entry
+            assert i < len(layer_types) and layer_types[i] == "mamba2"
+            mapping[hf_idx] = mamba_idx
+            mamba_idx += 1
             i += 1
-        physical_idx += 1
+        else:
+            # Pure mamba layer
+            mapping[hf_idx] = mamba_idx
+            mamba_idx += 1
+            i += 1
+        hf_idx += 1
     return mapping
 
 
-def _rename_zamba2_weight(
+def _remap_weight_key(
     key: str,
-    physical_to_logical: dict[int, tuple[int, ...]],
+    hf_to_mamba: dict[int, int],
     hybrid_indices: list[int],
-    layer_types: list[str],
+    first_hybrid_physical: int,
 ) -> list[str]:
-    """Rename a single HF weight key to ONNX parameter name(s).
+    """Remap a single HF weight key to ONNX parameter name(s).
 
-    Returns a list of new keys (usually 1, but shared weights may map to multiple).
+    Naming scheme:
+    - Shared transformer attn: model.shared_transformer.self_attn.q_proj.weight
+    - Shared transformer norms: model.shared_transformer.pre_ff_layernorm.weight
+    - Shared input_layernorm: model.input_layernorm.weight
+    - Shared MLP: model.gate_proj.weight, model.up_proj.weight, model.down_proj.weight
+    - QKV adapters: model.qkv_adapters.{hybrid_idx}.{q|k|v}_adapter.{down|up}.weight
+    - MLP adapters: model.mlp_adapters.{hybrid_idx}.mlp_adapter.{down|up}.weight
+    - Linears: model.linears.{hybrid_idx}.weight
+    - Mamba layers: model.mamba_layers.{mamba_idx}.mamba.* / input_layernorm.*
+
+    Shared weights are only taken from the first hybrid layer (canonical
+    source). Duplicate copies on other hybrid layers are dropped.
     """
-    # Non-layer keys pass through unchanged
+    # Non-layer keys (model.embed_tokens, lm_head, model.final_layernorm)
     m = _LAYER_RE.match(key)
     if not m:
         return [key]
@@ -676,51 +793,69 @@ def _rename_zamba2_weight(
     phys_idx = int(m.group(1))
     rest = m.group(2)
 
-    if phys_idx not in physical_to_logical:
+    if phys_idx not in hf_to_mamba:
         return [key]
 
-    logical_indices = physical_to_logical[phys_idx]
+    mamba_idx = hf_to_mamba[phys_idx]
 
     if phys_idx in hybrid_indices:
-        # Hybrid layer: split into attention (logical[0]) and mamba (logical[1])
-        logical_attn_idx = logical_indices[0]
-        logical_mamba_idx = logical_indices[1]
+        # Determine this hybrid's adapter index (0-based among hybrid layers)
+        hybrid_idx = hybrid_indices.index(phys_idx)
 
         if rest.startswith("shared_transformer."):
-            # Shared transformer → attention logical layer
-            sub = rest[len("shared_transformer.") :]
-            new_key = _map_shared_transformer_key(sub, logical_attn_idx)
-            return [new_key] if new_key else []
+            sub = rest[len("shared_transformer."):]
+
+            # Check if this is a QKV adapter key
+            adapter_m = _ADAPTER_RE.match(sub)
+            if adapter_m:
+                proj_type = adapter_m.group(1)  # q, k, or v
+                adapter_idx = int(adapter_m.group(2))
+                down_or_up = (
+                    "down" if adapter_m.group(3) == "0" else "up"
+                )
+                return [
+                    f"model.qkv_adapters.{adapter_idx}.{proj_type}_adapter.{down_or_up}.weight"
+                ]
+
+            # Check if this is a MLP adapter key
+            mlp_adapter_m = _MLP_ADAPTER_RE.match(sub)
+            if mlp_adapter_m:
+                adapter_idx = int(mlp_adapter_m.group(1))
+                down_or_up = (
+                    "down" if mlp_adapter_m.group(2) == "0" else "up"
+                )
+                return [
+                    f"model.mlp_adapters.{adapter_idx}.mlp_adapter.{down_or_up}.weight"
+                ]
+
+            # Shared transformer weight — only take from canonical source
+            if phys_idx == first_hybrid_physical:
+                # Input layernorm is at model level (called from TextModel)
+                if sub.startswith("input_layernorm."):
+                    return [f"model.{sub}"]
+                # MLP projections are at model level
+                if sub.startswith("feed_forward."):
+                    mlp_sub = sub[len("feed_forward."):]
+                    return [f"model.{mlp_sub}"]
+                # Everything else stays under shared_transformer
+                return [f"model.shared_transformer.{sub}"]
+            else:
+                # Drop duplicates from non-canonical hybrid layers
+                return []
+
         elif rest.startswith("linear."):
-            # Linear projection → part of the attention logical layer
-            sub = rest[len("linear.") :]
-            return [f"model.layers.{logical_attn_idx}.linear.{sub}"]
+            # Per-hybrid-layer linear projection
+            sub = rest[len("linear."):]
+            return [f"model.linears.{hybrid_idx}.{sub}"]
+
         elif rest.startswith("mamba_decoder."):
-            # Mamba decoder → mamba logical layer
-            sub = rest[len("mamba_decoder.") :]
-            return [f"model.layers.{logical_mamba_idx}.{sub}"]
+            # Mamba decoder in hybrid layer → mamba_layers
+            sub = rest[len("mamba_decoder."):]
+            return [f"model.mamba_layers.{mamba_idx}.{sub}"]
+
         else:
-            # Fallback
-            return [f"model.layers.{logical_attn_idx}.{rest}"]
+            # Fallback for unexpected hybrid layer keys
+            return [f"model.mamba_layers.{mamba_idx}.{rest}"]
     else:
-        # Pure mamba layer
-        logical_idx = logical_indices[0]
-        return [f"model.layers.{logical_idx}.{rest}"]
-
-
-def _map_shared_transformer_key(rest: str, logical_idx: int) -> str | None:
-    """Map a shared_transformer sub-key to the ONNX attention layer.
-
-    HF: shared_transformer.self_attn.{q,k,v,o}_proj.weight
-    HF: shared_transformer.feed_forward.gate_up_proj.weight
-    HF: shared_transformer.feed_forward.down_proj.weight
-    HF: shared_transformer.input_layernorm.weight
-    HF: shared_transformer.pre_ff_layernorm.weight
-
-    ONNX: model.layers.{idx}.self_attn.{q,k,v,o}_proj.weight
-    ONNX: model.layers.{idx}.feed_forward.{gate_proj,up_proj,down_proj}.weight
-    ONNX: model.layers.{idx}.input_layernorm.weight
-    ONNX: model.layers.{idx}.pre_ff_layernorm.weight
-    """
-    # All sub-keys map directly (self_attn.*, feed_forward.*, norms)
-    return f"model.layers.{logical_idx}.{rest}"
+        # Pure mamba layer → mamba_layers.{mamba_idx}.*
+        return [f"model.mamba_layers.{mamba_idx}.{rest}"]

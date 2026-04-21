@@ -184,6 +184,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # GraniteMoeHybrid: Mamba2 + MoE + shared-MLP FP accumulation differences.
     # Argmax correct, cosine=0.999870 — model is functionally correct.
     "granitemoehybrid": 0.02,
+    # Zamba2: hybrid Mamba2+Attention with low-rank adapters. Adapter FP accumulation
+    # produces ~0.0012 max diff. Argmax correct, cosine=0.999998 — functionally correct.
+    "zamba2": 0.002,
     # Gemma4 text: per-layer input embedding + softcapping + QK-norm FP accumulation.
     # Argmax correct, cosine=0.985 — model is functionally correct.
     "gemma4_text": 0.15,
