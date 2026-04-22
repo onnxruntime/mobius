@@ -480,12 +480,11 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         y_emb = op.Gather(y_table, y_coords, axis=0)  # [B, N, hidden]
 
         # Zero position embeddings for padding patches.
-        # Branchless Mul pattern: float(not_pad) * pos_emb is more efficient
-        # than Where(is_pad, zero, pos_emb) — no conditional select.
         pos_emb = op.Add(x_emb, y_emb)  # [B, N, hidden]
-        not_pad = op.CastLike(op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), pos_emb)
-        not_pad = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
-        pos_emb = op.Mul(pos_emb, not_pad)
+        zero = op.CastLike(0.0, pos_emb)
+        not_pad = op.Not(is_padding)  # [B, N]
+        not_pad_3d = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
+        pos_emb = op.Where(not_pad_3d, pos_emb, zero)
 
         return op.Add(hidden_states, pos_emb), is_padding  # ([B, N, hidden], [B, N])
 
@@ -534,12 +533,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
 
         # Build additive attention bias [B, 1, 1, N] masking out padding columns.
         # Valid positions get 0 (no effect), padding columns get -1e9 (suppressed).
-        # Branchless Mul pattern: float(is_pad) * neg_inf is more efficient
-        # than Where(is_pad, neg_inf, zero) — no conditional select.
-        # is_padding (bool) → float 0/1 → * neg_inf → padding=-1e9, valid=0
-        neg_inf = op.CastLike(op.Constant(value_float=-1e9), hidden_states)
-        is_pad_f = op.CastLike(op.Cast(is_padding, to=ir.DataType.FLOAT), hidden_states)
-        attn_bias = op.Mul(is_pad_f, neg_inf)  # [B, N]
+        neg_inf = op.CastLike(-1e9, hidden_states)
+        zero = op.CastLike(0.0, hidden_states)
+        attn_bias = op.Where(is_padding, neg_inf, zero)  # [B, N]
         attn_bias = op.Unsqueeze(attn_bias, [1, 2])  # [B, 1, 1, N]
 
         for layer in self.layers:

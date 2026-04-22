@@ -174,8 +174,7 @@ class TestCreatePaddingMask:
         )
         create_attention_bias(op_bias, input_ids_bias, mask_bias)
 
-        # Full causal bias requires CumSum + GreaterOrEqual + Mul chain
-        # (Where was replaced with Mul to avoid CPU Memcpy on CUDA EP)
+        # Full causal bias requires CumSum + GreaterOrEqual + Where chain
         assert count_op_type(graph_bias, "CumSum") >= 1
         assert count_op_type(graph_bias, "GreaterOrEqual") >= 1
-        assert count_op_type(graph_bias, "Mul") >= 1
+        assert count_op_type(graph_bias, "Where") >= 1

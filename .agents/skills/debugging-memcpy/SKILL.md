@@ -148,52 +148,7 @@ their outputs feed GPU ops:
 
 ## Fix patterns
 
-### Pattern 1: Where(bool, zero, tensor) → Mul
-
-**Problem**: `Where` with a bool condition and scalar branches can be
-replaced with a branchless `Mul` pattern that is more efficient — it avoids
-the conditional select and may fuse better with surrounding ops.
-
-> Note: `Where` IS supported by CUDA EP and does not itself cause Memcpy
-> nodes.  This pattern is a micro-optimization for efficiency, not a
-> Memcpy fix.
-
-**Fix**: Multiply by the bool mask cast to float.
-
-```python
-# BEFORE (conditional select)
-zero = op.CastLike(op.Constant(value_float=0.0), tensor)
-result = op.Where(is_padding, zero, tensor)
-
-# AFTER (branchless Mul)
-not_pad = op.CastLike(
-    op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), tensor
-)
-not_pad = op.Unsqueeze(not_pad, [2])  # broadcast dim
-result = op.Mul(tensor, not_pad)
-```
-
-**Variant** — zero-masking with negative infinity (attention bias):
-
-```python
-# BEFORE
-attn_bias = op.Where(is_padding, neg_inf, zero_bias)
-
-# AFTER — is_padding * neg_inf: True→neg_inf, False→0
-is_pad_f = op.CastLike(
-    op.Cast(is_padding, to=ir.DataType.FLOAT), hidden_states
-)
-attn_bias = op.Mul(is_pad_f, neg_inf)
-```
-
-**When to use**: Any `Where(bool, constant, tensor)` or
-`Where(bool, tensor, constant)` where one branch is 0 or a broadcast scalar.
-
-**When NOT to use**: When both branches are non-trivial tensors (e.g.,
-`Where(mask, gathered_features, original_embeddings)`).  In that case the
-`Where` is genuinely conditional and must stay.
-
-### Pattern 2: Shape-based Reshape → static or [0, 0, -1]
+### Pattern 1: Shape-based Reshape → static or [0, 0, -1]
 
 **Problem**: `Shape` is always CPU.  Using it to build a reshape target
 (e.g., `Concat(Shape(x, 0), Shape(x, 1), Constant(hidden))`) adds CPU ops
@@ -223,7 +178,7 @@ result = op.Reshape(x, op.Concat([-1], hidden, axis=0))
 result = op.Reshape(x, op.Constant(value_ints=[-1, config.hidden_size]))
 ```
 
-### Pattern 3: Additive float bias → bool mask with is_causal
+### Pattern 2: Additive float bias → bool mask with is_causal
 
 **Problem**: `create_attention_bias()` builds a float additive mask using
 `CumSum` → `GreaterOrEqual` → `Where` — all CPU ops.
@@ -251,7 +206,7 @@ and the `GreaterOrEqual` for causality.
 with `is_causal=1`.  Not applicable to `GroupQueryAttention` (GQA handles
 masking internally via `local_window_size`).
 
-### Pattern 4: Use GQA's built-in local_window_size
+### Pattern 3: Use GQA's built-in local_window_size
 
 **Problem**: Sliding-window attention requires an explicit mask (CumSum-based)
 when using the standard Attention op.
@@ -279,7 +234,7 @@ This completely eliminates the CumSum/Less/And mask chain for sliding layers.
 build dtype and `caps.supports_fused_rope` is True).  Currently CUDA EP
 supports GQA for FLOAT16 and BFLOAT16.
 
-### Pattern 5: Precompute at build time
+### Pattern 4: Precompute at build time
 
 **Problem**: A dynamic computation produces a value that is actually
 deterministic from the model config.
@@ -322,15 +277,12 @@ ORT batches them into a single CPU segment with only entry/exit Memcpy.
 The Gemma4 multimodal model (E2B) was optimized to reduce Memcpy from
 ~30 to ~17 CPU-likely ops across all sub-models:
 
-### Vision encoder (9 → ~5 Memcpy)
+### Vision encoder (9 → ~6 Memcpy)
 
 | Source | Fix | Ops removed |
 |--------|-----|-------------|
-| `Where(is_pad, zero, pos_emb)` | `Mul(pos_emb, CastLike(Not(is_pad)))` | 1 Where |
-| `Where(is_pad, neg_inf, zero)` | `Mul(Cast(is_pad, float), neg_inf)` | 1 Where |
-| `Where(is_pad, zero, hidden)` | `Mul(hidden, CastLike(Not(is_pad)))` | 1 Where |
 | `Shape(features, start=2)` for Reshape | Static `config.hidden_size` | 1 Shape |
-| **Remaining**: `OneHot` (dynamic depth), `Equal`/`And` (pooler padding) | Inherent | — |
+| **Remaining**: `Where` (CUDA-supported), `OneHot` (dynamic depth), `Equal`/`And` (pooler padding) | Inherent or CUDA-supported | — |
 
 ### Embedding model (3 Memcpy — unchanged)
 
@@ -355,11 +307,15 @@ Not all CPU ops are equal.  Prioritize fixes by **tensor size**:
 
 | Priority | Pattern | Tensor size | Impact |
 |----------|---------|-------------|--------|
-| **High** | `Where` on `[B, S, H]` activation tensors | Large | Copies full hidden states |
-| **High** | `create_attention_bias` chain | `[B, 1, Q, T]` | Scales with sequence length² |
-| **Medium** | `Shape` for Reshape | Scalar/1D | Small transfer, but blocks pipeline |
+| **High** | `create_attention_bias` chain (CumSum) | `[B, 1, Q, T]` | Scales with sequence length² |
+| **High** | `Shape` for Reshape | Scalar/1D | Small transfer, but blocks pipeline |
+| **Medium** | `CumSum` on INT64 | Varies | Inherently CPU, no workaround |
 | **Low** | `Equal` on `[B, S]` input_ids | Small | Tiny tensor, one-time |
 | **Low** | `Not`/`And` on bool scalars | Trivial | Negligible transfer cost |
+
+> **Note**: `Where` IS supported by CUDA EP and does not cause Memcpy nodes.
+> Do not replace `Where` with `Mul` patterns for Memcpy elimination — the
+> `Where` is cleaner and runs on GPU.
 
 Focus on ops that touch `[B, S, H]` or `[B, Q, T]` tensors first.  Shape
 and comparison ops on small metadata tensors rarely matter for throughput.
@@ -373,7 +329,7 @@ and comparison ops on small metadata tensors rarely matter for throughput.
 - `src/mobius/components/_common.py` — `create_attention_bias()`,
   `create_padding_mask()`, `create_sliding_window_mask()`
 - `src/mobius/models/base.py` — `TextModel.forward()` GQA decision logic
-- `src/mobius/models/gemma4.py` — Case study: vision Mul patterns, decoder
+- `src/mobius/models/gemma4.py` — Case study: static reshape, decoder
   bool mask fallback, GQA + sliding window
 - `src/mobius/_execution_providers.py` — `EpCapabilities` (gqa_dtypes,
   supports_fused_rope, supports_fused_moe)

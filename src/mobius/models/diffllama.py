@@ -188,30 +188,18 @@ class DiffLlamaAttention(nn.Module):
         past_len = op.Sub(kv_len, q_len)  # [1]
         causal_slice = op.Slice(lower_tri, past_len, kv_len, [0])  # [S, Sk]
         causal_bool = op.Cast(causal_slice, to=9)  # BOOL (dtype 9)
-        # Branchless Mul pattern: (1 - float(mask)) * neg_inf
-        # More efficient than Where — no conditional select.
-        # causal positions→0, masked→-inf
+        # CastLike before Where so the scalar is cast while still 1-element
+        zero_f = op.CastLike(0.0, q_4d)
         neg_inf_f = op.CastLike(float("-inf"), q_4d)
-        not_causal_f = op.CastLike(op.Cast(causal_bool, to=ir.DataType.FLOAT), q_4d)
-        causal_bias = op.Mul(
-            op.Sub(op.CastLike(op.Constant(value_float=1.0), q_4d), not_causal_f),
-            neg_inf_f,
-        )  # [S, Sk]
+        causal_bias = op.Where(causal_bool, zero_f, neg_inf_f)  # [S, Sk]
         # Unsqueeze to [1, 1, S, Sk] and add to scores [B, H, S, Sk]
         attn_scores = op.Add(attn_scores, op.Unsqueeze(causal_bias, [0, 1]))
 
         # Padding mask (3D bool [B, S, Sk]) → additive bias [B, 1, S, Sk]
         if attention_bias is not None:
+            pad_zero = op.CastLike(0.0, q_4d)
             pad_neg_inf = op.CastLike(float("-inf"), q_4d)
-            # not_pad * neg_inf: valid→0, padding→-inf
-            not_pad_f = op.CastLike(op.Cast(attention_bias, to=ir.DataType.FLOAT), q_4d)
-            pad_bias = op.Mul(
-                op.Sub(
-                    op.CastLike(op.Constant(value_float=1.0), q_4d),
-                    not_pad_f,
-                ),
-                pad_neg_inf,
-            )
+            pad_bias = op.Where(attention_bias, pad_zero, pad_neg_inf)
             attn_scores = op.Add(attn_scores, op.Unsqueeze(pad_bias, [1]))
 
         # Softmax and weighted sum with doubled V
