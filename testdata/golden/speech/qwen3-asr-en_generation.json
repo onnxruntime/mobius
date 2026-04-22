@@ -1,10 +1,7 @@
 {
   "model_id": "Qwen/Qwen3-ASR-0.6B",
-  "prompt": "testdata/652-129742-0006.flac",
+  "prompt": "language English<asr_text>",
   "generated_tokens": [
-    11528,
-    6364,
-    151704,
     34,
     4943,
     76773,
@@ -33,5 +30,5 @@
     13,
     151645
   ],
-  "generated_text": "language English<asr_text>Cauliflower mayonnaise: Take cold boiled cauliflower, break into branches, adding salt, pepper, and vinegar to season."
+  "generated_text": "Cauliflower mayonnaise: Take cold boiled cauliflower, break into branches, adding salt, pepper, and vinegar to season."
 }

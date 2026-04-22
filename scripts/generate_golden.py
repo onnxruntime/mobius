@@ -648,12 +648,18 @@ def _prepare_speech_language_inputs(
         text_prompt = processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
+        # If prompts are provided, append as forced decoder prefix
+        # (e.g. "language English<asr_text>" to skip language detection).
+        force_prefix = ""
+        if case.prompts:
+            force_prefix = case.prompts[0]
+            text_prompt = text_prompt + force_prefix
         processed = processor(
             text=text_prompt,
             audio=[audio_array],
             return_tensors="pt",
         ).to(device)
-        prompt_for_golden = str(audio_path)
+        prompt_for_golden = force_prefix or str(audio_path)
     else:
         # Gemma4-style: text prompt + audio
         prompt_text = case.prompts[0]

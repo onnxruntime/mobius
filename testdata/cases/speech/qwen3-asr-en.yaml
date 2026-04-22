@@ -5,6 +5,8 @@ dtype: "float32"
 trust_remote_code: true
 
 inputs:
+  prompts:
+    - "language English<asr_text>"
   audio:
     - "652-129742-0006.flac"
 
@@ -14,4 +16,4 @@ generation:
 
 level: "L4+L5"
 
-notes: "Qwen3-ASR speech recognition (auto language detection). 3-model split: audio_encoder + embedding + decoder. Uses fixed chat template with audio-only input."
+notes: "Qwen3-ASR with forced English language. Prompt is appended to assistant turn as decoder prefix to skip language detection."
