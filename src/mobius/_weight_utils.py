@@ -526,7 +526,10 @@ def preprocess_gptq_weights(
 
     for key, value in state_dict.items():
         if key.endswith(".g_idx"):
-            if not torch.equal(value, torch.arange(value.numel())):
+            # g_idx maps element i to its quantization group.  For
+            # non-desc_act models this is simply i // group_size.
+            trivial = torch.arange(value.numel(), dtype=value.dtype) // group_size
+            if not torch.equal(value, trivial):
                 logger.warning(
                     "Dropping %s — desc_act models with non-trivial "
                     "g_idx may produce incorrect results",

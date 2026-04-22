@@ -147,10 +147,7 @@ def _use_temp_hf_cache(tmp_path):
 
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
-_XFAIL_REASONS: dict[str, str] = {
-    # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
-    "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
-}
+_XFAIL_REASONS: dict[str, str] = {}
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
 _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
@@ -166,7 +163,7 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
 
 def _discover_cases(
     level: str,
-    extra_xfails: dict[str, str] | None = None,
+    xfails: dict[str, str] | None = None,
 ) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
 
@@ -175,7 +172,6 @@ def _discover_cases(
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
-    all_xfails = {**_XFAIL_REASONS, **(extra_xfails or {})}
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -189,8 +185,8 @@ def _discover_cases(
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in all_xfails:
-            marks.append(pytest.mark.xfail(reason=all_xfails[test_id], strict=False))
+        elif xfails and test_id in xfails:
+            marks.append(pytest.mark.xfail(reason=xfails[test_id], strict=False))
 
         params.append(
             pytest.param(
@@ -202,8 +198,8 @@ def _discover_cases(
     return params
 
 
-_L4_CASES = _discover_cases("L4")
-_L5_CASES = _discover_cases("L5", extra_xfails=_L5_ONLY_XFAIL_REASONS)
+_L4_CASES = _discover_cases("L4", xfails=_XFAIL_REASONS)
+_L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 
 # ---------------------------------------------------------------------------
@@ -1068,6 +1064,137 @@ def _run_text_only_multimodel_prefill(
     return outputs
 
 
+def _run_phi4mm_multimodal_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run the Phi4MM 4-model pipeline: vision → speech → embedding → decoder.
+
+    Phi4MM is a multimodal model with separate ONNX models for vision
+    (SigLIP), speech (Conformer), embedding (InputMixer), and decoder.
+    The pipeline chains: pixel_values → vision → image_features,
+    audio → speech → audio_features, then input_ids + features → embedding
+    → inputs_embeds → decoder → logits.
+    """
+    import transformers
+
+    device_kwargs = _get_test_device_kwargs()
+    hidden_size = getattr(config, "hidden_size", 3072)
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Step 1: Vision encoder (if images are provided)
+    if case.images:
+        from PIL import Image
+
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        images = [Image.open(_TESTDATA_DIR / img_path) for img_path in case.images]
+        img_inputs = processor.image_processor(images=images, return_tensors="np")
+        # Phi4MM image_processor returns 'input_image_embeds' as pixel tensor
+        pixel_values = img_inputs["input_image_embeds"].astype(np.float32)
+        image_sizes = img_inputs["image_sizes"].astype(np.int64)
+
+        # The vision model processes one image at a time (image_sizes is
+        # [1, 2] per call).  For multi-image, loop and concatenate.
+        vision_session = OnnxModelSession(pkg["vision"], **device_kwargs)
+        try:
+            all_features = []
+            num_images = pixel_values.shape[0]
+            for img_idx in range(num_images):
+                # Per-image crops: [crops, C, H, W]
+                per_img_pv = pixel_values[img_idx].astype(np.float32)
+                per_img_sizes = image_sizes[img_idx : img_idx + 1]  # [1, 2]
+                vision_out = vision_session.run(
+                    {"pixel_values": per_img_pv, "image_sizes": per_img_sizes}
+                )
+                feat = vision_out["image_features"]
+                if feat.ndim == 3:
+                    feat = feat[0]
+                all_features.append(feat)
+            image_features = np.concatenate(all_features, axis=0)
+        finally:
+            vision_session.close()
+    else:
+        image_features = np.zeros((0, hidden_size), dtype=np.float32)
+
+    # Step 2: Speech encoder (if audio is provided)
+    if case.audio:
+        import librosa
+
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        audios = []
+        for audio_path in case.audio:
+            audio_array, _sr = librosa.load(str(_TESTDATA_DIR / audio_path), sr=16000)
+            audios.append((audio_array, 16000))
+
+        # Process audio through the HF feature extractor
+        # Phi4MM expects list of (audio_array, sample_rate) tuples
+        audio_inputs = processor.audio_processor(audios, return_tensors="np")
+        audio_embeds = audio_inputs["input_audio_embeds"].astype(np.float32)
+        # audio_embeds: [num_clips, seq, features]
+        # audio_embed_sizes: per-clip output token counts from the processor
+        audio_sizes = audio_inputs["audio_embed_sizes"].astype(np.int64)
+        if audio_sizes.ndim > 1:
+            audio_sizes = audio_sizes.flatten()
+        # audio_projection_mode: 0=speech-only, 1=combined with vision
+        # When images are also present, HF uses the "vision" audio projection
+        audio_projection_mode = np.array(1 if case.images else 0, dtype=np.int64)
+
+        speech_session = OnnxModelSession(pkg["speech"], **device_kwargs)
+        try:
+            speech_out = speech_session.run(
+                {
+                    "audio_embeds": audio_embeds,
+                    "audio_sizes": audio_sizes,
+                    "audio_projection_mode": audio_projection_mode,
+                }
+            )
+        finally:
+            speech_session.close()
+        audio_features = speech_out["audio_features"]
+        # Flatten batch of clips: [num_clips, tokens, H] → [total_tokens, H]
+        if audio_features.ndim == 3:
+            audio_features = audio_features.reshape(-1, audio_features.shape[-1])
+    else:
+        audio_features = np.zeros((0, hidden_size), dtype=np.float32)
+
+    # Step 3: Embedding (fuse text + vision + speech)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+    try:
+        emb_out = emb_session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+                "audio_features": audio_features,
+            }
+        )
+    finally:
+        emb_session.close()
+    inputs_embeds = emb_out["inputs_embeds"]
+
+    # Step 4: Decoder
+    dec_session = OnnxModelSession(pkg["model"], **device_kwargs)
+    try:
+        seq_len = inputs_embeds.shape[1]
+        kv_cache = _make_empty_kv_cache(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+            "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
+            **kv_cache,
+        }
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
+
+
 def _run_speech_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -1249,6 +1376,8 @@ class TestL4CheckpointVerified:
             outputs = _run_speech_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-text-to-text":
             outputs = _run_vision_language_prefill(pkg, case, config)
+        elif case.task_type == "phi4mm-multimodal":
+            outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:

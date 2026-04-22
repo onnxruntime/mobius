@@ -82,7 +82,13 @@ class SymbolicShapeInferencePass(ir.passes.InPlacePass):
         self.policy = policy
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
-        onnx_shape_inference.infer_symbolic_shapes(model, policy=self.policy)
+        try:
+            onnx_shape_inference.infer_symbolic_shapes(model, policy=self.policy)
+        except Exception:
+            # Upstream onnx_shape_inference bugs: e.g. comparison between int
+            # and SymbolicDim, or ShapeInferenceError on complex models.
+            # Non-fatal — skip gracefully.
+            logger.warning("Symbolic shape inference failed (upstream bug); skipping")
         return ir.passes.PassResult(model, modified=True)
 
 

@@ -1,0 +1,19 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Transcribe this audio."
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+notes: "Phi-4-MM text + short audio (~9s). Exercises Conformer speech encoder + audio projection + embedding mixer + decoder. Audio is under 500 tokens after encoding."

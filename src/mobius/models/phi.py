@@ -253,19 +253,31 @@ class _LoRATextModel(TextModel):
 def _preprocess_phi4mm_weights(
     config: ArchitectureConfig, state_dict: dict[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
-    """Shared weight preprocessing for Phi4MM models (LoRA + fused QKV splitting).
+    """Shared weight preprocessing for Phi4MM models (LoRA + fused weight splitting).
 
-    Handles:
-    - Stripping ``base_layer.`` from LoRA-wrapped weight names
-    - Splitting fused ``qkv_proj`` into separate q/k/v weights
+    **LoRA strategy — separate parameters, not merged:**
+    The ONNX model keeps lora_A.{name}.weight and lora_B.{name}.weight as
+    separate initializers.  ``LoRALinear.forward()`` applies them at runtime:
+    ``out = base(x) + scale * x @ A.T @ B.T``.  This matches HuggingFace when
+    HF runs with ``merge_and_unload()`` (both vision + speech adapters merged).
 
-    ``gate_up_proj`` is NOT split here — the model uses
-    :class:`~mobius.models.base.FusedGateUpCausalLMModel` which keeps the
-    fused weight and splits activations in the MLP forward pass instead.
-    LoRA weights on ``gate_up_proj`` are passed through unchanged.
+    Do NOT merge LoRA into the base weight here — the separate-parameter
+    approach is intentional and produces correct output (100% token-match
+    parity confirmed in ``examples/phi4mm_parity.py``).
+
+    Steps performed:
+    1. Strip ``base_layer.`` from LoRA-wrapped weight names so
+       ``qkv_proj.base_layer.weight`` → ``qkv_proj.weight``.
+    2. Split fused ``qkv_proj`` weights (base + LoRA A/B) into separate
+       ``q_proj``, ``k_proj``, ``v_proj`` entries.
+    3. Split fused ``gate_up_proj`` weights (base + LoRA A/B) into
+       ``gate_proj`` and ``up_proj`` entries.
+    4. ``o_proj`` and ``down_proj`` LoRA A/B pass through unchanged
+       (not fused, no splitting needed).
     """
-    # Strip "base_layer." from LoRA-wrapped weight names
-    # HF stores e.g. "qkv_proj.base_layer.weight" → we need "qkv_proj.weight"
+    # Strip "base_layer." from LoRA-wrapped weight names.
+    # HF stores e.g. "qkv_proj.base_layer.weight"; after stripping this
+    # becomes "qkv_proj.weight" and falls through to the split logic below.
     for key in list(state_dict.keys()):
         if ".base_layer." in key:
             new_key = key.replace(".base_layer.", ".")
@@ -353,7 +365,13 @@ class Phi4MMCausalLMModel(Phi3CausalLMModel):
 
 
 class _Phi4MMSigLIPEncoder(nn.Module):
-    """SigLIP vision encoder for Phi4MM (no post_layernorm)."""
+    """SigLIP vision encoder for Phi4MM (no post_layernorm).
+
+    HuggingFace Phi4MM uses ``layer_idx=-2`` when extracting SigLIP
+    features, meaning it uses the *second-to-last* hidden state and
+    skips the final encoder layer.  We replicate this by instantiating
+    ``num_hidden_layers - 1`` encoder layers.
+    """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -370,8 +388,11 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             patch_size=patch_size,
             hidden_size=hidden_size,
         )
+        # layer_idx=-2: only run the first (num_layers - 1) encoder layers.
+        # When num_layers == 1, this gives 0 layers — just patch embeddings,
+        # matching HF's layer_idx=-2 behaviour for a 1-layer SigLIP.
         self.encoder = VisionEncoder(
-            num_layers=num_layers,
+            num_layers=num_layers - 1,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_heads=num_heads,
@@ -575,17 +596,26 @@ class _Phi4MMMultiModalTextModel(nn.Module):
 
 
 class _Phi4MMVisionModel(nn.Module):
-    """Phi4MM vision encoder: SigLIP + projection MLP + HD transform params.
+    """Phi4MM vision encoder: SigLIP + AvgPool + HD transform + projection MLP.
 
-    Takes raw pixel values, encodes through SigLIP, and projects to the
-    text decoder's hidden dimension. Includes glb_GN and sub_GN
-    parameters for HD spatial merge.
+    Takes raw pixel values (all crops) and image_sizes, encodes each crop
+    through SigLIP, applies 2x spatial compression (AvgPool2d), then assembles
+    the HD transform: arranges sub-crops in a spatial grid, adds row separator
+    tokens (sub_GN), and concatenates with the global crop feature in
+    sub-first order (sub | glb_GN | global).  The combined sequence is
+    projected to the text decoder's hidden dimension.
+
+    HF reference: ``Phi4MMImageEmbedding.forward`` with
+    ``image_token_compression_cls="avg_pool_2d"`` and
+    ``hd_transform_order="sub_glb"``.
 
     Inputs:
-        pixel_values: [batch, 3, image_size, image_size]
-        image_sizes: [num_images, 2] — (height, width) per image for HD crop
+        pixel_values: (N_crops, 3, image_size, image_size)
+        image_sizes: (1, 2) — [height_px, width_px] of the original image,
+            used to derive the sub-crop grid dimensions
+            (h = height_px // crop_size, w = width_px // crop_size).
     Outputs:
-        image_features: [num_image_tokens, hidden_size]
+        image_features: (total_image_tokens, text_hidden_size)
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -593,6 +623,16 @@ class _Phi4MMVisionModel(nn.Module):
         vc = config.vision
         vision_hidden = (vc.hidden_size if vc else None) or config.hidden_size
         text_hidden = config.hidden_size
+        image_size = (vc.image_size if vc else None) or 448
+        patch_size = (vc.patch_size if vc else None) or 14
+
+        # H: patches per side from SigLIP (e.g. 448/14 = 32)
+        # Hp: patches per side after AvgPool2d(kernel=2, stride=2) = H // 2 = 16
+        # crop_size: pixel width/height of one crop tile (= image_size for Phi4MM)
+        self._H = image_size // patch_size  # 32
+        self._Hp = self._H // 2  # 16 — post-AvgPool spatial dimension
+        self._C = vision_hidden  # 1152
+        self._crop_size = image_size  # 448
 
         self.img_processor = _Phi4MMSigLIPEncoder(config)
         self.img_projection = _Phi4MMProjectionMLP(vision_hidden, text_hidden)
@@ -605,10 +645,145 @@ class _Phi4MMVisionModel(nn.Module):
         pixel_values: ir.Value,
         image_sizes: ir.Value,
     ):
-        # image_sizes is plumbed for the I/O contract with ORT GenAI.
-        # It will be used by the HD dynamic crop transform in a follow-up.
+        """Encode crops through SigLIP + HD spatial reassembly.
+
+        Steps:
+          1. SigLIP: (N_crops, 3, H_px, W_px) → (N_crops, H*H, C)
+          2. AvgPool2d(kernel=2, stride=2): 32x32 -> 16x16 per crop
+          3. Extract grid ratio (h, w) from image_sizes
+          4. Global crop (index 0): reshape to (1, Hp, Hp, C) and append
+             sub_GN row separators → (1, Hp*(Hp+1), C)
+          5. Sub crops (indices 1..h*w): arrange in (h, w) grid →
+             (1, h*Hp, w*Hp, C) and append sub_GN row separators
+          6. Assemble sub-first: [sub | glb_GN | global]
+          7. Project flat sequence through img_projection MLP
+        """
+        H = self._H  # noqa: N806  # 32 patches per side from SigLIP
+        Hp = self._Hp  # noqa: N806  # 16 patches per side after AvgPool
+        C = self._C  # noqa: N806  # 1152 vision hidden dim
+
+        # ── Step 1: SigLIP encode all crops ────────────────────────────
+        # pixel_values: (N_crops, 3, 448, 448)
+        # vision_features: (N_crops, H*H, C) = (N_crops, 1024, 1152)
         vision_features = self.img_processor(op, pixel_values)
-        return self.img_projection(op, vision_features)
+
+        # ── Step 2: AvgPool2d — compress 32x32 patches to 16x16 ───────
+        # Reshape: (N_crops, H*H, C) -> (N_crops, H, H, C)
+        n_crops = op.Shape(vision_features, start=0, end=1)  # (1,) int64
+        feats = op.Reshape(
+            vision_features,
+            op.Concat(n_crops, op.Constant(value_ints=[H, H, C]), axis=0),
+        )  # (N_crops, 32, 32, 1152)
+        # NHWC -> NCHW for AveragePool
+        feats = op.Transpose(feats, perm=[0, 3, 1, 2])  # (N_crops, 1152, 32, 32)
+        feats = op.AveragePool(feats, kernel_shape=[2, 2], strides=[2, 2])
+        # (N_crops, 1152, 16, 16)
+        feats = op.Transpose(feats, perm=[0, 2, 3, 1])  # (N_crops, 16, 16, 1152)
+        # Flatten spatial dims: (N_crops, Hp*Hp, C)
+        feats = op.Reshape(
+            feats,
+            op.Concat(n_crops, op.Constant(value_ints=[Hp * Hp, C]), axis=0),
+        )  # (N_crops, 256, 1152)
+
+        # ── Step 3: Derive h, w grid dimensions from image_sizes ──────
+        # image_sizes: (1, 2) = [[height_px, width_px]]
+        # h = height_px // crop_size, w = width_px // crop_size
+        img_hw = op.Reshape(image_sizes, op.Constant(value_ints=[-1]))  # (2,)
+        crop_size_t = op.Constant(value_int=self._crop_size)  # scalar int64
+        h = op.Div(
+            op.Gather(img_hw, op.Constant(value_int=0), axis=0), crop_size_t
+        )  # scalar — num sub-crop rows
+        w = op.Div(
+            op.Gather(img_hw, op.Constant(value_int=1), axis=0), crop_size_t
+        )  # scalar — num sub-crop cols
+        B_ = op.Mul(h, w)  # noqa: N806  # total number of sub crops
+
+        # ── Step 4: Split global crop (index 0) and sub crops ─────────
+        # global: (1, Hp*Hp, C) = (1, 256, 1152)
+        global_feat = op.Slice(
+            feats,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[0]),
+        )
+
+        # sub: (h*w, Hp*Hp, C) — slices crops 1 through h*w (inclusive)
+        B_plus_1 = op.Unsqueeze(op.Add(B_, op.Constant(value_int=1)), [0])  # noqa: N806
+        sub_feat = op.Slice(
+            feats,
+            op.Constant(value_ints=[1]),
+            B_plus_1,  # end = h*w + 1
+            op.Constant(value_ints=[0]),
+        )  # (h*w, 256, 1152)
+
+        # ── Step 5: Process global crop — reshape + row separators ────
+        # Reshape to 2D grid: (1, Hp, Hp, C)
+        global_4d = op.Reshape(global_feat, op.Constant(value_ints=[1, Hp, Hp, C]))
+        # sub_GN: (1, 1, 1, C) -> tile to (1, Hp, 1, C) as row separators
+        temp_glb_gn = op.Tile(
+            self.sub_GN, op.Constant(value_ints=[1, Hp, 1, 1])
+        )  # (1, 16, 1, 1152)
+        # Append one separator per row: (1, Hp, Hp+1, C)
+        glb_rows = op.Concat(global_4d, temp_glb_gn, axis=2)
+        # Flatten rows: (1, Hp*(Hp+1), C) = (1, 272, 1152)
+        glb_img = op.Reshape(glb_rows, op.Constant(value_ints=[1, -1, C]))
+
+        # ── Step 6: Process sub crops — grid layout + row separators ──
+        # Reshape each crop to 2D grid: (h*w, Hp, Hp, C)
+        sub_4d_shape = op.Concat(
+            op.Unsqueeze(B_, [0]),
+            op.Constant(value_ints=[Hp, Hp, C]),
+            axis=0,
+        )
+        sub_4d = op.Reshape(sub_feat, sub_4d_shape)  # (h*w, 16, 16, 1152)
+
+        # Arrange in (h, w) spatial grid: (1, h, w, Hp, Hp, C)
+        sub_6d_shape = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h, [0]),
+            op.Unsqueeze(w, [0]),
+            op.Constant(value_ints=[Hp, Hp, C]),
+            axis=0,
+        )
+        sub_6d = op.Reshape(sub_4d, sub_6d_shape)  # (1, h, w, 16, 16, 1152)
+
+        # Permute row/col blocks to place spatially adjacent:
+        # (1, h, w, Hp, Hp, C) -> (1, h, Hp, w, Hp, C)
+        sub_6d_t = op.Transpose(sub_6d, perm=[0, 1, 3, 2, 4, 5])
+
+        # Flatten block dims: (1, h*Hp, w*Hp, C)
+        h_hp = op.Mul(h, op.Constant(value_int=Hp))  # h * 16
+        w_hp = op.Mul(w, op.Constant(value_int=Hp))  # w * 16
+        sub_flat_shape = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h_hp, [0]),
+            op.Unsqueeze(w_hp, [0]),
+            op.Constant(value_ints=[C]),
+            axis=0,
+        )
+        sub_grid = op.Reshape(sub_6d_t, sub_flat_shape)  # (1, h*16, w*16, 1152)
+
+        # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
+        sub_sep_tile = op.Concat(
+            op.Constant(value_ints=[1]),
+            op.Unsqueeze(h_hp, [0]),
+            op.Constant(value_ints=[1, 1]),
+            axis=0,
+        )
+        temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
+        # Append one separator per row: (1, h*Hp, w*Hp+1, C)
+        sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+        # Flatten rows: (1, h*Hp*(w*Hp+1), C)
+        sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+
+        # ── Step 7: Assemble sub-first and project ────────────────────
+        # HF hd_transform_order = "sub_glb": [sub | glb_GN | global]
+        # glb_GN: (1, 1, C) — separator between sub and global features
+        full_seq = op.Concat(sub_img, self.glb_GN, glb_img, axis=1)
+        # (1, total_tokens, C) -> (total_tokens, C)
+        flat = op.Reshape(full_seq, op.Constant(value_ints=[-1, C]))
+        # Project to text hidden dim: (total_tokens, text_hidden)
+        return self.img_projection(op, flat)
 
 
 class _Phi4MMSpeechModel(nn.Module):
@@ -831,6 +1006,13 @@ class Phi4MMMultiModalModel(nn.Module):
         - ``model.layers.*`` -> ``decoder.layers.*``
         - ``model.norm.*`` -> ``decoder.norm.*``
         - ``lm_head.*`` -> ``decoder.lm_head.*``
+
+        Layer-count filtering: weights for layer indices beyond the truncated
+        layer counts (``config.num_hidden_layers``, ``config.vision.num_hidden_layers``,
+        ``config.audio.num_blocks``) are dropped here rather than showing as
+        UNEXPECTED warnings during ``apply_weights``.  This is expected when the
+        ONNX model is built with fewer layers than the full checkpoint (e.g. 2
+        text layers vs. the default 32).
         """
         state_dict = _preprocess_phi4mm_weights(self.config, state_dict)
 
@@ -846,6 +1028,10 @@ class Phi4MMMultiModalModel(nn.Module):
             new_key = _remap_phi4mm_weight_key(key)
             renamed[new_key] = value
 
+        # Drop weights for truncated layers so they don't appear as UNEXPECTED
+        # in apply_weights when the ONNX model has fewer layers than the checkpoint.
+        renamed = _drop_truncated_layer_weights(renamed, self.config)
+
         # Duplicate embed_tokens weight for decoder (tied weights)
         embed_key = "embedding.embed_tokens.weight"
         lm_head_key = "decoder.lm_head.weight"
@@ -856,12 +1042,86 @@ class Phi4MMMultiModalModel(nn.Module):
         return renamed
 
 
+def _layer_index_from_key(key: str, prefix: str) -> int | None:
+    """Return the layer index N from a key of the form ``{prefix}.{N}.rest``.
+
+    Returns ``None`` if the key doesn't match or N is not an integer.
+    """
+    if not key.startswith(prefix + "."):
+        return None
+    rest = key[len(prefix) + 1 :]
+    idx_str, _, _ = rest.partition(".")
+    try:
+        return int(idx_str)
+    except ValueError:
+        return None
+
+
+def _drop_truncated_layer_weights(
+    renamed: dict[str, torch.Tensor],
+    config: ArchitectureConfig,
+) -> dict[str, torch.Tensor]:
+    """Drop weights for layers/blocks beyond the truncated layer counts.
+
+    When the ONNX model is built with fewer layers than the full checkpoint
+    (e.g. ``num_text_layers=2`` against a 32-layer checkpoint) the extra
+    layer weights would otherwise all appear as UNEXPECTED in ``apply_weights``.
+    Dropping them here silences those spurious warnings.
+
+    Affected namespaces after prefix remapping:
+    - ``decoder.layers.{N}.*``       — drop if N >= config.num_hidden_layers
+    - ``vision_encoder.img_processor.encoder.layers.{N}.*``
+                                      — drop if N >= config.vision.num_hidden_layers
+    - ``speech_encoder.encoder.encoders.{N}.*``
+                                      — drop if N >= config.audio.num_blocks
+    """
+    max_decoder = config.num_hidden_layers
+    # _Phi4MMSigLIPEncoder builds (num_hidden_layers - 1) layers (layer_idx=-2),
+    # so drop weights for layers at or above that count.
+    max_vision = (
+        config.vision.num_hidden_layers - 1
+        if config.vision is not None and config.vision.num_hidden_layers is not None
+        else None
+    )
+    max_audio = (
+        config.audio.num_blocks
+        if config.audio is not None and config.audio.num_blocks is not None
+        else None
+    )
+
+    filtered: dict[str, torch.Tensor] = {}
+    for key, value in renamed.items():
+        # Decoder layers
+        idx = _layer_index_from_key(key, "decoder.layers")
+        if idx is not None and idx >= max_decoder:
+            continue
+
+        # Vision encoder layers
+        if max_vision is not None:
+            idx = _layer_index_from_key(key, "vision_encoder.img_processor.encoder.layers")
+            if idx is not None and idx >= max_vision:
+                continue
+
+        # Audio encoder blocks
+        if max_audio is not None:
+            idx = _layer_index_from_key(key, "speech_encoder.encoder.encoders")
+            if idx is not None and idx >= max_audio:
+                continue
+
+        filtered[key] = value
+    return filtered
+
+
 def _remap_phi4mm_weight_key(key: str) -> str:
     """Remap a single HuggingFace weight key to 4-model prefix."""
     # Vision encoder: image_embed sub-tree
     img_prefix = "model.embed_tokens_extend.image_embed."
     if key.startswith(img_prefix):
-        return "vision_encoder." + key[len(img_prefix) :]
+        suffix = key[len(img_prefix) :]
+        # SigLIP vision encoder uses fc1/fc2 for MLP — rename to up_proj/down_proj
+        suffix = suffix.replace(".mlp.fc1.", ".mlp.up_proj.")
+        suffix = suffix.replace(".mlp.fc2.", ".mlp.down_proj.")
+        return "vision_encoder." + suffix
 
     # Speech encoder: audio_embed sub-tree
     audio_prefix = "model.embed_tokens_extend.audio_embed."
@@ -870,6 +1130,9 @@ def _remap_phi4mm_weight_key(key: str) -> str:
         # Strip "audio_projection." since onnxscript resolves the speech
         # and vision projection branches directly on the module (Bug 5).
         suffix = suffix.removeprefix("audio_projection.")
+        # Strip PyTorch activation-checkpoint wrapper segment injected by
+        # gradient-checkpointing — not present in the ONNX module tree.
+        suffix = suffix.replace("._checkpoint_wrapped_module", "")
         return "speech_encoder." + suffix
 
     # Token embeddings -> embedding model
