@@ -473,19 +473,23 @@ config.routed_scaling_factor         # Post-normalization scale
 
 ### com.microsoft.MoE compatibility
 
-The `com.microsoft.MoE` op can be used for the routed expert dispatch IF:
-- Router probs are pre-computed as `sigmoid(logits)` (not softmax)
-- The op is called with `normalize_routing_weights=0` since NemotronH
-  does its own normalization outside the op
-- `activation_type` matches the expert activation (e.g. "silu")
-- `softmax_routing_weights=0` is used to skip the op's internal softmax
-- The shared expert and latent projections remain outside the fused op
+**Not compatible with NemotronH.** Three blockers:
 
-**Limitation**: The fused MoE op expects `router_probs` to be the final
-routing weights. For NemotronH, the correction bias shifts expert selection
-but NOT weights, so the routing weights must be pre-computed (sigmoid probs
-gathered by pre-selected indices) BEFORE passing to the op. This requires
-splitting the gate into selection (custom) and dispatch (fused op).
+1. **Squared ReLU activation**: NemotronH experts use `relu2` (squared ReLU:
+   `relu(x)^2`). The fused MoE op only supports `silu`, `gelu`, `relu`,
+   `none` — no squared ReLU. Since the activation is applied between the
+   two matmuls inside the fused op, there is no way to inject a custom
+   activation.
+
+2. **Sigmoid routing with correction bias**: NemotronH gate uses
+   `sigmoid → add_bias → topk` for expert selection, but final routing
+   weights come from the unbiased sigmoid probs. The fused op has no
+   option to bypass its internal softmax/topk routing.
+
+3. **Shared expert + latent projection**: These must run outside the fused
+   op regardless, adding complexity without eliminating the main bottleneck.
+
+NemotronH uses loop-over-experts dispatch. See `NemotronHMoEBlock` docstring.
 
 ### Graph size impact
 
