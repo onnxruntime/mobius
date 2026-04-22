@@ -236,7 +236,11 @@ class NemotronHMoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter([num_experts])
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        # Route in float32 for numerical stability
+        # Cast to float32 for numerical stability (eps=1e-20 underflows
+        # in fp16/bf16).  HF does the same: hidden_states.type(torch.float32)
+        # in NemotronHTopkRouter.forward and never casts back.
+        hidden_states = op.Cast(hidden_states, to=1)  # FLOAT32
+
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
@@ -259,6 +263,9 @@ class NemotronHMoEGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
 
+        # Keep routing_weights in float32 (matching HF which never casts back).
+        # The expert dispatch multiplies these with expert outputs, and ONNX
+        # type promotion handles the mixed-dtype matmul naturally.
         return routing_weights, selected_experts
 
 

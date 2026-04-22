@@ -3507,6 +3507,98 @@ class TestBuildNemotronHGraph:
         for key in result:
             assert not key.startswith("backbone."), f"Unrenamed key: {key}"
 
+    def test_nemotron_h_moe_preprocess_weights(self):
+        """Verify stacked 3D MoE expert tensors are split into per-expert 2D weights."""
+        import torch
+
+        from mobius._configs import NemotronHConfig
+        from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+        config = NemotronHConfig(
+            vocab_size=TINY_VOCAB,
+            hidden_size=TINY_HIDDEN,
+            intermediate_size=TINY_INTERMEDIATE,
+            num_hidden_layers=2,
+            num_attention_heads=TINY_HEADS,
+            num_key_value_heads=TINY_KV_HEADS,
+            rms_norm_eps=1e-5,
+            layer_types=["full_attention", "moe"],
+            mamba_n_heads=TINY_KV_HEADS,
+            mamba_d_head=TINY_HEAD_DIM,
+            mamba_d_state=16,
+            mamba_n_groups=1,
+            mamba_d_conv=4,
+            mamba_expand=2,
+            hidden_act="relu2",
+            head_dim=TINY_HEAD_DIM,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=TINY_INTERMEDIATE,
+        )
+        module = NemotronHCausalLMModel(config)
+
+        num_experts = 4
+        # Stacked 3D expert tensors (HF format): (num_experts, out_dim, in_dim)
+        up_proj_stacked = torch.randn(num_experts, TINY_INTERMEDIATE, TINY_HIDDEN)
+        down_proj_stacked = torch.randn(num_experts, TINY_HIDDEN, TINY_INTERMEDIATE)
+
+        state_dict = {
+            # Embeddings & norm
+            "backbone.embeddings.weight": torch.zeros(1),
+            "backbone.norm_f.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(1),
+            # Layer 0: full_attention
+            "backbone.layers.0.norm.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.q_proj.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.k_proj.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.v_proj.weight": torch.zeros(1),
+            "backbone.layers.0.mixer.o_proj.weight": torch.zeros(1),
+            # Layer 1: moe — stacked expert weights (3D)
+            "backbone.layers.1.norm.weight": torch.zeros(1),
+            "backbone.layers.1.mixer.experts.up_proj": up_proj_stacked,
+            "backbone.layers.1.mixer.experts.down_proj": down_proj_stacked,
+            # MoE gate
+            "backbone.layers.1.mixer.gate.weight": torch.zeros(1),
+            "backbone.layers.1.mixer.gate.e_score_correction_bias": torch.zeros(1),
+            # MoE shared experts
+            "backbone.layers.1.mixer.shared_experts.up_proj.weight": torch.zeros(1),
+            "backbone.layers.1.mixer.shared_experts.down_proj.weight": torch.zeros(1),
+        }
+
+        result = module.preprocess_weights(state_dict)
+
+        # Stacked expert keys must NOT be in the result
+        assert "model.layers.1.moe.experts.up_proj" not in result
+        assert "model.layers.1.moe.experts.down_proj" not in result
+
+        # Per-expert keys must exist with correct shapes
+        for i in range(num_experts):
+            up_key = f"model.layers.1.moe.experts.{i}.up_proj.weight"
+            down_key = f"model.layers.1.moe.experts.{i}.down_proj.weight"
+            assert up_key in result, f"Missing {up_key}"
+            assert down_key in result, f"Missing {down_key}"
+            assert result[up_key].shape == (TINY_INTERMEDIATE, TINY_HIDDEN), (
+                f"{up_key} shape {result[up_key].shape}"
+            )
+            assert result[down_key].shape == (TINY_HIDDEN, TINY_INTERMEDIATE), (
+                f"{down_key} shape {result[down_key].shape}"
+            )
+            # Verify the data matches the original slice
+            torch.testing.assert_close(result[up_key], up_proj_stacked[i])
+            torch.testing.assert_close(result[down_key], down_proj_stacked[i])
+
+        # Gate weights are renamed correctly
+        assert "model.layers.1.moe.gate.weight" in result
+        assert "model.layers.1.moe.gate.e_score_correction_bias" in result
+
+        # Shared expert weights are renamed correctly
+        assert "model.layers.1.moe.shared_experts.up_proj.weight" in result
+        assert "model.layers.1.moe.shared_experts.down_proj.weight" in result
+
+        # No original backbone.* keys should remain
+        for key in result:
+            assert not key.startswith("backbone."), f"Unrenamed key: {key}"
+
 
 # ===========================================================================
 # Hybrid SSM+Attention (Jamba) model tests

@@ -34,33 +34,26 @@ def _fix_nemotron_h_dt_bias(model: torch.nn.Module, model_id: str) -> None:
     import glob
     import os
 
-    # Locate the cached snapshot directory
-    cache_dir = os.path.join(
-        torch.hub.get_dir().replace("/hub", ""),
-        "huggingface",
-        "hub",
-        f"models--{model_id.replace('/', '--')}",
-    )
-    if not os.path.isdir(cache_dir):
-        # Try the HF_HOME default
-        hf_home = os.environ.get(
-            "HF_HOME",
-            os.path.expanduser("~/.cache/huggingface"),
+    from huggingface_hub import snapshot_download
+
+    # Resolve the exact snapshot directory used by HF for this model,
+    # avoiding lexicographic guessing across multiple cached revisions.
+    try:
+        snapshot = snapshot_download(model_id, local_files_only=True)
+    except Exception:
+        logger.warning(
+            "NemotronH dt_bias fix: could not resolve snapshot for %s",
+            model_id,
         )
-        cache_dir = os.path.join(hf_home, "hub", f"models--{model_id.replace('/', '--')}")
-    snapshot_dirs = sorted(glob.glob(os.path.join(cache_dir, "snapshots", "*")))
-    if not snapshot_dirs:
-        logger.warning("NemotronH dt_bias fix: snapshot dir not found")
         return
 
-    snapshot = snapshot_dirs[-1]
     safetensor_files = sorted(glob.glob(os.path.join(snapshot, "*.safetensors")))
 
     patched = 0
     state = model.state_dict()
     for f in safetensor_files:
         with safe_open(f, framework="pt") as st:
-            for key in st.keys():
+            for key in st:
                 if "dt_bias" not in key:
                     continue
                 if key not in state:
@@ -75,6 +68,11 @@ def _fix_nemotron_h_dt_bias(model: torch.nn.Module, model_id: str) -> None:
     if patched:
         model.load_state_dict(state, strict=False)
         logger.info("NemotronH: restored %d dt_bias params from checkpoint", patched)
+    else:
+        logger.warning(
+            "NemotronH dt_bias fix: no dt_bias params found in checkpoint for %s",
+            model_id,
+        )
 
 
 def load_torch_model(
