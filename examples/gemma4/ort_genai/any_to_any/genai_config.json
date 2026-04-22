@@ -1,6 +1,6 @@
 {
     "model": {
-        "type": "gemma4_any_to_any",
+        "type": "gemma4",
         "vocab_size": 262144,
         "context_length": 131072,
         "bos_token_id": 2,

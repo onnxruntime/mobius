@@ -125,16 +125,17 @@ Output: `audio_features [batch, time/4, 1536]` — projected to text hidden_size
 
 ## ORT GenAI support required
 
-These configs use model types not yet in a released ORT GenAI build:
+These configs use the `gemma4` model type which is not yet in a released
+ORT GenAI build:
 
-| Config | `model.type` | Required new type |
+| Config | `model.type` | Pipeline variant |
 |---|---|---|
-| `text/genai_config.json` | `gemma4_text` | New decoder-only type |
-| `vlm/genai_config.json` | `gemma4` | New VLM type |
-| `any_to_any/genai_config.json` | `gemma4_any_to_any` | New multimodal type |
+| `text/genai_config.json` | `gemma4` | Decoder-only (text) |
+| `vlm/genai_config.json` | `gemma4` | VLM (vision + text) |
+| `any_to_any/genai_config.json` | `gemma4` | Multimodal (vision + audio + text) |
 
-Until these types are supported, you can approximate text-only generation
-using `"type": "gemma3_text"` (without KV sharing or dual head_dim support).
+The runtime auto-detects the pipeline variant from which ONNX files are
+present.
 
 ---
 

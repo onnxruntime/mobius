@@ -42,12 +42,16 @@ class GQAContext(NamedTuple):
             Taken directly from the model's ``rotary_emb.cos_cache`` parameter.
         sin_cache: Full sine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
             Taken directly from the model's ``rotary_emb.sin_cache`` parameter.
+        local_window_size: Left window size for local/sliding-window attention.
+            ``-1`` means unused (full causal attention).  Maps to the
+            ``local_window_size`` attribute on ``GroupQueryAttention``.
     """
 
     seqlens_k: ir.Value
     total_seq_len: ir.Value
     cos_cache: ir.Value
     sin_cache: ir.Value
+    local_window_size: int = -1
 
 
 class StaticCacheState(NamedTuple):
@@ -104,6 +108,11 @@ def _apply_attention(
         Both paths set ``is_causal=1`` on the Attention op, which enables
         built-in causal masking. This means ``attn_mask`` should encode
         only padding information (as a bool mask), not causality.
+
+    Note:
+        ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
+        (no ``past_key``/``past_value``). ORT asserts that it cannot be
+        combined with dynamic KV cache inputs.
 
     Note:
         In static cache mode, RoPE must be applied to key *before*
@@ -168,6 +177,10 @@ def _apply_attention(
     # is_causal=1 enables built-in causal masking, eliminating the need for
     # callers to embed causality in the attn_mask. This allows attn_mask to
     # be a simple bool padding mask, which unlocks Flash Attention eligibility.
+    #
+    # NOTE: nonpad_kv_seqlen cannot be used here — ORT requires that
+    # nonpad_kv_seqlen is NOT combined with past_key/past_value inputs.
+    # It is only valid in static cache mode (no past_key/past_value).
     attn_output, present_key, present_value = op.Attention(
         query,
         key,
@@ -388,6 +401,8 @@ class Attention(nn.Module):
         if self.rotary_embedding_dim:
             # Partial RoPE: only rotate the first rotary_embedding_dim elements.
             gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+        if gqa_ctx.local_window_size > 0:
+            gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
 
         # Emit GroupQueryAttention: RoPE + attention + KV cache in one op.
         # Outputs: (attn_output [B, S, hidden], present_key, present_value)

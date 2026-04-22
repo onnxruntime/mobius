@@ -49,6 +49,10 @@ def _make_gemma4_kv_cache_inputs(
     The last ``config.num_kv_shared_layers`` layers share K,V from earlier
     layers and do NOT have their own cache entries — only
     ``num_hidden_layers - num_kv_shared_layers`` entries are created.
+
+    All layers use the original ``num_key_value_heads`` (no expansion).
+    The Attention op supports GQA head counts natively.  CUDA EP limitations
+    are tracked in microsoft/onnxruntime#28195 and #28196.
     """
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
@@ -67,14 +71,15 @@ def _make_gemma4_kv_cache_inputs(
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
+        kv_heads = config.num_key_value_heads
         past_key = ir.Value(
             name=f"past_key_values.{i}.key",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         past_value = ir.Value(
             name=f"past_key_values.{i}.value",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         flat.extend([past_key, past_value])
