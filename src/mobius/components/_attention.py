@@ -110,6 +110,11 @@ def _apply_attention(
         only padding information (as a bool mask), not causality.
 
     Note:
+        ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
+        (no ``past_key``/``past_value``). ORT asserts that it cannot be
+        combined with dynamic KV cache inputs.
+
+    Note:
         In static cache mode, RoPE must be applied to key *before*
         calling this function so that cached entries have RoPE baked in.
     """
@@ -172,6 +177,10 @@ def _apply_attention(
     # is_causal=1 enables built-in causal masking, eliminating the need for
     # callers to embed causality in the attn_mask. This allows attn_mask to
     # be a simple bool padding mask, which unlocks Flash Attention eligibility.
+    #
+    # NOTE: nonpad_kv_seqlen cannot be used here — ORT requires that
+    # nonpad_kv_seqlen is NOT combined with past_key/past_value inputs.
+    # It is only valid in static cache mode (no past_key/past_value).
     attn_output, present_key, present_value = op.Attention(
         query,
         key,
