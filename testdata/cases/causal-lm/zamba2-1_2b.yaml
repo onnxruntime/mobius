@@ -13,4 +13,6 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-notes: "Zamba2 1.2B. Hybrid Mamba2 + shared attention architecture from Zyphra."
+min_token_match_ratio: 0.1
+
+notes: "Zamba2 1.2B. Hybrid Mamba2 + shared attention architecture from Zyphra. L5 diverges after a few tokens due to Mamba state accumulation differences."

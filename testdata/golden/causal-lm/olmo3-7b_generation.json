@@ -1,0 +1,27 @@
+{
+  "model_id": "allenai/Olmo-3-7B-Instruct",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    4815,
+    791,
+    7160,
+    7437,
+    304,
+    279,
+    9909,
+    345,
+    18590,
+    287,
+    279,
+    13180,
+    449,
+    82757,
+    315,
+    2800,
+    627,
+    62128,
+    34044,
+    304
+  ],
+  "generated_text": " \n\nThe sun sets in the west,\nPainting the sky with hues of rest.\nStars emerge in"
+}

@@ -13,5 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
+skip_reason: "Gated repo not accessible with current credentials."
 notes: "Cohere Command R 7B. Llama-compatible with layernorm differences."
-ci_skip_reason: "Model too large for CI (7B params)."

@@ -1,0 +1,27 @@
+{
+  "model_id": "THUDM/glm-4-9b-chat-hf",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    715,
+    40,
+    1079,
+    264,
+    15921,
+    11,
+    264,
+    15921,
+    429,
+    17047,
+    198,
+    40,
+    1079,
+    264,
+    15921,
+    11,
+    264,
+    15921,
+    429,
+    17047
+  ],
+  "generated_text": " \nI am a leaf, a leaf that falls\nI am a leaf, a leaf that falls"
+}

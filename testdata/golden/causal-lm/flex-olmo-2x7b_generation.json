@@ -1,0 +1,27 @@
+{
+  "model_id": "allenai/Flex-reddit-2x7B-1T",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    358,
+    1097,
+    264,
+    2697,
+    12224,
+    198,
+    4897,
+    374,
+    8774,
+    304,
+    264,
+    36460,
+    345,
+    3112,
+    358,
+    1097,
+    1633,
+    12703,
+    323,
+    40666
+  ],
+  "generated_text": " I am a little bird\nThat is kept in a cage,\nAnd I am very sad and lonely"
+}

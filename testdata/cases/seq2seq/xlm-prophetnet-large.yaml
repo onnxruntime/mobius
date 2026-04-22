@@ -11,3 +11,4 @@ inputs:
 level: "L4"
 
 notes: "XLM-ProphetNet large. Multilingual future n-gram prediction."
+skip_reason: "Tokenizer backend instantiation fails in current transformers."

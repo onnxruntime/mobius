@@ -13,5 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-ci_skip_reason: "Model too large for CI (7B params)."
+skip_reason: "Gated repo not accessible with current credentials."
 notes: "Cohere2 Command R 7B. LayerNorm1P with weight+1 scaling, logit scale 1/16."

@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 level: "L4"
 
 notes: "RemBERT. Decoupled embeddings multilingual encoder."

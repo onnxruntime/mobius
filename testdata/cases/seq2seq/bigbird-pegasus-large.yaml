@@ -8,6 +8,7 @@ inputs:
     - "summarize: The tower is 324 metres tall and is the tallest structure in Paris."
   decoder_prompt: ""
 
-level: "L4"
+level: "L4,L5"
 
+skip_reason: "Model only has .bin weights (no safetensors); weight loader requires safetensors."
 notes: "BigBird-Pegasus large. Long-range document summarization."

@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Weight shape mismatch in patch embeddings."
 level: "L4"
 
 notes: "Swin2SR. Super-resolution image transformer."

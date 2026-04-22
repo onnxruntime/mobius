@@ -374,12 +374,33 @@ def load_torch_vision_model(
     processor = transformers.AutoImageProcessor.from_pretrained(
         model_id, trust_remote_code=trust_remote_code
     )
-    model = transformers.AutoModel.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=trust_remote_code,
-    )
+
+    # Some vision models (DepthAnything, Segformer) aren't loadable via
+    # AutoModel.  Try progressively more specific Auto classes.
+    model = None
+    auto_classes = [
+        transformers.AutoModel,
+        transformers.AutoModelForImageClassification,
+    ]
+    if hasattr(transformers, "AutoModelForDepthEstimation"):
+        auto_classes.append(transformers.AutoModelForDepthEstimation)
+    if hasattr(transformers, "AutoModelForSemanticSegmentation"):
+        auto_classes.append(transformers.AutoModelForSemanticSegmentation)
+    if hasattr(transformers, "AutoModelForImageToImage"):
+        auto_classes.append(transformers.AutoModelForImageToImage)
+    for auto_cls in auto_classes:
+        try:
+            model = auto_cls.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                device_map=device,
+                trust_remote_code=trust_remote_code,
+            )
+            break
+        except (ValueError, TypeError):
+            continue
+    if model is None:
+        raise ValueError(f"Could not load {model_id} with any AutoModel variant")
     model.eval()
 
     # Multi-modal models (CLIP, SigLIP) wrap a vision sub-model that
@@ -398,13 +419,35 @@ def torch_vision_forward(
     """Run a single forward pass on a HuggingFace vision model.
 
     Returns:
-        last_hidden_state as numpy array [batch, seq_len, hidden_size].
+        Feature tensor as numpy array.  Shape varies by model:
+        [B, seq_len, hidden] for ViT-like, [B, C, H, W] for CNN-like,
+        or [B, num_classes] for classification heads.
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     pv = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
     outputs = model(pixel_values=pv)
-    return outputs.last_hidden_state.cpu().numpy()
+    # Prefer last_hidden_state; fall back to logits or first tensor output.
+    if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        return outputs.last_hidden_state.cpu().numpy()
+    if hasattr(outputs, "logits") and outputs.logits is not None:
+        return outputs.logits.cpu().numpy()
+    # Some models (DepthAnything) return predicted_depth or similar.
+    if hasattr(outputs, "predicted_depth") and outputs.predicted_depth is not None:
+        return outputs.predicted_depth.cpu().numpy()
+    # Generic fallback: accept dict-like ModelOutput, tuple, or list returns.
+    if hasattr(outputs, "cpu"):
+        return outputs.cpu().numpy()
+    values = None
+    if hasattr(outputs, "values"):
+        values = outputs.values()
+    elif isinstance(outputs, (tuple, list)):
+        values = outputs
+    if values is not None:
+        for v in values:
+            if hasattr(v, "cpu"):
+                return v.cpu().numpy()
+    raise ValueError(f"No usable tensor in model outputs: {type(outputs)}")
 
 
 # ---------------------------------------------------------------------------

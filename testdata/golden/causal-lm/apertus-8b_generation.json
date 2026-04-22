@@ -1,0 +1,27 @@
+{
+  "model_id": "swiss-ai/Apertus-8B-Instruct-2509",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    1429,
+    1784,
+    16544,
+    59100,
+    4410,
+    1784,
+    3804,
+    22494,
+    122675,
+    1317,
+    1278,
+    14029,
+    1520,
+    1065,
+    77635,
+    22494,
+    1044,
+    1261,
+    22494,
+    1307
+  ],
+  "generated_text": " \"The Last Leaf\"\n\nThe last leaf clung to the branch,\nA lonely leaf, a leaf of"
+}

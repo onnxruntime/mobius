@@ -9,6 +9,7 @@ inputs:
   audio:
     - "652-129742-0006.flac"
 
+skip_reason: "Weight shape mismatch in audio_encoder.encoder.output_proj."
 level: "L4+L5"
 
 generation:

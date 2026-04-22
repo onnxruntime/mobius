@@ -1,0 +1,28 @@
+{
+  "model_id": "stas/tiny-wmt19-en-de",
+  "prompt": "translate English to German: The house is wonderful.",
+  "generated_tokens": [
+    2,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942,
+    41942
+  ],
+  "generated_text": "\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe\u6cbe"
+}

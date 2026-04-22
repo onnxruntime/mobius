@@ -1,0 +1,24 @@
+{
+  "model_id": "google/pegasus-xsum",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    0,
+    139,
+    37695,
+    6817,
+    148,
+    174,
+    8514,
+    164,
+    115,
+    109,
+    3592,
+    113,
+    109,
+    1775,
+    5212,
+    107,
+    1
+  ],
+  "generated_text": "The Eiffel Tower has been lit up in the colours of the French flag."
+}

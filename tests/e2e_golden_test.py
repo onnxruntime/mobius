@@ -29,7 +29,7 @@ import pytest
 
 from mobius import build
 from mobius._model_package import ModelPackage
-from mobius._testing.generation import OnnxGenerator
+from mobius._testing.generation import OnnxGenerator, OnnxSeq2SeqGenerator
 from mobius._testing.golden import (
     GoldenRef,
     GoldenTestCase,
@@ -1305,6 +1305,7 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
         "image-text-to-text",
+        "seq2seq",
     }
 )
 
@@ -1363,6 +1364,50 @@ def _run_causal_lm_generation(
     return all_ids[0, prompt_len:]
 
 
+def _run_seq2seq_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    expected_token_ids: list[int] | None = None,
+) -> np.ndarray:
+    """Run greedy generation for a seq2seq (encoder-decoder) model.
+
+    Returns the full decoder output including decoder_start_token,
+    matching HuggingFace model.generate() output format.
+    """
+    config = pkg.config
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        generator = OnnxSeq2SeqGenerator(enc_session, dec_session, config)
+        input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        eos_token_id = case.generation_params.get("eos_token_id", None)
+
+        # Extract decoder_start_token_id: prefer config, fall back to
+        # the first token of the golden generation sequence.
+        decoder_start_id = getattr(config, "decoder_start_token_id", None)
+        if decoder_start_id is None and expected_token_ids:
+            decoder_start_id = expected_token_ids[0]
+        if decoder_start_id is None:
+            decoder_start_id = 0
+
+        all_ids = generator.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_id,
+        )
+    finally:
+        enc_session.close()
+        dec_session.close()
+
+    # Return the full decoder output including decoder_start_token,
+    # matching HuggingFace model.generate() output format.
+    return all_ids[0]
+
+
 # ---------------------------------------------------------------------------
 # L5 Tests: Generation E2E
 # ---------------------------------------------------------------------------
@@ -1374,9 +1419,9 @@ class TestL5GenerationE2E:
     """L5: Full autoregressive generation, compare token sequences.
 
     Gate: token match ratio >= ``min_token_match_ratio`` from tolerances.
-    Supported task types: ``text-generation`` (causal-LM via OnnxGenerator)
-    and ``image-text-to-text`` (VL three-model pipeline).
-    Other task types (seq2seq, speech-to-text) are skipped.
+    Supported task types: ``text-generation`` (causal-LM via OnnxGenerator),
+    ``image-text-to-text`` (VL three-model pipeline), ``seq2seq`` and
+    ``speech-to-text`` (encoder-decoder via OnnxSeq2SeqGenerator).
     """
 
     @pytest.mark.parametrize("case", _L5_CASES)
@@ -1430,6 +1475,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type in ("seq2seq", "speech-to-text"):
+            new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4) — L5 generation
             # requires embedding → decoder loop, not yet implemented.

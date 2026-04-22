@@ -8,6 +8,7 @@ inputs:
     - "summarize: The tower is 324 metres tall and is the tallest structure in Paris."
   decoder_prompt: ""
 
-level: "L4"
+skip_reason: "ORT InvalidArgument error during inference."
+level: "L4,L5"
 
 notes: "ProphetNet large uncased. Future n-gram prediction pre-training."

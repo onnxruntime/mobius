@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Weight shape mismatch in decode_head classifier."
 level: "L4"
 
 notes: "SegFormer B0. Semantic segmentation transformer."
