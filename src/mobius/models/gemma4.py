@@ -41,6 +41,8 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_attention_bias,
+    create_padding_mask,
+    create_sliding_window_mask,
     initialize_rope,
 )
 from mobius.components._activations import get_activation
@@ -473,11 +475,13 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         x_emb = op.Gather(x_table, x_coords, axis=0)  # [B, N, hidden]
         y_emb = op.Gather(y_table, y_coords, axis=0)  # [B, N, hidden]
 
-        # Zero position embeddings for padding patches (HF: torch.where(padding.unsqueeze(-1), 0.0, pos_emb))
+        # Zero position embeddings for padding patches.
+        # Use Mul instead of Where to avoid CPU-only bool Where ops that cause
+        # Memcpy nodes on CUDA EP. not_pad is 0/1 float broadcast over hidden.
         pos_emb = op.Add(x_emb, y_emb)  # [B, N, hidden]
-        is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1] — broadcast over hidden
-        zero = op.CastLike(op.Constant(value_float=0.0), pos_emb)
-        pos_emb = op.Where(is_pad_expanded, zero, pos_emb)
+        not_pad = op.CastLike(op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), pos_emb)
+        not_pad = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
+        pos_emb = op.Mul(pos_emb, not_pad)
 
         return op.Add(hidden_states, pos_emb), is_padding  # ([B, N, hidden], [B, N])
 
@@ -526,19 +530,22 @@ class _Gemma4VisionEncoderCore(nn.Module):
 
         # Build additive attention bias [B, 1, 1, N] masking out padding columns.
         # Valid positions get 0 (no effect), padding columns get -1e9 (suppressed).
-        # This matches HF Gemma4VisionEncoder passing attention_mask=~padding_positions.
+        # Use Mul instead of Where to keep computation on CUDA (avoids CPU
+        # Memcpy for bool Where ops).
+        # is_padding (bool) → float 0/1 → * neg_inf → padding=-1e9, valid=0
         neg_inf = op.CastLike(op.Constant(value_float=-1e9), hidden_states)
-        zero_bias = op.CastLike(op.Constant(value_float=0.0), hidden_states)
-        attn_bias = op.Where(is_padding, neg_inf, zero_bias)  # [B, N]
+        is_pad_f = op.CastLike(op.Cast(is_padding, to=ir.DataType.FLOAT), hidden_states)
+        attn_bias = op.Mul(is_pad_f, neg_inf)  # [B, N]
         attn_bias = op.Unsqueeze(attn_bias, [1, 2])  # [B, 1, 1, N]
 
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, attn_bias, pixel_position_ids)
 
         # Zero padding patches after all encoder blocks (matching HF pooler masked_fill).
-        is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1]
-        zero = op.CastLike(op.Constant(value_float=0.0), hidden_states)
-        hidden_states = op.Where(is_pad_expanded, zero, hidden_states)
+        # Use Mul instead of Where for CUDA-friendliness.
+        not_pad = op.CastLike(op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), hidden_states)
+        not_pad = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
+        hidden_states = op.Mul(hidden_states, not_pad)
 
         return hidden_states  # [B, N, vision_hidden]
 
@@ -682,13 +689,9 @@ class Gemma4TextAttention(nn.Module):
             src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
 
             # [B, total_seq, kv_heads, head_dim] → [B, total_seq, kv_heads * head_dim]
-            kv_hidden = self.num_key_value_heads * self.head_dim
-            batch_d = op.Shape(src_key, start=0, end=1)
-            seq_d = op.Shape(src_key, start=1, end=2)
-            kv_h = op.Constant(value_ints=[kv_hidden])
-            tgt_shape = op.Concat(batch_d, seq_d, kv_h, axis=0)
-            src_key = op.Reshape(src_key, tgt_shape)
-            src_value = op.Reshape(src_value, tgt_shape)
+            # Use [0, 0, -1] reshape to avoid Shape ops that cause CPU Memcpy.
+            src_key = op.Reshape(src_key, [0, 0, -1])
+            src_value = op.Reshape(src_value, [0, 0, -1])
 
             attn_output, present_key, present_value = _apply_attention(
                 op,
@@ -1446,21 +1449,43 @@ class Gemma4TextModel(nn.Module):
             layer.self_attn.is_kv_shared_layer for layer in self.layers
         )
         if need_fallback:
-            fallback_bias_dict = {
-                "sliding_attention": create_attention_bias(
-                    op,
-                    input_ids=query_input,
-                    attention_mask=attention_mask,
-                    sliding_window=self.sliding_window,
-                    dtype=self._dtype,
-                ),
-                "full_attention": create_attention_bias(
-                    op,
-                    input_ids=query_input,
-                    attention_mask=attention_mask,
-                    dtype=self._dtype,
-                ),
-            }
+            if use_gqa:
+                # GQA is active for non-shared layers. KV-shared layers use
+                # the standard Attention op with is_causal=1, so we only need
+                # bool masks (not additive float bias). This avoids the
+                # CumSum/GreaterOrEqual/Where chain that causes CPU Memcpy
+                # nodes on CUDA EP.
+                # Full-attention: simple padding mask (causality handled by op)
+                # Sliding-window: still needs CumSum for window constraint
+                fallback_bias_dict = {
+                    "sliding_attention": create_sliding_window_mask(
+                        op,
+                        input_ids=query_input,
+                        attention_mask=attention_mask,
+                        window_size=self.sliding_window or 512,
+                    ),
+                    "full_attention": create_padding_mask(
+                        op,
+                        input_ids=query_input,
+                        attention_mask=attention_mask,
+                    ),
+                }
+            else:
+                fallback_bias_dict = {
+                    "sliding_attention": create_attention_bias(
+                        op,
+                        input_ids=query_input,
+                        attention_mask=attention_mask,
+                        sliding_window=self.sliding_window,
+                        dtype=self._dtype,
+                    ),
+                    "full_attention": create_attention_bias(
+                        op,
+                        input_ids=query_input,
+                        attention_mask=attention_mask,
+                        dtype=self._dtype,
+                    ),
+                }
             # KV-shared layers also need position embeddings for the
             # standard Attention path (manual RoPE).
             if use_gqa:
@@ -1691,6 +1716,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+        self._text_hidden_size = config.hidden_size
         self.encoder = _Gemma4VisionEncoderCore(config)
         # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
@@ -1716,9 +1742,10 @@ class _Gemma4VisionEncoderModel(nn.Module):
         vision_features = self.projector(op, vision_features)
 
         # Flatten batch and token dims: [B, N/9, text_hidden] -> [B*(N/9), text_hidden]
-        hidden_size = op.Shape(vision_features, start=2, end=3)
+        # Use static hidden_size from config to avoid Shape op (CPU Memcpy).
         vision_features = op.Reshape(
-            vision_features, op.Concat(op.Constant(value_ints=[-1]), hidden_size, axis=0)
+            vision_features,
+            op.Constant(value_ints=[-1, self._text_hidden_size]),
         )
         return vision_features  # [B*(N/9), text_hidden]
 
