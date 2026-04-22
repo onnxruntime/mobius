@@ -576,7 +576,14 @@ class TestWeightTying:
         )
 
     def test_untied_weights_have_separate_initializers(self):
-        """When tie_word_embeddings=False, both initializers remain independent."""
+        """When tie_word_embeddings=False, both initializers remain independent.
+
+        The fold-transpose pass may rename ``lm_head.weight`` to
+        ``lm_head.weight_t`` (pre-transposing the single-user Transpose
+        node).  This is correct for untied weights because ``lm_head.weight``
+        has exactly one consumer.  In the tied case, the shared initializer
+        has multiple consumers and fold is correctly skipped.
+        """
         config = make_config(tie_word_embeddings=False)
         module = CausalLMModel(config)
         pkg = build_from_module(module, config)
@@ -591,7 +598,12 @@ class TestWeightTying:
         apply_weights(model, sd)
 
         assert "model.embed_tokens.weight" in model.graph.initializers
-        assert "lm_head.weight" in model.graph.initializers
+        # fold_initializers_after_weights may pre-transpose lm_head.weight
+        # into lm_head.weight_t (single-user Transpose fold).
+        assert (
+            "lm_head.weight" in model.graph.initializers
+            or "lm_head.weight_t" in model.graph.initializers
+        )
 
     def test_tied_model_initializer_count_lower_than_untied(self):
         """Tied model must have fewer initializers than untied (one embed weight, not two)."""
@@ -612,6 +624,35 @@ class TestWeightTying:
         assert n_tied < n_untied, (
             f"Tied model should have fewer initializers ({n_tied}) than untied ({n_untied})"
         )
+
+    def test_apply_weights_dedup_same_storage_different_objects(self):
+        """Dedup catches separate tensor objects sharing the same storage.
+
+        HuggingFace safetensors may deserialize tied weights as distinct
+        Python objects that share the same underlying storage (same
+        data_ptr).  apply_weights must detect this and merge them.
+        """
+        config = make_config(tie_word_embeddings=False)
+        module = CausalLMModel(config)
+        pkg = build_from_module(module, config)
+        model = pkg["model"]
+
+        # Create a base tensor and a view that shares storage but is a
+        # different Python object (simulates safetensors deserialization).
+        base = torch.zeros(config.vocab_size, config.hidden_size)
+        view = base[:]  # same storage, different id()
+        assert id(base) != id(view), "Precondition: must be different objects"
+        assert base.data_ptr() == view.data_ptr(), "Precondition: same storage"
+
+        sd = {
+            "model.embed_tokens.weight": base,
+            "lm_head.weight": view,
+        }
+        apply_weights(model, sd)
+
+        # One should be merged away
+        assert "model.embed_tokens.weight" in model.graph.initializers
+        assert "lm_head.weight" not in model.graph.initializers
 
 
 # ===========================================================================

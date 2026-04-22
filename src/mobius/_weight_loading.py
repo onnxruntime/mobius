@@ -100,12 +100,17 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
         model: The ONNX IR model.
         state_dict: Mapping of parameter names to torch tensors.
     """
-    # Map tensor id → the ir.Value of the first initializer assigned for that tensor.
-    # Enables genuine weight sharing: if lm_head.weight IS embed_tokens.weight
-    # (same Python object), the second initializer is merged into the first.
-    # The canonical key is simply whichever name appears first in state_dict
-    # iteration order, which is deterministic (PEP 468, Python 3.7+).
-    tensor_id_to_value: dict[int, ir.Value] = {}
+    # Map tensor storage identity → the ir.Value of the first initializer
+    # assigned for that tensor.  Enables genuine weight sharing: if
+    # lm_head.weight and embed_tokens.weight share the same underlying
+    # storage (common when HF ties weights), only one ONNX initializer is
+    # created and all graph uses point to it.
+    #
+    # We key on ``data_ptr()`` rather than ``id(tensor)`` because HF
+    # safetensors deserialization may create distinct Python objects that
+    # share the same storage (same data_ptr).  Using data_ptr catches both
+    # cases: same Python object *and* same-storage-different-object.
+    storage_to_value: dict[int, ir.Value] = {}
 
     for name, tensor in state_dict.items():
         if name not in model.graph.initializers:
@@ -116,13 +121,13 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
             continue
 
         initializer = model.graph.initializers[name]
-        tid = id(tensor)
+        storage_key = tensor.data_ptr()
 
-        if tid in tensor_id_to_value:
-            # This tensor was already assigned to another initializer.
+        if storage_key in storage_to_value:
+            # This tensor shares storage with an already-assigned initializer.
             # Redirect all graph uses of this initializer to the canonical one,
             # then delete this initializer — genuine single-copy weight sharing.
-            canonical = tensor_id_to_value[tid]
+            canonical = storage_to_value[storage_key]
             initializer.replace_all_uses_with(canonical)
             del model.graph.initializers[name]
             logger.debug(
@@ -132,7 +137,7 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
             )
         else:
             _assign_weight(initializer, tensor, name)
-            tensor_id_to_value[tid] = initializer
+            storage_to_value[storage_key] = initializer
 
     fold_initializers_after_weights(model)
 
