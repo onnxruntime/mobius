@@ -1,13 +1,6 @@
 name: "L5: End-to-End Generation (GPU)"
 
 on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'testdata/**'
-      - 'scripts/**'
   schedule:
     # Run nightly at 5am UTC (after L4 golden tests)
     - cron: '0 5 * * *'

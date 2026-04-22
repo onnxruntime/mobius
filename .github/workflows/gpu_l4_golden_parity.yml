@@ -1,13 +1,6 @@
 name: "L4: Golden Checkpoint Parity (GPU)"
 
 on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'testdata/**'
-      - 'scripts/**'
   schedule:
     # Run nightly at 4am UTC (after golden regen on Sunday)
     - cron: '0 4 * * *'
