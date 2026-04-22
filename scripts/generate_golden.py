@@ -829,16 +829,32 @@ def _apply_phi4mm_compat_patches():
     torch.Tensor.__int__ = _meta_safe_int
 
     # Patch 2: tied_weights_keys list→dict compat
+    # Phi4MM remote code sets _tied_weights_keys as a list (transformers 4.x
+    # format) but transformers 5.x expects a dict {tied_param: source_param}.
+    # We convert the list format before the original methods see it.
     import transformers.modeling_utils as mu
+
+    def _fix_tied_weights_keys(model):
+        """Convert _tied_weights_keys from list to dict if needed."""
+        twk = getattr(model, "_tied_weights_keys", None)
+        if isinstance(twk, list):
+            # Build dict: for each tied key, find the source via
+            # _get_tied_params (the embedding weight it's tied to)
+            tied_dict = {}
+            for key in twk:
+                # Standard pattern: lm_head.weight -> model.embed_tokens.weight
+                if key == "lm_head.weight":
+                    tied_dict[key] = "model.embed_tokens.weight"
+                else:
+                    tied_dict[key] = key  # fallback: self-reference
+            model._tied_weights_keys = tied_dict
 
     patches["get_expanded"] = mu.PreTrainedModel.get_expanded_tied_weights_keys
     _orig_get_expanded = patches["get_expanded"]
 
     def _patched_get_expanded(self, all_submodels=False):
-        try:
-            return _orig_get_expanded(self, all_submodels=all_submodels)
-        except AttributeError:
-            return {}
+        _fix_tied_weights_keys(self)
+        return _orig_get_expanded(self, all_submodels=all_submodels)
 
     mu.PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded
 
@@ -846,12 +862,8 @@ def _apply_phi4mm_compat_patches():
     _orig_post_init = patches["post_init"]
 
     def _patched_post_init(self):
-        try:
-            _orig_post_init(self)
-        except AttributeError:
-            self.all_tied_weights_keys = {}
-        if isinstance(getattr(self, "all_tied_weights_keys", None), list):
-            self.all_tied_weights_keys = {}
+        _fix_tied_weights_keys(self)
+        _orig_post_init(self)
 
     mu.PreTrainedModel.post_init = _patched_post_init
 
@@ -859,8 +871,7 @@ def _apply_phi4mm_compat_patches():
     _orig_total_bytes = patches["total_bytes"]
 
     def _patched_total_bytes(model, dm, q):
-        if isinstance(getattr(model, "all_tied_weights_keys", None), list):
-            model.all_tied_weights_keys = {}
+        _fix_tied_weights_keys(model)
         return _orig_total_bytes(model, dm, q)
 
     mu.get_total_byte_count = _patched_total_bytes
