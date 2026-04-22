@@ -1,0 +1,24 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe the image and summarize the long audio."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+  audio:
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 40
+  do_sample: false
+
+notes: "Phi-4-MM text + image + long audio. Full trimodal with long audio path. Exercises both vision and speech encoders, with audio using the 'long' projection mode. Maximum complexity for the 4-model split pipeline."

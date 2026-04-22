@@ -1,0 +1,10 @@
+{
+  "model_id": "microsoft/Phi-4-multimodal-instruct",
+  "prompt": "Describe these two images and compare them.",
+  "generated_tokens": [
+    38229,
+    200020,
+    199999
+  ],
+  "generated_text": "Both"
+}

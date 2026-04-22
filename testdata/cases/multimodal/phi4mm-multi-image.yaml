@@ -1,0 +1,20 @@
+model_id: "microsoft/Phi-4-multimodal-instruct"
+revision: "main"
+task_type: "phi4mm-multimodal"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe these two images and compare them."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+notes: "Phi-4-MM text + multiple images. Tests batch image processing in the vision encoder — SigLIP processes each image independently, then InputMixer fuses multiple image feature sets."
