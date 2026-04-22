@@ -24,7 +24,9 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import Gemma4Config
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
@@ -36,10 +38,19 @@ from mobius.tasks._cache_utils import (
 )
 
 
+def _will_use_gqa() -> bool:
+    """Return True when the current build context will use GQA rewrite rules."""
+    caps = ep_capabilities()
+    dtype = get_build_dtype()
+    return dtype in caps.gqa_dtypes and caps.supports_fused_rope
+
+
 def _make_gemma4_kv_cache_inputs(
     config: Gemma4Config,
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
+    *,
+    use_gqa: bool = False,
 ) -> tuple[list[ir.Value], list[tuple[ir.Value, ir.Value]]]:
     """Create per-layer KV cache inputs accounting for dual head_dim and KV sharing.
 
@@ -49,6 +60,14 @@ def _make_gemma4_kv_cache_inputs(
     The last ``config.num_kv_shared_layers`` layers share K,V from earlier
     layers and do NOT have their own cache entries — only
     ``num_hidden_layers - num_kv_shared_layers`` entries are created.
+
+    When *use_gqa* is True (CUDA/DML EP with supported dtype), sliding
+    layers use GroupQueryAttention ops with native GQA support, so their
+    cache keeps the original ``num_key_value_heads``.  Full_attention layers
+    always expand because head_dim exceeds the GQA MAX_HEAD_SIZE limit.
+
+    When *use_gqa* is False (CPU EP), ALL layers use the standard Attention
+    op which requires KV expansion to avoid GQA dispatch.
     """
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
@@ -64,17 +83,27 @@ def _make_gemma4_kv_cache_inputs(
 
     flat: list[ir.Value] = []
     pairs: list[tuple[ir.Value, ir.Value]] = []
+    expand_kv = (
+        flags.expand_kv_heads_for_attention
+        and config.num_key_value_heads < config.num_attention_heads
+    )
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
+        # Expand KV heads when the layer uses the standard Attention path
+        # (which can't handle GQA + attn_mask).  With GQA rewrite rules
+        # active, only full_attention layers need expansion (sliding layers
+        # go through the GQA op).  Without GQA, all layers need expansion.
+        needs_expand = expand_kv and (layer_type == "full_attention" or not use_gqa)
+        kv_heads = config.num_attention_heads if needs_expand else config.num_key_value_heads
         past_key = ir.Value(
             name=f"past_key_values.{i}.key",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         past_value = ir.Value(
             name=f"past_key_values.{i}.value",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         flat.extend([past_key, past_value])
@@ -129,7 +158,9 @@ class Gemma4TextCausalLMTask(ModelTask):
         )
 
         graph_inputs = [input_ids, attention_mask, position_ids]
-        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
+            config, batch, past_seq_len, use_gqa=_will_use_gqa()
+        )
         graph_inputs.extend(kv_inputs)
 
         graph, graph_builder = _make_graph(graph_inputs)
@@ -221,7 +252,9 @@ class Gemma4Task(ModelTask):
 
         graph_inputs = [inputs_embeds, attention_mask, position_ids, input_ids]
 
-        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
+        kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(
+            config, batch, past_seq_len, use_gqa=_will_use_gqa()
+        )
         graph_inputs.extend(kv_inputs)
 
         graph, graph_builder = _make_graph(graph_inputs, name="decoder")

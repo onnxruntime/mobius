@@ -711,7 +711,7 @@ class Gemma4TextAttention(nn.Module):
             # The Attention op expects key/value as 3D:
             #   [batch, total_seq, kv_heads * head_dim]
             # Transpose and reshape to match.
-            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+            src_key, src_value, src_kv_heads = shared_kv_states[self.kv_shared_layer_index]
 
             # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads*head_dim]
             src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
@@ -720,20 +720,16 @@ class Gemma4TextAttention(nn.Module):
             src_value = op.Reshape(src_value, [0, 0, -1])
 
             # Expand KV heads to match Q heads for CUDA EP compatibility.
-            # CUDA EP's Attention with GQA (q_num_heads != kv_num_heads)
-            # requires Flash (attn_mask==nullptr) or MEA. Expanding KV
-            # heads makes q_num_heads == kv_num_heads, allowing all
-            # attention runners including the unfused path with masks.
+            # The source layer may have already expanded (src_kv_heads ==
+            # num_attention_heads); only expand when still grouped.
             # Gated by flags.expand_kv_heads_for_attention (disable once
-            # ORT lifts the MAX_HEAD_SIZE limit).
-            n_groups = self.num_attention_heads // self.num_key_value_heads
-            effective_kv_heads = self.num_key_value_heads
+            # ORT supports GQA + attn_mask on CUDA).
+            effective_kv_heads = src_kv_heads
+            n_groups = self.num_attention_heads // src_kv_heads
             if n_groups > 1 and flags.expand_kv_heads_for_attention:
-                src_key = _expand_kv_heads(
-                    op, src_key, self.num_key_value_heads, n_groups, self.head_dim
-                )
+                src_key = _expand_kv_heads(op, src_key, src_kv_heads, n_groups, self.head_dim)
                 src_value = _expand_kv_heads(
-                    op, src_value, self.num_key_value_heads, n_groups, self.head_dim
+                    op, src_value, src_kv_heads, n_groups, self.head_dim
                 )
                 effective_kv_heads = self.num_attention_heads
 
@@ -808,11 +804,14 @@ class Gemma4TextAttention(nn.Module):
                 **gqa_attrs,
             )
 
-            # Source layers store K,V for downstream KV-shared layers
+            # Source layers store K,V for downstream KV-shared layers.
+            # Include effective kv_heads so consumers know whether expansion
+            # already happened (GQA path always uses original kv_heads).
             if self.provides_shared_kv and shared_kv_states is not None:
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
+                    self.num_key_value_heads,
                 )
         else:
             # K projection + per-head K norm + optional RoPE
@@ -847,12 +846,13 @@ class Gemma4TextAttention(nn.Module):
             value_states = op.Div(value_states, rms)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
-            # Expand KV heads when head_dim exceeds CUDA GQA's MAX_HEAD_SIZE
-            # (256). The Attention op on CUDA routes GQA (q_heads != kv_heads)
-            # to a kernel that enforces this limit; expanding KV heads to match
-            # Q heads avoids GQA dispatch entirely.
+            # Expand KV heads to avoid GQA dispatch on EPs where GQA + attn_mask
+            # is not supported by the unfused runner.  On CUDA EP, sliding layers
+            # go through the GQA rewrite path (they never reach here), so this
+            # only fires for full_attention layers with head_dim > 256.  On CPU EP
+            # all layers reach here, so all get expanded.
             # Gated by flags.expand_kv_heads_for_attention (disable once ORT
-            # lifts the MAX_HEAD_SIZE limit).
+            # supports GQA + attn_mask on all runners).
             effective_kv_heads = self.num_key_value_heads
             if (
                 flags.expand_kv_heads_for_attention
@@ -881,9 +881,15 @@ class Gemma4TextAttention(nn.Module):
                 softcap=self.softcap,
             )
 
-            # Source layers store K,V for downstream KV-shared layers
+            # Source layers store K,V for downstream KV-shared layers.
+            # Include effective kv_heads so consumers know whether heads
+            # were already expanded (standard path may expand for CUDA).
             if self.provides_shared_kv and shared_kv_states is not None:
-                shared_kv_states[self.layer_idx] = (present_key, present_value)
+                shared_kv_states[self.layer_idx] = (
+                    present_key,
+                    present_value,
+                    effective_kv_heads,
+                )
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)
@@ -1584,9 +1590,11 @@ class Gemma4TextModel(nn.Module):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
             # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared layers.
+            # available, fall back to standard Attention for KV-shared layers
+            # and layers where head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
             is_shared = layer.self_attn.is_kv_shared_layer
-            if use_gqa and not is_shared:
+            gqa_head_dim_ok = layer.self_attn.head_dim <= 256
+            if use_gqa and not is_shared and gqa_head_dim_ok:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:
