@@ -542,10 +542,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
             hidden_states = layer(op, hidden_states, attn_bias, pixel_position_ids)
 
         # Zero padding patches after all encoder blocks (matching HF pooler masked_fill).
-        # Use Mul instead of Where for CUDA-friendliness.
-        not_pad = op.CastLike(op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), hidden_states)
-        not_pad = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
-        hidden_states = op.Mul(hidden_states, not_pad)
+        is_pad_expanded = op.Unsqueeze(is_padding, [2])  # [B, N, 1]
+        zero = op.CastLike(op.Constant(value_float=0.0), hidden_states)
+        hidden_states = op.Where(is_pad_expanded, zero, hidden_states)
 
         return hidden_states  # [B, N, vision_hidden]
 
