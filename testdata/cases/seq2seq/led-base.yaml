@@ -9,6 +9,6 @@ inputs:
   decoder_prompt: ""
 
 skip_reason: "Model only has .bin weights (no safetensors); weight loader requires safetensors."
-level: "L4,L5"
+level: "L4+L5"
 
 notes: "LED base. Longformer encoder-decoder for long documents."

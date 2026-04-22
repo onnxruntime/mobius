@@ -220,20 +220,8 @@ _DIFF_MODELS: list[tuple[str, dict, str, str]] = [
         "text-generation",
         "standard",
     ),
-    (
-        "gemma4_text",
-        {
-            "_config_cls": "Gemma4Config",
-            "attn_qk_norm": True,
-            "rope_local_base_freq": 10_000.0,
-            "layer_types": ["sliding_attention", "full_attention"],
-            "global_head_dim": 16,
-            "global_rope_theta": 10_000.0,
-            "final_logit_softcapping": 30.0,
-        },
-        "static-cache",
-        "standard",
-    ),
+    # NOTE: gemma4_text does not support static-cache mode because
+    # Gemma4DecoderLayer inherits from nn.Module, not DecoderLayer.
     ("gemma4", {}, "gemma4", "gemma4"),
     ("qwen3_5_vl", {}, "hybrid-qwen-vl", "qwen3_5_vl"),
     ("whisper", {}, "speech-to-text", "whisper"),

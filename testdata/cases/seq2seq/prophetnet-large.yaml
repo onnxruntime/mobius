@@ -9,6 +9,6 @@ inputs:
   decoder_prompt: ""
 
 skip_reason: "ORT InvalidArgument error during inference."
-level: "L4,L5"
+level: "L4+L5"
 
 notes: "ProphetNet large uncased. Future n-gram prediction pre-training."
