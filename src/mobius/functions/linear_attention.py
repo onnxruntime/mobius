@@ -110,6 +110,8 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs (conditional on update_rule) ---
+    # TODO: Investigate relaxing onnx-shape-inference's strict arity check
+    # to allow trailing optional inputs, enabling a single 6-input signature.
     # The function is specialized per-model: only inputs actually used
     # by this update_rule variant are declared.  Call sites (e.g.
     # Mamba2Block with "gated") pass exactly the declared number of args.
