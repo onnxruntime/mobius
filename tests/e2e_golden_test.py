@@ -147,10 +147,7 @@ def _use_temp_hf_cache(tmp_path):
 
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
-_XFAIL_REASONS: dict[str, str] = {
-    # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
-    "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
-}
+_XFAIL_REASONS: dict[str, str] = {}
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
 _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
@@ -166,7 +163,7 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
 
 def _discover_cases(
     level: str,
-    extra_xfails: dict[str, str] | None = None,
+    xfails: dict[str, str] | None = None,
 ) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
 
@@ -175,7 +172,6 @@ def _discover_cases(
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
-    all_xfails = {**_XFAIL_REASONS, **(extra_xfails or {})}
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -189,8 +185,8 @@ def _discover_cases(
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in all_xfails:
-            marks.append(pytest.mark.xfail(reason=all_xfails[test_id], strict=False))
+        elif xfails and test_id in xfails:
+            marks.append(pytest.mark.xfail(reason=xfails[test_id], strict=False))
 
         params.append(
             pytest.param(
@@ -203,7 +199,7 @@ def _discover_cases(
 
 
 _L4_CASES = _discover_cases("L4")
-_L5_CASES = _discover_cases("L5", extra_xfails=_L5_ONLY_XFAIL_REASONS)
+_L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 
 # ---------------------------------------------------------------------------
