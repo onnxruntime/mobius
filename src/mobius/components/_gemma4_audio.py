@@ -62,7 +62,9 @@ if TYPE_CHECKING:
 
 def _gradient_clip(op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
     """Clamp activations to ±clip_val (gradient clipping for numerical stability)."""
-    return op.Clip(x, op.Constant(value_float=-clip_val), op.Constant(value_float=clip_val))
+    lo = op.CastLike(op.Constant(value_float=-clip_val), x)
+    hi = op.CastLike(op.Constant(value_float=clip_val), x)
+    return op.Clip(x, lo, hi)
 
 
 def _glu(op: builder.OpBuilder, x: ir.Value) -> ir.Value:
@@ -253,7 +255,7 @@ class Gemma4FeedForward(nn.Module):
         x = self.ffw_layer_2(op, x)  # [B, T, h]
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.post_layer_norm(op, x)
-        x = op.Mul(x, op.Constant(value_float=self._residual_weight))
+        x = op.Mul(x, op.CastLike(op.Constant(value_float=self._residual_weight), x))
         return op.Add(x, residual)
 
 
@@ -490,9 +492,9 @@ class Gemma4Attention(nn.Module):
         scores = op.MatMul(q, k_t)  # [B, H, T, T]
 
         # Relative position bias: matrix_bd
-        # pos_embed: [context_left, hidden_size] - cast to fp32 then project
-        pos_f32 = op.Cast(self.pos_embed, to=ir.DataType.FLOAT)
-        rel_k = self.relative_k_proj(op, pos_f32)  # [context_left, num_heads*head_dim]
+        # pos_embed: [context_left, hidden_size] - project in model dtype, then cast
+        rel_k = self.relative_k_proj(op, self.pos_embed)  # [context_left, num_heads*head_dim]
+        rel_k = op.Cast(rel_k, to=ir.DataType.FLOAT)
         rel_k = op.Reshape(
             rel_k, op.Constant(value_ints=[-1, num_heads, head_dim])
         )  # [ctx, H, D]

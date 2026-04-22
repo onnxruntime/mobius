@@ -35,6 +35,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._flags import flags
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
@@ -85,7 +86,8 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         # would corrupt the skip shape when an upstream Add uses a 1D bias.
         square = op.Mul(hidden_states, hidden_states)
         mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
-        rms = op.Sqrt(op.Add(mean_sq, op.Constant(value_float=self.eps)))
+        eps = op.CastLike(op.Constant(value_float=self.eps), mean_sq)
+        rms = op.Sqrt(op.Add(mean_sq, eps))
         return op.Div(hidden_states, rms)
 
 
@@ -369,7 +371,9 @@ class Gemma4VisionPooler(nn.Module):
         is_padding = op.And(op.Equal(x_pos, neg_one), op.Equal(y_pos, neg_one))  # [B, T] bool
 
         # zero out padding hidden states: features * (1 - is_padding)
-        not_padding_f = op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT)
+        not_padding_f = op.CastLike(
+            op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), vision_features
+        )
         not_padding_f = op.Unsqueeze(not_padding_f, [2])  # [B, T, 1]
         vision_features = op.Mul(vision_features, not_padding_f)  # [B, T, D]
 
@@ -410,7 +414,7 @@ class Gemma4VisionPooler(nn.Module):
         # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
         # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
         on_val = 1.0 / float(k2)
-        one_hot_vals = op.Constant(value_floats=[0.0, on_val])
+        one_hot_vals = op.CastLike(op.Constant(value_floats=[0.0, on_val]), vision_features)
         weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth]
 
         # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
@@ -418,7 +422,8 @@ class Gemma4VisionPooler(nn.Module):
         output = op.MatMul(weights_t, vision_features)  # [B, valid_depth, D]
 
         # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
-        return op.Mul(output, op.Constant(value_float=self._pooler_scale))
+        scale = op.CastLike(op.Constant(value_float=self._pooler_scale), output)
+        return op.Mul(output, scale)
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
@@ -455,10 +460,9 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         ``Gemma4VisionPatchEmbedder._position_embeddings``.
         """
         # pixel_values in [0,1] -> normalize to [-1, 1]: 2*(v - 0.5) = 2v - 1
-        pixel_values = op.Sub(
-            op.Mul(pixel_values, op.Constant(value_float=2.0)),
-            op.Constant(value_float=1.0),
-        )
+        two = op.CastLike(op.Constant(value_float=2.0), pixel_values)
+        one = op.CastLike(op.Constant(value_float=1.0), pixel_values)
+        pixel_values = op.Sub(op.Mul(pixel_values, two), one)
         hidden_states = self.input_proj(op, pixel_values)  # [B, N, hidden]
 
         # Detect padding patches: x-coord == -1 means the patch is padding.
@@ -547,6 +551,31 @@ class _Gemma4VisionEncoderCore(nn.Module):
         hidden_states = op.Where(is_pad_expanded, zero, hidden_states)
 
         return hidden_states  # [B, N, vision_hidden]
+
+
+def _expand_kv_heads(
+    op: builder.OpBuilder,
+    kv: ir.Value,
+    kv_heads: int,
+    n_groups: int,
+    head_dim: int,
+) -> ir.Value:
+    """Expand packed KV [B, seq, kv_heads*hd] → [B, seq, kv_heads*n_groups*hd].
+
+    Tiles each KV head ``n_groups`` times so kv_num_heads == q_num_heads,
+    avoiding CUDA GQA dispatch which has a MAX_HEAD_SIZE=256 limit.
+    """
+    num_heads = kv_heads * n_groups
+    # [B, seq, kv_heads*hd] → [B, seq, kv_heads, hd]
+    kv = op.Reshape(kv, [0, 0, kv_heads, head_dim])
+    # [B, seq, kv_heads, 1, hd]
+    kv = op.Unsqueeze(kv, [3])
+    # [B, seq, kv_heads, n_groups, hd]
+    kv = op.Tile(kv, [1, 1, 1, n_groups, 1])
+    # [B, seq, num_heads, hd] → [B, seq, num_heads*hd]
+    kv = op.Reshape(kv, [0, 0, num_heads, -1])
+    kv = op.Reshape(kv, [0, 0, -1])
+    return kv
 
 
 # ---------------------------------------------------------------------------
@@ -684,14 +713,29 @@ class Gemma4TextAttention(nn.Module):
             # Transpose and reshape to match.
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
 
-            # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads, head_dim]
+            # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads*head_dim]
             src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-            src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-
-            # [B, total_seq, kv_heads, head_dim] → [B, total_seq, kv_heads * head_dim]
-            # Use [0, 0, -1] reshape to avoid Shape ops that cause CPU Memcpy.
             src_key = op.Reshape(src_key, [0, 0, -1])
+            src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
             src_value = op.Reshape(src_value, [0, 0, -1])
+
+            # Expand KV heads to match Q heads for CUDA EP compatibility.
+            # CUDA EP's Attention with GQA (q_num_heads != kv_num_heads)
+            # requires Flash (attn_mask==nullptr) or MEA. Expanding KV
+            # heads makes q_num_heads == kv_num_heads, allowing all
+            # attention runners including the unfused path with masks.
+            # Gated by flags.expand_kv_heads_for_attention (disable once
+            # ORT lifts the MAX_HEAD_SIZE limit).
+            n_groups = self.num_attention_heads // self.num_key_value_heads
+            effective_kv_heads = self.num_key_value_heads
+            if n_groups > 1 and flags.expand_kv_heads_for_attention:
+                src_key = _expand_kv_heads(
+                    op, src_key, self.num_key_value_heads, n_groups, self.head_dim
+                )
+                src_value = _expand_kv_heads(
+                    op, src_value, self.num_key_value_heads, n_groups, self.head_dim
+                )
+                effective_kv_heads = self.num_attention_heads
 
             attn_output, present_key, present_value = _apply_attention(
                 op,
@@ -702,7 +746,7 @@ class Gemma4TextAttention(nn.Module):
                 past_key=None,
                 past_value=None,
                 num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
+                num_key_value_heads=effective_kv_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
             )
@@ -803,6 +847,26 @@ class Gemma4TextAttention(nn.Module):
             value_states = op.Div(value_states, rms)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
+            # Expand KV heads when head_dim exceeds CUDA GQA's MAX_HEAD_SIZE
+            # (256). The Attention op on CUDA routes GQA (q_heads != kv_heads)
+            # to a kernel that enforces this limit; expanding KV heads to match
+            # Q heads avoids GQA dispatch entirely.
+            # Gated by flags.expand_kv_heads_for_attention (disable once ORT
+            # lifts the MAX_HEAD_SIZE limit).
+            effective_kv_heads = self.num_key_value_heads
+            if (
+                flags.expand_kv_heads_for_attention
+                and self.num_key_value_heads < self.num_attention_heads
+            ):
+                n_groups = self.num_attention_heads // self.num_key_value_heads
+                key_states = _expand_kv_heads(
+                    op, key_states, self.num_key_value_heads, n_groups, self.head_dim
+                )
+                value_states = _expand_kv_heads(
+                    op, value_states, self.num_key_value_heads, n_groups, self.head_dim
+                )
+                effective_kv_heads = self.num_attention_heads
+
             attn_output, present_key, present_value = _apply_attention(
                 op,
                 query_states,
@@ -812,7 +876,7 @@ class Gemma4TextAttention(nn.Module):
                 past_key_value[0] if past_key_value is not None else None,
                 past_key_value[1] if past_key_value is not None else None,
                 num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
+                num_key_value_heads=effective_kv_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
             )
