@@ -785,6 +785,149 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
 # ---- Phi4MM multimodal generator ----
 
 
+def _apply_phi4mm_compat_patches():
+    """Apply compatibility patches for Phi4MM on transformers 5.x.
+
+    Phi4MM's remote code was written for transformers 4.x and has several
+    incompatibilities with transformers 5.x:
+
+    1. NemoConvSubsampling.__init__() calls int() on a meta tensor
+       (calc_length result) — we intercept __int__ to compute on CPU.
+    2. _tied_weights_keys is a list but transformers 5.x expects a dict.
+    3. PeftModelForCausalLM expects prepare_inputs_for_generation.
+    4. DynamicCache.get_usable_length was renamed to get_seq_length.
+
+    Returns a cleanup function that restores original behavior.
+    """
+    import math
+
+    import torch
+
+    patches = {}
+
+    # Patch 1: meta tensor int() for NemoConvSubsampling calc_length
+    patches["tensor_int"] = torch.Tensor.__int__
+    _orig_int = patches["tensor_int"]
+
+    def _meta_safe_int(self):
+        if self.is_meta:
+            import inspect
+
+            frame = inspect.currentframe().f_back
+            lv = frame.f_locals
+            if "out_length" in lv and "conv_channels" in lv:
+                s = lv["self"]
+                val = float(lv.get("feat_in", 80))
+                add_pad = float(s._left_padding + s._right_padding - s._kernel_size)
+                for _ in range(s._sampling_num):
+                    val = (val + add_pad) / s._stride + 1.0
+                    val = math.ceil(val) if s._ceil_mode else math.floor(val)
+                return int(val)
+            return 0
+        return _orig_int(self)
+
+    torch.Tensor.__int__ = _meta_safe_int
+
+    # Patch 2: tied_weights_keys list→dict compat
+    import transformers.modeling_utils as mu
+
+    patches["get_expanded"] = mu.PreTrainedModel.get_expanded_tied_weights_keys
+    _orig_get_expanded = patches["get_expanded"]
+
+    def _patched_get_expanded(self, all_submodels=False):
+        try:
+            return _orig_get_expanded(self, all_submodels=all_submodels)
+        except AttributeError:
+            return {}
+
+    mu.PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded
+
+    patches["post_init"] = mu.PreTrainedModel.post_init
+    _orig_post_init = patches["post_init"]
+
+    def _patched_post_init(self):
+        try:
+            _orig_post_init(self)
+        except AttributeError:
+            self.all_tied_weights_keys = {}
+        if isinstance(getattr(self, "all_tied_weights_keys", None), list):
+            self.all_tied_weights_keys = {}
+
+    mu.PreTrainedModel.post_init = _patched_post_init
+
+    patches["total_bytes"] = mu.get_total_byte_count
+    _orig_total_bytes = patches["total_bytes"]
+
+    def _patched_total_bytes(model, dm, q):
+        if isinstance(getattr(model, "all_tied_weights_keys", None), list):
+            model.all_tied_weights_keys = {}
+        return _orig_total_bytes(model, dm, q)
+
+    mu.get_total_byte_count = _patched_total_bytes
+
+    # Patch 3: peft prepare_inputs_for_generation
+    import peft.peft_model as pm
+
+    patches["peft_init"] = pm.PeftModelForCausalLM.__init__
+    _orig_peft_init = patches["peft_init"]
+
+    def _patched_peft_init(self, model, peft_config=None, adapter_name="default", **kwargs):
+        if not hasattr(model, "prepare_inputs_for_generation"):
+            model.prepare_inputs_for_generation = lambda *a, **kw: {}
+        _orig_peft_init(
+            self,
+            model,
+            peft_config=peft_config,
+            adapter_name=adapter_name,
+            **kwargs,
+        )
+
+    pm.PeftModelForCausalLM.__init__ = _patched_peft_init
+
+    # Patch 4: DynamicCache compat (methods removed in transformers 5.x)
+    from transformers import DynamicCache
+
+    if not hasattr(DynamicCache, "get_usable_length"):
+        DynamicCache.get_usable_length = lambda self, *a, **kw: self.get_seq_length()
+        patches["dc_get_usable_length"] = True
+
+    if not hasattr(DynamicCache, "to_legacy_cache"):
+
+        def _to_legacy_cache(self):
+            return tuple((layer.keys, layer.values) for layer in self.layers)
+
+        DynamicCache.to_legacy_cache = _to_legacy_cache
+        patches["dc_to_legacy_cache"] = True
+
+    if not hasattr(DynamicCache, "from_legacy_cache"):
+
+        @classmethod
+        def _from_legacy_cache(cls, past_kv):
+            cache = cls()
+            if past_kv is not None:
+                for layer_idx, (k, v) in enumerate(past_kv):
+                    cache.update(k, v, layer_idx)
+            return cache
+
+        DynamicCache.from_legacy_cache = _from_legacy_cache
+        patches["dc_from_legacy_cache"] = True
+
+    def cleanup():
+        torch.Tensor.__int__ = patches["tensor_int"]
+        mu.PreTrainedModel.get_expanded_tied_weights_keys = patches["get_expanded"]
+        mu.PreTrainedModel.post_init = patches["post_init"]
+        mu.get_total_byte_count = patches["total_bytes"]
+        pm.PeftModelForCausalLM.__init__ = patches["peft_init"]
+        if patches.get("dc_get_usable_length"):
+            del DynamicCache.get_usable_length
+        if patches.get("dc_to_legacy_cache"):
+            del DynamicCache.to_legacy_cache
+        if patches.get("dc_from_legacy_cache"):
+            del DynamicCache.from_legacy_cache
+
+    return cleanup
+
+
 def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for Phi4MM (text + vision + audio).
 
@@ -793,25 +936,31 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
     HF model and processor classes.
     """
     import torch
+    import transformers
     from PIL import Image
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
 
-    import transformers
+    # Apply transformers 5.x compatibility patches for Phi4MM remote code
+    cleanup = _apply_phi4mm_compat_patches()
 
-    # Load model and processor
-    processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=True
-    )
-    # Load in bfloat16 to reduce memory (14B model)
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        case.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-        trust_remote_code=True,
-        _attn_implementation="eager",
-    )
-    model.eval()
+    try:
+        # Load model and processor
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        # Load in bfloat16 to reduce memory (14B model)
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            case.model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            trust_remote_code=True,
+            _attn_implementation="eager",
+        )
+        model.eval()
+    except Exception:
+        cleanup()
+        raise
 
     # Build processor inputs based on available modalities
     call_kwargs: dict = {}
@@ -883,13 +1032,19 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
                 if step == 0:
                     out = model(input_ids=cur_input_ids, **fwd_kwargs)
                 else:
+                    # Get sequence length from past KV cache
+                    # (works with both tuple-style and DynamicCache)
+                    if hasattr(past_kv, "get_seq_length"):
+                        kv_len = past_kv.get_seq_length()
+                    else:
+                        kv_len = past_kv[0][0].shape[2]
                     out = model(
                         input_ids=cur_input_ids,
                         past_key_values=past_kv,
                         input_mode=input_mode,
                         attention_mask=torch.ones(
                             1,
-                            past_kv[0][0].shape[2] + 1,
+                            kv_len + 1,
                             dtype=torch.long,
                             device=device,
                         ),
@@ -927,6 +1082,8 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
             generated_tokens=generated_ids.tolist(),
             generated_text=generated_text,
         )
+
+    cleanup()
 
 
 # ---- Dispatcher ----

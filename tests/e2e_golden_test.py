@@ -150,14 +150,6 @@ def _use_temp_hf_cache(tmp_path):
 _XFAIL_REASONS: dict[str, str] = {
     # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
     "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
-    # Phi4MM combined modality tests: golden data generated with transformers 4.x;
-    # cannot regenerate with transformers 5.x (meta tensor bug in HF remote code).
-    # The speech model's audio_projection_mode If/Else branching produces identical
-    # outputs for mode 0 and 1, needs investigation.
-    "phi4mm-multimodal/phi4mm-image-short-audio": "Phi4MM combined vision+audio golden stale (transformers 4.x)",
-    "phi4mm-multimodal/phi4mm-image-long-audio": "Phi4MM combined vision+audio golden stale (transformers 4.x)",
-    "phi4mm-multimodal/phi4mm-long-audio": "Phi4MM long audio golden stale (transformers 4.x)",
-    "phi4mm-multimodal/phi4mm-multi-image-audio": "Phi4MM combined multi-image+audio golden stale (transformers 4.x)",
 }
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
