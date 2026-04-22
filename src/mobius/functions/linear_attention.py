@@ -109,33 +109,21 @@ def linear_attention(
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
 
-    # --- Define function inputs (conditional on update_rule) ---
-    query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
-    key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
-    value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
-    past_state = ir.Value(name="past_state")
-    inputs: list[ir.Value] = [query, key, value, past_state]
-    decay: ir.Value | None = None
-    beta: ir.Value | None = None
-    if uses_decay:
-        decay = ir.Value(name="decay")
-        inputs.append(decay)
-    if uses_beta:
-        beta = ir.Value(name="beta")
-        inputs.append(beta)
+    # --- Define function inputs ---
+    # All 6 formal parameters are always declared so the function
+    # signature is stable across update_rule variants.  Absent optional
+    # inputs are ``None``; build_function creates placeholder formals
+    # for them and passes ``None`` to the trace function.
+    inputs: list[ir.Value | None] = [
+        ir.Value(name="query"),  # (B, T, q_num_heads * d_k)
+        ir.Value(name="key"),  # (B, T, q_num_heads * d_k)
+        ir.Value(name="value"),  # (B, T, kv_num_heads * d_v)
+        ir.Value(name="past_state"),
+        ir.Value(name="decay") if uses_decay else None,
+        ir.Value(name="beta") if uses_beta else None,
+    ]
 
-    def body(op, *args):
-        # Unpack positional args matching the conditional input list.
-        query_v, key_v, value_v, past_state_v = args[:4]
-        idx = 4
-        decay_v: ir.Value | None = None
-        beta_v: ir.Value | None = None
-        if uses_decay:
-            decay_v = args[idx]
-            idx += 1
-        if uses_beta:
-            beta_v = args[idx]
-
+    def body(op, query_v, key_v, value_v, past_state_v, decay_v, beta_v):
         # --- Reshape 3D → 4D using head counts ---
         b_dim = op.Shape(query_v, start=0, end=1)
         t_dim = op.Shape(query_v, start=1, end=2)
