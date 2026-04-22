@@ -382,3 +382,138 @@ def _dispatch_moe_fallback(self, op, hidden, router_probs):
         ...
     return output
 ```
+
+## NemotronH MoE (sigmoid routing + shared experts + latent projection)
+
+NemotronH uses a non-standard MoE architecture that differs from the
+standard softmax top-k pattern in several ways.
+
+### Architecture
+
+```
+NemotronHMoEBlock
+ ├── NemotronHMoEGate (sigmoid top-k with correction bias)
+ ├── [optional] fc1_latent_proj (hidden → latent_size)
+ ├── Experts[0..N-1] (non-gated FCMLP: up → act → down)
+ ├── [optional] fc2_latent_proj (latent_size → hidden)
+ └── SharedExperts (FCMLP, all tokens, residual add)
+```
+
+### Classes
+
+| Class | File | Purpose |
+|-------|------|---------|
+| `NemotronHMoEGate` | `models/nemotron_h.py` | Sigmoid routing with e_score_correction_bias |
+| `NemotronHMoEBlock` | `models/nemotron_h.py` | MoE dispatch with shared expert + latent proj |
+| `NemotronHMoELayer` | `models/nemotron_h.py` | Pre-norm → MoE block → residual (stateless) |
+
+### Sigmoid gate with correction bias
+
+NemotronH does NOT use softmax routing. Instead:
+
+1. `router_logits = hidden_states @ gate_weight.T`
+2. `probs = sigmoid(router_logits)` — these become final routing weights
+3. `choice_scores = probs + e_score_correction_bias` — bias affects selection only
+4. `selected = topk(choice_scores)` — select top-k using biased scores
+5. `weights = gather(probs, selected)` — gather from UNBIASED sigmoid probs
+6. Normalize + scale by `routed_scaling_factor`
+
+**Key difference from standard MoE**: The correction bias shifts expert
+selection but does NOT affect final routing weights. The `com.microsoft.MoE`
+op's built-in softmax routing is incompatible — you must use the fallback
+loop or pre-compute routing weights and pass them to a modified MoE call.
+
+### Non-gated FCMLP experts
+
+Unlike Mixtral/Qwen (gated: `gate_proj * up_proj → down_proj`), NemotronH
+experts are simple FCMLPs: `up_proj → activation → down_proj`. This maps
+to `fc1_experts_weights` / `fc2_experts_weights` without a gate projection.
+
+### Latent projection (120B only)
+
+The 120B model has `moe_latent_size=1024` (vs `hidden_size=4096`):
+
+```
+hidden → fc1_latent_proj(4096→1024) → experts(1024→inter→1024) → fc2_latent_proj(1024→4096)
+```
+
+Gate routes on original hidden states (NOT latent). Shared expert operates
+on original hidden_size (no latent projection).
+
+### Shared expert
+
+A single FCMLP that runs on ALL tokens (not routed), added as residual:
+
+```python
+output = routed_expert_output + shared_experts(original_hidden)
+```
+
+### HF weight format
+
+HF stores expert weights as 3D stacked tensors:
+```
+experts.up_proj: [num_experts, intermediate_size, input_size]
+experts.down_proj: [num_experts, hidden_size, intermediate_size]
+```
+
+`preprocess_weights()` splits these into per-expert 2D tensors for the
+loop-based dispatch, or keeps them stacked for the fused MoE op path.
+
+### Config fields (NemotronHConfig)
+
+```python
+config.num_local_experts             # Total experts (128 for 30B, 512 for 120B)
+config.num_experts_per_tok           # Top-k (6 for 30B, 22 for 120B)
+config.moe_intermediate_size         # Per-expert hidden dim
+config.moe_latent_size               # Optional latent projection dim (120B: 1024)
+config.shared_expert_intermediate_size  # Shared expert hidden dim
+config.norm_topk_prob                # Whether to normalize routing weights
+config.routed_scaling_factor         # Post-normalization scale
+```
+
+### com.microsoft.MoE compatibility
+
+**Not compatible with NemotronH.** Three blockers:
+
+1. **Squared ReLU activation**: NemotronH experts use `relu2` (squared ReLU:
+   `relu(x)^2`). The fused MoE op only supports `silu`, `gelu`, `relu`,
+   `none` — no squared ReLU. Since the activation is applied between the
+   two matmuls inside the fused op, there is no way to inject a custom
+   activation.
+
+2. **Sigmoid routing with correction bias**: NemotronH gate uses
+   `sigmoid → add_bias → topk` for expert selection, but final routing
+   weights come from the unbiased sigmoid probs. The fused op has no
+   option to bypass its internal softmax/topk routing.
+
+3. **Shared expert + latent projection**: These must run outside the fused
+   op regardless, adding complexity without eliminating the main bottleneck.
+
+NemotronH uses loop-over-experts dispatch. See `NemotronHMoEBlock` docstring.
+
+### Graph size impact
+
+The loop-over-experts fallback creates one subgraph per expert per MoE layer:
+- 30B: 128 experts × 23 MoE layers = 2,944 expert subgraphs → ~40K nodes
+- 120B: 512 experts × 40 MoE layers = 20,480 expert subgraphs → ~270K nodes
+
+The fused MoE op replaces each per-layer loop with a single op, dramatically
+reducing graph size and enabling batched GPU execution.
+
+### HF dt_bias corruption bug
+
+**Critical**: The NemotronH remote-code `_init_weights` re-initialises
+Mamba2 `dt_bias` parameters with `torch.rand()` AFTER `from_pretrained`
+loads checkpoint weights, silently corrupting the model. HF inference
+becomes non-deterministic — different argmax on each model load.
+
+Fix: Use `_fix_nemotron_h_dt_bias()` from `mobius._testing.torch_reference`
+after loading the HF model. This reads correct `dt_bias` values from the
+safetensors files and patches them in-place. Without the fix, golden
+reference data is unreliable.
+
+```python
+from mobius._testing.torch_reference import _fix_nemotron_h_dt_bias
+model = AutoModelForCausalLM.from_pretrained(model_id, ...)
+_fix_nemotron_h_dt_bias(model, model_id)  # Must call before eval()
+```

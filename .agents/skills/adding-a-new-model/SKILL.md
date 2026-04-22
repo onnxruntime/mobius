@@ -335,6 +335,27 @@ defaults.
 4. Check weight dtype (numpy arrays must be float32)
 5. Compare layer by layer (moderate diff → norm/residual issue; huge → wrong weights)
 
+### 6. HF `_init_weights` corrupting checkpoint values
+
+**Symptom:** HF reference inference is non-deterministic across model loads —
+different argmax each time, despite identical inputs. Affects golden data
+generation and L4 parity tests.
+
+**Root cause:** Some HF models' `_init_weights` re-initialise parameters
+with random values (e.g. `torch.rand`) AFTER `from_pretrained` loads the
+checkpoint. Known cases:
+- **NemotronH**: `_init_weights` clobbers Mamba2 `dt_bias` with `torch.rand()`
+
+**Fix:** `_fix_nemotron_h_dt_bias()` in `mobius._testing.torch_reference`
+reads correct values from safetensors files and patches them in-place.
+Always call after `from_pretrained` for NemotronH models.
+
+**Diagnosis pattern:** Load the model twice and compare outputs. If argmax
+differs between loads, suspect `_init_weights` corruption. Set
+`torch.manual_seed(42)` before `from_pretrained` — if that makes outputs
+deterministic, `_init_weights` is the culprit. Then compare specific
+parameters between the loaded model and the safetensors checkpoint.
+
 > For additional troubleshooting (gated attention split ordering, DeltaNet
 > scaling, identity node folding, fp32 upcast patterns, multi-token prefill,
 > embedding table off-by-one), read

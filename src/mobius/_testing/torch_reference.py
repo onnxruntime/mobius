@@ -5,8 +5,92 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _fix_nemotron_h_init_weights(model: torch.nn.Module, model_id: str) -> None:
+    """Restore Mamba2 params from checkpoint after HF clobbers them.
+
+    The NemotronH remote-code ``_init_weights`` re-initialises several
+    parameters *after* ``from_pretrained`` loads the checkpoint:
+
+    - ``dt_bias``: overwritten with ``torch.rand(...)``
+    - ``out_proj.weight`` (in Mamba mixer layers): overwritten with
+      ``kaiming_uniform_`` then scaled by ``1/sqrt(n_layers)`` when
+      ``rescale_prenorm_residual`` is True
+
+    This helper reads the original values back from the safetensors
+    files on disk and patches them in-place.
+    """
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type != "nemotron_h":
+        return
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return
+
+    import glob
+    import os
+
+    from huggingface_hub import snapshot_download
+
+    # Resolve the exact snapshot directory used by HF for this model,
+    # avoiding lexicographic guessing across multiple cached revisions.
+    try:
+        snapshot = snapshot_download(model_id, local_files_only=True)
+    except Exception:
+        logger.warning(
+            "NemotronH init_weights fix: could not resolve snapshot for %s",
+            model_id,
+        )
+        return
+
+    safetensor_files = sorted(glob.glob(os.path.join(snapshot, "*.safetensors")))
+
+    # Collect parameter names that _init_weights corrupts:
+    # 1. All dt_bias params (Mamba2 layers)
+    # 2. mixer.out_proj.weight params (rescale_prenorm_residual)
+    corrupted_suffixes = {"dt_bias"}
+    if getattr(config, "rescale_prenorm_residual", False):
+        corrupted_suffixes.add("mixer.out_proj.weight")
+
+    patched = 0
+    state = model.state_dict()
+    for f in safetensor_files:
+        with safe_open(f, framework="pt") as st:
+            # safe_open objects aren't directly iterable
+            keys = st.keys()
+            for key in keys:
+                if not any(key.endswith(s) for s in corrupted_suffixes):
+                    continue
+                if key not in state:
+                    continue
+                ckpt_val = st.get_tensor(key)
+                param = state[key]
+                with torch.no_grad():
+                    param.copy_(ckpt_val.to(param.device, dtype=param.dtype))
+                patched += 1
+
+    # Write the fixed values back into the live model
+    if patched:
+        model.load_state_dict(state, strict=False)
+        logger.info(
+            "NemotronH: restored %d params from checkpoint (dt_bias + out_proj.weight)",
+            patched,
+        )
+    else:
+        logger.warning(
+            "NemotronH init_weights fix: no corrupted params found in checkpoint for %s",
+            model_id,
+        )
 
 
 def load_torch_model(
@@ -27,12 +111,22 @@ def load_torch_model(
     import transformers
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+    # NemotronH: disable rescale_prenorm_residual before loading to
+    # prevent _init_weights from corrupting out_proj.weight with
+    # random kaiming_uniform_ initialization after checkpoint loading.
+    config = transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if getattr(config, "model_type", None) == "nemotron_h":
+        config.rescale_prenorm_residual = False
+
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_id,
+        config=config,
         dtype=dtype,
         device_map=device,
         trust_remote_code=True,
     )
+    _fix_nemotron_h_init_weights(model, model_id)
     model.eval()
 
     if tokenizer.pad_token is None:

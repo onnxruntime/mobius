@@ -152,6 +152,34 @@ def _extract_logits_golden(
     }
 
 
+# ---- Compat patches ----
+
+
+def _apply_nemotron_h_generate_patch(model: object) -> None:
+    """Patch NemotronH prepare_inputs_for_generation for transformers 5.x.
+
+    The HF remote code accesses ``cache_position[-1]`` without checking
+    for ``None``, which crashes under transformers >=5.x where
+    ``cache_position`` is no longer passed on the first prefill call.
+    We wrap the method to supply a default ``cache_position`` when missing.
+    """
+    cls_name = type(model).__name__
+    if "NemotronH" not in cls_name:
+        return
+
+    import torch
+
+    original_prepare = model.prepare_inputs_for_generation
+
+    def _patched_prepare(input_ids, **kwargs):
+        if kwargs.get("past_key_values") is not None and kwargs.get("cache_position") is None:
+            seq_len = input_ids.shape[-1]
+            kwargs["cache_position"] = torch.arange(seq_len, device=input_ids.device)
+        return original_prepare(input_ids, **kwargs)
+
+    model.prepare_inputs_for_generation = _patched_prepare
+
+
 # ---- Task-specific generators ----
 # Each generator loads a HF model, runs inference, and calls
 # save_golden_ref() from golden.py.  Heavy imports (torch,
@@ -183,6 +211,8 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     generated_ids = None
     if "L5" in case.level:
         import torch
+
+        _apply_nemotron_h_generate_patch(model)
 
         with torch.no_grad():
             gen_output = model.generate(

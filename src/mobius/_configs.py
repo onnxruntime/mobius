@@ -2244,6 +2244,7 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_conv_bias: bool = True
     mamba_proj_bias: bool = False
     mamba_time_step_min: float = 0.001
+    moe_latent_size: int | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
@@ -2253,15 +2254,20 @@ class NemotronHConfig(ArchitectureConfig):
         layers_block_type = getattr(config, "layers_block_type", None)
         if layers_block_type is None:
             pattern = getattr(config, "hybrid_override_pattern", "")
-            # Map pattern chars: M=mamba2, *=full_attention, -=mlp
-            char_map = {"M": "mamba2", "*": "full_attention", "-": "mlp"}
+            # Map pattern chars: M=mamba2, *=full_attention, -=mlp, E=moe
+            char_map = {
+                "M": "mamba2",
+                "*": "full_attention",
+                "-": "mlp",
+                "E": "moe",
+            }
             layers_block_type = [char_map.get(c, "mamba2") for c in pattern]
         else:
             # Convert HF names to mobius names
             type_map = {
                 "mamba": "mamba2",
                 "attention": "full_attention",
-                "moe": "mlp",
+                "moe": "moe",
             }
             layers_block_type = [type_map.get(t, t) for t in layers_block_type]
 
@@ -2280,8 +2286,24 @@ class NemotronHConfig(ArchitectureConfig):
         base_fields = {
             k: v
             for k, v in _shallow_fields(base).items()
-            if k not in ("layer_types", "num_hidden_layers", "hidden_act")
+            if k
+            not in (
+                "layer_types",
+                "num_hidden_layers",
+                "hidden_act",
+                "moe_latent_size",
+                "shared_expert_intermediate_size",
+            )
         }
+
+        # Extract shared expert intermediate size (NemotronH uses a dedicated
+        # field name different from the base ArchitectureConfig default).
+        shared_expert_intermediate_size = getattr(
+            config,
+            "moe_shared_expert_intermediate_size",
+            base.shared_expert_intermediate_size,
+        )
+
         return cls(
             **base_fields,
             num_hidden_layers=n,
@@ -2296,6 +2318,8 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
             mamba_time_step_min=getattr(config, "time_step_min", 0.001),
+            moe_latent_size=getattr(config, "moe_latent_size", None),
+            shared_expert_intermediate_size=shared_expert_intermediate_size,
         )
 
 
