@@ -1119,7 +1119,11 @@ def _remap_phi4mm_weight_key(key: str) -> str:
     # Vision encoder: image_embed sub-tree
     img_prefix = "model.embed_tokens_extend.image_embed."
     if key.startswith(img_prefix):
-        return "vision_encoder." + key[len(img_prefix) :]
+        suffix = key[len(img_prefix) :]
+        # SigLIP vision encoder uses fc1/fc2 for MLP — rename to up_proj/down_proj
+        suffix = suffix.replace(".mlp.fc1.", ".mlp.up_proj.")
+        suffix = suffix.replace(".mlp.fc2.", ".mlp.down_proj.")
+        return "vision_encoder." + suffix
 
     # Speech encoder: audio_embed sub-tree
     audio_prefix = "model.embed_tokens_extend.audio_embed."
