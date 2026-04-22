@@ -110,7 +110,16 @@ def count_op_type(graph: ir.Graph, op_type: str) -> int:
 
 
 def make_config(**overrides) -> ArchitectureConfig:
-    """Create a minimal test config with sensible defaults."""
+    """Create a minimal test config with sensible defaults.
+
+    The defaults include ``rope_type="default"`` so the returned config
+    exercises the standard RoPE code path. ``ArchitectureConfig`` itself
+    defaults ``rope_type`` to ``None`` (the "NoPE" signal used by
+    ``from_transformers`` for models such as NemotronH); test helpers
+    need the opt-in so existing tests that rely on a RoPE-capable base
+    config keep working. Pass ``rope_type=None`` to exercise the NoPE
+    path instead.
+    """
     defaults = dict(
         vocab_size=100,
         max_position_embeddings=32,
@@ -122,6 +131,7 @@ def make_config(**overrides) -> ArchitectureConfig:
         hidden_act="silu",
         head_dim=16,
         pad_token_id=0,
+        rope_type="default",
     )
     defaults.update(overrides)
     return ArchitectureConfig(**defaults)

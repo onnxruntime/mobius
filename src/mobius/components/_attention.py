@@ -216,11 +216,13 @@ class Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = scale if scale is not None else self.head_dim**-0.5
-        self.rotary_embedding_dim = (
-            0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
-        )
+        # NoPE models leave ``partial_rotary_factor`` as ``None``; treat as
+        # the inert 1.0 for the purpose of computing ``rotary_embedding_dim``
+        # (which will itself be 0, i.e. no partial-RoPE splitting). The
+        # actual RoPE call sites are guarded by ``position_embeddings is not
+        # None``, so this value is never consumed for NoPE models.
+        prf = config.partial_rotary_factor if config.partial_rotary_factor is not None else 1.0
+        self.rotary_embedding_dim = 0 if math.isclose(prf, 1.0) else int(self.head_dim * prf)
         self._rope_interleave = config.rope_interleave
         # Gemma2-style logit soft-capping; 0.0 means disabled.
         self._softcap = getattr(config, "attn_logit_softcapping", 0.0) or 0.0
@@ -428,11 +430,10 @@ class Qwen35Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.rotary_embedding_dim = (
-            0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
-        )
+        # NoPE-safe: ``partial_rotary_factor`` may be ``None`` for models
+        # without RoPE. Treat ``None`` as the inert 1.0.
+        prf = config.partial_rotary_factor if config.partial_rotary_factor is not None else 1.0
+        self.rotary_embedding_dim = 0 if math.isclose(prf, 1.0) else int(self.head_dim * prf)
         self._rope_interleave = config.rope_interleave
 
         q_dim = self.num_attention_heads * self.head_dim
