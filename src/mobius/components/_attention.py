@@ -42,12 +42,16 @@ class GQAContext(NamedTuple):
             Taken directly from the model's ``rotary_emb.cos_cache`` parameter.
         sin_cache: Full sine RoPE table ``[max_seq_len, rotary_dim]`` FLOAT.
             Taken directly from the model's ``rotary_emb.sin_cache`` parameter.
+        local_window_size: Left window size for local/sliding-window attention.
+            ``-1`` means unused (full causal attention).  Maps to the
+            ``local_window_size`` attribute on ``GroupQueryAttention``.
     """
 
     seqlens_k: ir.Value
     total_seq_len: ir.Value
     cos_cache: ir.Value
     sin_cache: ir.Value
+    local_window_size: int = -1
 
 
 class StaticCacheState(NamedTuple):
@@ -388,6 +392,8 @@ class Attention(nn.Module):
         if self.rotary_embedding_dim:
             # Partial RoPE: only rotate the first rotary_embedding_dim elements.
             gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+        if gqa_ctx.local_window_size > 0:
+            gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
 
         # Emit GroupQueryAttention: RoPE + attention + KV cache in one op.
         # Outputs: (attn_output [B, S, hidden], present_key, present_value)

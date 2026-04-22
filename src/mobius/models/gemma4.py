@@ -640,15 +640,22 @@ class Gemma4TextAttention(nn.Module):
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
     ):
-        from mobius.components._attention import _apply_attention, apply_rotary_pos_emb
+        from mobius.components._attention import (
+            GQAContext,
+            _apply_attention,
+            apply_rotary_pos_emb,
+        )
 
-        # Q projection + per-head Q norm + optional RoPE
+        use_gqa = isinstance(attention_bias, GQAContext)
+
+        # Q projection + per-head Q norm
+        # For GQA, skip manual RoPE — the op applies it internally.
         query_states = self.q_proj(op, hidden_states)
         query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
         query_states = self.q_norm(op, query_states)
         query_states = op.Reshape(query_states, [0, 0, -1])
 
-        if position_embeddings is not None:
+        if not use_gqa and position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
                 op,
                 x=query_states,
@@ -659,6 +666,9 @@ class Gemma4TextAttention(nn.Module):
             )
 
         if self.is_kv_shared_layer:
+            # KV-shared layers always use standard Attention path because
+            # they borrow K,V from a source layer (no own KV cache).
+            assert not use_gqa, "KV-shared layers should not receive GQAContext"
             # Borrow full-history K,V from source layer.
             # present_key/value from the ONNX Attention op is 4D:
             #   [batch, kv_heads, total_seq, head_dim]
@@ -693,6 +703,70 @@ class Gemma4TextAttention(nn.Module):
                 scale=self.scaling,
                 softcap=self.softcap,
             )
+        elif use_gqa:
+            # GQA path: emit com.microsoft.GroupQueryAttention directly.
+            # The op fuses RoPE + attention + KV cache into a single op,
+            # with optional sliding-window via local_window_size.
+            gqa_ctx = attention_bias
+
+            # K projection + per-head K norm (no manual RoPE — GQA does it)
+            key_states = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_states = self.k_norm(op, key_states)
+            key_states = op.Reshape(key_states, [0, 0, -1])
+
+            # V projection + parameterless per-head V normalisation
+            value_states = self.v_proj(op, hidden_states)
+            value_states = op.Reshape(
+                value_states,
+                op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
+            )
+            sq = op.Mul(value_states, value_states)
+            mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
+            eps = op.Constant(value_floats=[self._v_norm_eps])
+            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
+            value_states = op.Div(value_states, rms)
+            value_states = op.Reshape(value_states, [0, 0, -1])
+
+            # Build GQA attributes
+            past_key = past_key_value[0] if past_key_value is not None else None
+            past_value = past_key_value[1] if past_key_value is not None else None
+
+            gqa_attrs: dict = {
+                "num_heads": self.num_attention_heads,
+                "kv_num_heads": self.num_key_value_heads,
+                "scale": self.scaling,
+                "do_rotary": 1,
+                "rotary_interleaved": int(self._rope_interleave),
+            }
+            if self.softcap:
+                gqa_attrs["softcap"] = self.softcap
+            if self.rotary_embedding_dim:
+                gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+            if gqa_ctx.local_window_size > 0:
+                gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
+
+            attn_output, present_key, present_value = op.GroupQueryAttention(
+                query_states,
+                key_states,
+                value_states,
+                past_key,
+                past_value,
+                gqa_ctx.seqlens_k,
+                gqa_ctx.total_seq_len,
+                gqa_ctx.cos_cache,
+                gqa_ctx.sin_cache,
+                _domain="com.microsoft",
+                _outputs=3,
+                **gqa_attrs,
+            )
+
+            # Source layers store K,V for downstream KV-shared layers
+            if self.provides_shared_kv and shared_kv_states is not None:
+                shared_kv_states[self.layer_idx] = (
+                    present_key,
+                    present_value,
+                )
         else:
             # K projection + per-head K norm + optional RoPE
             key_states = self.k_proj(op, hidden_states)
@@ -1298,28 +1372,106 @@ class Gemma4TextModel(nn.Module):
 
         per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states)
 
-        position_embeddings_dict = {
-            "sliding_attention": self.rotary_emb_local(op, position_ids),
-            "full_attention": self.rotary_emb_global(op, position_ids),
-        }
+        # Determine whether to emit GroupQueryAttention directly.
+        # GQA fuses RoPE + attention + KV cache into a single op, and
+        # supports local_window_size for sliding-window layers.
+        # KV-shared layers fall back to standard Attention because they
+        # borrow K,V from another layer (no own KV cache).
+        from mobius._build_context import get_build_dtype
+        from mobius.components._attention import GQAContext
 
-        # Use hidden_states for query length when input_ids is None (VL decoder)
+        caps = ep_capabilities()
+        dtype = get_build_dtype()
+        use_gqa = (
+            attention_mask is not None
+            and dtype in caps.gqa_dtypes
+            and caps.supports_fused_rope
+        )
+
+        if use_gqa:
+            # Realize cos/sin caches as ONNX graph initializers.
+            # The returned gathered embeddings are discarded — GQA indexes
+            # the full tables itself via do_rotary=1.
+            self.rotary_emb_local(op, position_ids)
+            self.rotary_emb_global(op, position_ids)
+
+            # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
+            # total_seq_len = attention_mask.shape[1]     (past + current)
+            one_i32 = op.Constant(value_int=1)
+            seqlens_k = op.Cast(
+                op.Sub(
+                    op.ReduceSum(attention_mask, [1], keepdims=0),
+                    one_i32,
+                ),
+                to=ir.DataType.INT32,
+            )
+            total_seq_len = op.Cast(
+                op.Gather(op.Shape(attention_mask), 1),
+                to=ir.DataType.INT32,
+            )
+
+            # Per-layer-type GQA contexts with appropriate cos/sin caches
+            # and local_window_size for sliding layers.
+            gqa_ctx_dict: dict[str, GQAContext] = {
+                "sliding_attention": GQAContext(
+                    seqlens_k=seqlens_k,
+                    total_seq_len=total_seq_len,
+                    cos_cache=self.rotary_emb_local.cos_cache,
+                    sin_cache=self.rotary_emb_local.sin_cache,
+                    local_window_size=self.sliding_window or -1,
+                ),
+                "full_attention": GQAContext(
+                    seqlens_k=seqlens_k,
+                    total_seq_len=total_seq_len,
+                    cos_cache=self.rotary_emb_global.cos_cache,
+                    sin_cache=self.rotary_emb_global.sin_cache,
+                ),
+            }
+            position_embeddings_dict: dict = {
+                "sliding_attention": None,
+                "full_attention": None,
+            }
+        else:
+            gqa_ctx_dict = {}
+            position_embeddings_dict = {
+                "sliding_attention": self.rotary_emb_local(op, position_ids),
+                "full_attention": self.rotary_emb_global(op, position_ids),
+            }
+
+        # Fallback attention bias for non-GQA layers (KV-shared layers always
+        # use this, plus all layers when use_gqa is False).
         query_input = input_ids if input_ids is not None else hidden_states
-        attention_bias_dict = {
-            "sliding_attention": create_attention_bias(
-                op,
-                input_ids=query_input,
-                attention_mask=attention_mask,
-                sliding_window=self.sliding_window,
-                dtype=self._dtype,
-            ),
-            "full_attention": create_attention_bias(
-                op,
-                input_ids=query_input,
-                attention_mask=attention_mask,
-                dtype=self._dtype,
-            ),
-        }
+        fallback_bias_dict: dict[str, ir.Value | None] = {}
+        need_fallback = not use_gqa or any(
+            layer.self_attn.is_kv_shared_layer for layer in self.layers
+        )
+        if need_fallback:
+            fallback_bias_dict = {
+                "sliding_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                ),
+            }
+            # KV-shared layers also need position embeddings for the
+            # standard Attention path (manual RoPE).
+            if use_gqa:
+                fallback_pos_dict = {
+                    "sliding_attention": self.rotary_emb_local(op, position_ids),
+                    "full_attention": self.rotary_emb_global(op, position_ids),
+                }
+            else:
+                fallback_pos_dict = position_embeddings_dict
+        else:
+            fallback_pos_dict = {}
 
         # shared_kv_states: source layers populate it, shared layers consume it
         shared_kv_states: dict = {}
@@ -1342,11 +1494,22 @@ class Gemma4TextModel(nn.Module):
             zip(self.layers, self.layer_types, past_kvs)
         ):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
+
+            # Per-layer decision: use GQA for non-shared layers when
+            # available, fall back to standard Attention for KV-shared layers.
+            is_shared = layer.self_attn.is_kv_shared_layer
+            if use_gqa and not is_shared:
+                attn_bias = gqa_ctx_dict[layer_type]
+                pos_emb = None
+            else:
+                attn_bias = fallback_bias_dict[layer_type]
+                pos_emb = fallback_pos_dict[layer_type]
+
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
-                attention_bias=attention_bias_dict[layer_type],
-                position_embeddings=position_embeddings_dict[layer_type],
+                attention_bias=attn_bias,
+                position_embeddings=pos_emb,
                 shared_kv_states=shared_kv_states,
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
