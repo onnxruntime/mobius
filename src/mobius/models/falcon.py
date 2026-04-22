@@ -294,8 +294,8 @@ def _create_alibi_bias(op, num_heads: int, seq_len, total_len):
     alibi = op.Mul(slopes_4d, bias_2d)  # [1, num_heads, seq_len, total_len]
 
     # Causal mask: mask future positions with large negative value.
-    # Use Mul instead of Where to avoid CPU Memcpy on CUDA EP.
-    # not_causal * -10000 → causal positions get 0, future gets -10000.
+    # Branchless Mul pattern: (1 - float(mask)) * -10000 is more
+    # efficient than Where — no conditional select.
     causal_f = op.CastLike(
         op.Cast(
             op.GreaterOrEqual(q_with_offset, kv_expanded),

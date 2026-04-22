@@ -216,8 +216,8 @@ def create_attention_bias(
     full_mask = op.And(attn_mask_bool, full_mask)
 
     # Convert to float bias: 0 where attended, dtype.min where masked.
-    # Use Mul instead of Where to avoid CPU-only bool Where ops that cause
-    # Memcpy nodes on CUDA EP.  not_mask * mask_value: True→0, False→mask_value.
+    # Branchless Mul pattern: (1 - float(mask)) * mask_value is more
+    # efficient than Where(mask, 0, mask_value) — no conditional select.
     mask_value = float(dtype.min)
     not_mask = op.Cast(full_mask, to=ir.DataType.FLOAT)  # 1.0=attend, 0.0=mask
     # (1 - not_mask) * mask_value → 0 where attended, mask_value where masked

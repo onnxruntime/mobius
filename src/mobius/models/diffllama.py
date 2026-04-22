@@ -188,8 +188,9 @@ class DiffLlamaAttention(nn.Module):
         past_len = op.Sub(kv_len, q_len)  # [1]
         causal_slice = op.Slice(lower_tri, past_len, kv_len, [0])  # [S, Sk]
         causal_bool = op.Cast(causal_slice, to=9)  # BOOL (dtype 9)
-        # Use Mul instead of Where to avoid CPU Memcpy on CUDA EP.
-        # not_causal * neg_inf: causal positions→0, masked→-inf
+        # Branchless Mul pattern: (1 - float(mask)) * neg_inf
+        # More efficient than Where — no conditional select.
+        # causal positions→0, masked→-inf
         neg_inf_f = op.CastLike(float("-inf"), q_4d)
         not_causal_f = op.CastLike(op.Cast(causal_bool, to=ir.DataType.FLOAT), q_4d)
         causal_bias = op.Mul(

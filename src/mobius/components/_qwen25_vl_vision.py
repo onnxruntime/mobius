@@ -340,8 +340,8 @@ class Qwen25VLVisionAttention(nn.Module):
         same_segment = op.Equal(seg_row, seg_col)
 
         # Convert to attention bias: 0 where same segment, -inf where different.
-        # Use Mul instead of Where to avoid CPU Memcpy on CUDA EP.
-        # not_same * neg_inf: same segment→0, different→-inf
+        # Branchless Mul pattern: (1 - float(mask)) * neg_inf is more
+        # efficient than Where — no conditional select.
         neg_inf = op.CastLike(op.Constant(value_float=-1e9), dtype_ref)
         same_f = op.CastLike(op.Cast(same_segment, to=ir.DataType.FLOAT), dtype_ref)
         return op.Mul(

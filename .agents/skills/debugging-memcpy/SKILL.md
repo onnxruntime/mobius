@@ -150,35 +150,40 @@ their outputs feed GPU ops:
 
 ### Pattern 1: Where(bool, zero, tensor) → Mul
 
-**Problem**: `Where` on a bool condition is CPU-only.  When one branch is
-zero and the other is a GPU tensor, this forces a GPU→CPU→GPU round-trip.
+**Problem**: `Where` with a bool condition and scalar branches can be
+replaced with a branchless `Mul` pattern that is more efficient — it avoids
+the conditional select and may fuse better with surrounding ops.
+
+> Note: `Where` IS supported by CUDA EP and does not itself cause Memcpy
+> nodes.  This pattern is a micro-optimization for efficiency, not a
+> Memcpy fix.
 
 **Fix**: Multiply by the bool mask cast to float.
 
 ```python
-# BEFORE (CPU Where)
+# BEFORE (conditional select)
 zero = op.CastLike(op.Constant(value_float=0.0), tensor)
-result = op.Where(is_padding, zero, tensor)  # CPU
+result = op.Where(is_padding, zero, tensor)
 
-# AFTER (GPU Mul)
+# AFTER (branchless Mul)
 not_pad = op.CastLike(
     op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), tensor
 )
 not_pad = op.Unsqueeze(not_pad, [2])  # broadcast dim
-result = op.Mul(tensor, not_pad)  # GPU
+result = op.Mul(tensor, not_pad)
 ```
 
 **Variant** — zero-masking with negative infinity (attention bias):
 
 ```python
 # BEFORE
-attn_bias = op.Where(is_padding, neg_inf, zero_bias)  # CPU
+attn_bias = op.Where(is_padding, neg_inf, zero_bias)
 
 # AFTER — is_padding * neg_inf: True→neg_inf, False→0
 is_pad_f = op.CastLike(
     op.Cast(is_padding, to=ir.DataType.FLOAT), hidden_states
 )
-attn_bias = op.Mul(is_pad_f, neg_inf)  # GPU
+attn_bias = op.Mul(is_pad_f, neg_inf)
 ```
 
 **When to use**: Any `Where(bool, constant, tensor)` or

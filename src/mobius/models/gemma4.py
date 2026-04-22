@@ -476,8 +476,8 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         y_emb = op.Gather(y_table, y_coords, axis=0)  # [B, N, hidden]
 
         # Zero position embeddings for padding patches.
-        # Use Mul instead of Where to avoid CPU-only bool Where ops that cause
-        # Memcpy nodes on CUDA EP. not_pad is 0/1 float broadcast over hidden.
+        # Branchless Mul pattern: float(not_pad) * pos_emb is more efficient
+        # than Where(is_pad, zero, pos_emb) — no conditional select.
         pos_emb = op.Add(x_emb, y_emb)  # [B, N, hidden]
         not_pad = op.CastLike(op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), pos_emb)
         not_pad = op.Unsqueeze(not_pad, [2])  # [B, N, 1]
@@ -530,8 +530,8 @@ class _Gemma4VisionEncoderCore(nn.Module):
 
         # Build additive attention bias [B, 1, 1, N] masking out padding columns.
         # Valid positions get 0 (no effect), padding columns get -1e9 (suppressed).
-        # Use Mul instead of Where to keep computation on CUDA (avoids CPU
-        # Memcpy for bool Where ops).
+        # Branchless Mul pattern: float(is_pad) * neg_inf is more efficient
+        # than Where(is_pad, neg_inf, zero) — no conditional select.
         # is_padding (bool) → float 0/1 → * neg_inf → padding=-1e9, valid=0
         neg_inf = op.CastLike(op.Constant(value_float=-1e9), hidden_states)
         is_pad_f = op.CastLike(op.Cast(is_padding, to=ir.DataType.FLOAT), hidden_states)
@@ -642,7 +642,7 @@ class Gemma4TextAttention(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
+        attention_bias: ir.Value | GQAContext,
         position_embeddings: tuple | None = None,
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
