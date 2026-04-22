@@ -39,85 +39,101 @@ The fix is always one of:
 ## Quick diagnostic flow
 
 ```
-1. Build model with execution_provider='cuda'
-2. Dump per-model op counts (see §Profiling recipe)
-3. Identify CPU-likely ops (see §CPU-only op reference)
-4. For each CPU op, trace its consumers
-   → If consumer is a GPU op (MatMul, Attention, etc.) → Memcpy source
-   → If consumer is another CPU op → no Memcpy (chain stays on CPU)
-5. Apply fix pattern from §Fix patterns
-6. Re-run op count to verify reduction
+1. Build model with execution_provider='cuda' and save with external data
+2. Load in ORT with log_severity_level=1 to get exact Memcpy attribution
+3. Parse the logs to identify which nodes triggered Memcpy
+4. Apply fix pattern from §Fix patterns
+5. Re-run to verify reduction
 ```
 
 ## Profiling recipe
 
-### Step 1: Build and count ops
+### Step 1: Build, save, and load with ORT verbose logging
+
+The authoritative way to identify Memcpy sources is ORT's own verbose
+logging.  It tells you exactly which nodes lack CUDA kernels and where
+`MemcpyFromHost` / `MemcpyToHost` nodes are inserted.
 
 ```python
+import os, tempfile
 import onnx_ir as ir
+import onnxruntime as ort
 from mobius import build
 
-pkg = build(model_id, execution_provider='cuda', dtype='float16',
-            load_weights=False)
+pkg = build(model_id, execution_provider='cuda', dtype='float16')
 
-cpu_likely = {
-    'Shape', 'CumSum', 'Equal', 'And', 'Not', 'Or',
-    'GreaterOrEqual', 'Less', 'Greater', 'LessOrEqual',
-    'OneHot', 'Where', 'NonZero', 'Range', 'ConstantOfShape',
-}
+tmpdir = tempfile.mkdtemp(prefix="memcpy_profile_")
 
 for name, model in pkg.items():
-    ops = {}
-    for node in model.graph:
-        if node.op_type in cpu_likely:
-            ops[node.op_type] = ops.get(node.op_type, 0) + 1
-    total = sum(ops.values())
-    print(f'{name}: {total} CPU-likely ops: {ops}')
+    # IMPORTANT: lower opset to 23 — CUDA EP doesn't register many ops
+    # (including Reshape, Cast) at opset 24.  Without this, you'll see
+    # hundreds of false-positive Memcpy from ops that work fine at opset 23.
+    if model.opset_imports.get("", 0) > 23:
+        model.opset_imports[""] = 23
+
+    path = os.path.join(tmpdir, f"{name}.onnx")
+    ir.save(model, path, external_data=f"{name}.onnx.data")
+
+    # Load with verbose logging
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 1  # INFO level — shows Memcpy details
+    sess = ort.InferenceSession(
+        path, opts,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
 ```
 
-### Step 2: Trace consumers of CPU ops
+### Step 2: Read the ORT logs
 
-For each CPU-likely op, check whether its output feeds a GPU op:
+ORT emits two kinds of relevant log messages:
 
-```python
-for node in model.graph:
-    if node.op_type in cpu_likely:
-        for out in node.outputs:
-            consumers = [
-                n for n in model.graph
-                if any(inp is not None and inp.name == out.name
-                       for inp in n.inputs)
-            ]
-            consumer_types = [c.op_type for c in consumers]
-            print(f'{node.op_type} -> {consumer_types}')
+**1. Kernel not found (INFO)** — the op falls back to CPU:
+```
+CUDA kernel not found in registries for Op type: Equal node name: decoder/model/Equal_node_8
 ```
 
-A CPU op whose consumer is `MatMul`, `Attention`, `GroupQueryAttention`,
-`Mul`, `Add`, `Gather` (on large tensors), `Reshape`, etc. is a confirmed
-Memcpy source.
-
-### Step 3: Verify with ORT session (requires weights)
-
-If you have weights, load the model in ORT with verbose logging:
-
-```python
-import onnxruntime as ort
-
-so = ort.SessionOptions()
-so.log_severity_level = 1  # INFO — shows Memcpy insertion details
-sess = ort.InferenceSession(
-    model_path, so,
-    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-)
+**2. Memcpy insertion (INFO)** — a transfer node is added at a
+CPU↔GPU boundary:
+```
+Add MemcpyFromHost after v_decoder.model.Equal_8 for CUDAExecutionProvider
 ```
 
-ORT logs will show exactly which nodes were placed on CPU and which
-triggered Memcpy insertions.
+**3. Summary (WARNING)** — total count per sub-model:
+```
+4 Memcpy nodes are added to the graph ... for CUDAExecutionProvider
+```
 
-## CPU-only op reference
+### Step 3: Categorize Memcpy sources
 
-These ONNX ops typically run on CPU in ORT's CUDA EP, causing Memcpy when
-their outputs feed GPU ops:
+Parse the `AddCopyNode` lines to identify patterns:
+
+```bash
+# Extract and categorize Memcpy sources from ORT log output
+grep "AddCopyNode" ort_output.log \
+  | sed 's/.*AddCopyNode] //' \
+  | sort | uniq -c | sort -rn
+```
+
+This gives you the exact node names causing Memcpy.  Common categories:
+- **Graph inputs** (`input_ids`, `attention_mask`) — expected, unavoidable
+- **Reshape with dynamic shape** — fix with static dims or `[0, 0, -1]`
+- **Equal/Cast on token IDs** — usually low-impact (small tensors)
+- **CumSum on INT64** — inherent, no GPU kernel
+
+### Critical: opset 24 false positives
+
+**Always lower opset to 23 before profiling.**  ORT CUDA EP (≤1.24.x)
+does not register kernels for many standard ops at opset 24, including
+`Reshape`, `Cast`, and others.  A Gemma4 decoder at opset 24 shows
+**280 Memcpy** nodes; at opset 23, it shows **4**.  The
+`ort_lower_opset_for_ep` flag in `_flags.py` handles this at runtime,
+but you must apply it manually when profiling with raw ORT sessions.
+
+## CPU-only op reference (ORT CUDA EP)
+
+These are ops that ORT's CUDA EP does **not** register kernels for in
+certain configurations.  The authoritative check is always
+`log_severity_level=1` (see above), but this table covers common cases:
 
 ### Always CPU (shape/index computation)
 
@@ -128,15 +144,6 @@ their outputs feed GPU ops:
 | `Range` | Generates integer sequences | Position indices |
 | `ConstantOfShape` | Creates tensor from shape input | Dynamic zero-fill |
 
-### Usually CPU (boolean/comparison)
-
-| Op | Why CPU | Common source |
-|----|---------|---------------|
-| `Equal` | Bool comparison | Token ID matching, padding detection |
-| `Where` | Conditional selection on bool | Masking, scatter |
-| `And` / `Or` / `Not` | Bool logic | Combining masks |
-| `GreaterOrEqual` / `Less` | Comparison | Causal mask, window mask |
-
 ### Context-dependent
 
 | Op | When CPU | When GPU |
@@ -144,7 +151,17 @@ their outputs feed GPU ops:
 | `CumSum` | INT64 inputs | FLOAT inputs |
 | `OneHot` | Dynamic depth parameter | Static depth |
 | `Gather` | Small index tensor from CPU op | Large data tensor on GPU |
-| `Cast` | To/from bool | Between float types |
+| `Cast` | Some type combinations | Most float↔float casts |
+| `Equal` | Some type/opset combinations | Often CUDA-supported |
+| `Reshape` | **Opset 24** (no CUDA kernel) | **Opset ≤23** (CUDA-supported) |
+
+### CUDA-supported (do NOT try to eliminate)
+
+| Op | Notes |
+|----|-------|
+| `Where` | Fully supported on CUDA EP. Do not replace with `Mul` patterns. |
+| `And` / `Or` / `Not` | Bool logic — generally CUDA-supported |
+| `GreaterOrEqual` / `Less` | Comparison — generally CUDA-supported |
 
 ## Fix patterns
 
@@ -274,32 +291,24 @@ ORT batches them into a single CPU segment with only entry/exit Memcpy.
 
 ## Gemma4 case study
 
-The Gemma4 multimodal model (E2B) was optimized to reduce Memcpy from
-~30 to ~17 CPU-likely ops across all sub-models:
+The Gemma4 multimodal model (E2B) was profiled with ORT verbose logging
+at opset 23.  Results after optimization:
 
-### Vision encoder (9 → ~6 Memcpy)
+### Final Memcpy counts (opset 23, CUDA EP)
 
-| Source | Fix | Ops removed |
-|--------|-----|-------------|
-| `Shape(features, start=2)` for Reshape | Static `config.hidden_size` | 1 Shape |
-| **Remaining**: `Where` (CUDA-supported), `OneHot` (dynamic depth), `Equal`/`And` (pooler padding) | Inherent or CUDA-supported | — |
+| Sub-model | Memcpy | Sources |
+|-----------|--------|---------|
+| Vision | 0 | Clean — all ops on GPU |
+| Audio | 0 | Clean — all ops on GPU |
+| Decoder | 4 | `input_ids` (input), 2× `Equal` (token masks), `Where` (bool mask) |
+| Embedding | 3 | `input_ids` (input), 2× `Equal` (token masks) |
 
-### Embedding model (3 Memcpy — unchanged)
+### Opset 24 trap
 
-| Source | Status |
-|--------|--------|
-| `CumSum` for scatter indexing (×2) | Inherent (INT64 cumsum) |
-| `Where` for conditional scatter (×2) | Inherent (both branches non-trivial) |
-
-### Decoder (reduced by switching to bool masks + GQA)
-
-| Source | Fix | Ops removed |
-|--------|-----|-------------|
-| `create_attention_bias()` for full-attn | `create_padding_mask()` + `is_causal=1` | CumSum, GreaterOrEqual, Where |
-| `create_attention_bias()` for sliding | `create_sliding_window_mask()` (bool) | 2 Where (CumSum remains) |
-| Shape-based KV reshape (×4) | `op.Reshape(x, [0, 0, -1])` | 4 Shape |
-| Non-shared layers | `GroupQueryAttention` with `local_window_size` | All mask ops |
-| **Remaining**: per-layer token masking (`Equal`/`Where`), sliding CumSum | Low-impact or inherent | — |
+Without opset lowering, the decoder showed **280 Memcpy** nodes because
+CUDA EP doesn't register `Reshape`, `Cast`, and other standard ops at
+opset 24.  The `ort_lower_opset_for_ep` flag (enabled by default) fixes
+this at runtime.  Always lower to opset 23 before profiling.
 
 ## Impact assessment
 
