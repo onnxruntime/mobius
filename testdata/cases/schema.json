@@ -118,6 +118,10 @@
         "do_sample": {
           "type": "boolean",
           "description": "Whether to use sampling. false = greedy decoding (required for reproducible golden tests)."
+        },
+        "eos_token_id": {
+          "type": "integer",
+          "description": "End-of-sequence token ID. Overrides the model's default to ensure generation stops correctly."
         }
       },
       "additionalProperties": false,
@@ -134,6 +138,13 @@
         "null"
       ],
       "description": "If non-null/non-empty, the test is skipped with this message. Use for known failures or unimplemented features."
+    },
+    "ci_skip_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "If non-null/non-empty and skip_reason is unset, the test is skipped in CI (GITHUB_ACTIONS=true) but runs locally. skip_reason takes precedence when both are set. Use for models that are too large for CI hardware. Does NOT block golden data generation."
     },
     "min_token_match_ratio": {
       "type": "number",

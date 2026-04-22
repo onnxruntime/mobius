@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Model type 'clip' not registered in mobius."
 level: "L4"
 
 notes: "CLIP text model. Text encoder from CLIP vision-language model."

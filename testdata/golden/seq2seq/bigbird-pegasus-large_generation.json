@@ -1,0 +1,22 @@
+{
+  "model_id": "google/bigbird-pegasus-large-bigpatent",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    2,
+    139,
+    5998,
+    117,
+    56966,
+    7641,
+    3930,
+    111,
+    117,
+    109,
+    22246,
+    1557,
+    115,
+    47195,
+    1
+  ],
+  "generated_text": "The tower is 324 metres tall and is the tallest structure inrope"
+}

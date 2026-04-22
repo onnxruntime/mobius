@@ -1,0 +1,27 @@
+{
+  "model_id": "Qwen/Qwen3-30B-A3B",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    330,
+    785,
+    7015,
+    572,
+    6243,
+    11,
+    24172,
+    264,
+    20748,
+    35966,
+    916,
+    279,
+    34074,
+    13,
+    576,
+    12884,
+    572,
+    23983,
+    304,
+    81657
+  ],
+  "generated_text": " \"The sun was setting, casting a golden glow over the horizon. The sky was painted in hues"
+}

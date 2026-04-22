@@ -9,11 +9,11 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "HF inference requires Triton FP8 kernels (w8a8_fp8_matmul) not available."
 level: "L4+L5"
 
 generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "Gated repo (mistralai/Ministral-3-3B-Instruct-2512 requires authentication)."
 notes: "Ministral 3-3B (Pixtral VLM). PixtralVisionTower + Mistral3MultiModalProjector + MistralDecoder. 3-model split (vision/embedding/decoder). Uses 2D RoPE for vision, YaRN 1D RoPE for text decoder."

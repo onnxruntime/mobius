@@ -1291,6 +1291,7 @@ class TestBuildGraphVisionLanguage:
                 hidden_size=32,
                 num_layers=1,
                 output_dim=64,
+                output_proj_dims=64,
                 audio_token_id=255998,
             ),
         )
@@ -1380,6 +1381,7 @@ class TestBuildGraphVisionLanguage:
                 hidden_size=32,
                 num_layers=1,
                 output_dim=64,
+                output_proj_dims=64,
                 audio_token_id=255998,
             ),
         )
