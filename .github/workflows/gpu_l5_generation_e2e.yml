@@ -1,17 +1,24 @@
 name: "L5: End-to-End Generation (GPU)"
 
 on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'testdata/**'
-      - 'scripts/**'
   schedule:
     # Run nightly at 5am UTC (after L4 golden tests)
     - cron: '0 5 * * *'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      affected_models:
+        description: >-
+          JSON array of affected model names (e.g. '["qwen2", "llama"]').
+          Empty string or empty array means run all models.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      HF_TOKEN:
+        required: false
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -66,13 +73,34 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MOBIUS_TEST_DEVICE: cuda
         run: |
-          pytest tests/e2e_golden_test.py \
-            -m generation \
-            -v \
-            --timeout=300 \
-            --junitxml=junit-l5.xml \
-            --cov=src --cov-report=xml --cov-branch \
-            --tb=short
+          AFFECTED='${{ inputs.affected_models }}'
+          if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
+            echo "Running all L5 generation E2E tests"
+            pytest tests/e2e_golden_test.py \
+              -m generation \
+              -v \
+              --timeout=300 \
+              --junitxml=junit-l5.xml \
+              --cov=src --cov-report=xml --cov-branch \
+              --tb=short
+          else
+            echo "Running L5 generation tests for affected models: $AFFECTED"
+            # Convert JSON array to comma-separated list for --models
+            MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
+            if [ -n "$MODELS" ]; then
+              pytest tests/e2e_golden_test.py \
+                -m generation \
+                -v \
+                --models "$MODELS" \
+                --timeout=300 \
+                --junitxml=junit-l5.xml \
+                --cov=src --cov-report=xml --cov-branch \
+                --tb=short \
+                || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
+            else
+              echo "No affected models — skipping"
+            fi
+          fi
         timeout-minutes: 60
 
       - name: Upload coverage to Codecov
