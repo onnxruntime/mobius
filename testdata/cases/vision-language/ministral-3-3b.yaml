@@ -15,5 +15,4 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "Ministral custom code requires FP8 matmul not available."
 notes: "Ministral 3-3B (Pixtral VLM). PixtralVisionTower + Mistral3MultiModalProjector + MistralDecoder. 3-model split (vision/embedding/decoder). Uses 2D RoPE for vision, YaRN 1D RoPE for text decoder."

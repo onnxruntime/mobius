@@ -7,7 +7,6 @@ inputs:
   prompts:
     - "Here is my poem:"
 
-skip_reason: "Weight shape mismatch in audio_encoder.encoder.output_proj."
 level: "L4+L5"
 
 generation:

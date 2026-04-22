@@ -271,6 +271,7 @@ class Gemma4AudioConfig(AudioConfig):
     hidden_size: int = 1024
     subsampling_conv_channels: list[int] | None = None
     use_causal_chunked_attn: bool = False
+    output_proj_dims: int | None = None
 
 
 def _first_not_none(*values, default=None):
@@ -627,6 +628,7 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
                     ),
                     use_causal_chunked_attn=getattr(ac, "use_causal_chunked_attn", False),
                     output_dim=getattr(ac, "output_dim", None),
+                    output_proj_dims=getattr(ac, "output_proj_dims", None),
                     audio_token_id=getattr(composite, "audio_token_id", None),
                 )
             }

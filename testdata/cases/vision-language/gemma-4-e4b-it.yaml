@@ -9,7 +9,6 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
-skip_reason: "Weight shape mismatch in audio_encoder.encoder.output_proj."
 level: "L4+L5"
 
 generation:
