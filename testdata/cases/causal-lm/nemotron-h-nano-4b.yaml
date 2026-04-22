@@ -7,11 +7,7 @@ inputs:
   prompts:
     - "Here is my poem:"
 
-level: "L4+L5"
+level: "L4"
 
-generation:
-  max_new_tokens: 20
-  do_sample: false
-
-skip_reason: "Requires mamba-ssm package (CUDA-only) for HF inference."
-notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MLP architecture from NVIDIA."
+ci_skip_reason: "Requires mamba-ssm package (CUDA-only) for HF inference."
+notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MLP architecture from NVIDIA. L5 skipped: HF remote code generate() is broken (cache_position bug)."

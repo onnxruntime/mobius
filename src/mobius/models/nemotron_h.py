@@ -29,7 +29,6 @@ HuggingFace reference: ``NemotronHForCausalLM``.
 
 from __future__ import annotations
 
-import dataclasses
 import re
 from typing import TYPE_CHECKING
 
@@ -249,22 +248,16 @@ class NemotronHMoEGate(nn.Module):
 
         # Select top-k experts based on biased scores
         k = op.Constant(value_ints=[self.top_k])
-        _top_vals, selected_experts = op.TopK(
-            choice_scores, k, axis=-1, _outputs=2
-        )
+        _top_vals, selected_experts = op.TopK(choice_scores, k, axis=-1, _outputs=2)
 
         # Gather actual routing weights from unbiased probs
         routing_weights = op.GatherElements(probs, selected_experts, axis=-1)
 
         if self.norm_topk_prob:
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            routing_weights = op.Div(
-                routing_weights, op.Add(weight_sum, 1e-20)
-            )
+            routing_weights = op.Div(routing_weights, op.Add(weight_sum, 1e-20))
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
-            routing_weights = op.Mul(
-                routing_weights, self.routed_scaling_factor
-            )
+            routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
 
         return routing_weights, selected_experts
 
@@ -323,8 +316,7 @@ class NemotronHMoEBlock(nn.Module):
 
         # Shared expert processes all tokens (not routed)
         shared_intermediate = (
-            config.shared_expert_intermediate_size
-            or config.moe_intermediate_size
+            config.shared_expert_intermediate_size or config.moe_intermediate_size
         )
         self.shared_experts = FCMLP(
             config.hidden_size,
@@ -575,9 +567,9 @@ class NemotronHCausalLMModel(nn.Module):
                 for i, expert_weight in enumerate(value):
                     # value[i] is (out_dim, in_dim) — standard 2D weight
                     suffix = new_key.rsplit(".", 1)[-1]  # "up_proj"/"down_proj"
-                    expert_key = new_key.rsplit(
-                        "experts.", 1
-                    )[0] + f"experts.{i}.{suffix}.weight"
+                    expert_key = (
+                        new_key.rsplit("experts.", 1)[0] + f"experts.{i}.{suffix}.weight"
+                    )
                     new_state_dict[expert_key] = expert_weight
             else:
                 new_state_dict[new_key] = value
@@ -634,7 +626,7 @@ def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
         ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
 
         if rest.startswith("mixer."):
-            mixer_rest = rest[len("mixer."):]
+            mixer_rest = rest[len("mixer.") :]
             if ltype == "mamba2":
                 return f"model.layers.{layer_idx}.mamba.{mixer_rest}"
             elif ltype == "full_attention":
@@ -661,7 +653,5 @@ def _is_stacked_expert_tensor(key: str, value: torch.Tensor) -> bool:
     These need to be split into per-expert 2D weights.
     """
     return (
-        value.ndim == 3
-        and ".moe.experts." in key
-        and key.endswith((".up_proj", ".down_proj"))
+        value.ndim == 3 and ".moe.experts." in key and key.endswith((".up_proj", ".down_proj"))
     )

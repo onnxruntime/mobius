@@ -5,8 +5,76 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _fix_nemotron_h_dt_bias(model: torch.nn.Module, model_id: str) -> None:
+    """Restore Mamba2 ``dt_bias`` from checkpoint after HF clobbers it.
+
+    The NemotronH remote-code ``_init_weights`` re-initialises ``dt_bias``
+    with ``torch.rand`` *after* ``from_pretrained`` loads the checkpoint,
+    silently corrupting the model.  This helper reads the original values
+    back from the safetensors files on disk and patches them in-place.
+    """
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type != "nemotron_h":
+        return
+
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return
+
+    import glob
+    import os
+
+    # Locate the cached snapshot directory
+    cache_dir = os.path.join(
+        torch.hub.get_dir().replace("/hub", ""),
+        "huggingface",
+        "hub",
+        f"models--{model_id.replace('/', '--')}",
+    )
+    if not os.path.isdir(cache_dir):
+        # Try the HF_HOME default
+        hf_home = os.environ.get(
+            "HF_HOME",
+            os.path.expanduser("~/.cache/huggingface"),
+        )
+        cache_dir = os.path.join(hf_home, "hub", f"models--{model_id.replace('/', '--')}")
+    snapshot_dirs = sorted(glob.glob(os.path.join(cache_dir, "snapshots", "*")))
+    if not snapshot_dirs:
+        logger.warning("NemotronH dt_bias fix: snapshot dir not found")
+        return
+
+    snapshot = snapshot_dirs[-1]
+    safetensor_files = sorted(glob.glob(os.path.join(snapshot, "*.safetensors")))
+
+    patched = 0
+    state = model.state_dict()
+    for f in safetensor_files:
+        with safe_open(f, framework="pt") as st:
+            for key in st.keys():
+                if "dt_bias" not in key:
+                    continue
+                if key not in state:
+                    continue
+                ckpt_val = st.get_tensor(key)
+                param = state[key]
+                with torch.no_grad():
+                    param.copy_(ckpt_val.to(param.device, dtype=param.dtype))
+                patched += 1
+
+    # Write the fixed values back into the live model
+    if patched:
+        model.load_state_dict(state, strict=False)
+        logger.info("NemotronH: restored %d dt_bias params from checkpoint", patched)
 
 
 def load_torch_model(
@@ -33,6 +101,7 @@ def load_torch_model(
         device_map=device,
         trust_remote_code=True,
     )
+    _fix_nemotron_h_dt_bias(model, model_id)
     model.eval()
 
     if tokenizer.pad_token is None:

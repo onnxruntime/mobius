@@ -148,8 +148,12 @@ def _use_temp_hf_cache(tmp_path):
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
 _XFAIL_REASONS: dict[str, str] = {
-    # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
-    "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
+    # NemotronH uses mamba-ssm CUDA kernels (trust_remote_code) that are
+    # non-deterministic across model loads for float32.  HF itself produces
+    # different argmax on each load, so golden comparison is unreliable.
+    "text-generation/nemotron-h-nano-4b": "NemotronH HF float32 is non-deterministic across loads (mamba-ssm CUDA kernels)",
+    "text-generation/nemotron-3-nano-30b": "NemotronH HF float32 is non-deterministic across loads (mamba-ssm CUDA kernels)",
+    "text-generation/nemotron-3-super-120b": "NemotronH HF float32 is non-deterministic across loads (mamba-ssm CUDA kernels)",
 }
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
