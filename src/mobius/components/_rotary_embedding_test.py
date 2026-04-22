@@ -171,6 +171,17 @@ class TestInitializeRope:
         rope = initialize_rope(config)
         assert isinstance(rope, InterleavedMRope)
 
+    def test_nope_returns_none(self):
+        """initialize_rope returns None when rope_type is None (NoPE).
+
+        NoPE models like NemotronH and GraniteMoeHybrid leave ``rope_type``
+        at its ``None`` default so that callers do not silently apply
+        rotary encoding to a model that shouldn't have any. This is the
+        Phase 1 fix for the default-value bug.
+        """
+        config = make_config(rope_type=None)
+        assert initialize_rope(config) is None
+
 
 class TestChunkedMRope:
     def test_creates_caches_and_masks(self):

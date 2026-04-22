@@ -29,7 +29,7 @@ import pytest
 
 from mobius import build
 from mobius._model_package import ModelPackage
-from mobius._testing.generation import OnnxGenerator
+from mobius._testing.generation import OnnxGenerator, OnnxSeq2SeqGenerator
 from mobius._testing.golden import (
     GoldenRef,
     GoldenTestCase,
@@ -63,6 +63,9 @@ def _get_test_device_kwargs() -> dict[str, str]:
     if ep:
         kwargs["providers"] = [ep]
     return kwargs
+
+
+_IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 def _make_empty_kv_cache(
@@ -144,10 +147,7 @@ def _use_temp_hf_cache(tmp_path):
 
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
-_XFAIL_REASONS: dict[str, str] = {
-    # Hybrid Mamba2 near-tie: top logits too close for stable argmax across frameworks
-    "text-generation/bamba-9b": "Bamba hybrid Mamba2 produces near-tie logits for this prompt",
-}
+_XFAIL_REASONS: dict[str, str] = {}
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
 _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
@@ -163,7 +163,7 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
 
 def _discover_cases(
     level: str,
-    extra_xfails: dict[str, str] | None = None,
+    xfails: dict[str, str] | None = None,
 ) -> list[pytest.ParameterSet]:
     """Discover YAML test cases and wrap as ``pytest.param`` entries.
 
@@ -172,7 +172,6 @@ def _discover_cases(
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
-    all_xfails = {**_XFAIL_REASONS, **(extra_xfails or {})}
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -180,12 +179,14 @@ def _discover_cases(
 
         if case.skip_reason:
             marks.append(pytest.mark.skip(reason=case.skip_reason))
+        elif case.ci_skip_reason and _IN_CI:
+            marks.append(pytest.mark.skip(reason=f"[CI] {case.ci_skip_reason}"))
         elif not has_golden(case):
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
-        elif test_id in all_xfails:
-            marks.append(pytest.mark.xfail(reason=all_xfails[test_id], strict=False))
+        elif xfails and test_id in xfails:
+            marks.append(pytest.mark.xfail(reason=xfails[test_id], strict=False))
 
         params.append(
             pytest.param(
@@ -197,8 +198,8 @@ def _discover_cases(
     return params
 
 
-_L4_CASES = _discover_cases("L4")
-_L5_CASES = _discover_cases("L5", extra_xfails=_L5_ONLY_XFAIL_REASONS)
+_L4_CASES = _discover_cases("L4", xfails=_XFAIL_REASONS)
+_L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1064,137 @@ def _run_text_only_multimodel_prefill(
     return outputs
 
 
+def _run_phi4mm_multimodal_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run the Phi4MM 4-model pipeline: vision → speech → embedding → decoder.
+
+    Phi4MM is a multimodal model with separate ONNX models for vision
+    (SigLIP), speech (Conformer), embedding (InputMixer), and decoder.
+    The pipeline chains: pixel_values → vision → image_features,
+    audio → speech → audio_features, then input_ids + features → embedding
+    → inputs_embeds → decoder → logits.
+    """
+    import transformers
+
+    device_kwargs = _get_test_device_kwargs()
+    hidden_size = getattr(config, "hidden_size", 3072)
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Step 1: Vision encoder (if images are provided)
+    if case.images:
+        from PIL import Image
+
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        images = [Image.open(_TESTDATA_DIR / img_path) for img_path in case.images]
+        img_inputs = processor.image_processor(images=images, return_tensors="np")
+        # Phi4MM image_processor returns 'input_image_embeds' as pixel tensor
+        pixel_values = img_inputs["input_image_embeds"].astype(np.float32)
+        image_sizes = img_inputs["image_sizes"].astype(np.int64)
+
+        # The vision model processes one image at a time (image_sizes is
+        # [1, 2] per call).  For multi-image, loop and concatenate.
+        vision_session = OnnxModelSession(pkg["vision"], **device_kwargs)
+        try:
+            all_features = []
+            num_images = pixel_values.shape[0]
+            for img_idx in range(num_images):
+                # Per-image crops: [crops, C, H, W]
+                per_img_pv = pixel_values[img_idx].astype(np.float32)
+                per_img_sizes = image_sizes[img_idx : img_idx + 1]  # [1, 2]
+                vision_out = vision_session.run(
+                    {"pixel_values": per_img_pv, "image_sizes": per_img_sizes}
+                )
+                feat = vision_out["image_features"]
+                if feat.ndim == 3:
+                    feat = feat[0]
+                all_features.append(feat)
+            image_features = np.concatenate(all_features, axis=0)
+        finally:
+            vision_session.close()
+    else:
+        image_features = np.zeros((0, hidden_size), dtype=np.float32)
+
+    # Step 2: Speech encoder (if audio is provided)
+    if case.audio:
+        import librosa
+
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        audios = []
+        for audio_path in case.audio:
+            audio_array, _sr = librosa.load(str(_TESTDATA_DIR / audio_path), sr=16000)
+            audios.append((audio_array, 16000))
+
+        # Process audio through the HF feature extractor
+        # Phi4MM expects list of (audio_array, sample_rate) tuples
+        audio_inputs = processor.audio_processor(audios, return_tensors="np")
+        audio_embeds = audio_inputs["input_audio_embeds"].astype(np.float32)
+        # audio_embeds: [num_clips, seq, features]
+        # audio_embed_sizes: per-clip output token counts from the processor
+        audio_sizes = audio_inputs["audio_embed_sizes"].astype(np.int64)
+        if audio_sizes.ndim > 1:
+            audio_sizes = audio_sizes.flatten()
+        # audio_projection_mode: 0=speech-only, 1=combined with vision
+        # When images are also present, HF uses the "vision" audio projection
+        audio_projection_mode = np.array(1 if case.images else 0, dtype=np.int64)
+
+        speech_session = OnnxModelSession(pkg["speech"], **device_kwargs)
+        try:
+            speech_out = speech_session.run(
+                {
+                    "audio_embeds": audio_embeds,
+                    "audio_sizes": audio_sizes,
+                    "audio_projection_mode": audio_projection_mode,
+                }
+            )
+        finally:
+            speech_session.close()
+        audio_features = speech_out["audio_features"]
+        # Flatten batch of clips: [num_clips, tokens, H] → [total_tokens, H]
+        if audio_features.ndim == 3:
+            audio_features = audio_features.reshape(-1, audio_features.shape[-1])
+    else:
+        audio_features = np.zeros((0, hidden_size), dtype=np.float32)
+
+    # Step 3: Embedding (fuse text + vision + speech)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+    try:
+        emb_out = emb_session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+                "audio_features": audio_features,
+            }
+        )
+    finally:
+        emb_session.close()
+    inputs_embeds = emb_out["inputs_embeds"]
+
+    # Step 4: Decoder
+    dec_session = OnnxModelSession(pkg["model"], **device_kwargs)
+    try:
+        seq_len = inputs_embeds.shape[1]
+        kv_cache = _make_empty_kv_cache(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+            "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
+            **kv_cache,
+        }
+        outputs = dec_session.run(dec_feeds)
+    finally:
+        dec_session.close()
+
+    return outputs
+
+
 def _run_speech_language_prefill(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -1244,6 +1376,8 @@ class TestL4CheckpointVerified:
             outputs = _run_speech_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-text-to-text":
             outputs = _run_vision_language_prefill(pkg, case, config)
+        elif case.task_type == "phi4mm-multimodal":
+            outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
@@ -1295,11 +1429,13 @@ class TestL4CheckpointVerified:
 # ---------------------------------------------------------------------------
 
 # Task types that support autoregressive generation.
-# seq2seq and speech-to-text require specialised loops not yet implemented.
 _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
         "image-text-to-text",
+        "seq2seq",
+        "speech-to-text",
+        "speech-language",
     }
 )
 
@@ -1358,6 +1494,337 @@ def _run_causal_lm_generation(
     return all_ids[0, prompt_len:]
 
 
+def _run_seq2seq_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+    expected_token_ids: list[int] | None = None,
+) -> np.ndarray:
+    """Run greedy generation for a seq2seq (encoder-decoder) model.
+
+    Returns the full decoder output including decoder_start_token,
+    matching HuggingFace model.generate() output format.
+    """
+    config = pkg.config
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        generator = OnnxSeq2SeqGenerator(enc_session, dec_session, config)
+        input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        eos_token_id = case.generation_params.get("eos_token_id", None)
+
+        # Extract decoder_start_token_id: prefer config, fall back to
+        # the first token of the golden generation sequence.
+        decoder_start_id = getattr(config, "decoder_start_token_id", None)
+        if decoder_start_id is None and expected_token_ids:
+            decoder_start_id = expected_token_ids[0]
+        if decoder_start_id is None:
+            decoder_start_id = 0
+
+        all_ids = generator.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_id,
+        )
+    finally:
+        enc_session.close()
+        dec_session.close()
+
+    # Return the full decoder output including decoder_start_token,
+    # matching HuggingFace model.generate() output format.
+    return all_ids[0]
+
+
+def _run_speech_to_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+) -> np.ndarray:
+    """Run greedy generation for a speech-to-text (Whisper) model.
+
+    Returns only the "real" generated tokens (after the forced decoder
+    prefix), matching HuggingFace ``model.generate()`` output which
+    strips the forced prefix tokens.
+    """
+    import librosa
+    import transformers
+
+    from mobius._testing.generation import OnnxSpeechToTextGenerator
+
+    config = pkg.config
+    device_kwargs = _get_test_device_kwargs()
+
+    # Load audio and extract features (same as L4 prefill)
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        trust_remote_code=case.trust_remote_code,
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+    processed = processor(
+        audio_array,
+        sampling_rate=16000,
+        return_tensors="np",
+    )
+
+    # Step 1: Run encoder
+    enc_session = OnnxModelSession(pkg["encoder"], **device_kwargs)
+    try:
+        enc_feeds: dict[str, np.ndarray] = {}
+        for name in enc_session.input_names:
+            if name in processed:
+                enc_feeds[name] = processed[name].astype(np.float32)
+        enc_outputs = enc_session.run(enc_feeds)
+    finally:
+        enc_session.close()
+
+    enc_hidden = None
+    for key in ("encoder_hidden_states", "last_hidden_state"):
+        if key in enc_outputs:
+            enc_hidden = enc_outputs[key]
+            break
+    if enc_hidden is None:
+        raise KeyError(
+            f"Encoder output missing hidden states. Keys: {sorted(enc_outputs.keys())}"
+        )
+
+    # Step 2: Run decoder generation
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        decoder_start_id = getattr(config, "decoder_start_token_id", 0) or 0
+        max_new_tokens = case.generation_params.get("max_new_tokens", 50)
+        eos_token_id = case.generation_params.get("eos_token_id", None)
+
+        generator = OnnxSpeechToTextGenerator(dec_session, config)
+        all_ids = generator.generate(
+            enc_hidden,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_id,
+        )
+    finally:
+        dec_session.close()
+
+    # Strip forced decoder prefix.  HF model.generate() returns only
+    # the "real" generated tokens — it internally handles forced decoder
+    # IDs (language, task, notimestamps) and strips them from output.
+    # We align by finding where the expected content starts in our
+    # greedy output, using the golden's first token as anchor.
+    output = all_ids[0]  # drop batch dim
+
+    # Load the expected tokens to find the prefix boundary.
+    expected = load_generation_golden(case)
+    if expected and len(output) > 0:
+        first_expected = expected[0]
+        # Find the first occurrence of the expected first token
+        prefix_len = 0
+        for i, tok in enumerate(output):
+            if tok == first_expected:
+                prefix_len = i
+                break
+
+        output = output[prefix_len:]
+
+    # Strip trailing EOS tokens that HF generation suppresses.
+    eos_id = case.generation_params.get("eos_token_id", None)
+    if eos_id is not None:
+        while len(output) > 0 and output[-1] == eos_id:
+            output = output[:-1]
+
+    return output
+
+
+def _run_speech_language_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+    golden: GoldenRef,
+    max_new_tokens: int = 50,
+) -> np.ndarray:
+    """Run greedy generation for a speech-language (3-model) pipeline.
+
+    Pipeline: audio_encoder → embedding → decoder (autoregressive).
+    Uses the same embed→decode loop as VL generation but with audio
+    features instead of image features.
+
+    Returns newly generated token IDs (prompt excluded).
+    """
+    import librosa
+    import transformers
+
+    device_kwargs = _get_test_device_kwargs()
+
+    # --- Load audio and extract features ---
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+
+    fe = getattr(processor, "feature_extractor", None)
+    if fe is None or not hasattr(fe, "sampling_rate"):
+        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
+    audio_processed = fe(
+        [audio_array],
+        sampling_rate=16000,
+        return_tensors="np",
+        padding=False,
+    )
+
+    # --- Step 1: audio encoder ---
+    audio_key = "audio" if "audio" in pkg else "audio_encoder"
+    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
+    try:
+        audio_feeds: dict[str, np.ndarray] = {}
+        for name in audio_session.input_names:
+            if name in audio_processed:
+                audio_feeds[name] = audio_processed[name].astype(np.float32)
+            elif name == "input_features" and "input_features" in audio_processed:
+                audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
+        audio_out = audio_session.run(audio_feeds)
+    finally:
+        audio_session.close()
+
+    audio_hidden = audio_out[next(iter(audio_out))]
+    if audio_hidden.ndim == 3:
+        audio_hidden = audio_hidden[0]  # squeeze batch → [seq, hidden]
+
+    # --- Build input_ids from golden reference ---
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+
+    # Adjust audio placeholder count to match encoder output
+    num_encoder_tokens = audio_hidden.shape[0]
+    audio_token_id = getattr(config, "audio_token_id", None)
+    if audio_token_id is None:
+        thinker_cfg = getattr(config, "thinker_config", None)
+        if thinker_cfg is not None:
+            audio_token_id = getattr(thinker_cfg, "audio_token_id", None)
+    if audio_token_id is not None:
+        flat = input_ids[0].tolist()
+        num_placeholders = flat.count(audio_token_id)
+        if num_placeholders != num_encoder_tokens:
+            new_ids: list[int] = []
+            replaced = False
+            for tok in flat:
+                if tok == audio_token_id:
+                    if not replaced:
+                        new_ids.extend([audio_token_id] * num_encoder_tokens)
+                        replaced = True
+                else:
+                    new_ids.append(tok)
+            input_ids = np.array(new_ids, dtype=np.int64).reshape(1, -1)
+
+    # --- Step 2: embedding (prefill) ---
+    dec_key = "model" if "model" in pkg else "decoder"
+    dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+
+    # Find the audio features input name on the embedding model
+    audio_feat_input = next(
+        (n for n in emb_session.input_names if "audio" in n),
+        None,
+    )
+
+    try:
+        emb_feeds: dict[str, np.ndarray] = {
+            "input_ids": input_ids,
+        }
+        if audio_feat_input is not None:
+            emb_feeds[audio_feat_input] = audio_hidden
+        for name in emb_session.input_names:
+            if name not in emb_feeds:
+                shape = emb_session.get_input_shape(name) or []
+                static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+        emb_out = emb_session.run(emb_feeds)
+        inputs_embeds = emb_out[next(iter(emb_out))]
+
+        batch_size = 1
+        prompt_seq_len = inputs_embeds.shape[1]
+        hidden_size = inputs_embeds.shape[2]
+
+        # --- Step 3: prefill decoder ---
+        past_cache = _make_empty_kv_cache(dec_session, config)
+        dec_feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
+            **past_cache,
+        }
+        if "input_ids" in dec_session.input_names:
+            dec_feeds["input_ids"] = input_ids
+
+        # Detect 3D position_ids (e.g. Qwen3-ASR uses MRoPE-style)
+        uses_3d_pos = False
+        ndims_pos = 3
+        if "position_ids" in dec_session.input_names:
+            pos = np.arange(prompt_seq_len, dtype=np.int64).reshape(1, -1)
+            pos_shape = dec_session.get_input_shape("position_ids")
+            if pos_shape and len(pos_shape) == 3:
+                uses_3d_pos = True
+                ndims_pos = pos_shape[0] if isinstance(pos_shape[0], int) else 3
+                pos = np.tile(pos, (ndims_pos, 1, 1))
+            dec_feeds["position_ids"] = pos
+
+        prefill_out = dec_session.run(dec_feeds)
+        logits = prefill_out["logits"]
+        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        _update_vl_cache(past_cache, prefill_out, config)
+
+        generated = [next_token]
+        past_seq_len = prompt_seq_len
+
+        # --- Step 4: decode loop ---
+        empty_audio = np.zeros((0, hidden_size), dtype=np.float32)
+        eos_token_id = case.generation_params.get("eos_token_id")
+        for _ in range(max_new_tokens - 1):
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+
+            # Embed single token (no new audio features during decode)
+            step_emb_feeds: dict[str, np.ndarray] = {"input_ids": next_token}
+            if audio_feat_input is not None:
+                step_emb_feeds[audio_feat_input] = empty_audio
+            for name in emb_session.input_names:
+                if name not in step_emb_feeds:
+                    shape = emb_session.get_input_shape(name) or []
+                    static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+            step_emb_out = emb_session.run(step_emb_feeds)
+            step_embeds = step_emb_out[next(iter(step_emb_out))]
+
+            total_len = past_seq_len + 1
+            step_feeds: dict[str, np.ndarray] = {
+                "inputs_embeds": step_embeds,
+                "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
+                **past_cache,
+            }
+            if "input_ids" in dec_session.input_names:
+                step_feeds["input_ids"] = next_token
+            if "position_ids" in dec_session.input_names:
+                if uses_3d_pos:
+                    step_feeds["position_ids"] = np.full(
+                        (ndims_pos, batch_size, 1), past_seq_len, dtype=np.int64
+                    )
+                else:
+                    step_feeds["position_ids"] = np.array([[past_seq_len]], dtype=np.int64)
+
+            step_out = dec_session.run(step_feeds)
+            logits = step_out["logits"]
+            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            generated.append(next_token)
+            _update_vl_cache(past_cache, step_out, config)
+            past_seq_len = total_len
+
+    finally:
+        dec_session.close()
+        emb_session.close()
+
+    return np.concatenate(generated, axis=1)[0]  # [generated_len]
+
+
 # ---------------------------------------------------------------------------
 # L5 Tests: Generation E2E
 # ---------------------------------------------------------------------------
@@ -1369,9 +1836,9 @@ class TestL5GenerationE2E:
     """L5: Full autoregressive generation, compare token sequences.
 
     Gate: token match ratio >= ``min_token_match_ratio`` from tolerances.
-    Supported task types: ``text-generation`` (causal-LM via OnnxGenerator)
-    and ``image-text-to-text`` (VL three-model pipeline).
-    Other task types (seq2seq, speech-to-text) are skipped.
+    Supported task types: ``text-generation`` (causal-LM via OnnxGenerator),
+    ``image-text-to-text`` (VL three-model pipeline), ``seq2seq`` and
+    ``speech-to-text`` (encoder-decoder via OnnxSeq2SeqGenerator).
     """
 
     @pytest.mark.parametrize("case", _L5_CASES)
@@ -1424,6 +1891,18 @@ class TestL5GenerationE2E:
                 config,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
+            )
+        elif case.task_type == "seq2seq":
+            new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
+        elif case.task_type == "speech-to-text":
+            new_tokens = _run_speech_to_text_generation(pkg, case, golden)
+        elif case.task_type == "speech-language":
+            new_tokens = _run_speech_language_generation(
+                pkg,
+                case,
+                config,
+                golden,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 50),
             )
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4) — L5 generation

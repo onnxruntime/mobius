@@ -33,7 +33,13 @@ class TestArchitectureConfig:
         assert config.hidden_size == DEFAULT_INT
         assert config.num_hidden_layers == DEFAULT_INT
         assert config.rms_norm_eps == pytest.approx(1e-6)
-        assert config.rope_type == "default"
+        # rope_type defaults to None (NoPE) so that directly-constructed
+        # ArchitectureConfig instances without an explicit rope_type are
+        # treated as having no RoPE, matching the signal from_transformers
+        # uses for NoPE models. The other RoPE fields keep inert numeric
+        # defaults so that specifying only rope_type="default" is enough
+        # for test / reproducer configs.
+        assert config.rope_type is None
         assert config.rope_theta == pytest.approx(10_000.0)
         assert config.partial_rotary_factor == pytest.approx(1.0)
         assert config.attn_qkv_bias is False
@@ -125,6 +131,9 @@ class TestArchitectureConfig:
             rms_norm_eps = 1e-5
             rope_theta = 10000.0
             rope_scaling = None
+            # Real HuggingFace LlamaConfig populates rope_parameters in
+            # __post_init__ for any model that declares RoPE support.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         config = ArchitectureConfig.from_transformers(FakeLlamaConfig())
         assert config.vocab_size == 32000
@@ -232,30 +241,128 @@ class TestArchitectureConfig:
         assert config.bos_token_id == 2
         assert config.eos_token_id == 1
 
+    def test_from_transformers_nope_model_has_none_rope(self):
+        """NoPE models (e.g. NemotronH) get ``rope=None`` and ``rope_type=None``.
+
+        This is the Phase 1 fix for the silent-RoPE-on-NoPE-models bug:
+        when the HuggingFace config declares neither ``rope_parameters``
+        nor ``rope_scaling`` nor the legacy ``rotary_dim`` / ``rotary_pct``
+        / ``rotary_emb_base`` fields, the resulting ``ArchitectureConfig``
+        must express "no RoPE" structurally so that ``initialize_rope``
+        returns ``None`` and ``TextModel`` skips rotary encoding entirely.
+        """
+
+        class FakeNemotronH:
+            # Minimal NemotronH-like config: carries a stale ``rope_theta``
+            # as dead data but declares NO ``rope_parameters`` / ``rope_scaling``
+            # / ``rotary_*`` fields — so this is a NoPE model.
+            model_type = "nemotron_h"
+            num_attention_heads = 8
+            num_key_value_heads = 2
+            num_hidden_layers = 4
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "relu2"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0  # stale — ignored because no rope_parameters
+
+        config = ArchitectureConfig.from_transformers(FakeNemotronH())
+        # Sub-config is None: no RoPE data exists at all.
+        assert config.rope is None
+        # Flat fields are all None: no spurious "default" values.
+        assert config.rope_type is None
+        assert config.rope_theta is None
+        assert config.partial_rotary_factor is None
+        assert config.rope_scaling is None
+        assert config.rope_local_base_freq is None
+        assert config.original_max_position_embeddings is None
+        # rope_interleave stays at its inert False default.
+        assert config.rope_interleave is False
+
+    def test_from_transformers_legacy_rotary_dim_enables_rope(self):
+        """GPT-J / CodeGen-style legacy configs use ``rotary_dim``."""
+
+        class FakeGPTJ:
+            model_type = "gptj"
+            num_attention_heads = 4
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 16
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rotary_dim = 8  # legacy partial-RoPE signal
+
+        config = ArchitectureConfig.from_transformers(FakeGPTJ())
+        # Legacy rotary_dim activates RoPE with partial_rotary_factor = 8/16.
+        assert config.rope is not None
+        assert config.rope_type == "default"
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+
 
 class TestExtractRopeConfig:
     """Unit tests for _extract_rope_config helper."""
 
     def test_defaults_when_no_rope_attrs(self):
-        """Bare config with no rope attrs yields sensible defaults."""
+        """Bare config with no RoPE signal yields ``None`` (NoPE model)."""
 
         class Bare:
             pass
 
         result = _extract_rope_config(Bare())
+        assert result is None
+
+    def test_rope_theta_alone_is_not_a_rope_signal(self):
+        """rope_theta without rope_parameters/rope_scaling is not a RoPE signal.
+
+        For example NemotronH carries ``rope_theta`` as dead data while
+        declaring no actual RoPE support — so the absence of
+        ``rope_parameters`` / ``rope_scaling`` / legacy rotary fields must
+        produce ``None`` (NoPE), not a spurious ``RoPEConfig``.
+        """
+
+        class Cfg:
+            # No rope_scaling, no rope_parameters — just a stale rope_theta.
+            rope_theta = 10_000.0
+
+        assert _extract_rope_config(Cfg()) is None
+
+    def test_rope_parameters_activates_rope(self):
+        """``rope_parameters`` on the HF config is the modern RoPE signal."""
+
+        class Cfg:
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_type == "default"
-        assert result.rope_theta == pytest.approx(10_000.0)
-        assert result.rope_scaling is None
-        assert result.partial_rotary_factor == pytest.approx(1.0)
-        assert result.rope_local_base_freq is None
-        assert result.original_max_position_embeddings is None
+
+    def test_legacy_rotary_dim_activates_rope(self):
+        """Legacy GPT-J / CodeGen configs use ``rotary_dim``."""
+
+        class Cfg:
+            rotary_dim = 64
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
 
     def test_rope_theta_from_config_attr(self):
         class Cfg:
             rope_theta = 500_000.0
-            rope_scaling = None
+            # rope_parameters triggers the RoPE path so rope_theta is read.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_theta == pytest.approx(500_000.0)
 
     def test_rope_type_from_rope_scaling(self):
@@ -268,9 +375,10 @@ class TestExtractRopeConfig:
     def test_partial_rotary_factor(self):
         class Cfg:
             partial_rotary_factor = 0.5
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.partial_rotary_factor == pytest.approx(0.5)
 
     def test_partial_rotary_factor_zero_is_preserved(self):
@@ -278,9 +386,10 @@ class TestExtractRopeConfig:
 
         class Cfg:
             partial_rotary_factor = 0.0
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.partial_rotary_factor == pytest.approx(0.0)
 
     def test_rope_theta_zero_is_preserved(self):
@@ -288,9 +397,10 @@ class TestExtractRopeConfig:
 
         class Cfg:
             rope_theta = 0.0
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.rope_theta == pytest.approx(0.0)
 
     def test_mrope_interleaved_from_rope_scaling(self):
@@ -319,9 +429,10 @@ class TestExtractRopeConfig:
     def test_original_max_position_embeddings(self):
         class Cfg:
             original_max_position_embeddings = 8192
-            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
 
         result = _extract_rope_config(Cfg())
+        assert result is not None
         assert result.original_max_position_embeddings == 8192
 
 

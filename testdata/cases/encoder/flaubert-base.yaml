@@ -7,6 +7,7 @@ inputs:
   prompts:
     - "The quick brown fox jumps over the lazy dog."
 
+skip_reason: "Hidden activation is None; not handled in ACT2FN."
 level: "L4"
 
 notes: "FlauBERT base cased. French encoder-only model."

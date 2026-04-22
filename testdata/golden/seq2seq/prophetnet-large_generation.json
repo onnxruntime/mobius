@@ -1,0 +1,17 @@
+{
+  "model_id": "microsoft/prophetnet-large-uncased",
+  "prompt": "summarize: The tower is 324 metres tall and is the tallest structure in Paris.",
+  "generated_tokens": [
+    102,
+    7680,
+    1024,
+    1024,
+    7680,
+    7849,
+    4697,
+    1024,
+    1024,
+    102
+  ],
+  "generated_text": "sum : : summarize : :"
+}

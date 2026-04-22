@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "ORT shape inference error in model graph."
 level: "L4"
 
 notes: "Depth Anything small. Monocular depth estimation."

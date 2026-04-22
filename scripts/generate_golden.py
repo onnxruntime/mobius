@@ -230,6 +230,15 @@ def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
 
     model, tokenizer = load_torch_encoder_model(case.model_id, device=device)
 
+    # CLIP-like multimodal models wrap a text sub-model that can be
+    # called with text-only inputs (pixel_values not required).
+    if hasattr(model, "text_model"):
+        model = model.text_model
+
+    # X-MOD requires setting a default language before inference.
+    if hasattr(model, "set_default_language"):
+        model.set_default_language("en_XX")
+
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
@@ -267,7 +276,11 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
     input_ids = encoded["input_ids"]
 
     # Prepare decoder input (pad token for autoregressive start)
-    decoder_start = np.array([[model.config.decoder_start_token_id or 0]], dtype=np.int64)
+    decoder_start_id = getattr(model.config, "decoder_start_token_id", None)
+    if decoder_start_id is None:
+        generation_config = getattr(model, "generation_config", None)
+        decoder_start_id = getattr(generation_config, "decoder_start_token_id", None) or 0
+    decoder_start = np.array([[decoder_start_id]], dtype=np.int64)
 
     # L4: single forward pass through full model
     torch_device = next(model.parameters()).device
@@ -635,12 +648,18 @@ def _prepare_speech_language_inputs(
         text_prompt = processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False
         )
+        # If prompts are provided, append as forced decoder prefix
+        # (e.g. "language English<asr_text>" to skip language detection).
+        force_prefix = ""
+        if case.prompts:
+            force_prefix = case.prompts[0]
+            text_prompt = text_prompt + force_prefix
         processed = processor(
             text=text_prompt,
             audio=[audio_array],
             return_tensors="pt",
         ).to(device)
-        prompt_for_golden = str(audio_path)
+        prompt_for_golden = force_prefix or str(audio_path)
     else:
         # Gemma4-style: text prompt + audio
         prompt_text = case.prompts[0]
@@ -735,10 +754,20 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
 
     # Forward pass → last_hidden_state
     hidden_states = torch_vision_forward(model, pixel_values)
-    # Use the last patch token rather than the CLS token (index 0) because
-    # patch-based ViT models aggregate spatial context into trailing tokens;
-    # the last token provides a stable, architecture-neutral summary vector.
-    last_hidden = hidden_states[0, -1, :]  # (hidden_size,)
+    # Vision models return different output shapes:
+    # - ViT-like: [B, seq_len, hidden] → select first token (CLS)
+    # - CNN-like (CvT, MobileViT, PVT): [B, C, H, W] → flatten feature map
+    # - Classification head: [B, num_classes] → 1-D logits
+    batch_hidden = hidden_states[0]  # drop batch dim
+    if batch_hidden.ndim == 2:
+        # (seq_len, hidden) — take CLS token
+        last_hidden = batch_hidden[0]
+    elif batch_hidden.ndim >= 3:
+        # (C, H, W) feature map — flatten
+        last_hidden = batch_hidden.reshape(-1)
+    else:
+        # 1-D logits or already flat
+        last_hidden = batch_hidden
     golden = _extract_logits_golden(last_hidden)
 
     # Image classification is L4-only (no generation)
@@ -753,6 +782,321 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
 
+# ---- Phi4MM multimodal generator ----
+
+
+def _apply_phi4mm_compat_patches():
+    """Apply compatibility patches for Phi4MM on transformers 5.x.
+
+    Phi4MM's remote code was written for transformers 4.x and has several
+    incompatibilities with transformers 5.x:
+
+    1. NemoConvSubsampling.__init__() calls int() on a meta tensor
+       (calc_length result) — we intercept __int__ to compute on CPU.
+    2. _tied_weights_keys is a list but transformers 5.x expects a dict.
+    3. PeftModelForCausalLM expects prepare_inputs_for_generation.
+    4. DynamicCache.get_usable_length was renamed to get_seq_length.
+
+    Returns a cleanup function that restores original behavior.
+    """
+    import math
+
+    import torch
+
+    patches = {}
+
+    # Patch 1: meta tensor int() for NemoConvSubsampling calc_length
+    patches["tensor_int"] = torch.Tensor.__int__
+    _orig_int = patches["tensor_int"]
+
+    def _meta_safe_int(self):
+        if self.is_meta:
+            import inspect
+
+            frame = inspect.currentframe().f_back
+            lv = frame.f_locals
+            if "out_length" in lv and "conv_channels" in lv:
+                s = lv["self"]
+                val = float(lv.get("feat_in", 80))
+                add_pad = float(s._left_padding + s._right_padding - s._kernel_size)
+                for _ in range(s._sampling_num):
+                    val = (val + add_pad) / s._stride + 1.0
+                    val = math.ceil(val) if s._ceil_mode else math.floor(val)
+                return int(val)
+            return 0
+        return _orig_int(self)
+
+    torch.Tensor.__int__ = _meta_safe_int
+
+    # Patch 2: tied_weights_keys list→dict compat
+    # Phi4MM remote code sets _tied_weights_keys as a list (transformers 4.x
+    # format) but transformers 5.x expects a dict {tied_param: source_param}.
+    # We convert the list format before the original methods see it.
+    import transformers.modeling_utils as mu
+
+    def _fix_tied_weights_keys(model):
+        """Convert _tied_weights_keys from list to dict if needed."""
+        twk = getattr(model, "_tied_weights_keys", None)
+        if isinstance(twk, list):
+            # Build dict: for each tied key, find the source via
+            # _get_tied_params (the embedding weight it's tied to)
+            tied_dict = {}
+            for key in twk:
+                # Standard pattern: lm_head.weight -> model.embed_tokens.weight
+                if key == "lm_head.weight":
+                    tied_dict[key] = "model.embed_tokens.weight"
+                else:
+                    tied_dict[key] = key  # fallback: self-reference
+            model._tied_weights_keys = tied_dict
+
+    patches["get_expanded"] = mu.PreTrainedModel.get_expanded_tied_weights_keys
+    _orig_get_expanded = patches["get_expanded"]
+
+    def _patched_get_expanded(self, all_submodels=False):
+        _fix_tied_weights_keys(self)
+        return _orig_get_expanded(self, all_submodels=all_submodels)
+
+    mu.PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded
+
+    patches["post_init"] = mu.PreTrainedModel.post_init
+    _orig_post_init = patches["post_init"]
+
+    def _patched_post_init(self):
+        _fix_tied_weights_keys(self)
+        _orig_post_init(self)
+
+    mu.PreTrainedModel.post_init = _patched_post_init
+
+    patches["total_bytes"] = mu.get_total_byte_count
+    _orig_total_bytes = patches["total_bytes"]
+
+    def _patched_total_bytes(model, dm, q):
+        _fix_tied_weights_keys(model)
+        return _orig_total_bytes(model, dm, q)
+
+    mu.get_total_byte_count = _patched_total_bytes
+
+    # Patch 3: peft prepare_inputs_for_generation
+    import peft.peft_model as pm
+
+    patches["peft_init"] = pm.PeftModelForCausalLM.__init__
+    _orig_peft_init = patches["peft_init"]
+
+    def _patched_peft_init(self, model, peft_config=None, adapter_name="default", **kwargs):
+        if not hasattr(model, "prepare_inputs_for_generation"):
+            model.prepare_inputs_for_generation = lambda *a, **kw: {}
+        _orig_peft_init(
+            self,
+            model,
+            peft_config=peft_config,
+            adapter_name=adapter_name,
+            **kwargs,
+        )
+
+    pm.PeftModelForCausalLM.__init__ = _patched_peft_init
+
+    # Patch 4: DynamicCache compat (methods removed in transformers 5.x)
+    from transformers import DynamicCache
+
+    if not hasattr(DynamicCache, "get_usable_length"):
+        DynamicCache.get_usable_length = lambda self, *a, **kw: self.get_seq_length()
+        patches["dc_get_usable_length"] = True
+
+    if not hasattr(DynamicCache, "to_legacy_cache"):
+
+        def _to_legacy_cache(self):
+            return tuple((layer.keys, layer.values) for layer in self.layers)
+
+        DynamicCache.to_legacy_cache = _to_legacy_cache
+        patches["dc_to_legacy_cache"] = True
+
+    if not hasattr(DynamicCache, "from_legacy_cache"):
+
+        @classmethod
+        def _from_legacy_cache(cls, past_kv):
+            cache = cls()
+            if past_kv is not None:
+                for layer_idx, (k, v) in enumerate(past_kv):
+                    cache.update(k, v, layer_idx)
+            return cache
+
+        DynamicCache.from_legacy_cache = _from_legacy_cache
+        patches["dc_from_legacy_cache"] = True
+
+    def cleanup():
+        torch.Tensor.__int__ = patches["tensor_int"]
+        mu.PreTrainedModel.get_expanded_tied_weights_keys = patches["get_expanded"]
+        mu.PreTrainedModel.post_init = patches["post_init"]
+        mu.get_total_byte_count = patches["total_bytes"]
+        pm.PeftModelForCausalLM.__init__ = patches["peft_init"]
+        if patches.get("dc_get_usable_length"):
+            del DynamicCache.get_usable_length
+        if patches.get("dc_to_legacy_cache"):
+            del DynamicCache.to_legacy_cache
+        if patches.get("dc_from_legacy_cache"):
+            del DynamicCache.from_legacy_cache
+
+    return cleanup
+
+
+def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for Phi4MM (text + vision + audio).
+
+    Phi4MM is a 4-model-split multimodal model that accepts text, images,
+    and audio in any combination. Uses trust_remote_code for the custom
+    HF model and processor classes.
+    """
+    import torch
+    import transformers
+    from PIL import Image
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    # Apply transformers 5.x compatibility patches for Phi4MM remote code
+    cleanup = _apply_phi4mm_compat_patches()
+
+    try:
+        # Load model and processor
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        # Load in bfloat16 to reduce memory (14B model)
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            case.model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            trust_remote_code=True,
+            _attn_implementation="eager",
+        )
+        model.eval()
+    except Exception:
+        cleanup()
+        raise
+
+    # Build processor inputs based on available modalities
+    call_kwargs: dict = {}
+
+    # Text prompt
+    prompt_text = case.prompts[0] if case.prompts else ""
+
+    # Images
+    images = None
+    if case.images:
+        images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
+
+    # Audio (processor expects list of (audio_array, sample_rate) tuples)
+    audios = None
+    if case.audio:
+        import librosa
+
+        audios = []
+        for audio_path in case.audio:
+            audio_array, _sr = librosa.load(str(Path("testdata") / audio_path), sr=16000)
+            audios.append((audio_array, 16000))
+
+    # Build prompt with special tokens for each modality
+    # Phi4MM uses <|image_N|> and <|audio_N|> placeholders (1-indexed)
+    user_content = ""
+    if images:
+        for i in range(len(images)):
+            user_content += f"<|image_{i + 1}|>\n"
+    if audios:
+        for i in range(len(audios)):
+            user_content += f"<|audio_{i + 1}|>\n"
+    user_content += prompt_text
+
+    messages = [{"role": "user", "content": user_content}]
+    prompt_formatted = processor.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    call_kwargs["text"] = prompt_formatted
+    if images:
+        call_kwargs["images"] = images
+    if audios:
+        call_kwargs["audios"] = audios
+    call_kwargs["return_tensors"] = "pt"
+
+    processed = processor(**call_kwargs).to(device)
+
+    # L4: single forward pass for prefill logits
+    with torch.no_grad():
+        outputs = model(**processed)
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+    input_ids_np = processed["input_ids"].cpu().numpy()
+
+    # L5: manual greedy decode (model.generate() has compatibility issues
+    # with phi4mm's custom modeling code on transformers 4.x)
+    generated_ids = None
+    if "L5" in case.level:
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        gen_ids = []
+        past_kv = None
+        cur_input_ids = processed["input_ids"]
+        input_mode = processed.get("input_mode")
+        # Build initial kwargs (first step uses full processed inputs)
+        fwd_kwargs = dict(processed)
+        fwd_kwargs.pop("input_ids", None)
+        for step in range(max_new_tokens):
+            with torch.no_grad():
+                if step == 0:
+                    out = model(input_ids=cur_input_ids, **fwd_kwargs)
+                else:
+                    # Get sequence length from past KV cache
+                    # (works with both tuple-style and DynamicCache)
+                    if hasattr(past_kv, "get_seq_length"):
+                        kv_len = past_kv.get_seq_length()
+                    else:
+                        kv_len = past_kv[0][0].shape[2]
+                    out = model(
+                        input_ids=cur_input_ids,
+                        past_key_values=past_kv,
+                        input_mode=input_mode,
+                        attention_mask=torch.ones(
+                            1,
+                            kv_len + 1,
+                            dtype=torch.long,
+                            device=device,
+                        ),
+                    )
+            next_id = int(out.logits[0, -1, :].argmax())
+            past_kv = out.past_key_values
+            gen_ids.append(next_id)
+            cur_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            # Stop on EOS
+            eos = getattr(model.config, "eos_token_id", None)
+            if eos is not None and next_id == eos:
+                break
+        if gen_ids:
+            generated_ids = np.array(gen_ids)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids_np,
+    )
+
+    if generated_ids is not None:
+        generated_text = processor.tokenizer.decode(
+            generated_ids.tolist(), skip_special_tokens=True
+        )
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0] if case.prompts else "",
+            generated_tokens=generated_ids.tolist(),
+            generated_text=generated_text,
+        )
+
+    cleanup()
+
+
 # ---- Dispatcher ----
 
 # Map task_type strings to generator functions.
@@ -765,6 +1109,12 @@ _GENERATORS = {
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
+    # Vision tasks that produce last_hidden_state — reuse image classification.
+    "depth-estimation": _generate_image_classification,
+    "image-segmentation": _generate_image_classification,
+    "image-to-image": _generate_image_classification,
+    "object-detection": _generate_image_classification,
+    "phi4mm-multimodal": _generate_phi4mm_multimodal,
 }
 
 

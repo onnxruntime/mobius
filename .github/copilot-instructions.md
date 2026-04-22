@@ -90,7 +90,7 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
   to source)
 - Top-level tests: `tests/build_graph_test.py` (graph construction),
   `tests/integration_test.py` (numerical accuracy vs HuggingFace)
-- Skills: `.github/skills/<name>/SKILL.md`
+- Skills: `.agents/skills/<name>/SKILL.md`
 
 ### Code style
 

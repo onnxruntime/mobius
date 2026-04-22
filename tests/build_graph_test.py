@@ -1291,6 +1291,7 @@ class TestBuildGraphVisionLanguage:
                 hidden_size=32,
                 num_layers=1,
                 output_dim=64,
+                output_proj_dims=64,
                 audio_token_id=255998,
             ),
         )
@@ -1380,6 +1381,7 @@ class TestBuildGraphVisionLanguage:
                 hidden_size=32,
                 num_layers=1,
                 output_dim=64,
+                output_proj_dims=64,
                 audio_token_id=255998,
             ),
         )
@@ -3310,6 +3312,10 @@ class TestBuildBambaGraph:
             mamba_proj_bias=False,
             hidden_act="silu",
             head_dim=TINY_HIDDEN // TINY_HEADS,
+            # Bamba's attention layers use standard RoPE; enable it
+            # explicitly since ArchitectureConfig now defaults ``rope_type``
+            # to ``None`` (NoPE) to represent "no RoPE" structurally.
+            rope_type="default",
         )
 
     def test_bamba_builds(self):
@@ -3538,6 +3544,10 @@ class TestBuildJambaGraph:
             expert_layer_offset=1,
             num_local_experts=2,
             num_experts_per_tok=1,
+            # Jamba's attention layers use standard RoPE; enable it
+            # explicitly since ArchitectureConfig defaults ``rope_type`` to
+            # ``None`` (NoPE) to express "no RoPE" structurally.
+            rope_type="default",
         )
 
     def test_jamba_builds(self):

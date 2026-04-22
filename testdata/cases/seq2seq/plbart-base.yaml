@@ -8,6 +8,7 @@ inputs:
     - "def add(a, b): return a + b"
   decoder_prompt: ""
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 level: "L4+L5"
 
 generation:

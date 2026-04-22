@@ -107,6 +107,9 @@ _GEMMA2_CONFIG = Gemma2Config(
     query_pre_attn_scalar=16,
     attn_logit_softcapping=50.0,
     final_logit_softcapping=30.0,
+    # ArchitectureConfig defaults ``rope_type`` to None (NoPE) since
+    # April 2026; enable RoPE explicitly for this Gemma2 test config.
+    rope_type="default",
 )
 
 

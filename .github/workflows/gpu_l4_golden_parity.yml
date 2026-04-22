@@ -83,6 +83,7 @@ jobs:
         if: steps.check_golden.outputs.has_golden == 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
         run: |
           AFFECTED='${{ inputs.affected_models }}'
           if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then

@@ -5,8 +5,6 @@ dtype: "float32"
 trust_remote_code: true
 
 inputs:
-  prompts:
-    - "Transcribe this audio."
   audio:
     - "652-129742-0006.flac"
 
@@ -16,5 +14,4 @@ generation:
 
 level: "L4+L5"
 
-skip_reason: ""
-notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."
+notes: "Qwen3-ASR speech recognition (auto language detection). 3-model split: audio_encoder + embedding + decoder. Uses fixed chat template with audio-only input."

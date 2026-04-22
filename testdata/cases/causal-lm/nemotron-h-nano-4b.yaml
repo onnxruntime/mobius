@@ -13,5 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "4B parameter model — too large for CI golden generation."
+skip_reason: "Requires mamba-ssm package (CUDA-only) for HF inference."
 notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MLP architecture from NVIDIA."

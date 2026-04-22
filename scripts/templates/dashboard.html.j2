@@ -384,9 +384,17 @@ const LEVEL_DESCRIPTIONS = {
   bar.innerHTML = totalCard;
   for (let i = 0; i <= 5; i++) {
     const count = SUMMARY.by_level[i] || 0;
-    // Annotate L4 and L5 cards with skipped + awaiting-data counts so the full
-    // picture is visible without a separate redundant card.
+    // Annotate level cards with status breakdowns.
     let annotation = '';
+    if (i === 3) {
+      // L3: show pass/xfail/skip parity status breakdown
+      const l3s = SUMMARY.l3_status_counts || {};
+      const parts = [];
+      if (l3s.pass) parts.push(`${l3s.pass} pass`);
+      if (l3s.xfail) parts.push(`${l3s.xfail} xfail`);
+      if (l3s.skip) parts.push(`${l3s.skip} skip`);
+      if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
+    }
     if (i === 4 || i === 5) {
       const skipped = i === 4 ? (SUMMARY.l4_skipped_count || 0) : (SUMMARY.l5_skipped_count || 0);
       const caseKey = i === 4 ? 'l4_case' : 'l5_case';
@@ -403,19 +411,7 @@ const LEVEL_DESCRIPTIONS = {
       ${annotation}
     </div>`;
   }
-  // L3 parity breakdown
-  const l3s = SUMMARY.l3_status_counts || {};
-  if (l3s.pass || l3s.xfail || l3s.skip) {
-    bar.innerHTML += `<div class="summary-card" title="L3 parity status breakdown">
-      <div class="number" style="font-size:1em;line-height:1.4">
-        <span style="color:var(--l3)">${l3s.pass || 0}\u2713</span>
-        <span style="color:var(--l1)">${l3s.xfail || 0}\u26A0</span>
-        <span style="color:var(--text-muted)">${l3s.skip || 0}\u23ED</span>
-      </div>
-      <div class="label">L3 Parity Status</div>
-    </div>`;
-  }
-  // (L4/L5 skipped counts are shown as annotations on the L4/L5 level cards above.)
+  // (L3 parity status and L4/L5 skipped counts are shown as annotations on their level cards above.)
 })();
 
 // --- Category filter ---

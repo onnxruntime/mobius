@@ -159,9 +159,13 @@ class _Qwen2DecoderAsEncoder(nn.Module):
         # Learned query embeddings (for 1024x1024 images)
         self.query_1024 = Embedding(num_queries_1024, hidden_size)
 
-        # RoPE for position encoding
+        # RoPE for position encoding. ArchitectureConfig defaults
+        # ``rope_type`` to ``None`` (NoPE) since April 2026 to fix a
+        # silent RoPE-for-NoPE-models bug; set it explicitly here so
+        # ``initialize_rope`` returns a ``DefaultRope`` module.
         rope_config = ArchitectureConfig(
             head_dim=head_dim,
+            rope_type="default",
             rope_theta=rope_theta,
             max_position_embeddings=max_position_embeddings,
         )

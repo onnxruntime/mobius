@@ -1,0 +1,27 @@
+{
+  "model_id": "baidu/ERNIE-4.5-21B-A3B-PT",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    23,
+    23,
+    386,
+    93946,
+    66682,
+    301,
+    315,
+    290,
+    1172,
+    17877,
+    93946,
+    386,
+    23,
+    23,
+    93978,
+    1455,
+    542,
+    290,
+    28376,
+    94114
+  ],
+  "generated_text": "\n\n**\"Echoes of the Unseen\"**\n\nBeneath the moon\u2019"
+}

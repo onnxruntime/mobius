@@ -1,0 +1,18 @@
+{
+  "model_id": "microsoft/Phi-4-multimodal-instruct",
+  "prompt": "Compare these images and explain what you hear.",
+  "generated_tokens": [
+    38229,
+    279,
+    32,
+    198,
+    33,
+    198,
+    34,
+    198,
+    35,
+    200020,
+    199999
+  ],
+  "generated_text": "Both\n\nA\nB\nC\nD"
+}
