@@ -1165,7 +1165,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # nemotron_h: hybrid Mamba2+Attention (requires NemotronHConfig)
-    # NemotronH's "moe" layers are not yet implemented — use only mamba2+attention.
     (
         "nemotron_h",
         {
@@ -1179,6 +1178,36 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_n_groups": 1,
             "mamba_d_conv": 4,
             "mamba_expand": 2,
+        },
+        True,
+    ),
+    # nemotron_h MoE variant: hybrid Mamba2+MoE+Attention (Nemotron-3 30B/120B)
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": [
+                "mamba2",
+                "moe",
+                "mamba2",
+                "moe",
+                "full_attention",
+                "moe",
+            ],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 6,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE * 2,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 2.5,
         },
         True,
     ),

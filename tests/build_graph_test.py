@@ -255,8 +255,8 @@ class TestBuildGraph:
         layer_types = config.layer_types or []
         for i in range(num_layers):
             ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-            if ltype == "mlp":
-                continue  # MLP layers are stateless — no cache outputs
+            if ltype in ("mlp", "moe"):
+                continue  # MLP and MoE layers are stateless — no cache outputs
             if ltype == "lightning_attention":
                 # Lightning Attention: single recurrent state only (no conv_state)
                 assert f"present.{i}.recurrent_state" in output_names, (

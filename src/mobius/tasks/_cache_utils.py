@@ -220,8 +220,8 @@ def _make_hybrid_cache_inputs(
             )
             flat.append(conv_state)
             pairs.append((conv_state,))  # 1-tuple: conv has no second state
-        elif ltype == "mlp":
-            # MLP-only layers are stateless — no cache inputs needed
+        elif ltype in ("mlp", "moe"):
+            # MLP and MoE layers are stateless — no cache inputs needed
             pairs.append((None, None))
         elif ltype == "mamba":
             conv_state = ir.Value(
@@ -290,8 +290,8 @@ def _register_hybrid_cache_outputs(
     """
     for i, states in enumerate(present_key_values):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "mlp":
-            continue  # MLP layers produce no cache state
+        if ltype == "mlp" or ltype == "moe":
+            continue  # MLP and MoE layers produce no cache state
         if ltype == "lightning_attention":
             # Single recurrent state only (no conv_state for lightning)
             (state_a,) = states
