@@ -14,4 +14,4 @@ generation:
   do_sample: false
 
 notes: "Mixtral 8x7B. Canonical sparse Mixture-of-Experts with top-2 gating."
-skip_reason: "Model too large (47B MoE) for CPU golden generation."
+ci_skip_reason: "Model too large (47B MoE) for CI."

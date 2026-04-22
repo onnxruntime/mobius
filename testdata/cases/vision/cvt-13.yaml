@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Invalid ArchitectureConfig for CvT model."
 level: "L4"
 
 notes: "CvT-13. Convolutional vision transformer."

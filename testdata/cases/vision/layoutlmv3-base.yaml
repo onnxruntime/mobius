@@ -7,7 +7,6 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
-skip_reason: "Requires bbox + pixel_values + text inputs; not a simple vision model."
 level: "L4"
 
 notes: "LayoutLMv3 base. Unified text+image document model."

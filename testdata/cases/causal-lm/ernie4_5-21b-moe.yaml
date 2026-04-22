@@ -13,5 +13,6 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Model is 21B — too large for CI golden data generation."
+skip_reason: "UngatedSharedMoELayer requires config.shared_expert_intermediate_size."
+ci_skip_reason: "Model is 21B — too large for CI."
 notes: "ERNIE 4.5 MoE (3B active). e_score_correction_bias + shared expert."

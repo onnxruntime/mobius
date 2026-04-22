@@ -7,11 +7,11 @@ inputs:
   prompts:
     - "Here is my poem:"
 
+skip_reason: "Weight shape mismatch in audio_encoder.encoder.output_proj."
 level: "L4+L5"
 
 generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Gated repo (google/gemma-4-E4B-it requires authentication)."
 notes: "Gemma 4 E4B Any-to-Any (text-only path). Dual RoPE, KV sharing, double-wide MLP, sliding+global attention, logit softcapping, audio encoder."

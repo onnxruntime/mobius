@@ -8,6 +8,7 @@ inputs:
     - "translate English to German: The house is wonderful."
   decoder_prompt: ""
 
+skip_reason: "No safetensors weights on HuggingFace Hub."
 level: "L4+L5"
 
 generation:

@@ -135,6 +135,13 @@
       ],
       "description": "If non-null/non-empty, the test is skipped with this message. Use for known failures or unimplemented features."
     },
+    "ci_skip_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "If non-null/non-empty, the test is skipped in CI (GITHUB_ACTIONS=true) but runs locally. Use for models that are too large for CI hardware. Does NOT block golden data generation."
+    },
     "min_token_match_ratio": {
       "type": "number",
       "minimum": 0.0,

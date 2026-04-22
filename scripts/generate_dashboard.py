@@ -83,6 +83,7 @@ class ModelInfo:
     l5_test_case_skipped: bool = False
     yaml_test_case_file: str | None = None
     yaml_test_case_skip_reason: str | None = None
+    yaml_test_case_ci_skip_reason: str | None = None
     yaml_min_token_match_ratio: float | None = None
     # L3 synthetic parity status: "pass", "xfail", "skip", or None
     l3_status: str | None = None
@@ -413,6 +414,7 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         # Skip test cases that are explicitly skipped — they don't count as coverage,
         # but we still record them so the dashboard can show "skipped" status.
         skip_reason = data.get("skip_reason")
+        ci_skip_reason = data.get("ci_skip_reason")
         min_token_match_ratio = data.get("min_token_match_ratio")
         if skip_reason:
             matched_types = model_id_to_types.get(model_id, [])
@@ -435,6 +437,8 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
         for model_type in matched_types:
             if model_type in models:
                 models[model_type].yaml_test_case_file = rel_path
+                if ci_skip_reason:
+                    models[model_type].yaml_test_case_ci_skip_reason = ci_skip_reason
                 if min_token_match_ratio is not None:
                     models[model_type].yaml_min_token_match_ratio = float(
                         min_token_match_ratio
@@ -711,6 +715,7 @@ def _render_html(
                 "l3_reason": info.l3_status_reason,
                 "yaml_case": info.yaml_test_case_file,
                 "yaml_skip_reason": info.yaml_test_case_skip_reason,
+                "yaml_ci_skip_reason": info.yaml_test_case_ci_skip_reason,
                 "min_token_match_ratio": info.yaml_min_token_match_ratio,
                 "code_paths": sorted(info.code_paths),
                 "config_overrides": _json_safe(info.config_overrides),

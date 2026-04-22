@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-research/moe-7b-1b-active-shared-experts",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    203,
+    203,
+    1318,
+    15323,
+    438,
+    787,
+    19068,
+    203,
+    1318,
+    8424,
+    3210,
+    884,
+    20206,
+    299,
+    203,
+    1318,
+    7290,
+    483,
+    884,
+    323
+  ],
+  "generated_text": "\n\nThe sun is shining\nThe birds are singing\nThe flowers are b"
+}

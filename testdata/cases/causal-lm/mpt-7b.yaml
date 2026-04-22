@@ -13,5 +13,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Model is 7B — too large for CI golden data generation."
+skip_reason: "Model removed from HuggingFace Hub (mosaicml/mpt-7b)."
 notes: "MPT 7B. ALiBi attention, no positional embeddings, no bias in linear layers."

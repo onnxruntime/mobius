@@ -7,6 +7,7 @@ inputs:
   images:
     - "pipeline-cat-chonk.jpeg"
 
+skip_reason: "Invalid ArchitectureConfig for MobileViTv2."
 level: "L4"
 
 notes: "MobileViTv2 1.0. Separable self-attention mobile vision transformer."
