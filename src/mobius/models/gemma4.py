@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx_ir as ir
@@ -50,6 +51,9 @@ from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
+
+if TYPE_CHECKING:
+    from mobius.components._attention import GQAContext
 
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
@@ -675,7 +679,8 @@ class Gemma4TextAttention(nn.Module):
         if self.is_kv_shared_layer:
             # KV-shared layers always use standard Attention path because
             # they borrow K,V from a source layer (no own KV cache).
-            assert not use_gqa, "KV-shared layers should not receive GQAContext"
+            if use_gqa:
+                raise ValueError("KV-shared layers should not receive GQAContext")
             # Borrow full-history K,V from source layer.
             # present_key/value from the ONNX Attention op is 4D:
             #   [batch, kv_heads, total_seq, head_dim]
@@ -1008,8 +1013,8 @@ class Gemma4DecoderLayer(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple,
+        attention_bias: ir.Value | GQAContext,
+        position_embeddings: tuple | None,
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
         past_key_value: tuple | None,
@@ -1393,10 +1398,10 @@ class Gemma4TextModel(nn.Module):
 
         if use_gqa:
             # Realize cos/sin caches as ONNX graph initializers.
-            # The returned gathered embeddings are discarded — GQA indexes
-            # the full tables itself via do_rotary=1.
-            self.rotary_emb_local(op, position_ids)
-            self.rotary_emb_global(op, position_ids)
+            # The returned gathered embeddings are saved for potential reuse
+            # by KV-shared layers that fall back to standard Attention.
+            local_pos_emb = self.rotary_emb_local(op, position_ids)
+            global_pos_emb = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
@@ -1435,7 +1440,6 @@ class Gemma4TextModel(nn.Module):
                 "full_attention": None,
             }
         else:
-            gqa_ctx_dict = {}
             position_embeddings_dict = {
                 "sliding_attention": self.rotary_emb_local(op, position_ids),
                 "full_attention": self.rotary_emb_global(op, position_ids),
@@ -1453,8 +1457,7 @@ class Gemma4TextModel(nn.Module):
                 # GQA is active for non-shared layers. KV-shared layers use
                 # the standard Attention op with is_causal=1, so we only need
                 # bool masks (not additive float bias). This avoids the
-                # CumSum/GreaterOrEqual/Where chain that causes CPU Memcpy
-                # nodes on CUDA EP.
+                # CumSum/GreaterOrEqual chain used by create_attention_bias.
                 # Full-attention: simple padding mask (causality handled by op)
                 # Sliding-window: still needs CumSum for window constraint
                 fallback_bias_dict = {
@@ -1487,11 +1490,12 @@ class Gemma4TextModel(nn.Module):
                     ),
                 }
             # KV-shared layers also need position embeddings for the
-            # standard Attention path (manual RoPE).
+            # standard Attention path (manual RoPE). Reuse the embeddings
+            # already gathered when realizing cos/sin caches above.
             if use_gqa:
                 fallback_pos_dict = {
-                    "sliding_attention": self.rotary_emb_local(op, position_ids),
-                    "full_attention": self.rotary_emb_global(op, position_ids),
+                    "sliding_attention": local_pos_emb,
+                    "full_attention": global_pos_emb,
                 }
             else:
                 fallback_pos_dict = position_embeddings_dict
