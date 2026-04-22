@@ -23,6 +23,7 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 
@@ -292,12 +293,19 @@ def _create_alibi_bias(op, num_heads: int, seq_len, total_len):
     bias_2d = op.Unsqueeze(neg_distance, [0, 1])  # [1, 1, seq_len, total_len]
     alibi = op.Mul(slopes_4d, bias_2d)  # [1, num_heads, seq_len, total_len]
 
-    # Causal mask: mask future positions with large negative value
-    # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
-    causal_mask = op.Where(
-        op.GreaterOrEqual(q_with_offset, kv_expanded),
-        op.CastLike(0.0, neg_distance),
-        op.CastLike(-10000.0, neg_distance),
+    # Causal mask: mask future positions with large negative value.
+    # Use Mul instead of Where to avoid CPU Memcpy on CUDA EP.
+    # not_causal * -10000 → causal positions get 0, future gets -10000.
+    causal_f = op.CastLike(
+        op.Cast(
+            op.GreaterOrEqual(q_with_offset, kv_expanded),
+            to=ir.DataType.FLOAT,
+        ),
+        neg_distance,
+    )
+    causal_mask = op.Mul(
+        op.Sub(op.CastLike(op.Constant(value_float=1.0), neg_distance), causal_f),
+        op.CastLike(op.Constant(value_float=-10000.0), neg_distance),
     )  # [seq_len, total_len]
     causal_4d = op.Unsqueeze(causal_mask, [0, 1])  # [1, 1, seq_len, total_len]
     return op.Add(alibi, causal_4d)

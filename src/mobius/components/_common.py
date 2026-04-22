@@ -215,9 +215,16 @@ def create_attention_bias(
     attn_mask_bool = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
     full_mask = op.And(attn_mask_bool, full_mask)
 
-    # Convert to float bias: 0 where attended, dtype.min where masked
+    # Convert to float bias: 0 where attended, dtype.min where masked.
+    # Use Mul instead of Where to avoid CPU-only bool Where ops that cause
+    # Memcpy nodes on CUDA EP.  not_mask * mask_value: True→0, False→mask_value.
     mask_value = float(dtype.min)
-    attention_bias = op.Where(full_mask, 0.0, mask_value)
+    not_mask = op.Cast(full_mask, to=ir.DataType.FLOAT)  # 1.0=attend, 0.0=mask
+    # (1 - not_mask) * mask_value → 0 where attended, mask_value where masked
+    attention_bias = op.Mul(
+        op.Sub(op.Constant(value_float=1.0), not_mask),
+        op.Constant(value_float=mask_value),
+    )
     attention_bias = op.Cast(attention_bias, to=dtype)
 
     # Unsqueeze to (batch_size, 1, query_length, total_length)

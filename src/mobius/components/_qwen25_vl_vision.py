@@ -339,11 +339,15 @@ class Qwen25VLVisionAttention(nn.Module):
         seg_col = op.Unsqueeze(seg_ids, [0])  # (1, N)
         same_segment = op.Equal(seg_row, seg_col)
 
-        # Convert to attention bias: 0 where same segment, -inf where different
-        # CastLike before Where so only the scalar is cast (cheaper than post-broadcast)
-        neg_inf = op.CastLike(-1e9, dtype_ref)
-        zero = op.CastLike(0.0, dtype_ref)
-        return op.Where(same_segment, zero, neg_inf)
+        # Convert to attention bias: 0 where same segment, -inf where different.
+        # Use Mul instead of Where to avoid CPU Memcpy on CUDA EP.
+        # not_same * neg_inf: same segment→0, different→-inf
+        neg_inf = op.CastLike(op.Constant(value_float=-1e9), dtype_ref)
+        same_f = op.CastLike(op.Cast(same_segment, to=ir.DataType.FLOAT), dtype_ref)
+        return op.Mul(
+            op.Sub(op.CastLike(op.Constant(value_float=1.0), dtype_ref), same_f),
+            neg_inf,
+        )
 
 
 class Qwen25VLVisionBlock(nn.Module):
