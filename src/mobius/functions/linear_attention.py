@@ -109,21 +109,29 @@ def linear_attention(
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
 
-    # --- Define function inputs ---
-    # All 6 formal parameters are always declared so the function
-    # signature is stable across update_rule variants.  Absent optional
-    # inputs are ``None``; build_function creates placeholder formals
-    # for them and passes ``None`` to the trace function.
-    inputs: list[ir.Value | None] = [
+    # --- Define function inputs (conditional on update_rule) ---
+    # The function is specialized per-model: only inputs actually used
+    # by this update_rule variant are declared.  Call sites (e.g.
+    # Mamba2Block with "gated") pass exactly the declared number of args.
+    inputs: list[ir.Value] = [
         ir.Value(name="query"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="key"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="value"),  # (B, T, kv_num_heads * d_v)
         ir.Value(name="past_state"),
-        ir.Value(name="decay") if uses_decay else None,
-        ir.Value(name="beta") if uses_beta else None,
     ]
+    if uses_decay:
+        inputs.append(ir.Value(name="decay"))
+    if uses_beta:
+        inputs.append(ir.Value(name="beta"))
 
-    def body(op, query_v, key_v, value_v, past_state_v, decay_v, beta_v):
+    def body(op, *args):
+        query_v, key_v, value_v, past_state_v = args[:4]
+        idx = 4
+        decay_v = args[idx] if uses_decay else None
+        if uses_decay:
+            idx += 1
+        beta_v = args[idx] if uses_beta else None
+
         # --- Reshape 3D → 4D using head counts ---
         b_dim = op.Shape(query_v, start=0, end=1)
         t_dim = op.Shape(query_v, start=1, end=2)

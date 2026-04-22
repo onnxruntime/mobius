@@ -15,14 +15,6 @@ Naming convention:
     discoverability, matching the convention in
     :mod:`~mobius.functions.causal_conv` and
     :mod:`~mobius.functions.linear_attention`.
-
-.. note::
-
-   These function bodies use raw ``ir.Node`` construction for
-   ``LayerNormalization`` and ``RMSNormalization`` nodes because
-   ``ref_attr_name`` (which tells InlinePass to forward the caller's
-   ``epsilon`` value) is not supported by the ``OpBuilder`` API.
-   All other ops use the standard ``OpBuilder`` (``op.Add``, etc.).
 """
 
 from __future__ import annotations
@@ -54,26 +46,21 @@ def skip_layer_normalization() -> ir.Function:
     def body(op, v_input, v_skip, v_weight, v_bias):
         add_out = op.Add(v_input, v_skip)
 
-        # ir.Node is required here: ref_attr_name forwards the caller's
-        # epsilon value at InlinePass expand time (OpBuilder doesn't
-        # support ref_attr_name).
-        ln_node = ir.Node(
-            "",
-            "LayerNormalization",
-            inputs=[add_out, v_weight, v_bias],
-            attributes=[
-                ir.Attr("axis", ir.AttributeType.INT, -1),
-                ir.Attr(
-                    "epsilon",
-                    ir.AttributeType.FLOAT,
-                    1e-5,
-                    ref_attr_name="epsilon",
-                ),
-            ],
-            num_outputs=3,
+        # ref_attr_name forwards the caller's epsilon at InlinePass expand time.
+        epsilon_attr = ir.Attr(
+            "epsilon",
+            ir.AttributeType.FLOAT,
+            1e-5,
+            ref_attr_name="epsilon",
         )
-        op._builder._graph.append(ln_node)
-        norm_out, mean_out, inv_std_out = ln_node.outputs
+        norm_out, mean_out, inv_std_out = op.LayerNormalization(
+            add_out,
+            v_weight,
+            v_bias,
+            axis=-1,
+            epsilon=epsilon_attr,
+            _outputs=3,
+        )
 
         norm_out.name = "norm_out"
         mean_out.name = "mean_out"
@@ -114,23 +101,14 @@ def skip_simplified_layer_normalization() -> ir.Function:
     def body(op, v_input, v_skip, v_weight):
         add_out = op.Add(v_input, v_skip)
 
-        # ir.Node required: ref_attr_name forwards caller's epsilon.
-        rms_node = ir.Node(
-            "",
-            "RMSNormalization",
-            inputs=[add_out, v_weight],
-            attributes=[
-                ir.Attr(
-                    "epsilon",
-                    ir.AttributeType.FLOAT,
-                    1e-5,
-                    ref_attr_name="epsilon",
-                ),
-            ],
-            num_outputs=1,
+        # ref_attr_name forwards caller's epsilon at InlinePass expand time.
+        epsilon_attr = ir.Attr(
+            "epsilon",
+            ir.AttributeType.FLOAT,
+            1e-5,
+            ref_attr_name="epsilon",
         )
-        op._builder._graph.append(rms_node)
-        norm_out = rms_node.outputs[0]
+        norm_out = op.RMSNormalization(add_out, v_weight, epsilon=epsilon_attr)
 
         norm_out.name = "norm_out"
         add_out.name = "add_out"

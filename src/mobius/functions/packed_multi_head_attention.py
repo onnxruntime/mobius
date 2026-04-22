@@ -122,40 +122,32 @@ def packed_multi_head_attention() -> ir.Function:
         value_batched = op.Unsqueeze(value_input, [0])
 
         # --- Call standard Attention op ---
-        # Use ir.Node for ref_attr_name forwarding of num_heads and scale.
-        attention_node = ir.Node(
-            "",
-            "Attention",
-            inputs=[
-                query_batched,
-                key_batched,
-                value_batched,
-                attention_bias,
-            ],
-            attributes=[
-                ir.Attr(
-                    "q_num_heads",
-                    ir.AttributeType.INT,
-                    1,
-                    ref_attr_name="num_heads",
-                ),
-                ir.Attr(
-                    "kv_num_heads",
-                    ir.AttributeType.INT,
-                    1,
-                    ref_attr_name="num_heads",
-                ),
-                ir.Attr(
-                    "scale",
-                    ir.AttributeType.FLOAT,
-                    1.0,
-                    ref_attr_name="scale",
-                ),
-            ],
-            num_outputs=1,
+        # ir.Attr with ref_attr_name forwards num_heads and scale from
+        # the function's formal attributes to the inner Attention node.
+        attention_output = op.Attention(
+            query_batched,
+            key_batched,
+            value_batched,
+            attention_bias,
+            q_num_heads=ir.Attr(
+                "q_num_heads",
+                ir.AttributeType.INT,
+                1,
+                ref_attr_name="num_heads",
+            ),
+            kv_num_heads=ir.Attr(
+                "kv_num_heads",
+                ir.AttributeType.INT,
+                1,
+                ref_attr_name="num_heads",
+            ),
+            scale=ir.Attr(
+                "scale",
+                ir.AttributeType.FLOAT,
+                1.0,
+                ref_attr_name="scale",
+            ),
         )
-        op._builder._graph.append(attention_node)
-        attention_output = attention_node.outputs[0]
 
         # --- Remove batch dimension ---
         # (1, token_count, v_hidden) → (token_count, v_hidden)
