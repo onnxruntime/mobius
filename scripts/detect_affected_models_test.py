@@ -40,9 +40,9 @@ class TestClassifyFile:
     def test_model_file(self):
         assert classify_file("src/mobius/models/falcon.py") == "model"
 
-    def test_model_init_is_shared_infra(self):
-        """models/__init__.py is the re-export hub — classify as shared_infra."""
-        assert classify_file("src/mobius/models/__init__.py") == "shared_infra"
+    def test_model_init_is_model(self):
+        """models/__init__.py classifies as model (shared_infra disabled)."""
+        assert classify_file("src/mobius/models/__init__.py") == "model"
 
     def test_component_file(self):
         assert classify_file("src/mobius/components/_attention.py") == "traceable"
@@ -51,16 +51,16 @@ class TestClassifyFile:
         assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
 
     def test_configs_file(self):
-        assert classify_file("src/mobius/_configs.py") == "shared_infra"
+        assert classify_file("src/mobius/_configs.py") == "other"
 
     def test_registry_file(self):
-        assert classify_file("src/mobius/_registry.py") == "shared_infra"
+        assert classify_file("src/mobius/_registry.py") == "other"
 
     def test_builder_file(self):
-        assert classify_file("src/mobius/_builder.py") == "shared_infra"
+        assert classify_file("src/mobius/_builder.py") == "other"
 
     def test_exporter_file(self):
-        assert classify_file("src/mobius/_exporter.py") == "shared_infra"
+        assert classify_file("src/mobius/_exporter.py") == "other"
 
     def test_test_file_in_src(self):
         assert classify_file("src/mobius/models/_models_test.py") == "test"
@@ -194,9 +194,11 @@ class TestDetectAffectedModels:
         assert result["run_all"] is False
         assert result["affected"] == []
 
-    def test_configs_change_triggers_run_all(self):
+    def test_configs_change_no_run_all(self):
+        """_configs.py no longer triggers run_all (shared_infra disabled)."""
         result = detect_affected_models(["src/mobius/_configs.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert result["affected"] == []
 
     def test_unrelated_file_no_affected(self):
         result = detect_affected_models(["README.md"])
@@ -249,20 +251,21 @@ class TestDetectAffectedModels:
         assert result["run_all"] is False
         assert "falcon" in result["affected"]
 
-    def test_shared_infra_overrides_model(self):
-        """If any shared infra changes, run_all even with model files."""
+    def test_infra_does_not_override_model(self):
+        """Infra files no longer trigger run_all (shared_infra disabled)."""
         result = detect_affected_models(
             [
                 "src/mobius/models/falcon.py",
                 "src/mobius/_configs.py",
             ]
         )
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert "falcon" in result["affected"]
 
-    def test_models_init_triggers_run_all(self):
-        """models/__init__.py is the re-export hub — must trigger run_all."""
+    def test_models_init_no_run_all(self):
+        """models/__init__.py no longer triggers run_all (shared_infra disabled)."""
         result = detect_affected_models(["src/mobius/models/__init__.py"])
-        assert result["run_all"] is True
+        assert result["run_all"] is False
 
     def test_deleted_model_file_triggers_run_all(self):
         """A model file that doesn't exist on disk triggers run_all."""
@@ -281,21 +284,20 @@ class TestDetectAffectedModels:
         # _common.py defines Linear, Embedding, LayerNorm — used everywhere
         assert len(result["affected"]) > 10
 
-    def test_shared_infra_still_triggers_run_all(self):
-        """True shared_infra files (_configs, _registry, etc.) still trigger run_all."""
+    def test_former_shared_infra_no_run_all(self):
+        """Former shared_infra files no longer trigger run_all."""
         for path in [
             "src/mobius/_configs.py",
             "src/mobius/_registry.py",
             "src/mobius/_builder.py",
             "src/mobius/_weight_loading.py",
             "src/mobius/_model_package.py",
-            "src/mobius/_exporter.py",
             "src/mobius/models/__init__.py",
-            "tests/conftest.py",
-            "tests/_test_configs.py",
         ]:
             result = detect_affected_models([path])
-            assert result["run_all"] is True, f"{path} should trigger run_all but didn't"
+            assert result["run_all"] is False, (
+                f"{path} should NOT trigger run_all"
+            )
 
     def test_traceable_and_model_combined(self):
         """A component + model file change returns union of affected types."""
@@ -310,15 +312,16 @@ class TestDetectAffectedModels:
         # _attention.py dependents should also be included
         assert len(result["affected"]) > 2
 
-    def test_traceable_overridden_by_shared_infra(self):
-        """If both traceable and shared_infra change, run_all wins."""
+    def test_traceable_and_infra_no_run_all(self):
+        """Component + infra files no longer trigger run_all."""
         result = detect_affected_models(
             [
                 "src/mobius/components/_attention.py",
                 "src/mobius/_configs.py",
             ]
         )
-        assert result["run_all"] is True
+        assert result["run_all"] is False
+        assert len(result["affected"]) > 0
 
     def test_deleted_traceable_file_triggers_run_all(self):
         """A deleted component file triggers run_all (conservative)."""
