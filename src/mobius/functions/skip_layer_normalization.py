@@ -15,14 +15,6 @@ Naming convention:
     discoverability, matching the convention in
     :mod:`~mobius.functions.causal_conv` and
     :mod:`~mobius.functions.linear_attention`.
-
-.. note::
-
-   These function bodies use raw ``ir.Node`` construction for
-   ``LayerNormalization`` and ``RMSNormalization`` nodes because
-   ``ref_attr_name`` (which tells InlinePass to forward the caller's
-   ``epsilon`` value) is not supported by the ``OpBuilder`` API.
-   All other ops use the standard ``OpBuilder`` (``op.Add``, etc.).
 """
 
 from __future__ import annotations
@@ -50,53 +42,46 @@ def skip_layer_normalization() -> ir.Function:
     Outputs: ``[norm_out, mean_out, inv_std_out, add_out]``
     Attr:    ``epsilon`` (float)
     """
-    v_input = ir.Value(name="input")
-    v_skip = ir.Value(name="skip")
-    v_weight = ir.Value(name="weight")
-    v_bias = ir.Value(name="bias")
 
-    graph = ir.Graph(
-        inputs=[v_input, v_skip, v_weight, v_bias],
-        outputs=[],
-        nodes=[],
-        name="SkipLayerNormalization_body",
-        opset_imports={"": OPSET_VERSION},
-    )
-    gb = builder.GraphBuilder(graph)
-    op = gb.op
+    def body(op, v_input, v_skip, v_weight, v_bias):
+        add_out = op.Add(v_input, v_skip)
 
-    add_out = op.Add(v_input, v_skip)
+        # ref_attr_name forwards the caller's epsilon at InlinePass expand time.
+        epsilon_attr = ir.Attr(
+            "epsilon",
+            ir.AttributeType.FLOAT,
+            1e-5,
+            ref_attr_name="epsilon",
+        )
+        norm_out, mean_out, inv_std_out = op.LayerNormalization(
+            add_out,
+            v_weight,
+            v_bias,
+            axis=-1,
+            epsilon=epsilon_attr,
+            _outputs=3,
+        )
 
-    # ir.Node is required here: ref_attr_name forwards the caller's
-    # epsilon value at InlinePass expand time (OpBuilder doesn't
-    # support ref_attr_name).
-    ln_node = ir.Node(
-        "",
-        "LayerNormalization",
-        inputs=[add_out, v_weight, v_bias],
-        attributes=[
-            ir.Attr("axis", ir.AttributeType.INT, -1),
-            ir.Attr(
-                "epsilon",
-                ir.AttributeType.FLOAT,
-                1e-5,
-                ref_attr_name="epsilon",
-            ),
+        norm_out.name = "norm_out"
+        mean_out.name = "mean_out"
+        inv_std_out.name = "inv_std_out"
+        add_out.name = "add_out"
+        return norm_out, mean_out, inv_std_out, add_out
+
+    return builder.build_function(
+        body,
+        [
+            ir.Value(name="input"),
+            ir.Value(name="skip"),
+            ir.Value(name="weight"),
+            ir.Value(name="bias"),
         ],
-        num_outputs=3,
-    )
-    graph.append(ln_node)
-    norm_out, mean_out, inv_std_out = ln_node.outputs
-
-    graph.outputs.extend([norm_out, mean_out, inv_std_out, add_out])
-
-    return ir.Function(
         domain=DOMAIN,
         name="SkipLayerNormalization",
-        graph=graph,
-        attributes={
-            "epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
-        },
+        attributes=[
+            ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
+        ],
+        opset_imports={"": OPSET_VERSION},
     )
 
 
@@ -112,47 +97,34 @@ def skip_simplified_layer_normalization() -> ir.Function:
     Outputs: ``[norm_out, add_out]``
     Attr:    ``epsilon`` (float)
     """
-    v_input = ir.Value(name="input")
-    v_skip = ir.Value(name="skip")
-    v_weight = ir.Value(name="weight")
 
-    graph = ir.Graph(
-        inputs=[v_input, v_skip, v_weight],
-        outputs=[],
-        nodes=[],
-        name="SkipSimplifiedLayerNormalization_body",
-        opset_imports={"": OPSET_VERSION},
-    )
-    gb = builder.GraphBuilder(graph)
-    op = gb.op
+    def body(op, v_input, v_skip, v_weight):
+        add_out = op.Add(v_input, v_skip)
 
-    add_out = op.Add(v_input, v_skip)
+        # ref_attr_name forwards caller's epsilon at InlinePass expand time.
+        epsilon_attr = ir.Attr(
+            "epsilon",
+            ir.AttributeType.FLOAT,
+            1e-5,
+            ref_attr_name="epsilon",
+        )
+        norm_out = op.RMSNormalization(add_out, v_weight, epsilon=epsilon_attr)
 
-    # ir.Node required: ref_attr_name forwards caller's epsilon.
-    rms_node = ir.Node(
-        "",
-        "RMSNormalization",
-        inputs=[add_out, v_weight],
-        attributes=[
-            ir.Attr(
-                "epsilon",
-                ir.AttributeType.FLOAT,
-                1e-5,
-                ref_attr_name="epsilon",
-            ),
+        norm_out.name = "norm_out"
+        add_out.name = "add_out"
+        return norm_out, add_out
+
+    return builder.build_function(
+        body,
+        [
+            ir.Value(name="input"),
+            ir.Value(name="skip"),
+            ir.Value(name="weight"),
         ],
-        num_outputs=1,
-    )
-    graph.append(rms_node)
-    norm_out = rms_node.outputs[0]
-
-    graph.outputs.extend([norm_out, add_out])
-
-    return ir.Function(
         domain=DOMAIN,
         name="SkipSimplifiedLayerNormalization",
-        graph=graph,
-        attributes={
-            "epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
-        },
+        attributes=[
+            ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
+        ],
+        opset_imports={"": OPSET_VERSION},
     )

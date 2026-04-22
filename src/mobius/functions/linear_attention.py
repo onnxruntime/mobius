@@ -110,159 +110,158 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs (conditional on update_rule) ---
-    query = ir.Value(name="query")  # (B, T, q_num_heads * d_k)
-    key = ir.Value(name="key")  # (B, T, q_num_heads * d_k)
-    value = ir.Value(name="value")  # (B, T, kv_num_heads * d_v)
-    past_state = ir.Value(name="past_state")
-    inputs = [query, key, value, past_state]
-    decay: ir.Value | None = None
-    beta: ir.Value | None = None
+    # TODO: Investigate relaxing onnx-shape-inference's strict arity check
+    # to allow trailing optional inputs, enabling a single 6-input signature.
+    # The function is specialized per-model: only inputs actually used
+    # by this update_rule variant are declared.  Call sites (e.g.
+    # Mamba2Block with "gated") pass exactly the declared number of args.
+    inputs: list[ir.Value] = [
+        ir.Value(name="query"),  # (B, T, q_num_heads * d_k)
+        ir.Value(name="key"),  # (B, T, q_num_heads * d_k)
+        ir.Value(name="value"),  # (B, T, kv_num_heads * d_v)
+        ir.Value(name="past_state"),
+    ]
     if uses_decay:
-        decay = ir.Value(name="decay")
-        inputs.append(decay)
+        inputs.append(ir.Value(name="decay"))
     if uses_beta:
-        beta = ir.Value(name="beta")
-        inputs.append(beta)
+        inputs.append(ir.Value(name="beta"))
 
-    # --- Build function body graph ---
-    graph = ir.Graph(
-        inputs=inputs,
-        outputs=[],
-        nodes=[],
-        name=f"LinearAttention_{update_rule}_body",
-        opset_imports={"": OPSET_VERSION},
-    )
-    gb = builder.GraphBuilder(graph)
-    op = gb.op
+    def body(op, *args):
+        query_v, key_v, value_v, past_state_v = args[:4]
+        idx = 4
+        decay_v = args[idx] if uses_decay else None
+        if uses_decay:
+            idx += 1
+        beta_v = args[idx] if uses_beta else None
 
-    # --- Reshape 3D → 4D using head counts ---
-    b_dim = op.Shape(query, start=0, end=1)
-    t_dim = op.Shape(query, start=1, end=2)
+        # --- Reshape 3D → 4D using head counts ---
+        b_dim = op.Shape(query_v, start=0, end=1)
+        t_dim = op.Shape(query_v, start=1, end=2)
 
-    # Q/K: [B, T, q_num_heads*d_k] → [B, T, q_num_heads, d_k]
-    #     → transpose to [B, q_num_heads, T, d_k]
-    qk_4d_shape = op.Concat(
-        b_dim,
-        t_dim,
-        op.Constant(value_ints=[q_num_heads, -1]),
-        axis=0,
-    )
-    query_4d = op.Transpose(
-        op.Reshape(query, qk_4d_shape), perm=[0, 2, 1, 3]
-    )  # [B, q_num_heads, T, d_k]
-    key_4d = op.Transpose(
-        op.Reshape(key, qk_4d_shape), perm=[0, 2, 1, 3]
-    )  # [B, q_num_heads, T, d_k]
-
-    # V: [B, T, kv_num_heads*d_v] → [B, kv_num_heads, T, d_v]
-    # Reuse kv_4d_shape for both V and decay (same [B, T, kv_num_heads, -1]).
-    kv_4d_shape = op.Concat(
-        b_dim,
-        t_dim,
-        op.Constant(value_ints=[kv_num_heads, -1]),
-        axis=0,
-    )
-    value_4d = op.Transpose(
-        op.Reshape(value, kv_4d_shape), perm=[0, 2, 1, 3]
-    )  # [B, kv_num_heads, T, d_v]
-
-    # --- GQA: expand Q/K heads to match V head count ---
-    if kv_num_heads % q_num_heads != 0:
-        raise ValueError(
-            f"kv_num_heads ({kv_num_heads}) must be divisible by q_num_heads ({q_num_heads})"
+        # Q/K: [B, T, q_num_heads*d_k] → [B, T, q_num_heads, d_k]
+        #     → transpose to [B, q_num_heads, T, d_k]
+        qk_4d_shape = op.Concat(
+            b_dim,
+            t_dim,
+            op.Constant(value_ints=[q_num_heads, -1]),
+            axis=0,
         )
-    gqa_ratio = kv_num_heads // q_num_heads
-    query_expanded, key_expanded = _expand_kv_heads(op, query_4d, key_4d, gqa_ratio=gqa_ratio)
+        query_4d = op.Transpose(
+            op.Reshape(query_v, qk_4d_shape), perm=[0, 2, 1, 3]
+        )  # [B, q_num_heads, T, d_k]
+        key_4d = op.Transpose(
+            op.Reshape(key_v, qk_4d_shape), perm=[0, 2, 1, 3]
+        )  # [B, q_num_heads, T, d_k]
 
-    # --- Reshape decay/beta 3D → 4D (only when used) ---
-    # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
-    #     → transpose to (B, kv_num_heads, T, d_k)
-    if uses_decay:
-        decay_4d = op.Transpose(
-            op.Reshape(decay, kv_4d_shape), perm=[0, 2, 1, 3]
-        )  # [B, kv_num_heads, T, d_k]
-    if uses_beta:
-        # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
-        beta_3d = op.Transpose(beta, perm=[0, 2, 1])  # [B, kv_num_heads, T]
+        # V: [B, T, kv_num_heads*d_v] → [B, kv_num_heads, T, d_v]
+        # Reuse kv_4d_shape for both V and decay (same [B, T, kv_num_heads, -1]).
+        kv_4d_shape = op.Concat(
+            b_dim,
+            t_dim,
+            op.Constant(value_ints=[kv_num_heads, -1]),
+            axis=0,
+        )
+        value_4d = op.Transpose(
+            op.Reshape(value_v, kv_4d_shape), perm=[0, 2, 1, 3]
+        )  # [B, kv_num_heads, T, d_v]
 
-    # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
-    # CastLike ensures scale constant matches the input dtype.
-    scaled_query = op.Mul(
-        query_expanded,
-        op.CastLike(op.Constant(value_float=scale), query_expanded),
-    )
+        # --- GQA: expand Q/K heads to match V head count ---
+        if kv_num_heads % q_num_heads != 0:
+            raise ValueError(
+                f"kv_num_heads ({kv_num_heads}) must be divisible by q_num_heads ({q_num_heads})"
+            )
+        gqa_ratio = kv_num_heads // q_num_heads
+        query_expanded, key_expanded = _expand_kv_heads(
+            op, query_4d, key_4d, gqa_ratio=gqa_ratio
+        )
 
-    # --- Build Scan for sequential recurrence ---
-    scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
+        # --- Reshape decay/beta 3D → 4D (only when used) ---
+        # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
+        #     → transpose to (B, kv_num_heads, T, d_k)
+        if uses_decay:
+            decay_4d = op.Transpose(
+                op.Reshape(decay_v, kv_4d_shape), perm=[0, 2, 1, 3]
+            )  # [B, kv_num_heads, T, d_k]
+        if uses_beta:
+            # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
+            beta_3d = op.Transpose(beta_v, perm=[0, 2, 1])  # [B, kv_num_heads, T]
 
-    # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
-    q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
-    k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
-    v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
+        # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
+        # CastLike ensures scale constant matches the input dtype.
+        scaled_query = op.Mul(
+            query_expanded,
+            op.CastLike(op.Constant(value_float=scale), query_expanded),
+        )
 
-    scan_inputs = [q_t, k_t, v_t]
-    if uses_decay:
-        decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])  # (T, B, H, d_k)
-        scan_inputs.append(decay_t)
-    if uses_beta:
-        beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])  # (T, B, H)
-        scan_inputs.append(beta_t)
+        # --- Build Scan for sequential recurrence ---
+        scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
 
-    present_state, output_t = op.Scan(
-        past_state,  # carry: (B, H, d_k, d_v)
-        *scan_inputs,
-        body=scan_body,
-        num_scan_inputs=len(scan_inputs),
-        _outputs=2,
-    )
-    # present_state: (B, H, d_k, d_v)
-    # output_t: (T, B, H, d_v)
+        # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
+        q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
+        k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
+        v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
 
-    # --- Reshape output 4D → 3D ---
-    # (T, B, H, d_v) → (B, T, H, d_v) → (B, T, H*d_v)
-    output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
-    out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
-    output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
+        scan_inputs = [q_t, k_t, v_t]
+        if uses_decay:
+            decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])  # (T, B, H, d_k)
+            scan_inputs.append(decay_t)
+        if uses_beta:
+            beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])  # (T, B, H)
+            scan_inputs.append(beta_t)
 
-    output.name = "output"
-    present_state.name = "present_state"
-    graph.outputs.extend([output, present_state])
+        present_state_v, output_t = op.Scan(
+            past_state_v,  # carry: (B, H, d_k, d_v)
+            *scan_inputs,
+            body=scan_body,
+            num_scan_inputs=len(scan_inputs),
+            _outputs=2,
+        )
+        # present_state_v: (B, H, d_k, d_v)
+        # output_t: (T, B, H, d_v)
+
+        # --- Reshape output 4D → 3D ---
+        # (T, B, H, d_v) → (B, T, H, d_v) → (B, T, H*d_v)
+        output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
+        out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
+        output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
+
+        output.name = "output"
+        present_state_v.name = "present_state"
+        return output, present_state_v
 
     # --- Build the ir.Function ---
-    update_rule_attr = ir.Attr(
-        "update_rule",
-        ir.AttributeType.STRING,
-        update_rule,
-        ref_attr_name="update_rule",
-    )
-    scale_attr = ir.Attr(
-        "scale",
-        ir.AttributeType.FLOAT,
-        scale,
-        ref_attr_name="scale",
-    )
-    q_heads_attr = ir.Attr(
-        "q_num_heads",
-        ir.AttributeType.INT,
-        q_num_heads,
-        ref_attr_name="q_num_heads",
-    )
-    kv_heads_attr = ir.Attr(
-        "kv_num_heads",
-        ir.AttributeType.INT,
-        kv_num_heads,
-        ref_attr_name="kv_num_heads",
-    )
-    return ir.Function(
+    return builder.build_function(
+        body,
+        inputs,
         domain=DOMAIN,
         name="LinearAttention",
-        graph=graph,
-        attributes={
-            "update_rule": update_rule_attr,
-            "scale": scale_attr,
-            "q_num_heads": q_heads_attr,
-            "kv_num_heads": kv_heads_attr,
-        },
+        attributes=[
+            ir.Attr(
+                "update_rule",
+                ir.AttributeType.STRING,
+                update_rule,
+                ref_attr_name="update_rule",
+            ),
+            ir.Attr(
+                "scale",
+                ir.AttributeType.FLOAT,
+                scale,
+                ref_attr_name="scale",
+            ),
+            ir.Attr(
+                "q_num_heads",
+                ir.AttributeType.INT,
+                q_num_heads,
+                ref_attr_name="q_num_heads",
+            ),
+            ir.Attr(
+                "kv_num_heads",
+                ir.AttributeType.INT,
+                kv_num_heads,
+                ref_attr_name="kv_num_heads",
+            ),
+        ],
+        opset_imports={"": OPSET_VERSION},
     )
 
 
