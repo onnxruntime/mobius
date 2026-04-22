@@ -7,6 +7,10 @@ inputs:
   prompts:
     - "Here is my poem:"
 
-level: "L4"
+level: "L4+L5"
 
-notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MLP architecture from NVIDIA. L5 skipped: HF remote code generate() is broken (cache_position bug)."
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "NemotronH Nano 4B. Hybrid Mamba2 + Attention + MoE architecture from NVIDIA."
