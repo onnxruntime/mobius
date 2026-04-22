@@ -707,7 +707,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "command_r": "CohereForAI/c4ai-command-r-v01",
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
-    "nemotron_h": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
     "open-llama": "openlm-research/open_llama_3b",
     "persimmon": "adept/persimmon-8b-base",
     "shieldgemma2": "google/shieldgemma-2b",
