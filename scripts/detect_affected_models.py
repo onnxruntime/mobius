@@ -36,16 +36,17 @@ _SRC_ROOT = _PROJECT_ROOT / "src" / "mobius"
 
 # ----------------------------------------------------------------
 # Shared infrastructure paths — any change triggers run_all
+# NOTE: Temporarily disabled to run everything per-model via the
+# import graph. Restore entries to re-enable run_all for these paths.
 # ----------------------------------------------------------------
-_SHARED_INFRA_PATTERNS = (
-    "src/mobius/_configs.py",
-    "src/mobius/_registry.py",
-    "src/mobius/_builder.py",
-    "src/mobius/_weight_loading.py",
-    "src/mobius/_model_package.py",
-    "src/mobius/_exporter.py",
-    # Re-export hub for all model classes — any change here affects all models
-    "src/mobius/models/__init__.py",
+_SHARED_INFRA_PATTERNS: tuple[str, ...] = (
+    # "src/mobius/_configs.py",
+    # "src/mobius/_registry.py",
+    # "src/mobius/_builder.py",
+    # "src/mobius/_weight_loading.py",
+    # "src/mobius/_model_package.py",
+    # "src/mobius/_exporter.py",
+    # "src/mobius/models/__init__.py",
 )
 
 _SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
