@@ -344,9 +344,7 @@ def _empty_features(hidden_size: int, dtype=np.float32) -> np.ndarray:
     return np.zeros((0, hidden_size), dtype=dtype)
 
 
-def _init_kv_cache(
-    config, dtype=np.float32, *, use_gqa: bool = False
-) -> dict[str, np.ndarray]:
+def _init_kv_cache(config, dtype=np.float32) -> dict[str, np.ndarray]:
     """Create an empty KV cache for all independent decoder layers.
 
     Gemma 4 uses:
@@ -355,12 +353,8 @@ def _init_kv_cache(
     - ``num_kv_shared_layers`` trailing layers that share KV from earlier layers
       (these have NO independent cache entries)
 
-    When ``expand_kv_heads_for_attention`` is enabled and *use_gqa* is True
-    (CUDA/DML EP), only full_attention layers expand kv_heads (sliding layers
-    use native GQA).  When *use_gqa* is False (CPU EP), ALL layers expand.
+    All layers use the original ``num_key_value_heads`` (no expansion).
     """
-    from mobius._flags import flags
-
     num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
     layer_types = (
@@ -370,17 +364,11 @@ def _init_kv_cache(
     local_hd = config.head_dim
     global_hd = getattr(config, "global_head_dim", None) or local_hd
 
-    expand_kv = (
-        flags.expand_kv_heads_for_attention
-        and config.num_key_value_heads < config.num_attention_heads
-    )
-
     past_kv: dict[str, np.ndarray] = {}
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_hd if layer_type == "full_attention" else local_hd
-        needs_expand = expand_kv and (layer_type == "full_attention" or not use_gqa)
-        kv_heads = config.num_attention_heads if needs_expand else config.num_key_value_heads
+        kv_heads = config.num_key_value_heads
         past_kv[f"past_key_values.{i}.key"] = np.zeros(
             (1, kv_heads, 0, hd),
             dtype=dtype,
@@ -420,7 +408,6 @@ def generate(
     config,
     *,
     max_new_tokens: int = MAX_NEW_TOKENS,
-    use_gqa: bool = False,
 ) -> str:
     """Greedy autoregressive generation with KV cache and token streaming.
 
@@ -466,10 +453,11 @@ def generate(
     zero_image = _empty_features(hidden_size, dtype=feat_dtype)
     zero_audio = _empty_features(hidden_size, dtype=feat_dtype)
 
-    past_kv = _init_kv_cache(config, dtype=image_features.dtype, use_gqa=use_gqa)
     cur_ids = input_ids
     past_seq_len = 0
     generated_ids: list[int] = []
+
+    past_kv = _init_kv_cache(config, dtype=image_features.dtype)
 
     for step in range(max_new_tokens):
         is_prefill = step == 0
@@ -525,7 +513,6 @@ def demo_text(
     prompt: str = "Explain the theory of general relativity in simple terms.",
     max_new_tokens: int = MAX_NEW_TOKENS,
     model_np_dtype=np.float32,
-    use_gqa: bool = False,
 ) -> str:
     """Text-only generation demo."""
     print("\n" + "=" * 64)
@@ -548,7 +535,6 @@ def demo_text(
         audio_features=zero,
         config=config,
         max_new_tokens=max_new_tokens,
-        use_gqa=use_gqa,
     )
 
 
@@ -563,7 +549,6 @@ def demo_vision(
     prompt: str = "Describe what you see in this image in detail.",
     max_new_tokens: int = MAX_NEW_TOKENS,
     model_np_dtype=np.float32,
-    use_gqa: bool = False,
 ) -> str:
     """Vision (image + text) generation demo."""
     print("\n" + "=" * 64)
@@ -599,7 +584,6 @@ def demo_vision(
         audio_features=_empty_features(config.hidden_size, dtype=image_features.dtype),
         config=config,
         max_new_tokens=max_new_tokens,
-        use_gqa=use_gqa,
     )
 
 
@@ -614,7 +598,6 @@ def demo_audio(
     prompt: str = "Transcribe the following audio.",
     max_new_tokens: int = MAX_NEW_TOKENS,
     model_np_dtype=np.float32,
-    use_gqa: bool = False,
 ) -> str:
     """Audio (speech + text) generation demo."""
     print("\n" + "=" * 64)
@@ -649,7 +632,6 @@ def demo_audio(
         audio_features=audio_features,
         config=config,
         max_new_tokens=max_new_tokens,
-        use_gqa=use_gqa,
     )
 
 
@@ -666,7 +648,6 @@ def demo_vision_audio(
     prompt: str = "Describe the image and transcribe the audio.",
     max_new_tokens: int = MAX_NEW_TOKENS,
     model_np_dtype=np.float32,
-    use_gqa: bool = False,
 ) -> str:
     """Combined vision + audio generation demo."""
     print("\n" + "=" * 64)
@@ -712,7 +693,6 @@ def demo_vision_audio(
         audio_features=audio_features,
         config=config,
         max_new_tokens=max_new_tokens,
-        use_gqa=use_gqa,
     )
 
 
@@ -1110,11 +1090,6 @@ def main() -> int:
     # Collect ONNX outputs for optional --compare-hf side-by-side display
     onnx_outputs: dict[str, str] = {}
 
-    # Determine whether GQA rewrite rules will be applied at runtime.
-    # When GQA is used, sliding-attention layers keep 1 KV head in cache;
-    # otherwise all layers expand KV heads to match query heads.
-    use_gqa = args.ep in ("cuda", "trt-rtx") and np_dtype == np.float16
-
     for mode in modes:
         if mode == "text":
             result = demo_text(
@@ -1125,7 +1100,6 @@ def main() -> int:
                 prompt=text_prompt,
                 max_new_tokens=max_tokens,
                 model_np_dtype=np_dtype,
-                use_gqa=use_gqa,
             )
             onnx_outputs["text"] = result
 
@@ -1143,7 +1117,6 @@ def main() -> int:
                 prompt=vision_prompt,
                 max_new_tokens=max_tokens,
                 model_np_dtype=np_dtype,
-                use_gqa=use_gqa,
             )
             onnx_outputs["vision"] = result
 
@@ -1161,7 +1134,6 @@ def main() -> int:
                 prompt=audio_prompt,
                 max_new_tokens=max_tokens,
                 model_np_dtype=np_dtype,
-                use_gqa=use_gqa,
             )
             onnx_outputs["audio"] = result
 
@@ -1181,7 +1153,6 @@ def main() -> int:
                 prompt=vision_audio_prompt,
                 max_new_tokens=max_tokens,
                 model_np_dtype=np_dtype,
-                use_gqa=use_gqa,
             )
             onnx_outputs["vision-audio"] = result
 

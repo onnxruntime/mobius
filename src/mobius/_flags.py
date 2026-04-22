@@ -84,11 +84,6 @@ class _Flags:
          - ``True``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT ≤1.24.x workaround).
-       * - ``expand_kv_heads_for_attention``
-         - ``MOBIUS_EXPAND_KV_HEADS_FOR_ATTENTION``
-         - ``True``
-         - Expand KV heads in Attention ops to avoid CUDA GQA
-           MAX_HEAD_SIZE=256 limit (ORT ≤1.24.x workaround).
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -119,23 +114,6 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
     opset 24 kernel support.
-    """
-
-    expand_kv_heads_for_attention: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_EXPAND_KV_HEADS_FOR_ATTENTION", True)
-    )
-    """Expand KV heads to match Q heads in standard Attention ops so that
-    ``kv_num_heads == q_num_heads``.
-
-    ORT ≤1.24.x CUDA EP dispatches the Attention op with GQA head counts
-    (``q_num_heads != kv_num_heads``) to a GroupQueryAttention kernel that
-    enforces ``MAX_HEAD_SIZE=256``.  Models like Gemma 4 have
-    ``global_head_dim=512`` which exceeds this limit.  Expanding KV heads
-    avoids the GQA dispatch path.
-
-    Set ``MOBIUS_EXPAND_KV_HEADS_FOR_ATTENTION=0`` once ORT lifts the
-    ``MAX_HEAD_SIZE`` limit or adds a non-GQA fallback for the Attention
-    op on CUDA.
     """
 
 

@@ -35,7 +35,6 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
-from mobius._flags import flags
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
@@ -553,31 +552,6 @@ class _Gemma4VisionEncoderCore(nn.Module):
         return hidden_states  # [B, N, vision_hidden]
 
 
-def _expand_kv_heads(
-    op: builder.OpBuilder,
-    kv: ir.Value,
-    kv_heads: int,
-    n_groups: int,
-    head_dim: int,
-) -> ir.Value:
-    """Expand packed KV [B, seq, kv_heads*hd] → [B, seq, kv_heads*n_groups*hd].
-
-    Tiles each KV head ``n_groups`` times so kv_num_heads == q_num_heads,
-    avoiding CUDA GQA dispatch which has a MAX_HEAD_SIZE=256 limit.
-    """
-    num_heads = kv_heads * n_groups
-    # [B, seq, kv_heads*hd] → [B, seq, kv_heads, hd]
-    kv = op.Reshape(kv, [0, 0, kv_heads, head_dim])
-    # [B, seq, kv_heads, 1, hd]
-    kv = op.Unsqueeze(kv, [3])
-    # [B, seq, kv_heads, n_groups, hd]
-    kv = op.Tile(kv, [1, 1, 1, n_groups, 1])
-    # [B, seq, num_heads, hd] → [B, seq, num_heads*hd]
-    kv = op.Reshape(kv, [0, 0, num_heads, -1])
-    kv = op.Reshape(kv, [0, 0, -1])
-    return kv
-
-
 # ---------------------------------------------------------------------------
 # Gemma4 text decoder layers
 # ---------------------------------------------------------------------------
@@ -711,27 +685,13 @@ class Gemma4TextAttention(nn.Module):
             # The Attention op expects key/value as 3D:
             #   [batch, total_seq, kv_heads * head_dim]
             # Transpose and reshape to match.
-            src_key, src_value, src_kv_heads = shared_kv_states[self.kv_shared_layer_index]
+            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
 
             # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads*head_dim]
             src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
             src_key = op.Reshape(src_key, [0, 0, -1])
             src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
             src_value = op.Reshape(src_value, [0, 0, -1])
-
-            # Expand KV heads to match Q heads for CUDA EP compatibility.
-            # The source layer may have already expanded (src_kv_heads ==
-            # num_attention_heads); only expand when still grouped.
-            # Gated by flags.expand_kv_heads_for_attention (disable once
-            # ORT supports GQA + attn_mask on CUDA).
-            effective_kv_heads = src_kv_heads
-            n_groups = self.num_attention_heads // src_kv_heads
-            if n_groups > 1 and flags.expand_kv_heads_for_attention:
-                src_key = _expand_kv_heads(op, src_key, src_kv_heads, n_groups, self.head_dim)
-                src_value = _expand_kv_heads(
-                    op, src_value, src_kv_heads, n_groups, self.head_dim
-                )
-                effective_kv_heads = self.num_attention_heads
 
             attn_output, present_key, present_value = _apply_attention(
                 op,
@@ -742,7 +702,7 @@ class Gemma4TextAttention(nn.Module):
                 past_key=None,
                 past_value=None,
                 num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=effective_kv_heads,
+                num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
             )
@@ -805,13 +765,10 @@ class Gemma4TextAttention(nn.Module):
             )
 
             # Source layers store K,V for downstream KV-shared layers.
-            # Include effective kv_heads so consumers know whether expansion
-            # already happened (GQA path always uses original kv_heads).
             if self.provides_shared_kv and shared_kv_states is not None:
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
-                    self.num_key_value_heads,
                 )
         else:
             # K projection + per-head K norm + optional RoPE
@@ -846,27 +803,6 @@ class Gemma4TextAttention(nn.Module):
             value_states = op.Div(value_states, rms)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
-            # Expand KV heads to avoid GQA dispatch on EPs where GQA + attn_mask
-            # is not supported by the unfused runner.  On CUDA EP, sliding layers
-            # go through the GQA rewrite path (they never reach here), so this
-            # only fires for full_attention layers with head_dim > 256.  On CPU EP
-            # all layers reach here, so all get expanded.
-            # Gated by flags.expand_kv_heads_for_attention (disable once ORT
-            # supports GQA + attn_mask on all runners).
-            effective_kv_heads = self.num_key_value_heads
-            if (
-                flags.expand_kv_heads_for_attention
-                and self.num_key_value_heads < self.num_attention_heads
-            ):
-                n_groups = self.num_attention_heads // self.num_key_value_heads
-                key_states = _expand_kv_heads(
-                    op, key_states, self.num_key_value_heads, n_groups, self.head_dim
-                )
-                value_states = _expand_kv_heads(
-                    op, value_states, self.num_key_value_heads, n_groups, self.head_dim
-                )
-                effective_kv_heads = self.num_attention_heads
-
             attn_output, present_key, present_value = _apply_attention(
                 op,
                 query_states,
@@ -876,19 +812,16 @@ class Gemma4TextAttention(nn.Module):
                 past_key_value[0] if past_key_value is not None else None,
                 past_key_value[1] if past_key_value is not None else None,
                 num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=effective_kv_heads,
+                num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
             )
 
             # Source layers store K,V for downstream KV-shared layers.
-            # Include effective kv_heads so consumers know whether heads
-            # were already expanded (standard path may expand for CUDA).
             if self.provides_shared_kv and shared_kv_states is not None:
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
-                    effective_kv_heads,
                 )
 
         attn_output = self.o_proj(op, attn_output)
