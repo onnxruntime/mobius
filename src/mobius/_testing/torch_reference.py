@@ -388,6 +388,8 @@ def load_torch_vision_model(
         auto_classes.append(transformers.AutoModelForSemanticSegmentation)
     if hasattr(transformers, "AutoModelForImageToImage"):
         auto_classes.append(transformers.AutoModelForImageToImage)
+    if hasattr(transformers, "AutoModelForObjectDetection"):
+        auto_classes.append(transformers.AutoModelForObjectDetection)
     for auto_cls in auto_classes:
         try:
             model = auto_cls.from_pretrained(

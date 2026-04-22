@@ -172,6 +172,12 @@ class OnnxSeq2SeqGenerator:
     decoder with cross-attention to encoder hidden states.  Manages
     both self-attention and cross-attention KV caches.
 
+    Note: This generator is designed for text-to-text seq2seq models
+    (BART, T5, mBART, etc.) where both encoder and decoder use
+    ``input_ids``.  It is NOT suitable for speech-to-text models
+    (e.g. Whisper) which require ``input_features`` for the encoder
+    and ``decoder_input_ids`` + ``position_ids`` for the decoder.
+
     Example::
 
         enc_session = OnnxModelSession(pkg["encoder"])

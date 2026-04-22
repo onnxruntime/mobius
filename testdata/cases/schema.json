@@ -140,7 +140,7 @@
         "string",
         "null"
       ],
-      "description": "If non-null/non-empty, the test is skipped in CI (GITHUB_ACTIONS=true) but runs locally. Use for models that are too large for CI hardware. Does NOT block golden data generation."
+      "description": "If non-null/non-empty and skip_reason is unset, the test is skipped in CI (GITHUB_ACTIONS=true) but runs locally. skip_reason takes precedence when both are set. Use for models that are too large for CI hardware. Does NOT block golden data generation."
     },
     "min_token_match_ratio": {
       "type": "number",

@@ -1300,7 +1300,8 @@ class TestL4CheckpointVerified:
 # ---------------------------------------------------------------------------
 
 # Task types that support autoregressive generation.
-# seq2seq and speech-to-text require specialised loops not yet implemented.
+# speech-to-text requires a dedicated loop (audio features + decoder_input_ids
+# + position_ids) that is not yet implemented.
 _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
@@ -1475,8 +1476,13 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
-        elif case.task_type in ("seq2seq", "speech-to-text"):
+        elif case.task_type == "seq2seq":
             new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
+        elif case.task_type == "speech-to-text":
+            pytest.skip(
+                "L5 generation for speech-to-text not yet implemented: "
+                "requires audio features + decoder_input_ids/position_ids"
+            )
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4) — L5 generation
             # requires embedding → decoder loop, not yet implemented.
