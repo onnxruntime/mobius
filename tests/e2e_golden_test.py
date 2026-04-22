@@ -198,7 +198,7 @@ def _discover_cases(
     return params
 
 
-_L4_CASES = _discover_cases("L4")
+_L4_CASES = _discover_cases("L4", xfails=_XFAIL_REASONS)
 _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 
