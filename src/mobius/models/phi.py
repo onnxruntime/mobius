@@ -275,8 +275,6 @@ def _preprocess_phi4mm_weights(
     4. ``o_proj`` and ``down_proj`` LoRA A/B pass through unchanged
        (not fused, no splitting needed).
     """
-    intermediate_size = config.intermediate_size
-
     # Strip "base_layer." from LoRA-wrapped weight names.
     # HF stores e.g. "qkv_proj.base_layer.weight"; after stripping this
     # becomes "qkv_proj.weight" and falls through to the split logic below.
