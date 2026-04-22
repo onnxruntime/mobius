@@ -16,5 +16,4 @@ generation:
 
 level: "L4+L5"
 
-skip_reason: ""
 notes: "Qwen3-ASR speech recognition. 3-model split: audio_encoder + embedding + decoder."

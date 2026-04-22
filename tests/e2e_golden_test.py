@@ -1300,13 +1300,12 @@ class TestL4CheckpointVerified:
 # ---------------------------------------------------------------------------
 
 # Task types that support autoregressive generation.
-# speech-to-text requires a dedicated loop (audio features + decoder_input_ids
-# + position_ids) that is not yet implemented.
 _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
         "image-text-to-text",
         "seq2seq",
+        "speech-to-text",
     }
 )
 
@@ -1409,6 +1408,105 @@ def _run_seq2seq_generation(
     return all_ids[0]
 
 
+def _run_speech_to_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    golden: GoldenRef,
+) -> np.ndarray:
+    """Run greedy generation for a speech-to-text (Whisper) model.
+
+    Returns only the "real" generated tokens (after the forced decoder
+    prefix), matching HuggingFace ``model.generate()`` output which
+    strips the forced prefix tokens.
+    """
+    import librosa
+    import transformers
+
+    from mobius._testing.generation import OnnxSpeechToTextGenerator
+
+    config = pkg.config
+    device_kwargs = _get_test_device_kwargs()
+
+    # Load audio and extract features (same as L4 prefill)
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        trust_remote_code=case.trust_remote_code,
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, _sr = librosa.load(str(audio_path), sr=16000)
+    processed = processor(
+        audio_array,
+        sampling_rate=16000,
+        return_tensors="np",
+    )
+
+    # Step 1: Run encoder
+    enc_session = OnnxModelSession(pkg["encoder"], **device_kwargs)
+    try:
+        enc_feeds: dict[str, np.ndarray] = {}
+        for name in enc_session.input_names:
+            if name in processed:
+                enc_feeds[name] = processed[name].astype(np.float32)
+        enc_outputs = enc_session.run(enc_feeds)
+    finally:
+        enc_session.close()
+
+    enc_hidden = None
+    for key in ("encoder_hidden_states", "last_hidden_state"):
+        if key in enc_outputs:
+            enc_hidden = enc_outputs[key]
+            break
+    if enc_hidden is None:
+        raise KeyError(
+            f"Encoder output missing hidden states. Keys: {sorted(enc_outputs.keys())}"
+        )
+
+    # Step 2: Run decoder generation
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        decoder_start_id = getattr(config, "decoder_start_token_id", 0) or 0
+        max_new_tokens = case.generation_params.get("max_new_tokens", 50)
+        eos_token_id = case.generation_params.get("eos_token_id", None)
+
+        generator = OnnxSpeechToTextGenerator(dec_session, config)
+        all_ids = generator.generate(
+            enc_hidden,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            decoder_start_token_id=decoder_start_id,
+        )
+    finally:
+        dec_session.close()
+
+    # Strip forced decoder prefix.  HF model.generate() returns only
+    # the "real" generated tokens — it internally handles forced decoder
+    # IDs (language, task, notimestamps) and strips them from output.
+    # We align by finding where the expected content starts in our
+    # greedy output, using the golden's first token as anchor.
+    output = all_ids[0]  # drop batch dim
+
+    # Load the expected tokens to find the prefix boundary.
+    expected = load_generation_golden(case)
+    if expected and len(output) > 0:
+        first_expected = expected[0]
+        # Find the first occurrence of the expected first token
+        prefix_len = 0
+        for i, tok in enumerate(output):
+            if tok == first_expected:
+                prefix_len = i
+                break
+
+        output = output[prefix_len:]
+
+    # Strip trailing EOS tokens that HF generation suppresses.
+    eos_id = case.generation_params.get("eos_token_id", None)
+    if eos_id is not None:
+        while len(output) > 0 and output[-1] == eos_id:
+            output = output[:-1]
+
+    return output
+
+
 # ---------------------------------------------------------------------------
 # L5 Tests: Generation E2E
 # ---------------------------------------------------------------------------
@@ -1479,10 +1577,7 @@ class TestL5GenerationE2E:
         elif case.task_type == "seq2seq":
             new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
         elif case.task_type == "speech-to-text":
-            pytest.skip(
-                "L5 generation for speech-to-text not yet implemented: "
-                "requires audio features + decoder_input_ids/position_ids"
-            )
+            new_tokens = _run_speech_to_text_generation(pkg, case, golden)
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4) — L5 generation
             # requires embedding → decoder loop, not yet implemented.

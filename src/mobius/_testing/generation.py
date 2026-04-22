@@ -295,6 +295,116 @@ class OnnxSeq2SeqGenerator:
         return all_ids
 
 
+class OnnxSpeechToTextGenerator:
+    """Greedy generation for speech-to-text (Whisper) ONNX models.
+
+    Unlike :class:`OnnxSeq2SeqGenerator`, this generator:
+
+    * Accepts pre-computed ``encoder_hidden_states`` (audio features
+      are processed externally).
+    * Feeds ``decoder_input_ids`` (not ``input_ids``) to the decoder.
+    * Computes and feeds ``position_ids`` each step.
+    * Uses self-attention KV cache only (no cross-attention cache in
+      the current Whisper ONNX export).
+
+    Example::
+
+        enc_session = OnnxModelSession(pkg["encoder"])
+        dec_session = OnnxModelSession(pkg["decoder"])
+        enc_hidden = enc_session.run({"input_features": mel})["encoder_hidden_states"]
+        gen = OnnxSpeechToTextGenerator(dec_session, config)
+        output_ids = gen.generate(enc_hidden, max_new_tokens=50)
+    """
+
+    def __init__(
+        self,
+        dec_session: OnnxModelSession,
+        config: ArchitectureConfig,
+    ):
+        self.dec_session = dec_session
+        self.config = config
+
+    def generate(
+        self,
+        encoder_hidden_states: np.ndarray,
+        max_new_tokens: int = 50,
+        eos_token_id: int | None = None,
+        decoder_start_token_id: int = 0,
+    ) -> np.ndarray:
+        """Generate tokens from pre-computed encoder output.
+
+        Args:
+            encoder_hidden_states: [batch, enc_seq_len, hidden] float32.
+            max_new_tokens: Maximum tokens to generate.
+            eos_token_id: Stop token.
+            decoder_start_token_id: Token to seed the decoder (e.g. 50258).
+
+        Returns:
+            [batch, generated_len] int64 array of ALL generated token IDs
+            (including decoder_start_token and any forced prefix tokens).
+        """
+        batch_size = encoder_hidden_states.shape[0]
+
+        # Initialize self-attention KV cache (no cross-attention cache
+        # in the current Whisper ONNX export)
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim
+        past_kv: dict[str, np.ndarray] = {}
+        for name in self.dec_session.input_names:
+            if name.startswith("past_key_values."):
+                past_kv[name] = np.zeros(
+                    (batch_size, num_kv_heads, 0, head_dim),
+                    dtype=np.float32,
+                )
+
+        # Seed with decoder_start_token_id
+        cur_dec_ids = np.full((batch_size, 1), decoder_start_token_id, dtype=np.int64)
+        all_ids = cur_dec_ids.copy()
+        past_seq_len = 0
+
+        for _step in range(max_new_tokens):
+            cur_len = cur_dec_ids.shape[1]
+            position_ids = np.arange(past_seq_len, past_seq_len + cur_len, dtype=np.int64)[
+                np.newaxis, :
+            ].repeat(batch_size, axis=0)
+
+            dec_feeds: dict[str, np.ndarray] = {
+                "encoder_hidden_states": encoder_hidden_states,
+                **past_kv,
+            }
+            # Map decoder input names dynamically
+            for name in self.dec_session.input_names:
+                if name in dec_feeds:
+                    continue
+                if name in ("decoder_input_ids", "input_ids"):
+                    dec_feeds[name] = cur_dec_ids
+                elif name == "position_ids":
+                    dec_feeds[name] = position_ids
+
+            outputs = self.dec_session.run(dec_feeds)
+
+            # Greedy argmax
+            logits = outputs["logits"]  # [batch, seq_len, vocab]
+            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+
+            all_ids = np.concatenate([all_ids, next_token], axis=1)
+
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+
+            # Update KV cache
+            for name in list(past_kv.keys()):
+                layer_suffix = name.replace("past_key_values.", "")
+                present_name = f"present.{layer_suffix}"
+                if present_name in outputs:
+                    past_kv[name] = outputs[present_name]
+
+            cur_dec_ids = next_token.astype(np.int64)
+            past_seq_len += cur_len
+
+        return all_ids
+
+
 def torch_generate_greedy(
     model,
     input_ids: np.ndarray,
