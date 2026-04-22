@@ -176,7 +176,8 @@ jobs:
     needs: [detect-affected]
     if: >-
       always() && !cancelled() &&
-      (needs.detect-affected.outputs.has_affected == 'true' ||
+      (needs.detect-affected.result == 'failure' ||
+       needs.detect-affected.outputs.has_affected == 'true' ||
        github.event_name != 'pull_request')
     uses: ./.github/workflows/gpu_l4_golden_parity.yml
     with:
@@ -190,7 +191,8 @@ jobs:
     needs: [detect-affected]
     if: >-
       always() && !cancelled() &&
-      (needs.detect-affected.outputs.has_affected == 'true' ||
+      (needs.detect-affected.result == 'failure' ||
+       needs.detect-affected.outputs.has_affected == 'true' ||
        github.event_name != 'pull_request')
     uses: ./.github/workflows/gpu_l5_generation_e2e.yml
     with:
