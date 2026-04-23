@@ -58,7 +58,7 @@
         },
         "vision": {
             "filename": "vision.onnx",
-            "config_filename": "image_processor.json",
+            "config_filename": "processor_config.json",
             "spatial_merge_size": 2,
             "session_options": {
                 "log_id": "onnxruntime-genai",
