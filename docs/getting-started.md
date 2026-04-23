@@ -218,19 +218,25 @@ It drives the entire build pipeline — graph construction, operator fusion,
 dead input removal, and KV cache sizing are all tailored for the target EP:
 
 ```bash
-# CUDA GPU (uses GQA, SkipNorm, PackQKV fusions)
+# Default (portable ONNX with standard fusions, no vendor-specific ops)
+mobius build --model meta-llama/Llama-3.2-1B output/
+
+# CPU (GQA fusion for f32)
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep cpu
+
+# CUDA GPU (GQA, SkipNorm, PackQKV fusions for f16/bf16)
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16
 
-# DirectML (uses GQA without fused RoPE)
+# DirectML (GQA without fused RoPE)
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep dml --dtype f16
 
-# TensorRT-RTX (uses GQA, no SkipLayerNorm)
+# TensorRT-RTX (GQA, no SkipLayerNorm)
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep trt-rtx --dtype f16
 
 # WebGPU
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep webgpu --dtype f16
 
-# Portable ONNX (no vendor fusions, runs on any ONNX runtime)
+# Strict ONNX standard (zero custom ops, runs on any ONNX runtime)
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep onnx-standard
 ```
 
