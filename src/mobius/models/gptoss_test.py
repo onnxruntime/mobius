@@ -14,9 +14,7 @@ from mobius.models.gptoss import GPTOSSCausalLMModel
 
 
 class TestGPTOSSPreprocessWeightsMXFP4:
-    """Test that MXFP4 _blocks/_scales pairs are dequantized and
-    then split into per-expert weight keys.
-    """
+    """Test MXFP4 _blocks/_scales dequantization in preprocess_weights."""
 
     @staticmethod
     def _make_gptoss_config():
@@ -32,9 +30,7 @@ class TestGPTOSSPreprocessWeightsMXFP4:
         )
 
     def test_mxfp4_blocks_scales_dequantized(self):
-        """_blocks/_scales keys are consumed and replaced by the
-        base tensor, then Phase 2 splits into per-expert keys.
-        """
+        """Blocks/scales are dequantized then split into per-expert keys."""
         config = self._make_gptoss_config()
         model = GPTOSSCausalLMModel(config)
 
@@ -81,9 +77,7 @@ class TestGPTOSSPreprocessWeightsMXFP4:
             assert result[up_key].shape == (inter, hidden)
 
     def test_no_blocks_passes_through(self):
-        """When no _blocks/_scales keys exist, weights pass through
-        unchanged to Phase 2.
-        """
+        """Weights pass through unchanged when no _blocks/_scales exist."""
         config = self._make_gptoss_config()
         model = GPTOSSCausalLMModel(config)
 
