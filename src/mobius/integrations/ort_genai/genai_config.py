@@ -159,6 +159,9 @@ class GenaiConfigGenerator:
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
 
+        # Extra decoder inputs (set via with_extra_decoder_inputs())
+        self._extra_decoder_inputs: dict[str, str] = {}
+
         # Optional speech fields (set via with_speech())
         self._speech: dict[str, Any] | None = None
 
@@ -277,6 +280,24 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
+    def with_extra_decoder_inputs(
+        self,
+        **inputs: str,
+    ) -> GenaiConfigGenerator:
+        """Add extra inputs to the decoder section.
+
+        For example, Gemma4 decoders need ``input_ids`` alongside
+        ``inputs_embeds`` for per-layer token embeddings (E2B).
+
+        Args:
+            **inputs: Mapping of input names to ONNX tensor names,
+                e.g. ``input_ids="input_ids"``.
+
+        Returns self for chaining.
+        """
+        self._extra_decoder_inputs.update(inputs)
+        return self
+
     def with_speech(
         self,
         *,
@@ -329,12 +350,14 @@ class GenaiConfigGenerator:
         is_multimodal = self._vision is not None or self._speech is not None
 
         # Decoder section
+        decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
+        decoder_inputs.update(self._extra_decoder_inputs)
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
             "filename": "model.onnx",
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
-            "inputs": _default_decoder_inputs(is_vlm=is_multimodal),
+            "inputs": decoder_inputs,
             "outputs": _default_decoder_outputs(),
             "num_attention_heads": self.num_attention_heads,
             "num_hidden_layers": self.num_hidden_layers,

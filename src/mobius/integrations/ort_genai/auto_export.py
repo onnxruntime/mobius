@@ -150,10 +150,27 @@ def _write_processor_config(
     if vision is None:
         return None
 
-    processor: dict[str, Any] = {
-        "image_size": getattr(vision, "image_size", 448),
-        "patch_size": getattr(vision, "patch_size", 14),
-    }
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in ("gemma4", "gemma4_text"):
+        # Gemma4 needs a processor wrapper with model-specific fields
+        max_soft_tokens = getattr(vision, "max_soft_tokens", 280)
+        processor: dict[str, Any] = {
+            "processor": {
+                "name": "gemma4_image_processor",
+                "image_size": getattr(vision, "image_size", 448),
+                "patch_size": getattr(vision, "patch_size", 16),
+                "tokens_per_image": max_soft_tokens,
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5],
+            }
+        }
+    else:
+        processor = {
+            "image_size": getattr(vision, "image_size", 448),
+            "patch_size": getattr(vision, "patch_size", 14),
+        }
+
     path = os.path.join(output_dir, "processor_config.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
@@ -201,7 +218,27 @@ def _write_genai_config(
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
                 }
+            elif getattr(config, "model_type", "") in (
+                "gemma4",
+                "gemma4_text",
+            ):
+                # Gemma4 uses pixel_values + pixel_position_ids
+                # (not image_grid_thw)
+                vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = "processor_config.json"
+                vision_kwargs["input_names"] = {
+                    "pixel_values": "pixel_values",
+                    "pixel_position_ids": "pixel_position_ids",
+                }
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
+
+    # Gemma4 decoders need input_ids alongside inputs_embeds for
+    # per-layer token embeddings (E2B architecture).
+    if is_vlm and getattr(config, "model_type", "") in (
+        "gemma4",
+        "gemma4_text",
+    ):
+        generator.with_extra_decoder_inputs(input_ids="input_ids")
 
     if has_speech:
         audio_config = getattr(config, "audio", None)
