@@ -65,6 +65,19 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
 }
 
+_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+
+_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",  # SentencePiece
+    "added_tokens.json",
+    "merges.txt",  # BPE
+    "vocab.json",  # BPE
+    "chat_template.jinja",  # Chat template for ORT GenAI
+]
+
 
 def _resolve_ort_genai_model_type(model_type: str) -> str:
     """Map HuggingFace model_type to ORT-GenAI model type string."""
@@ -87,6 +100,20 @@ def _graph_input_names(model: ir.Model) -> list[str]:
     ]
 
 
+def _introspect_inputs(
+    pkg: ModelPackage, key: str
+) -> dict[str, str] | None:
+    """Return ``{name: name}`` identity mapping for a sub-model's inputs.
+
+    Returns ``None`` when *key* is absent from *pkg*, letting callers
+    fall back to hard-coded defaults.
+    """
+    model = pkg.get(key)
+    if model is None:
+        return None
+    return {n: n for n in _graph_input_names(model)}
+
+
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
@@ -98,18 +125,8 @@ def _copy_tokenizer_files(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    tokenizer_files = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",  # SentencePiece
-        "added_tokens.json",
-        "merges.txt",  # BPE
-        "vocab.json",  # BPE
-        "chat_template.jinja",  # Chat template for ORT GenAI
-    ]
     copied: list[str] = []
-    for filename in tokenizer_files:
+    for filename in _TOKENIZER_FILES:
         try:
             src = hf_hub_download(model_id, filename)
             dst = os.path.join(output_dir, filename)
@@ -138,18 +155,8 @@ def _copy_tokenizer_files_from_local(
             source_dir,
         )
         return []
-    tokenizer_files = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",  # SentencePiece
-        "added_tokens.json",
-        "merges.txt",  # BPE
-        "vocab.json",  # BPE
-        "chat_template.jinja",  # Chat template for ORT GenAI
-    ]
     copied: list[str] = []
-    for filename in tokenizer_files:
+    for filename in _TOKENIZER_FILES:
         src = os.path.join(source_dir, filename)
         if os.path.isfile(src):
             dst = os.path.join(output_dir, filename)
@@ -319,7 +326,9 @@ def _write_genai_config(
                 vision_kwargs["spatial_merge_size"] = None
                 vision_kwargs["config_filename"] = "image_processor.json"
             elif model_type in ("gemma4", "gemma4_text"):
-                vision_kwargs["spatial_merge_size"] = None
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", 2)
+                vision_kwargs["spatial_merge_size"] = sms
                 vision_kwargs["config_filename"] = "image_processor.json"
 
             if vision_input_mapping is not None:

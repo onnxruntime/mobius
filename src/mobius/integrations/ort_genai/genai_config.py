@@ -362,9 +362,10 @@ class GenaiConfigGenerator:
             decoder_inputs = dict(self._decoder_inputs)
         else:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
+        decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
-            "filename": self._decoder_filename or "model.onnx",
+            "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
