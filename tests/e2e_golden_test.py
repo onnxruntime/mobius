@@ -1178,7 +1178,7 @@ def _run_phi4mm_multimodal_prefill(
     inputs_embeds = emb_out["inputs_embeds"]
 
     # Step 4: Decoder
-    dec_session = OnnxModelSession(pkg["model"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
     try:
         seq_len = inputs_embeds.shape[1]
         kv_cache = _make_empty_kv_cache(dec_session, config)

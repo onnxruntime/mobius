@@ -4,7 +4,7 @@
 """Speech-language 3-model split task for ASR / forced alignment.
 
 Builds three separate ONNX models:
-1. **audio**: input_features (mel spectrogram) → audio_features
+1. **audio_encoder**: input_features (mel spectrogram) → audio_features
 2. **embedding**: input_ids + audio_features → inputs_embeds
 3. **decoder**: inputs_embeds → logits + KV cache (MRoPE 3D position_ids)
 

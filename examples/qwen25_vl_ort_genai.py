@@ -94,7 +94,7 @@ def _write_genai_config(config, output_dir: str) -> None:
             },
             "vision": {
                 "filename": "vision_encoder/model.onnx",
-                "config_filename": "processor_config.json",
+                "config_filename": "image_processor.json",
                 "spatial_merge_size": 2,
                 "tokens_per_second": 2.0,
                 "inputs": {
@@ -145,13 +145,13 @@ def _copy_tokenizer(model_id: str, output_dir: str) -> None:
     processor = AutoProcessor.from_pretrained(model_id)
     processor.save_pretrained(output_dir)
 
-    # ORT GenAI expects ort-extensions processor_config.json format
+    # ORT GenAI expects ort-extensions image_processor.json format
     # (not the HuggingFace format), so overwrite with the correct schema.
     _write_processor_config(processor, output_dir)
 
 
 def _write_processor_config(processor, output_dir: str) -> None:
-    """Write processor_config.json in the ort-extensions format.
+    """Write image_processor.json in the ort-extensions format.
 
     NOTE: The ``width`` / ``height`` in the Resize step are default hints.
     Call ``_update_resize_for_image`` before running multimodal inference
@@ -223,14 +223,14 @@ def _write_processor_config(processor, output_dir: str) -> None:
             ],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+    with open(os.path.join(output_dir, "image_processor.json"), "w") as f:
         json.dump(processor_config, f, indent=2)
 
 
 def _update_resize_for_image(
     model_dir: str, image_path: str, patch_size: int = 14, merge_size: int = 2
 ) -> None:
-    """Update processor_config.json resize dims to match HF smart_resize.
+    """Update image_processor.json resize dims to match HF smart_resize.
 
     The ORT GenAI processor uses the configured width/height as the
     target resize.  HuggingFace instead computes target dimensions from
@@ -248,7 +248,7 @@ def _update_resize_for_image(
     new_h = max(factor, round(h / factor) * factor)
     new_w = max(factor, round(w / factor) * factor)
 
-    config_path = os.path.join(model_dir, "processor_config.json")
+    config_path = os.path.join(model_dir, "image_processor.json")
     with open(config_path) as f:
         config = json.load(f)
 

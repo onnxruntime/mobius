@@ -279,7 +279,7 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
-    decoder_filename = f"{decoder_key}/model.onnx" if is_vlm else "model.onnx"
+    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
 
     generator = GenaiConfigGenerator.from_config(
         config,

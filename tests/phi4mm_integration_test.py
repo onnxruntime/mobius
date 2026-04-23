@@ -157,7 +157,7 @@ def _run_onnx_pipeline(
             dtype=np.float32,
         )
 
-    decoder_session = OnnxModelSession(pkg["model"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
     decoder_out = decoder_session.run(decoder_feeds)
     decoder_session.close()
 

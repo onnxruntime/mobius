@@ -100,7 +100,7 @@ internally.
 Gemma 4 uses a **SigLIP** vision encoder (ViT, patch_size=16, image_size=448)
 with a "pan-and-scan" tiling strategy for high-resolution images.
 
-The ONNX vision model (`vision.onnx`) takes **pre-patchified** inputs:
+The ONNX vision model (`vision_encoder/model.onnx`) takes **pre-patchified** inputs:
 - `pixel_values [batch, num_patches, 3 * 16 * 16]` — flattened patch pixels
 - `pixel_position_ids [batch, num_patches, 2]` — (row, col) patch coordinates
 
@@ -116,7 +116,7 @@ Each image produces **280 soft tokens** (`vision_soft_tokens_per_image = 280`).
 Gemma 4 Any-to-Any uses a **Conformer** audio encoder (12 layers,
 hidden_size=1024) with 4× subsampling.
 
-The ONNX audio model (`audio.onnx`) takes:
+The ONNX audio model (`audio_encoder/model.onnx`) takes:
 - `input_features [batch, time, 128]` — 128-dim mel spectrogram
 
 Output: `audio_features [batch, time/4, 1536]` — projected to text hidden_size.
@@ -152,7 +152,7 @@ params = og.GeneratorParams(model)
 params.set_search_options(max_length=512)
 generator = og.Generator(model, params)
 
-# VLM (requires vision.onnx + embedding.onnx alongside model.onnx)
+# VLM (requires vision_encoder/ + embedding/ alongside decoder/)
 model = og.Model("path/to/gemma4/ort_genai/vlm")
 processor = og.MultiModalProcessor(model)
 # ... load image and tokenize prompt with processor ...
@@ -166,10 +166,10 @@ text/
   genai_config.json
 
 vlm/
-  model.onnx          ← decoder (Gemma4VisionLanguageTask / Gemma4AnyToAnyTask)
-  vision.onnx         ← vision encoder
-  audio.onnx          ← Conformer audio encoder (when model has audio)
-  embedding.onnx      ← embedding fusion
+  decoder/model.onnx          ← decoder (Gemma4VisionLanguageTask / Gemma4AnyToAnyTask)
+  vision_encoder/model.onnx  ← vision encoder
+  audio_encoder/model.onnx   ← Conformer audio encoder (when model has audio)
+  embedding/model.onnx       ← embedding fusion
   tokenizer.json
   genai_config.json
   image_processor.json
