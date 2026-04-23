@@ -296,7 +296,7 @@ def _write_genai_config(
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
-            vision_input_mapping = _introspect_inputs(pkg, "vision")
+            vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
             embedding_input_mapping = _introspect_inputs(pkg, "embedding")
 
             # spatial_merge_size and config_filename are config-level
@@ -320,7 +320,7 @@ def _write_genai_config(
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
     if has_speech:
-        audio_input_mapping = _introspect_inputs(pkg, "audio")
+        audio_input_mapping = _introspect_inputs(pkg, "audio_encoder")
 
         audio_config = getattr(config, "audio", None)
         audio_token_id = (
@@ -462,11 +462,11 @@ def write_ort_genai_config(
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
     # Detect multimodal capabilities from the package keys
-    is_vlm = "vision" in pkg and "embedding" in pkg
-    has_speech = "audio" in pkg
+    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+    has_speech = "audio_encoder" in pkg
 
     # Phi4MM quirk: HF reports model_type='phi' but the model package
-    # includes an 'audio' component that distinguishes it from plain Phi.
+    # includes an 'audio_encoder' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"

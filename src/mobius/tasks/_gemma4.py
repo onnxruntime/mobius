@@ -180,9 +180,9 @@ class Gemma4Task(ModelTask):
     ) -> ModelPackage:
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         if config.audio is not None:
-            models["audio"] = self._build_audio(module.audio_encoder, config)
+            models["audio_encoder"] = self._build_audio(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
@@ -279,7 +279,7 @@ class Gemma4Task(ModelTask):
 
         graph_inputs = [pixel_values, pixel_position_ids]
 
-        graph, graph_builder = _make_graph(graph_inputs, name="vision")
+        graph, graph_builder = _make_graph(graph_inputs, name="vision_encoder")
         op = graph_builder.op
 
         image_features = vision(
@@ -316,7 +316,7 @@ class Gemma4Task(ModelTask):
             type=ir.TensorType(config.dtype),
         )
 
-        graph, graph_builder = _make_graph([input_features], name="audio")
+        graph, graph_builder = _make_graph([input_features], name="audio_encoder")
         op = graph_builder.op
 
         audio_features = audio(op, input_features)

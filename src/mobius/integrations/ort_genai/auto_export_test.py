@@ -294,7 +294,7 @@ class TestExportForOrtGenai:
         pkg = ModelPackage(
             {
                 "model": mock.MagicMock(),
-                "vision": mock.MagicMock(),
+                "vision_encoder": mock.MagicMock(),
                 "embedding": mock.MagicMock(),
             },
             config=FakeConfig(),
@@ -551,7 +551,7 @@ class TestGemma4GenaiConfig:
         return ModelPackage(
             {
                 "decoder": decoder,
-                "vision": vision,
+                "vision_encoder": vision,
                 "embedding": embedding,
             },
             config=FakeConfig(),
@@ -888,14 +888,14 @@ class TestGemma4RealModel:
         pkg = build_from_module(module, config, task=Phi4MMMultiModalTask())
 
         # Verify 4-model split
-        assert "vision" in pkg
-        assert "audio" in pkg
+        assert "vision_encoder" in pkg
+        assert "audio_encoder" in pkg
         assert "embedding" in pkg
         assert "decoder" in pkg
 
         # Simulate auto_export detection logic
-        is_vlm = "vision" in pkg and "embedding" in pkg
-        has_speech = "audio" in pkg
+        is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+        has_speech = "audio_encoder" in pkg
         ort_model_type = "phi"  # HF model_type for phi4mm
         if ort_model_type == "phi" and has_speech:
             ort_model_type = "phi4mm"
@@ -966,8 +966,8 @@ class TestGemma4RealModel:
 
         assert os.path.exists(os.path.join(output_dir, "genai_config.json"))
         # 4-model split produces subdirectories
-        assert os.path.exists(os.path.join(output_dir, "vision"))
-        assert os.path.exists(os.path.join(output_dir, "audio"))
+        assert os.path.exists(os.path.join(output_dir, "vision_encoder"))
+        assert os.path.exists(os.path.join(output_dir, "audio_encoder"))
         assert os.path.exists(os.path.join(output_dir, "embedding"))
 
         with open(os.path.join(output_dir, "genai_config.json")) as f:

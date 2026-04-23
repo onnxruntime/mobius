@@ -262,7 +262,7 @@ class TestGenaiConfigGeneratorVLM:
         """VLM config includes vision model section."""
         config = self._make_vlm_gen().generate()
         vision = config["model"]["vision"]
-        assert vision["filename"] == "vision/model.onnx"
+        assert vision["filename"] == "vision_encoder/model.onnx"
         assert vision["spatial_merge_size"] == 2
         assert vision["inputs"]["pixel_values"] == "pixel_values"
         assert vision["outputs"]["image_features"] == "image_features"
@@ -561,7 +561,7 @@ class TestGenaiConfigGeneratorMultimodal:
         """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
         audio = config["model"]["audio"]
-        assert audio["filename"] == "audio/model.onnx"
+        assert audio["filename"] == "audio_encoder/model.onnx"
         assert audio["config_filename"] == "audio_processor.json"
         assert audio["inputs"]["audio_embeds"] == "audio_embeds"
         assert audio["inputs"]["audio_sizes"] == "audio_sizes"

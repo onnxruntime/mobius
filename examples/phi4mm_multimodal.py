@@ -850,8 +850,8 @@ def main():
     # Step 2: Create 4 inference sessions and tokenizer
     # ------------------------------------------------------------------
     print("Creating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"])
-    speech_session = OnnxModelSession(pkg["audio"])
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    speech_session = OnnxModelSession(pkg["audio_encoder"])
     embedding_session = OnnxModelSession(pkg["embedding"])
     decoder_session = OnnxModelSession(pkg["model"])
 

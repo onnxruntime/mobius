@@ -93,7 +93,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "config_filename": "processor_config.json",
                 "spatial_merge_size": 2,
                 "tokens_per_second": 2.0,

@@ -143,7 +143,7 @@ class TestModelPackageApplyWeights:
         model1 = pkg1["model"]
         model2 = pkg2["model"]
 
-        pkg = ModelPackage({"text": model1, "vision": model2})
+        pkg = ModelPackage({"text": model1, "vision_encoder": model2})
 
         # Get a weight name from model1
         init_name = next(iter(model1.graph.initializers.keys()))
@@ -153,7 +153,7 @@ class TestModelPackageApplyWeights:
         # Route via prefix
         pkg.apply_weights(
             {f"text.{init_name}": weight},
-            prefix_map={"text.": "text", "vision.": "vision"},
+            prefix_map={"text.": "text", "vision_encoder.": "vision_encoder"},
         )
         assert model1.graph.initializers[init_name].const_value is not None
 
@@ -233,7 +233,7 @@ class TestMultiModalPackageIntegration:
         task = VisionLanguageTask()
         pkg = task.build(module, config)
         assert isinstance(pkg, ModelPackage)
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
         assert pkg["decoder"].graph.num_nodes() > 0
 
     def test_multimodal_package_save_load(self, tmp_path):
@@ -255,7 +255,7 @@ class TestMultiModalPackageIntegration:
         pkg = task.build(module, config)
 
         # Vision model has vision_tower and projector params
-        vision_inits = list(pkg["vision"].graph.initializers.keys())
+        vision_inits = list(pkg["vision_encoder"].graph.initializers.keys())
         assert any("vision_tower" in n for n in vision_inits)
         assert any("multi_modal_projector" in n for n in vision_inits)
 

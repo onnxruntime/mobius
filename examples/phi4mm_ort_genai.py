@@ -135,7 +135,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "config_filename": "vision_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
@@ -150,7 +150,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "audio": {
-                "filename": "audio/model.onnx",
+                "filename": "audio_encoder/model.onnx",
                 "config_filename": "audio_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",

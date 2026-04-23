@@ -189,7 +189,7 @@ def transcribe(
     mel = compute_mel_spectrogram(audio)  # (1, n_mels, time)
 
     # Step 2: Run audio encoder
-    audio_out = sessions["audio"].run({"input_features": mel})
+    audio_out = sessions["audio_encoder"].run({"input_features": mel})
     audio_features = audio_out["audio_features"]  # (1, audio_seq, dim)
     num_audio_tokens = audio_features.shape[1]
 

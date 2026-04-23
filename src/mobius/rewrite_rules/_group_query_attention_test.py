@@ -163,7 +163,7 @@ class TestGroupQueryAttentionRules:
             load_weights=False,
         )
         # Vision model: no KV cache, Attention should remain untouched
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         vision_attn_before = count_ops(vision).get("Attention", 0)
         assert vision_attn_before == 24
 

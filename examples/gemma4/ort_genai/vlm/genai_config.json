@@ -35,7 +35,7 @@
         ],
         "pad_token_id": 0,
         "vision": {
-            "filename": "vision/model.onnx",
+            "filename": "vision_encoder/model.onnx",
             "config_filename": "image_processor.json",
             "inputs": {
                 "pixel_values": "pixel_values",
@@ -65,7 +65,7 @@
             }
         },
         "audio": {
-            "filename": "audio/model.onnx",
+            "filename": "audio_encoder/model.onnx",
             "config_filename": "audio_processor.json",
             "inputs": {
                 "audio_embeds": "audio_embeds",

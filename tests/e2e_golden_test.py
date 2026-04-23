@@ -584,7 +584,7 @@ def _run_vision_language_prefill(
     }
 
     # --- Step 1: Run vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
     try:
         vis_feeds: dict[str, np.ndarray] = {}
         for name in vis_session.input_names:
@@ -769,7 +769,7 @@ def _run_vl_generation(
     }
 
     # --- Step 1: vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
     try:
         vis_feeds: dict[str, np.ndarray] = {}
         for name in vis_session.input_names:
@@ -1099,7 +1099,7 @@ def _run_phi4mm_multimodal_prefill(
 
         # The vision model processes one image at a time (image_sizes is
         # [1, 2] per call).  For multi-image, loop and concatenate.
-        vision_session = OnnxModelSession(pkg["vision"], **device_kwargs)
+        vision_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
         try:
             all_features = []
             num_images = pixel_values.shape[0]
@@ -1145,7 +1145,7 @@ def _run_phi4mm_multimodal_prefill(
         # When images are also present, HF uses the "vision" audio projection
         audio_projection_mode = np.array(1 if case.images else 0, dtype=np.int64)
 
-        speech_session = OnnxModelSession(pkg["audio"], **device_kwargs)
+        speech_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
         try:
             speech_out = speech_session.run(
                 {
@@ -1235,7 +1235,7 @@ def _run_speech_language_prefill(
     )
 
     # Step 1: Run audio encoder
-    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
@@ -1674,7 +1674,7 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
-    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:

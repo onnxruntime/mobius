@@ -85,7 +85,7 @@ def _write_genai_config(config, output_dir: str, *, model_type: str = "qwen2_5_v
             "video_token_id": 151656,
             "vision_start_token_id": 151652,
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "config_filename": "image_processor.json",
                 "spatial_merge_size": getattr(config, "spatial_merge_size", 2),
                 "tokens_per_second": 2.0,
@@ -232,7 +232,7 @@ class TestOrtGenaiQwen25VL:
         # Build 3-model package with weights
         pkg = build(model_id, dtype="f32", load_weights=True)
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         # Save in flat layout for ORT GenAI
@@ -353,7 +353,7 @@ class TestOrtGenaiQwen3VL:
 
         pkg = build(model_id, dtype="f32", load_weights=True)
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         output_dir = str(tmp_path / "qwen3vl")

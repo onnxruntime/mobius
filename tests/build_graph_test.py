@@ -820,13 +820,13 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         # Verify 4-model package structure
-        assert "vision" in pkg, "Should have vision model"
-        assert "audio" in pkg, "Should have audio model"
+        assert "vision_encoder" in pkg, "Should have vision model"
+        assert "audio_encoder" in pkg, "Should have audio model"
         assert "embedding" in pkg, "Should have embedding model"
         assert "decoder" in pkg, "Should have decoder model"
 
         # Vision model: pixel_values + image_sizes → image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         v_inputs = {inp.name for inp in vision.graph.inputs}
         v_outputs = {out.name for out in vision.graph.outputs}
         assert "pixel_values" in v_inputs
@@ -838,7 +838,7 @@ class TestBuildGraphVisionLanguage:
         )
 
         # Speech model: audio_embeds + metadata → audio_features (single output)
-        speech = pkg["audio"]
+        speech = pkg["audio_encoder"]
         s_inputs = {inp.name for inp in speech.graph.inputs}
         s_outputs = {out.name for out in speech.graph.outputs}
         assert "audio_embeds" in s_inputs
@@ -884,13 +884,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -918,13 +918,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -965,7 +965,7 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         # 3-model split: decoder, vision, embedding
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         # Decoder: inputs_embeds → logits + KV cache
         decoder = pkg["decoder"]
@@ -973,7 +973,7 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
         # Vision: pixel_values → image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1022,7 +1022,7 @@ class TestBuildGraphVisionLanguage:
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         # Decoder should have logits output and inputs_embeds input
@@ -1065,7 +1065,7 @@ class TestBuildGraphVisionLanguage:
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         # Decoder should have logits output and inputs_embeds input
@@ -1133,8 +1133,8 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
-        assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+        assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
     def test_gemma4_multimodal_graph(self):
@@ -1183,7 +1183,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
         )
         # Decoder: inputs_embeds -> logits + per-layer KV cache
@@ -1191,7 +1191,7 @@ class TestBuildGraphVisionLanguage:
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision: pixel_values + pixel_position_ids -> image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         vision_input_names = {i.name for i in vision.graph.inputs}
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
@@ -1301,9 +1301,12 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}, (
-            f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
-        )
+        assert set(pkg.keys()) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }, f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
         # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
@@ -1312,13 +1315,13 @@ class TestBuildGraphVisionLanguage:
         assert "past_key_values.1.key" not in decoder_input_names  # shared layer
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         vision_input_names = {i.name for i in vision.graph.inputs}
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
         # Audio encoder
-        audio = pkg["audio"]
+        audio = pkg["audio_encoder"]
         assert "input_features" in {i.name for i in audio.graph.inputs}
         assert "audio_features" in {o.name for o in audio.graph.outputs}
         # Embedding: all three inputs
@@ -1436,7 +1439,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         # Decoder: inputs_embeds → logits + KV cache
         decoder = pkg["decoder"]
@@ -1444,7 +1447,7 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
         # Vision: pixel_values → image_features (via ViT + Q-Former)
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1500,13 +1503,13 @@ class TestBuildGraphVisionLanguage:
             task = get_task(task_name)
             pkg = task.build(module, config)
 
-            assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+            assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
                 f"{model_type} should produce 3 models"
             )
             assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}, (
                 f"{model_type} decoder missing logits"
             )
-            assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}, (
+            assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}, (
                 f"{model_type} vision missing pixel_values"
             )
 
@@ -1531,9 +1534,9 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
-        assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
+        assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}
 
     def test_pixtral_preprocess_weights_remapping(self):
         """Verify _preprocess_pixtral_weights remaps HF weight names correctly."""
@@ -1618,7 +1621,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         dec_inputs = {i.name for i in decoder.graph.inputs}
@@ -1637,7 +1640,7 @@ class TestBuildGraphVisionLanguage:
         assert kv_shapes["past_key_values.1.key"] != kv_shapes["past_key_values.0.key"]
         assert kv_shapes["past_key_values.0.key"] == kv_shapes["past_key_values.2.key"]
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
 
         embed = pkg["embedding"]
@@ -1669,13 +1672,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1783,17 +1786,17 @@ class TestBuildGraphMultiModal:
 
         # Verify 4 models in package
         assert len(pkg) == 4, f"Expected 4 models, got {len(pkg)}"
-        for key in ("vision", "audio", "embedding", "decoder"):
+        for key in ("vision_encoder", "audio_encoder", "embedding", "decoder"):
             assert key in pkg, f"Missing model: {key}"
 
         # Vision model has SigLIP encoder initializers
-        vision_inits = list(pkg["vision"].graph.initializers)
+        vision_inits = list(pkg["vision_encoder"].graph.initializers)
         assert any("img_processor" in n for n in vision_inits), (
             "Vision model should have SigLIP initializers"
         )
 
         # Speech model has Conformer encoder initializers
-        speech_inits = list(pkg["audio"].graph.initializers)
+        speech_inits = list(pkg["audio_encoder"].graph.initializers)
         assert any("encoder" in n for n in speech_inits), (
             "Speech model should have Conformer initializers"
         )
@@ -1975,7 +1978,7 @@ class TestBuildGraphQwen3ASR:
         module = Qwen3ASRForConditionalGeneration(config)
         pkg = build_from_module(module, config, task=SpeechLanguageTask())
 
-        assert "audio" in pkg
+        assert "audio_encoder" in pkg
         assert "embedding" in pkg
         assert "decoder" in pkg
 
@@ -1989,7 +1992,7 @@ class TestBuildGraphQwen3ASR:
         config = self._asr_config()
         module = Qwen3ASRForConditionalGeneration(config)
         pkg = build_from_module(module, config, task=SpeechLanguageTask())
-        encoder = pkg["audio"]
+        encoder = pkg["audio_encoder"]
 
         input_names = {inp.name for inp in encoder.graph.inputs}
         assert "input_features" in input_names
@@ -2087,7 +2090,7 @@ class TestBuildGraphQwen3ASR:
             fill_random_weights(model)
 
         # Step 1: Audio encoder — random mel input
-        enc_sess = OnnxModelSession(pkg["audio"])
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
         mel = np.random.randn(1, config.audio.num_mel_bins, 100).astype(np.float32)
         enc_out = enc_sess.run({"input_features": mel})
         audio_features = enc_out["audio_features"]
@@ -4064,14 +4067,14 @@ class TestBuildVLGraph:
             assert "logits" in output_names
         else:
             assert "decoder" in pkg, f"{model_type} should produce 'decoder'"
-            assert "vision" in pkg, f"{model_type} should produce 'vision'"
+            assert "vision_encoder" in pkg, f"{model_type} should produce 'vision_encoder'"
             assert "embedding" in pkg, f"{model_type} should produce 'embedding'"
 
             decoder = pkg["decoder"]
             assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
             assert "logits" in {o.name for o in decoder.graph.outputs}
 
-            vision = pkg["vision"]
+            vision = pkg["vision_encoder"]
             assert "pixel_values" in {i.name for i in vision.graph.inputs}
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
@@ -4112,7 +4115,7 @@ _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
 # Expected sub-model keys per speech task type
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-to-text": {"encoder", "decoder"},
-    "speech-language": {"audio", "embedding", "decoder"},
+    "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
     "audio-feature-extraction": {"model"},
 }
