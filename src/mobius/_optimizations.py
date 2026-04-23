@@ -493,6 +493,22 @@ def optimize_model(
                 stacklevel=4,
             )
 
+    # Stage 5: Remove dead graph inputs.  After EP-aware fusion, some
+    # inputs may have no consumers (e.g. position_ids when all layers use
+    # GQA with fused RoPE).  Removing them produces a cleaner model and
+    # avoids requiring the runtime to provide dummy values.
+    dead_inputs = [
+        inp
+        for inp in model.graph.inputs
+        if inp.name is not None
+        and not inp.name.startswith("past_key_values.")
+        and len(inp.uses()) == 0
+    ]
+    for inp in dead_inputs:
+        model.graph.inputs.remove(inp)
+        if trace:
+            logger.info("[EP Trace] Removed dead input: %s", inp.name)
+
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
     """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.

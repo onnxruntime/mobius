@@ -186,8 +186,6 @@ def _write_processor_config(
                 "image_size": image_size,
                 "patch_size": patch_size,
                 "tokens_per_image": tokens_per_image,
-                "mean": [0.5, 0.5, 0.5],
-                "std": [0.5, 0.5, 0.5],
             }
         }
     else:
