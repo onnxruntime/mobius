@@ -586,7 +586,7 @@ class TestGemma4GenaiConfig:
         assert "pixel_values" in vision_inputs
         assert "pixel_position_ids" in vision_inputs
         assert "image_grid_thw" not in vision_inputs
-        assert "spatial_merge_size" not in data["model"]["vision"]
+        assert data["model"]["vision"]["spatial_merge_size"] == 2
 
     def test_gemma4_decoder_has_input_ids_and_inputs_embeds(self, tmp_path):
         """Gemma4 decoder has both inputs_embeds and input_ids."""
@@ -779,7 +779,7 @@ class TestGemma4RealModel:
 
         # Config-level properties are still present
         assert data["model"]["image_token_id"] == 255999
-        assert "spatial_merge_size" not in data["model"]["vision"]
+        assert data["model"]["vision"]["spatial_merge_size"] == 2
         assert data["model"]["vision"]["config_filename"] == "processor_config.json"
 
     def test_auto_export_produces_genai_config(self, tmp_path):

@@ -196,7 +196,9 @@ def _write_processor_config(
             "patch_size": getattr(vision, "patch_size", None) or 14,
         }
 
-    path = os.path.join(output_dir, "processor_config.json")
+    proc_filename = "processor_config.json"
+
+    path = os.path.join(output_dir, proc_filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
@@ -275,8 +277,9 @@ def _write_genai_config(
                 vision_kwargs["spatial_merge_size"] = None
                 vision_kwargs["config_filename"] = "vision_processor.json"
             elif model_type in ("gemma4", "gemma4_text"):
-                vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "processor_config.json"
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", 2)
+                vision_kwargs["spatial_merge_size"] = sms
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
