@@ -4,7 +4,10 @@
         "vocab_size": 262144,
         "context_length": 131072,
         "bos_token_id": 2,
-        "eos_token_id": [1, 106],
+        "eos_token_id": [
+            1,
+            106
+        ],
         "pad_token_id": 0,
         "image_token_id": 255999,
         "decoder": {
@@ -12,7 +15,7 @@
                 "log_id": "onnxruntime-genai",
                 "provider_options": []
             },
-            "filename": "model.onnx",
+            "filename": "decoder/model.onnx",
             "hidden_size": 1536,
             "head_size": 256,
             "num_attention_heads": 8,
@@ -20,6 +23,7 @@
             "num_hidden_layers": 15,
             "inputs": {
                 "inputs_embeds": "inputs_embeds",
+                "input_ids": "input_ids",
                 "attention_mask": "attention_mask",
                 "position_ids": "position_ids",
                 "past_key_names": "past_key_values.%d.key",
@@ -36,12 +40,26 @@
                 "alignment": "right",
                 "slide_key_value_cache": true,
                 "slide_inputs": true,
-                "layers": [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]
+                "layers": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    5,
+                    6,
+                    7,
+                    8,
+                    10,
+                    11,
+                    12,
+                    13
+                ]
             }
         },
         "vision": {
             "filename": "vision.onnx",
             "config_filename": "processor_config.json",
+            "spatial_merge_size": 2,
             "session_options": {
                 "log_id": "onnxruntime-genai",
                 "provider_options": []

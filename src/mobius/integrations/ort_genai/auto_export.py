@@ -42,6 +42,8 @@ import shutil
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import onnx_ir as ir
+
     from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,22 @@ def _resolve_ort_genai_model_type(model_type: str) -> str:
     return _ORT_GENAI_MODEL_TYPE.get(model_type, model_type)
 
 
+def _graph_input_names(model: ir.Model) -> list[str]:
+    """Return non-KV-cache input names from an ONNX model graph.
+
+    Filters out KV cache inputs (``past_key_values.*`` and ``past_*``)
+    since those are represented as template patterns in genai_config.json,
+    not as literal graph input names.
+    """
+    return [
+        inp.name
+        for inp in model.graph.inputs
+        if inp.name is not None
+        and not inp.name.startswith("past_key_values.")
+        and not inp.name.startswith("past_")
+    ]
+
+
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
@@ -88,6 +106,7 @@ def _copy_tokenizer_files(
         "added_tokens.json",
         "merges.txt",  # BPE
         "vocab.json",  # BPE
+        "chat_template.jinja",  # Chat template for ORT GenAI
     ]
     copied: list[str] = []
     for filename in tokenizer_files:
@@ -127,6 +146,7 @@ def _copy_tokenizer_files_from_local(
         "added_tokens.json",
         "merges.txt",  # BPE
         "vocab.json",  # BPE
+        "chat_template.jinja",  # Chat template for ORT GenAI
     ]
     copied: list[str] = []
     for filename in tokenizer_files:
@@ -150,11 +170,35 @@ def _write_processor_config(
     if vision is None:
         return None
 
-    processor: dict[str, Any] = {
-        "image_size": getattr(vision, "image_size", 448),
-        "patch_size": getattr(vision, "patch_size", 14),
-    }
-    path = os.path.join(output_dir, "processor_config.json")
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in ("gemma4", "gemma4_text"):
+        # Gemma4 needs a processor wrapper with model-specific fields
+        tokens_per_image = (
+            getattr(vision, "mm_tokens_per_image", None)
+            or getattr(config, "mm_tokens_per_image", None)
+            or getattr(vision, "max_soft_tokens", None)
+            or 280
+        )
+        image_size = getattr(vision, "image_size", None) or 448
+        patch_size = getattr(vision, "patch_size", None) or 16
+        processor: dict[str, Any] = {
+            "processor": {
+                "name": "gemma4_image_processor",
+                "image_size": image_size,
+                "patch_size": patch_size,
+                "tokens_per_image": tokens_per_image,
+            }
+        }
+    else:
+        processor = {
+            "image_size": getattr(vision, "image_size", None) or 448,
+            "patch_size": getattr(vision, "patch_size", None) or 14,
+        }
+
+    proc_filename = "processor_config.json"
+
+    path = os.path.join(output_dir, proc_filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
@@ -164,6 +208,7 @@ def _write_genai_config(
     config: Any,
     output_dir: str,
     *,
+    pkg: ModelPackage,
     ort_model_type: str,
     ep: str,
     context_length: int,
@@ -175,9 +220,24 @@ def _write_genai_config(
 ) -> str:
     """Generate and write genai_config.json.
 
+    Input names for each sub-model (decoder, vision, embedding) are
+    introspected from the ONNX graphs in *pkg* rather than hard-coded
+    per model type.
+
     Returns the path to the written file.
     """
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
+
+    # --- Discover decoder inputs from the ONNX graph ---
+    decoder_model = pkg.get("decoder") or pkg.get("model")
+    if decoder_model is not None:
+        decoder_input_names = _graph_input_names(decoder_model)
+        decoder_inputs: dict[str, str] | None = {name: name for name in decoder_input_names}
+        # KV cache entries are template-based, not per-input
+        decoder_inputs["past_key_names"] = "past_key_values.%d.key"
+        decoder_inputs["past_value_names"] = "past_key_values.%d.value"
+    else:
+        decoder_inputs = None  # fall back to defaults
 
     generator = GenaiConfigGenerator.from_config(
         config,
@@ -187,20 +247,45 @@ def _write_genai_config(
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
+        decoder_inputs=decoder_inputs,
     )
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
+            # Discover vision inputs from the graph
+            vision_model = pkg.get("vision")
+            if vision_model is not None:
+                names = _graph_input_names(vision_model)
+                vision_input_mapping: dict[str, str] | None = {n: n for n in names}
+            else:
+                vision_input_mapping = None
+
+            # Discover embedding inputs from the graph
+            embedding_model = pkg.get("embedding")
+            if embedding_model is not None:
+                names = _graph_input_names(embedding_model)
+                embedding_input_mapping: dict[str, str] | None = {n: n for n in names}
+            else:
+                embedding_input_mapping = None
+
+            # spatial_merge_size and config_filename are config-level
+            # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
+            model_type = getattr(config, "model_type", "")
             if has_speech:
-                # Phi4MM uses different vision inputs than Qwen2.5-VL
                 vision_kwargs["spatial_merge_size"] = None
                 vision_kwargs["config_filename"] = "vision_processor.json"
-                vision_kwargs["input_names"] = {
-                    "pixel_values": "pixel_values",
-                    "image_sizes": "image_sizes",
-                }
+            elif model_type in ("gemma4", "gemma4_text"):
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", 2)
+                vision_kwargs["spatial_merge_size"] = sms
+
+            if vision_input_mapping is not None:
+                vision_kwargs["input_names"] = vision_input_mapping
+            if embedding_input_mapping is not None:
+                vision_kwargs["embedding_input_names"] = embedding_input_mapping
+
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
     if has_speech:
@@ -331,6 +416,7 @@ def write_ort_genai_config(
     genai_path = _write_genai_config(
         config,
         directory,
+        pkg=pkg,
         ort_model_type=ort_model_type,
         ep=ep,
         context_length=context_length,
