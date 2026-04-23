@@ -502,28 +502,23 @@ class GPTOSSCausalLMModel(CausalLMModel):
         ``[N, inter, hidden]`` shapes that the non-quantized path expects.
         """
         # Phase 1: Dequantize MXFP4 _blocks + _scales into full tensors.
-        # Collect pairs and replace them with dequantized full tensors.
-        dequantized: dict[str, torch.Tensor] = {}
+        # The mxfp4 module ships with the same transformers version that
+        # added GPT-OSS support, so no version guard is needed.
+        from transformers.integrations.mxfp4 import (
+            _convert_moe_packed_tensors,
+        )
+
         blocks_keys = [k for k in state_dict if k.endswith("_blocks")]
         for bk in blocks_keys:
             sk = bk.replace("_blocks", "_scales")
             if sk not in state_dict:
                 continue
-            # Reconstruct the base key (e.g. "model.layers.0.mlp.experts.gate_up_proj")
             base_key = bk.removesuffix("_blocks")
-            from transformers.integrations.mxfp4 import (
-                _convert_moe_packed_tensors,
+            state_dict[base_key] = _convert_moe_packed_tensors(
+                state_dict.pop(bk),
+                state_dict.pop(sk),
+                dtype=torch.bfloat16,
             )
-
-            dequantized[base_key] = _convert_moe_packed_tensors(
-                state_dict[bk], state_dict[sk], dtype=torch.bfloat16
-            )
-
-        # Remove consumed _blocks/_scales and inject dequantized tensors
-        for base_key, tensor in dequantized.items():
-            state_dict.pop(f"{base_key}_blocks", None)
-            state_dict.pop(f"{base_key}_scales", None)
-            state_dict[base_key] = tensor
 
         # Phase 2: Split fused/stacked weights into per-expert tensors.
         result: dict[str, torch.Tensor] = {}
