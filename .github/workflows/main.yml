@@ -45,13 +45,21 @@ jobs:
         id: changed
         env:
           BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
+          elif [ "${{ github.event_name }}" = "push" ] && \
+               [ -n "$BEFORE" ] && \
+               [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # Push with a known previous commit: use the full push range so
+            # multi-commit pushes don't silently miss changed files.
+            git diff --name-only "$BEFORE"..."$SHA" > changed_files.txt
           else
-            # Push, tag, or workflow_dispatch: compare against the previous
-            # commit when one exists. On a root commit there is no HEAD~1, so
-            # fall back to listing the files introduced by HEAD.
+            # workflow_dispatch, new-branch push (before=0000...), or unknown
+            # event: fall back to HEAD~1 when it exists, or diff-tree for the
+            # root commit of a new repository.
             if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
               git diff --name-only HEAD~1...HEAD > changed_files.txt
             else
