@@ -8,7 +8,7 @@ Two entry points:
 - :func:`write_ort_genai_config` — programmatic API. Takes an already-built
   :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
   ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
-  ``processor_config.json``) alongside the ONNX models.
+  ``image_processor.json``) alongside the ONNX models.
 
 - :func:`auto_export` — end-to-end convenience function. Builds the model
   from a HuggingFace ID, saves the ONNX files, then calls
@@ -162,7 +162,7 @@ def _write_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write a minimal processor_config.json for VLM models.
+    """Write a minimal image_processor.json for VLM models.
 
     Returns the path if written, None otherwise.
     """
@@ -196,7 +196,7 @@ def _write_processor_config(
             "patch_size": getattr(vision, "patch_size", None) or 14,
         }
 
-    path = os.path.join(output_dir, "processor_config.json")
+    path = os.path.join(output_dir, "image_processor.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
@@ -227,7 +227,8 @@ def _write_genai_config(
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
 
     # --- Discover decoder inputs from the ONNX graph ---
-    decoder_model = pkg.get("decoder") or pkg.get("model")
+    decoder_key = "decoder" if "decoder" in pkg else "model"
+    decoder_model = pkg.get(decoder_key)
     if decoder_model is not None:
         decoder_input_names = _graph_input_names(decoder_model)
         decoder_inputs: dict[str, str] | None = {name: name for name in decoder_input_names}
@@ -236,6 +237,9 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
     else:
         decoder_inputs = None  # fall back to defaults
+
+    # Derive decoder filename from the actual package key
+    decoder_filename = f"{decoder_key}/model.onnx" if is_vlm else "model.onnx"
 
     generator = GenaiConfigGenerator.from_config(
         config,
@@ -246,6 +250,7 @@ def _write_genai_config(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
+        decoder_filename=decoder_filename,
     )
 
     if is_vlm:
@@ -273,10 +278,10 @@ def _write_genai_config(
             model_type = getattr(config, "model_type", "")
             if has_speech:
                 vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "vision_processor.json"
+                vision_kwargs["config_filename"] = "image_processor.json"
             elif model_type in ("gemma4", "gemma4_text"):
                 vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "processor_config.json"
+                vision_kwargs["config_filename"] = "image_processor.json"
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
@@ -307,7 +312,7 @@ def write_ort_genai_config(
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
     Writes ``genai_config.json``, optionally copies tokenizer files from
-    HuggingFace Hub or a local directory, and writes ``processor_config.json``
+    HuggingFace Hub or a local directory, and writes ``image_processor.json``
     for VLM models.  Does NOT build or save ONNX models — call
     :meth:`~mobius._model_package.ModelPackage.save` separately before or
     after this function.
@@ -340,7 +345,7 @@ def write_ort_genai_config(
             {
                 "genai_config": "/output/genai_config.json",
                 "tokenizer.json": "/output/tokenizer.json",
-                "processor_config": "/output/processor_config.json",
+                "processor_config": "/output/image_processor.json",
             }
 
     Raises:
@@ -401,10 +406,10 @@ def write_ort_genai_config(
 
     # Detect multimodal capabilities from the package keys
     is_vlm = "vision" in pkg and "embedding" in pkg
-    has_speech = "speech" in pkg
+    has_speech = "audio" in pkg
 
     # Phi4MM quirk: HF reports model_type='phi' but the model package
-    # includes a 'speech' component that distinguishes it from plain Phi.
+    # includes an 'audio' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
@@ -446,7 +451,7 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
-    # Write processor_config.json for VLMs
+    # Write image_processor.json for VLMs
     processor_path = _write_processor_config(config, directory)
     if processor_path:
         result["processor_config"] = processor_path
@@ -476,7 +481,7 @@ def auto_export(
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
     4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
-       tokenizer files, and ``processor_config.json``
+       tokenizer files, and ``image_processor.json``
 
     Args:
         model_id: HuggingFace model repository ID.

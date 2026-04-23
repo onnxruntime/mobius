@@ -86,7 +86,7 @@ def _write_genai_config(config, output_dir: str, *, model_type: str = "qwen2_5_v
             "vision_start_token_id": 151652,
             "vision": {
                 "filename": "vision/model.onnx",
-                "config_filename": "processor_config.json",
+                "config_filename": "image_processor.json",
                 "spatial_merge_size": getattr(config, "spatial_merge_size", 2),
                 "tokens_per_second": 2.0,
                 "inputs": {
@@ -135,12 +135,12 @@ def _copy_tokenizer(model_id: str, output_dir: str) -> None:
     processor = AutoProcessor.from_pretrained(model_id)
     processor.save_pretrained(output_dir)
 
-    # ORT GenAI expects ort-extensions processor_config.json format
+    # ORT GenAI expects ort-extensions image_processor.json format
     _write_processor_config(processor, output_dir)
 
 
 def _write_processor_config(processor, output_dir: str) -> None:
-    """Write processor_config.json in the ort-extensions format."""
+    """Write image_processor.json in the ort-extensions format."""
     ip = processor.image_processor
     processor_config = {
         "processor": {
@@ -206,7 +206,7 @@ def _write_processor_config(processor, output_dir: str) -> None:
             ],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+    with open(os.path.join(output_dir, "image_processor.json"), "w") as f:
         json.dump(processor_config, f, indent=2)
 
 

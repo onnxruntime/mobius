@@ -4,7 +4,7 @@
 """Speech-language 3-model split task for ASR / forced alignment.
 
 Builds three separate ONNX models:
-1. **audio_encoder**: input_features (mel spectrogram) → audio_features
+1. **audio**: input_features (mel spectrogram) → audio_features
 2. **embedding**: input_ids + audio_features → inputs_embeds
 3. **decoder**: inputs_embeds → logits + KV cache (MRoPE 3D position_ids)
 
@@ -43,12 +43,12 @@ class SpeechLanguageTask(ModelTask):
     """
 
     model_roles: ClassVar[dict[str, str]] = {
-        "audio_encoder": "encoder",
+        "audio": "encoder",
         "embedding": "embedding",
         "decoder": "decoder",
     }
     components = ComponentSpec(
-        audio_encoder="audio_tower",
+        audio="audio_tower",
         embedding="embedding",
         decoder="decoder",
     )
@@ -60,7 +60,7 @@ class SpeechLanguageTask(ModelTask):
     ) -> ModelPackage:
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
-        models["audio_encoder"] = self._build_audio_encoder(module.audio_tower, config)
+        models["audio"] = self._build_audio_encoder(module.audio_tower, config)
         output_dim = (config.audio.output_dim if config.audio else None) or config.hidden_size
         models["embedding"] = build_embedding_from_features(
             module.embedding,
@@ -88,7 +88,7 @@ class SpeechLanguageTask(ModelTask):
             type=ir.TensorType(config.dtype),
         )
 
-        graph, builder = _make_graph([input_features], name="audio_encoder")
+        graph, builder = _make_graph([input_features], name="audio")
         audio_features = audio_encoder(builder.op, input_features)
 
         audio_features.name = "audio_features"

@@ -661,8 +661,8 @@ class TestBuildGraphLoRA:
         module = model_cls(config)
         task = Phi4MMMultiModalTask()
         pkg = task.build(module, config)
-        # LoRA adapters live in the decoder model (pkg["model"])
-        decoder = pkg["model"]
+        # LoRA adapters live in the decoder model (pkg["decoder"])
+        decoder = pkg["decoder"]
 
         init_names = list(decoder.graph.initializers)
         lora_names = [n for n in init_names if "lora" in n]
@@ -821,9 +821,9 @@ class TestBuildGraphVisionLanguage:
 
         # Verify 4-model package structure
         assert "vision" in pkg, "Should have vision model"
-        assert "speech" in pkg, "Should have speech model"
+        assert "audio" in pkg, "Should have audio model"
         assert "embedding" in pkg, "Should have embedding model"
-        assert "model" in pkg, "Should have decoder model"
+        assert "decoder" in pkg, "Should have decoder model"
 
         # Vision model: pixel_values + image_sizes → image_features
         vision = pkg["vision"]
@@ -838,7 +838,7 @@ class TestBuildGraphVisionLanguage:
         )
 
         # Speech model: audio_embeds + metadata → audio_features (single output)
-        speech = pkg["speech"]
+        speech = pkg["audio"]
         s_inputs = {inp.name for inp in speech.graph.inputs}
         s_outputs = {out.name for out in speech.graph.outputs}
         assert "audio_embeds" in s_inputs
@@ -855,8 +855,8 @@ class TestBuildGraphVisionLanguage:
         assert "audio_features" in e_inputs
         assert "inputs_embeds" in e_outputs
 
-        # Decoder model (pkg["model"]): inputs_embeds → logits + KV cache
-        decoder = pkg["model"]
+        # Decoder model (pkg["decoder"]): inputs_embeds → logits + KV cache
+        decoder = pkg["decoder"]
         d_inputs = {inp.name for inp in decoder.graph.inputs}
         d_outputs = {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in d_inputs
@@ -1783,7 +1783,7 @@ class TestBuildGraphMultiModal:
 
         # Verify 4 models in package
         assert len(pkg) == 4, f"Expected 4 models, got {len(pkg)}"
-        for key in ("vision", "speech", "embedding", "model"):
+        for key in ("vision", "audio", "embedding", "decoder"):
             assert key in pkg, f"Missing model: {key}"
 
         # Vision model has SigLIP encoder initializers
@@ -1793,13 +1793,13 @@ class TestBuildGraphMultiModal:
         )
 
         # Speech model has Conformer encoder initializers
-        speech_inits = list(pkg["speech"].graph.initializers)
+        speech_inits = list(pkg["audio"].graph.initializers)
         assert any("encoder" in n for n in speech_inits), (
             "Speech model should have Conformer initializers"
         )
 
-        # Decoder model (pkg["model"]) has LoRA initializers
-        decoder_inits = list(pkg["model"].graph.initializers)
+        # Decoder model (pkg["decoder"]) has LoRA initializers
+        decoder_inits = list(pkg["decoder"].graph.initializers)
         assert any("lora" in n for n in decoder_inits), (
             "Decoder model should have LoRA initializers"
         )
@@ -1975,7 +1975,7 @@ class TestBuildGraphQwen3ASR:
         module = Qwen3ASRForConditionalGeneration(config)
         pkg = build_from_module(module, config, task=SpeechLanguageTask())
 
-        assert "audio_encoder" in pkg
+        assert "audio" in pkg
         assert "embedding" in pkg
         assert "decoder" in pkg
 
@@ -1989,7 +1989,7 @@ class TestBuildGraphQwen3ASR:
         config = self._asr_config()
         module = Qwen3ASRForConditionalGeneration(config)
         pkg = build_from_module(module, config, task=SpeechLanguageTask())
-        encoder = pkg["audio_encoder"]
+        encoder = pkg["audio"]
 
         input_names = {inp.name for inp in encoder.graph.inputs}
         assert "input_features" in input_names
@@ -2087,7 +2087,7 @@ class TestBuildGraphQwen3ASR:
             fill_random_weights(model)
 
         # Step 1: Audio encoder — random mel input
-        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        enc_sess = OnnxModelSession(pkg["audio"])
         mel = np.random.randn(1, config.audio.num_mel_bins, 100).astype(np.float32)
         enc_out = enc_sess.run({"input_features": mel})
         audio_features = enc_out["audio_features"]
@@ -4112,7 +4112,7 @@ _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
 # Expected sub-model keys per speech task type
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-to-text": {"encoder", "decoder"},
-    "speech-language": {"audio_encoder", "embedding", "decoder"},
+    "speech-language": {"audio", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
     "audio-feature-extraction": {"model"},
 }

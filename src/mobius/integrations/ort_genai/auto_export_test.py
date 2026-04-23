@@ -266,7 +266,7 @@ class TestExportForOrtGenai:
         assert data["model"]["type"] == "qwen2"
 
     def test_processor_config_written_with_vision(self, tmp_path):
-        """processor_config.json is written when pkg.config.vision is set."""
+        """image_processor.json is written when pkg.config.vision is set."""
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -305,14 +305,14 @@ class TestExportForOrtGenai:
         assert data["image_size"] == 448
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
-        """processor_config.json is NOT written when pkg.config has no vision attr."""
+        """image_processor.json is NOT written when pkg.config has no vision attr."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
         result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "processor_config" not in result
-        assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
+        assert not os.path.exists(os.path.join(str(tmp_path), "image_processor.json"))
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
@@ -780,7 +780,7 @@ class TestGemma4RealModel:
         # Config-level properties are still present
         assert data["model"]["image_token_id"] == 255999
         assert "spatial_merge_size" not in data["model"]["vision"]
-        assert data["model"]["vision"]["config_filename"] == "processor_config.json"
+        assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
@@ -904,13 +904,13 @@ class TestGemma4RealModel:
 
         # Verify 4-model split
         assert "vision" in pkg
-        assert "speech" in pkg
+        assert "audio" in pkg
         assert "embedding" in pkg
-        assert "model" in pkg
+        assert "decoder" in pkg
 
         # Simulate auto_export detection logic
         is_vlm = "vision" in pkg and "embedding" in pkg
-        has_speech = "speech" in pkg
+        has_speech = "audio" in pkg
         ort_model_type = "phi"  # HF model_type for phi4mm
         if ort_model_type == "phi" and has_speech:
             ort_model_type = "phi4mm"
@@ -923,7 +923,7 @@ class TestGemma4RealModel:
         generator = GenaiConfigGenerator.from_config(config, ort_model_type)
         vision_kwargs = {
             "spatial_merge_size": None,
-            "config_filename": "vision_processor.json",
+            "config_filename": "image_processor.json",
             "input_names": {
                 "pixel_values": "pixel_values",
                 "image_sizes": "image_sizes",
@@ -943,7 +943,7 @@ class TestGemma4RealModel:
         # All 4 model sections present
         assert "decoder" in model
         assert "vision" in model
-        assert "speech" in model
+        assert "audio" in model
         assert "embedding" in model
 
         # Vision uses phi4mm-specific inputs
@@ -951,12 +951,12 @@ class TestGemma4RealModel:
         assert model["vision"]["inputs"]["image_sizes"] == "image_sizes"
         assert "image_grid_thw" not in model["vision"]["inputs"]
         assert "spatial_merge_size" not in model["vision"]
-        assert model["vision"]["config_filename"] == "vision_processor.json"
+        assert model["vision"]["config_filename"] == "image_processor.json"
 
-        # Speech section
-        assert model["speech"]["inputs"]["audio_embeds"] == "audio_embeds"
-        assert model["speech"]["inputs"]["audio_sizes"] == "audio_sizes"
-        assert model["speech"]["inputs"]["audio_projection_mode"] == "audio_projection_mode"
+        # Audio section
+        assert model["audio"]["inputs"]["audio_embeds"] == "audio_embeds"
+        assert model["audio"]["inputs"]["audio_sizes"] == "audio_sizes"
+        assert model["audio"]["inputs"]["audio_projection_mode"] == "audio_projection_mode"
 
         # Embedding includes audio_features
         assert model["embedding"]["inputs"]["audio_features"] == "audio_features"
@@ -982,10 +982,10 @@ class TestGemma4RealModel:
         assert os.path.exists(os.path.join(output_dir, "genai_config.json"))
         # 4-model split produces subdirectories
         assert os.path.exists(os.path.join(output_dir, "vision"))
-        assert os.path.exists(os.path.join(output_dir, "speech"))
+        assert os.path.exists(os.path.join(output_dir, "audio"))
         assert os.path.exists(os.path.join(output_dir, "embedding"))
 
         with open(os.path.join(output_dir, "genai_config.json")) as f:
             saved = json.load(f)
         assert saved["model"]["type"] == "phi4mm"
-        assert "speech" in saved["model"]
+        assert "audio" in saved["model"]

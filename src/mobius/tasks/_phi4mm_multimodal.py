@@ -49,16 +49,16 @@ class Phi4MMMultiModalTask(ModelTask):
     """
 
     model_roles: ClassVar[dict[str, str]] = {
-        "model": "decoder",
+        "decoder": "decoder",
         "vision": "encoder",
-        "speech": "encoder",
+        "audio": "encoder",
         "embedding": "embedding",
     }
     components = ComponentSpec(
         vision="vision_encoder",
-        speech="speech_encoder",
+        audio="speech_encoder",
         embedding="embedding",
-        model="decoder",
+        decoder="decoder",
     )
 
     def build(
@@ -69,9 +69,9 @@ class Phi4MMMultiModalTask(ModelTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["vision"] = self._build_vision(module.vision_encoder, config)
-        models["speech"] = self._build_speech(module.speech_encoder, config)
+        models["audio"] = self._build_speech(module.speech_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
-        models["model"] = build_decoder_from_embeds(module.decoder, config)
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config)
         return ModelPackage(models, config=config)
 
     def _build_vision(
@@ -135,7 +135,7 @@ class Phi4MMMultiModalTask(ModelTask):
 
         graph, builder = _make_graph(
             [audio_embeds, audio_sizes, audio_projection_mode],
-            name="speech",
+            name="audio",
         )
         speech_out = speech(
             builder.op,

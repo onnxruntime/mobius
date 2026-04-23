@@ -537,7 +537,7 @@ class TestGenaiConfigGeneratorMultimodal:
             .with_vision(
                 image_token_id=200010,
                 spatial_merge_size=None,
-                config_filename="vision_processor.json",
+                config_filename="image_processor.json",
                 input_names={
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
@@ -549,24 +549,24 @@ class TestGenaiConfigGeneratorMultimodal:
         )
 
     def test_multimodal_has_all_four_sections(self):
-        """Phi4MM config has decoder, vision, speech, and embedding."""
+        """Phi4MM config has decoder, vision, audio, and embedding."""
         config = self._make_phi4mm_gen().generate()
         model = config["model"]
         assert "decoder" in model
         assert "vision" in model
-        assert "speech" in model
+        assert "audio" in model
         assert "embedding" in model
 
     def test_speech_section_has_correct_inputs(self):
-        """Speech section has audio_embeds, audio_sizes, mode."""
+        """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
-        speech = config["model"]["speech"]
-        assert speech["filename"] == "speech/model.onnx"
-        assert speech["config_filename"] == "speech_processor.json"
-        assert speech["inputs"]["audio_embeds"] == "audio_embeds"
-        assert speech["inputs"]["audio_sizes"] == "audio_sizes"
-        assert speech["inputs"]["audio_projection_mode"] == "audio_projection_mode"
-        assert speech["outputs"]["audio_features"] == "audio_features"
+        audio = config["model"]["audio"]
+        assert audio["filename"] == "audio/model.onnx"
+        assert audio["config_filename"] == "audio_processor.json"
+        assert audio["inputs"]["audio_embeds"] == "audio_embeds"
+        assert audio["inputs"]["audio_sizes"] == "audio_sizes"
+        assert audio["inputs"]["audio_projection_mode"] == "audio_projection_mode"
+        assert audio["outputs"]["audio_features"] == "audio_features"
 
     def test_vision_custom_inputs(self):
         """Vision section uses custom input names (no image_grid_thw)."""
@@ -700,7 +700,7 @@ class TestGenaiConfigGeneratorEp:
         assert "CUDAExecutionProvider" in opts[0]
 
     def test_cuda_ep_all_blocks_have_cuda_session_options(self):
-        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, speech)."""
+        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, audio)."""
         gen = (
             GenaiConfigGenerator(
                 "phi4mm",
@@ -717,7 +717,7 @@ class TestGenaiConfigGeneratorEp:
         )
         config = gen.generate()
 
-        for block in ("decoder", "vision", "embedding", "speech"):
+        for block in ("decoder", "vision", "embedding", "audio"):
             if block not in config["model"]:
                 continue
             session_opts = config["model"][block]["session_options"]

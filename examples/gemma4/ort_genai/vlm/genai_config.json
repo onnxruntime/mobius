@@ -42,7 +42,7 @@
         },
         "vision": {
             "filename": "vision.onnx",
-            "config_filename": "processor_config.json",
+            "config_filename": "image_processor.json",
             "session_options": {
                 "log_id": "onnxruntime-genai",
                 "provider_options": []
