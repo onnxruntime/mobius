@@ -115,6 +115,7 @@ from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
@@ -518,6 +519,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         WhisperForConditionalGeneration,
         task="speech-to-text",
         config_class=WhisperConfig,
+    ),
+
+    # --- Omni ---
+    "qwen2_5_omni": ModelRegistration(
+        Qwen25OmniThinkerForConditionalGeneration,
+        task="speech-language",
     ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),

@@ -54,6 +54,45 @@ class Conv2d(nn.Module):
         )
 
 
+class Conv1d(nn.Module):
+    """1D convolution with bias.
+
+    Matches ``torch.nn.Conv1d`` with ``bias=True``.  The default ``padding=0``
+    follows PyTorch convention; callers should specify padding explicitly.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 0,
+        groups: int = 1,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(
+            (out_channels, in_channels // groups, kernel_size)
+        )
+        self.bias = nn.Parameter((out_channels))
+        self._kernel_size = kernel_size
+        self._stride = stride
+        self._padding = padding
+        self._groups = groups
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value):
+        p = self._padding
+        return op.Conv(
+            x,
+            self.weight,
+            self.bias,
+            kernel_shape=[self._kernel_size],
+            strides=[self._stride],
+            pads=[p, p],
+            group=self._groups,
+        )
+
+
 class Conv2dNoBias(nn.Module):
     """2D convolution without bias."""
 
