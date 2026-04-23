@@ -49,8 +49,14 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
           else
-            # Push to main or workflow_dispatch: compare against previous commit
-            git diff --name-only HEAD~1...HEAD > changed_files.txt
+            # Push, tag, or workflow_dispatch: compare against the previous
+            # commit when one exists. On a root commit there is no HEAD~1, so
+            # fall back to listing the files introduced by HEAD.
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              git diff --name-only HEAD~1...HEAD > changed_files.txt
+            else
+              git diff-tree --root --no-commit-id --name-only -r HEAD > changed_files.txt
+            fi
           fi
           echo "Changed files:"
           cat changed_files.txt
