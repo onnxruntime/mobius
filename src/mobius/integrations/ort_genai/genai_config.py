@@ -172,8 +172,8 @@ class GenaiConfigGenerator:
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
 
-        # Optional speech fields (set via with_speech())
-        self._speech: dict[str, Any] | None = None
+        # Optional audio fields (set via with_audio())
+        self._audio: dict[str, Any] | None = None
 
     @classmethod
     def from_config(
@@ -301,7 +301,7 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
-    def with_speech(
+    def with_audio(
         self,
         *,
         audio_token_id: int | None = None,
@@ -310,16 +310,16 @@ class GenaiConfigGenerator:
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
-        """Add speech/audio model section for multimodal models.
+        """Add audio model section for multimodal models.
 
         Args:
             audio_token_id: Token ID for audio placeholders.
-            filename: Speech ONNX model filename.
-            config_filename: Speech processor config filename.
-            input_names: Override speech model input name mapping.
+            filename: Audio ONNX model filename.
+            config_filename: Audio processor config filename.
+            input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
-            output_names: Override speech model output name mapping.
+            output_names: Override audio model output name mapping.
                 Defaults to audio_features.
 
         Returns self for chaining.
@@ -335,7 +335,7 @@ class GenaiConfigGenerator:
                 "audio_features": "audio_features",
             }
 
-        self._speech = {
+        self._audio = {
             "filename": filename,
             "config_filename": config_filename,
             "inputs": input_names,
@@ -350,7 +350,7 @@ class GenaiConfigGenerator:
 
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
-        is_multimodal = self._vision is not None or self._speech is not None
+        is_multimodal = self._vision is not None or self._audio is not None
 
         # Decoder section — use explicit inputs when available (from
         # graph introspection), otherwise fall back to defaults.
@@ -392,11 +392,11 @@ class GenaiConfigGenerator:
             # Add audio_features to embedding inputs when speech is
             # enabled and not already present (graph-introspected
             # inputs already include it).
-            if self._speech is not None and "audio_features" not in self._embedding["inputs"]:
+            if self._audio is not None and "audio_features" not in self._embedding["inputs"]:
                 self._embedding["inputs"]["audio_features"] = "audio_features"
             model["embedding"] = self._embedding
-        if self._speech is not None:
-            model["audio"] = self._speech
+        if self._audio is not None:
+            model["audio"] = self._audio
         model.update(self._vlm_token_ids)
 
         return {

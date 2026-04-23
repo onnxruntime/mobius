@@ -543,7 +543,7 @@ class TestGenaiConfigGeneratorMultimodal:
                     "image_sizes": "image_sizes",
                 },
             )
-            .with_speech(
+            .with_audio(
                 audio_token_id=200011,
             )
         )
@@ -557,7 +557,7 @@ class TestGenaiConfigGeneratorMultimodal:
         assert "audio" in model
         assert "embedding" in model
 
-    def test_speech_section_has_correct_inputs(self):
+    def test_audio_section_has_correct_inputs(self):
         """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
         audio = config["model"]["audio"]
@@ -585,8 +585,8 @@ class TestGenaiConfigGeneratorMultimodal:
         assert emb["inputs"]["image_features"] == "image_features"
         assert emb["inputs"]["audio_features"] == "audio_features"
 
-    def test_embedding_no_audio_without_speech(self):
-        """Embedding inputs don't have audio_features without speech."""
+    def test_embedding_no_audio_without_audio(self):
+        """Embedding inputs don't have audio_features without audio."""
         gen = GenaiConfigGenerator(
             "qwen2_5_vl",
             vocab_size=151936,
@@ -612,8 +612,8 @@ class TestGenaiConfigGeneratorMultimodal:
         assert "inputs_embeds" in inputs
         assert "input_id" not in inputs
 
-    def test_speech_only_uses_inputs_embeds(self):
-        """Speech-only (no vision) still uses inputs_embeds."""
+    def test_audio_only_uses_inputs_embeds(self):
+        """Audio-only (no vision) still uses inputs_embeds."""
         gen = GenaiConfigGenerator(
             "whisper",
             vocab_size=51865,
@@ -622,13 +622,13 @@ class TestGenaiConfigGeneratorMultimodal:
             num_attention_heads=8,
             num_key_value_heads=8,
             head_dim=64,
-        ).with_speech()
+        ).with_audio()
         config = gen.generate()
         inputs = config["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in inputs
 
     def test_chaining_returns_self(self):
-        """with_vision() and with_speech() return self for chaining."""
+        """with_vision() and with_audio() return self for chaining."""
         gen = GenaiConfigGenerator(
             "phi4mm",
             vocab_size=200064,
@@ -638,7 +638,7 @@ class TestGenaiConfigGeneratorMultimodal:
             num_key_value_heads=8,
             head_dim=128,
         )
-        result = gen.with_vision(image_token_id=200010).with_speech()
+        result = gen.with_vision(image_token_id=200010).with_audio()
         assert result is gen
 
 
@@ -713,7 +713,7 @@ class TestGenaiConfigGeneratorEp:
                 ep="cuda",
             )
             .with_vision(image_token_id=200010)
-            .with_speech()
+            .with_audio()
         )
         config = gen.generate()
 

@@ -56,7 +56,7 @@
             }
         },
         "audio": {
-            "filename": "audio.onnx",
+            "filename": "audio/model.onnx",
             "session_options": {
                 "log_id": "onnxruntime-genai",
                 "provider_options": []

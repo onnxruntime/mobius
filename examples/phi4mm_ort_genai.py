@@ -11,7 +11,7 @@ generation with image and/or audio input.
 The model is split into 4 ONNX graphs:
 
     - **Vision**  (``vision/model.onnx``): SigLIP encoder + projection
-    - **Speech**  (``speech/model.onnx``): Conformer encoder + projection
+    - **Speech**  (``audio/model.onnx``): Conformer encoder + projection
     - **Embedding** (``embedding/model.onnx``): token embed + InputMixer
     - **Decoder** (``model/model.onnx``): LoRA text decoder + lm_head
 
@@ -149,9 +149,9 @@ def _write_genai_config(config, output_dir: str) -> None:
                     "image_features": "image_features",
                 },
             },
-            "speech": {
-                "filename": "speech/model.onnx",
-                "config_filename": "speech_processor.json",
+            "audio": {
+                "filename": "audio/model.onnx",
+                "config_filename": "audio_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
                     "provider_options": [],

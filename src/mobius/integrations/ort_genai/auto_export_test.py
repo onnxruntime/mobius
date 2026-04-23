@@ -298,9 +298,9 @@ class TestExportForOrtGenai:
         )
         result = write_ort_genai_config(pkg, str(tmp_path))
 
-        assert "processor_config" in result
-        assert os.path.isfile(result["processor_config"])
-        with open(result["processor_config"]) as f:
+        assert "image_processor" in result
+        assert os.path.isfile(result["image_processor"])
+        with open(result["image_processor"]) as f:
             data = json.load(f)
         assert data["image_size"] == 448
 
@@ -311,7 +311,7 @@ class TestExportForOrtGenai:
         pkg = self._make_pkg()
         result = write_ort_genai_config(pkg, str(tmp_path))
 
-        assert "processor_config" not in result
+        assert "image_processor" not in result
         assert not os.path.exists(os.path.join(str(tmp_path), "image_processor.json"))
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
@@ -930,7 +930,7 @@ class TestGemma4RealModel:
             },
         }
         generator.with_vision(image_token_id=config.image_token_id, **vision_kwargs)
-        generator.with_speech(audio_token_id=config.audio.token_id)
+        generator.with_audio(audio_token_id=config.audio.token_id)
 
         genai_config = generator.generate()
 

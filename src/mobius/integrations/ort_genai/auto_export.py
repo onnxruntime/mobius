@@ -295,7 +295,7 @@ def _write_genai_config(
         audio_token_id = (
             getattr(audio_config, "token_id", None) if audio_config is not None else None
         )
-        generator.with_speech(audio_token_id=audio_token_id)
+        generator.with_audio(audio_token_id=audio_token_id)
 
     return generator.write(output_dir)
 
@@ -345,7 +345,7 @@ def write_ort_genai_config(
             {
                 "genai_config": "/output/genai_config.json",
                 "tokenizer.json": "/output/tokenizer.json",
-                "processor_config": "/output/image_processor.json",
+                "image_processor": "/output/image_processor.json",
             }
 
     Raises:
@@ -454,7 +454,7 @@ def write_ort_genai_config(
     # Write image_processor.json for VLMs
     processor_path = _write_processor_config(config, directory)
     if processor_path:
-        result["processor_config"] = processor_path
+        result["image_processor"] = processor_path
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
