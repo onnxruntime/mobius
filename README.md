@@ -95,26 +95,17 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 ```sh
 mobius build --model Qwen/Qwen2.5-0.5B output_dir/
 
-# Build without weights (graph skeleton only)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --no-weights
+# Build for CUDA with f16
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
 mobius build --model Qwen/Qwen-Image-2512 output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
 mobius build --model openai/whisper-tiny output_dir/
-
-# Specify dtype
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --dtype f16
-
-# Build with static KV cache (pre-allocated buffers, uses TensorScatter)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache
-
-# Static cache with explicit max sequence length
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache --max-seq-len 2048
 ```
 
-See the [CLI reference](https://onnxruntime.github.io/mobius/cli.html) for all options.
+See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
 
 ### Examples
 
