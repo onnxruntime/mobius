@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 import tqdm
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
     import torch
 
 from mobius._builder import (
@@ -70,45 +69,6 @@ def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
-def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
-    """Apply rewrite rules if --optimize is specified."""
-    if not optimize:
-        return
-
-    from onnxscript.rewriter import rewrite
-
-    from mobius.rewrite_rules import (
-        bias_gelu_rules,
-        group_query_attention_rules,
-        packed_attention_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-    )
-
-    rule_map = {
-        "bias_gelu": bias_gelu_rules,
-        "group_query_attention": group_query_attention_rules,
-        "packed_attention": packed_attention_rules,
-        "skip_layer_norm": skip_layer_norm_rules,
-        "skip_norm": skip_norm_rules,
-    }
-
-    if optimize == "all":
-        rule_names = list(rule_map)
-    else:
-        rule_names = [r.strip() for r in optimize.split(",")]
-        for name in rule_names:
-            if name not in rule_map:
-                raise ValueError(
-                    f"Unknown rewrite rule '{name}'. Available: {sorted(rule_map)}"
-                )
-
-    for name in rule_names:
-        rules = rule_map[name]()
-        rewrite(model, pattern_rewrite_rules=rules)
-        print(f"Applied rewrite rule: {name}")
-
-
 def _cmd_build(args: argparse.Namespace) -> None:
     """Execute the 'build' subcommand."""
     import dataclasses
@@ -142,9 +102,53 @@ def _cmd_build(args: argparse.Namespace) -> None:
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
-    optimize = args.optimize
     component_filter = args.component
     execution_provider = args.execution_provider
+
+    # Handle --optimize + --ep conflict
+    if args.optimize and execution_provider != "default":
+        raise ValueError("Cannot use both --optimize and --ep. Use --ep alone.")
+
+    # If --optimize is specified, build a synthetic EP from the flags
+    if args.optimize:
+        import warnings
+
+        import onnx_ir as ir
+
+        from mobius._execution_providers import (
+            EpCapabilities,
+            ep_registry,
+        )
+
+        warnings.warn(
+            "--optimize is deprecated. Use --ep to select an execution "
+            "provider that enables the desired optimizations "
+            "(e.g. --ep cuda for GQA + SkipNorm).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        if args.optimize == "all":
+            execution_provider = "cpu"
+        else:
+            rule_names = [r.strip() for r in args.optimize.split(",")]
+            valid_rules = {
+                "group_query_attention",
+                "packed_attention",
+                "skip_layer_norm",
+                "skip_norm",
+                "bias_gelu",
+            }
+            for name in rule_names:
+                if name not in valid_rules:
+                    raise ValueError(
+                        f"Unknown optimization rule '{name}'. Available: {sorted(valid_rules)}"
+                    )
+
+            dtype = dtype_override or ir.DataType.FLOAT
+            caps = EpCapabilities.from_optimize_flags(rule_names, dtype=dtype)
+            ep_registry.register(caps, overwrite=True)
+            execution_provider = "custom"
 
     # Auto-detect diffusers pipelines
     if args.model and not args.config:
@@ -158,7 +162,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 dtype=dtype_override,
                 load_weights=load_weights,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
 
     # Build from HuggingFace model ID or local config
@@ -200,18 +204,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
             execution_provider=execution_provider,
         )
 
-    _save_package(pkg, output_dir, args, optimize, component_filter)
+    _save_package(pkg, output_dir, args, component_filter)
 
 
-def _save_package(
-    pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
-) -> None:
-    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+def _save_package(pkg, output_dir: str, args, component_filter: str | None) -> None:
+    """Save a ModelPackage to disk with runtime configs."""
     components = (lambda name: name == component_filter) if component_filter else None
-    for name, model in pkg.items():
-        if components is not None and not components(name):
-            continue
-        _apply_optimize(model, optimize)
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
     pkg.save(

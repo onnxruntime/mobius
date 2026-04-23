@@ -99,6 +99,30 @@ class EpCapabilities:
                 f"this EP, so packing would be immediately undone."
             )
 
+    @classmethod
+    def from_optimize_flags(
+        cls,
+        rules: list[str],
+        dtype: ir.DataType = ir.DataType.FLOAT16,
+    ) -> EpCapabilities:
+        """Build a synthetic EpCapabilities from --optimize rule names.
+
+        This maps optimization rule names to the EP capability flags
+        that would enable those optimizations in the EP pipeline.
+        """
+        gqa = "group_query_attention" in rules
+        skip_norm = "skip_norm" in rules or "skip_layer_norm" in rules
+        packed_attn = "packed_attention" in rules
+
+        return cls(
+            name="custom",
+            gqa_dtypes=frozenset({dtype}) if gqa else frozenset(),
+            qkv_pack_dtypes=frozenset({dtype}) if gqa else frozenset(),
+            supports_fused_rope=True,
+            supports_skip_layer_norm=skip_norm,
+            supports_packed_multi_head_attention=packed_attn,
+        )
+
 
 class EpRegistry:
     """Central registry mapping EP name → :class:`EpCapabilities`.
