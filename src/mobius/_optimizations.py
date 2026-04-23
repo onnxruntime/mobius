@@ -54,7 +54,11 @@ from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
-from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
+from mobius._passes import (
+    FoldConcatInitializersPass,
+    FoldTransposedInitializerPass,
+    RemoveDeadGraphInputsPass,
+)
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     gelu_fusion_rules,
@@ -445,7 +449,8 @@ def optimize_model(
         for _, ir_pass in lower_ir_passes:
             ir_pass(model)
 
-    # Stage 4: Final dead-node removal and constant folding after rewrites.
+    # Stage 4: Final dead-node removal, constant folding, and dead input
+    # cleanup after rewrites.
     if trace:
         before_fold = sum(_count_all_ops(model).values())
         logger.info("[EP Trace] Stage 4: Constant folding")
@@ -461,6 +466,9 @@ def optimize_model(
                 input_size_limit=8192,
                 output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
+            # Remove graph inputs whose consumers were all eliminated by
+            # fusion (e.g. position_ids when GQA absorbs RoPE).
+            RemoveDeadGraphInputsPass(),
         ]
     )
     fold_pass(model)

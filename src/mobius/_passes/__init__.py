@@ -42,7 +42,9 @@ from __future__ import annotations
 __all__ = [
     "FoldTransposedInitializerPass",
     "FoldConcatInitializersPass",
+    "RemoveDeadGraphInputsPass",
 ]
 
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 from mobius._passes._fold_transpose import FoldTransposedInitializerPass
+from mobius._passes._remove_dead_inputs import RemoveDeadGraphInputsPass

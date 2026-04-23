@@ -20,6 +20,7 @@
             "num_hidden_layers": 15,
             "inputs": {
                 "inputs_embeds": "inputs_embeds",
+                "input_ids": "input_ids",
                 "attention_mask": "attention_mask",
                 "position_ids": "position_ids",
                 "past_key_names": "past_key_values.%d.key",
