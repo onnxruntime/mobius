@@ -568,6 +568,38 @@ class TestGenaiConfigGeneratorMultimodal:
         assert audio["inputs"]["audio_projection_mode"] == "audio_projection_mode"
         assert audio["outputs"]["audio_features"] == "audio_features"
 
+    def test_boa_token_id_in_audio_config(self):
+        """boa_token_id is included when passed to with_audio()."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+        )
+        gen.with_vision(image_token_id=200010)
+        gen.with_audio(audio_token_id=200011, boa_token_id=256000)
+        config = gen.generate()
+        assert config["model"]["boa_token_id"] == 256000
+
+    def test_boa_token_id_absent_when_not_set(self):
+        """boa_token_id is omitted when not provided."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+        )
+        gen.with_vision(image_token_id=200010)
+        gen.with_audio(audio_token_id=200011)
+        config = gen.generate()
+        assert "boa_token_id" not in config["model"]
+
     def test_vision_custom_inputs(self):
         """Vision section uses custom input names (no image_grid_thw)."""
         config = self._make_phi4mm_gen().generate()

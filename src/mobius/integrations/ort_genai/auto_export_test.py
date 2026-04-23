@@ -736,6 +736,8 @@ class TestGemma4RealModel:
             final_logit_softcapping=0.0,
             hidden_size_per_layer_input=0,
             image_token_id=255999,
+            bos_token_id=2,
+            boa_token_id=256000,
             pad_token_id=0,
             tie_word_embeddings=True,
             vision=VisionConfig(
@@ -779,6 +781,8 @@ class TestGemma4RealModel:
 
         # Config-level properties are still present
         assert data["model"]["image_token_id"] == 255999
+        assert data["model"]["bos_token_id"] == 2
+        # boa_token_id only present when audio component is in the package
         assert "spatial_merge_size" not in data["model"]["vision"]
         assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
