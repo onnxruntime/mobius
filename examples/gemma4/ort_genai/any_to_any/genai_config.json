@@ -41,7 +41,7 @@
             }
         },
         "vision": {
-            "filename": "vision.onnx",
+            "filename": "vision/model.onnx",
             "config_filename": "image_processor.json",
             "session_options": {
                 "log_id": "onnxruntime-genai",
@@ -69,7 +69,7 @@
             }
         },
         "embedding": {
-            "filename": "embedding.onnx",
+            "filename": "embedding/model.onnx",
             "session_options": {
                 "log_id": "onnxruntime-genai",
                 "provider_options": []
