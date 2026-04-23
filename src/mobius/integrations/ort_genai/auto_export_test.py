@@ -23,6 +23,41 @@ from mobius.integrations.ort_genai.auto_export import (
 )
 
 
+def _mock_model_with_inputs(names):
+    """Create a mock ir.Model whose graph.inputs have the given names."""
+    inputs = []
+    for n in names:
+        inp = mock.MagicMock()
+        inp.name = n
+        inputs.append(inp)
+    m = mock.MagicMock()
+    m.graph.inputs = inputs
+    return m
+
+
+def _make_fake_llm_pkg(model_type: str = "qwen2"):
+    """Build a minimal LLM-only ModelPackage with a fake config."""
+    import dataclasses
+
+    from mobius._model_package import ModelPackage
+
+    @dataclasses.dataclass
+    class FakeConfig:
+        model_type: str = "qwen2"
+        vocab_size: int = 256
+        hidden_size: int = 64
+        num_hidden_layers: int = 2
+        num_attention_heads: int = 4
+        num_key_value_heads: int = 2
+        head_dim: int = 16
+        max_position_embeddings: int = 128
+
+    return ModelPackage(
+        {"model": mock.MagicMock()},
+        config=FakeConfig(model_type=model_type),
+    )
+
+
 class TestResolveOrtGenaiModelType:
     def test_known_model_type(self):
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"
@@ -150,22 +185,7 @@ class TestWriteOrtGenaiConfigLocalDir:
 
     @staticmethod
     def _make_pkg():
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "llama"
-            vocab_size: int = 256
-            hidden_size: int = 64
-            num_hidden_layers: int = 2
-            num_attention_heads: int = 4
-            num_key_value_heads: int = 2
-            head_dim: int = 16
-            max_position_embeddings: int = 128
-
-        return ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        return _make_fake_llm_pkg("llama")
 
     def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
         """When local_config_dir is set, tokenizer files are copied from it."""
@@ -234,24 +254,7 @@ class TestExportForOrtGenai:
 
     @staticmethod
     def _make_pkg():
-        """Build a minimal LLM-only ModelPackage with a fake config."""
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "qwen2"
-            vocab_size: int = 256
-            hidden_size: int = 64
-            num_hidden_layers: int = 2
-            num_attention_heads: int = 4
-            num_key_value_heads: int = 2
-            head_dim: int = 16
-            max_position_embeddings: int = 128
-
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
-        return pkg
+        return _make_fake_llm_pkg("qwen2")
 
     def test_genai_config_json_is_written(self, tmp_path):
         """genai_config.json is always written to the output directory."""
@@ -522,16 +525,6 @@ class TestGemma4GenaiConfig:
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
         # Mock graph inputs for each sub-model
-        def _mock_model_with_inputs(names):
-            inputs = []
-            for n in names:
-                inp = mock.MagicMock()
-                inp.name = n
-                inputs.append(inp)
-            m = mock.MagicMock()
-            m.graph.inputs = inputs
-            return m
-
         decoder = _mock_model_with_inputs(
             [
                 "inputs_embeds",
@@ -638,20 +631,9 @@ class TestGemma4GenaiConfig:
 class TestGraphInputNames:
     """Tests for _graph_input_names() helper."""
 
-    @staticmethod
-    def _mock_model(names):
-        inputs = []
-        for n in names:
-            inp = mock.MagicMock()
-            inp.name = n
-            inputs.append(inp)
-        m = mock.MagicMock()
-        m.graph.inputs = inputs
-        return m
-
     def test_filters_kv_cache_inputs(self):
         """KV cache inputs (past_key_values.*) are filtered out."""
-        model = self._mock_model(
+        model = _mock_model_with_inputs(
             [
                 "input_ids",
                 "attention_mask",
@@ -666,7 +648,7 @@ class TestGraphInputNames:
 
     def test_filters_past_prefix(self):
         """Inputs starting with 'past_' are also filtered out."""
-        model = self._mock_model(
+        model = _mock_model_with_inputs(
             [
                 "input_ids",
                 "past_something",
@@ -688,7 +670,7 @@ class TestGraphInputNames:
 
     def test_returns_all_semantic_inputs(self):
         """All non-KV-cache inputs are returned in order."""
-        model = self._mock_model(
+        model = _mock_model_with_inputs(
             [
                 "inputs_embeds",
                 "input_ids",

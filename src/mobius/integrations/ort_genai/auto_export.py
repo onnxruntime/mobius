@@ -100,9 +100,7 @@ def _graph_input_names(model: ir.Model) -> list[str]:
     ]
 
 
-def _introspect_inputs(
-    pkg: ModelPackage, key: str
-) -> dict[str, str] | None:
+def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     """Return ``{name: name}`` identity mapping for a sub-model's inputs.
 
     Returns ``None`` when *key* is absent from *pkg*, letting callers
@@ -179,7 +177,7 @@ def _write_processor_config(
 
     model_type = getattr(config, "model_type", "")
 
-    if model_type in ("gemma4", "gemma4_text"):
+    if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs a processor wrapper with model-specific fields
         tokens_per_image = (
             getattr(vision, "mm_tokens_per_image", None)
@@ -223,7 +221,7 @@ def _write_audio_processor_config(
 
     model_type = getattr(config, "model_type", "")
 
-    if model_type in ("gemma4", "gemma4_text"):
+    if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 USM-style 128-dim log-mel spectrogram.
         # Values from ort-extensions Gemma4LogMel kernel.
         processor: dict[str, Any] = {
@@ -274,15 +272,11 @@ def _write_genai_config(
 
     # --- Discover decoder inputs from the ONNX graph ---
     decoder_key = "decoder" if "decoder" in pkg else "model"
-    decoder_model = pkg.get(decoder_key)
-    if decoder_model is not None:
-        decoder_input_names = _graph_input_names(decoder_model)
-        decoder_inputs: dict[str, str] | None = {name: name for name in decoder_input_names}
+    decoder_inputs = _introspect_inputs(pkg, decoder_key)
+    if decoder_inputs is not None:
         # KV cache entries are template-based, not per-input
         decoder_inputs["past_key_names"] = "past_key_values.%d.key"
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
-    else:
-        decoder_inputs = None  # fall back to defaults
 
     # Derive decoder filename from the actual package key
     decoder_filename = f"{decoder_key}/model.onnx" if is_vlm else "model.onnx"
@@ -302,21 +296,8 @@ def _write_genai_config(
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
-            # Discover vision inputs from the graph
-            vision_model = pkg.get("vision")
-            if vision_model is not None:
-                names = _graph_input_names(vision_model)
-                vision_input_mapping: dict[str, str] | None = {n: n for n in names}
-            else:
-                vision_input_mapping = None
-
-            # Discover embedding inputs from the graph
-            embedding_model = pkg.get("embedding")
-            if embedding_model is not None:
-                names = _graph_input_names(embedding_model)
-                embedding_input_mapping: dict[str, str] | None = {n: n for n in names}
-            else:
-                embedding_input_mapping = None
+            vision_input_mapping = _introspect_inputs(pkg, "vision")
+            embedding_input_mapping = _introspect_inputs(pkg, "embedding")
 
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
@@ -325,7 +306,7 @@ def _write_genai_config(
             if has_speech:
                 vision_kwargs["spatial_merge_size"] = None
                 vision_kwargs["config_filename"] = "image_processor.json"
-            elif model_type in ("gemma4", "gemma4_text"):
+            elif model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 sms = getattr(vision_cfg, "spatial_merge_size", 2)
                 vision_kwargs["spatial_merge_size"] = sms
@@ -339,15 +320,23 @@ def _write_genai_config(
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
     if has_speech:
+        audio_input_mapping = _introspect_inputs(pkg, "audio")
+
         audio_config = getattr(config, "audio", None)
         audio_token_id = (
-            getattr(audio_config, "token_id", None) if audio_config is not None else None
+            getattr(audio_config, "token_id", None)
+            or getattr(audio_config, "audio_token_id", None)
+            or getattr(config, "audio_token_id", None)
         )
-        # boa_token_id (beginning-of-audio) from our config
         boa_token_id = getattr(config, "boa_token_id", None)
+
+        audio_kwargs: dict[str, Any] = {}
+        if audio_input_mapping is not None:
+            audio_kwargs["input_names"] = audio_input_mapping
         generator.with_audio(
             audio_token_id=audio_token_id,
             boa_token_id=boa_token_id,
+            **audio_kwargs,
         )
 
     return generator.write(output_dir)

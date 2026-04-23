@@ -16,12 +16,14 @@ ORT GenAI configuration files for the **`google/gemma-4-E2B-it`** checkpoint
 ort_genai/
 ├── text/
 │   └── genai_config.json        # Text-only decoder (model.onnx)
-├── vlm/
-│   ├── genai_config.json        # 3-model VLM (model.onnx + vision.onnx + embedding.onnx)
-│   └── image_processor.json      # SigLIP image processor config
-└── any_to_any/
-    └── genai_config.json        # 4-model AnyToAny (+audio.onnx)
+└── vlm/
+    ├── genai_config.json        # Full multimodal config (vision + audio + text)
+    └── image_processor.json      # SigLIP image processor config
 ```
+
+The VLM config is the full any-to-any config — it includes the audio section
+when the model has audio support.  ORT GenAI auto-detects the pipeline variant
+from which ONNX files are present in the directory.
 
 ---
 
@@ -131,8 +133,7 @@ ORT GenAI build:
 | Config | `model.type` | Pipeline variant |
 |---|---|---|
 | `text/genai_config.json` | `gemma4` | Decoder-only (text) |
-| `vlm/genai_config.json` | `gemma4` | VLM (vision + text) |
-| `any_to_any/genai_config.json` | `gemma4` | Multimodal (vision + audio + text) |
+| `vlm/genai_config.json` | `gemma4` | Multimodal (vision + audio + text) |
 
 The runtime auto-detects the pipeline variant from which ONNX files are
 present.
@@ -165,19 +166,11 @@ text/
   genai_config.json
 
 vlm/
-  model.onnx          ← decoder (Gemma4VisionLanguageTask)
+  model.onnx          ← decoder (Gemma4VisionLanguageTask / Gemma4AnyToAnyTask)
   vision.onnx         ← vision encoder
+  audio.onnx          ← Conformer audio encoder (when model has audio)
   embedding.onnx      ← embedding fusion
   tokenizer.json
   genai_config.json
   image_processor.json
-
-any_to_any/
-  model.onnx          ← decoder (Gemma4AnyToAnyTask)
-  vision.onnx
-  audio.onnx          ← Conformer audio encoder
-  embedding.onnx
-  tokenizer.json
-  genai_config.json
-  image_processor.json   ← copy from vlm/
 ```
