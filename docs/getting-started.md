@@ -248,15 +248,20 @@ mobius build --model meta-llama/Llama-3.2-1B output/ \
 
 # Apply all available rules
 mobius build --model meta-llama/Llama-3.2-1B output/ --optimize
+
+# Combine EP-aware building with additional post-hoc rules
+mobius build --model meta-llama/Llama-3.2-1B output/ \
+    --ep cuda --dtype f16 --optimize=bias_gelu
 ```
 
 Available rules: `group_query_attention`, `skip_norm`, `skip_layer_norm`,
 `packed_attention`, `bias_gelu`.
 
-> **Note**: `--ep` and `--optimize` cannot be used together. `--ep` is
-> strictly more capable — it affects both graph construction and
-> optimization, while `--optimize` only applies rewrite rules after the
-> graph is built.
+> **Tip**: Prefer `--ep` over `--optimize` for production builds. `--ep`
+> affects both graph construction and optimization (EP-aware KV cache
+> sizing, dead input removal, operator fusion), while `--optimize` only
+> applies rewrite rules after the graph is built. They can be combined
+> when you need both EP-aware construction and additional post-hoc rules.
 
 ### `build-gguf` — Build from a GGUF file
 
