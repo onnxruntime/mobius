@@ -114,10 +114,24 @@ class EpCapabilities:
         skip_norm = "skip_norm" in rules or "skip_layer_norm" in rules
         packed_attn = "packed_attention" in rules
 
+        # Enable all dtypes so --optimize=all works regardless
+        # of the user's --dtype choice.
+        gqa_dtypes = (
+            frozenset(
+                {
+                    ir.DataType.FLOAT,
+                    ir.DataType.FLOAT16,
+                    ir.DataType.BFLOAT16,
+                }
+            )
+            if gqa
+            else frozenset()
+        )
+
         return cls(
-            name="custom",
-            gqa_dtypes=frozenset({dtype}) if gqa else frozenset(),
-            qkv_pack_dtypes=frozenset({dtype}) if gqa else frozenset(),
+            name="_optimize_custom",
+            gqa_dtypes=gqa_dtypes,
+            qkv_pack_dtypes=gqa_dtypes,
             supports_fused_rope=True,
             supports_skip_layer_norm=skip_norm,
             supports_packed_multi_head_attention=packed_attn,

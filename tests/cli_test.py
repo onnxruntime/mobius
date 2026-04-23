@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import warnings
 from unittest import mock
 
 import onnx
@@ -227,3 +228,106 @@ class TestCLIBuildRuntime:
                     "tensorrt",  # not a supported value
                 ]
             )
+
+
+class TestCLIOptimize:
+    """Test the deprecated --optimize flag."""
+
+    def test_optimize_gqa_produces_gqa_nodes(self):
+        """--optimize=group_query_attention produces GQA nodes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--optimize=group_query_attention",
+                    ]
+                )
+            model = onnx.load(os.path.join(tmpdir, "model.onnx"))
+            op_types = {n.op_type for n in model.graph.node}
+            assert "GroupQueryAttention" in op_types
+
+    def test_optimize_bias_gelu_applies(self):
+        """--optimize=bias_gelu is accepted and builds."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--optimize=bias_gelu",
+                    ]
+                )
+            assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
+
+    def test_optimize_all_with_float16(self):
+        """--optimize=all --dtype f16 produces GQA nodes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--optimize",
+                        "--dtype",
+                        "f16",
+                    ]
+                )
+            model = onnx.load(os.path.join(tmpdir, "model.onnx"))
+            op_types = {n.op_type for n in model.graph.node}
+            assert "GroupQueryAttention" in op_types
+
+    def test_optimize_with_ep_raises(self):
+        """--optimize + --ep raises error."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="Cannot use both"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--optimize=group_query_attention",
+                    "--ep",
+                    "cuda",
+                ]
+            )
+
+    def test_optimize_emits_deprecation_warning(self):
+        """--optimize emits DeprecationWarning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                main(
+                    [
+                        "build",
+                        "--model",
+                        "Qwen/Qwen2.5-0.5B",
+                        tmpdir,
+                        "--no-weights",
+                        "--optimize=group_query_attention",
+                    ]
+                )
+            dep_warnings = [
+                x
+                for x in w
+                if issubclass(x.category, DeprecationWarning)
+                and "--optimize is deprecated" in str(x.message)
+            ]
+            assert len(dep_warnings) >= 1

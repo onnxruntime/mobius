@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import tqdm
 
 if TYPE_CHECKING:
+    import onnx_ir as ir
     import torch
 
 from mobius._builder import (
@@ -30,6 +31,16 @@ from mobius._config_resolver import (
 from mobius._registry import registry
 
 logger = logging.getLogger(__name__)
+
+# Rules handled by the EP pipeline (via capabilities):
+EP_MAPPED_RULES = {
+    "group_query_attention",
+    "skip_norm",
+    "skip_layer_norm",
+}
+
+# Rules that need post-hoc application (no EP equivalent):
+POST_HOC_RULES = {"bias_gelu", "packed_attention"}
 
 
 def _parse_size(size_str: str) -> int:
@@ -69,6 +80,24 @@ def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
+def _apply_posthoc_rules(model: ir.Model, rule_names: list[str]) -> None:
+    """Apply rewrite rules that aren't covered by the EP pipeline."""
+    from onnxscript.rewriter import rewrite
+
+    from mobius.rewrite_rules import (
+        bias_gelu_rules,
+        packed_attention_rules,
+    )
+
+    rule_map = {
+        "bias_gelu": bias_gelu_rules,
+        "packed_attention": packed_attention_rules,
+    }
+    for name in rule_names:
+        if name in rule_map:
+            rewrite(model, pattern_rewrite_rules=rule_map[name]())
+
+
 def _cmd_build(args: argparse.Namespace) -> None:
     """Execute the 'build' subcommand."""
     import dataclasses
@@ -104,6 +133,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     dtype_override = resolve_dtype(args.dtype)
     component_filter = args.component
     execution_provider = args.execution_provider
+    posthoc_rules: list[str] = []
 
     # Handle --optimize + --ep conflict
     if args.optimize and execution_provider != "default":
@@ -121,34 +151,36 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
         warnings.warn(
-            "--optimize is deprecated. Use --ep to select an execution "
-            "provider that enables the desired optimizations "
-            "(e.g. --ep cuda for GQA + SkipNorm).",
+            "--optimize is deprecated. Use --ep to select an "
+            "execution provider that enables the desired "
+            "optimizations (e.g. --ep cuda for GQA + SkipNorm).",
             DeprecationWarning,
             stacklevel=2,
         )
 
+        dtype = dtype_override or ir.DataType.FLOAT
+
         if args.optimize == "all":
-            execution_provider = "cpu"
+            # Enable all EP-mapped fusions + all post-hoc rules
+            caps = EpCapabilities.from_optimize_flags(list(EP_MAPPED_RULES), dtype=dtype)
+            ep_registry.register(caps, overwrite=True)
+            execution_provider = "_optimize_custom"
+            posthoc_rules = list(POST_HOC_RULES)
         else:
             rule_names = [r.strip() for r in args.optimize.split(",")]
-            valid_rules = {
-                "group_query_attention",
-                "packed_attention",
-                "skip_layer_norm",
-                "skip_norm",
-                "bias_gelu",
-            }
+            valid_rules = EP_MAPPED_RULES | POST_HOC_RULES
             for name in rule_names:
                 if name not in valid_rules:
                     raise ValueError(
                         f"Unknown optimization rule '{name}'. Available: {sorted(valid_rules)}"
                     )
 
-            dtype = dtype_override or ir.DataType.FLOAT
-            caps = EpCapabilities.from_optimize_flags(rule_names, dtype=dtype)
+            ep_rules = [r for r in rule_names if r in EP_MAPPED_RULES]
+            posthoc_rules = [r for r in rule_names if r in POST_HOC_RULES]
+
+            caps = EpCapabilities.from_optimize_flags(ep_rules, dtype=dtype)
             ep_registry.register(caps, overwrite=True)
-            execution_provider = "custom"
+            execution_provider = "_optimize_custom"
 
     # Auto-detect diffusers pipelines
     if args.model and not args.config:
@@ -157,6 +189,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
+            # TODO: Thread execution_provider through diffusers
+            # pipeline. EP-aware optimizations are currently not
+            # applied to diffusers models.
             pkg = build_diffusers_pipeline(
                 args.model,
                 dtype=dtype_override,
@@ -204,11 +239,29 @@ def _cmd_build(args: argparse.Namespace) -> None:
             execution_provider=execution_provider,
         )
 
-    _save_package(pkg, output_dir, args, component_filter)
+    _save_package(
+        pkg,
+        output_dir,
+        args,
+        component_filter,
+        posthoc_rules=posthoc_rules,
+    )
 
 
-def _save_package(pkg, output_dir: str, args, component_filter: str | None) -> None:
+def _save_package(
+    pkg,
+    output_dir: str,
+    args,
+    component_filter: str | None,
+    posthoc_rules: list[str] | None = None,
+) -> None:
     """Save a ModelPackage to disk with runtime configs."""
+    # Apply post-hoc rewrite rules (bias_gelu, packed_attention) that
+    # aren't covered by the EP capability pipeline.
+    if posthoc_rules:
+        for model in pkg.values():
+            _apply_posthoc_rules(model, posthoc_rules)
+
     components = (lambda name: name == component_filter) if component_filter else None
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
