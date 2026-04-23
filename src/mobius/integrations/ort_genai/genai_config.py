@@ -123,6 +123,12 @@ class GenaiConfigGenerator:
         bos_token_id: Beginning-of-sequence token ID.
         eos_token_id: End-of-sequence token ID(s).
         pad_token_id: Padding token ID.
+        decoder_inputs: Explicit decoder input name mapping. When
+            provided (e.g. from ONNX graph introspection), used
+            directly instead of the default mapping from
+            :func:`_default_decoder_inputs`. Must already include KV
+            cache template entries (``past_key_names``,
+            ``past_value_names``).
     """
 
     def __init__(
@@ -140,6 +146,7 @@ class GenaiConfigGenerator:
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
+        decoder_inputs: dict[str, str] | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -154,13 +161,13 @@ class GenaiConfigGenerator:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
+        # Explicit decoder inputs (from graph introspection); None → use defaults
+        self._decoder_inputs = decoder_inputs
+
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
-
-        # Extra decoder inputs (set via with_extra_decoder_inputs())
-        self._extra_decoder_inputs: dict[str, str] = {}
 
         # Optional speech fields (set via with_speech())
         self._speech: dict[str, Any] | None = None
@@ -176,6 +183,7 @@ class GenaiConfigGenerator:
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
+        decoder_inputs: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -207,6 +215,7 @@ class GenaiConfigGenerator:
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad,
+            decoder_inputs=decoder_inputs,
         )
 
     def with_vision(
@@ -219,6 +228,7 @@ class GenaiConfigGenerator:
         config_filename: str = "processor_config.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
+        embedding_input_names: dict[str, str] | None = None,
         vision_start_token_id: int | None = None,
         video_token_id: int | None = None,
     ) -> GenaiConfigGenerator:
@@ -237,6 +247,10 @@ class GenaiConfigGenerator:
                 Defaults to pixel_values + image_grid_thw.
             output_names: Override vision model output name mapping.
                 Defaults to image_features.
+            embedding_input_names: Override embedding model input name
+                mapping.  When provided (e.g. from ONNX graph
+                introspection), used directly.  Defaults to
+                input_ids + image_features.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
 
@@ -249,6 +263,11 @@ class GenaiConfigGenerator:
             }
         if output_names is None:
             output_names = {
+                "image_features": "image_features",
+            }
+        if embedding_input_names is None:
+            embedding_input_names = {
+                "input_ids": "input_ids",
                 "image_features": "image_features",
             }
 
@@ -264,10 +283,7 @@ class GenaiConfigGenerator:
 
         self._embedding = {
             "filename": embedding_filename,
-            "inputs": {
-                "input_ids": "input_ids",
-                "image_features": "image_features",
-            },
+            "inputs": embedding_input_names,
             "outputs": {
                 "inputs_embeds": "inputs_embeds",
             },
@@ -278,24 +294,6 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["vision_start_token_id"] = vision_start_token_id
         if video_token_id is not None:
             self._vlm_token_ids["video_token_id"] = video_token_id
-        return self
-
-    def with_extra_decoder_inputs(
-        self,
-        **inputs: str,
-    ) -> GenaiConfigGenerator:
-        """Add extra inputs to the decoder section.
-
-        For example, Gemma4 decoders need ``input_ids`` alongside
-        ``inputs_embeds`` for per-layer token embeddings (E2B).
-
-        Args:
-            **inputs: Mapping of input names to ONNX tensor names,
-                e.g. ``input_ids="input_ids"``.
-
-        Returns self for chaining.
-        """
-        self._extra_decoder_inputs.update(inputs)
         return self
 
     def with_speech(
@@ -349,9 +347,12 @@ class GenaiConfigGenerator:
         """Generate the full genai_config.json dict."""
         is_multimodal = self._vision is not None or self._speech is not None
 
-        # Decoder section
-        decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
-        decoder_inputs.update(self._extra_decoder_inputs)
+        # Decoder section — use explicit inputs when available (from
+        # graph introspection), otherwise fall back to defaults.
+        if self._decoder_inputs is not None:
+            decoder_inputs = dict(self._decoder_inputs)
+        else:
+            decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
             "filename": "model.onnx",
@@ -383,8 +384,10 @@ class GenaiConfigGenerator:
         if self._vision is not None:
             model["vision"] = self._vision
         if self._embedding is not None:
-            # Add audio_features to embedding inputs when speech is enabled
-            if self._speech is not None:
+            # Add audio_features to embedding inputs when speech is
+            # enabled and not already present (graph-introspected
+            # inputs already include it).
+            if self._speech is not None and "audio_features" not in self._embedding["inputs"]:
                 self._embedding["inputs"]["audio_features"] = "audio_features"
             model["embedding"] = self._embedding
         if self._speech is not None:

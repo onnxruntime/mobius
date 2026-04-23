@@ -336,6 +336,29 @@ class TestGenaiConfigGeneratorVLM:
         with pytest.raises(TypeError):
             gen.with_vision()  # missing image_token_id
 
+    def test_custom_embedding_input_names(self):
+        """embedding_input_names overrides the default embedding inputs."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=262144,
+            hidden_size=2048,
+            num_hidden_layers=26,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=256,
+        ).with_vision(
+            image_token_id=255999,
+            embedding_input_names={
+                "input_ids": "input_ids",
+                "image_features": "image_features",
+                "custom_input": "custom_input",
+            },
+        )
+        config = gen.generate()
+        emb = config["model"]["embedding"]
+        assert emb["inputs"]["custom_input"] == "custom_input"
+        assert emb["inputs"]["input_ids"] == "input_ids"
+
 
 class TestGenaiConfigFromConfig:
     """Test from_config() factory method."""
@@ -443,11 +466,19 @@ class TestGenaiConfigWrite:
         assert loaded["model"]["image_token_id"] == 151655
 
 
-class TestExtraDecoderInputs:
-    """Test with_extra_decoder_inputs() merges into decoder inputs."""
+class TestExplicitDecoderInputs:
+    """Test decoder_inputs parameter overrides defaults."""
 
-    def test_extra_decoder_inputs_merged(self):
-        """Extra decoder inputs are merged with default VLM inputs."""
+    def test_explicit_decoder_inputs_used(self):
+        """When decoder_inputs is provided, it replaces the defaults."""
+        decoder_inputs = {
+            "inputs_embeds": "inputs_embeds",
+            "input_ids": "input_ids",
+            "attention_mask": "attention_mask",
+            "position_ids": "position_ids",
+            "past_key_names": "past_key_values.%d.key",
+            "past_value_names": "past_key_values.%d.value",
+        }
         gen = GenaiConfigGenerator(
             "gemma4",
             vocab_size=262144,
@@ -456,15 +487,33 @@ class TestExtraDecoderInputs:
             num_attention_heads=8,
             num_key_value_heads=4,
             head_dim=256,
+            decoder_inputs=decoder_inputs,
         ).with_vision(
             image_token_id=255999,
             spatial_merge_size=None,
         )
-        gen.with_extra_decoder_inputs(input_ids="input_ids")
         config = gen.generate()
-        decoder_inputs = config["model"]["decoder"]["inputs"]
-        assert "input_ids" in decoder_inputs
-        assert "inputs_embeds" in decoder_inputs  # original still present
+        result = config["model"]["decoder"]["inputs"]
+        assert "input_ids" in result
+        assert "inputs_embeds" in result
+        assert result["past_key_names"] == "past_key_values.%d.key"
+
+    def test_default_used_when_decoder_inputs_none(self):
+        """When decoder_inputs is None, default mapping is used."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
+        config = gen.generate()
+        inputs = config["model"]["decoder"]["inputs"]
+        # LLM default: input_ids, not inputs_embeds
+        assert "input_ids" in inputs
+        assert "inputs_embeds" not in inputs
 
 
 class TestGenaiConfigGeneratorMultimodal:
