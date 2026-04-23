@@ -177,7 +177,7 @@ rewrite(model, pattern_rewrite_rules=skip_norm_rules())
 Or via CLI:
 
 ```bash
-mobius build --model Qwen/Qwen2.5-0.5B output/ --optimize
+mobius build --model Qwen/Qwen2.5-0.5B output/ --ep cuda --dtype f16
 ```
 
 ## CLI Reference
@@ -193,19 +193,70 @@ mobius build --model meta-llama/Llama-3.2-1B output/
 # From a local config directory (with safetensors weights)
 mobius build --config /path/to/model/ output/
 
-# With options
+# Target a specific execution provider (recommended)
 mobius build --model Qwen/Qwen2.5-0.5B output/ \
-    --dtype f16 \
-    --external-data safetensors \
-    --optimize
+    --ep cuda --dtype f16
+
+# Export for ORT GenAI runtime
+mobius build --model Qwen/Qwen2.5-0.5B output/ \
+    --ep cuda --dtype f16 --runtime ort-genai
 ```
 
 Key flags:
 - `--dtype` — Target dtype (`f32`, `f16`, `bf16`)
+- `--ep` — Target execution provider (see below)
+- `--runtime` — Target runtime format (`ort-genai`)
 - `--no-weights` — Build graph only (no weight download)
 - `--external-data` — `onnx` (default) or `safetensors`
-- `--optimize` — Apply rewrite rules (e.g. fused attention)
+- `--optimize` — Apply individual rewrite rules (see below)
 - `--component` — Build only one component from a diffusers pipeline
+
+#### `--ep` vs `--optimize`: when to use which
+
+**Use `--ep` (recommended)** when building for a known runtime/hardware target.
+It drives the entire build pipeline — graph construction, operator fusion,
+dead input removal, and KV cache sizing are all tailored for the target EP:
+
+```bash
+# CUDA GPU (uses GQA, SkipNorm, PackQKV fusions)
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep cuda --dtype f16
+
+# DirectML (uses GQA without fused RoPE)
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep dml --dtype f16
+
+# TensorRT-RTX (uses GQA, no SkipLayerNorm)
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep trt-rtx --dtype f16
+
+# WebGPU
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep webgpu --dtype f16
+
+# Portable ONNX (no vendor fusions, runs on any ONNX runtime)
+mobius build --model meta-llama/Llama-3.2-1B output/ --ep onnx-standard
+```
+
+Run `mobius list eps` to see all available execution providers.
+
+**Use `--optimize` only** for manual, targeted rewrite rule application on
+a pre-built model. Rules are applied post-hoc and do not affect graph
+construction. This is useful for experimentation or when `--ep` doesn't
+cover a specific optimization:
+
+```bash
+# Apply specific rules
+mobius build --model meta-llama/Llama-3.2-1B output/ \
+    --optimize=group_query_attention,skip_norm
+
+# Apply all available rules
+mobius build --model meta-llama/Llama-3.2-1B output/ --optimize
+```
+
+Available rules: `group_query_attention`, `skip_norm`, `skip_layer_norm`,
+`packed_attention`, `bias_gelu`.
+
+> **Note**: `--ep` and `--optimize` cannot be used together. `--ep` is
+> strictly more capable — it affects both graph construction and
+> optimization, while `--optimize` only applies rewrite rules after the
+> graph is built.
 
 ### `build-gguf` — Build from a GGUF file
 
@@ -219,6 +270,7 @@ mobius build-gguf model.gguf --output output/
 mobius list models   # All supported architectures
 mobius list tasks    # Available task types
 mobius list dtypes   # Supported dtypes
+mobius list eps      # Available execution providers
 ```
 
 ### `info` — Inspect a model
