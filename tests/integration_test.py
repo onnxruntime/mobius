@@ -2963,7 +2963,7 @@ class TestWhisperForward:
 
 @pytest.mark.integration
 @pytest.mark.integration_fast
-def test_gemma3_multimodal_3model_builds_and_runs():
+def test_gemma3_3model_builds_and_runs():
     """Gemma3 multimodal 3-model split: build + graph structure verification.
 
     Uses a tiny config with random weights. Verifies:
@@ -3008,7 +3008,7 @@ def test_gemma3_multimodal_3model_builds_and_runs():
         dtype=ir.DataType.FLOAT,
     )
 
-    model_cls = registry.get("gemma3_multimodal")
+    model_cls = registry.get("gemma3")
     module = model_cls(config)
     task = get_task("vision-language")
     pkg = task.build(module, config)
