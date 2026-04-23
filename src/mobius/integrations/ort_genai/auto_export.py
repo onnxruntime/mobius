@@ -334,7 +334,7 @@ def _write_genai_config(
         audio_token_id = (
             getattr(audio_config, "token_id", None) if audio_config is not None else None
         )
-        # boa_token_id (beginning-of-audio) lives on the parent HF config
+        # boa_token_id (beginning-of-audio) from our config
         boa_token_id = getattr(config, "boa_token_id", None)
         generator.with_audio(
             audio_token_id=audio_token_id,

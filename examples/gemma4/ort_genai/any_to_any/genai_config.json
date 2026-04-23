@@ -80,7 +80,8 @@
                 "provider_options": []
             }
         },
-        "image_token_id": 258880
+        "image_token_id": 258880,
+        "boa_token_id": 256000
     },
     "search": {
         "do_sample": true,
