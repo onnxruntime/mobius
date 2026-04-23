@@ -202,6 +202,45 @@ def _write_processor_config(
     return path
 
 
+def _write_audio_processor_config(
+    config: Any,
+    output_dir: str,
+) -> str | None:
+    """Write audio_processor.json for models with audio encoders.
+
+    Returns the path if written, None otherwise.
+    """
+    audio = getattr(config, "audio", None)
+    if audio is None:
+        return None
+
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in ("gemma4", "gemma4_text"):
+        # Gemma4 USM-style 128-dim log-mel spectrogram.
+        # Values from ort-extensions Gemma4LogMel kernel.
+        processor: dict[str, Any] = {
+            "processor": {
+                "name": "gemma4_audio_processor",
+                "sample_rate": 16000,
+                "num_mel_bins": 128,
+                "frame_length_ms": 20,
+                "frame_step_ms": 10,
+                "fft_size": 512,
+                "mel_floor": 0.001,
+                "mel_upper_hertz": 8000,
+            }
+        }
+    else:
+        # Generic audio processor — add model-specific branches as needed.
+        return None
+
+    path = os.path.join(output_dir, "audio_processor.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(processor, f, indent=4)
+    return path
+
+
 def _write_genai_config(
     config: Any,
     output_dir: str,
@@ -295,7 +334,12 @@ def _write_genai_config(
         audio_token_id = (
             getattr(audio_config, "token_id", None) if audio_config is not None else None
         )
-        generator.with_audio(audio_token_id=audio_token_id)
+        # boa_token_id (beginning-of-audio) lives on the parent HF config
+        boa_token_id = getattr(config, "boa_token_id", None)
+        generator.with_audio(
+            audio_token_id=audio_token_id,
+            boa_token_id=boa_token_id,
+        )
 
     return generator.write(output_dir)
 
@@ -379,9 +423,24 @@ def write_ort_genai_config(
         hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
         model_type = hf_config.model_type
         ort_model_type = _resolve_ort_genai_model_type(model_type)
-        bos_token_id = getattr(hf_config, "bos_token_id", None)
-        eos_token_id = getattr(hf_config, "eos_token_id", None)
-        pad_token_id = getattr(hf_config, "pad_token_id", None)
+        # Token IDs may live on the parent config or the text sub-config
+        # (e.g. Gemma4Config has text_config with bos_token_id=2).
+        _tok_cfg = getattr(hf_config, "text_config", hf_config)
+        bos_token_id = getattr(
+            hf_config,
+            "bos_token_id",
+            getattr(_tok_cfg, "bos_token_id", None),
+        )
+        eos_token_id = getattr(
+            hf_config,
+            "eos_token_id",
+            getattr(_tok_cfg, "eos_token_id", None),
+        )
+        pad_token_id = getattr(
+            hf_config,
+            "pad_token_id",
+            getattr(_tok_cfg, "pad_token_id", None),
+        )
     else:
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
@@ -455,6 +514,11 @@ def write_ort_genai_config(
     processor_path = _write_processor_config(config, directory)
     if processor_path:
         result["image_processor"] = processor_path
+
+    # Write audio_processor.json for models with audio encoders
+    audio_proc_path = _write_audio_processor_config(config, directory)
+    if audio_proc_path:
+        result["audio_processor"] = audio_proc_path
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result

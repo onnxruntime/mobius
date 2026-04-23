@@ -305,6 +305,7 @@ class GenaiConfigGenerator:
         self,
         *,
         audio_token_id: int | None = None,
+        boa_token_id: int | None = None,
         filename: str = "audio/model.onnx",
         config_filename: str = "audio_processor.json",
         input_names: dict[str, str] | None = None,
@@ -314,6 +315,7 @@ class GenaiConfigGenerator:
 
         Args:
             audio_token_id: Token ID for audio placeholders.
+            boa_token_id: Beginning-of-audio token ID.
             filename: Audio ONNX model filename.
             config_filename: Audio processor config filename.
             input_names: Override audio model input name mapping.
@@ -345,6 +347,8 @@ class GenaiConfigGenerator:
 
         if audio_token_id is not None:
             self._vlm_token_ids["audio_token_id"] = audio_token_id
+        if boa_token_id is not None:
+            self._vlm_token_ids["boa_token_id"] = boa_token_id
 
         return self
 
