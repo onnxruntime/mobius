@@ -54,7 +54,11 @@ from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
-from mobius._passes import FoldConcatInitializersPass, FoldTransposedInitializerPass
+from mobius._passes import (
+    FoldConcatInitializersPass,
+    FoldTransposedInitializerPass,
+    RemoveDeadGraphInputsPass,
+)
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     gelu_fusion_rules,
@@ -445,7 +449,8 @@ def optimize_model(
         for _, ir_pass in lower_ir_passes:
             ir_pass(model)
 
-    # Stage 4: Final dead-node removal and constant folding after rewrites.
+    # Stage 4: Final dead-node removal, constant folding, and dead input
+    # cleanup after rewrites.
     if trace:
         before_fold = sum(_count_all_ops(model).values())
         logger.info("[EP Trace] Stage 4: Constant folding")
@@ -461,6 +466,9 @@ def optimize_model(
                 input_size_limit=8192,
                 output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
+            # Remove graph inputs whose consumers were all eliminated by
+            # fusion (e.g. position_ids when GQA absorbs RoPE).
+            RemoveDeadGraphInputsPass(),
         ]
     )
     fold_pass(model)
@@ -492,22 +500,6 @@ def optimize_model(
                 f"Check that the attention pattern matches the GQA rewrite rule.",
                 stacklevel=4,
             )
-
-    # Stage 5: Remove dead graph inputs.  After EP-aware fusion, some
-    # inputs may have no consumers (e.g. position_ids when all layers use
-    # GQA with fused RoPE).  Removing them produces a cleaner model and
-    # avoids requiring the runtime to provide dummy values.
-    dead_inputs = [
-        inp
-        for inp in model.graph.inputs
-        if inp.name is not None
-        and not inp.name.startswith("past_key_values.")
-        and len(inp.uses()) == 0
-    ]
-    for inp in dead_inputs:
-        model.graph.inputs.remove(inp)
-        if trace:
-            logger.info("[EP Trace] Removed dead input: %s", inp.name)
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
