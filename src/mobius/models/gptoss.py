@@ -494,7 +494,33 @@ class GPTOSSCausalLMModel(CausalLMModel):
         - ``mlp.experts.down_proj [N, inter, hidden]``: transpose per-expert to
           ``down_proj.weight [hidden, inter]``
         - ``mlp.experts.down_proj_bias [N, hidden]``: split to per-expert ``down_proj.bias``
+
+        MXFP4 quantized checkpoints store ``_blocks`` + ``_scales`` instead
+        of full weight tensors.  These are dequantized first using HF's
+        ``_convert_moe_packed_tensors`` (4-bit nibble-packed with shared
+        exponent), producing the same ``[N, hidden, 2*inter]`` or
+        ``[N, inter, hidden]`` shapes that the non-quantized path expects.
         """
+        # Phase 1: Dequantize MXFP4 _blocks + _scales into full tensors.
+        # The mxfp4 module ships with the same transformers version that
+        # added GPT-OSS support, so no version guard is needed.
+        from transformers.integrations.mxfp4 import (
+            _convert_moe_packed_tensors,
+        )
+
+        blocks_keys = [k for k in state_dict if k.endswith("_blocks")]
+        for bk in blocks_keys:
+            sk = bk.replace("_blocks", "_scales")
+            if sk not in state_dict:
+                continue
+            base_key = bk.removesuffix("_blocks")
+            state_dict[base_key] = _convert_moe_packed_tensors(
+                state_dict.pop(bk),
+                state_dict.pop(sk),
+                dtype=torch.bfloat16,
+            )
+
+        # Phase 2: Split fused/stacked weights into per-expert tensors.
         result: dict[str, torch.Tensor] = {}
         for name, tensor in state_dict.items():
             # Router weight/bias rename
@@ -516,7 +542,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
                     ].contiguous()
 
             # Expert fused gate+up weight: [N, hidden, 2*inter] — transposed + interleaved
-            elif "mlp.experts.gate_up_proj" in name:
+            elif name.endswith("mlp.experts.gate_up_proj"):
                 prefix = name.replace(".mlp.experts.gate_up_proj", "")
                 n_exp = tensor.shape[0]
                 for i in range(n_exp):
@@ -537,7 +563,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
                     result[f"{prefix}.mlp.experts.{i}.down_proj.bias"] = tensor[i].contiguous()
 
             # Expert down projection weight: [N, inter, hidden] — transposed
-            elif "mlp.experts.down_proj" in name:
+            elif name.endswith("mlp.experts.down_proj"):
                 prefix = name.replace(".mlp.experts.down_proj", "")
                 n_exp = tensor.shape[0]
                 for i in range(n_exp):

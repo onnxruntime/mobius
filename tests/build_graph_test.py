@@ -1127,9 +1127,9 @@ class TestBuildGraphVisionLanguage:
             mm_tokens_per_image=4,
             image_token_id=255999,
         )
-        model_cls = registry.get("gemma3_multimodal")
+        model_cls = registry.get("gemma3")
         module = model_cls(config)
-        task_name = _default_task_for_model("gemma3_multimodal")
+        task_name = _default_task_for_model("gemma3")
         task = get_task(task_name)
         pkg = task.build(module, config)
 
@@ -3772,7 +3772,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # VLM dedicated tests
     "blip-2",
     "deepseek_vl_v2",
-    "gemma3_multimodal",
+    "gemma3",
     "gemma4",
     "llava",
     "mllama",
