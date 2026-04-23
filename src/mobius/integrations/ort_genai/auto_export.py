@@ -88,6 +88,7 @@ def _copy_tokenizer_files(
         "added_tokens.json",
         "merges.txt",  # BPE
         "vocab.json",  # BPE
+        "chat_template.jinja",  # Chat template for ORT GenAI
     ]
     copied: list[str] = []
     for filename in tokenizer_files:
@@ -127,6 +128,7 @@ def _copy_tokenizer_files_from_local(
         "added_tokens.json",
         "merges.txt",  # BPE
         "vocab.json",  # BPE
+        "chat_template.jinja",  # Chat template for ORT GenAI
     ]
     copied: list[str] = []
     for filename in tokenizer_files:

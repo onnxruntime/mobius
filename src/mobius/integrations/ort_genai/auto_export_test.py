@@ -63,6 +63,7 @@ class TestCopyTokenizerFiles:
         fake_src = tmp_path / "src"
         fake_src.mkdir()
         (fake_src / "tokenizer.json").write_text('{"test": true}')
+        (fake_src / "chat_template.jinja").write_text("{{ messages }}")
 
         with mock.patch("huggingface_hub.hf_hub_download") as mock_dl:
             mock_dl.side_effect = lambda model_id, filename: (
@@ -77,6 +78,8 @@ class TestCopyTokenizerFiles:
 
         assert "tokenizer.json" in copied
         assert (dst / "tokenizer.json").exists()
+        assert "chat_template.jinja" in copied
+        assert (dst / "chat_template.jinja").exists()
 
 
 class TestCopyTokenizerFilesFromLocal:
@@ -88,14 +91,19 @@ class TestCopyTokenizerFilesFromLocal:
         src.mkdir()
         (src / "tokenizer.json").write_text('{"test": true}')
         (src / "tokenizer_config.json").write_text('{"model_type": "llama"}')
+        (src / "chat_template.jinja").write_text("{{ messages }}")
 
         dst = tmp_path / "output"
         dst.mkdir()
         copied = _copy_tokenizer_files_from_local(str(src), str(dst))
 
-        assert set(copied) == {"tokenizer.json", "tokenizer_config.json"}
+        assert set(copied) == {
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+        }
         assert (dst / "tokenizer.json").read_text() == '{"test": true}'
-        assert (dst / "tokenizer_config.json").read_text() == '{"model_type": "llama"}'
+        assert (dst / "chat_template.jinja").read_text() == "{{ messages }}"
 
     def test_skips_absent_files(self, tmp_path):
         """Files not present in the source directory are silently skipped."""
