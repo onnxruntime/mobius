@@ -16,6 +16,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
     _resolve_ort_genai_model_type,
+    _write_genai_config,
     _write_processor_config,
     write_ort_genai_config,
 )
@@ -480,6 +481,80 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert data["model"]["eos_token_id"] == [1, 106]
+
+
+class TestGemma4GenaiConfig:
+    """Tests for Gemma4-specific genai_config generation."""
+
+    @staticmethod
+    def _make_gemma4_config():
+        """Build a minimal mock Gemma4 config with vision."""
+        import dataclasses
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            mm_tokens_per_image: int = 256
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 2048
+            num_hidden_layers: int = 26
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 4
+            head_dim: int = 256
+            max_position_embeddings: int = 8192
+            image_token_id: int = 255999
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        return FakeConfig()
+
+    def test_gemma4_vision_inputs(self, tmp_path):
+        """Gemma4 vision uses pixel_values + pixel_position_ids."""
+        config = self._make_gemma4_config()
+        path = _write_genai_config(
+            config,
+            str(tmp_path),
+            ort_model_type="gemma4",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        vision_inputs = data["model"]["vision"]["inputs"]
+        assert "pixel_values" in vision_inputs
+        assert "pixel_position_ids" in vision_inputs
+        assert "image_grid_thw" not in vision_inputs
+        assert "spatial_merge_size" not in data["model"]["vision"]
+
+    def test_gemma4_decoder_has_input_ids_and_inputs_embeds(self, tmp_path):
+        """Gemma4 decoder has both inputs_embeds and input_ids."""
+        config = self._make_gemma4_config()
+        path = _write_genai_config(
+            config,
+            str(tmp_path),
+            ort_model_type="gemma4",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        decoder_inputs = data["model"]["decoder"]["inputs"]
+        assert "inputs_embeds" in decoder_inputs
+        assert "input_ids" in decoder_inputs
 
 
 @pytest.mark.integration

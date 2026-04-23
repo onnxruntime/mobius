@@ -154,21 +154,28 @@ def _write_processor_config(
 
     if model_type in ("gemma4", "gemma4_text"):
         # Gemma4 needs a processor wrapper with model-specific fields
-        max_soft_tokens = getattr(vision, "max_soft_tokens", 280)
+        tokens_per_image = (
+            getattr(vision, "mm_tokens_per_image", None)
+            or getattr(config, "mm_tokens_per_image", None)
+            or getattr(vision, "max_soft_tokens", None)
+            or 280
+        )
+        image_size = getattr(vision, "image_size", None) or 448
+        patch_size = getattr(vision, "patch_size", None) or 16
         processor: dict[str, Any] = {
             "processor": {
                 "name": "gemma4_image_processor",
-                "image_size": getattr(vision, "image_size", 448),
-                "patch_size": getattr(vision, "patch_size", 16),
-                "tokens_per_image": max_soft_tokens,
+                "image_size": image_size,
+                "patch_size": patch_size,
+                "tokens_per_image": tokens_per_image,
                 "mean": [0.5, 0.5, 0.5],
                 "std": [0.5, 0.5, 0.5],
             }
         }
     else:
         processor = {
-            "image_size": getattr(vision, "image_size", 448),
-            "patch_size": getattr(vision, "patch_size", 14),
+            "image_size": getattr(vision, "image_size", None) or 448,
+            "patch_size": getattr(vision, "patch_size", None) or 14,
         }
 
     path = os.path.join(output_dir, "processor_config.json")

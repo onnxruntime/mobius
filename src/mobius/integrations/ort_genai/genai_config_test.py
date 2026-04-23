@@ -443,6 +443,30 @@ class TestGenaiConfigWrite:
         assert loaded["model"]["image_token_id"] == 151655
 
 
+class TestExtraDecoderInputs:
+    """Test with_extra_decoder_inputs() merges into decoder inputs."""
+
+    def test_extra_decoder_inputs_merged(self):
+        """Extra decoder inputs are merged with default VLM inputs."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=262144,
+            hidden_size=2048,
+            num_hidden_layers=26,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=256,
+        ).with_vision(
+            image_token_id=255999,
+            spatial_merge_size=None,
+        )
+        gen.with_extra_decoder_inputs(input_ids="input_ids")
+        config = gen.generate()
+        decoder_inputs = config["model"]["decoder"]["inputs"]
+        assert "input_ids" in decoder_inputs
+        assert "inputs_embeds" in decoder_inputs  # original still present
+
+
 class TestGenaiConfigGeneratorMultimodal:
     """Test genai_config generation for multimodal (vision + speech)."""
 
