@@ -218,7 +218,7 @@ It drives the entire build pipeline — graph construction, operator fusion,
 dead input removal, and KV cache sizing are all tailored for the target EP:
 
 ```bash
-# Default (portable ONNX with standard fusions, no vendor-specific ops)
+# Default (portable ONNX with standard fusions as model local functions)
 mobius build --model meta-llama/Llama-3.2-1B output/
 
 # CPU (GQA fusion for f32)
@@ -236,7 +236,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ --ep trt-rtx --dtype f16
 # WebGPU
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep webgpu --dtype f16
 
-# Strict ONNX standard (zero custom ops, runs on any ONNX runtime)
+# Strict ONNX standard (zero custom ops)
 mobius build --model meta-llama/Llama-3.2-1B output/ --ep onnx-standard
 ```
 
