@@ -35,7 +35,7 @@ multi-component packages.
 | Option | Description |
 |--------|-------------|
 | `--model MODEL_ID` | HuggingFace model identifier (e.g. `meta-llama/Llama-3-8B`). Downloads config and weights from the Hub. |
-| `--config CONFIG_PATH` | Path to a local model directory containing `config.json` (and optionally safetensors weights). Alternative to `--model`. |
+| `--config CONFIG_PATH` | Path to a local model directory containing `config.json`. Safetensors weights are also required unless `--no-weights` is provided; use `--no-weights` to build from a config-only directory. Alternative to `--model`. |
 
 ### Execution Provider (`--ep`)
 
@@ -200,7 +200,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache --max-seq-le
 | Option | Description |
 |--------|-------------|
 | `--task TASK` | Model task (auto-detected if not specified). Use `mobius list tasks` to see available tasks. |
-| `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32` (also accepts `float16`, `bfloat16`, `float32`). Default: `f32`. Weights are cast at save time. |
+| `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32` (also accepts `float16`, `bfloat16`, `float32`). If omitted, the dtype is auto-detected from the HuggingFace config (`torch_dtype`); provide `--dtype` to override it. Weights are cast at save time. |
 | `--no-weights` | Export graph structure only, without weight data. Useful for inspection or testing. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
