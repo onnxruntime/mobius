@@ -35,7 +35,6 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import BambaConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     MLP,
     Attention,
@@ -247,6 +246,8 @@ class BambaCausalLMModel(nn.Module):
         self.config = config
         self.model = _BambaTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -275,7 +276,9 @@ class BambaCausalLMModel(nn.Module):
         1. Weight tying (embed_tokens ↔ lm_head)
         """
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(state_dict)
+            if "model.embed_tokens.weight" not in state_dict:
+                state_dict["model.embed_tokens.weight"] = state_dict["lm_head.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         # HF and ONNX naming match directly — no renaming needed.
         return state_dict
