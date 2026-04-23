@@ -157,7 +157,7 @@ def run_alignment(
 
     # Step 2: Compute mel spectrogram and run audio encoder
     mel = compute_mel_spectrogram(audio)
-    audio_out = sessions["audio_encoder"].run({"input_features": mel})
+    audio_out = sessions["audio"].run({"input_features": mel})
     audio_features = audio_out["audio_features"]
     num_audio_tokens = audio_features.shape[1]
     audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])

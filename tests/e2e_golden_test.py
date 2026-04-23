@@ -1145,7 +1145,7 @@ def _run_phi4mm_multimodal_prefill(
         # When images are also present, HF uses the "vision" audio projection
         audio_projection_mode = np.array(1 if case.images else 0, dtype=np.int64)
 
-        speech_session = OnnxModelSession(pkg["speech"], **device_kwargs)
+        speech_session = OnnxModelSession(pkg["audio"], **device_kwargs)
         try:
             speech_out = speech_session.run(
                 {
@@ -1235,8 +1235,7 @@ def _run_speech_language_prefill(
     )
 
     # Step 1: Run audio encoder
-    audio_key = "audio" if "audio" in pkg else "audio_encoder"
-    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
@@ -1675,8 +1674,7 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
-    audio_key = "audio" if "audio" in pkg else "audio_encoder"
-    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:

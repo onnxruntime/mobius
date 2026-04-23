@@ -18,9 +18,9 @@ ort_genai/
 │   └── genai_config.json        # Text-only decoder (model.onnx)
 ├── vlm/
 │   ├── genai_config.json        # 3-model VLM (model.onnx + vision.onnx + embedding.onnx)
-│   └── processor_config.json    # SigLIP image processor config
+│   └── image_processor.json      # SigLIP image processor config
 └── any_to_any/
-    └── genai_config.json        # 4-model AnyToAny (+speech.onnx)
+    └── genai_config.json        # 4-model AnyToAny (+audio.onnx)
 ```
 
 ---
@@ -114,7 +114,7 @@ Each image produces **280 soft tokens** (`vision_soft_tokens_per_image = 280`).
 Gemma 4 Any-to-Any uses a **Conformer** audio encoder (12 layers,
 hidden_size=1024) with 4× subsampling.
 
-The ONNX audio model (`speech.onnx`) takes:
+The ONNX audio model (`audio.onnx`) takes:
 - `input_features [batch, time, 128]` — 128-dim mel spectrogram
 
 Output: `audio_features [batch, time/4, 1536]` — projected to text hidden_size.
@@ -170,14 +170,14 @@ vlm/
   embedding.onnx      ← embedding fusion
   tokenizer.json
   genai_config.json
-  processor_config.json
+  image_processor.json
 
 any_to_any/
   model.onnx          ← decoder (Gemma4AnyToAnyTask)
   vision.onnx
-  speech.onnx         ← Conformer audio encoder
+  audio.onnx          ← Conformer audio encoder
   embedding.onnx
   tokenizer.json
   genai_config.json
-  processor_config.json  ← copy from vlm/
+  image_processor.json   ← copy from vlm/
 ```

@@ -112,7 +112,7 @@ def _run_onnx_pipeline(
 
     # Step 2: Speech encoder
     if audio_features is not None:
-        speech_session = OnnxModelSession(pkg["speech"])
+        speech_session = OnnxModelSession(pkg["audio"])
         audio_sizes = np.array([audio_features.shape[1]], dtype=np.int64)
         speech_out = speech_session.run(
             {

@@ -851,7 +851,7 @@ def main():
     # ------------------------------------------------------------------
     print("Creating ONNX Runtime sessions ...")
     vision_session = OnnxModelSession(pkg["vision"])
-    speech_session = OnnxModelSession(pkg["speech"])
+    speech_session = OnnxModelSession(pkg["audio"])
     embedding_session = OnnxModelSession(pkg["embedding"])
     decoder_session = OnnxModelSession(pkg["model"])
 

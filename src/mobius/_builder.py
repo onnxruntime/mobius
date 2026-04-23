@@ -113,8 +113,9 @@ _MODEL_ROLE_MAP: dict[str, str] = {
     "encoder": "encoder",
     # Audio sub-models are encoder-role; must not receive decoder-only fusions.
     "audio": "encoder",
-    "audio_encoder": "encoder",  # backward compat alias
-    "speech": "encoder",  # backward compat alias
+    # Backward compatibility aliases (deprecated — will be removed)
+    "audio_encoder": "encoder",
+    "speech": "encoder",
 }
 
 
