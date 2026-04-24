@@ -158,13 +158,22 @@ def _copy_tokenizer_files_from_local(
     return copied
 
 
-def _write_processor_config(
+def _write_vision_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write a minimal processor_config.json for VLM models.
+    """Write the vision processor config file for VLM models.
 
-    Returns the path if written, None otherwise.
+    The output format depends on the model type:
+
+    - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
+      in the onnxruntime-extensions transforms pipeline format required by
+      ``OrtxCreateProcessor``.  The pipeline is
+      ``DecodeImage → Gemma4ImageTransform``.
+    - **Other models**: Writes ``processor_config.json`` with a minimal
+      HuggingFace-style schema (``image_size``, ``patch_size``).
+
+    Returns the written file path, or None if the config has no vision section.
     """
     vision = getattr(config, "vision", None)
     if vision is None:
@@ -176,10 +185,13 @@ def _write_processor_config(
         # Gemma4 needs an onnxruntime-extensions format processor config
         # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
         # The OrtxCreateProcessor API requires this format.
+        #
+        # max_soft_tokens: maps from HF's mm_tokens_per_image (the number of
+        # vision tokens per image after pooling) into the Gemma4ImageTransform's
+        # max_soft_tokens attribute, which controls the padded patch budget.
         max_soft_tokens = (
             getattr(vision, "mm_tokens_per_image", None)
             or getattr(config, "mm_tokens_per_image", None)
-            or getattr(vision, "max_soft_tokens", None)
             or 280
         )
         patch_size = getattr(vision, "patch_size", None) or 16
@@ -470,7 +482,7 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor_config.json for VLMs
-    processor_path = _write_processor_config(config, directory)
+    processor_path = _write_vision_processor_config(config, directory)
     if processor_path:
         result["processor_config"] = processor_path
 
