@@ -9,7 +9,7 @@ The unified :class:`Gemma4Task` builds a 3- or 4-model package:
 2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` → ``image_features``
 3. **embedding**: ``input_ids, image_features[, audio_features]`` → ``inputs_embeds``
 4. **audio** (audio encoder, only when ``config.audio is not None``):
-   ``input_features`` → ``audio_features``
+   ``input_features, input_features_mask`` → ``audio_features``
 
 The decoder uses per-layer KV cache where local (sliding_attention) layers
 use ``config.head_dim`` and global (full_attention) layers use
@@ -298,10 +298,11 @@ class Gemma4Task(ModelTask):
         audio: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build audio encoder: input_features -> audio_features.
+        """Build audio encoder: input_features + input_features_mask -> audio_features.
 
-        Input:
+        Inputs:
         - ``input_features [batch, time, input_size]``: mel-spectrogram
+        - ``input_features_mask [batch, time]``: BOOL mask (True = valid frame)
 
         Output:
         - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
@@ -315,11 +316,20 @@ class Gemma4Task(ModelTask):
             shape=ir.Shape([batch, time, input_size]),
             type=ir.TensorType(config.dtype),
         )
+        input_features_mask = ir.Value(
+            name="input_features_mask",
+            shape=ir.Shape([batch, time]),
+            type=ir.TensorType(ir.DataType.BOOL),
+        )
 
-        graph, graph_builder = _make_graph([input_features], name="audio")
+        graph, graph_builder = _make_graph([input_features, input_features_mask], name="audio")
         op = graph_builder.op
 
-        audio_features = audio(op, input_features)
+        audio_features = audio(
+            op,
+            input_features,
+            input_features_mask=input_features_mask,
+        )
         audio_features.name = "audio_features"
         graph.outputs.append(audio_features)
         return _make_model(graph)

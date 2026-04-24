@@ -49,7 +49,7 @@ class TestGemma4ConvSubsampling:
         comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 20, 32])
-        result = comp(op, x)
+        result, _mask = comp(op, x)
         b._adapt_outputs([result])
         assert graph.num_nodes() > 0
 

@@ -191,11 +191,64 @@ class Gemma4ConvSubsampling(nn.Module):
         x = op.Transpose(x, perm=[0, 3, 1, 2])  # [B, C_out, T', F']
         return op.Relu(x)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def _mask_and_downsample(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        mask: ir.Value | None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        """Zero out padded positions via *mask*, then downsample mask by stride 2.
+
+        Args:
+            x: hidden states ``[B, C, T, F]`` **before** the conv layer.
+            mask: bool ``[B, T]`` (True = valid).  ``None`` → no-op.
+
+        Returns:
+            ``(masked_x, downsampled_mask)`` where the mask time dimension
+            is halved (``mask[:, ::2]``).
+        """
+        if mask is None:
+            return x, None
+        # Broadcast mask [B, T] → [B, 1, T, 1] over C and F dims
+        mask_4d = op.Unsqueeze(mask, [1, 3])  # [B, 1, T, 1]
+        x = op.Mul(x, op.CastLike(mask_4d, x))
+        # Downsample mask by conv stride (2): mask[:, ::2]
+        mask = op.Slice(
+            mask,
+            op.Constant(value_ints=[0]),  # starts
+            op.Constant(value_ints=[9223372036854775807]),  # ends (INT64_MAX)
+            op.Constant(value_ints=[1]),  # axes
+            op.Constant(value_ints=[2]),  # steps
+        )  # [B, T//2]
+        return x, mask
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        """Subsample audio features and propagate the padding mask.
+
+        Args:
+            x: mel-spectrogram ``[B, T, input_size]``.
+            input_features_mask: optional bool ``[B, T]``
+                (True = valid frame).
+
+        Returns:
+            ``(projected_features, downsampled_mask)`` where features
+            are ``[B, T//4, hidden_size]`` and mask is ``[B, T//4]``
+            (or ``None`` when no mask was provided).
+        """
         # x: [B, T, input_size]
         x = op.Unsqueeze(x, [1])  # [B, 1, T, input_size]
 
+        # Stage 0: mask → conv → norm → relu → downsample mask
+        x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv0, self.norm0)  # [B, c0, T//2, F//2]
+
+        # Stage 1: mask → conv → norm → relu → downsample mask
+        x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv1, self.norm1)  # [B, c1, T//4, F//4]
 
         # [B, c1, T', F'] → [B, T', F'*c1]  (permute so T is dim 1, flatten C and F)
@@ -204,7 +257,9 @@ class Gemma4ConvSubsampling(nn.Module):
         t_out = op.Shape(x, start=1, end=2)
         x = op.Reshape(x, op.Concat(batch, t_out, op.Constant(value_ints=[-1]), axis=0))
 
-        return self.input_proj_linear(op, x)  # [B, T', hidden_size]
+        return self.input_proj_linear(
+            op, x
+        ), input_features_mask  # [B, T', hidden_size], [B, T']
 
 
 class Gemma4FeedForward(nn.Module):
@@ -444,7 +499,19 @@ class Gemma4Attention(nn.Module):
         )  # [T, T] float32
         return op.Unsqueeze(bias, [0, 1])  # [1, 1, T, T]
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ) -> ir.Value:
+        """Compute attention with optional padding mask.
+
+        Args:
+            x: ``[B, T, hidden_size]``
+            attention_mask: optional bool ``[B, T]`` (True = valid).
+                Used to prevent attending to padded key positions.
+        """
         # x: [B, T, hidden_size]
         batch = op.Shape(x, start=0, end=1)
         seq_len = op.Shape(x, start=1, end=2)
@@ -539,6 +606,16 @@ class Gemma4Attention(nn.Module):
         window_mask = self._build_causal_window_mask(op, seq_len)
         scores = op.Add(scores, window_mask)
 
+        # Padding mask: block attention to padded key positions
+        if attention_mask is not None:
+            # attention_mask [B, T] bool → additive bias [B, 1, 1, T]
+            pad_bias = op.Where(
+                op.Unsqueeze(attention_mask, [1, 2]),
+                op.Constant(value_float=0.0),
+                op.Constant(value_float=-1e9),
+            )  # [B, 1, 1, T]
+            scores = op.Add(scores, pad_bias)
+
         # Softmax in float32 → attention weights
         attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
 
@@ -610,14 +687,19 @@ class Gemma4AudioLayer(nn.Module):
         self.norm_post_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.norm_out = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ) -> ir.Value:
         gc = self._gradient_clipping
         x = self.feed_forward1(op, x)  # FF1 (handles residual internally)
 
         residual = x
         x = _gradient_clip(op, x, gc)
         x = self.norm_pre_attn(op, x)
-        x = self.self_attn(op, x)
+        x = self.self_attn(op, x, attention_mask=attention_mask)
         x = _gradient_clip(op, x, gc)
         x = self.norm_post_attn(op, x)
         x = op.Add(x, residual)
@@ -708,11 +790,29 @@ class Gemma4AudioEncoder(nn.Module):
         # op.RMSNormalization, preventing ORT from recognizing the fusion pattern.
         self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_features: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> ir.Value:
+        """Encode audio mel-spectrogram features.
+
+        Args:
+            input_features: ``[B, T, input_size]`` mel-spectrogram.
+            input_features_mask: optional bool ``[B, T]``
+                (True = valid frame).  Propagated through conv subsampling
+                and used as key-padding mask in Conformer attention.
+
+        Returns:
+            ``[B, T//4, output_proj_dims]`` encoded audio tokens.
+        """
         # input_features: [B, T, input_size]
-        x = self.subsample_conv_projection(op, input_features)  # [B, T//4, hidden_size]
+        x, attention_mask = self.subsample_conv_projection(
+            op, input_features, input_features_mask
+        )  # [B, T//4, hidden_size], [B, T//4] or None
 
         for layer in self.layers:
-            x = layer(op, x)  # [B, T//4, hidden_size]
+            x = layer(op, x, attention_mask=attention_mask)  # [B, T//4, hidden_size]
 
         return self.output_proj(op, x)  # [B, T//4, output_proj_dims]
