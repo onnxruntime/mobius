@@ -161,9 +161,9 @@ class Gemma4Task(ModelTask):
     """Unified task for Gemma4 multimodal models (3- or 4-model split).
 
     Always builds:
-    - ``decoder``: text decoder accepting ``inputs_embeds`` [+ ``per_layer_inputs``]
+    - ``decoder``: text decoder accepting ``inputs_embeds`` + ``input_ids``
     - ``vision``: vision encoder accepting ``pixel_values, pixel_position_ids``
-    - ``embedding``: produces ``inputs_embeds`` [+ ``per_layer_inputs``] from ``input_ids``
+    - ``embedding``: produces ``inputs_embeds`` from ``input_ids``
 
     When ``config.audio is not None``, also builds:
     - ``audio``: Conformer audio encoder accepting ``input_features``
@@ -196,11 +196,13 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds [+ per_layer_inputs] -> logits + per-layer KV cache.
+        """Build text decoder: inputs_embeds + input_ids -> logits + per-layer KV cache.
 
-        When ``hidden_size_per_layer_input > 0``, the decoder takes a
-        pre-computed ``per_layer_inputs`` [B, S, L, D] tensor produced by
-        the embedding model.  The decoder does NOT take ``input_ids``.
+        ``input_ids`` is included alongside ``inputs_embeds`` because models with
+        ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B) need the original token
+        IDs to compute per-layer token embeddings that condition each decoder layer.
+        When ``hidden_size_per_layer_input == 0`` the tensor is passed through but has
+        no effect (``_compute_per_layer_inputs`` short-circuits to ``None``).
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -221,25 +223,13 @@ class Gemma4Task(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
+        input_ids = ir.Value(
+            name="input_ids",
+            shape=ir.Shape([batch, seq_len]),
+            type=ir.TensorType(ir.DataType.INT64),
+        )
 
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
-
-        per_layer_val: ir.Value | None = None
-        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        if per_layer_dim:
-            per_layer_val = ir.Value(
-                name="per_layer_inputs",
-                shape=ir.Shape(
-                    [
-                        batch,
-                        seq_len,
-                        config.num_hidden_layers,
-                        per_layer_dim,
-                    ]
-                ),
-                type=ir.TensorType(config.dtype),
-            )
-            graph_inputs.append(per_layer_val)
+        graph_inputs = [inputs_embeds, attention_mask, position_ids, input_ids]
 
         kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
         graph_inputs.extend(kv_inputs)
@@ -252,7 +242,7 @@ class Gemma4Task(ModelTask):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            per_layer_inputs=per_layer_val,
+            input_ids=input_ids,
             past_key_values=past_key_values,
         )
 
@@ -344,11 +334,9 @@ class Gemma4Task(ModelTask):
         embedding: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build embedding: input_ids -> inputs_embeds [+ per_layer_inputs].
+        """Build embedding: input_ids -> inputs_embeds.
 
         Multimodal fusion is handled by the runtime, not this model.
-        When ``hidden_size_per_layer_input > 0``, also outputs
-        ``per_layer_inputs`` [B, S, num_layers, per_layer_dim].
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -364,14 +352,11 @@ class Gemma4Task(ModelTask):
         graph, graph_builder = _make_graph(graph_inputs, name="embedding")
         op = graph_builder.op
 
-        inputs_embeds, per_layer_inputs = embedding(
+        inputs_embeds = embedding(
             op,
             input_ids=input_ids,
         )
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
-        if per_layer_inputs is not None:
-            per_layer_inputs.name = "per_layer_inputs"
-            graph.outputs.append(per_layer_inputs)
 
         return _make_model(graph)

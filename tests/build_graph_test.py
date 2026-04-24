@@ -1186,11 +1186,11 @@ class TestBuildGraphVisionLanguage:
         assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
         )
-        # Decoder: inputs_embeds -> logits + per-layer KV cache (no input_ids)
+        # Decoder: inputs_embeds + input_ids -> logits + per-layer KV cache
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
         assert "inputs_embeds" in decoder_input_names
-        assert "input_ids" not in decoder_input_names
+        assert "input_ids" in decoder_input_names
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision: pixel_values + pixel_position_ids -> image_features
         vision = pkg["vision"]
@@ -1210,8 +1210,8 @@ class TestBuildGraphVisionLanguage:
         """Build Gemma4 VLM with per-layer input embeddings (hidden_size_per_layer_input > 0).
 
         Verifies:
-        - Embedding outputs both ``inputs_embeds`` and ``per_layer_inputs``
-        - Decoder takes ``per_layer_inputs`` instead of ``input_ids``
+        - Decoder takes ``input_ids`` for per-layer computation
+        - Embedding outputs only ``inputs_embeds`` (per-layer computed by decoder)
         """
         from mobius._configs import Gemma4Config
 
@@ -1254,20 +1254,19 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
-        # Decoder: per_layer_inputs replaces input_ids
+        # Decoder: input_ids for per-layer computation
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
         assert "inputs_embeds" in decoder_input_names
-        assert "per_layer_inputs" in decoder_input_names
-        assert "input_ids" not in decoder_input_names
+        assert "input_ids" in decoder_input_names
         assert "logits" in {o.name for o in decoder.graph.outputs}
-        # Embedding: outputs both inputs_embeds and per_layer_inputs
+        # Embedding: outputs only inputs_embeds (per-layer computed by decoder)
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         emb_output_names = {o.name for o in embedding.graph.outputs}
         assert emb_input_names == {"input_ids"}
         assert "inputs_embeds" in emb_output_names
-        assert "per_layer_inputs" in emb_output_names
+        assert "per_layer_inputs" not in emb_output_names
 
     def test_gemma4_moe_graph(self):
         """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""
@@ -1373,7 +1372,7 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
         assert "inputs_embeds" in decoder_input_names
-        assert "input_ids" not in decoder_input_names
+        assert "input_ids" in decoder_input_names
         assert "past_key_values.0.key" in decoder_input_names
         assert "past_key_values.1.key" not in decoder_input_names  # shared layer
         assert "logits" in {o.name for o in decoder.graph.outputs}

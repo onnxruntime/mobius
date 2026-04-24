@@ -631,6 +631,21 @@ def _run_vision_language_prefill(
     emb_key = next(iter(emb_out))
     inputs_embeds = emb_out[emb_key]
 
+    # External multimodal fusion: if the embedding model does NOT accept
+    # image features (new split interface), replace placeholder token
+    # embeddings with vision encoder features in the test harness.
+    emb_has_image_input = any("image" in n for n in emb_session.input_names)
+    if not emb_has_image_input:
+        image_token_id = getattr(config, "image_token_id", None)
+        if image_token_id is not None:
+            vis_feat = vis_hidden[0] if vis_hidden.ndim == 3 else vis_hidden
+            flat = processed["input_ids"].astype(np.int64)[0]
+            positions = np.where(flat == image_token_id)[0]
+            n = min(len(positions), vis_feat.shape[0])
+            if n > 0:
+                inputs_embeds = inputs_embeds.copy()
+                inputs_embeds[0, positions[:n]] = vis_feat[:n]
+
     # --- Step 3: Run decoder ---
     # VL packages may use "model" or "decoder" for the text decoder.
     dec_key = "model" if "model" in pkg else "decoder"
@@ -647,7 +662,11 @@ def _run_vision_language_prefill(
         for name in dec_session.input_names:
             if name in dec_feeds:
                 continue
-            if name in processed:
+            # Pass through embedding outputs that match decoder inputs
+            # (e.g. per_layer_inputs from split embedding interface)
+            if name in emb_out:
+                dec_feeds[name] = emb_out[name]
+            elif name in processed:
                 dec_feeds[name] = processed[name]
             elif name == "attention_mask":
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
@@ -814,6 +833,19 @@ def _run_vl_generation(
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
 
+        # External multimodal fusion: if the embedding model does NOT accept
+        # image features (new split interface), fuse vision features here.
+        if image_feat_input is None:
+            image_token_id = getattr(config, "image_token_id", None)
+            if image_token_id is not None:
+                vis_feat = vis_hidden[0] if vis_hidden.ndim == 3 else vis_hidden
+                flat = processed["input_ids"].astype(np.int64)[0]
+                positions = np.where(flat == image_token_id)[0]
+                n = min(len(positions), vis_feat.shape[0])
+                if n > 0:
+                    inputs_embeds = inputs_embeds.copy()
+                    inputs_embeds[0, positions[:n]] = vis_feat[:n]
+
         batch_size = 1
         prompt_seq_len = inputs_embeds.shape[1]
         hidden_size = inputs_embeds.shape[2]
@@ -830,7 +862,11 @@ def _run_vl_generation(
             "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
             **past_cache,
         }
-        # Gemma4 decoder requires input_ids alongside inputs_embeds
+        # Pass through embedding outputs that match decoder inputs
+        # (e.g. per_layer_inputs from split embedding interface)
+        for name in dec_session.input_names:
+            if name not in dec_feeds and name in emb_out:
+                dec_feeds[name] = emb_out[name]
         if "input_ids" in dec_session.input_names:
             dec_feeds["input_ids"] = processed["input_ids"].astype(np.int64)
         # Track the next decode position (may differ from token count for MRoPE
@@ -893,7 +929,10 @@ def _run_vl_generation(
                 "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
                 **past_cache,
             }
-            # Gemma4 decoder requires input_ids alongside inputs_embeds
+            # Pass through embedding outputs that match decoder inputs
+            for name in dec_session.input_names:
+                if name not in step_feeds and name in step_emb_out:
+                    step_feeds[name] = step_emb_out[name]
             if "input_ids" in dec_session.input_names:
                 step_feeds["input_ids"] = next_token
             if "position_ids" in dec_session.input_names:
@@ -1051,7 +1090,11 @@ def _run_text_only_multimodel_prefill(
         for name in dec_session.input_names:
             if name in dec_feeds:
                 continue
-            if name == "input_ids":
+            # Pass through embedding outputs that match decoder inputs
+            # (e.g. per_layer_inputs from split embedding interface)
+            if name in emb_out:
+                dec_feeds[name] = emb_out[name]
+            elif name == "input_ids":
                 dec_feeds[name] = input_ids
             elif name == "attention_mask":
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
@@ -1264,6 +1307,11 @@ def _run_speech_language_prefill(
     num_encoder_tokens = audio_hidden.shape[0]
     audio_token_id = getattr(config, "audio_token_id", None)
     if audio_token_id is None:
+        # Gemma4: audio_token_id lives in config.audio sub-config
+        audio_cfg = getattr(config, "audio", None)
+        if audio_cfg is not None:
+            audio_token_id = getattr(audio_cfg, "audio_token_id", None)
+    if audio_token_id is None:
         thinker_cfg = getattr(config, "thinker_config", None)
         if thinker_cfg is not None:
             audio_token_id = getattr(thinker_cfg, "audio_token_id", None)
@@ -1306,6 +1354,18 @@ def _run_speech_language_prefill(
 
     inputs_embeds = emb_out[next(iter(emb_out))]
 
+    # External multimodal fusion: if the embedding model does NOT accept
+    # audio features (new split interface), fuse audio features here.
+    emb_has_audio_input = any("audio" in n for n in emb_session.input_names)
+    if not emb_has_audio_input and audio_token_id is not None:
+        aud_feat = audio_hidden[0] if audio_hidden.ndim == 3 else audio_hidden
+        flat = input_ids[0]
+        positions = np.where(flat == audio_token_id)[0]
+        n = min(len(positions), aud_feat.shape[0])
+        if n > 0:
+            inputs_embeds = inputs_embeds.copy()
+            inputs_embeds[0, positions[:n]] = aud_feat[:n]
+
     # Step 3: Run decoder
     dec_key = "model" if "model" in pkg else "decoder"
     dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
@@ -1319,7 +1379,11 @@ def _run_speech_language_prefill(
         for name in dec_session.input_names:
             if name in dec_feeds:
                 continue
-            if name == "input_ids":
+            # Pass through embedding outputs that match decoder inputs
+            # (e.g. per_layer_inputs from split embedding interface)
+            if name in emb_out:
+                dec_feeds[name] = emb_out[name]
+            elif name == "input_ids":
                 dec_feeds[name] = input_ids
             elif name == "attention_mask":
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
@@ -1699,6 +1763,11 @@ def _run_speech_language_generation(
     num_encoder_tokens = audio_hidden.shape[0]
     audio_token_id = getattr(config, "audio_token_id", None)
     if audio_token_id is None:
+        # Gemma4: audio_token_id lives in config.audio sub-config
+        audio_cfg = getattr(config, "audio", None)
+        if audio_cfg is not None:
+            audio_token_id = getattr(audio_cfg, "audio_token_id", None)
+    if audio_token_id is None:
         thinker_cfg = getattr(config, "thinker_config", None)
         if thinker_cfg is not None:
             audio_token_id = getattr(thinker_cfg, "audio_token_id", None)
@@ -1742,6 +1811,17 @@ def _run_speech_language_generation(
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]
 
+        # External multimodal fusion: if the embedding model does NOT accept
+        # audio features (new split interface), fuse audio features here.
+        if audio_feat_input is None and audio_token_id is not None:
+            aud_feat = audio_hidden[0] if audio_hidden.ndim == 3 else audio_hidden
+            flat = input_ids[0]
+            positions = np.where(flat == audio_token_id)[0]
+            n_fuse = min(len(positions), aud_feat.shape[0])
+            if n_fuse > 0:
+                inputs_embeds = inputs_embeds.copy()
+                inputs_embeds[0, positions[:n_fuse]] = aud_feat[:n_fuse]
+
         batch_size = 1
         prompt_seq_len = inputs_embeds.shape[1]
         hidden_size = inputs_embeds.shape[2]
@@ -1753,6 +1833,10 @@ def _run_speech_language_generation(
             "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
             **past_cache,
         }
+        # Pass through embedding outputs that match decoder inputs
+        for name in dec_session.input_names:
+            if name not in dec_feeds and name in emb_out:
+                dec_feeds[name] = emb_out[name]
         if "input_ids" in dec_session.input_names:
             dec_feeds["input_ids"] = input_ids
 
@@ -1801,6 +1885,10 @@ def _run_speech_language_generation(
                 "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
                 **past_cache,
             }
+            # Pass through embedding outputs that match decoder inputs
+            for name in dec_session.input_names:
+                if name not in step_feeds and name in step_emb_out:
+                    step_feeds[name] = step_emb_out[name]
             if "input_ids" in dec_session.input_names:
                 step_feeds["input_ids"] = next_token
             if "position_ids" in dec_session.input_names:

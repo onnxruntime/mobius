@@ -537,6 +537,7 @@ class TestGemma4GenaiConfig:
                 "inputs_embeds",
                 "attention_mask",
                 "position_ids",
+                "input_ids",
                 "past_key_values.0.key",
                 "past_key_values.0.value",
             ]
@@ -587,7 +588,7 @@ class TestGemma4GenaiConfig:
         assert data["model"]["vision"]["spatial_merge_size"] == 2
 
     def test_gemma4_decoder_has_inputs_embeds(self, tmp_path):
-        """Gemma4 decoder has inputs_embeds (no input_ids)."""
+        """Gemma4 decoder has inputs_embeds and input_ids."""
         pkg = self._make_gemma4_pkg()
         path = _write_genai_config(
             pkg.config,
@@ -606,8 +607,7 @@ class TestGemma4GenaiConfig:
             data = json.load(f)
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
-        assert "input_ids" not in decoder_inputs
-        # KV cache templates are present
+        assert "input_ids" in decoder_inputs
         assert decoder_inputs["past_key_names"] == "past_key_values.%d.key"
 
     def test_gemma4_embedding_inputs(self, tmp_path):
@@ -759,7 +759,7 @@ class TestGemma4RealModel:
         # Decoder inputs introspected from graph
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
-        assert "input_ids" not in decoder_inputs
+        assert "input_ids" in decoder_inputs
         assert "attention_mask" in decoder_inputs
         assert "position_ids" in decoder_inputs
         assert decoder_inputs["past_key_names"] == ("past_key_values.%d.key")
@@ -781,7 +781,7 @@ class TestGemma4RealModel:
         assert data["model"]["vision"]["config_filename"] == "processor_config.json"
 
     def test_gemma4_per_layer_inputs_in_genai_config(self, tmp_path):
-        """When hidden_size_per_layer_input > 0, decoder gets per_layer_inputs."""
+        """When hidden_size_per_layer_input > 0, decoder still gets input_ids."""
         from mobius._builder import build_from_module
         from mobius._config_resolver import _default_task_for_model
         from mobius._configs import Gemma4Config, VisionConfig
@@ -831,10 +831,10 @@ class TestGemma4RealModel:
         with open(result["genai_config"]) as f:
             data = json.load(f)
 
-        # Decoder must include per_layer_inputs (no input_ids)
+        # Decoder uses input_ids for per-layer computation
         decoder_inputs = data["model"]["decoder"]["inputs"]
-        assert "per_layer_inputs" in decoder_inputs
-        assert "input_ids" not in decoder_inputs
+        assert "input_ids" in decoder_inputs
+        assert "per_layer_inputs" not in decoder_inputs
 
         # Embedding must output per_layer_inputs
         emb_inputs = data["model"]["embedding"]["inputs"]

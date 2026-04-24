@@ -17,14 +17,17 @@ Gemma 4 uses a 4-model split (same pattern as Phi-4 Multimodal):
 
     - **Vision**:    ``pixel_values`` → ``image_features``
       (SigLIP ViT-like encoder + projector; ~256 soft tokens/image)
-    - **Audio**:     ``audio_features`` → ``audio_features``
+    - **Audio**:     ``input_features`` → ``audio_features``
       (Conformer encoder, 12 layers, hidden 1024; subsampling 4x)
-    - **Embedding**: ``input_ids`` + ``image_features`` + ``audio_features``
-      → ``inputs_embeds``
-      (token embedding + multimodal feature fusion)
-    - **Decoder**:   ``inputs_embeds`` + ``attention_mask`` +
-      ``position_ids`` + KV cache → ``logits`` + present KV
-      (Gemma4 text decoder with dual RoPE, GQA, optional MoE)
+    - **Embedding**: ``input_ids`` → ``inputs_embeds``
+      (scaled token embedding with multimodal PAD masking)
+    - **Decoder**:   ``inputs_embeds`` + ``input_ids`` +
+      ``attention_mask`` + ``position_ids`` + KV cache → ``logits`` + present KV
+      (Gemma4 text decoder with dual RoPE, GQA, per-layer input gating)
+
+Multimodal fusion (replacing image/audio placeholder tokens in
+``inputs_embeds`` with encoder features) is handled by the runtime (or
+this example script), NOT by the embedding model.
 
 During prefill all four sessions run.  During decode only embedding + decoder
 are used (vision and audio encoders run once per generation).
@@ -191,37 +194,31 @@ def prepare_audio_feeds(
 
 def prepare_embedding_feeds(
     input_ids: np.ndarray,
-    image_features: np.ndarray,
-    audio_features: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **embedding** session.
 
-    The embedding model fuses token embeddings with image and audio
-    feature vectors by replacing the corresponding placeholder tokens.
+    The embedding model performs scaled token lookup and (when the model
+    has ``hidden_size_per_layer_input > 0``) computes per-layer gate
+    embeddings.  Multimodal fusion is NOT done here — it happens after
+    this call, in the generation loop.
 
     Args:
         input_ids: ``int64[1, seq_len]`` — token ids with image/audio
             placeholder tokens already inserted at the correct positions.
-        image_features: ``float32[num_image_tokens, hidden_size]``, or
-            ``float32[0, hidden_size]`` when no image is provided.
-        audio_features: ``float32[num_audio_tokens, hidden_size]``, or
-            ``float32[0, hidden_size]`` when no audio is provided.
 
     Returns:
         Feeds dict for the embedding ONNX model.
     """
     return {
         "input_ids": input_ids,
-        "image_features": image_features,
-        "audio_features": audio_features,
     }
 
 
 def prepare_decoder_feeds(
     inputs_embeds: np.ndarray,
+    input_ids: np.ndarray,
     past_seq_len: int,
     past_kv: dict[str, np.ndarray],
-    input_ids: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **decoder** session.
 
@@ -231,11 +228,12 @@ def prepare_decoder_feeds(
 
     Args:
         inputs_embeds: ``float32[1, cur_seq_len, hidden_size]``.
+        input_ids: ``int64[1, cur_seq_len]`` — original token ids
+            (including multimodal placeholder IDs).  The decoder uses
+            these for per-layer embedding computation.
         past_seq_len: Number of tokens already stored in the KV cache.
         past_kv: Mapping of ``"past_key_values.{i}.key/value"`` arrays
             from the previous decoder step.
-        input_ids: ``int64[1, cur_seq_len]`` — original token ids (needed for
-            per-layer token embeddings when ``hidden_size_per_layer_input > 0``).
 
     Returns:
         Complete feeds dict for the decoder ONNX model.
@@ -245,10 +243,10 @@ def prepare_decoder_feeds(
 
     return {
         "inputs_embeds": inputs_embeds,
+        "input_ids": input_ids,
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
         "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
-        "input_ids": input_ids,
         **past_kv,
     }
 
@@ -344,6 +342,50 @@ def _empty_features(hidden_size: int, dtype=np.float32) -> np.ndarray:
     return np.zeros((0, hidden_size), dtype=dtype)
 
 
+def _fuse_multimodal_features(
+    inputs_embeds: np.ndarray,
+    input_ids: np.ndarray,
+    image_features: np.ndarray,
+    audio_features: np.ndarray,
+) -> np.ndarray:
+    """Replace placeholder token embeddings with encoder features.
+
+    After the embedding model produces ``inputs_embeds`` from ``input_ids``,
+    the runtime must splice in vision/audio encoder outputs at the positions
+    corresponding to the placeholder tokens.  This function performs that
+    replacement in-place (matching what ORT GenAI would do).
+
+    Args:
+        inputs_embeds: ``float32[1, seq_len, hidden_size]`` from the
+            embedding model.
+        input_ids: ``int64[1, seq_len]`` — the original token ids, used
+            to locate placeholder positions.
+        image_features: ``float32[N_img, hidden_size]`` from the vision
+            encoder, or ``float32[0, hidden_size]`` when no image.
+        audio_features: ``float32[N_aud, hidden_size]`` from the audio
+            encoder, or ``float32[0, hidden_size]`` when no audio.
+
+    Returns:
+        Updated ``inputs_embeds`` with encoder features spliced in.
+    """
+    embeds = inputs_embeds.copy()
+    flat_ids = input_ids[0]  # [seq_len]
+
+    if image_features.shape[0] > 0:
+        img_positions = np.where(flat_ids == IMAGE_TOKEN_ID)[0]
+        n = min(len(img_positions), image_features.shape[0])
+        if n > 0:
+            embeds[0, img_positions[:n]] = image_features[:n]
+
+    if audio_features.shape[0] > 0:
+        aud_positions = np.where(flat_ids == AUDIO_TOKEN_ID)[0]
+        n = min(len(aud_positions), audio_features.shape[0])
+        if n > 0:
+            embeds[0, aud_positions[:n]] = audio_features[:n]
+
+    return embeds
+
+
 def _init_kv_cache(config, dtype=np.float32) -> dict[str, np.ndarray]:
     """Create an empty KV cache for all independent decoder layers.
 
@@ -417,12 +459,14 @@ def generate(
 
     1. *vision*    → ``image_features`` (if image present)
     2. *audio*     → ``audio_features`` (if audio present)
-    3. *embedding* → ``inputs_embeds`` (fuses text + modality features)
-    4. *decoder*   → ``logits`` + initial KV cache
+    3. *embedding* → ``inputs_embeds``
+    4. fuse image/audio features into ``inputs_embeds`` (runtime step)
+    5. *decoder*   → ``logits`` + initial KV cache (uses ``input_ids`` for
+       per-layer embedding computation)
 
     **Decode** (subsequent steps — generates one token at a time):
 
-    1. *embedding* → ``inputs_embeds`` (text token only; no modality features)
+    1. *embedding* → ``inputs_embeds`` (single text token)
     2. *decoder*   → ``logits`` + updated KV cache
 
     Args:
@@ -430,7 +474,7 @@ def generate(
             Pass ``None`` if no image is provided.
         audio_session:    ONNX session for the Conformer audio encoder.
             Pass ``None`` if no audio is provided.
-        embedding_session: ONNX session for the embedding + fusion model.
+        embedding_session: ONNX session for the embedding model.
         decoder_session:  ONNX session for the Gemma4 text decoder.
         tokenizer: HuggingFace tokenizer for decoding generated ids.
         input_ids: ``int64[1, seq_len]`` — prompt tokens with placeholders.
@@ -446,12 +490,6 @@ def generate(
     """
     num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
-    hidden_size = config.hidden_size
-
-    # Zero-length feature tensors used during decode steps (no modality input)
-    feat_dtype = image_features.dtype
-    zero_image = _empty_features(hidden_size, dtype=feat_dtype)
-    zero_audio = _empty_features(hidden_size, dtype=feat_dtype)
 
     cur_ids = input_ids
     past_seq_len = 0
@@ -463,21 +501,22 @@ def generate(
         is_prefill = step == 0
 
         # ---- Embedding session ----
-        # On the first step, pass real multimodal features so the embedding
-        # model can splice image/audio tokens into the hidden states.
-        # On subsequent decode steps pass zero-length tensors (no modality).
-        embed_out = embedding_session.run(
-            prepare_embedding_feeds(
-                cur_ids,
-                image_features if is_prefill else zero_image,
-                audio_features if is_prefill else zero_audio,
-            )
-        )
+        # Embedding takes only input_ids and produces inputs_embeds.
+        embed_out = embedding_session.run(prepare_embedding_feeds(cur_ids))
         inputs_embeds: np.ndarray = embed_out["inputs_embeds"]
+
+        # ---- Multimodal fusion (runtime responsibility) ----
+        # On prefill, replace placeholder token embeddings in inputs_embeds
+        # with the encoder features.  During decode steps there are no
+        # placeholder tokens, so no fusion is needed.
+        if is_prefill:
+            inputs_embeds = _fuse_multimodal_features(
+                inputs_embeds, cur_ids, image_features, audio_features
+            )
 
         # ---- Decoder session ----
         decoder_out = decoder_session.run(
-            prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv, cur_ids)
+            prepare_decoder_feeds(inputs_embeds, cur_ids, past_seq_len, past_kv)
         )
 
         # Greedy: pick the token with the highest logit at the last position

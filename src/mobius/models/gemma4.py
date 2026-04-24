@@ -1370,17 +1370,13 @@ class Gemma4TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
-        per_layer_inputs: list[ir.Value] | None = None,
     ) -> tuple[ir.Value, list]:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
 
-        # Use pre-computed per-layer inputs when provided (multimodal decoder
-        # path); otherwise compute from input_ids + hidden_states (text-only).
-        if per_layer_inputs is None:
-            per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states)
+        per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states)
 
         # Determine whether to emit GroupQueryAttention directly.
         # GQA fuses RoPE + attention + KV cache into a single op, and
@@ -1661,14 +1657,15 @@ class Gemma4CausalLMModel(CausalLMModel):
 class _Gemma4DecoderModel(nn.Module):
     """Gemma4 text decoder sub-model accepting ``inputs_embeds``.
 
-    When ``hidden_size_per_layer_input > 0`` (e.g. E2B), the decoder also takes
-    pre-computed ``per_layer_inputs`` [B, S, L, D] — one embedding per decoder
-    layer.  The embedding sub-model is responsible for computing these from the
-    original token IDs (via per-layer embedding tables and a projection of the
-    text embeddings).
+    When ``hidden_size_per_layer_input > 0`` (e.g. E2B), the text model also
+    needs the original ``input_ids`` to compute per-layer token embeddings that
+    condition each decoder layer.  The per-layer projection uses the (already
+    fused) ``inputs_embeds`` so that multimodal positions carry content-aware
+    information through the per-layer gate — this is critical for numerical
+    accuracy with the ONNX runtime.
 
-    When ``hidden_size_per_layer_input == 0``, ``per_layer_inputs`` is ``None``
-    and the per-layer gating in each decoder layer is skipped.
+    When ``hidden_size_per_layer_input == 0``, ``input_ids`` is passed through
+    but has no effect (``_compute_per_layer_inputs`` short-circuits to ``None``).
     """
 
     def __init__(self, config: Gemma4Config):
@@ -1683,33 +1680,16 @@ class _Gemma4DecoderModel(nn.Module):
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
-        per_layer_inputs: ir.Value | None = None,
+        input_ids: ir.Value | None = None,
         past_key_values: list | None = None,
     ) -> tuple[ir.Value, list]:
-        # Slice per_layer_inputs [B, S, L, D] into per-layer list of [B, S, D]
-        per_layer_list: list[ir.Value] | None = None
-        if per_layer_inputs is not None:
-            per_layer_list = []
-            for i in range(self.config.num_hidden_layers):
-                slice_i = op.Squeeze(
-                    op.Slice(
-                        per_layer_inputs,
-                        starts=[i],
-                        ends=[i + 1],
-                        axes=[2],
-                    ),
-                    [2],
-                )  # [B, S, D]
-                per_layer_list.append(slice_i)
-
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=None,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            per_layer_inputs=per_layer_list,
         )
         logits = self.lm_head(op, hidden_states)
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
@@ -1800,23 +1780,23 @@ class _Gemma4VisionEncoderModel(nn.Module):
 
 
 class Gemma4EmbeddingModel(nn.Module):
-    """Gemma4 embedding sub-model: scaled token lookup + per-layer input computation.
+    """Gemma4 embedding sub-model: scaled token lookup with multimodal masking.
 
-    Outputs ``inputs_embeds`` from the main vocabulary embedding and, when
-    ``hidden_size_per_layer_input > 0``, also outputs ``per_layer_inputs``
-    [B, S, num_layers, per_layer_dim] — pre-computed per-layer embeddings
-    consumed by the decoder.
+    Outputs ``inputs_embeds`` from the main vocabulary embedding.  Multimodal
+    token IDs (image/audio) are masked to ``pad_token_id`` (0) before the
+    embedding lookup so that multimodal positions contain neutral PAD embeddings.
+    The runtime is responsible for fusing vision/audio encoder features into
+    ``inputs_embeds`` at those positions.
 
-    Multimodal fusion (image/audio feature replacement into ``inputs_embeds``)
-    is handled by the runtime, NOT by this model.
+    Per-layer input embeddings (PLE) are computed by the *decoder*, not by
+    this model: the PLE projection must operate on the *fused* hidden states
+    (after image/audio features are scattered in) for numerical accuracy.
 
     Inputs:
     - ``input_ids [B, S]`` INT64
 
-    Outputs:
+    Output:
     - ``inputs_embeds [B, S, hidden_size]``
-    - ``per_layer_inputs [B, S, num_layers, per_layer_dim]``
-      (only when ``hidden_size_per_layer_input > 0``)
     """
 
     def __init__(self, config: Gemma4Config):
@@ -1829,68 +1809,24 @@ class Gemma4EmbeddingModel(nn.Module):
             config.pad_token_id,
             embed_scale=embed_scale,
         )
-
-        # Per-layer embedding weights (when hidden_size_per_layer_input > 0)
-        self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        self._hidden_size = config.hidden_size
-        # Multimodal token IDs to mask before per-layer embedding lookup.
-        # HF masks these to pad_token_id (0) so image/audio slots don't contribute
-        # arbitrary large-ID embeddings to the per-layer gate.
+        # Multimodal token IDs to mask before embedding lookup.
+        # HF masks these to pad_token_id (0) so multimodal positions get
+        # neutral PAD embeddings (later replaced by runtime fusion).
         self._image_token_id: int = config.image_token_id or 0
         self._audio_token_id: int | None = (
             config.audio.audio_token_id if config.audio is not None else None
         )
-        if self._per_layer_dim:
-            self._num_layers = config.num_hidden_layers
-            vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Per-layer embedding tables: each [V, D], same layout as
-            # Gemma4TextModel.embed_tokens_per_layer for HF weight compat.
-            self.embed_tokens_per_layer = nn.ModuleList(
-                [
-                    Gemma3TextScaledWordEmbedding(
-                        vocab_per_layer,
-                        self._per_layer_dim,
-                        config.pad_token_id,
-                        embed_scale=float(self._per_layer_dim**0.5),
-                    )
-                    for _ in range(config.num_hidden_layers)
-                ]
-            )
-            self.per_layer_model_projection = Linear(
-                config.hidden_size,
-                config.num_hidden_layers * self._per_layer_dim,
-                bias=False,
-            )
-            self.per_layer_projection_norm = RMSNorm(
-                self._per_layer_dim, eps=config.rms_norm_eps
-            )
 
-    def _compute_per_layer_inputs(
+    def forward(
         self,
         op: builder.OpBuilder,
         input_ids: ir.Value,
-        inputs_embeds: ir.Value,
     ) -> ir.Value:
-        """Compute per-layer input embeddings as a [B, S, L, D] tensor.
-
-        Each layer's embedding is the sum of:
-        1. A projection of ``inputs_embeds`` through ``per_layer_model_projection``
-        2. A token embedding from ``embed_tokens_per_layer[i]``
-
-        Image/audio token IDs are masked to ``pad_token_id`` (0) before the
-        per-layer embedding lookup, matching HF's behavior.
-        """
-        # Project hidden states: [B, S, H] -> [B, S, L*D], scale by H^{-0.5}
-        proj = self.per_layer_model_projection(op, inputs_embeds)
-        proj = op.Mul(proj, float(self._hidden_size**-0.5))
-        # Reshape to [B, S, L, D] and normalize
-        proj = op.Reshape(
-            proj,
-            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-        )
-        proj = self.per_layer_projection_norm(op, proj)
-
-        # Mask multimodal token IDs to pad_token_id (0)
+        # Mask multimodal token IDs to pad_token_id (0) before embedding.
+        # HF's Gemma4Model replaces image/audio tokens with pad_token_id
+        # before calling embed_tokens, so inputs_embeds at multimodal
+        # positions contain PAD embeddings (later replaced by runtime
+        # fusion).
         masked_ids = input_ids
         pad = op.Constant(value_int=0)
         if self._image_token_id:
@@ -1912,32 +1848,8 @@ class Gemma4EmbeddingModel(nn.Module):
                 masked_ids,
             )
 
-        # Per-layer token embeddings + projection, scaled by 1/sqrt(2)
-        per_layer_results: list[ir.Value] = []
-        for i in range(self._num_layers):
-            # Slice proj along axis 2: [B, S, L, D] → [B, S, D]
-            proj_i = op.Squeeze(op.Slice(proj, starts=[i], ends=[i + 1], axes=[2]), [2])
-            token_emb_i = self.embed_tokens_per_layer[i](op, masked_ids)
-            proj_i = op.Add(proj_i, token_emb_i)
-            per_layer_results.append(op.Mul(proj_i, float(0.5**0.5)))  # [B, S, D]
-
-        # Stack into [B, S, L, D]
-        unsqueezed = [op.Unsqueeze(r, [2]) for r in per_layer_results]
-        return op.Concat(*unsqueezed, axis=2)
-
-    def forward(
-        self,
-        op: builder.OpBuilder,
-        input_ids: ir.Value,
-    ) -> tuple[ir.Value, ir.Value | None]:
         # [B, S] → [B, S, hidden_size]
-        hidden = self.embed_tokens(op, input_ids)
-
-        per_layer_inputs: ir.Value | None = None
-        if self._per_layer_dim:
-            per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden)
-
-        return hidden, per_layer_inputs
+        return self.embed_tokens(op, masked_ids)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -2065,10 +1977,6 @@ class Gemma4Model(nn.Module):
         Mapping (after stripping the leading ``model.``):
 
         - ``language_model.lm_head.*`` → ``decoder.lm_head.*``
-        - ``language_model.embed_tokens_per_layer.weight`` → split into
-          ``embedding.embed_tokens_per_layer.{i}.weight``
-        - ``language_model.per_layer_model_projection.*`` → ``embedding.per_layer_model_projection.*``
-        - ``language_model.per_layer_projection_norm.*`` → ``embedding.per_layer_projection_norm.*``
         - ``language_model.*`` → ``decoder.model.*``
         - ``language_model.embed_tokens.weight`` also → ``embedding.embed_tokens.weight``
         - ``vision_tower.*`` → ``vision_encoder.encoder.*``
@@ -2086,8 +1994,7 @@ class Gemma4Model(nn.Module):
 
         Note: the decoder sub-model takes ``inputs_embeds`` rather than
         ``input_ids``, so ``embed_tokens`` is not a decoder initializer — the
-        token embedding lives only in the ``embedding`` sub-model.  Per-layer
-        embedding weights likewise live in the embedding sub-model.
+        token embedding lives only in the ``embedding`` sub-model.
         """
         # Strip top-level "model." prefix used by HF multimodal checkpoints.
         state_dict = {
@@ -2103,34 +2010,25 @@ class Gemma4Model(nn.Module):
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}
-        # Per-layer weight keys that belong to the embedding sub-model
-        # (not the decoder), because the embedding model now owns the
-        # per-layer embedding computation.
-        per_layer_prefixes = (
-            "per_layer_model_projection.",
-            "per_layer_projection_norm.",
-        )
         for key, value in state_dict.items():
             if key.startswith("language_model."):
                 suffix = key[len("language_model.") :]
                 if suffix.startswith("lm_head"):
                     # lm_head lives directly under decoder (not decoder.model)
                     renamed["decoder." + suffix] = value
-                elif suffix == "embed_tokens_per_layer.weight":
-                    # HF stores one [V, L*D] weight; split into L separate
-                    # [V, D] tables in the embedding sub-model.
-                    num_layers = self.config.num_hidden_layers
-                    per_layer_dim = self.embedding._per_layer_dim
-                    for i in range(num_layers):
-                        shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
-                        renamed[f"embedding.embed_tokens_per_layer.{i}.weight"] = shard
-                elif any(suffix.startswith(p) for p in per_layer_prefixes):
-                    # Per-layer projection/norm weights → embedding sub-model
-                    renamed["embedding." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
                     onnx_key = "decoder.model." + suffix
-                    renamed[onnx_key] = value
+                    if suffix == "embed_tokens_per_layer.weight":
+                        # HF stores one [V, L*D] weight; split into L separate
+                        # [V, D] tables matching our nn.ModuleList layout.
+                        num_layers = self.config.num_hidden_layers
+                        per_layer_dim = self.decoder.model._per_layer_dim
+                        for i in range(num_layers):
+                            shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
+                            renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = shard
+                    else:
+                        renamed[onnx_key] = value
                     if suffix == "embed_tokens.weight":
                         # Token embedding is shared with the embedding sub-model
                         renamed["embedding.embed_tokens.weight"] = value
