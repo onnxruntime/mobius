@@ -1186,9 +1186,11 @@ class TestBuildGraphVisionLanguage:
         assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
         )
-        # Decoder: inputs_embeds -> logits + per-layer KV cache
+        # Decoder: inputs_embeds -> logits + per-layer KV cache (no input_ids)
         decoder = pkg["decoder"]
-        assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
+        decoder_input_names = {i.name for i in decoder.graph.inputs}
+        assert "inputs_embeds" in decoder_input_names
+        assert "input_ids" not in decoder_input_names
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision: pixel_values + pixel_position_ids -> image_features
         vision = pkg["vision"]
@@ -1196,13 +1198,76 @@ class TestBuildGraphVisionLanguage:
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
-        # Embedding: input_ids + image_features (no audio) -> inputs_embeds
+        # Embedding: input_ids -> inputs_embeds (no multimodal fusion)
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
-        assert "image_features" in emb_input_names
+        assert "image_features" not in emb_input_names
         assert "audio_features" not in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+
+    def test_gemma4_per_layer_inputs_graph(self):
+        """Build Gemma4 VLM with per-layer input embeddings (hidden_size_per_layer_input > 0).
+
+        Verifies:
+        - Embedding outputs both ``inputs_embeds`` and ``per_layer_inputs``
+        - Decoder takes ``per_layer_inputs`` instead of ``input_ids``
+        """
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            # Enable per-layer input embeddings
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=128,
+            image_token_id=255,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        # Decoder: per_layer_inputs replaces input_ids
+        decoder = pkg["decoder"]
+        decoder_input_names = {i.name for i in decoder.graph.inputs}
+        assert "inputs_embeds" in decoder_input_names
+        assert "per_layer_inputs" in decoder_input_names
+        assert "input_ids" not in decoder_input_names
+        assert "logits" in {o.name for o in decoder.graph.outputs}
+        # Embedding: outputs both inputs_embeds and per_layer_inputs
+        embedding = pkg["embedding"]
+        emb_input_names = {i.name for i in embedding.graph.inputs}
+        emb_output_names = {o.name for o in embedding.graph.outputs}
+        assert emb_input_names == {"input_ids"}
+        assert "inputs_embeds" in emb_output_names
+        assert "per_layer_inputs" in emb_output_names
 
     def test_gemma4_moe_graph(self):
         """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""
@@ -1308,6 +1373,7 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
         assert "inputs_embeds" in decoder_input_names
+        assert "input_ids" not in decoder_input_names
         assert "past_key_values.0.key" in decoder_input_names
         assert "past_key_values.1.key" not in decoder_input_names  # shared layer
         assert "logits" in {o.name for o in decoder.graph.outputs}
@@ -1321,12 +1387,12 @@ class TestBuildGraphVisionLanguage:
         audio = pkg["audio"]
         assert "input_features" in {i.name for i in audio.graph.inputs}
         assert "audio_features" in {o.name for o in audio.graph.outputs}
-        # Embedding: all three inputs
+        # Embedding: only input_ids (no multimodal fusion)
         embedding = pkg["embedding"]
         emb_input_names = {i.name for i in embedding.graph.inputs}
         assert "input_ids" in emb_input_names
-        assert "image_features" in emb_input_names
-        assert "audio_features" in emb_input_names
+        assert "image_features" not in emb_input_names
+        assert "audio_features" not in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
         # KV cache outputs: num_kv_layers = num_hidden_layers - num_kv_shared_layers = 1
         decoder_output_names = {o.name for o in decoder.graph.outputs}

@@ -5,11 +5,14 @@
 
 The unified :class:`Gemma4Task` builds a 3- or 4-model package:
 
-1. **decoder** (text decoder): ``inputs_embeds`` → logits + KV cache
+1. **decoder** (text decoder): ``inputs_embeds [+ per_layer_inputs]`` → logits + KV cache
 2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` → ``image_features``
-3. **embedding**: ``input_ids, image_features[, audio_features]`` → ``inputs_embeds``
+3. **embedding**: ``input_ids`` → ``inputs_embeds [+ per_layer_inputs]``
 4. **audio** (audio encoder, only when ``config.audio is not None``):
    ``input_features`` → ``audio_features``
+
+Multimodal fusion (image/audio feature replacement into ``inputs_embeds``) is
+handled by the runtime, NOT by the embedding model.
 
 The decoder uses per-layer KV cache where local (sliding_attention) layers
 use ``config.head_dim`` and global (full_attention) layers use
@@ -158,13 +161,15 @@ class Gemma4Task(ModelTask):
     """Unified task for Gemma4 multimodal models (3- or 4-model split).
 
     Always builds:
-    - ``decoder``: text decoder accepting ``inputs_embeds``
+    - ``decoder``: text decoder accepting ``inputs_embeds`` [+ ``per_layer_inputs``]
     - ``vision``: vision encoder accepting ``pixel_values, pixel_position_ids``
-    - ``embedding``: embedding model fusing ``input_ids`` and multimodal features
+    - ``embedding``: produces ``inputs_embeds`` [+ ``per_layer_inputs``] from ``input_ids``
 
     When ``config.audio is not None``, also builds:
     - ``audio``: Conformer audio encoder accepting ``input_features``
-      (and adds ``audio_features`` as a third input to ``embedding``)
+
+    Multimodal fusion (image/audio feature replacement) is handled by the
+    runtime, not by the embedding model.
 
     Decoder KV cache is per-layer with the correct head_dim for each layer type
     (local vs global), unlike the uniform head_dim in :class:`VisionLanguageTask`.
@@ -191,13 +196,11 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds + input_ids -> logits + per-layer KV cache.
+        """Build text decoder: inputs_embeds [+ per_layer_inputs] -> logits + per-layer KV cache.
 
-        ``input_ids`` is included alongside ``inputs_embeds`` because models with
-        ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B) need the original token
-        IDs to compute per-layer token embeddings that condition each decoder layer.
-        When ``hidden_size_per_layer_input == 0`` the tensor is passed through but has
-        no effect (``_compute_per_layer_inputs`` short-circuits to ``None``).
+        When ``hidden_size_per_layer_input > 0``, the decoder takes a
+        pre-computed ``per_layer_inputs`` [B, S, L, D] tensor produced by
+        the embedding model.  The decoder does NOT take ``input_ids``.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -218,13 +221,25 @@ class Gemma4Task(ModelTask):
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
 
-        graph_inputs = [inputs_embeds, attention_mask, position_ids, input_ids]
+        graph_inputs = [inputs_embeds, attention_mask, position_ids]
+
+        per_layer_val: ir.Value | None = None
+        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        if per_layer_dim:
+            per_layer_val = ir.Value(
+                name="per_layer_inputs",
+                shape=ir.Shape(
+                    [
+                        batch,
+                        seq_len,
+                        config.num_hidden_layers,
+                        per_layer_dim,
+                    ]
+                ),
+                type=ir.TensorType(config.dtype),
+            )
+            graph_inputs.append(per_layer_val)
 
         kv_inputs, past_key_values = _make_gemma4_kv_cache_inputs(config, batch, past_seq_len)
         graph_inputs.extend(kv_inputs)
@@ -237,7 +252,7 @@ class Gemma4Task(ModelTask):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            input_ids=input_ids,
+            per_layer_inputs=per_layer_val,
             past_key_values=past_key_values,
         )
 
@@ -329,43 +344,34 @@ class Gemma4Task(ModelTask):
         embedding: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build embedding: input_ids + image_features [+ audio_features] -> inputs_embeds."""
+        """Build embedding: input_ids -> inputs_embeds [+ per_layer_inputs].
+
+        Multimodal fusion is handled by the runtime, not this model.
+        When ``hidden_size_per_layer_input > 0``, also outputs
+        ``per_layer_inputs`` [B, S, num_layers, per_layer_dim].
+        """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
-        num_image_tokens = ir.SymbolicDim("num_image_tokens")
 
         input_ids = ir.Value(
             name="input_ids",
             shape=ir.Shape([batch, seq_len]),
             type=ir.TensorType(ir.DataType.INT64),
         )
-        image_features = ir.Value(
-            name="image_features",
-            shape=ir.Shape([num_image_tokens, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
-        )
 
-        graph_inputs = [input_ids, image_features]
-        audio_features_val: ir.Value | None = None
-
-        if config.audio is not None:
-            num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
-            audio_features_val = ir.Value(
-                name="audio_features",
-                shape=ir.Shape([num_audio_tokens, config.hidden_size]),
-                type=ir.TensorType(config.dtype),
-            )
-            graph_inputs.append(audio_features_val)
+        graph_inputs = [input_ids]
 
         graph, graph_builder = _make_graph(graph_inputs, name="embedding")
         op = graph_builder.op
 
-        inputs_embeds = embedding(
+        inputs_embeds, per_layer_inputs = embedding(
             op,
             input_ids=input_ids,
-            image_features=image_features,
-            audio_features=audio_features_val,
         )
         inputs_embeds.name = "inputs_embeds"
         graph.outputs.append(inputs_embeds)
+        if per_layer_inputs is not None:
+            per_layer_inputs.name = "per_layer_inputs"
+            graph.outputs.append(per_layer_inputs)
+
         return _make_model(graph)
