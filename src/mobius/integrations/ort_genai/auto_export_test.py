@@ -780,6 +780,66 @@ class TestGemma4RealModel:
         assert data["model"]["vision"]["spatial_merge_size"] == 2
         assert data["model"]["vision"]["config_filename"] == "processor_config.json"
 
+    def test_gemma4_per_layer_inputs_in_genai_config(self, tmp_path):
+        """When hidden_size_per_layer_input > 0, decoder gets per_layer_inputs."""
+        from mobius._builder import build_from_module
+        from mobius._config_resolver import _default_task_for_model
+        from mobius._configs import Gemma4Config, VisionConfig
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        config = Gemma4Config(
+            model_type="gemma4",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = build_from_module(module, config, task=task)
+        pkg.config = config
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        # Decoder must include per_layer_inputs (no input_ids)
+        decoder_inputs = data["model"]["decoder"]["inputs"]
+        assert "per_layer_inputs" in decoder_inputs
+        assert "input_ids" not in decoder_inputs
+
+        # Embedding must output per_layer_inputs
+        emb_inputs = data["model"]["embedding"]["inputs"]
+        assert "input_ids" in emb_inputs
+
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
         import onnx_ir as ir
