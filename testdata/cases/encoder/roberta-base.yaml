@@ -1,4 +1,5 @@
 model_id: "FacebookAI/roberta-base"
+model_type: "roberta"
 revision: "e2da8e2f811d1448a5b465c236feacd80ffbac7b"
 task_type: "feature-extraction"
 dtype: "float32"

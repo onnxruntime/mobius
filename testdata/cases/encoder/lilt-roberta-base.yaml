@@ -1,4 +1,5 @@
 model_id: "SCUT-DLVCLab/lilt-roberta-en-base"
+model_type: "lilt"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

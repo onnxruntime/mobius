@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+model_type: "qwen3_vl_moe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

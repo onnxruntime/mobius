@@ -1,4 +1,5 @@
 model_id: "hustvl/yolos-tiny"
+model_type: "yolos"
 revision: "main"
 task_type: "object-detection"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "Zetatech/pvt-tiny-224"
+model_type: "pvt"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

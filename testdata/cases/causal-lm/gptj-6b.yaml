@@ -1,4 +1,5 @@
 model_id: "EleutherAI/gpt-j-6b"
+model_type: "gptj"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

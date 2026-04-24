@@ -1,4 +1,5 @@
 model_id: "tencent/Youtu-LLM-2B-Base"
+model_type: "youtu"
 revision: "7b32c99715f9"
 task_type: "text-generation"
 dtype: "float32"

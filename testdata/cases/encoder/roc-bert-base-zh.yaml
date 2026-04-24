@@ -1,4 +1,5 @@
 model_id: "weiweishi/roc-bert-base-zh"
+model_type: "roc_bert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "AI-Sweden-Models/gpt-sw3-356m"
+model_type: "gpt-sw3"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

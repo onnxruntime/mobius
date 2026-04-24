@@ -1,4 +1,5 @@
 model_id: "openai-community/openai-gpt"
+model_type: "openai-gpt"
 revision: "1e0d4f3028acbffb47fe933cea64619c5ec1a002"
 task_type: "text-generation"
 dtype: "float32"

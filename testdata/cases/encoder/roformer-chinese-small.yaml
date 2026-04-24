@@ -1,4 +1,5 @@
 model_id: "junnyu/roformer_chinese_small"
+model_type: "roformer"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

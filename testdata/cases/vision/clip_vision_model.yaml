@@ -1,4 +1,5 @@
 model_id: "openai/clip-vit-base-patch32"
+model_type: "clip_vision_model"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

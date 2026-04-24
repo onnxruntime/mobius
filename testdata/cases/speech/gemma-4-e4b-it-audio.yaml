@@ -1,4 +1,5 @@
 model_id: "google/gemma-4-E4B-it"
+model_type: "gemma4"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"
