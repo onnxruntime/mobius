@@ -332,6 +332,9 @@ class Gemma4Task(ModelTask):
         )
         audio_features.name = "audio_features"
         graph.outputs.append(audio_features)
+        # TODO: For batched variable-length audio, expose the downsampled
+        # mask as a second output (e.g. "audio_features_mask") so callers
+        # can strip padding rows. Not needed for single-clip inference.
         return _make_model(graph)
 
     def _build_embedding(

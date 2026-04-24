@@ -167,7 +167,7 @@ def prepare_audio_feeds(
         np_dtype: Numpy dtype for audio features (default float32).
 
     Returns:
-        ``{"input_features": [1, T, n_mels]}``
+        ``{"input_features": [1, T, n_mels], "input_features_mask": [1, T]}``
     """
     import soundfile as sf
 
@@ -186,7 +186,12 @@ def prepare_audio_feeds(
     )
     # out["input_features"]: [1, T, n_mels]  (already in correct layout)
     audio_features = out["input_features"].astype(np_dtype)
-    return {"input_features": audio_features}  # [1, T, n_mels]
+    # All-True mask for single-clip inference (no padding to mask out).
+    input_features_mask = np.ones(audio_features.shape[:2], dtype=np.bool_)  # [1, T]
+    return {
+        "input_features": audio_features,
+        "input_features_mask": input_features_mask,
+    }
 
 
 def prepare_embedding_feeds(

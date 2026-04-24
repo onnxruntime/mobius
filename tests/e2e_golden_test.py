@@ -1244,6 +1244,16 @@ def _run_speech_language_prefill(
                 audio_feeds[name] = audio_processed[name].astype(np.float32)
             elif name == "input_features" and "input_features" in audio_processed:
                 audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
+        # Provide all-True mask for single-clip inference when the model
+        # expects input_features_mask but the feature extractor didn't
+        # produce one.
+        if (
+            "input_features_mask" in audio_session.input_names
+            and "input_features_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=np.bool_)
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1684,6 +1694,16 @@ def _run_speech_language_generation(
                 audio_feeds[name] = audio_processed[name].astype(np.float32)
             elif name == "input_features" and "input_features" in audio_processed:
                 audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
+        # Provide all-True mask for single-clip inference when the model
+        # expects input_features_mask but the feature extractor didn't
+        # produce one.
+        if (
+            "input_features_mask" in audio_session.input_names
+            and "input_features_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=np.bool_)
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
