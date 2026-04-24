@@ -47,7 +47,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius.components._common import LayerNormNoBias, Linear
+from mobius.components._common import INT64_MAX, LayerNormNoBias, Linear
 from mobius.components._conv import CausalDepthwiseConv1d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 
@@ -216,7 +216,7 @@ class Gemma4ConvSubsampling(nn.Module):
         mask = op.Slice(
             mask,
             op.Constant(value_ints=[0]),  # starts
-            op.Constant(value_ints=[9223372036854775807]),  # ends (INT64_MAX)
+            op.Constant(value_ints=[INT64_MAX]),  # ends
             op.Constant(value_ints=[1]),  # axes
             op.Constant(value_ints=[2]),  # steps
         )  # [B, T//2]
@@ -243,11 +243,11 @@ class Gemma4ConvSubsampling(nn.Module):
         # x: [B, T, input_size]
         x = op.Unsqueeze(x, [1])  # [B, 1, T, input_size]
 
-        # Stage 0: mask → conv → norm → relu → downsample mask
+        # Stage 0: mask + downsample → conv → norm → relu
         x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv0, self.norm0)  # [B, c0, T//2, F//2]
 
-        # Stage 1: mask → conv → norm → relu → downsample mask
+        # Stage 1: mask + downsample → conv → norm → relu
         x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv1, self.norm1)  # [B, c1, T//4, F//4]
 

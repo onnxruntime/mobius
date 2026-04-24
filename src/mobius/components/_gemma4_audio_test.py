@@ -62,6 +62,19 @@ class TestGemma4ConvSubsampling:
         assert "norm1.weight" in names
         assert "input_proj_linear.weight" in names
 
+    def test_mask_input(self):
+        """Passing input_features_mask returns a mask and adds Mul/Slice nodes."""
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 20, 32])
+        mask = create_test_input(b, "mask", [1, 20])
+        result, out_mask = comp(op, x, input_features_mask=mask)
+        b._adapt_outputs([result])
+        assert out_mask is not None
+        op_types = {node.op_type for node in graph}
+        assert "Mul" in op_types, "Mask application should produce Mul nodes"
+        assert "Slice" in op_types, "Mask downsampling should produce Slice nodes"
+
     def test_no_bias_convolutions(self):
         """Subsampling conv layers have no bias (matches HF Conv2dNoBias)."""
         comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
