@@ -780,7 +780,7 @@ class TestGemma4RealModel:
         # Config-level properties are still present
         assert data["model"]["image_token_id"] == 255999
         assert data["model"]["vision"]["spatial_merge_size"] == 2
-        assert data["model"]["vision"]["config_filename"] == "processor_config.json"
+        assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
