@@ -18,7 +18,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _graph_input_names,
     _resolve_ort_genai_model_type,
     _write_genai_config,
-    _write_processor_config,
+    _write_vision_processor_config,
     write_ort_genai_config,
 )
 
@@ -42,7 +42,7 @@ class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
         del config.vision  # ensure no vision attribute
-        assert _write_processor_config(config, str(tmp_path)) is None
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
 
     def test_writes_vision_config(self, tmp_path):
         vision = mock.MagicMock()
@@ -51,7 +51,7 @@ class TestWriteProcessorConfig:
         config = mock.MagicMock()
         config.vision = vision
 
-        path = _write_processor_config(config, str(tmp_path))
+        path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
