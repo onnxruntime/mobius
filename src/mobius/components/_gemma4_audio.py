@@ -233,7 +233,9 @@ class Gemma4ConvSubsampling(nn.Module):
         Args:
             x: mel-spectrogram ``[B, T, input_size]``.
             input_features_mask: optional bool ``[B, T]``
-                (True = valid frame).
+                (True = valid frame). Must be **contiguous**:
+                all True entries precede all False entries
+                (right-padded batch layout).
 
         Returns:
             ``(projected_features, downsampled_mask)`` where features

@@ -302,7 +302,14 @@ class Gemma4Task(ModelTask):
 
         Inputs:
         - ``input_features [batch, time, input_size]``: mel-spectrogram
-        - ``input_features_mask [batch, time]``: BOOL mask (True = valid frame)
+        - ``input_features_mask [batch, time]``: BOOL mask indicating valid
+          mel frames. Must be **contiguous**: all ``True`` entries precede
+          all ``False`` entries (right-padded). The HuggingFace
+          ``Gemma4AudioFeatureExtractor`` produces this layout by padding
+          audio to equal batch lengths and marking padded frames as
+          ``False``. The mask is downsampled through conv subsampling
+          layers (stride 2 per stage) and used to zero out padded
+          positions in Conformer attention.
 
         Output:
         - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
