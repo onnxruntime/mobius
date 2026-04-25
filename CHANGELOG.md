@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Qwen35VL3ModelCausalLMModel`). Qwen3.6 uses the same architecture as
   Qwen3.5 with `tie_word_embeddings=false` and larger dimensions (64
   layers, 5120 hidden size). No code changes required — fully config-driven.
-- Added `test_qwen36_vl_graph` and `test_qwen36_vl_preprocess_weights_untied`
-  tests to verify untied weight handling for Qwen3.6.
+- Added `test_qwen35_vl_preprocess_weights_untied` to verify untied weight
+  handling (`tie_word_embeddings=False`) for the qwen3_5 architecture.
 
 ### Mistral-3 / Pixtral VLM Support
 
