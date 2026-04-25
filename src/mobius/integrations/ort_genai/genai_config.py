@@ -401,7 +401,7 @@ class GenaiConfigGenerator:
                 self._embedding["inputs"]["audio_features"] = "audio_features"
             model["embedding"] = self._embedding
         if self._audio is not None:
-            model["audio"] = self._audio
+            model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
         return {

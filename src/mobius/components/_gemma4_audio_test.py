@@ -49,7 +49,7 @@ class TestGemma4ConvSubsampling:
         comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 20, 32])
-        result = comp(op, x)
+        result, _mask = comp(op, x)
         b._adapt_outputs([result])
         assert graph.num_nodes() > 0
 
@@ -61,6 +61,19 @@ class TestGemma4ConvSubsampling:
         assert "norm0.weight" in names
         assert "norm1.weight" in names
         assert "input_proj_linear.weight" in names
+
+    def test_mask_input(self):
+        """Passing input_features_mask returns a mask and adds Mul/Slice nodes."""
+        comp = Gemma4ConvSubsampling(input_size=32, conv_channels=[16, 8], hidden_size=HIDDEN)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 20, 32])
+        mask = create_test_input(b, "mask", [1, 20])
+        result, out_mask = comp(op, x, input_features_mask=mask)
+        b._adapt_outputs([result])
+        assert out_mask is not None
+        op_types = {node.op_type for node in graph}
+        assert "Mul" in op_types, "Mask application should produce Mul nodes"
+        assert "Slice" in op_types, "Mask downsampling should produce Slice nodes"
 
     def test_no_bias_convolutions(self):
         """Subsampling conv layers have no bias (matches HF Conv2dNoBias)."""
@@ -310,9 +323,10 @@ class TestGemma4AudioEncoder:
         enc = self._make_encoder()
         b, op, graph = create_test_builder()
         x = create_test_input(b, "input_features", [1, 20, 32])
-        result = enc(op, x)
+        result, mask = enc(op, x)
         b._adapt_outputs([result])
         assert graph.num_nodes() > 0
+        assert mask is None  # No mask provided → no mask returned
 
     def test_layer_count(self):
         enc = self._make_encoder(num_layers=3)

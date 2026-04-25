@@ -549,18 +549,18 @@ class TestGenaiConfigGeneratorMultimodal:
         )
 
     def test_multimodal_has_all_four_sections(self):
-        """Phi4MM config has decoder, vision, audio, and embedding."""
+        """Phi4MM config has decoder, vision, speech, and embedding."""
         config = self._make_phi4mm_gen().generate()
         model = config["model"]
         assert "decoder" in model
         assert "vision" in model
-        assert "audio" in model
+        assert "speech" in model
         assert "embedding" in model
 
     def test_audio_section_has_correct_inputs(self):
         """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
-        audio = config["model"]["audio"]
+        audio = config["model"]["speech"]
         assert audio["filename"] == "audio_encoder/model.onnx"
         assert audio["config_filename"] == "audio_processor.json"
         assert audio["inputs"]["audio_embeds"] == "audio_embeds"
@@ -749,7 +749,7 @@ class TestGenaiConfigGeneratorEp:
         )
         config = gen.generate()
 
-        for block in ("decoder", "vision", "embedding", "audio"):
+        for block in ("decoder", "vision", "embedding", "speech"):
             if block not in config["model"]:
                 continue
             session_opts = config["model"][block]["session_options"]

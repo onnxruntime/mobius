@@ -1322,7 +1322,9 @@ class TestBuildGraphVisionLanguage:
         assert "image_features" in {o.name for o in vision.graph.outputs}
         # Audio encoder
         audio = pkg["audio_encoder"]
-        assert "input_features" in {i.name for i in audio.graph.inputs}
+        audio_input_names = {i.name for i in audio.graph.inputs}
+        assert "input_features" in audio_input_names
+        assert "input_features_mask" in audio_input_names
         assert "audio_features" in {o.name for o in audio.graph.outputs}
         # Embedding: all three inputs
         embedding = pkg["embedding"]

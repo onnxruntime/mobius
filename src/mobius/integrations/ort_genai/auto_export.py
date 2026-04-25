@@ -163,13 +163,22 @@ def _copy_tokenizer_files_from_local(
     return copied
 
 
-def _write_processor_config(
+def _write_vision_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write a minimal image_processor.json for VLM models.
+    """Write the vision processor config file for VLM models.
 
-    Returns the path if written, None otherwise.
+    The output format depends on the model type:
+
+    - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
+      in the onnxruntime-extensions transforms pipeline format required by
+      ``OrtxCreateProcessor``.  The pipeline is
+      ``DecodeImage → Gemma4ImageTransform``.
+    - **Other models**: Writes ``processor_config.json`` with a minimal
+      HuggingFace-style schema (``image_size``, ``patch_size``).
+
+    Returns the written file path, or None if the config has no vision section.
     """
     vision = getattr(config, "vision", None)
     if vision is None:
@@ -178,30 +187,54 @@ def _write_processor_config(
     model_type = getattr(config, "model_type", "")
 
     if model_type in _GEMMA4_MODEL_TYPES:
-        # Gemma4 needs a processor wrapper with model-specific fields
-        tokens_per_image = (
+        # Gemma4 needs an onnxruntime-extensions format processor config
+        # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
+        # The OrtxCreateProcessor API requires this format.
+        #
+        # max_soft_tokens: maps from HF's mm_tokens_per_image (the number of
+        # vision tokens per image after pooling) into the Gemma4ImageTransform's
+        # max_soft_tokens attribute, which controls the padded patch budget.
+        max_soft_tokens = (
             getattr(vision, "mm_tokens_per_image", None)
             or getattr(config, "mm_tokens_per_image", None)
-            or getattr(vision, "max_soft_tokens", None)
             or 280
         )
-        image_size = getattr(vision, "image_size", None) or 448
         patch_size = getattr(vision, "patch_size", None) or 16
-        processor: dict[str, Any] = {
+        pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
+        processor = {
             "processor": {
-                "name": "gemma4_image_processor",
-                "image_size": image_size,
-                "patch_size": patch_size,
-                "tokens_per_image": tokens_per_image,
+                "name": "gemma_4_image_processing",
+                "transforms": [
+                    {
+                        "operation": {
+                            "name": "decode_image",
+                            "type": "DecodeImage",
+                            "attrs": {"color_space": "RGB"},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_image_transform",
+                            "type": "Gemma4ImageTransform",
+                            "attrs": {
+                                "patch_size": patch_size,
+                                "max_soft_tokens": max_soft_tokens,
+                                "pooling_kernel_size": pooling_kernel_size,
+                            },
+                        }
+                    },
+                ],
             }
         }
+        proc_filename = "image_processor.json"
     else:
         processor = {
             "image_size": getattr(vision, "image_size", None) or 448,
             "patch_size": getattr(vision, "patch_size", None) or 14,
         }
+        proc_filename = "processor_config.json"
 
-    path = os.path.join(output_dir, "image_processor.json")
+    path = os.path.join(output_dir, proc_filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
@@ -508,10 +541,10 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
-    # Write image_processor.json for VLMs
-    processor_path = _write_processor_config(config, directory)
+    # Write processor config for VLMs
+    processor_path = _write_vision_processor_config(config, directory)
     if processor_path:
-        result["image_processor"] = processor_path
+        result["processor_config"] = processor_path
 
     # Write audio_processor.json for models with audio encoders
     audio_proc_path = _write_audio_processor_config(config, directory)

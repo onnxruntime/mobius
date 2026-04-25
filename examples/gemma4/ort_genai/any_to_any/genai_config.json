@@ -64,7 +64,7 @@
                 "provider_options": []
             }
         },
-        "audio": {
+        "speech": {
             "filename": "audio_encoder/model.onnx",
             "config_filename": "audio_processor.json",
             "inputs": {
