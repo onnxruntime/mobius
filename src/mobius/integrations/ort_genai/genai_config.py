@@ -147,6 +147,7 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_filename: str | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -163,14 +164,16 @@ class GenaiConfigGenerator:
 
         # Explicit decoder inputs (from graph introspection); None → use defaults
         self._decoder_inputs = decoder_inputs
+        # Explicit decoder filename; None → use "model.onnx"
+        self._decoder_filename = decoder_filename
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
 
-        # Optional speech fields (set via with_speech())
-        self._speech: dict[str, Any] | None = None
+        # Optional audio fields (set via with_audio())
+        self._audio: dict[str, Any] | None = None
 
     @classmethod
     def from_config(
@@ -184,6 +187,7 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_filename: str | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -216,16 +220,17 @@ class GenaiConfigGenerator:
             eos_token_id=eos_token_id,
             pad_token_id=pad,
             decoder_inputs=decoder_inputs,
+            decoder_filename=decoder_filename,
         )
 
     def with_vision(
         self,
         *,
         image_token_id: int,
-        filename: str = "vision/model.onnx",
+        filename: str = "vision_encoder/model.onnx",
         embedding_filename: str = "embedding/model.onnx",
         spatial_merge_size: int | None = 2,
-        config_filename: str = "processor_config.json",
+        config_filename: str = "image_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
         embedding_input_names: dict[str, str] | None = None,
@@ -296,25 +301,27 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
-    def with_speech(
+    def with_audio(
         self,
         *,
         audio_token_id: int | None = None,
-        filename: str = "speech/model.onnx",
-        config_filename: str = "speech_processor.json",
+        boa_token_id: int | None = None,
+        filename: str = "audio_encoder/model.onnx",
+        config_filename: str = "audio_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
-        """Add speech/audio model section for multimodal models.
+        """Add audio model section for multimodal models.
 
         Args:
             audio_token_id: Token ID for audio placeholders.
-            filename: Speech ONNX model filename.
-            config_filename: Speech processor config filename.
-            input_names: Override speech model input name mapping.
+            boa_token_id: Beginning-of-audio token ID.
+            filename: Audio ONNX model filename.
+            config_filename: Audio processor config filename.
+            input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
-            output_names: Override speech model output name mapping.
+            output_names: Override audio model output name mapping.
                 Defaults to audio_features.
 
         Returns self for chaining.
@@ -330,7 +337,7 @@ class GenaiConfigGenerator:
                 "audio_features": "audio_features",
             }
 
-        self._speech = {
+        self._audio = {
             "filename": filename,
             "config_filename": config_filename,
             "inputs": input_names,
@@ -340,12 +347,14 @@ class GenaiConfigGenerator:
 
         if audio_token_id is not None:
             self._vlm_token_ids["audio_token_id"] = audio_token_id
+        if boa_token_id is not None:
+            self._vlm_token_ids["boa_token_id"] = boa_token_id
 
         return self
 
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
-        is_multimodal = self._vision is not None or self._speech is not None
+        is_multimodal = self._vision is not None or self._audio is not None
 
         # Decoder section — use explicit inputs when available (from
         # graph introspection), otherwise fall back to defaults.
@@ -356,7 +365,7 @@ class GenaiConfigGenerator:
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
-            "filename": decoder_filename,
+            "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
@@ -388,11 +397,11 @@ class GenaiConfigGenerator:
             # Add audio_features to embedding inputs when speech is
             # enabled and not already present (graph-introspected
             # inputs already include it).
-            if self._speech is not None and "audio_features" not in self._embedding["inputs"]:
+            if self._audio is not None and "audio_features" not in self._embedding["inputs"]:
                 self._embedding["inputs"]["audio_features"] = "audio_features"
             model["embedding"] = self._embedding
-        if self._speech is not None:
-            model["speech"] = self._speech
+        if self._audio is not None:
+            model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
         return {

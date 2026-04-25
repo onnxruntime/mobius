@@ -610,7 +610,7 @@ def main():
             return
 
         decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
-        vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+        vision_session = OnnxModelSession(pkg["vision_encoder"], device=args.device)
         embed_session = OnnxModelSession(pkg["embedding"], device=args.device)
         processor = transformers.AutoProcessor.from_pretrained(args.model)
 

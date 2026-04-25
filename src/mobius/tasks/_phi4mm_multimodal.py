@@ -49,16 +49,16 @@ class Phi4MMMultiModalTask(ModelTask):
     """
 
     model_roles: ClassVar[dict[str, str]] = {
-        "model": "decoder",
-        "vision": "encoder",
-        "speech": "encoder",
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
+        "audio_encoder": "encoder",
         "embedding": "embedding",
     }
     components = ComponentSpec(
-        vision="vision_encoder",
-        speech="speech_encoder",
+        vision_encoder="vision_encoder",
+        audio_encoder="speech_encoder",
         embedding="embedding",
-        model="decoder",
+        decoder="decoder",
     )
 
     def build(
@@ -68,10 +68,10 @@ class Phi4MMMultiModalTask(ModelTask):
     ) -> ModelPackage:
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
-        models["vision"] = self._build_vision(module.vision_encoder, config)
-        models["speech"] = self._build_speech(module.speech_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["audio_encoder"] = self._build_speech(module.speech_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
-        models["model"] = build_decoder_from_embeds(module.decoder, config)
+        models["decoder"] = build_decoder_from_embeds(module.decoder, config)
         return ModelPackage(models, config=config)
 
     def _build_vision(
@@ -95,7 +95,7 @@ class Phi4MMMultiModalTask(ModelTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, builder = _make_graph([pixel_values, image_sizes], name="vision")
+        graph, builder = _make_graph([pixel_values, image_sizes], name="vision_encoder")
         image_features = vision(builder.op, pixel_values, image_sizes=image_sizes)
 
         image_features.name = "image_features"
@@ -135,7 +135,7 @@ class Phi4MMMultiModalTask(ModelTask):
 
         graph, builder = _make_graph(
             [audio_embeds, audio_sizes, audio_projection_mode],
-            name="speech",
+            name="audio_encoder",
         )
         speech_out = speech(
             builder.op,

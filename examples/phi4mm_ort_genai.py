@@ -10,10 +10,10 @@ generation with image and/or audio input.
 
 The model is split into 4 ONNX graphs:
 
-    - **Vision**  (``vision/model.onnx``): SigLIP encoder + projection
-    - **Speech**  (``speech/model.onnx``): Conformer encoder + projection
+    - **Vision**  (``vision_encoder/model.onnx``): SigLIP encoder + projection
+    - **Speech**  (``audio_encoder/model.onnx``): Conformer encoder + projection
     - **Embedding** (``embedding/model.onnx``): token embed + InputMixer
-    - **Decoder** (``model/model.onnx``): LoRA text decoder + lm_head
+    - **Decoder** (``decoder/model.onnx``): LoRA text decoder + lm_head
 
 Requirements::
 
@@ -96,7 +96,7 @@ def _write_genai_config(config, output_dir: str) -> None:
             "pad_token_id": config.pad_token_id or 199999,
             "image_token_id": IMAGE_TOKEN_ID,
             "decoder": {
-                "filename": "model/model.onnx",
+                "filename": "decoder/model.onnx",
                 "hidden_size": config.hidden_size,
                 "head_size": config.head_dim,
                 "num_attention_heads": config.num_attention_heads,
@@ -135,7 +135,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "config_filename": "vision_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
@@ -149,9 +149,9 @@ def _write_genai_config(config, output_dir: str) -> None:
                     "image_features": "image_features",
                 },
             },
-            "speech": {
-                "filename": "speech/model.onnx",
-                "config_filename": "speech_processor.json",
+            "audio": {
+                "filename": "audio_encoder/model.onnx",
+                "config_filename": "audio_processor.json",
                 "session_options": {
                     "log_id": "onnxruntime-genai",
                     "provider_options": [],

@@ -83,7 +83,7 @@ class MultimodalPipeline:
         self._config = pkg.config
         # VisionLanguageTask produces 3 separate models
         self._decoder = OnnxModelSession(pkg["decoder"])
-        self._vision = OnnxModelSession(pkg["vision"])
+        self._vision = OnnxModelSession(pkg["vision_encoder"])
         self._embedding = OnnxModelSession(pkg["embedding"])
 
         # Tokenizer and image processor
