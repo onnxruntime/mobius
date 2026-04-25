@@ -18,7 +18,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _graph_input_names,
     _resolve_ort_genai_model_type,
     _write_genai_config,
-    _write_processor_config,
+    _write_vision_processor_config,
     write_ort_genai_config,
 )
 
@@ -42,7 +42,7 @@ class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
         del config.vision  # ensure no vision attribute
-        assert _write_processor_config(config, str(tmp_path)) is None
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
 
     def test_writes_vision_config(self, tmp_path):
         vision = mock.MagicMock()
@@ -51,7 +51,7 @@ class TestWriteProcessorConfig:
         config = mock.MagicMock()
         config.vision = vision
 
-        path = _write_processor_config(config, str(tmp_path))
+        path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
@@ -313,6 +313,69 @@ class TestExportForOrtGenai:
 
         assert "processor_config" not in result
         assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
+
+    def test_gemma4_image_processor_json_written(self, tmp_path):
+        """Gemma4 writes image_processor.json with onnxruntime-extensions transforms pipeline."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            mm_tokens_per_image: int = 260
+            pooling_kernel_size: int = 3
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "vision": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        # Should write image_processor.json, not processor_config.json
+        assert "processor_config" in result
+        proc_path = result["processor_config"]
+        assert proc_path.endswith("image_processor.json")
+        assert os.path.isfile(proc_path)
+        assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
+
+        with open(proc_path) as f:
+            data = json.load(f)
+
+        # Verify onnxruntime-extensions transforms pipeline structure
+        assert "processor" in data
+        assert "transforms" in data["processor"]
+        transforms = data["processor"]["transforms"]
+        assert len(transforms) == 2
+
+        # First op: DecodeImage
+        op0 = transforms[0]["operation"]
+        assert op0["type"] == "DecodeImage"
+        assert op0["attrs"]["color_space"] == "RGB"
+
+        # Second op: Gemma4ImageTransform with correct attrs from config
+        op1 = transforms[1]["operation"]
+        assert op1["type"] == "Gemma4ImageTransform"
+        assert op1["attrs"]["patch_size"] == 16
+        assert op1["attrs"]["max_soft_tokens"] == 260
+        assert op1["attrs"]["pooling_kernel_size"] == 3
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
@@ -778,7 +841,7 @@ class TestGemma4RealModel:
         # Config-level properties are still present
         assert data["model"]["image_token_id"] == 255999
         assert data["model"]["vision"]["spatial_merge_size"] == 2
-        assert data["model"]["vision"]["config_filename"] == "processor_config.json"
+        assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
     def test_gemma4_per_layer_inputs_in_genai_config(self, tmp_path):
         """When hidden_size_per_layer_input > 0, decoder still gets input_ids."""
