@@ -584,7 +584,7 @@ def _run_vision_language_prefill(
     }
 
     # --- Step 1: Run vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
     try:
         vis_feeds: dict[str, np.ndarray] = {}
         for name in vis_session.input_names:
@@ -769,7 +769,7 @@ def _run_vl_generation(
     }
 
     # --- Step 1: vision encoder ---
-    vis_session = OnnxModelSession(pkg["vision"], **_get_test_device_kwargs())
+    vis_session = OnnxModelSession(pkg["vision_encoder"], **_get_test_device_kwargs())
     try:
         vis_feeds: dict[str, np.ndarray] = {}
         for name in vis_session.input_names:
@@ -1099,7 +1099,7 @@ def _run_phi4mm_multimodal_prefill(
 
         # The vision model processes one image at a time (image_sizes is
         # [1, 2] per call).  For multi-image, loop and concatenate.
-        vision_session = OnnxModelSession(pkg["vision"], **device_kwargs)
+        vision_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
         try:
             all_features = []
             num_images = pixel_values.shape[0]
@@ -1145,7 +1145,7 @@ def _run_phi4mm_multimodal_prefill(
         # When images are also present, HF uses the "vision" audio projection
         audio_projection_mode = np.array(1 if case.images else 0, dtype=np.int64)
 
-        speech_session = OnnxModelSession(pkg["speech"], **device_kwargs)
+        speech_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
         try:
             speech_out = speech_session.run(
                 {
@@ -1178,7 +1178,7 @@ def _run_phi4mm_multimodal_prefill(
     inputs_embeds = emb_out["inputs_embeds"]
 
     # Step 4: Decoder
-    dec_session = OnnxModelSession(pkg["model"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
     try:
         seq_len = inputs_embeds.shape[1]
         kv_cache = _make_empty_kv_cache(dec_session, config)
@@ -1235,8 +1235,7 @@ def _run_speech_language_prefill(
     )
 
     # Step 1: Run audio encoder
-    audio_key = "audio" if "audio" in pkg else "audio_encoder"
-    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
@@ -1685,8 +1684,7 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
-    audio_key = "audio" if "audio" in pkg else "audio_encoder"
-    audio_session = OnnxModelSession(pkg[audio_key], **device_kwargs)
+    audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:

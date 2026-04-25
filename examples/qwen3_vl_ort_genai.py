@@ -97,7 +97,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "spatial_merge_size": 2,
                 "inputs": {
                     "pixel_values": "pixel_values",
