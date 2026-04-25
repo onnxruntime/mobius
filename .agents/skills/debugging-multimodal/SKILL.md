@@ -86,8 +86,8 @@ with torch.no_grad():
     hf_vision_out = hf_model.model.visual(
         pixel_values, grid_thw=grid_thw
     )
-# ONNX
-session = OnnxModelSession(pkg["vision"])
+# ONNX — use standardized ModelPackage key "vision_encoder"
+session = OnnxModelSession(pkg["vision_encoder"])
 onnx_out = session.run({"pixel_values": pv, "grid_thw": grid_thw})
 
 # Compare
@@ -102,14 +102,21 @@ print(f"Vision cos_sim: {cos_sim:.6f}")  # Should be > 0.99
 - Wrong rotary embedding dimension (must be `head_dim // 2` for 2D)
 - Missing `fullatt_block_indexes` (windowed vs full attention)
 
-### Stage 2: Speech encoder (multi-encoder models)
+### Stage 2: Speech/audio encoder (multi-encoder models)
 
 **What to check:**
 - Compression rate (typically 8× time reduction)
 - Projection branch selection
 - Conv subsampling output length
+- Audio mask: `input_features_mask: BOOL [B, T]` must be contiguous
+  (right-padded). Output `audio_features_mask: BOOL [B, T//4]` after
+  conv stride downsampling.
 
 Compare Conformer output against HF. Target: cos_sim > 0.99.
+
+**Common issues:**
+- Missing `input_features_mask` input (causes wrong padding handling)
+- `audio_features_mask` shape mismatch (T//4 for stride-4 conv)
 
 ### Stage 3: Embedding/fusion
 
@@ -250,6 +257,25 @@ ORT bug: microsoft/onnxruntime#28107
 ORT ≤1.24.x CUDA/TRT EPs don't register kernels for opset 24.
 **Fix:** Use the `ort_lower_opset_for_ep` feature flag (enabled by
 default). See `src/mobius/_flags.py`.
+
+### NaN for large head_dim (> 256)
+
+CUDA EP may produce NaN values when `head_dim > 256` in attention ops.
+Tracked in microsoft/onnxruntime#28195 and #28196. CPU EP is unaffected.
+
+### `nonpad_kv_seqlen` requires static cache
+
+The `nonpad_kv_seqlen` optimization only works with static KV cache.
+ORT asserts that no `past_key`/`past_value` inputs exist — if they do,
+the model will fail to run on CUDA EP.
+
+### EP-aware building
+
+`--ep` flag drives both graph construction and optimization (e.g. GQA
+fusion with `do_rotary=1`). `--optimize` is for post-hoc rewrite rules
+only (separate from EP). After EP-aware optimization, unused graph inputs
+(e.g. `position_ids` absorbed by GQA) are removed by
+`RemoveDeadGraphInputsPass`.
 
 ## Tolerance guidelines
 
