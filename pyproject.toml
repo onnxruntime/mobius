@@ -28,6 +28,7 @@ dependencies = [
 mobius = "mobius.__main__:main"
 
 [project.optional-dependencies]
+transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
     "accelerate",
