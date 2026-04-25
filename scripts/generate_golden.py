@@ -392,7 +392,13 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         text=prompt_text,
         images=images if images else None,
         return_tensors="pt",
-    ).to(device)
+    )
+    
+    if device == "auto":
+        first_device = next(model.parameters()).device
+        processed = processed.to(first_device)
+    else:
+        processed = processed.to(device)
 
     # L4: single forward pass
     with torch.no_grad():
