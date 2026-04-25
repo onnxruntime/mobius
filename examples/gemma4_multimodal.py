@@ -167,7 +167,7 @@ def prepare_audio_feeds(
         np_dtype: Numpy dtype for audio features (default float32).
 
     Returns:
-        ``{"input_features": [1, T, n_mels]}``
+        ``{"input_features": [1, T, n_mels], "input_features_mask": [1, T]}``
     """
     import soundfile as sf
 
@@ -186,7 +186,12 @@ def prepare_audio_feeds(
     )
     # out["input_features"]: [1, T, n_mels]  (already in correct layout)
     audio_features = out["input_features"].astype(np_dtype)
-    return {"input_features": audio_features}  # [1, T, n_mels]
+    # All-True mask for single-clip inference (no padding to mask out).
+    input_features_mask = np.ones(audio_features.shape[:2], dtype=np.bool_)  # [1, T]
+    return {
+        "input_features": audio_features,
+        "input_features_mask": input_features_mask,
+    }
 
 
 def prepare_embedding_feeds(
@@ -608,14 +613,18 @@ def demo_audio(
     print("-" * 64)
 
     # Step 1: Encode audio through the Conformer encoder.
-    # Input:  audio_features [1, T, n_mels]  (mel spectrogram)
-    # Output: audio_features [1, T', hidden_size]  (T' = T / subsampling_factor)
+    # Input:  input_features [1, T, n_mels], input_features_mask [1, T]
+    # Output: audio_features [1, T', hidden_size], audio_features_mask [1, T']
+    #         where T' = T / 4 (two conv layers with stride 2)
     audio_out = audio_session.run(
         prepare_audio_feeds(processor, audio_path, np_dtype=model_np_dtype)
     )
     audio_features: np.ndarray = audio_out["audio_features"]
+    audio_mask: np.ndarray = audio_out["audio_features_mask"]
     if audio_features.ndim == 3:
-        audio_features = audio_features[0]  # [T', hidden_size]
+        # Strip padding using the downsampled mask, then flatten batch dim.
+        valid = audio_mask[0].astype(bool)  # [T']
+        audio_features = audio_features[0][valid]  # [num_valid, hidden_size]
 
     # Step 2: Build input_ids with AUDIO_TOKEN_ID placeholders.
     num_audio_tokens = audio_features.shape[0]
@@ -671,8 +680,10 @@ def demo_vision_audio(
         prepare_audio_feeds(processor, audio_path, np_dtype=model_np_dtype)
     )
     audio_features: np.ndarray = audio_out["audio_features"]
+    audio_mask: np.ndarray = audio_out["audio_features_mask"]
     if audio_features.ndim == 3:
-        audio_features = audio_features[0]
+        valid = audio_mask[0].astype(bool)
+        audio_features = audio_features[0][valid]
 
     # Step 3: Build input_ids — image placeholders first, then audio
     input_ids = build_input_ids(
