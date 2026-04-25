@@ -15,7 +15,7 @@ the graph directly without saving/loading:
 from mobius._testing.ort_inference import OnnxModelSession
 
 pkg = build(model_id, dtype="f32", load_weights=True)
-vision_model = pkg["vision"]
+vision_model = pkg["vision_encoder"]
 graph = vision_model.graph
 
 # Find target nodes by op type or name pattern
