@@ -60,9 +60,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def _gradient_clip(
-    op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9
-) -> ir.Value:
+def _gradient_clip(op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
     """Clamp activations to ±clip_val (gradient clipping for numerical stability)."""
     lo = op.CastLike(op.Constant(value_float=-clip_val), x)
     hi = op.CastLike(op.Constant(value_float=clip_val), x)
@@ -468,9 +466,7 @@ class Gemma4Attention(nn.Module):
         """Sinusoidal relative position embeddings [context_left, hidden_size]."""
         num_ts = hidden_size // 2
         log_ts_inc = math.log(10000.0) / max(num_ts - 1, 1)
-        inv_ts = np.array(
-            [math.exp(-i * log_ts_inc) for i in range(num_ts)], dtype=np.float32
-        )
+        inv_ts = np.array([math.exp(-i * log_ts_inc) for i in range(num_ts)], dtype=np.float32)
         # Descending relative distances: [context_left-1, ..., 1, 0]
         pos_ids = np.arange(context_left - 1, -1, -1, dtype=np.float32).reshape(
             context_left, 1
@@ -480,9 +476,7 @@ class Gemma4Attention(nn.Module):
             [np.sin(scaled), np.cos(scaled)], axis=-1
         )  # [context_left, hidden_size]
 
-    def _build_causal_window_mask(
-        self, op: builder.OpBuilder, seq_len: ir.Value
-    ) -> ir.Value:
+    def _build_causal_window_mask(self, op: builder.OpBuilder, seq_len: ir.Value) -> ir.Value:
         """Build [1, 1, T, T] causal sliding-window attention bias."""
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
@@ -550,9 +544,7 @@ class Gemma4Attention(nn.Module):
         softplus_scale = op.Log(
             op.Add(1.0, op.Exp(per_dim_f32))
         )  # [head_dim] softplus(per_dim_scale)
-        q = op.Mul(
-            q, op.Mul(self._q_scale, softplus_scale)
-        )  # [B, T, num_heads, head_dim]
+        q = op.Mul(q, op.Mul(self._q_scale, softplus_scale))  # [B, T, num_heads, head_dim]
 
         # Apply K scale (constant)
         k = op.Mul(k, self._k_scale)  # [B, T, num_heads, head_dim]
@@ -568,9 +560,7 @@ class Gemma4Attention(nn.Module):
 
         # Relative position bias: matrix_bd
         # pos_embed: [context_left, hidden_size] - project in model dtype, then cast
-        rel_k = self.relative_k_proj(
-            op, self.pos_embed
-        )  # [context_left, num_heads*head_dim]
+        rel_k = self.relative_k_proj(op, self.pos_embed)  # [context_left, num_heads*head_dim]
         rel_k = op.Cast(rel_k, to=ir.DataType.FLOAT)
         rel_k = op.Reshape(
             rel_k, op.Constant(value_ints=[-1, num_heads, head_dim])
@@ -601,9 +591,7 @@ class Gemma4Attention(nn.Module):
         offset_expanded = op.Expand(offset_2d, expand_shape)  # [B, H, T, T]
 
         # Gather relative scores: rel_bias[b, h, i, j] = rel_scores[b, h, i, offset[i,j]]
-        rel_bias = op.GatherElements(
-            rel_scores, offset_expanded, axis=3
-        )  # [B, H, T, T]
+        rel_bias = op.GatherElements(rel_scores, offset_expanded, axis=3)  # [B, H, T, T]
 
         scores = op.Add(scores, rel_bias)  # [B, H, T, T]
 
@@ -636,9 +624,7 @@ class Gemma4Attention(nn.Module):
         context = op.MatMul(attn_weights, v)  # [B, num_heads, T, head_dim]
 
         # Reshape [B, num_heads, T, head_dim] → [B, T, H*D]
-        context = op.Transpose(
-            context, perm=[0, 2, 1, 3]
-        )  # [B, T, num_heads, head_dim]
+        context = op.Transpose(context, perm=[0, 2, 1, 3])  # [B, T, num_heads, head_dim]
         out_shape = op.Concat(batch, seq_len, op.Constant(value_ints=[-1]), axis=0)
         context = op.Reshape(context, out_shape)  # [B, T, H*D]
 

@@ -169,8 +169,31 @@ class Gemma4Task(ModelTask):
     Decoder KV cache is per-layer with the correct head_dim for each layer type
     (local vs global), unlike the uniform head_dim in :class:`VisionLanguageTask`.
 
-    Vision input is pre-patchified: ``pixel_values [B, N, 3*P^2]`` and
-    ``pixel_position_ids [B, N, 2]`` with (x, y) patch coordinates.
+    Batching strategies
+    -------------------
+    Each sub-model uses a different strategy for variable-size inputs:
+
+    **Vision** — padded patches with sentinel position IDs.
+        All images are patchified to a fixed ``max_soft_tokens`` (280)
+        slots.  Images smaller than the maximum get ``(-1, -1)`` in their
+        ``pixel_position_ids`` for unused patch slots, which the encoder
+        ignores.  No explicit mask is needed.
+
+    **Audio** — explicit contiguous bool mask.
+        Audio clips of different lengths are padded to equal time
+        dimension.  ``input_features_mask [B, T]`` marks valid frames
+        (``True``) vs padding (``False``), always contiguous
+        (right-padded).  The mask is downsampled through two conv layers
+        (stride 2 each → ``T//4``) and used to zero out padding in
+        Conformer attention.  The downsampled mask is returned as
+        ``audio_features_mask [B, T//4]`` so callers can strip padding
+        rows before scattering into text embeddings.
+
+    **Decoder** — standard ``attention_mask`` for KV cache padding.
+        ``attention_mask [B, past+current]`` is a 1/0 int mask indicating
+        valid token positions across the full sequence (past cache +
+        current input).  The ``Attention`` / ``GroupQueryAttention`` ops
+        handle causal masking internally via ``is_causal=1``.
     """
 
     def build(
@@ -255,8 +278,12 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data
-        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates
+        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data where
+          ``B`` is the number of images and ``N`` is the number of patches
+          (padded to ``max_soft_tokens``, typically 280).
+        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates.
+          Unused patch slots (from images smaller than the maximum) use
+          ``(-1, -1)`` as a sentinel value — no explicit mask is needed.
 
         Output:
         - ``image_features [B*N, text_hidden_size]``: projected vision features
