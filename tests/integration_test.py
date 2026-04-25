@@ -833,7 +833,7 @@ class TestQwen25VL3Model:
         pkg = _build_qwen25vl_3model(model_id)
 
         assert "decoder" in pkg, "Package should contain 'decoder' (decoder)"
-        assert "vision" in pkg, "Package should contain 'vision'"
+        assert "vision_encoder" in pkg, "Package should contain 'vision_encoder'"
         assert "embedding" in pkg, "Package should contain 'embedding'"
 
         for name, model in pkg.items():
@@ -947,7 +947,7 @@ class TestQwen25VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
@@ -1067,7 +1067,7 @@ class TestQwen25VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         vision_out = vision_session.run({"pixel_values": pixel_values, "grid_thw": grid_thw})
         vision_session.close()
         onnx_features = vision_out["image_features"]
@@ -1103,7 +1103,7 @@ class TestQwen25VL3Model:
 
         # 3-model package saves each component in its own subdirectory
         assert os.path.isfile(tmp_path / "model" / "model.onnx")
-        assert os.path.isfile(tmp_path / "vision" / "model.onnx")
+        assert os.path.isfile(tmp_path / "vision_encoder" / "model.onnx")
         assert os.path.isfile(tmp_path / "embedding" / "model.onnx")
 
 
@@ -1136,7 +1136,7 @@ class TestQwen3VL3Model:
         pkg = _build_qwen3vl_3model(model_id)
 
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         for name, model in pkg.items():
@@ -1254,7 +1254,7 @@ class TestQwen3VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
@@ -1354,7 +1354,7 @@ class TestMistral3VL3Model:
         pkg = _build_mistral3_3model(model_id)
 
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         for name, model in pkg.items():
@@ -1461,7 +1461,7 @@ class TestMistral3VL3Model:
         # Step 1: ONNX vision model — pixel_values → image_features
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
 
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         vision_out = vision_session.run({"pixel_values": pixel_values})
         vision_session.close()
         image_features = vision_out["image_features"]
@@ -1567,7 +1567,7 @@ class TestMistral3VL3Model:
             )
 
         # ONNX vision model
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         onnx_out = vision_session.run({"pixel_values": pixel_values.astype(np.float32)})
         vision_session.close()
         onnx_features = onnx_out["image_features"].astype(np.float32)
@@ -1599,7 +1599,7 @@ class TestMistral3VL3Model:
         rng = np.random.RandomState(42)
         r1 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
         r2 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         o1 = vision_session.run({"pixel_values": r1})["image_features"].flatten()
         o2 = vision_session.run({"pixel_values": r2})["image_features"].flatten()
         vision_session.close()
@@ -2426,7 +2426,7 @@ def _build_sam_onnx_model(
 
     wrapper = _SAMTestComposite()
     pkg = build_from_module(wrapper, config, task="vision-language")
-    return pkg["vision"], wrapper.vision_encoder.encoder
+    return pkg["vision_encoder"], wrapper.vision_encoder.encoder
 
 
 def _map_hf_sam_weights_to_onnx(hf_state_dict):
@@ -2779,7 +2779,7 @@ def test_ocr2_3model_graph_all_weights_assigned():
     module = models.DeepSeekOCR2CausalLMModel(config)
     pkg = build_from_module(module, config, task="vision-language")
 
-    assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+    assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     # Fill all initializers with random weights
     for onnx_model in pkg.values():
@@ -2830,7 +2830,7 @@ def test_ocr2_3model_graph_all_weights_assigned():
             # Vision model is too large for arbitrary input testing
             # (SAM is hardcoded to 1024x1024, 768-dim). Just verify
             # the decoder and embedding models run correctly.
-            if model_name == "vision":
+            if model_name == "vision_encoder":
                 session.close()
                 print(f"  [{model_name}] loaded OK (skipped inference)")
                 continue
@@ -3014,10 +3014,10 @@ def test_gemma3_3model_builds_and_runs():
     pkg = task.build(module, config)
 
     # Verify 3-model split structure
-    assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+    assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     # Verify vision model I/O
-    vision_inputs = {i.name for i in pkg["vision"].graph.inputs}
+    vision_inputs = {i.name for i in pkg["vision_encoder"].graph.inputs}
     assert "pixel_values" in vision_inputs
 
     # Verify decoder model I/O
@@ -3134,7 +3134,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     pkg = task.build(module, config)
 
     # Verify 3-model split
-    assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+    assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     # Verify decoder has hybrid cache outputs
     decoder_outputs = {o.name for o in pkg["decoder"].graph.outputs}
@@ -3153,7 +3153,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     assert "position_ids" in decoder_inputs
 
     # Verify vision model I/O
-    vision_inputs = {i.name for i in pkg["vision"].graph.inputs}
+    vision_inputs = {i.name for i in pkg["vision_encoder"].graph.inputs}
     assert "pixel_values" in vision_inputs
 
     # Verify embedding model I/O
@@ -3631,7 +3631,7 @@ def test_qwen35_vl_vision_features_match():
         arch_config,
         task="hybrid-qwen-vl",
     )
-    assert "vision" in pkg
+    assert "vision_encoder" in pkg
 
     # Build HF model with random weights and transfer to ONNX
     hf_model = (
@@ -3684,7 +3684,7 @@ def test_qwen35_vl_vision_features_match():
     hf_features = hf_visual_out.pooler_output.numpy()
 
     # ONNX vision forward
-    vision_session = OnnxModelSession(pkg["vision"])
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
     vision_out = vision_session.run(
         {
             "pixel_values": pixel_values.numpy().astype(np.float32),
@@ -4212,7 +4212,7 @@ class TestBlip2VL:
     def test_blip2_vision_model(self):
         """Vision model: pixel_values -> image_features via ViT + Q-Former."""
         pkg, config = self._build_blip2()
-        session = OnnxModelSession(pkg["vision"])
+        session = OnnxModelSession(pkg["vision_encoder"])
 
         rng = np.random.default_rng(123)
         img_size = config.vision.image_size if config.vision else None
@@ -4585,7 +4585,7 @@ def test_internvl2_3model_parity():
         ref_image_features = ref_mlp1(shuffled).numpy()
 
     # ONNX vision
-    vision_sess = OnnxModelSession(pkg["vision"])
+    vision_sess = OnnxModelSession(pkg["vision_encoder"])
     onnx_vision_out = vision_sess.run({"pixel_values": pixel_values})
     vision_sess.close()
     onnx_image_features = onnx_vision_out["image_features"]

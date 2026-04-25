@@ -31,7 +31,7 @@ class ComponentSpec:
 
         ComponentSpec(
             decoder="decoder",
-            vision="vision_encoder",
+            vision_encoder="vision_encoder",
             embedding="embedding",
         )
 
@@ -42,9 +42,9 @@ class ComponentSpec:
 
     Args:
         **components: Keyword arguments mapping output name → module attribute
-            name.  For example, ``vision="vision_encoder"`` means the task
-            expects ``module.vision_encoder`` and will store the result as
-            ``package["vision"]``.
+            name.  For example, ``vision_encoder="vision_encoder"`` means
+            the task expects ``module.vision_encoder`` and will store the
+            result as ``package["vision_encoder"]``.
     """
 
     def __init__(self, **components: str) -> None:

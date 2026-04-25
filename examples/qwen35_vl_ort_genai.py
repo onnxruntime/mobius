@@ -123,7 +123,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
             },
             "vision": {
-                "filename": "vision/model.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "spatial_merge_size": 2,
                 "inputs": {
                     "pixel_values": "pixel_values",
@@ -689,7 +689,7 @@ def generate_with_image(
     tokenizer = og.Tokenizer(og_model)
 
     decoder_sess = _ort_session(model_dir, "decoder")
-    vision_sess = _ort_session(model_dir, "vision")
+    vision_sess = _ort_session(model_dir, "vision_encoder")
     embed_sess = _ort_session(model_dir, "embedding")
 
     # Step 1: Vision encoder → image features

@@ -47,12 +47,12 @@ class VisionLanguageTask(ModelTask):
 
     model_roles: ClassVar[dict[str, str]] = {
         "decoder": "decoder",
-        "vision": "encoder",
+        "vision_encoder": "encoder",
         "embedding": "embedding",
     }
     components = ComponentSpec(
         decoder="decoder",
-        vision="vision_encoder",
+        vision_encoder="vision_encoder",
         embedding="embedding",
     )
 
@@ -64,7 +64,7 @@ class VisionLanguageTask(ModelTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -88,7 +88,7 @@ class VisionLanguageTask(ModelTask):
             type=ir.TensorType(config.dtype),
         )
 
-        graph, graph_builder = _make_graph([pixel_values], name="vision")
+        graph, graph_builder = _make_graph([pixel_values], name="vision_encoder")
         image_features = vision(graph_builder.op, pixel_values=pixel_values)
 
         image_features.name = "image_features"
@@ -112,7 +112,7 @@ class QwenVLTask(VisionLanguageTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -146,7 +146,9 @@ class QwenVLTask(VisionLanguageTask):
             type=ir.TensorType(ir.DataType.INT64),
         )
 
-        graph, graph_builder = _make_graph([pixel_values, image_grid_thw], name="vision")
+        graph, graph_builder = _make_graph(
+            [pixel_values, image_grid_thw], name="vision_encoder"
+        )
         image_features = vision(
             graph_builder.op,
             pixel_values=pixel_values,
@@ -177,7 +179,7 @@ class HybridQwenVLTask(QwenVLTask):
         models["decoder"] = build_decoder_from_embeds(
             module.decoder, config, mrope=True, hybrid=True
         )
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -219,7 +221,7 @@ class PixtralVLTask(VisionLanguageTask):
 
         graph_inputs = [pixel_values]
 
-        graph, graph_builder = _make_graph(graph_inputs, name="vision")
+        graph, graph_builder = _make_graph(graph_inputs, name="vision_encoder")
         op = graph_builder.op
 
         image_features = vision(
@@ -257,7 +259,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
 
     components = ComponentSpec(
         decoder="decoder",
-        vision="vision_encoder",
+        vision_encoder="vision_encoder",
         embedding="embedding",
     )
 
@@ -269,7 +271,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,

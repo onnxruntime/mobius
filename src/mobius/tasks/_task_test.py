@@ -174,7 +174,7 @@ class TestVisionLanguageTask:
         task = VisionLanguageTask()
         pkg = task.build(module, config)
         assert isinstance(pkg, ModelPackage)
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     def test_decoder_has_inputs_embeds(self):
         config = _make_multimodal_config()
@@ -212,7 +212,7 @@ class TestVisionLanguageTask:
         module = Gemma3MultiModalModel(config)
         task = VisionLanguageTask()
         pkg = task.build(module, config)
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         input_names = [v.name for v in vision.graph.inputs]
         assert "pixel_values" in input_names
         output_names = [v.name for v in vision.graph.outputs]
