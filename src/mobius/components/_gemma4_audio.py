@@ -809,7 +809,7 @@ class Gemma4AudioEncoder(nn.Module):
         op: builder.OpBuilder,
         input_features: ir.Value,
         input_features_mask: ir.Value | None = None,
-    ) -> ir.Value:
+    ) -> tuple[ir.Value, ir.Value | None]:
         """Encode audio mel-spectrogram features.
 
         Args:
@@ -819,7 +819,9 @@ class Gemma4AudioEncoder(nn.Module):
                 and used as key-padding mask in Conformer attention.
 
         Returns:
-            ``[B, T//4, output_proj_dims]`` encoded audio tokens.
+            ``(encoded, downsampled_mask)`` where encoded is
+            ``[B, T//4, output_proj_dims]`` and downsampled_mask is
+            ``[B, T//4]`` bool (or ``None`` when no mask was provided).
         """
         # input_features: [B, T, input_size]
         x, attention_mask = self.subsample_conv_projection(
@@ -829,4 +831,4 @@ class Gemma4AudioEncoder(nn.Module):
         for layer in self.layers:
             x = layer(op, x, attention_mask=attention_mask)  # [B, T//4, hidden_size]
 
-        return self.output_proj(op, x)  # [B, T//4, output_proj_dims]
+        return self.output_proj(op, x), attention_mask

@@ -1938,15 +1938,15 @@ class _Gemma4AudioEncoderModel(nn.Module):
         op: builder.OpBuilder,
         input_features: ir.Value,
         input_features_mask: ir.Value | None = None,
-    ) -> ir.Value:
+    ) -> tuple[ir.Value, ir.Value | None]:
         # [B, T, input_size] → encoder → [B, T//4, output_proj_dims]
-        audio_features = self.encoder(
+        audio_features, downsampled_mask = self.encoder(
             op, input_features, input_features_mask=input_features_mask
         )
         # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
         audio_features = self.pre_projection_norm(op, audio_features)
         # → projector → [B, T//4, text_hidden_size]
-        return self.projector(op, audio_features)
+        return self.projector(op, audio_features), downsampled_mask
 
 
 # ---------------------------------------------------------------------------

@@ -311,8 +311,11 @@ class Gemma4Task(ModelTask):
           layers (stride 2 per stage) and used to zero out padded
           positions in Conformer attention.
 
-        Output:
+        Outputs:
         - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
+        - ``audio_features_mask [batch, time//4]``: BOOL downsampled mask
+          indicating which output positions are valid (for stripping
+          padding rows before scattering into text embeddings)
         """
         batch = ir.SymbolicDim("batch")
         time = ir.SymbolicDim("time")
@@ -332,16 +335,18 @@ class Gemma4Task(ModelTask):
         graph, graph_builder = _make_graph([input_features, input_features_mask], name="audio")
         op = graph_builder.op
 
-        audio_features = audio(
+        audio_features, downsampled_mask = audio(
             op,
             input_features,
             input_features_mask=input_features_mask,
         )
         audio_features.name = "audio_features"
         graph.outputs.append(audio_features)
-        # TODO: For batched variable-length audio, expose the downsampled
-        # mask as a second output (e.g. "audio_features_mask") so callers
-        # can strip padding rows. Not needed for single-clip inference.
+
+        if downsampled_mask is not None:
+            downsampled_mask.name = "audio_features_mask"
+            graph.outputs.append(downsampled_mask)
+
         return _make_model(graph)
 
     def _build_embedding(

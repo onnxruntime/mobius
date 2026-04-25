@@ -323,9 +323,10 @@ class TestGemma4AudioEncoder:
         enc = self._make_encoder()
         b, op, graph = create_test_builder()
         x = create_test_input(b, "input_features", [1, 20, 32])
-        result = enc(op, x)
+        result, mask = enc(op, x)
         b._adapt_outputs([result])
         assert graph.num_nodes() > 0
+        assert mask is None  # No mask provided → no mask returned
 
     def test_layer_count(self):
         enc = self._make_encoder(num_layers=3)
