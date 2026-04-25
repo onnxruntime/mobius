@@ -226,15 +226,13 @@ def _write_vision_processor_config(
                 ],
             }
         }
-        proc_filename = "image_processor.json"
     else:
         processor = {
             "image_size": getattr(vision, "image_size", None) or 448,
             "patch_size": getattr(vision, "patch_size", None) or 14,
         }
-        proc_filename = "processor_config.json"
 
-    path = os.path.join(output_dir, proc_filename)
+    path = os.path.join(output_dir, "image_processor.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
