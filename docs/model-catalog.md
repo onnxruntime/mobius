@@ -28,7 +28,7 @@ Standard autoregressive language models using rotary position embeddings.
 | `phi3` | `Phi3CausalLMModel` | `microsoft/Phi-3-mini-4k-instruct` |
 | `phi3small` | `Phi3SmallCausalLMModel` | `microsoft/Phi-3-small-8k-instruct` |
 | `smollm3` | `SmolLM3CausalLMModel` | `HuggingFaceTB/SmolLM3-3B` |
-| `qwen3_5_text` | `Qwen35CausalLMModel` | — |
+| `qwen3_5_text` | `Qwen35CausalLMModel` | `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.6-27B` |
 | `falcon` | `FalconCausalLMModel` | `tiiuae/falcon-7b` |
 | `bloom` | `FalconCausalLMModel` | `bigscience/bloom-560m` |
 | `mpt` | `FalconCausalLMModel` | `mosaicml/mpt-7b` |

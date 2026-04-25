@@ -1081,6 +1081,62 @@ class TestBuildGraphVisionLanguage:
         assert "present.1.key" in output_names
         assert "present.1.value" in output_names
 
+    def test_qwen36_vl_graph(self):
+        """Build Qwen3.6-27B-like VL graph (untied weights, more layers)."""
+        config = _base_config(
+            attn_qk_norm=True,
+            partial_rotary_factor=0.25,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            tie_word_embeddings=False,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            deepstack_visual_indexes=[0],
+            image_token_id=248056,
+            mrope_section=[8, 12, 12],
+        )
+        model_cls = registry.get("qwen3_5_vl")
+        module = model_cls(config)
+        task_name = _default_task_for_model("qwen3_5_vl")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        # 3-model split produces decoder, vision, embedding
+        assert "decoder" in pkg
+        assert "vision" in pkg
+        assert "embedding" in pkg
+
+        # Decoder should have logits output and inputs_embeds input
+        decoder = pkg["decoder"]
+        assert "logits" in {out.name for out in decoder.graph.outputs}
+        assert "inputs_embeds" in {inp.name for inp in decoder.graph.inputs}
+
+        # Verify hybrid cache outputs
+        output_names = {out.name for out in decoder.graph.outputs}
+        assert "present.0.conv_state" in output_names
+        assert "present.0.recurrent_state" in output_names
+        assert "present.3.key" in output_names
+        assert "present.3.value" in output_names
+
     def test_qwen3_vl_single_model_graph(self):
         """Build Qwen3-VL with single-model Qwen3VLVisionLanguageTask."""
         config = _base_config(
@@ -1745,17 +1801,14 @@ class TestBuildGraphVisionLanguage:
 
         assert "decoder.model.embed_tokens.weight" in result
         assert "embedding.embed_tokens.weight" in result
-        assert (
-            result["decoder.model.embed_tokens.weight"]
-            is result["embedding.embed_tokens.weight"]
-        )
+        assert result["decoder.model.embed_tokens.weight"] is result["embedding.embed_tokens.weight"]
         assert "decoder.model.layers.0.self_attn.q_proj.weight" in result
         assert "decoder.lm_head.weight" in result
         assert "vision_encoder.visual.blocks.0.mlp.up_proj.weight" in result
         assert "mtp_head.weight" not in result
 
-    def test_qwen35_vl_preprocess_weights_untied(self):
-        """Qwen3.5-VL with tie_word_embeddings=False; lm_head must be a separate tensor."""
+    def test_qwen36_vl_preprocess_weights_untied(self):
+        """Qwen3.6-27B uses tie_word_embeddings=false; lm_head must be separate."""
         import torch
 
         from mobius.models.qwen35 import Qwen35VL3ModelCausalLMModel
@@ -1794,18 +1847,12 @@ class TestBuildGraphVisionLanguage:
         # embed_tokens shared across decoder and embedding models
         assert "decoder.model.embed_tokens.weight" in result
         assert "embedding.embed_tokens.weight" in result
-        assert (
-            result["decoder.model.embed_tokens.weight"]
-            is result["embedding.embed_tokens.weight"]
-        )
+        assert result["decoder.model.embed_tokens.weight"] is result["embedding.embed_tokens.weight"]
 
         # lm_head must NOT be tied to embed_tokens (tie_word_embeddings=false)
         assert "decoder.lm_head.weight" in result
         assert result["decoder.lm_head.weight"] is lm_head_weight
-        assert (
-            result["decoder.lm_head.weight"]
-            is not result["decoder.model.embed_tokens.weight"]
-        )
+        assert result["decoder.lm_head.weight"] is not result["decoder.model.embed_tokens.weight"]
 
         # Vision encoder keys renamed correctly
         assert "vision_encoder.visual.blocks.0.mlp.up_proj.weight" in result
