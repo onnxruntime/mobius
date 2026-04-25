@@ -1745,7 +1745,10 @@ class TestBuildGraphVisionLanguage:
 
         assert "decoder.model.embed_tokens.weight" in result
         assert "embedding.embed_tokens.weight" in result
-        assert result["decoder.model.embed_tokens.weight"] is result["embedding.embed_tokens.weight"]
+        assert (
+            result["decoder.model.embed_tokens.weight"]
+            is result["embedding.embed_tokens.weight"]
+        )
         assert "decoder.model.layers.0.self_attn.q_proj.weight" in result
         assert "decoder.lm_head.weight" in result
         assert "vision_encoder.visual.blocks.0.mlp.up_proj.weight" in result
