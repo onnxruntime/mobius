@@ -18,6 +18,7 @@ dependencies = [
     "onnx_ir>=0.1.0",
     "onnx-shape-inference>=0.1.7",
     "onnxscript>=0.7.0",
+    "safetensors",
     "torch>=2.1.0",
     "tqdm",
     "transformers",  # >5.0 recommended
@@ -27,9 +28,9 @@ dependencies = [
 mobius = "mobius.__main__:main"
 
 [project.optional-dependencies]
-transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
+    "accelerate",
     "onnxruntime-easy>=0.1.1",
     "torch",
     "transformers>=5.0",
