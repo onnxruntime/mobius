@@ -3040,7 +3040,7 @@ def test_gemma3_3model_builds_and_runs():
     print(
         f"Gemma3 multimodal 3-model split OK: "
         f"decoder({len(list(pkg['decoder'].graph.inputs))} inputs), "
-        f"vision({len(list(pkg['vision'].graph.inputs))} inputs), "
+        f"vision({len(list(pkg['vision_encoder'].graph.inputs))} inputs), "
         f"embedding({len(list(pkg['embedding'].graph.inputs))} inputs)"
     )
 
@@ -3240,7 +3240,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     print(
         f"Qwen3.5-VL 3-model split OK: "
         f"decoder({len(list(pkg['decoder'].graph.inputs))} inputs), "
-        f"vision({len(list(pkg['vision'].graph.inputs))} inputs), "
+        f"vision({len(list(pkg['vision_encoder'].graph.inputs))} inputs), "
         f"embedding({len(list(pkg['embedding'].graph.inputs))} inputs)"
     )
 
@@ -3513,7 +3513,7 @@ def test_qwen35_vl_3model_text_only_parity():
         arch_config,
         task="hybrid-qwen-vl",
     )
-    assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+    assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     # Build HF model with random weights
     hf_model = (
@@ -3732,10 +3732,17 @@ def test_qwen35_deltanet_single_layer_parity():
     """
     import onnx_ir as ir
     from onnxscript._internal import builder as onnx_builder
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        Qwen3_5DynamicCache,
-        Qwen3_5GatedDeltaNet,
-    )
+
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5DynamicCache,
+            Qwen3_5GatedDeltaNet,
+        )
+    except ImportError:
+        pytest.skip(
+            "Qwen3_5DynamicCache/Qwen3_5GatedDeltaNet not available"
+            " in this transformers version"
+        )
 
     from mobius._weight_loading import apply_weights
     from mobius.components._gated_deltanet import (
@@ -4207,7 +4214,7 @@ class TestBlip2VL:
     def test_blip2_3model_structure(self):
         """BLIP-2 produces decoder, vision, and embedding models."""
         pkg, _config = self._build_blip2()
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     def test_blip2_vision_model(self):
         """Vision model: pixel_values -> image_features via ViT + Q-Former."""
@@ -4495,7 +4502,7 @@ def test_internvl2_3model_parity():
     # ----- Build ONNX 3-model package -----
     onnx_module = models.InternVL2Model(config)
     pkg = build_from_module(onnx_module, config, task="vision-language")
-    assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+    assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
     # ----- Build PyTorch reference models -----
     # Vision: InternViT + pixel shuffle + MLP projector
