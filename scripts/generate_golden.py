@@ -393,7 +393,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         images=images if images else None,
         return_tensors="pt",
     )
-    
+
     if device == "auto":
         first_device = next(model.parameters()).device
         processed = processed.to(first_device)
