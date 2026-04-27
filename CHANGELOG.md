@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### Qwen3.6-27B Support
+
+#### Added
+
+- Qwen3.6-27B is now supported via the existing `qwen3_5` model type
+  (`Qwen35VL3ModelCausalLMModel`). Qwen3.6 uses the same architecture as
+  Qwen3.5 with `tie_word_embeddings=false` and larger dimensions (64
+  layers, 5120 hidden size). No code changes required — fully config-driven.
+
 ### Mistral-3 / Pixtral VLM Support
 
 #### Added
