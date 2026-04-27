@@ -180,6 +180,25 @@ def _apply_nemotron_h_generate_patch(model: object) -> None:
     model.prepare_inputs_for_generation = _patched_prepare
 
 
+# ---- Device helpers ----
+
+
+def _get_model_device(model: object, device: str):
+    """Return the concrete ``torch.device`` where model inputs should go.
+
+    ``device_map="auto"`` is valid for ``from_pretrained()`` (it
+    distributes layers across available GPUs), but ``.to("auto")`` is
+    not valid for tensors or BatchEncoding objects.  When *device* is
+    ``"auto"``, we inspect the model's first parameter to find the
+    actual device that inputs should be placed on.
+    """
+    import torch
+
+    if device == "auto":
+        return next(model.parameters()).device
+    return torch.device(device)
+
+
 # ---- Task-specific generators ----
 # Each generator loads a HF model, runs inference, and calls
 # save_golden_ref() from golden.py.  Heavy imports (torch,
@@ -214,9 +233,10 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
 
         _apply_nemotron_h_generate_patch(model)
 
+        model_device = _get_model_device(model, device)
         with torch.no_grad():
             gen_output = model.generate(
-                torch.from_numpy(input_ids).to(device),
+                torch.from_numpy(input_ids).to(model_device),
                 max_new_tokens=case.generation_params.get("max_new_tokens", 20),
                 do_sample=False,
             )
@@ -394,11 +414,12 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         return_tensors="pt",
     )
 
-    if device == "auto":
-        first_device = next(model.parameters()).device
-        processed = processed.to(first_device)
-    else:
-        processed = processed.to(device)
+    # Normalize the CLI/device-map selection to a concrete runtime device
+    # before moving any tensors. `device="auto"` is handled by Transformers/
+    # Accelerate during model loading, but `.to("auto")` is not valid for
+    # BatchEncoding or Tensor objects.
+    model_device = _get_model_device(model, device)
+    processed = processed.to(model_device)
 
     # L4: single forward pass
     with torch.no_grad():
@@ -462,8 +483,9 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     # Load and preprocess audio
     audio_path = Path("testdata") / case.audio[0]
     audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
+    model_device = _get_model_device(model, device)
     processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
-        device
+        model_device
     )
     input_features = processed["input_features"]
 
@@ -471,7 +493,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     decoder_start_id = (
         model.config.decoder_start_token_id or model.generation_config.decoder_start_token_id
     )
-    decoder_input_ids = torch.tensor([[decoder_start_id]], dtype=torch.long, device=device)
+    decoder_input_ids = torch.tensor([[decoder_start_id]], dtype=torch.long, device=model_device)
     with torch.no_grad():
         outputs = model(
             input_features=input_features,
@@ -631,10 +653,16 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
             Qwen3ASRForConditionalGeneration,
         )
 
-        model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            case.model_id, torch_dtype=torch.float32
-        )
-        model = model.to(device).eval()
+        if device == "auto":
+            model = Qwen3ASRForConditionalGeneration.from_pretrained(
+                case.model_id, torch_dtype=torch.float32, device_map=device
+            )
+        else:
+            model = Qwen3ASRForConditionalGeneration.from_pretrained(
+                case.model_id, torch_dtype=torch.float32
+            )
+            model = model.to(device)
+        model.eval()
         processor = transformers.AutoProcessor.from_pretrained(
             case.model_id, trust_remote_code=True
         )
@@ -690,11 +718,12 @@ def _prepare_speech_language_inputs(
         if case.prompts:
             force_prefix = case.prompts[0]
             text_prompt = text_prompt + force_prefix
+        model_device = _get_model_device(model, device)
         processed = processor(
             text=text_prompt,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(device)
+        ).to(model_device)
         prompt_for_golden = force_prefix or str(audio_path)
     else:
         # Gemma4-style: text prompt + audio
@@ -708,11 +737,12 @@ def _prepare_speech_language_inputs(
             prompt_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+        model_device = _get_model_device(model, device)
         processed = processor(
             text=prompt_text,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(device)
+        ).to(model_device)
         prompt_for_golden = case.prompts[0]
 
     return processed, prompt_for_golden
@@ -1053,7 +1083,8 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
         call_kwargs["audios"] = audios
     call_kwargs["return_tensors"] = "pt"
 
-    processed = processor(**call_kwargs).to(device)
+    model_device = _get_model_device(model, device)
+    processed = processor(**call_kwargs).to(model_device)
 
     # L4: single forward pass for prefill logits
     with torch.no_grad():
@@ -1093,13 +1124,13 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
                             1,
                             kv_len + 1,
                             dtype=torch.long,
-                            device=device,
+                            device=model_device,
                         ),
                     )
             next_id = int(out.logits[0, -1, :].argmax())
             past_kv = out.past_key_values
             gen_ids.append(next_id)
-            cur_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            cur_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=model_device)
             # Stop on EOS
             eos = getattr(model.config, "eos_token_id", None)
             if eos is not None and next_id == eos:
