@@ -48,7 +48,12 @@ from mobius._testing.torch_reference import (
 
 def _get_test_device() -> str:
     """Return 'cuda' if MOBIUS_TEST_DEVICE=cuda, else 'cpu'."""
-    return os.environ.get("MOBIUS_TEST_DEVICE", "cpu")
+    return os.environ.get("MOBIUS_TEST_DEVICE", "cpu").strip().lower()
+
+
+def _make_session(model, **kwargs) -> OnnxModelSession:
+    """Create an OnnxModelSession with the test device."""
+    return OnnxModelSession(model, device=_get_test_device(), **kwargs)
 
 
 def _model_accessible(model_id: str) -> bool:
@@ -134,9 +139,6 @@ _TEXT_MODELS = [
         "bigscience/bloom-560m",
         False,
         id="bloom-560m",
-        marks=pytest.mark.skip(
-            reason="lm_head.weight not properly initialized (weight tying bug)"
-        ),
     ),
     # Falcon (ALiBi attention, multi-query)
     pytest.param(
@@ -242,7 +244,7 @@ class TestForwardNumerical:
 
         torch_logits, _ = torch_forward(torch_model, input_ids, attention_mask, position_ids)
 
-        session = OnnxModelSession(onnx_model, device=_get_test_device())
+        session = _make_session(onnx_model)
         feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         onnx_outputs = session.run(feeds)
         session.close()
@@ -267,7 +269,7 @@ class TestForwardNumerical:
             torch_model, input_ids, attention_mask, position_ids
         )
 
-        session = OnnxModelSession(onnx_model, device=_get_test_device())
+        session = _make_session(onnx_model)
         feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         onnx_out_1 = session.run(feeds)
 
@@ -316,7 +318,7 @@ class TestGreedyGeneration:
         input_ids = tokens["input_ids"].astype(np.int64)
         max_new = 20
 
-        session = OnnxModelSession(onnx_model, device=_get_test_device())
+        session = _make_session(onnx_model)
         generator = OnnxGenerator(session, config)
         onnx_ids = generator.generate(
             input_ids,
@@ -432,7 +434,7 @@ class TestVLTextForward:
             position_ids,
         )
 
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         onnx_outputs = session.run(feeds)
         session.close()
@@ -474,7 +476,7 @@ class TestVLTextForward:
             position_ids,
         )
 
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         onnx_out_1 = session.run(feeds)
 
@@ -536,7 +538,7 @@ class TestVLTextGeneration:
         input_ids = tokens["input_ids"].astype(np.int64)
         max_new = 20
 
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         generator = OnnxGenerator(session, config)
         onnx_ids = generator.generate(
             input_ids,
@@ -666,7 +668,7 @@ class TestVLFullForward:
             feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
             feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
 
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         onnx_out = session.run(feeds)
         session.close()
 
@@ -768,7 +770,7 @@ class TestVLFullForward:
             vl_feeds[f"past_key_values.{i}.key"] = np.zeros(kv_shape, dtype=np.float32)
             vl_feeds[f"past_key_values.{i}.value"] = np.zeros(kv_shape, dtype=np.float32)
 
-        vl_session = OnnxModelSession(onnx_vl_model)
+        vl_session = _make_session(onnx_vl_model)
         prefill_out = vl_session.run(vl_feeds)
         vl_session.close()
 
@@ -777,7 +779,7 @@ class TestVLFullForward:
         # the raw sequence position — use the last MRoPE position + offset.
         # All 3 MRoPE dims are equal for text tokens, so 1D RoPE works.
         last_mrope_pos = int(position_ids[0, 0, -1])  # position_ids: (3, 1, seq)
-        text_session = OnnxModelSession(onnx_text_model)
+        text_session = _make_session(onnx_text_model)
         generated_tokens = []
         seq_len = input_ids.shape[1]
         past_kv = {}
@@ -902,7 +904,7 @@ class TestQwen25VL3Model:
 
         # ONNX: embedding → dummy image features (no images in text-only)
         # Pass at least 1 dummy row since Gather runs eagerly
-        embedding_session = OnnxModelSession(pkg["embedding"])
+        embedding_session = _make_session(pkg["embedding"])
         embed_feeds = {
             "input_ids": input_ids,
             "image_features": np.zeros((1, config.hidden_size), dtype=np.float32),
@@ -912,7 +914,7 @@ class TestQwen25VL3Model:
         inputs_embeds = embed_out["inputs_embeds"]
 
         # ONNX: decoder
-        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_session = _make_session(pkg["decoder"])
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -974,7 +976,7 @@ class TestQwen25VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
@@ -997,7 +999,7 @@ class TestQwen25VL3Model:
         # Step 2: ONNX embedding model — fuse text + image features
         input_ids = hf_inputs["input_ids"].numpy().astype(np.int64)
 
-        embedding_session = OnnxModelSession(pkg["embedding"])
+        embedding_session = _make_session(pkg["embedding"])
         embed_out = embedding_session.run(
             {
                 "input_ids": input_ids,
@@ -1027,7 +1029,7 @@ class TestQwen25VL3Model:
         position_ids = position_ids_3d.numpy().astype(np.int64)
         attention_mask = hf_inputs["attention_mask"].numpy().astype(np.int64)
 
-        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_session = _make_session(pkg["decoder"])
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -1094,7 +1096,7 @@ class TestQwen25VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         vision_out = vision_session.run({"pixel_values": pixel_values, "grid_thw": grid_thw})
         vision_session.close()
         onnx_features = vision_out["image_features"]
@@ -1178,7 +1180,6 @@ class TestQwen3VL3Model:
         """Decoder + embedding produce logits matching HF text-only forward."""
         import numpy as np
 
-        from mobius._testing.ort_inference import OnnxModelSession
         from mobius._testing.torch_reference import (
             load_torch_multimodal_model,
         )
@@ -1206,7 +1207,7 @@ class TestQwen3VL3Model:
         hf_logits = hf_out.logits.numpy()
 
         # Run ONNX: first embedding, then decoder
-        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_sess = _make_session(pkg["embedding"])
         image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
         embed_out = embed_sess.run(
             {
@@ -1216,7 +1217,7 @@ class TestQwen3VL3Model:
         )
         inputs_embeds = embed_out["inputs_embeds"]
 
-        decoder_sess = OnnxModelSession(pkg["decoder"])
+        decoder_sess = _make_session(pkg["decoder"])
         past_kv = {}
         for i in range(config.num_hidden_layers):
             past_kv[f"past_key_values.{i}.key"] = np.zeros(
@@ -1281,7 +1282,7 @@ class TestQwen3VL3Model:
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
@@ -1293,7 +1294,7 @@ class TestQwen3VL3Model:
 
         # Step 2: Embedding model
         input_ids = hf_inputs["input_ids"].numpy().astype(np.int64)
-        embedding_session = OnnxModelSession(pkg["embedding"])
+        embedding_session = _make_session(pkg["embedding"])
         embed_out = embedding_session.run(
             {
                 "input_ids": input_ids,
@@ -1316,7 +1317,7 @@ class TestQwen3VL3Model:
         position_ids = position_ids_3d.numpy().astype(np.int64)
         attention_mask = hf_inputs["attention_mask"].numpy().astype(np.int64)
 
-        decoder_sess = OnnxModelSession(pkg["decoder"])
+        decoder_sess = _make_session(pkg["decoder"])
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -1422,7 +1423,7 @@ class TestMistral3VL3Model:
         hf_logits = hf_out.logits.numpy()
 
         # ONNX: embedding (no image features for text-only)
-        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_sess = _make_session(pkg["embedding"])
         image_features = np.zeros((1, config.hidden_size), dtype=np.float32)
         embed_out = embed_sess.run(
             {
@@ -1434,7 +1435,7 @@ class TestMistral3VL3Model:
         inputs_embeds = embed_out["inputs_embeds"]
 
         # ONNX: decoder
-        decoder_sess = OnnxModelSession(pkg["decoder"])
+        decoder_sess = _make_session(pkg["decoder"])
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -1491,7 +1492,7 @@ class TestMistral3VL3Model:
         # Step 1: ONNX vision model — pixel_values → image_features
         pixel_values = hf_inputs["pixel_values"].numpy().astype(np.float32)
 
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         vision_out = vision_session.run({"pixel_values": pixel_values})
         vision_session.close()
         image_features = vision_out["image_features"]
@@ -1499,7 +1500,7 @@ class TestMistral3VL3Model:
         # Step 2: ONNX embedding model — fuse text + image features
         input_ids = hf_inputs["input_ids"].numpy().astype(np.int64)
 
-        embedding_session = OnnxModelSession(pkg["embedding"])
+        embedding_session = _make_session(pkg["embedding"])
         embed_out = embedding_session.run(
             {
                 "input_ids": input_ids,
@@ -1520,7 +1521,7 @@ class TestMistral3VL3Model:
         seq_len = input_ids.shape[1]
         position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
 
-        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_session = _make_session(pkg["decoder"])
         decoder_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
@@ -1597,7 +1598,7 @@ class TestMistral3VL3Model:
             )
 
         # ONNX vision model
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         onnx_out = vision_session.run({"pixel_values": pixel_values.astype(np.float32)})
         vision_session.close()
         onnx_features = onnx_out["image_features"].astype(np.float32)
@@ -1629,7 +1630,7 @@ class TestMistral3VL3Model:
         rng = np.random.RandomState(42)
         r1 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
         r2 = rng.randn(1, 3, new_h, new_w).astype(np.float32)
-        vision_session = OnnxModelSession(pkg["vision_encoder"])
+        vision_session = _make_session(pkg["vision_encoder"])
         o1 = vision_session.run({"pixel_values": r1})["image_features"].flatten()
         o2 = vision_session.run({"pixel_values": r2})["image_features"].flatten()
         vision_session.close()
@@ -1694,7 +1695,7 @@ class TestEncoderOnlyForward:
             torch_model, input_ids, attention_mask, token_type_ids
         )
 
-        session = OnnxModelSession(onnx_model, device=_get_test_device())
+        session = _make_session(onnx_model)
         feeds: dict[str, np.ndarray] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -1756,7 +1757,7 @@ class TestSeq2SeqForward:
 
         torch_enc = torch_seq2seq_encoder_forward(torch_model, input_ids, attention_mask)
 
-        encoder_session = OnnxModelSession(pkg["encoder"])
+        encoder_session = _make_session(pkg["encoder"])
         feeds = {"input_ids": input_ids, "attention_mask": attention_mask}
         onnx_enc = encoder_session.run(feeds)
         encoder_session.close()
@@ -1805,7 +1806,7 @@ class TestSeq2SeqForward:
         num_heads = hf_config.num_attention_heads
         head_dim = hf_config.d_model // num_heads
 
-        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_session = _make_session(pkg["decoder"])
         feeds: dict[str, np.ndarray] = {
             "input_ids": decoder_input_ids,
             "encoder_hidden_states": enc_hidden,
@@ -1882,7 +1883,7 @@ class TestVisionForward:
 
         torch_hidden = torch_vision_forward(torch_model, pixel_values)
 
-        session = OnnxModelSession(onnx_model, device=_get_test_device())
+        session = _make_session(onnx_model)
         feeds = {"pixel_values": pixel_values}
         onnx_outputs = session.run(feeds)
         session.close()
@@ -1941,7 +1942,7 @@ class TestAudioForward:
 
         torch_hidden = torch_audio_forward(torch_model, input_values)
 
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         feeds = {"input_values": input_values}
         onnx_outputs = session.run(feeds)
         session.close()
@@ -1966,7 +1967,6 @@ class TestQwenImageVAEDecoder:
     @pytest.mark.integration_fast
     def test_decoder_matches_diffusers(self):
         """Decode a random latent and compare outputs."""
-        pytest.importorskip("diffusers")
         import onnx_ir
         import onnxruntime as ort
         from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
@@ -2136,7 +2136,7 @@ def _build_and_compare_qwen35(hf_model, text_config, onnx_module_cls):
             )
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_outputs = session.run(feeds)
     session.close()
 
@@ -2266,7 +2266,7 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
             )
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_outputs = session.run(feeds)
     session.close()
 
@@ -2275,9 +2275,6 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
 
 @pytest.mark.integration
 @pytest.mark.integration_fast
-@pytest.mark.skip(
-    reason="CausalConvWithState custom op not registered in current ORT; requires ort-extensions or newer ORT"
-)
 def test_qwen3_next_prefill_logits_match():
     """Qwen3-Coder-Next (hybrid DeltaNet + attention + MoE) vs HuggingFace."""
     try:
@@ -2365,7 +2362,7 @@ def _build_and_compare_deepseek(hf_model, config, onnx_module_cls):
             shape = (1, arch_config.num_key_value_heads, 0, v_head_dim)
             feeds[name] = np.zeros(shape, dtype=np.float32)
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_outputs = session.run(feeds)
     session.close()
 
@@ -2517,37 +2514,11 @@ def _build_sam_onnx_model(
 def _map_hf_sam_weights_to_onnx(hf_state_dict):
     """Map HuggingFace SamVisionEncoder weights to our SAM parameter names.
 
-    HF → ONNX mappings:
-    - patch_embed.projection.* → patch_embed.proj.*
-    - layers.N.layer_norm1.* → blocks.N.norm1.*
-    - layers.N.layer_norm2.* → blocks.N.norm2.*
-    - layers.N.attn.* → blocks.N.attn.* (attn sublayer names match)
-    - layers.N.mlp.* → blocks.N.mlp.* (mlp sublayer names match)
-    - neck.conv1.* → neck.0.* (conv weight only, no bias)
-    - neck.layer_norm1.* → neck.1.* (weight + bias)
-    - neck.conv2.* → neck.2.* (conv weight only, no bias)
-    - neck.layer_norm2.* → neck.3.* (weight + bias)
+    Delegates to the canonical rename function in the SAM component module.
     """
-    renamed = {}
-    for key, value in hf_state_dict.items():
-        new_key = key
-        # patch_embed.projection → patch_embed.proj (our nn.Parameter names)
-        new_key = new_key.replace("patch_embed.projection.", "patch_embed.proj.")
-        # Neck conv/layernorm to indexed (do BEFORE generic layer_norm rename)
-        new_key = new_key.replace("neck.conv1.", "neck.0.")
-        new_key = new_key.replace("neck.layer_norm1.", "neck.1.")
-        new_key = new_key.replace("neck.conv2.", "neck.2.")
-        new_key = new_key.replace("neck.layer_norm2.", "neck.3.")
-        # layers → blocks
-        new_key = new_key.replace("layers.", "blocks.")
-        # Block-level: layer_norm1 → norm1, layer_norm2 → norm2
-        new_key = new_key.replace(".layer_norm1.", ".norm1.")
-        new_key = new_key.replace(".layer_norm2.", ".norm2.")
-        # MLP: HF lin1/lin2 → ONNX FCMLP up_proj/down_proj
-        new_key = new_key.replace(".mlp.lin1.", ".mlp.up_proj.")
-        new_key = new_key.replace(".mlp.lin2.", ".mlp.down_proj.")
-        renamed[new_key] = value
-    return renamed
+    from mobius.components._sam_vision import preprocess_sam_encoder_weights
+
+    return preprocess_sam_encoder_weights(hf_state_dict)
 
 
 @pytest.mark.integration
@@ -2634,7 +2605,7 @@ def test_sam_vit_encoder_features_match():
     hf_features = hf_out.last_hidden_state.numpy()
 
     # Run ONNX forward
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_out = session.run({"pixel_values": pixel_values_np})
     session.close()
     onnx_features = onnx_out["image_features"]
@@ -2885,7 +2856,7 @@ def test_ocr2_3model_graph_all_weights_assigned():
 
     # Verify all models run through ORT without error
     for model_name, onnx_model in pkg.items():
-        session = OnnxModelSession(onnx_model)
+        session = _make_session(onnx_model)
         feeds = {}
         seq_len = 4
         for inp in onnx_model.graph.inputs:
@@ -2975,7 +2946,7 @@ class TestWhisperForward:
 
         torch_hidden = torch_whisper_encoder_forward(torch_model, input_features)
 
-        encoder_session = OnnxModelSession(pkg["encoder"])
+        encoder_session = _make_session(pkg["encoder"])
         feeds = {"input_features": input_features}
         onnx_enc = encoder_session.run(feeds)
         encoder_session.close()
@@ -3024,7 +2995,7 @@ class TestWhisperForward:
         head_dim = hf_config.d_model // num_heads
         position_ids = np.zeros((1, 1), dtype=np.int64)
 
-        decoder_session = OnnxModelSession(pkg["decoder"])
+        decoder_session = _make_session(pkg["decoder"])
         feeds: dict[str, np.ndarray] = {
             "decoder_input_ids": decoder_input_ids,
             "encoder_hidden_states": enc_hidden,
@@ -3261,7 +3232,7 @@ def test_qwen35_vl_3model_builds_and_runs():
                 init.const_value = ir.Tensor(rng.standard_normal(shape).astype(np.float32))
 
     # Run embedding model with a single token (DeltaNet = decode-only)
-    embed_sess = OnnxModelSession(pkg["embedding"])
+    embed_sess = _make_session(pkg["embedding"])
     input_ids = np.array([[1]], dtype=np.int64)
     image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
     embed_out = embed_sess.run({"input_ids": input_ids, "image_features": image_features})
@@ -3270,7 +3241,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     assert embed_out["inputs_embeds"].shape == (1, 1, config.hidden_size)
 
     # Run decoder model (seq_len=1 since DeltaNet is decode-only)
-    decoder_sess = OnnxModelSession(pkg["decoder"])
+    decoder_sess = _make_session(pkg["decoder"])
     feeds: dict[str, np.ndarray] = {
         "inputs_embeds": embed_out["inputs_embeds"],
         "attention_mask": np.ones((1, 1), dtype=np.int64),
@@ -3391,7 +3362,7 @@ def test_qwen35_vl_deltanet_state_carry():
             shape = [d if isinstance(d, int) else 1 for d in init.shape]
             init.const_value = ir.Tensor(rng.standard_normal(shape).astype(np.float32))
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
 
     # DeltaNet cache dimensions
     num_k_heads = config.linear_num_key_heads
@@ -3646,7 +3617,7 @@ def test_qwen35_vl_3model_text_only_parity():
         ).logits.numpy()
 
     # ONNX: embedding model
-    embed_sess = OnnxModelSession(pkg["embedding"])
+    embed_sess = _make_session(pkg["embedding"])
     embed_out = embed_sess.run(
         {
             "input_ids": input_ids,
@@ -3659,7 +3630,7 @@ def test_qwen35_vl_3model_text_only_parity():
     embed_sess.close()
 
     # ONNX: decoder model
-    decoder_sess = OnnxModelSession(pkg["decoder"])
+    decoder_sess = _make_session(pkg["decoder"])
     feeds: dict[str, np.ndarray] = {
         "inputs_embeds": embed_out["inputs_embeds"],
         "attention_mask": attention_mask,
@@ -3775,7 +3746,7 @@ def test_qwen35_vl_vision_features_match():
     hf_features = hf_visual_out.pooler_output.numpy()
 
     # ONNX vision forward
-    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    vision_session = _make_session(pkg["vision_encoder"])
     vision_out = vision_session.run(
         {
             "pixel_values": pixel_values.numpy().astype(np.float32),
@@ -3826,13 +3797,10 @@ def test_qwen35_deltanet_single_layer_parity():
 
     try:
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
-            Qwen3_5DynamicCache,
             Qwen3_5GatedDeltaNet,
         )
     except ImportError:
-        pytest.skip(
-            "Qwen3_5DynamicCache/Qwen3_5GatedDeltaNet not available in this transformers version"
-        )
+        pytest.skip("Qwen3_5GatedDeltaNet not available in this transformers version")
 
     from mobius._weight_loading import apply_weights
     from mobius.components._gated_deltanet import (
@@ -3959,13 +3927,13 @@ def test_qwen35_deltanet_single_layer_parity():
     ).astype(np.float32)
 
     # HF forward (single-token decode with pre-filled cache)
-    cache = Qwen3_5DynamicCache(tc)
+    cache = DynamicCache(config=tc)
     # HF conv_state shape is (batch, conv_dim, conv_kernel_size) —
     # pad with one extra left position vs ONNX (kernel_size - 1)
-    cache.conv_states[0] = torch.from_numpy(
+    cache.layers[0].conv_states = torch.from_numpy(
         np.pad(conv_np, ((0, 0), (0, 0), (1, 0))),
     ).float()
-    cache.recurrent_states[0] = torch.from_numpy(rec_np).float()
+    cache.layers[0].recurrent_states = torch.from_numpy(rec_np).float()
     # has_previous_state is True once conv_states[0] is set
 
     with torch.no_grad():
@@ -3974,10 +3942,10 @@ def test_qwen35_deltanet_single_layer_parity():
             cache_params=cache,
             cache_position=torch.tensor([conv_kernel - 1]),
         ).numpy()
-    hf_rec = cache.recurrent_states[0].numpy()
+    hf_rec = cache.layers[0].recurrent_states.numpy()
 
     # ONNX forward
-    sess = OnnxModelSession(onnx_model)
+    sess = _make_session(onnx_model)
     onnx_out = sess.run(
         {
             "hidden_states": hidden_np,
@@ -4060,7 +4028,6 @@ def _run_generation_test(
     from mobius._configs import ArchitectureConfig
     from mobius._registry import registry
     from mobius._testing.generation import OnnxGenerator
-    from mobius._testing.ort_inference import OnnxModelSession
     from mobius.tasks import get_task
 
     overrides = dict(config_overrides or {})
@@ -4097,7 +4064,7 @@ def _run_generation_test(
     _fill_random_weights(onnx_model, rng)
 
     # Create ORT session and generator
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     generator = OnnxGenerator(session, config)
 
     # Prompt: 3 random tokens
@@ -4309,7 +4276,7 @@ class TestBlip2VL:
     def test_blip2_vision_model(self):
         """Vision model: pixel_values -> image_features via ViT + Q-Former."""
         pkg, config = self._build_blip2()
-        session = OnnxModelSession(pkg["vision_encoder"])
+        session = _make_session(pkg["vision_encoder"])
 
         rng = np.random.default_rng(123)
         img_size = config.vision.image_size if config.vision else None
@@ -4327,7 +4294,7 @@ class TestBlip2VL:
     def test_blip2_embedding_model(self):
         """Embedding model: input_ids + image_features -> inputs_embeds."""
         pkg, config = self._build_blip2()
-        session = OnnxModelSession(pkg["embedding"])
+        session = _make_session(pkg["embedding"])
 
         rng = np.random.default_rng(456)
         input_ids = rng.integers(0, config.vocab_size, size=(1, 5)).astype(np.int64)
@@ -4351,7 +4318,7 @@ class TestBlip2VL:
     def test_blip2_decoder_model(self):
         """Decoder model: inputs_embeds -> logits + KV cache."""
         pkg, config = self._build_blip2()
-        session = OnnxModelSession(pkg["decoder"])
+        session = _make_session(pkg["decoder"])
 
         rng = np.random.default_rng(789)
         seq_len = 3
@@ -4682,7 +4649,7 @@ def test_internvl2_3model_parity():
         ref_image_features = ref_mlp1(shuffled).numpy()
 
     # ONNX vision
-    vision_sess = OnnxModelSession(pkg["vision_encoder"])
+    vision_sess = _make_session(pkg["vision_encoder"])
     onnx_vision_out = vision_sess.run({"pixel_values": pixel_values})
     vision_sess.close()
     onnx_image_features = onnx_vision_out["image_features"]
@@ -4716,7 +4683,7 @@ def test_internvl2_3model_parity():
         ref_inputs_embeds = torch.where(mask_3d, gathered, ref_text_embeds).numpy()
 
     # ONNX embedding — image_features is 2D (num_tokens, hidden_size)
-    embed_sess = OnnxModelSession(pkg["embedding"])
+    embed_sess = _make_session(pkg["embedding"])
     onnx_embed_out = embed_sess.run(
         {
             "input_ids": input_ids,
@@ -4749,7 +4716,7 @@ def test_internvl2_3model_parity():
         ).logits.numpy()
 
     # ONNX decoder
-    decoder_sess = OnnxModelSession(pkg["decoder"])
+    decoder_sess = _make_session(pkg["decoder"])
     feeds: dict[str, np.ndarray] = {
         "inputs_embeds": onnx_inputs_embeds,
         "attention_mask": attention_mask,
@@ -4793,7 +4760,6 @@ def test_bamba_prefill_logits_match():
     from mobius import build_from_module
     from mobius._configs import BambaConfig
     from mobius._testing.comparison import assert_logits_close
-    from mobius._testing.ort_inference import OnnxModelSession
     from mobius._weight_loading import apply_weights
     from mobius.models.bamba import BambaCausalLMModel
 
@@ -4868,7 +4834,7 @@ def test_bamba_prefill_logits_match():
                 shape.append(0)
         feeds[name] = np.zeros(shape, dtype=np.float32)
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_outputs = session.run(feeds)
     session.close()
 
@@ -4966,7 +4932,7 @@ def test_bert_hidden_states_parity():
         )
         hf_hidden = hf_out.last_hidden_state.numpy()
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_out = session.run(feeds)
     session.close()
 
@@ -5042,7 +5008,7 @@ def test_distilbert_hidden_states_parity():
         )
         hf_hidden = hf_out.last_hidden_state.numpy()
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_out = session.run(feeds)
     session.close()
 
@@ -5124,7 +5090,7 @@ def test_roberta_hidden_states_parity():
         )
         hf_hidden = hf_out.last_hidden_state.numpy()
 
-    session = OnnxModelSession(onnx_model)
+    session = _make_session(onnx_model)
     onnx_out = session.run(feeds)
     session.close()
 
@@ -5251,7 +5217,7 @@ def test_gemma4_e2b_text_prefill():
     hf_logits = hf_out.logits.numpy()  # [1, seq_len, vocab_size]
 
     # ONNX inference
-    session = OnnxModelSession(pkg["model"])
+    session = _make_session(pkg["model"])
     feeds = _make_gemma4_prefill_feeds(gemma4_config, input_ids, attention_mask, position_ids)
     onnx_outputs = session.run(feeds)
     session.close()
@@ -5269,9 +5235,6 @@ def test_gemma4_e2b_text_prefill():
 
 @pytest.mark.integration
 @pytest.mark.integration_slow
-@pytest.mark.skip(
-    reason="ORT bf16 type mismatch: Add op receives bfloat16 and float inputs; needs graph-level cast fix"
-)
 def test_gemma4_e2b_text_prefill_bf16():
     """Gemma 4 E2B text-only prefill in bfloat16: ONNX logits match HuggingFace.
 
@@ -5363,7 +5326,7 @@ def test_gemma4_e2b_text_prefill_bf16():
         )
 
     # ONNX inference
-    session = OnnxModelSession(pkg["model"])
+    session = _make_session(pkg["model"])
     onnx_outputs = session.run(feeds)
     session.close()
     # ONNX returns bfloat16; convert to float32 for numerical comparison
