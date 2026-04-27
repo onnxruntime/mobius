@@ -254,50 +254,8 @@ def _write_audio_processor_config(
 
     if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 USM-style 128-dim log-mel spectrogram.
-        # Values from ort-extensions Gemma4LogMel kernel.
-        processor: dict[str, Any] = {
-            "processor": {
-                "name": "gemma4_audio_processor",
-                "sample_rate": 16000,
-                "num_mel_bins": 128,
-                "frame_length_ms": 20,
-                "frame_step_ms": 10,
-                "fft_size": 512,
-                "mel_floor": 0.001,
-                "mel_upper_hertz": 8000,
-            }
-        }
-    else:
-        # Generic audio processor — add model-specific branches as needed.
-        return None
-
-    path = os.path.join(output_dir, "audio_processor.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(processor, f, indent=4)
-    return path
-
-
-def _write_audio_processor_config(
-    config: Any,
-    output_dir: str,
-) -> str | None:
-    """Write the audio feature extraction config for models with speech support.
-
-    For Gemma4: writes ``audio_feature_extraction.json`` with the
-    onnxruntime-extensions feature extraction pipeline
-    (``AudioDecoder → Gemma4LogMel``).
-
-    Returns the written file path, or None if the config has no audio section.
-    """
-    audio = getattr(config, "audio", None)
-    if audio is None:
-        return None
-
-    model_type = getattr(config, "model_type", "")
-
-    if model_type in ("gemma4", "gemma4_text"):
-        # Gemma4 audio uses onnxruntime-extensions Gemma4LogMel feature extractor
-        audio_config: dict[str, Any] = {
+        # OrtxCreateSpeechFeatureExtractor requires the feature_extraction.sequence format.
+        processor = {
             "feature_extraction": {
                 "sequence": [
                     {
@@ -311,16 +269,16 @@ def _write_audio_processor_config(
                             "name": "gemma4_log_mel",
                             "type": "Gemma4LogMel",
                             "attrs": {
-                                "feature_size": getattr(audio, "feature_size", 128),
-                                "sampling_rate": getattr(audio, "sampling_rate", 16000),
+                                "feature_size": 128,
+                                "sampling_rate": 16000,
                                 "frame_length_ms": 20.0,
                                 "hop_length_ms": 10.0,
-                                "min_frequency": getattr(audio, "min_frequency", 0.0),
-                                "max_frequency": getattr(audio, "max_frequency", 8000.0),
-                                "preemphasis": getattr(audio, "preemphasis", 0.0),
+                                "min_frequency": 0.0,
+                                "max_frequency": 8000.0,
+                                "preemphasis": 0.0,
                                 "preemphasis_htk_flavor": 1,
                                 "fft_overdrive": 0,
-                                "mel_floor": getattr(audio, "mel_floor", 0.001),
+                                "mel_floor": 0.001,
                             },
                         }
                     },
@@ -329,11 +287,12 @@ def _write_audio_processor_config(
         }
         proc_filename = "audio_feature_extraction.json"
     else:
+        # Generic audio processor — add model-specific branches as needed.
         return None
 
     path = os.path.join(output_dir, proc_filename)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(audio_config, f, indent=4)
+        json.dump(processor, f, indent=4)
     return path
 
 
@@ -394,13 +353,13 @@ def _write_genai_config(
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
             model_type = getattr(config, "model_type", "")
-            if has_speech:
-                vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "image_processor.json"
-            elif model_type in _GEMMA4_MODEL_TYPES:
+            if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 sms = getattr(vision_cfg, "spatial_merge_size", 2)
                 vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "image_processor.json"
+            elif has_speech:
+                vision_kwargs["spatial_merge_size"] = None
                 vision_kwargs["config_filename"] = "image_processor.json"
 
             if vision_input_mapping is not None:
@@ -422,7 +381,17 @@ def _write_genai_config(
         boa_token_id = getattr(config, "boa_token_id", None)
 
         audio_kwargs: dict[str, Any] = {}
-        if audio_input_mapping is not None:
+        model_type = getattr(config, "model_type", "")
+        if model_type in _GEMMA4_MODEL_TYPES:
+            # Gemma4 audio encoder uses different filename and config
+            audio_kwargs["filename"] = "audio_encoder/model.onnx"
+            audio_kwargs["config_filename"] = "audio_feature_extraction.json"
+            # Gemma4 speech model input is 'input_features' + 'input_features_mask'
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
+        elif audio_input_mapping is not None:
             audio_kwargs["input_names"] = audio_input_mapping
         generator.with_audio(
             audio_token_id=audio_token_id,
