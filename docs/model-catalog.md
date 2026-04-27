@@ -28,7 +28,7 @@ Standard autoregressive language models using rotary position embeddings.
 | `phi3` | `Phi3CausalLMModel` | `microsoft/Phi-3-mini-4k-instruct` |
 | `phi3small` | `Phi3SmallCausalLMModel` | `microsoft/Phi-3-small-8k-instruct` |
 | `smollm3` | `SmolLM3CausalLMModel` | `HuggingFaceTB/SmolLM3-3B` |
-| `qwen3_5_text` | `Qwen35CausalLMModel` | `Qwen/Qwen3.5-VL-32B` |
+| `qwen3_5_text` | `Qwen35CausalLMModel` | `Qwen/Qwen3.5-2B` |
 | `falcon` | `FalconCausalLMModel` | `tiiuae/falcon-7b` |
 | `bloom` | `FalconCausalLMModel` | `bigscience/bloom-560m` |
 | `mpt` | `FalconCausalLMModel` | `mosaicml/mpt-7b` |
@@ -116,7 +116,7 @@ Models that process both images and text.
 | `qwen2_vl` | `Qwen25VLCausalLMModel` | `qwen-vl` | `Qwen/Qwen2-VL-7B-Instruct` |
 | `qwen2_5_vl` | `Qwen25VLCausalLMModel` | `qwen-vl` | `Qwen/Qwen2.5-VL-3B-Instruct` |
 | `qwen3_vl` | `Qwen3VL3ModelCausalLMModel` | `qwen-vl` | `Qwen/Qwen3-VL-2B-Instruct` |
-| `qwen3_5_vl` | `Qwen35VL3ModelCausalLMModel` | `hybrid-qwen-vl` | — |
+| `qwen3_5_vl` | `Qwen35VL3ModelCausalLMModel` | `hybrid-qwen-vl` | `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.6-27B` |
 | `gemma3_multimodal` | `Gemma3MultiModalModel` | `vision-language` | `google/gemma-3-4b-it` |
 | `mllama` | `MllamaCausalLMModel` | `mllama-vision-language` | `meta-llama/Llama-3.2-11B-Vision` |
 | `phi4mm` | `Phi4MMMultiModalModel` | `multimodal` | `microsoft/Phi-4-multimodal-instruct` |

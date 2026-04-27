@@ -32,6 +32,7 @@ transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
     "accelerate",
+    "diffusers",
     "onnxruntime-easy>=0.1.1",
     "torch",
     "transformers>=5.0",
