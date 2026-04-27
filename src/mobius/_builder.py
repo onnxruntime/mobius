@@ -108,11 +108,14 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
 _MODEL_ROLE_MAP: dict[str, str] = {
     "model": "decoder",
     "decoder": "decoder",
-    "vision": "vision",
+    "vision_encoder": "vision",
     "embedding": "embedding",
     "encoder": "encoder",
     # Audio sub-models are encoder-role; must not receive decoder-only fusions.
     "audio_encoder": "encoder",
+    # Backward compatibility aliases (deprecated — will be removed)
+    "vision": "vision",
+    "audio": "encoder",
     "speech": "encoder",
 }
 

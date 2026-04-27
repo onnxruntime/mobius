@@ -1,6 +1,6 @@
-# processor_config.json — Complete Field Reference
+# image_processor.json — Complete Field Reference
 
-This document is the exhaustive reference for the `processor_config.json` file
+This document is the exhaustive reference for the `image_processor.json` file
 used by ort-extensions image processors. For an overview, see the parent
 [SKILL.md](../SKILL.md).
 
@@ -9,9 +9,9 @@ used by ort-extensions image processors. For an overview, see the parent
 ## Format: ort-extensions vs HuggingFace
 
 > **Critical:** ORT GenAI expects the ort-extensions format — NOT the
-> HuggingFace `processor_config.json` format. The HF format wraps data under
-> `"image_processor"` with different keys; ORT extensions expects a `"processor"`
-> key with an ordered transform pipeline.
+> HuggingFace format (HF's `preprocessor_config.json` wraps data under
+> `"image_processor"` with different keys). The ort-extensions
+> `image_processor.json` expects a `"processor"` key with an ordered transform pipeline.
 
 ---
 
@@ -139,7 +139,7 @@ processor_config = {
 
 ---
 
-## Writing processor_config.json from HuggingFace
+## Writing image_processor.json from HuggingFace
 
 ```python
 def _write_processor_config(processor, output_dir):
@@ -171,6 +171,6 @@ def _write_processor_config(processor, output_dir):
             ],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
+    with open(os.path.join(output_dir, "image_processor.json"), "w") as f:
         json.dump(config, f, indent=2)
 ```

@@ -850,10 +850,10 @@ def main():
     # Step 2: Create 4 inference sessions and tokenizer
     # ------------------------------------------------------------------
     print("Creating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"])
-    speech_session = OnnxModelSession(pkg["speech"])
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    speech_session = OnnxModelSession(pkg["audio_encoder"])
     embedding_session = OnnxModelSession(pkg["embedding"])
-    decoder_session = OnnxModelSession(pkg["model"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.model_id, trust_remote_code=True

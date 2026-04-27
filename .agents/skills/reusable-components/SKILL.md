@@ -156,8 +156,22 @@ class TestMyComponent:
 | `GatedDeltaNet(config)` | Recurrent linear attention | Qwen3.5 hybrid; delta rule recurrence |
 | `RMSNorm(h, eps)` | Opset 23 `RMSNormalization` | `OffsetRMSNorm` for `1+weight` variant |
 | `LayerNorm(h, eps)` | `LayerNormalization` op | Check HF config for correct eps |
-| `ClippableLinear(in, out)` | Linear + learned input/output clipping | Critical for Gemma4 encoders |
+| `ClippableLinear(in, out)` | Linear + learned input/output clipping | Critical for Gemma4 vision/audio encoders |
 | `Embedding(V, D)` | Gather on weight matrix | |
+
+### Audio mask pattern
+
+Audio encoders that handle variable-length inputs (e.g. Gemma4) use a
+boolean mask pair:
+
+- **Input:** `input_features_mask: BOOL [B, T]` — contiguous, right-padded
+  mask indicating real vs padding frames.
+- **Output:** `audio_features_mask: BOOL [B, T//stride]` — downsampled
+  through conv stride (typically stride=4), passed to runtime for padding
+  stripping before token replacement.
+
+This is different from vision padding, which uses `(-1, -1)` sentinel
+position IDs instead of an explicit mask.
 
 > Read `references/component-examples.md` when you need detailed constructor
 > arguments, Attention/MLP/norm variant code, ClippableLinear weight mapping,

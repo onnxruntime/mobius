@@ -8,7 +8,7 @@ Two entry points:
 - :func:`write_ort_genai_config` — programmatic API. Takes an already-built
   :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
   ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
-  ``processor_config.json``) alongside the ONNX models.
+  ``image_processor.json``) alongside the ONNX models.
 
 - :func:`auto_export` — end-to-end convenience function. Builds the model
   from a HuggingFace ID, saves the ONNX files, then calls
@@ -42,6 +42,8 @@ import shutil
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import onnx_ir as ir
+
     from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
@@ -63,10 +65,51 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
 }
 
+_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+
+_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",  # SentencePiece
+    "added_tokens.json",
+    "merges.txt",  # BPE
+    "vocab.json",  # BPE
+    "chat_template.jinja",  # Chat template for ORT GenAI
+]
+
 
 def _resolve_ort_genai_model_type(model_type: str) -> str:
     """Map HuggingFace model_type to ORT-GenAI model type string."""
     return _ORT_GENAI_MODEL_TYPE.get(model_type, model_type)
+
+
+def _graph_input_names(model: ir.Model) -> list[str]:
+    """Return non-KV-cache input names from an ONNX model graph.
+
+    Filters out KV cache inputs (``past_key_values.*`` and ``past_*``)
+    since those are represented as template patterns in genai_config.json,
+    not as literal graph input names.
+    """
+    return [
+        inp.name
+        for inp in model.graph.inputs
+        if inp.name is not None
+        and not inp.name.startswith("past_key_values.")
+        and not inp.name.startswith("past_")
+    ]
+
+
+def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
+    """Return ``{name: name}`` identity mapping for a sub-model's inputs.
+
+    Returns ``None`` when *key* is absent from *pkg*, letting callers
+    fall back to hard-coded defaults.
+    """
+    model = pkg.get(key)
+    if model is None:
+        return None
+    return {n: n for n in _graph_input_names(model)}
 
 
 def _copy_tokenizer_files(
@@ -80,17 +123,8 @@ def _copy_tokenizer_files(
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError
 
-    tokenizer_files = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",  # SentencePiece
-        "added_tokens.json",
-        "merges.txt",  # BPE
-        "vocab.json",  # BPE
-    ]
     copied: list[str] = []
-    for filename in tokenizer_files:
+    for filename in _TOKENIZER_FILES:
         try:
             src = hf_hub_download(model_id, filename)
             dst = os.path.join(output_dir, filename)
@@ -119,17 +153,8 @@ def _copy_tokenizer_files_from_local(
             source_dir,
         )
         return []
-    tokenizer_files = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.model",  # SentencePiece
-        "added_tokens.json",
-        "merges.txt",  # BPE
-        "vocab.json",  # BPE
-    ]
     copied: list[str] = []
-    for filename in tokenizer_files:
+    for filename in _TOKENIZER_FILES:
         src = os.path.join(source_dir, filename)
         if os.path.isfile(src):
             dst = os.path.join(output_dir, filename)
@@ -138,23 +163,115 @@ def _copy_tokenizer_files_from_local(
     return copied
 
 
-def _write_processor_config(
+def _write_vision_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write a minimal processor_config.json for VLM models.
+    """Write the vision processor config file for VLM models.
 
-    Returns the path if written, None otherwise.
+    The output format depends on the model type:
+
+    - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
+      in the onnxruntime-extensions transforms pipeline format required by
+      ``OrtxCreateProcessor``.  The pipeline is
+      ``DecodeImage → Gemma4ImageTransform``.
+    - **Other models**: Writes ``processor_config.json`` with a minimal
+      HuggingFace-style schema (``image_size``, ``patch_size``).
+
+    Returns the written file path, or None if the config has no vision section.
     """
     vision = getattr(config, "vision", None)
     if vision is None:
         return None
 
-    processor: dict[str, Any] = {
-        "image_size": getattr(vision, "image_size", 448),
-        "patch_size": getattr(vision, "patch_size", 14),
-    }
-    path = os.path.join(output_dir, "processor_config.json")
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in _GEMMA4_MODEL_TYPES:
+        # Gemma4 needs an onnxruntime-extensions format processor config
+        # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
+        # The OrtxCreateProcessor API requires this format.
+        #
+        # max_soft_tokens: maps from HF's mm_tokens_per_image (the number of
+        # vision tokens per image after pooling) into the Gemma4ImageTransform's
+        # max_soft_tokens attribute, which controls the padded patch budget.
+        max_soft_tokens = (
+            getattr(vision, "mm_tokens_per_image", None)
+            or getattr(config, "mm_tokens_per_image", None)
+            or 280
+        )
+        patch_size = getattr(vision, "patch_size", None) or 16
+        pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
+        processor = {
+            "processor": {
+                "name": "gemma_4_image_processing",
+                "transforms": [
+                    {
+                        "operation": {
+                            "name": "decode_image",
+                            "type": "DecodeImage",
+                            "attrs": {"color_space": "RGB"},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_image_transform",
+                            "type": "Gemma4ImageTransform",
+                            "attrs": {
+                                "patch_size": patch_size,
+                                "max_soft_tokens": max_soft_tokens,
+                                "pooling_kernel_size": pooling_kernel_size,
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+    else:
+        processor = {
+            "image_size": getattr(vision, "image_size", None) or 448,
+            "patch_size": getattr(vision, "patch_size", None) or 14,
+        }
+
+    path = os.path.join(output_dir, "image_processor.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(processor, f, indent=4)
+    return path
+
+
+def _write_audio_processor_config(
+    config: Any,
+    output_dir: str,
+) -> str | None:
+    """Write audio_processor.json for models with audio encoders.
+
+    Returns the path if written, None otherwise.
+    """
+    audio = getattr(config, "audio", None)
+    if audio is None:
+        return None
+
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in _GEMMA4_MODEL_TYPES:
+        # Gemma4 USM-style 128-dim log-mel spectrogram.
+        # Values from ort-extensions Gemma4LogMel kernel.
+        processor: dict[str, Any] = {
+            "processor": {
+                "name": "gemma4_audio_processor",
+                "sample_rate": 16000,
+                "num_mel_bins": 128,
+                "frame_length_ms": 20,
+                "frame_step_ms": 10,
+                "fft_size": 512,
+                "mel_floor": 0.001,
+                "mel_upper_hertz": 8000,
+            }
+        }
+    else:
+        # Generic audio processor — add model-specific branches as needed.
+        return None
+
+    path = os.path.join(output_dir, "audio_processor.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
@@ -164,6 +281,7 @@ def _write_genai_config(
     config: Any,
     output_dir: str,
     *,
+    pkg: ModelPackage,
     ort_model_type: str,
     ep: str,
     context_length: int,
@@ -175,9 +293,24 @@ def _write_genai_config(
 ) -> str:
     """Generate and write genai_config.json.
 
+    Input names for each sub-model (decoder, vision, embedding) are
+    introspected from the ONNX graphs in *pkg* rather than hard-coded
+    per model type.
+
     Returns the path to the written file.
     """
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
+
+    # --- Discover decoder inputs from the ONNX graph ---
+    decoder_key = "decoder" if "decoder" in pkg else "model"
+    decoder_inputs = _introspect_inputs(pkg, decoder_key)
+    if decoder_inputs is not None:
+        # KV cache entries are template-based, not per-input
+        decoder_inputs["past_key_names"] = "past_key_values.%d.key"
+        decoder_inputs["past_value_names"] = "past_key_values.%d.value"
+
+    # Derive decoder filename from the actual package key
+    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
 
     generator = GenaiConfigGenerator.from_config(
         config,
@@ -187,28 +320,55 @@ def _write_genai_config(
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
+        decoder_inputs=decoder_inputs,
+        decoder_filename=decoder_filename,
     )
 
     if is_vlm:
         image_token_id = getattr(config, "image_token_id", None)
         if image_token_id is not None:
+            vision_input_mapping = _introspect_inputs(pkg, "vision_encoder")
+            embedding_input_mapping = _introspect_inputs(pkg, "embedding")
+
+            # spatial_merge_size and config_filename are config-level
+            # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
+            model_type = getattr(config, "model_type", "")
             if has_speech:
-                # Phi4MM uses different vision inputs than Qwen2.5-VL
                 vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "vision_processor.json"
-                vision_kwargs["input_names"] = {
-                    "pixel_values": "pixel_values",
-                    "image_sizes": "image_sizes",
-                }
+                vision_kwargs["config_filename"] = "image_processor.json"
+            elif model_type in _GEMMA4_MODEL_TYPES:
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", 2)
+                vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "image_processor.json"
+
+            if vision_input_mapping is not None:
+                vision_kwargs["input_names"] = vision_input_mapping
+            if embedding_input_mapping is not None:
+                vision_kwargs["embedding_input_names"] = embedding_input_mapping
+
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
     if has_speech:
+        audio_input_mapping = _introspect_inputs(pkg, "audio_encoder")
+
         audio_config = getattr(config, "audio", None)
         audio_token_id = (
-            getattr(audio_config, "token_id", None) if audio_config is not None else None
+            getattr(audio_config, "token_id", None)
+            or getattr(audio_config, "audio_token_id", None)
+            or getattr(config, "audio_token_id", None)
         )
-        generator.with_speech(audio_token_id=audio_token_id)
+        boa_token_id = getattr(config, "boa_token_id", None)
+
+        audio_kwargs: dict[str, Any] = {}
+        if audio_input_mapping is not None:
+            audio_kwargs["input_names"] = audio_input_mapping
+        generator.with_audio(
+            audio_token_id=audio_token_id,
+            boa_token_id=boa_token_id,
+            **audio_kwargs,
+        )
 
     return generator.write(output_dir)
 
@@ -225,7 +385,7 @@ def write_ort_genai_config(
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
     Writes ``genai_config.json``, optionally copies tokenizer files from
-    HuggingFace Hub or a local directory, and writes ``processor_config.json``
+    HuggingFace Hub or a local directory, and writes ``image_processor.json``
     for VLM models.  Does NOT build or save ONNX models — call
     :meth:`~mobius._model_package.ModelPackage.save` separately before or
     after this function.
@@ -258,7 +418,7 @@ def write_ort_genai_config(
             {
                 "genai_config": "/output/genai_config.json",
                 "tokenizer.json": "/output/tokenizer.json",
-                "processor_config": "/output/processor_config.json",
+                "image_processor": "/output/image_processor.json",
             }
 
     Raises:
@@ -292,9 +452,24 @@ def write_ort_genai_config(
         hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
         model_type = hf_config.model_type
         ort_model_type = _resolve_ort_genai_model_type(model_type)
-        bos_token_id = getattr(hf_config, "bos_token_id", None)
-        eos_token_id = getattr(hf_config, "eos_token_id", None)
-        pad_token_id = getattr(hf_config, "pad_token_id", None)
+        # Token IDs may live on the parent config or the text sub-config
+        # (e.g. Gemma4Config has text_config with bos_token_id=2).
+        _tok_cfg = getattr(hf_config, "text_config", hf_config)
+        bos_token_id = getattr(
+            hf_config,
+            "bos_token_id",
+            getattr(_tok_cfg, "bos_token_id", None),
+        )
+        eos_token_id = getattr(
+            hf_config,
+            "eos_token_id",
+            getattr(_tok_cfg, "eos_token_id", None),
+        )
+        pad_token_id = getattr(
+            hf_config,
+            "pad_token_id",
+            getattr(_tok_cfg, "pad_token_id", None),
+        )
     else:
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
@@ -318,11 +493,11 @@ def write_ort_genai_config(
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
     # Detect multimodal capabilities from the package keys
-    is_vlm = "vision" in pkg and "embedding" in pkg
-    has_speech = "speech" in pkg
+    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+    has_speech = "audio_encoder" in pkg
 
     # Phi4MM quirk: HF reports model_type='phi' but the model package
-    # includes a 'speech' component that distinguishes it from plain Phi.
+    # includes an 'audio_encoder' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
@@ -331,6 +506,7 @@ def write_ort_genai_config(
     genai_path = _write_genai_config(
         config,
         directory,
+        pkg=pkg,
         ort_model_type=ort_model_type,
         ep=ep,
         context_length=context_length,
@@ -363,10 +539,15 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
-    # Write processor_config.json for VLMs
-    processor_path = _write_processor_config(config, directory)
+    # Write processor config for VLMs
+    processor_path = _write_vision_processor_config(config, directory)
     if processor_path:
         result["processor_config"] = processor_path
+
+    # Write audio_processor.json for models with audio encoders
+    audio_proc_path = _write_audio_processor_config(config, directory)
+    if audio_proc_path:
+        result["audio_processor"] = audio_proc_path
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
@@ -393,7 +574,7 @@ def auto_export(
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
     4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
-       tokenizer files, and ``processor_config.json``
+       tokenizer files, and ``image_processor.json``
 
     Args:
         model_id: HuggingFace model repository ID.

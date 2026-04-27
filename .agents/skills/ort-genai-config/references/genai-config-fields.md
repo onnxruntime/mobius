@@ -128,7 +128,7 @@ Required for VLM and MMM models.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `filename` | string | — | Vision ONNX model |
-| `config_filename` | string | `"processor_config.json"` | Processor config file |
+| `config_filename` | string | `"image_processor.json"` | Processor config file |
 | `adapter_filename` | string | — | Optional adapter model |
 | `spatial_merge_size` | int | 2 | **Required for Qwen2.5-VL.** Controls how many vision patches are merged into one token. Used to compute grid dimensions for 3D M-RoPE position IDs (h/merge × w/merge). |
 | `tokens_per_second` | float | 2.0 | Video tokens/second |
@@ -179,7 +179,7 @@ For audio-language models (whisper, phi4mm).
 ```json
 "speech": {
   "filename": "speech.onnx",
-  "config_filename": "audio_processor_config.json",
+  "config_filename": "audio_processor.json",
   "inputs": {
     "audio_embeds": "audio_embeds",
     "attention_mask": "audio_attention_mask",

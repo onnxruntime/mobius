@@ -122,6 +122,7 @@ AUDIO_SUBSAMPLING_FACTOR = 4
 def prepare_vision_feeds(
     processor,
     image_path: str,
+    np_dtype=np.float32,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **vision** session.
 
@@ -131,9 +132,10 @@ def prepare_vision_feeds(
     Args:
         processor: ``AutoProcessor`` loaded for the Gemma 4 model.
         image_path: Path to a local image file (JPEG, PNG, etc.).
+        np_dtype: Numpy dtype for pixel values (default float32).
 
     Returns:
-        ``{"pixel_values": float32[B, N, 3*P^2], "pixel_position_ids": int64[B, N, 2]}``
+        ``{"pixel_values": [B, N, 3*P^2], "pixel_position_ids": int64[B, N, 2]}``
     """
     from PIL import Image
 
@@ -141,7 +143,7 @@ def prepare_vision_feeds(
     # Gemma 4 processor requires a text argument alongside images.
     # Use a placeholder image token so the processor computes correct dims.
     processed = processor(images=img, text="<image>", return_tensors="np")
-    pixel_values = processed["pixel_values"].astype(np.float32)
+    pixel_values = processed["pixel_values"].astype(np_dtype)
     # The HF processor returns "image_position_ids"; our ONNX vision model input is "pixel_position_ids"
     pixel_position_ids = processed["image_position_ids"].astype(np.int64)
     return {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids}
@@ -150,6 +152,7 @@ def prepare_vision_feeds(
 def prepare_audio_feeds(
     processor,
     audio_path: str,
+    np_dtype=np.float32,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **audio** session.
 
@@ -161,9 +164,10 @@ def prepare_audio_feeds(
     Args:
         processor: ``AutoProcessor`` loaded for the Gemma 4 model.
         audio_path: Path to an audio file (WAV, FLAC, MP3, etc.).
+        np_dtype: Numpy dtype for audio features (default float32).
 
     Returns:
-        ``{"input_features": float32[1, T, n_mels]}``
+        ``{"input_features": [1, T, n_mels], "input_features_mask": [1, T]}``
     """
     import soundfile as sf
 
@@ -181,8 +185,13 @@ def prepare_audio_feeds(
         padding=False,
     )
     # out["input_features"]: [1, T, n_mels]  (already in correct layout)
-    audio_features = out["input_features"].astype(np.float32)
-    return {"input_features": audio_features}  # [1, T, n_mels]
+    audio_features = out["input_features"].astype(np_dtype)
+    # All-True mask for single-clip inference (no padding to mask out).
+    input_features_mask = np.ones(audio_features.shape[:2], dtype=np.bool_)  # [1, T]
+    return {
+        "input_features": audio_features,
+        "input_features_mask": input_features_mask,
+    }
 
 
 def prepare_embedding_feeds(
@@ -335,12 +344,12 @@ def build_input_ids(
 # ---------------------------------------------------------------------------
 
 
-def _empty_features(hidden_size: int) -> np.ndarray:
-    """Return a ``float32[0, hidden_size]`` zero tensor (no modality tokens)."""
-    return np.zeros((0, hidden_size), dtype=np.float32)
+def _empty_features(hidden_size: int, dtype=np.float32) -> np.ndarray:
+    """Return a zero-length feature tensor ``[0, hidden_size]``."""
+    return np.zeros((0, hidden_size), dtype=dtype)
 
 
-def _init_kv_cache(config) -> dict[str, np.ndarray]:
+def _init_kv_cache(config, dtype=np.float32) -> dict[str, np.ndarray]:
     """Create an empty KV cache for all independent decoder layers.
 
     Gemma 4 uses:
@@ -348,6 +357,8 @@ def _init_kv_cache(config) -> dict[str, np.ndarray]:
     - ``global_head_dim`` for global (full_attention) layers
     - ``num_kv_shared_layers`` trailing layers that share KV from earlier layers
       (these have NO independent cache entries)
+
+    All layers use the original ``num_key_value_heads`` (no expansion).
     """
     num_kv_shared = getattr(config, "num_kv_shared_layers", 0) or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
@@ -362,13 +373,14 @@ def _init_kv_cache(config) -> dict[str, np.ndarray]:
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_hd if layer_type == "full_attention" else local_hd
+        kv_heads = config.num_key_value_heads
         past_kv[f"past_key_values.{i}.key"] = np.zeros(
-            (1, config.num_key_value_heads, 0, hd),
-            dtype=np.float32,
+            (1, kv_heads, 0, hd),
+            dtype=dtype,
         )
         past_kv[f"past_key_values.{i}.value"] = np.zeros(
-            (1, config.num_key_value_heads, 0, hd),
-            dtype=np.float32,
+            (1, kv_heads, 0, hd),
+            dtype=dtype,
         )
     return past_kv
 
@@ -442,13 +454,15 @@ def generate(
     hidden_size = config.hidden_size
 
     # Zero-length feature tensors used during decode steps (no modality input)
-    zero_image = _empty_features(hidden_size)
-    zero_audio = _empty_features(hidden_size)
+    feat_dtype = image_features.dtype
+    zero_image = _empty_features(hidden_size, dtype=feat_dtype)
+    zero_audio = _empty_features(hidden_size, dtype=feat_dtype)
 
-    past_kv = _init_kv_cache(config)
     cur_ids = input_ids
     past_seq_len = 0
     generated_ids: list[int] = []
+
+    past_kv = _init_kv_cache(config, dtype=image_features.dtype)
 
     for step in range(max_new_tokens):
         is_prefill = step == 0
@@ -503,6 +517,7 @@ def demo_text(
     config,
     prompt: str = "Explain the theory of general relativity in simple terms.",
     max_new_tokens: int = MAX_NEW_TOKENS,
+    model_np_dtype=np.float32,
 ) -> str:
     """Text-only generation demo."""
     print("\n" + "=" * 64)
@@ -512,7 +527,7 @@ def demo_text(
     print("-" * 64)
 
     input_ids = build_input_ids(tokenizer, prompt)
-    zero = _empty_features(config.hidden_size)
+    zero = _empty_features(config.hidden_size, dtype=model_np_dtype)
 
     return generate(
         vision_session=None,
@@ -538,6 +553,7 @@ def demo_vision(
     image_path: str,
     prompt: str = "Describe what you see in this image in detail.",
     max_new_tokens: int = MAX_NEW_TOKENS,
+    model_np_dtype=np.float32,
 ) -> str:
     """Vision (image + text) generation demo."""
     print("\n" + "=" * 64)
@@ -549,7 +565,9 @@ def demo_vision(
 
     # Step 1: Encode the image through the SigLIP vision encoder.
     # Output: image_features [1, num_image_tokens, hidden_size]
-    vision_out = vision_session.run(prepare_vision_feeds(processor, image_path))
+    vision_out = vision_session.run(
+        prepare_vision_feeds(processor, image_path, np_dtype=model_np_dtype)
+    )
     image_features: np.ndarray = vision_out["image_features"]
     # Squeeze the batch dimension: [1, T, H] → [T, H]
     if image_features.ndim == 3:
@@ -568,7 +586,7 @@ def demo_vision(
         tokenizer=tokenizer,
         input_ids=input_ids,
         image_features=image_features,
-        audio_features=_empty_features(config.hidden_size),
+        audio_features=_empty_features(config.hidden_size, dtype=image_features.dtype),
         config=config,
         max_new_tokens=max_new_tokens,
     )
@@ -584,6 +602,7 @@ def demo_audio(
     audio_path: str,
     prompt: str = "Transcribe the following audio.",
     max_new_tokens: int = MAX_NEW_TOKENS,
+    model_np_dtype=np.float32,
 ) -> str:
     """Audio (speech + text) generation demo."""
     print("\n" + "=" * 64)
@@ -594,12 +613,18 @@ def demo_audio(
     print("-" * 64)
 
     # Step 1: Encode audio through the Conformer encoder.
-    # Input:  audio_features [1, T, n_mels]  (mel spectrogram)
-    # Output: audio_features [1, T', hidden_size]  (T' = T / subsampling_factor)
-    audio_out = audio_session.run(prepare_audio_feeds(processor, audio_path))
+    # Input:  input_features [1, T, n_mels], input_features_mask [1, T]
+    # Output: audio_features [1, T', hidden_size], audio_features_mask [1, T']
+    #         where T' = T / 4 (two conv layers with stride 2)
+    audio_out = audio_session.run(
+        prepare_audio_feeds(processor, audio_path, np_dtype=model_np_dtype)
+    )
     audio_features: np.ndarray = audio_out["audio_features"]
+    audio_mask: np.ndarray = audio_out["audio_features_mask"]
     if audio_features.ndim == 3:
-        audio_features = audio_features[0]  # [T', hidden_size]
+        # Strip padding using the downsampled mask, then flatten batch dim.
+        valid = audio_mask[0].astype(bool)  # [T']
+        audio_features = audio_features[0][valid]  # [num_valid, hidden_size]
 
     # Step 2: Build input_ids with AUDIO_TOKEN_ID placeholders.
     num_audio_tokens = audio_features.shape[0]
@@ -612,7 +637,7 @@ def demo_audio(
         decoder_session=decoder_session,
         tokenizer=tokenizer,
         input_ids=input_ids,
-        image_features=_empty_features(config.hidden_size),
+        image_features=_empty_features(config.hidden_size, dtype=audio_features.dtype),
         audio_features=audio_features,
         config=config,
         max_new_tokens=max_new_tokens,
@@ -631,6 +656,7 @@ def demo_vision_audio(
     audio_path: str,
     prompt: str = "Describe the image and transcribe the audio.",
     max_new_tokens: int = MAX_NEW_TOKENS,
+    model_np_dtype=np.float32,
 ) -> str:
     """Combined vision + audio generation demo."""
     print("\n" + "=" * 64)
@@ -642,16 +668,22 @@ def demo_vision_audio(
     print("-" * 64)
 
     # Step 1: Encode image
-    vision_out = vision_session.run(prepare_vision_feeds(processor, image_path))
+    vision_out = vision_session.run(
+        prepare_vision_feeds(processor, image_path, np_dtype=model_np_dtype)
+    )
     image_features: np.ndarray = vision_out["image_features"]
     if image_features.ndim == 3:
         image_features = image_features[0]
 
     # Step 2: Encode audio
-    audio_out = audio_session.run(prepare_audio_feeds(processor, audio_path))
+    audio_out = audio_session.run(
+        prepare_audio_feeds(processor, audio_path, np_dtype=model_np_dtype)
+    )
     audio_features: np.ndarray = audio_out["audio_features"]
+    audio_mask: np.ndarray = audio_out["audio_features_mask"]
     if audio_features.ndim == 3:
-        audio_features = audio_features[0]
+        valid = audio_mask[0].astype(bool)
+        audio_features = audio_features[0][valid]
 
     # Step 3: Build input_ids — image placeholders first, then audio
     input_ids = build_input_ids(
@@ -970,10 +1002,19 @@ def main() -> int:
     # ------------------------------------------------------------------
     load_weights = not args.no_weights
     ep = args.ep
-    print(f"Building ONNX models from {args.model_id!r} (dtype={args.dtype}, ep={ep}) ...")
+
+    # Auto-select f16 for CUDA EP: GQA and Flash Attention require fp16/bf16.
+    dtype = args.dtype
+    if dtype == "f32" and ep in ("cuda", "trt-rtx"):
+        dtype = "f16"
+        print(f"Note: auto-selecting dtype=f16 for {ep} EP (GQA/Flash require fp16/bf16)")
+
+    np_dtype = {"f32": np.float32, "f16": np.float16, "bf16": np.float32}[dtype]
+
+    print(f"Building ONNX models from {args.model_id!r} (dtype={dtype}, ep={ep}) ...")
     pkg = build(
         args.model_id,
-        dtype=args.dtype,
+        dtype=dtype,
         load_weights=load_weights,
         execution_provider=ep,
     )
@@ -1000,12 +1041,19 @@ def main() -> int:
     # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+    vision_session = OnnxModelSession(pkg["vision_encoder"], device=args.device)
     audio_session = (
-        OnnxModelSession(pkg["audio"], device=args.device) if "audio" in pkg else None
+        OnnxModelSession(pkg["audio_encoder"], device=args.device)
+        if "audio_encoder" in pkg
+        else None
     )
     embedding_session = OnnxModelSession(pkg["embedding"], device=args.device)
-    decoder_session = OnnxModelSession(pkg["decoder"], device=args.device)
+    # Use 'basic' graph optimization for the decoder on CUDA to prevent an
+    # ORT crash in the extended graph optimization pass when Attention nodes
+    # have mixed head configurations (GQA + expanded-KV MHA). This is an
+    # ORT bug; remove once it's fixed upstream.
+    decoder_opt = {"graph_optimization_level": "basic"} if ep in ("cuda", "trt-rtx") else {}
+    decoder_session = OnnxModelSession(pkg["decoder"], device=args.device, **decoder_opt)
 
     # ------------------------------------------------------------------
     # Step 3: Load the HuggingFace processor.
@@ -1064,6 +1112,7 @@ def main() -> int:
                 config=config,
                 prompt=text_prompt,
                 max_new_tokens=max_tokens,
+                model_np_dtype=np_dtype,
             )
             onnx_outputs["text"] = result
 
@@ -1080,6 +1129,7 @@ def main() -> int:
                 image_path=args.image,
                 prompt=vision_prompt,
                 max_new_tokens=max_tokens,
+                model_np_dtype=np_dtype,
             )
             onnx_outputs["vision"] = result
 
@@ -1096,6 +1146,7 @@ def main() -> int:
                 audio_path=args.audio,
                 prompt=audio_prompt,
                 max_new_tokens=max_tokens,
+                model_np_dtype=np_dtype,
             )
             onnx_outputs["audio"] = result
 
@@ -1114,6 +1165,7 @@ def main() -> int:
                 audio_path=args.audio,
                 prompt=vision_audio_prompt,
                 max_new_tokens=max_tokens,
+                model_np_dtype=np_dtype,
             )
             onnx_outputs["vision-audio"] = result
 

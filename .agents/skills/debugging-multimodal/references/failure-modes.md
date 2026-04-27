@@ -20,12 +20,12 @@ don't match the input image. Text-only generation works correctly.
 
 2. **Image resize mismatch** — ORT processor resizes image to different
    dimensions than HF processor, producing different number of vision
-   tokens. ORT's `width`/`height` in `processor_config.json` are used
+   tokens. ORT's `width`/`height` in `image_processor.json` are used
    as direct resize targets, unlike HF's smart_resize which computes
    target from original image dimensions.
 
 3. **Processor config format** — ORT GenAI expects ort-extensions format
-   `processor_config.json`, not HuggingFace format. The file must include
+   `image_processor.json`, not HuggingFace format. The file must include
    `DecodeImage`, `ConvertRGB`, `Resize`, `Rescale`, `Normalize`, and
    `PatchImage` transforms with correct attributes.
 
@@ -39,7 +39,7 @@ def _update_resize_for_image(processor_config_path, image_path):
     factor = 14 * 2  # patch_size * merge_size
     new_w = round(w / factor) * factor
     new_h = round(h / factor) * factor
-    # Update width/height in processor_config.json
+    # Update width/height in image_processor.json
 ```
 
 ## 2. Numerical divergence in greedy decoding

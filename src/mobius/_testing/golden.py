@@ -148,10 +148,10 @@ class GoldenRef:
 
     # Multi-model diagnostics — empty dicts for single-model tasks
     component_norms: dict[str, float]
-    """L2 norms of component outputs, e.g. ``{"vision": 42.5}``."""
+    """L2 norms of component outputs, e.g. ``{"vision_encoder": 42.5}``."""
 
     component_shapes: dict[str, list[int]]
-    """Output shapes for components, e.g. ``{"vision": [1, 577, 1024]}``."""
+    """Output shapes for components, e.g. ``{"vision_encoder": [1, 577, 1024]}``."""
 
     # Metadata
     json_path: Path
