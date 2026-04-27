@@ -1601,7 +1601,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
         if self.config.final_logit_softcapping:
             cap = op.CastLike(
-                op.Constant(value_float=float(self.config.final_logit_softcapping)),
+                self.config.final_logit_softcapping,
                 logits,
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
@@ -1695,7 +1695,7 @@ class _Gemma4DecoderModel(nn.Module):
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
         if self.config.final_logit_softcapping:
             cap = op.CastLike(
-                op.Constant(value_float=float(self.config.final_logit_softcapping)),
+                self.config.final_logit_softcapping,
                 logits,
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
