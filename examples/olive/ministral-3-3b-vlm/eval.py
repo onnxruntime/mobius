@@ -183,7 +183,7 @@ def build_pytorch_runner(model_id: str):
     print(f"  Device: {device}, dtype: {dtype}")
 
     pt_model = Mistral3ForConditionalGeneration.from_pretrained(
-        model_id, dtype=dtype, trust_remote_code=True
+        model_id, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
     pt_proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     print("  PyTorch model loaded.")

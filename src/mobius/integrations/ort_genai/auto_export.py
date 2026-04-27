@@ -8,7 +8,7 @@ Two entry points:
 - :func:`write_ort_genai_config` — programmatic API. Takes an already-built
   :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
   ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
-  ``image_processor.json``) alongside the ONNX models.
+  ``processor_config.json`` / ``image_processor.json``) alongside the ONNX models.
 
 - :func:`auto_export` — end-to-end convenience function. Builds the model
   from a HuggingFace ID, saves the ONNX files, then calls
@@ -63,9 +63,11 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
+    "mistral3": "mistral3",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -252,6 +254,74 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     return False
 
 
+def _build_vision_transform_pipeline(
+    *,
+    image_size: int,
+    patch_size: int,
+    merge_size: int,
+    rescale_factor: float,
+    image_mean: list[float],
+    image_std: list[float],
+    min_pixels: int = 784,
+    max_pixels: int = 2371600,
+) -> list[dict[str, Any]]:
+    """Build the common 5-step vision transform pipeline.
+
+    Returns the base transforms: DecodeImage → ConvertRGB → Resize →
+    Rescale → Normalize.  Callers may append model-specific steps
+    (e.g. Permute3D, PixtralImageSizes) after this.
+    """
+    return [
+        {
+            "operation": {
+                "name": "decode_image",
+                "type": "DecodeImage",
+                "attrs": {"color_space": "RGB"},
+            }
+        },
+        {
+            "operation": {
+                "name": "convert_to_rgb",
+                "type": "ConvertRGB",
+            }
+        },
+        {
+            "operation": {
+                "name": "resize",
+                "type": "Resize",
+                "attrs": {
+                    "height": image_size,
+                    "width": image_size,
+                    "smart_resize": 1,
+                    "min_pixels": min_pixels,
+                    "max_pixels": max_pixels,
+                    "patch_size": patch_size,
+                    "merge_size": merge_size,
+                },
+            }
+        },
+        {
+            "operation": {
+                "name": "rescale",
+                "type": "Rescale",
+                "attrs": {
+                    "rescale_factor": rescale_factor,
+                },
+            }
+        },
+        {
+            "operation": {
+                "name": "normalize",
+                "type": "Normalize",
+                "attrs": {
+                    "mean": image_mean,
+                    "std": image_std,
+                },
+            }
+        },
+    ]
+
+
 def _write_vision_processor_config(
     config: Any,
     output_dir: str,
@@ -268,11 +338,12 @@ def _write_vision_processor_config(
     The output format depends on the model type:
 
     - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
-      in the onnxruntime-extensions transforms pipeline format required by
-      ``OrtxCreateProcessor``.  The pipeline is
-      ``DecodeImage → Gemma4ImageTransform``.
-    - **Other models**: Writes ``processor_config.json`` with a minimal
-      HuggingFace-style schema (``image_size``, ``patch_size``).
+      with a ``DecodeImage → Gemma4ImageTransform`` pipeline.
+    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
+      pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
+      Permute3D → PixtralImageSizes).
+    - **Other VLMs**: Writes ``processor_config.json`` with a 5-step pipeline
+      (DecodeImage → ConvertRGB → Resize → Rescale → Normalize).
 
     Returns the written file path, or None if the config has no vision section.
     """
@@ -282,16 +353,11 @@ def _write_vision_processor_config(
 
     model_type = getattr(config, "model_type", "")
     vision_model_type = getattr(vision, "model_type", None)
-    is_pixtral = vision_model_type == "pixtral"
+    is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
 
     if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs an onnxruntime-extensions format processor config
         # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
-        # The OrtxCreateProcessor API requires this format.
-        #
-        # max_soft_tokens: maps from HF's mm_tokens_per_image (the number of
-        # vision tokens per image after pooling) into the Gemma4ImageTransform's
-        # max_soft_tokens attribute, which controls the padded patch budget.
         max_soft_tokens = (
             getattr(vision, "mm_tokens_per_image", None)
             or getattr(config, "mm_tokens_per_image", None)
@@ -325,9 +391,9 @@ def _write_vision_processor_config(
             }
         }
         path = os.path.join(output_dir, "image_processor.json")
-    elif is_pixtral:
-        # Pixtral / Mistral3 VLM: full ORT-extensions transform pipeline
-        # with CLIP-standard normalization defaults.
+    else:
+        # Pixtral and generic VLMs share the same base pipeline;
+        # Pixtral adds Permute3D + PixtralImageSizes at the end.
         patch_size = getattr(vision, "patch_size", 14) or 14
         merge_size = (
             getattr(vision, "spatial_merge_size", None)
@@ -348,13 +414,13 @@ def _write_vision_processor_config(
                 from transformers import AutoProcessor
 
                 hf_proc = AutoProcessor.from_pretrained(hf_model_id)
-                image_processor = getattr(hf_proc, "image_processor", None)
-                if image_processor is not None:
-                    image_mean = list(getattr(image_processor, "image_mean", image_mean))
-                    image_std = list(getattr(image_processor, "image_std", image_std))
-                    rescale_factor = getattr(image_processor, "rescale_factor", rescale_factor)
-                    if hasattr(image_processor, "size"):
-                        size = image_processor.size
+                ip = getattr(hf_proc, "image_processor", None)
+                if ip is not None:
+                    image_mean = list(getattr(ip, "image_mean", image_mean))
+                    image_std = list(getattr(ip, "image_std", image_std))
+                    rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    if hasattr(ip, "size"):
+                        size = ip.size
                         if isinstance(size, dict):
                             if "longest_edge" in size:
                                 image_size = size["longest_edge"]
@@ -371,133 +437,44 @@ def _write_vision_processor_config(
                 )
 
         if image_size is None:
-            image_size = 1540
+            image_size = 1540 if is_pixtral else 448
 
-        transforms: list[dict[str, Any]] = [
-            {
-                "operation": {
-                    "name": "decode_image",
-                    "type": "DecodeImage",
-                    "attrs": {"color_space": "RGB"},
-                }
-            },
-            {
-                "operation": {
-                    "name": "convert_to_rgb",
-                    "type": "ConvertRGB",
-                }
-            },
-            {
-                "operation": {
-                    "name": "resize",
-                    "type": "Resize",
-                    "attrs": {
-                        "height": image_size,
-                        "width": image_size,
-                        "smart_resize": 1,
-                        "min_pixels": min_pixels,
-                        "max_pixels": max_pixels,
-                        "patch_size": patch_size,
-                        "merge_size": merge_size,
-                    },
-                }
-            },
-            {
-                "operation": {
-                    "name": "rescale",
-                    "type": "Rescale",
-                    "attrs": {
-                        "rescale_factor": rescale_factor,
-                    },
-                }
-            },
-            {
-                "operation": {
-                    "name": "normalize",
-                    "type": "Normalize",
-                    "attrs": {
-                        "mean": image_mean,
-                        "std": image_std,
-                    },
-                }
-            },
-        ]
-
-        processor_config = {
-            "processor": {
-                "name": "pixtral_image_processor",
-                "transforms": transforms,
-            }
-        }
-        path = os.path.join(output_dir, "processor_config.json")
-    else:
-        # Generic VLM: full ORT-extensions transform pipeline with
-        # CLIP-standard normalization defaults.
-        patch_size = getattr(vision, "patch_size", 14) or 14
-        merge_size = (
-            getattr(vision, "spatial_merge_size", None)
-            or getattr(config, "spatial_merge_size", 2)
-            or 2
+        transforms = _build_vision_transform_pipeline(
+            image_size=image_size,
+            patch_size=patch_size,
+            merge_size=merge_size,
+            rescale_factor=rescale_factor,
+            image_mean=image_mean,
+            image_std=image_std,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
         )
-        image_mean = [0.48145466, 0.4578275, 0.40821073]
-        image_std = [0.26862954, 0.26130258, 0.27577711]
-        rescale_factor = 1.0 / 255.0
-        min_pixels = 784
-        max_pixels = 2371600
-        image_size = getattr(vision, "image_size", None) or 448
 
-        transforms = [
-            {
-                "operation": {
-                    "name": "decode_image",
-                    "type": "DecodeImage",
-                    "attrs": {"color_space": "RGB"},
+        if is_pixtral:
+            # Pixtral requires Permute3D (HWC→CHW) and PixtralImageSizes
+            # for the per-image slicing loop in PixtralVisionState.
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "permute",
+                        "type": "Permute3D",
+                        "attrs": {"dims": [2, 0, 1]},
+                    }
                 }
-            },
-            {
-                "operation": {
-                    "name": "convert_to_rgb",
-                    "type": "ConvertRGB",
+            )
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "pixtral_image_sizes",
+                        "type": "PixtralImageSizes",
+                    }
                 }
-            },
-            {
-                "operation": {
-                    "name": "resize",
-                    "type": "Resize",
-                    "attrs": {
-                        "height": image_size,
-                        "width": image_size,
-                        "smart_resize": 1,
-                        "min_pixels": min_pixels,
-                        "max_pixels": max_pixels,
-                        "patch_size": patch_size,
-                        "merge_size": merge_size,
-                    },
-                }
-            },
-            {
-                "operation": {
-                    "name": "rescale",
-                    "type": "Rescale",
-                    "attrs": {
-                        "rescale_factor": rescale_factor,
-                    },
-                }
-            },
-            {
-                "operation": {
-                    "name": "normalize",
-                    "type": "Normalize",
-                    "attrs": {
-                        "mean": image_mean,
-                        "std": image_std,
-                    },
-                }
-            },
-        ]
+            )
+
+        processor_name = "pixtral_image_processor" if is_pixtral else "image_processor"
         processor_config = {
             "processor": {
-                "name": "image_processor",
+                "name": processor_name,
                 "transforms": transforms,
             }
         }
@@ -630,6 +607,16 @@ def _write_genai_config(
                 )
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
+            elif (
+                model_type in _PIXTRAL_MODEL_TYPES
+                or getattr(getattr(config, "vision", None), "model_type", None) == "pixtral"
+            ):
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", 2
+                )
+                vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
