@@ -1713,6 +1713,52 @@ class TestBuildGraphVisionLanguage:
         assert registry.get("qwen3_5") is registry.get("qwen3_5_vl")
         assert _default_task_for_model("qwen3_5") == "hybrid-qwen-vl"
 
+    def test_qwen35_vl_preprocess_weights_model_prefix(self):
+        """Qwen3.5-VL preprocess handles model.language_model.* style keys."""
+        import torch
+
+        from mobius.models.qwen35 import Qwen35VL3ModelCausalLMModel
+
+        vision_config = VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_size=16,
+            in_channels=3,
+            out_hidden_size=64,
+            num_position_embeddings=16,
+        )
+        config = _base_config(vision=vision_config)
+        module = Qwen35VL3ModelCausalLMModel(config)
+        embed_weight = torch.zeros(config.vocab_size, config.hidden_size)
+        state_dict = {
+            "model.language_model.embed_tokens.weight": embed_weight,
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(
+                config.hidden_size, config.hidden_size
+            ),
+            "model.language_model.lm_head.weight": torch.zeros(
+                config.vocab_size, config.hidden_size
+            ),
+            "model.visual.blocks.0.mlp.linear_fc1.weight": torch.zeros(
+                vision_config.intermediate_size, vision_config.hidden_size
+            ),
+            "mtp_head.weight": torch.zeros(1),
+        }
+
+        result = module.preprocess_weights(state_dict)
+
+        assert "decoder.model.embed_tokens.weight" in result
+        assert "embedding.embed_tokens.weight" in result
+        assert (
+            result["decoder.model.embed_tokens.weight"]
+            is result["embedding.embed_tokens.weight"]
+        )
+        assert "decoder.model.layers.0.self_attn.q_proj.weight" in result
+        assert "decoder.lm_head.weight" in result
+        assert "vision_encoder.visual.blocks.0.mlp.up_proj.weight" in result
+        assert "mtp_head.weight" not in result
+
 
 class TestBuildGraphDtype:
     """Verify dtype casting for model initializers."""
