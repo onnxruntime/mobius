@@ -493,7 +493,9 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     decoder_start_id = (
         model.config.decoder_start_token_id or model.generation_config.decoder_start_token_id
     )
-    decoder_input_ids = torch.tensor([[decoder_start_id]], dtype=torch.long, device=model_device)
+    decoder_input_ids = torch.tensor(
+        [[decoder_start_id]], dtype=torch.long, device=model_device
+    )
     with torch.no_grad():
         outputs = model(
             input_features=input_features,
