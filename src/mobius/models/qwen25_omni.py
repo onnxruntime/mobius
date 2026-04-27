@@ -30,6 +30,7 @@ from mobius.components._common import (
 )
 from mobius.components._conv import Conv1d
 from mobius.components._qwen25_omni_audio import Qwen25OmniAudioEncoderLayer
+from mobius.components import Qwen25VLVisionModel
 
 
 
@@ -165,7 +166,31 @@ class Qwen25OmniAudioEncoder(nn.Module):
 
 
 class Qwen25OmniVisionEncoder(nn.Module):
-    pass
+    """
+    Qwen2.5-Omni vision encoder - reuses Qwen2.5-VL ViT
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        vc = config.vision
+        assert vc is not None
+
+        self.visual = Qwen25VLVisionModel(
+            depth=vc.num_hidden_layers or 32,
+            hidden_size = vc.hidden_size or 1280,
+            intermediate_size = vc.intermediate_size or 3420,
+            num_heads = vc.num_attention_heads or 16,
+            patch_size = vc.patch_size or 14,
+            temporal_patch_size = vc.temporal_patch_size or 2,
+            in_channels = vc.in_channels or 3,
+            out_hidden_size = vc.out_hidden_size or 3584,
+            spatial_merge_size = vc.spatial_merge_size or 2,
+            fullatt_block_indexes = vc.fullatt_block_indexes or (7, 15, 23, 31),
+            window_size = vc.window_size or 112
+        )
+
+    def forward(self, op, pixel_values, image_grid_thw):
+        return self.visual(op, pixel_values, image_grid_thw)
 
 class Qwen25OmniEmbeddingModel(nn.Module):
     pass
