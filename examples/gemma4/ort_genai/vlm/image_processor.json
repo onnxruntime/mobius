@@ -1,0 +1,8 @@
+{
+    "processor": {
+        "name": "gemma4_image_processor",
+        "image_size": 448,
+        "patch_size": 16,
+        "tokens_per_image": 280
+    }
+}

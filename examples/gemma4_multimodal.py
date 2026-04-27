@@ -1041,9 +1041,11 @@ def main() -> int:
     # are handled — audio_session is None when the model has no audio component.
     # ------------------------------------------------------------------
     print("\nCreating ONNX Runtime sessions ...")
-    vision_session = OnnxModelSession(pkg["vision"], device=args.device)
+    vision_session = OnnxModelSession(pkg["vision_encoder"], device=args.device)
     audio_session = (
-        OnnxModelSession(pkg["audio"], device=args.device) if "audio" in pkg else None
+        OnnxModelSession(pkg["audio_encoder"], device=args.device)
+        if "audio_encoder" in pkg
+        else None
     )
     embedding_session = OnnxModelSession(pkg["embedding"], device=args.device)
     # Use 'basic' graph optimization for the decoder on CUDA to prevent an

@@ -121,6 +121,11 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 - [ ] `mobius build --model <hf-model-id> /tmp/out` completes without error
 - [ ] Output directory contains the expected ONNX files and `genai_config.json`
+- [ ] Multi-model tasks use standardised ModelPackage keys: `"decoder"`,
+      `"vision_encoder"`, `"audio_encoder"`, `"embedding"` (not legacy names
+      like `"model"`, `"vision"`, `"audio"`, or `"speech"`)
+- [ ] Processor config uses correct filename: `image_processor.json` for
+      all VLMs, `audio_processor.json` for audio
 
 ### 8a. Multi-EP correctness (CUDA)
 
@@ -128,8 +133,12 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 - [ ] CUDA results match CPU results (compare generation output)
 - [ ] No crashes from large tensor operations (see ORT Gather int32
       overflow: microsoft/onnxruntime#28107)
+- [ ] No NaN from large head_dim > 256 (tracked in
+      microsoft/onnxruntime#28195, #28196)
 - [ ] `ort_lower_opset_for_ep` flag handles opset 24→23 lowering for
       CUDA EP (enabled by default in `src/mobius/_flags.py`)
+- [ ] Dead graph inputs removed after EP-aware optimization
+      (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
 
 ### 9. ORT GenAI runtime
 

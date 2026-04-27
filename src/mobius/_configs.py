@@ -1659,6 +1659,7 @@ class Gemma4Config(VisionLanguageConfig):
     final_logit_softcapping: float = 0.0
     attn_logit_softcapping: float = 0.0
     enable_moe_block: bool = False
+    boa_token_id: int | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
@@ -1723,6 +1724,7 @@ class Gemma4Config(VisionLanguageConfig):
             final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
             attn_logit_softcapping=(getattr(config, "attn_logit_softcapping", 0.0) or 0.0),
             enable_moe_block=getattr(config, "enable_moe_block", False),
+            boa_token_id=getattr(parent_config, "boa_token_id", None),
         )
 
 

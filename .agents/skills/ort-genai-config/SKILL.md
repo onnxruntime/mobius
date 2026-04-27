@@ -1,12 +1,12 @@
 ---
 name: ort-genai-config
 description: >
-  Use this skill when generating genai_config.json or processor_config.json
+  Use this skill when generating genai_config.json or image_processor.json
   for onnxruntime-genai model exports, debugging ORT GenAI model loading
   errors, understanding the model type registry, or integrating ONNX models
   with the onnxruntime-genai runtime. Covers the full config format, the
   MultiModal pipeline architecture (vision/audio/embedding/decoder), and
-  the ort-extensions processor_config.json format.
+  the ort-extensions image_processor.json format.
 ---
 
 # Skill: ORT GenAI Config Format
@@ -16,7 +16,7 @@ description: >
 Use this skill when:
 
 - Writing `genai_config.json` for a new model export
-- Writing `processor_config.json` for image/audio preprocessing
+- Writing `image_processor.json` for image preprocessing (or `audio_processor.json` for audio)
 - Debugging ORT GenAI model loading errors (protobuf parsing, missing keys)
 - Understanding how the ORT GenAI pipeline feeds inputs to vision, embedding,
   and decoder models
@@ -31,7 +31,7 @@ Read these companion documents for exhaustive field-by-field details:
   (model, decoder, vision, embedding, speech, encoder, search, engine,
   session_options).
 - Read **[`references/processor-config-fields.md`](references/processor-config-fields.md)**
-  when you need the full `processor_config.json` transform reference, the
+  when you need the full `image_processor.json` transform reference, the
   HuggingFace-to-ort-extensions conversion code, or the Qwen2.5-VL example.
 - Read **[`references/multimodal-pipeline.md`](references/multimodal-pipeline.md)**
   when you need the VLM 3-model prompt/generation flow, input routing
@@ -47,15 +47,20 @@ onnxruntime-genai loads models from a directory containing:
 ```
 model_dir/
 ├── genai_config.json          # Required — model config + search params
-├── model.onnx                 # Decoder model
-├── model.onnx.data            # External weights (optional)
-├── vision.onnx                # Vision encoder (multimodal only)
-├── embedding.onnx             # Embedding model (multimodal only)
+├── model.onnx                 # Decoder model (single-model) OR:
+├── decoder/model.onnx         # Decoder model (multimodal)
+├── vision_encoder/model.onnx   # Vision encoder (multimodal only)
+├── audio_encoder/model.onnx   # Audio encoder (multimodal only)
+├── embedding/model.onnx       # Embedding model (multimodal only)
 ├── tokenizer.json             # Tokenizer (HuggingFace format)
 ├── tokenizer_config.json      # Tokenizer config
 ├── chat_template.jinja        # Chat template (optional)
-└── processor_config.json      # Image processor (multimodal only)
+├── image_processor.json       # Image processor (ort-extensions, all VLMs)
+└── audio_processor.json       # Audio processor (multimodal only)
 ```
+
+**Processor config filenames**: `image_processor.json` for all VLMs,
+`audio_processor.json` for audio models.
 
 ## genai_config.json — Structure
 
@@ -106,7 +111,7 @@ fara, gemma3, phi3v, qwen2_5_vl
 ### MMM (vision + audio → `MultiModalLanguageModel`)
 
 ```
-phi4mm
+gemma4, phi4mm
 ```
 
 ### ALM (audio-language → `WhisperModel`)
@@ -178,12 +183,12 @@ the full vision/embedding/speech/encoder schemas.
 
 ---
 
-## processor_config.json overview
+## image_processor.json overview
 
 > **Critical:** ORT GenAI expects the **ort-extensions** format — NOT the
-> HuggingFace `processor_config.json` format. HF uses `"image_processor"`
-> as the top key; ort-extensions uses `"processor"` with an ordered
-> transform pipeline.
+> HuggingFace format (HF's `preprocessor_config.json` uses `"image_processor"`
+> as the top key). The ort-extensions `image_processor.json` uses `"processor"`
+> with an ordered transform pipeline.
 
 Structure:
 
@@ -212,16 +217,32 @@ Transform types: `DecodeImage`, `ConvertRGB`, `Resize`, `Rescale`,
 VLM models use a 3-model split:
 
 ```
-pixel_values + image_grid_thw  →  [vision.onnx]   →  image_features
-                                                           │
-input_ids + image_features     →  [embedding.onnx] →  inputs_embeds
-                                                           │
-inputs_embeds + position_ids   →  [model.onnx]     →  logits
+pixel_values + image_grid_thw  →  [vision_encoder/model.onnx]  →  image_features
+                                                                   │
+input_ids + image_features     →  [embedding/model.onnx]   →  inputs_embeds
+                                                                   │
+inputs_embeds + position_ids   →  [decoder/model.onnx]     →  logits
               + past_kv
 ```
 
 During generation, the vision model runs once at prompt time. The embedding
 and decoder models run each token step.
+
+### GenAI config input introspection
+
+Decoder, vision, embedding, and audio input mappings in `genai_config.json`
+are discovered from the ONNX graph via `_graph_input_names()` — they are
+NOT hardcoded. This helper filters out KV cache inputs
+(`past_key_values.*`, `past_*`) and returns semantic input names.
+
+```python
+# In auto_export.py
+decoder_input_names = _graph_input_names(decoder_model)
+decoder_inputs = {name: name for name in decoder_input_names}
+```
+
+This means the genai config automatically adapts when `RemoveDeadGraphInputsPass`
+removes unused inputs (e.g. `position_ids` absorbed by GQA fusion).
 
 > For the full generation flow, input routing, QwenImageProcessor output
 > tensors, and the multimodal processor factory, see
@@ -238,9 +259,12 @@ VLM models require all three model sections.
 
 ### "key 'processor' not found"
 
-The `processor_config.json` is in HuggingFace format instead of ort-extensions
+The `image_processor.json` is in HuggingFace format instead of ort-extensions
 format. The HF format has `"image_processor"` as the top key; ORT extensions
 needs `"processor"` with a transforms pipeline.
+
+The filename is specified via `config_filename` in the vision section of
+genai_config.json. Audio uses `audio_processor.json`.
 
 ### "Missing Input: cu_window_seqlens"
 
@@ -271,7 +295,7 @@ If the model generates coherent text but fails to describe image contents:
    `vision_start_token_id` at model level and `spatial_merge_size` under
    model.vision.
 
-2. **processor_config.json resize mismatch:** The Resize transform uses
+2. **image_processor.json resize mismatch:** The Resize transform uses
    `width`/`height` as direct target dimensions. If too small, image loses
    detail. Compute correct dimensions:
    ```python
@@ -298,7 +322,7 @@ If the model generates coherent text but fails to describe image contents:
   `/home/justinchu/dev/onnxruntime-genai/src/models/multi_modal.cpp`
 - **Qwen image processor:**
   `/home/justinchu/dev/onnxruntime-genai/src/models/qwen2_5_vl_image_processor.cpp`
-- **Reference processor_config.json:**
+- **Reference image_processor.json:**
   `/home/justinchu/dev/onnxruntime-genai/test/test_models/qwen-vision-preprocessing/processor_config.json`
 - **Example genai_config generation:**
   `examples/qwen25_vl_ort_genai.py`
