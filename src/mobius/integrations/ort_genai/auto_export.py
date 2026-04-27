@@ -235,6 +235,66 @@ def _write_vision_processor_config(
     return path
 
 
+def _write_audio_processor_config(
+    config: Any,
+    output_dir: str,
+) -> str | None:
+    """Write the audio feature extraction config for models with speech support.
+
+    For Gemma4: writes ``audio_feature_extraction.json`` with the
+    onnxruntime-extensions feature extraction pipeline
+    (``AudioDecoder → Gemma4LogMel``).
+
+    Returns the written file path, or None if the config has no audio section.
+    """
+    audio = getattr(config, "audio", None)
+    if audio is None:
+        return None
+
+    model_type = getattr(config, "model_type", "")
+
+    if model_type in ("gemma4", "gemma4_text"):
+        # Gemma4 audio uses onnxruntime-extensions Gemma4LogMel feature extractor
+        audio_config: dict[str, Any] = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_log_mel",
+                            "type": "Gemma4LogMel",
+                            "attrs": {
+                                "feature_size": getattr(audio, "feature_size", 128),
+                                "sampling_rate": getattr(audio, "sampling_rate", 16000),
+                                "frame_length_ms": 20.0,
+                                "hop_length_ms": 10.0,
+                                "min_frequency": getattr(audio, "min_frequency", 0.0),
+                                "max_frequency": getattr(audio, "max_frequency", 8000.0),
+                                "preemphasis": getattr(audio, "preemphasis", 0.0),
+                                "preemphasis_htk_flavor": 1,
+                                "fft_overdrive": 0,
+                                "mel_floor": getattr(audio, "mel_floor", 0.001),
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_feature_extraction.json"
+    else:
+        return None
+
+    path = os.path.join(output_dir, proc_filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(audio_config, f, indent=4)
+    return path
+
+
 def _write_genai_config(
     config: Any,
     output_dir: str,
@@ -325,7 +385,17 @@ def _write_genai_config(
         audio_token_id = (
             getattr(audio_config, "token_id", None) if audio_config is not None else None
         )
-        generator.with_speech(audio_token_id=audio_token_id)
+        model_type = getattr(config, "model_type", "")
+
+        speech_kwargs: dict[str, Any] = {}
+        if model_type in ("gemma4", "gemma4_text"):
+            # Gemma4 audio encoder uses a different filename and input mapping
+            speech_kwargs["filename"] = "audio/model.onnx"
+            speech_kwargs["config_filename"] = "audio_feature_extraction.json"
+            # Gemma4 speech model input is 'input_features', map it to genai's 'audio_embeds' field
+            speech_kwargs["input_names"] = {"audio_embeds": "input_features"}
+
+        generator.with_speech(audio_token_id=audio_token_id, **speech_kwargs)
 
     return generator.write(output_dir)
 
@@ -485,6 +555,11 @@ def write_ort_genai_config(
     processor_path = _write_vision_processor_config(config, directory)
     if processor_path:
         result["processor_config"] = processor_path
+
+    # Write audio_feature_extraction.json for models with speech
+    audio_proc_path = _write_audio_processor_config(config, directory)
+    if audio_proc_path:
+        result["audio_processor_config"] = audio_proc_path
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
