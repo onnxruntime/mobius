@@ -183,6 +183,9 @@ class MambaCausalLMModel(nn.Module):
         self.config = config
         self.model = MambaBackbone(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # MambaBackbone uses self.embeddings (not embed_tokens)
+            self.lm_head.weight = self.model.embeddings.weight
 
     def forward(
         self,
@@ -243,12 +246,12 @@ class MambaCausalLMModel(nn.Module):
         for old_key, new_key in renames.items():
             state_dict[new_key] = state_dict.pop(old_key)
 
-        # Tied embeddings
+        # Tied embeddings: lm_head.weight shares graph initializer with model.embeddings.weight.
+        # Ensure model.embeddings.weight is present; discard lm_head.weight.
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" in state_dict:
+            if "model.embeddings.weight" not in state_dict:
                 state_dict["model.embeddings.weight"] = state_dict["lm_head.weight"]
-            elif "model.embeddings.weight" in state_dict:
-                state_dict["lm_head.weight"] = state_dict["model.embeddings.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         return state_dict
 
@@ -404,6 +407,9 @@ class Mamba2CausalLMModel(nn.Module):
         self.config = config
         self.backbone = Mamba2Backbone(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            # Mamba2Backbone uses self.embeddings (not embed_tokens)
+            self.lm_head.weight = self.backbone.embeddings.weight
 
     def forward(
         self,
@@ -441,9 +447,8 @@ class Mamba2CausalLMModel(nn.Module):
         """
         # Tied embeddings (Mamba2 uses self.backbone, not self.model)
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" in state_dict:
+            if "backbone.embeddings.weight" not in state_dict:
                 state_dict["backbone.embeddings.weight"] = state_dict["lm_head.weight"]
-            elif "backbone.embeddings.weight" in state_dict:
-                state_dict["lm_head.weight"] = state_dict["backbone.embeddings.weight"]
+            state_dict.pop("lm_head.weight", None)
 
         return state_dict

@@ -20,9 +20,9 @@ multi-component export for pipelines.
 
 | Category | Examples |
 |---|---|
-| **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3, Phi-3/3.5, Gemma 1/2/3, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
+| **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3, Phi-3V, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Pixtral |
+| **Multimodal** | Gemma 3, Phi-3V, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
 | **Speech-to-Text** | Whisper |
@@ -95,26 +95,17 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 ```sh
 mobius build --model Qwen/Qwen2.5-0.5B output_dir/
 
-# Build without weights (graph skeleton only)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --no-weights
+# Build for CUDA with f16
+mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
 mobius build --model Qwen/Qwen-Image-2512 output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
 mobius build --model openai/whisper-tiny output_dir/
-
-# Specify dtype
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --dtype f16
-
-# Build with static KV cache (pre-allocated buffers, uses TensorScatter)
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache
-
-# Static cache with explicit max sequence length
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --static-cache --max-seq-len 2048
 ```
 
-See the [CLI reference](https://onnxruntime.github.io/mobius/cli.html) for all options.
+See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
 
 ### Examples
 

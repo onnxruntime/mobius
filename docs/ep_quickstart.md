@@ -38,7 +38,7 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
 pkg.save("output/llama/")
 ```
 
-CLI equivalent:
+CLI equivalent (see [CLI Reference](cli_reference.md) for all `--ep` options):
 
 ```bash
 mobius build --model meta-llama/Llama-3.2-1B output/ \

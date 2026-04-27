@@ -89,7 +89,7 @@ def _run_onnx_pipeline(
 
     # Step 1: Vision encoder
     if pixel_values is not None:
-        vision_session = OnnxModelSession(pkg["vision"])
+        vision_session = OnnxModelSession(pkg["vision_encoder"])
         # Flatten multi-crop to batch: [N, crops, C, H, W] → [N*crops, C, H, W]
         if pixel_values.ndim == 5:
             n, crops, c, h, w = pixel_values.shape
@@ -112,7 +112,7 @@ def _run_onnx_pipeline(
 
     # Step 2: Speech encoder
     if audio_features is not None:
-        speech_session = OnnxModelSession(pkg["speech"])
+        speech_session = OnnxModelSession(pkg["audio_encoder"])
         audio_sizes = np.array([audio_features.shape[1]], dtype=np.int64)
         speech_out = speech_session.run(
             {
@@ -157,7 +157,7 @@ def _run_onnx_pipeline(
             dtype=np.float32,
         )
 
-    decoder_session = OnnxModelSession(pkg["model"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
     decoder_out = decoder_session.run(decoder_feeds)
     decoder_session.close()
 

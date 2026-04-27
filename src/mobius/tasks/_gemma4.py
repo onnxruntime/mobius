@@ -9,7 +9,7 @@ The unified :class:`Gemma4Task` builds a 3- or 4-model package:
 2. **vision** (vision encoder): ``pixel_values, pixel_position_ids`` → ``image_features``
 3. **embedding**: ``input_ids, image_features[, audio_features]`` → ``inputs_embeds``
 4. **audio** (audio encoder, only when ``config.audio is not None``):
-   ``input_features`` → ``audio_features``
+   ``input_features, input_features_mask`` → ``audio_features``
 
 The decoder uses per-layer KV cache where local (sliding_attention) layers
 use ``config.head_dim`` and global (full_attention) layers use
@@ -49,6 +49,10 @@ def _make_gemma4_kv_cache_inputs(
     The last ``config.num_kv_shared_layers`` layers share K,V from earlier
     layers and do NOT have their own cache entries — only
     ``num_hidden_layers - num_kv_shared_layers`` entries are created.
+
+    All layers use the original ``num_key_value_heads`` (no expansion).
+    The Attention op supports GQA head counts natively.  CUDA EP limitations
+    are tracked in microsoft/onnxruntime#28195 and #28196.
     """
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
@@ -67,14 +71,15 @@ def _make_gemma4_kv_cache_inputs(
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
+        kv_heads = config.num_key_value_heads
         past_key = ir.Value(
             name=f"past_key_values.{i}.key",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         past_value = ir.Value(
             name=f"past_key_values.{i}.value",
-            shape=ir.Shape([batch, config.num_key_value_heads, past_seq_len, hd]),
+            shape=ir.Shape([batch, kv_heads, past_seq_len, hd]),
             type=ir.TensorType(config.dtype),
         )
         flat.extend([past_key, past_value])
@@ -164,8 +169,31 @@ class Gemma4Task(ModelTask):
     Decoder KV cache is per-layer with the correct head_dim for each layer type
     (local vs global), unlike the uniform head_dim in :class:`VisionLanguageTask`.
 
-    Vision input is pre-patchified: ``pixel_values [B, N, 3*P^2]`` and
-    ``pixel_position_ids [B, N, 2]`` with (x, y) patch coordinates.
+    Batching strategies
+    -------------------
+    Each sub-model uses a different strategy for variable-size inputs:
+
+    **Vision** — padded patches with sentinel position IDs.
+        All images are patchified to a fixed ``max_soft_tokens`` (280)
+        slots.  Images smaller than the maximum get ``(-1, -1)`` in their
+        ``pixel_position_ids`` for unused patch slots, which the encoder
+        ignores.  No explicit mask is needed.
+
+    **Audio** — explicit contiguous bool mask.
+        Audio clips of different lengths are padded to equal time
+        dimension.  ``input_features_mask [B, T]`` marks valid frames
+        (``True``) vs padding (``False``), always contiguous
+        (right-padded).  The mask is downsampled through two conv layers
+        (stride 2 each → ``T//4``) and used to zero out padding in
+        Conformer attention.  The downsampled mask is returned as
+        ``audio_features_mask [B, T//4]`` so callers can strip padding
+        rows before scattering into text embeddings.
+
+    **Decoder** — standard ``attention_mask`` for KV cache padding.
+        ``attention_mask [B, past+current]`` is a 1/0 int mask indicating
+        valid token positions across the full sequence (past cache +
+        current input).  The ``Attention`` / ``GroupQueryAttention`` ops
+        handle causal masking internally via ``is_causal=1``.
     """
 
     def build(
@@ -175,9 +203,9 @@ class Gemma4Task(ModelTask):
     ) -> ModelPackage:
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         if config.audio is not None:
-            models["audio"] = self._build_audio(module.audio_encoder, config)
+            models["audio_encoder"] = self._build_audio(module.audio_encoder, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
         return ModelPackage(models, config=config)
 
@@ -250,8 +278,12 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data
-        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates
+        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data where
+          ``B`` is the number of images and ``N`` is the number of patches
+          (padded to ``max_soft_tokens``, typically 280).
+        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates.
+          Unused patch slots (from images smaller than the maximum) use
+          ``(-1, -1)`` as a sentinel value — no explicit mask is needed.
 
         Output:
         - ``image_features [B*N, text_hidden_size]``: projected vision features
@@ -274,7 +306,7 @@ class Gemma4Task(ModelTask):
 
         graph_inputs = [pixel_values, pixel_position_ids]
 
-        graph, graph_builder = _make_graph(graph_inputs, name="vision")
+        graph, graph_builder = _make_graph(graph_inputs, name="vision_encoder")
         op = graph_builder.op
 
         image_features = vision(
@@ -293,13 +325,24 @@ class Gemma4Task(ModelTask):
         audio: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build audio encoder: input_features -> audio_features.
+        """Build audio encoder: input_features + input_features_mask -> audio_features.
 
-        Input:
+        Inputs:
         - ``input_features [batch, time, input_size]``: mel-spectrogram
+        - ``input_features_mask [batch, time]``: BOOL mask indicating valid
+          mel frames. Must be **contiguous**: all ``True`` entries precede
+          all ``False`` entries (right-padded). The HuggingFace
+          ``Gemma4AudioFeatureExtractor`` produces this layout by padding
+          audio to equal batch lengths and marking padded frames as
+          ``False``. The mask is downsampled through conv subsampling
+          layers (stride 2 per stage) and used to zero out padded
+          positions in Conformer attention.
 
-        Output:
+        Outputs:
         - ``audio_features [batch, time//4, text_hidden_size]``: encoded tokens
+        - ``audio_features_mask [batch, time//4]``: BOOL downsampled mask
+          indicating which output positions are valid (for stripping
+          padding rows before scattering into text embeddings)
         """
         batch = ir.SymbolicDim("batch")
         time = ir.SymbolicDim("time")
@@ -310,13 +353,29 @@ class Gemma4Task(ModelTask):
             shape=ir.Shape([batch, time, input_size]),
             type=ir.TensorType(config.dtype),
         )
+        input_features_mask = ir.Value(
+            name="input_features_mask",
+            shape=ir.Shape([batch, time]),
+            type=ir.TensorType(ir.DataType.BOOL),
+        )
 
-        graph, graph_builder = _make_graph([input_features], name="audio")
+        graph, graph_builder = _make_graph(
+            [input_features, input_features_mask], name="audio_encoder"
+        )
         op = graph_builder.op
 
-        audio_features = audio(op, input_features)
+        audio_features, downsampled_mask = audio(
+            op,
+            input_features,
+            input_features_mask=input_features_mask,
+        )
         audio_features.name = "audio_features"
         graph.outputs.append(audio_features)
+
+        if downsampled_mask is not None:
+            downsampled_mask.name = "audio_features_mask"
+            graph.outputs.append(downsampled_mask)
+
         return _make_model(graph)
 
     def _build_embedding(

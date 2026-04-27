@@ -85,7 +85,13 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
     """Apply weights from a state dict to an ONNX model.
 
     Assigns each tensor in *state_dict* to the matching initializer in the
-    model.  After all weights are assigned,
+    model.  When two entries in *state_dict* are the **same Python object**
+    (i.e. genuinely tied weights such as ``lm_head.weight`` /
+    ``embed_tokens.weight``), the second initializer's value is redirected to
+    share the first one — a single ONNX initializer is emitted instead of two
+    identical copies.
+
+    After all weights are assigned,
     :func:`~mobius._optimizations.fold_initializers_after_weights` is called to
     fold ``Transpose`` and ``Concat`` nodes over initializers into pre-computed
     weights and remove unused source initializers.
@@ -94,6 +100,18 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
         model: The ONNX IR model.
         state_dict: Mapping of parameter names to torch tensors.
     """
+    # Map tensor storage identity → the ir.Value of the first initializer
+    # assigned for that tensor.  Enables genuine weight sharing: if
+    # lm_head.weight and embed_tokens.weight share the same underlying
+    # storage (common when HF ties weights), only one ONNX initializer is
+    # created and all graph uses point to it.
+    #
+    # We key on ``data_ptr()`` rather than ``id(tensor)`` because HF
+    # safetensors deserialization may create distinct Python objects that
+    # share the same storage (same data_ptr).  Using data_ptr catches both
+    # cases: same Python object *and* same-storage-different-object.
+    storage_to_value: dict[int, ir.Value] = {}
+
     for name, tensor in state_dict.items():
         if name not in model.graph.initializers:
             logger.warning(
@@ -102,7 +120,24 @@ def apply_weights(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> None:
             )
             continue
 
-        _assign_weight(model.graph.initializers[name], tensor, name)
+        initializer = model.graph.initializers[name]
+        storage_key = tensor.data_ptr()
+
+        if storage_key in storage_to_value:
+            # This tensor shares storage with an already-assigned initializer.
+            # Redirect all graph uses of this initializer to the canonical one,
+            # then delete this initializer — genuine single-copy weight sharing.
+            canonical = storage_to_value[storage_key]
+            initializer.replace_all_uses_with(canonical)
+            del model.graph.initializers[name]
+            logger.debug(
+                "Weight tying: '%s' shares initializer with '%s'",
+                name,
+                canonical.name,
+            )
+        else:
+            _assign_weight(initializer, tensor, name)
+            storage_to_value[storage_key] = initializer
 
     fold_initializers_after_weights(model)
 

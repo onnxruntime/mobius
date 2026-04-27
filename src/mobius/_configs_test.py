@@ -910,3 +910,67 @@ class TestArchitectureConfigValidate:
         msg = str(exc_info.value)
         assert "hidden_size" in msg
         assert "num_hidden_layers" in msg
+
+
+class TestGemma4Config:
+    """Tests for Gemma4Config.from_transformers."""
+
+    def test_boa_token_id_extracted_from_parent(self):
+        """boa_token_id lives on the parent HF config, not text_config."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+                "bos_token_id": 2,
+                "eos_token_id": 1,
+                "pad_token_id": 0,
+            },
+        )()
+        parent_config = type(
+            "ParentConfig",
+            (),
+            {"boa_token_id": 256000, "model_type": "gemma4"},
+        )()
+
+        config = Gemma4Config.from_transformers(text_config, parent_config=parent_config)
+        assert config.boa_token_id == 256000
+
+    def test_boa_token_id_none_when_absent(self):
+        """boa_token_id defaults to None when parent doesn't have it."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+            },
+        )()
+
+        config = Gemma4Config.from_transformers(text_config)
+        assert config.boa_token_id is None

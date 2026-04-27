@@ -262,7 +262,7 @@ class TestGenaiConfigGeneratorVLM:
         """VLM config includes vision model section."""
         config = self._make_vlm_gen().generate()
         vision = config["model"]["vision"]
-        assert vision["filename"] == "vision/model.onnx"
+        assert vision["filename"] == "vision_encoder/model.onnx"
         assert vision["spatial_merge_size"] == 2
         assert vision["inputs"]["pixel_values"] == "pixel_values"
         assert vision["outputs"]["image_features"] == "image_features"
@@ -335,6 +335,29 @@ class TestGenaiConfigGeneratorVLM:
         )
         with pytest.raises(TypeError):
             gen.with_vision()  # missing image_token_id
+
+    def test_custom_embedding_input_names(self):
+        """embedding_input_names overrides the default embedding inputs."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=262144,
+            hidden_size=2048,
+            num_hidden_layers=26,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=256,
+        ).with_vision(
+            image_token_id=255999,
+            embedding_input_names={
+                "input_ids": "input_ids",
+                "image_features": "image_features",
+                "custom_input": "custom_input",
+            },
+        )
+        config = gen.generate()
+        emb = config["model"]["embedding"]
+        assert emb["inputs"]["custom_input"] == "custom_input"
+        assert emb["inputs"]["input_ids"] == "input_ids"
 
 
 class TestGenaiConfigFromConfig:
@@ -443,6 +466,56 @@ class TestGenaiConfigWrite:
         assert loaded["model"]["image_token_id"] == 151655
 
 
+class TestExplicitDecoderInputs:
+    """Test decoder_inputs parameter overrides defaults."""
+
+    def test_explicit_decoder_inputs_used(self):
+        """When decoder_inputs is provided, it replaces the defaults."""
+        decoder_inputs = {
+            "inputs_embeds": "inputs_embeds",
+            "input_ids": "input_ids",
+            "attention_mask": "attention_mask",
+            "position_ids": "position_ids",
+            "past_key_names": "past_key_values.%d.key",
+            "past_value_names": "past_key_values.%d.value",
+        }
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=262144,
+            hidden_size=2048,
+            num_hidden_layers=26,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=256,
+            decoder_inputs=decoder_inputs,
+        ).with_vision(
+            image_token_id=255999,
+            spatial_merge_size=None,
+        )
+        config = gen.generate()
+        result = config["model"]["decoder"]["inputs"]
+        assert "input_ids" in result
+        assert "inputs_embeds" in result
+        assert result["past_key_names"] == "past_key_values.%d.key"
+
+    def test_default_used_when_decoder_inputs_none(self):
+        """When decoder_inputs is None, default mapping is used."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
+        config = gen.generate()
+        inputs = config["model"]["decoder"]["inputs"]
+        # LLM default: input_ids, not inputs_embeds
+        assert "input_ids" in inputs
+        assert "inputs_embeds" not in inputs
+
+
 class TestGenaiConfigGeneratorMultimodal:
     """Test genai_config generation for multimodal (vision + speech)."""
 
@@ -464,13 +537,13 @@ class TestGenaiConfigGeneratorMultimodal:
             .with_vision(
                 image_token_id=200010,
                 spatial_merge_size=None,
-                config_filename="vision_processor.json",
+                config_filename="image_processor.json",
                 input_names={
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
                 },
             )
-            .with_speech(
+            .with_audio(
                 audio_token_id=200011,
             )
         )
@@ -484,16 +557,48 @@ class TestGenaiConfigGeneratorMultimodal:
         assert "speech" in model
         assert "embedding" in model
 
-    def test_speech_section_has_correct_inputs(self):
-        """Speech section has audio_embeds, audio_sizes, mode."""
+    def test_audio_section_has_correct_inputs(self):
+        """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
-        speech = config["model"]["speech"]
-        assert speech["filename"] == "speech/model.onnx"
-        assert speech["config_filename"] == "speech_processor.json"
-        assert speech["inputs"]["audio_embeds"] == "audio_embeds"
-        assert speech["inputs"]["audio_sizes"] == "audio_sizes"
-        assert speech["inputs"]["audio_projection_mode"] == "audio_projection_mode"
-        assert speech["outputs"]["audio_features"] == "audio_features"
+        audio = config["model"]["speech"]
+        assert audio["filename"] == "audio_encoder/model.onnx"
+        assert audio["config_filename"] == "audio_processor.json"
+        assert audio["inputs"]["audio_embeds"] == "audio_embeds"
+        assert audio["inputs"]["audio_sizes"] == "audio_sizes"
+        assert audio["inputs"]["audio_projection_mode"] == "audio_projection_mode"
+        assert audio["outputs"]["audio_features"] == "audio_features"
+
+    def test_boa_token_id_in_audio_config(self):
+        """boa_token_id is included when passed to with_audio()."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+        )
+        gen.with_vision(image_token_id=200010)
+        gen.with_audio(audio_token_id=200011, boa_token_id=256000)
+        config = gen.generate()
+        assert config["model"]["boa_token_id"] == 256000
+
+    def test_boa_token_id_absent_when_not_set(self):
+        """boa_token_id is omitted when not provided."""
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+        )
+        gen.with_vision(image_token_id=200010)
+        gen.with_audio(audio_token_id=200011)
+        config = gen.generate()
+        assert "boa_token_id" not in config["model"]
 
     def test_vision_custom_inputs(self):
         """Vision section uses custom input names (no image_grid_thw)."""
@@ -512,8 +617,8 @@ class TestGenaiConfigGeneratorMultimodal:
         assert emb["inputs"]["image_features"] == "image_features"
         assert emb["inputs"]["audio_features"] == "audio_features"
 
-    def test_embedding_no_audio_without_speech(self):
-        """Embedding inputs don't have audio_features without speech."""
+    def test_embedding_no_audio_without_audio(self):
+        """Embedding inputs don't have audio_features without audio."""
         gen = GenaiConfigGenerator(
             "qwen2_5_vl",
             vocab_size=151936,
@@ -539,8 +644,8 @@ class TestGenaiConfigGeneratorMultimodal:
         assert "inputs_embeds" in inputs
         assert "input_id" not in inputs
 
-    def test_speech_only_uses_inputs_embeds(self):
-        """Speech-only (no vision) still uses inputs_embeds."""
+    def test_audio_only_uses_inputs_embeds(self):
+        """Audio-only (no vision) still uses inputs_embeds."""
         gen = GenaiConfigGenerator(
             "whisper",
             vocab_size=51865,
@@ -549,13 +654,13 @@ class TestGenaiConfigGeneratorMultimodal:
             num_attention_heads=8,
             num_key_value_heads=8,
             head_dim=64,
-        ).with_speech()
+        ).with_audio()
         config = gen.generate()
         inputs = config["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in inputs
 
     def test_chaining_returns_self(self):
-        """with_vision() and with_speech() return self for chaining."""
+        """with_vision() and with_audio() return self for chaining."""
         gen = GenaiConfigGenerator(
             "phi4mm",
             vocab_size=200064,
@@ -565,7 +670,7 @@ class TestGenaiConfigGeneratorMultimodal:
             num_key_value_heads=8,
             head_dim=128,
         )
-        result = gen.with_vision(image_token_id=200010).with_speech()
+        result = gen.with_vision(image_token_id=200010).with_audio()
         assert result is gen
 
 
@@ -627,7 +732,7 @@ class TestGenaiConfigGeneratorEp:
         assert "CUDAExecutionProvider" in opts[0]
 
     def test_cuda_ep_all_blocks_have_cuda_session_options(self):
-        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, speech)."""
+        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, audio)."""
         gen = (
             GenaiConfigGenerator(
                 "phi4mm",
@@ -640,7 +745,7 @@ class TestGenaiConfigGeneratorEp:
                 ep="cuda",
             )
             .with_vision(image_token_id=200010)
-            .with_speech()
+            .with_audio()
         )
         config = gen.generate()
 

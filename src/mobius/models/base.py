@@ -203,6 +203,10 @@ class CausalLMModel(nn.Module):
         self.config = config
         self.model = TextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Share a single ONNX initializer: lm_head and embed_tokens point to
+        # the same nn.Parameter so only one ir.Value appears in the graph.
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -236,6 +240,14 @@ class CausalLMModel(nn.Module):
                 state_dict, bits=qc.bits, group_size=qc.group_size
             )
         if self.config.tie_word_embeddings:
+            # Ensure both embed_tokens.weight and lm_head.weight are present so
+            # apply_weights can assign each to its initializer.  For graph-level
+            # tied models (standard CausalLMModel) both ir.Values are the same
+            # object, so apply_weights' id()-dedup redirects lm_head uses to the
+            # embed_tokens canonical and drops the duplicate initializer.  For
+            # subclasses that override self.model after super().__init__ (e.g.
+            # Cohere, GPT-2 family), the ir.Values differ but the dedup still
+            # unifies them at load time via replace_all_uses_with.
             tie_word_embeddings(state_dict)
         return state_dict
 

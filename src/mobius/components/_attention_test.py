@@ -255,6 +255,64 @@ class TestGQAContextDispatch:
         gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
         assert gqa_node.attributes["rotary_interleaved"].value == 1
 
+    def test_gqa_context_local_window_size(self):
+        """local_window_size attribute is set on GQA node when > 0."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, 8])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 8])
+
+        gqa_ctx = GQAContext(
+            seqlens_k, total_seq_len, cos_cache, sin_cache, local_window_size=512
+        )
+
+        output, _ = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output])
+
+        gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
+        assert gqa_node.attributes["local_window_size"].value == 512
+
+    def test_gqa_context_no_local_window_size_when_default(self):
+        """local_window_size attribute is absent when default (-1)."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config()
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, 8])
+        sin_cache = create_test_input(builder, "sin_cache", [32, 8])
+
+        gqa_ctx = GQAContext(seqlens_k, total_seq_len, cos_cache, sin_cache)
+
+        output, _ = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output])
+
+        gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
+        assert "local_window_size" not in gqa_node.attributes
+
     def test_standard_attention_when_no_gqa_context(self):
         """Without GQAContext, standard ONNX Attention is emitted."""
         config = make_config()

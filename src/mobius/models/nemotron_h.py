@@ -518,6 +518,8 @@ class NemotronHCausalLMModel(nn.Module):
         self.config = config
         self.model = _NemotronHTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,

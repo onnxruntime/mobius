@@ -637,7 +637,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("chatglm", {}, True),
     ("ernie4_5", {}, True),
     (
-        "gemma3",
+        "gemma3_text",
         {
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
@@ -2027,7 +2027,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("internvl", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     # --- Gemma3 multimodal (requires rope_local_base_freq, layer_types) ---
     (
-        "gemma3_multimodal",
+        "gemma3",
         {
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,

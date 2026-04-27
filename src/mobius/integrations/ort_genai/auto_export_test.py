@@ -15,10 +15,47 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _graph_input_names,
     _resolve_ort_genai_model_type,
-    _write_processor_config,
+    _write_genai_config,
+    _write_vision_processor_config,
     write_ort_genai_config,
 )
+
+
+def _mock_model_with_inputs(names):
+    """Create a mock ir.Model whose graph.inputs have the given names."""
+    inputs = []
+    for n in names:
+        inp = mock.MagicMock()
+        inp.name = n
+        inputs.append(inp)
+    m = mock.MagicMock()
+    m.graph.inputs = inputs
+    return m
+
+
+def _make_fake_llm_pkg(model_type: str = "qwen2"):
+    """Build a minimal LLM-only ModelPackage with a fake config."""
+    import dataclasses
+
+    from mobius._model_package import ModelPackage
+
+    @dataclasses.dataclass
+    class FakeConfig:
+        model_type: str = "qwen2"
+        vocab_size: int = 256
+        hidden_size: int = 64
+        num_hidden_layers: int = 2
+        num_attention_heads: int = 4
+        num_key_value_heads: int = 2
+        head_dim: int = 16
+        max_position_embeddings: int = 128
+
+    return ModelPackage(
+        {"model": mock.MagicMock()},
+        config=FakeConfig(model_type=model_type),
+    )
 
 
 class TestResolveOrtGenaiModelType:
@@ -40,7 +77,7 @@ class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
         del config.vision  # ensure no vision attribute
-        assert _write_processor_config(config, str(tmp_path)) is None
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
 
     def test_writes_vision_config(self, tmp_path):
         vision = mock.MagicMock()
@@ -49,7 +86,7 @@ class TestWriteProcessorConfig:
         config = mock.MagicMock()
         config.vision = vision
 
-        path = _write_processor_config(config, str(tmp_path))
+        path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
@@ -63,6 +100,7 @@ class TestCopyTokenizerFiles:
         fake_src = tmp_path / "src"
         fake_src.mkdir()
         (fake_src / "tokenizer.json").write_text('{"test": true}')
+        (fake_src / "chat_template.jinja").write_text("{{ messages }}")
 
         with mock.patch("huggingface_hub.hf_hub_download") as mock_dl:
             mock_dl.side_effect = lambda model_id, filename: (
@@ -77,6 +115,8 @@ class TestCopyTokenizerFiles:
 
         assert "tokenizer.json" in copied
         assert (dst / "tokenizer.json").exists()
+        assert "chat_template.jinja" in copied
+        assert (dst / "chat_template.jinja").exists()
 
 
 class TestCopyTokenizerFilesFromLocal:
@@ -88,14 +128,19 @@ class TestCopyTokenizerFilesFromLocal:
         src.mkdir()
         (src / "tokenizer.json").write_text('{"test": true}')
         (src / "tokenizer_config.json").write_text('{"model_type": "llama"}')
+        (src / "chat_template.jinja").write_text("{{ messages }}")
 
         dst = tmp_path / "output"
         dst.mkdir()
         copied = _copy_tokenizer_files_from_local(str(src), str(dst))
 
-        assert set(copied) == {"tokenizer.json", "tokenizer_config.json"}
+        assert set(copied) == {
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+        }
         assert (dst / "tokenizer.json").read_text() == '{"test": true}'
-        assert (dst / "tokenizer_config.json").read_text() == '{"model_type": "llama"}'
+        assert (dst / "chat_template.jinja").read_text() == "{{ messages }}"
 
     def test_skips_absent_files(self, tmp_path):
         """Files not present in the source directory are silently skipped."""
@@ -140,22 +185,7 @@ class TestWriteOrtGenaiConfigLocalDir:
 
     @staticmethod
     def _make_pkg():
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "llama"
-            vocab_size: int = 256
-            hidden_size: int = 64
-            num_hidden_layers: int = 2
-            num_attention_heads: int = 4
-            num_key_value_heads: int = 2
-            head_dim: int = 16
-            max_position_embeddings: int = 128
-
-        return ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        return _make_fake_llm_pkg("llama")
 
     def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
         """When local_config_dir is set, tokenizer files are copied from it."""
@@ -224,24 +254,7 @@ class TestExportForOrtGenai:
 
     @staticmethod
     def _make_pkg():
-        """Build a minimal LLM-only ModelPackage with a fake config."""
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "qwen2"
-            vocab_size: int = 256
-            hidden_size: int = 64
-            num_hidden_layers: int = 2
-            num_attention_heads: int = 4
-            num_key_value_heads: int = 2
-            head_dim: int = 16
-            max_position_embeddings: int = 128
-
-        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
-        return pkg
+        return _make_fake_llm_pkg("qwen2")
 
     def test_genai_config_json_is_written(self, tmp_path):
         """genai_config.json is always written to the output directory."""
@@ -256,7 +269,7 @@ class TestExportForOrtGenai:
         assert data["model"]["type"] == "qwen2"
 
     def test_processor_config_written_with_vision(self, tmp_path):
-        """processor_config.json is written when pkg.config.vision is set."""
+        """image_processor.json is written when pkg.config.vision is set."""
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -281,7 +294,7 @@ class TestExportForOrtGenai:
         pkg = ModelPackage(
             {
                 "model": mock.MagicMock(),
-                "vision": mock.MagicMock(),
+                "vision_encoder": mock.MagicMock(),
                 "embedding": mock.MagicMock(),
             },
             config=FakeConfig(),
@@ -295,7 +308,7 @@ class TestExportForOrtGenai:
         assert data["image_size"] == 448
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
-        """processor_config.json is NOT written when pkg.config has no vision attr."""
+        """image_processor.json is NOT written when pkg.config has no vision attr."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
@@ -303,6 +316,69 @@ class TestExportForOrtGenai:
 
         assert "processor_config" not in result
         assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
+
+    def test_gemma4_image_processor_json_written(self, tmp_path):
+        """Gemma4 writes image_processor.json with onnxruntime-extensions transforms pipeline."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            mm_tokens_per_image: int = 260
+            pooling_kernel_size: int = 3
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "vision": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        # Should write image_processor.json, not processor_config.json
+        assert "processor_config" in result
+        proc_path = result["processor_config"]
+        assert proc_path.endswith("image_processor.json")
+        assert os.path.isfile(proc_path)
+        assert not os.path.exists(os.path.join(str(tmp_path), "processor_config.json"))
+
+        with open(proc_path) as f:
+            data = json.load(f)
+
+        # Verify onnxruntime-extensions transforms pipeline structure
+        assert "processor" in data
+        assert "transforms" in data["processor"]
+        transforms = data["processor"]["transforms"]
+        assert len(transforms) == 2
+
+        # First op: DecodeImage
+        op0 = transforms[0]["operation"]
+        assert op0["type"] == "DecodeImage"
+        assert op0["attrs"]["color_space"] == "RGB"
+
+        # Second op: Gemma4ImageTransform with correct attrs from config
+        op1 = transforms[1]["operation"]
+        assert op1["type"] == "Gemma4ImageTransform"
+        assert op1["attrs"]["patch_size"] == 16
+        assert op1["attrs"]["max_soft_tokens"] == 260
+        assert op1["attrs"]["pooling_kernel_size"] == 3
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
@@ -482,9 +558,277 @@ class TestExportForOrtGenai:
         assert data["model"]["eos_token_id"] == [1, 106]
 
 
-@pytest.mark.integration
-class TestAutoExportEndToEnd:
-    """Integration test: auto_export with a tiny model (no real download)."""
+class TestGemma4GenaiConfig:
+    """Tests for Gemma4-specific genai_config generation via graph introspection."""
+
+    @staticmethod
+    def _make_gemma4_pkg():
+        """Build a mock Gemma4 VLM package with graph inputs."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            mm_tokens_per_image: int = 256
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 2048
+            num_hidden_layers: int = 26
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 4
+            head_dim: int = 256
+            max_position_embeddings: int = 8192
+            image_token_id: int = 255999
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        # Mock graph inputs for each sub-model
+        decoder = _mock_model_with_inputs(
+            [
+                "inputs_embeds",
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+            ]
+        )
+        vision = _mock_model_with_inputs(
+            [
+                "pixel_values",
+                "pixel_position_ids",
+            ]
+        )
+        embedding = _mock_model_with_inputs(
+            [
+                "input_ids",
+                "image_features",
+            ]
+        )
+
+        return ModelPackage(
+            {
+                "decoder": decoder,
+                "vision_encoder": vision,
+                "embedding": embedding,
+            },
+            config=FakeConfig(),
+        )
+
+    def test_gemma4_vision_inputs(self, tmp_path):
+        """Gemma4 vision uses pixel_values + pixel_position_ids."""
+        pkg = self._make_gemma4_pkg()
+        path = _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="gemma4",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        vision_inputs = data["model"]["vision"]["inputs"]
+        assert "pixel_values" in vision_inputs
+        assert "pixel_position_ids" in vision_inputs
+        assert "image_grid_thw" not in vision_inputs
+        assert data["model"]["vision"]["spatial_merge_size"] == 2
+
+    def test_gemma4_decoder_has_input_ids_and_inputs_embeds(self, tmp_path):
+        """Gemma4 decoder has both inputs_embeds and input_ids."""
+        pkg = self._make_gemma4_pkg()
+        path = _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="gemma4",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        decoder_inputs = data["model"]["decoder"]["inputs"]
+        assert "inputs_embeds" in decoder_inputs
+        assert "input_ids" in decoder_inputs
+        # KV cache templates are present
+        assert decoder_inputs["past_key_names"] == "past_key_values.%d.key"
+
+    def test_gemma4_embedding_inputs(self, tmp_path):
+        """Gemma4 embedding inputs discovered from graph."""
+        pkg = self._make_gemma4_pkg()
+        path = _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="gemma4",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        emb_inputs = data["model"]["embedding"]["inputs"]
+        assert "input_ids" in emb_inputs
+        assert "image_features" in emb_inputs
+
+
+class TestGraphInputNames:
+    """Tests for _graph_input_names() helper."""
+
+    def test_filters_kv_cache_inputs(self):
+        """KV cache inputs (past_key_values.*) are filtered out."""
+        model = _mock_model_with_inputs(
+            [
+                "input_ids",
+                "attention_mask",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "past_key_values.1.key",
+                "past_key_values.1.value",
+            ]
+        )
+        result = _graph_input_names(model)
+        assert result == ["input_ids", "attention_mask"]
+
+    def test_filters_past_prefix(self):
+        """Inputs starting with 'past_' are also filtered out."""
+        model = _mock_model_with_inputs(
+            [
+                "input_ids",
+                "past_something",
+            ]
+        )
+        result = _graph_input_names(model)
+        assert result == ["input_ids"]
+
+    def test_skips_none_names(self):
+        """Inputs with name=None are skipped."""
+        inp_good = mock.MagicMock()
+        inp_good.name = "input_ids"
+        inp_none = mock.MagicMock()
+        inp_none.name = None
+        m = mock.MagicMock()
+        m.graph.inputs = [inp_good, inp_none]
+        result = _graph_input_names(m)
+        assert result == ["input_ids"]
+
+    def test_returns_all_semantic_inputs(self):
+        """All non-KV-cache inputs are returned in order."""
+        model = _mock_model_with_inputs(
+            [
+                "inputs_embeds",
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+            ]
+        )
+        result = _graph_input_names(model)
+        assert result == [
+            "inputs_embeds",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+        ]
+
+
+class TestGemma4RealModel:
+    """Build a real tiny Gemma4 model and verify genai config inputs."""
+
+    def test_gemma4_genai_config_from_real_model(self, tmp_path):
+        """Build tiny Gemma4 VLM, generate genai config, verify inputs."""
+        from mobius._builder import build_from_module
+        from mobius._config_resolver import _default_task_for_model
+        from mobius._configs import Gemma4Config, VisionConfig
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        config = Gemma4Config(
+            model_type="gemma4",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            bos_token_id=2,
+            boa_token_id=256000,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4")
+        task = get_task(task_name)
+        pkg = build_from_module(module, config, task=task)
+        pkg.config = config
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        # Decoder inputs introspected from graph
+        decoder_inputs = data["model"]["decoder"]["inputs"]
+        assert "inputs_embeds" in decoder_inputs
+        assert "input_ids" in decoder_inputs
+        assert "attention_mask" in decoder_inputs
+        assert "position_ids" in decoder_inputs
+        assert decoder_inputs["past_key_names"] == ("past_key_values.%d.key")
+
+        # Vision inputs introspected from graph
+        vision_inputs = data["model"]["vision"]["inputs"]
+        assert "pixel_values" in vision_inputs
+        assert "pixel_position_ids" in vision_inputs
+        assert "image_grid_thw" not in vision_inputs
+
+        # Embedding inputs introspected from graph
+        emb_inputs = data["model"]["embedding"]["inputs"]
+        assert "input_ids" in emb_inputs
+        assert "image_features" in emb_inputs
+
+        # Config-level properties are still present
+        assert data["model"]["image_token_id"] == 255999
+        assert data["model"]["bos_token_id"] == 2
+        assert data["model"]["vision"]["spatial_merge_size"] == 2
+        assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
@@ -607,14 +951,14 @@ class TestAutoExportEndToEnd:
         pkg = build_from_module(module, config, task=Phi4MMMultiModalTask())
 
         # Verify 4-model split
-        assert "vision" in pkg
-        assert "speech" in pkg
+        assert "vision_encoder" in pkg
+        assert "audio_encoder" in pkg
         assert "embedding" in pkg
-        assert "model" in pkg
+        assert "decoder" in pkg
 
         # Simulate auto_export detection logic
-        is_vlm = "vision" in pkg and "embedding" in pkg
-        has_speech = "speech" in pkg
+        is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+        has_speech = "audio_encoder" in pkg
         ort_model_type = "phi"  # HF model_type for phi4mm
         if ort_model_type == "phi" and has_speech:
             ort_model_type = "phi4mm"
@@ -627,14 +971,14 @@ class TestAutoExportEndToEnd:
         generator = GenaiConfigGenerator.from_config(config, ort_model_type)
         vision_kwargs = {
             "spatial_merge_size": None,
-            "config_filename": "vision_processor.json",
+            "config_filename": "image_processor.json",
             "input_names": {
                 "pixel_values": "pixel_values",
                 "image_sizes": "image_sizes",
             },
         }
         generator.with_vision(image_token_id=config.image_token_id, **vision_kwargs)
-        generator.with_speech(audio_token_id=config.audio.token_id)
+        generator.with_audio(audio_token_id=config.audio.token_id)
 
         genai_config = generator.generate()
 
@@ -655,9 +999,9 @@ class TestAutoExportEndToEnd:
         assert model["vision"]["inputs"]["image_sizes"] == "image_sizes"
         assert "image_grid_thw" not in model["vision"]["inputs"]
         assert "spatial_merge_size" not in model["vision"]
-        assert model["vision"]["config_filename"] == "vision_processor.json"
+        assert model["vision"]["config_filename"] == "image_processor.json"
 
-        # Speech section
+        # Audio section
         assert model["speech"]["inputs"]["audio_embeds"] == "audio_embeds"
         assert model["speech"]["inputs"]["audio_sizes"] == "audio_sizes"
         assert model["speech"]["inputs"]["audio_projection_mode"] == "audio_projection_mode"
@@ -685,8 +1029,8 @@ class TestAutoExportEndToEnd:
 
         assert os.path.exists(os.path.join(output_dir, "genai_config.json"))
         # 4-model split produces subdirectories
-        assert os.path.exists(os.path.join(output_dir, "vision"))
-        assert os.path.exists(os.path.join(output_dir, "speech"))
+        assert os.path.exists(os.path.join(output_dir, "vision_encoder"))
+        assert os.path.exists(os.path.join(output_dir, "audio_encoder"))
         assert os.path.exists(os.path.join(output_dir, "embedding"))
 
         with open(os.path.join(output_dir, "genai_config.json")) as f:
