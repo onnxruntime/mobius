@@ -353,14 +353,13 @@ def _write_genai_config(
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
             model_type = getattr(config, "model_type", "")
-            if model_type in _GEMMA4_MODEL_TYPES:
-                vision_cfg = getattr(config, "vision", None)
-                sms = getattr(vision_cfg, "spatial_merge_size", 2)
-                vision_kwargs["spatial_merge_size"] = sms
+            if model_type in _GEMMA4_MODEL_TYPES or has_speech:
                 vision_kwargs["config_filename"] = "image_processor.json"
-            elif has_speech:
-                vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "image_processor.json"
+                if model_type in _GEMMA4_MODEL_TYPES:
+                    vision_cfg = getattr(config, "vision", None)
+                    vision_kwargs["spatial_merge_size"] = getattr(vision_cfg, "spatial_merge_size", 2)
+                else:
+                    vision_kwargs["spatial_merge_size"] = None
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
