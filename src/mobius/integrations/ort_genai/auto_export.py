@@ -355,7 +355,9 @@ def _write_genai_config(
             model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
-                vision_kwargs["spatial_merge_size"] = getattr(vision_cfg, "spatial_merge_size", 2)
+                vision_kwargs["spatial_merge_size"] = getattr(
+                    vision_cfg, "spatial_merge_size", 2
+                )
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
 

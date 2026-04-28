@@ -125,9 +125,9 @@ class TestWriteProcessorConfig:
         attrs = seq[1]["operation"]["attrs"]
         assert attrs["feature_size"] == 128
         assert attrs["sampling_rate"] == 16000
-        assert attrs["frame_length_ms"] == 20.0
-        assert attrs["hop_length_ms"] == 10.0
-        assert attrs["mel_floor"] == 0.001
+        assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
+        assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
+        assert attrs["mel_floor"] == 0.001  # noqa: RUF069
 
 
 class TestCopyTokenizerFiles:
@@ -472,7 +472,7 @@ class TestExportForOrtGenai:
         assert op1["type"] == "Gemma4LogMel"
         assert op1["attrs"]["feature_size"] == 128
         assert op1["attrs"]["sampling_rate"] == 16000
-        assert op1["attrs"]["mel_floor"] == 0.001
+        assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
 
     def test_gemma4_audio_processor_not_written_without_audio(self, tmp_path):
         """No audio_feature_extraction.json when config has no audio attr."""
@@ -534,7 +534,9 @@ class TestExportForOrtGenai:
             data = json.load(f)
 
         # Speech section must exist
-        assert "speech" in data["model"], "genai_config.json should have a speech section for Gemma4 with audio_encoder"
+        assert "speech" in data["model"], (
+            "genai_config.json should have a speech section for Gemma4 with audio_encoder"
+        )
         speech = data["model"]["speech"]
 
         # config_filename must point to the onnxruntime-extensions audio config
