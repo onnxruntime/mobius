@@ -193,10 +193,113 @@ class Qwen25OmniVisionEncoder(nn.Module):
         return self.visual(op, pixel_values, image_grid_thw)
 
 class Qwen25OmniEmbeddingModel(nn.Module):
-    pass
+    """Fuses text embedding with audio and image feature
+    
+    Replaces audio_token_id positions with audio features,
+    and image_token_id positions with image features.
+
+    Inputs:
+        input_ids: (batch, seq_len)
+        audio_features: (num_audio_tokens, hidden_size)
+        image_features: (num_image_tokens, hidden_size)
+
+    Output:
+        inputs_embeds: (batch, seq_len, hidden_size)
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+
+        # Token IDs from Qwen2.5-Omni config
+        audio = config.audio
+        self._audio_token_id = audio.audio_token_id if audio else 151646
+        self._image_token_id = audio.image_token_id or 151655
+
+    
+    def forward(self, op, inputs_ids, audio_features, image_features):
+        inputs_embeds = self.embed_tokens(op, inputs_ids)
+
+        # Fuse audio features at audio token positions
+        inputs_embeds = self._replace_tokens(
+            op, inputs_embeds, inputs_ids, audio_features, self._audio_token_id
+        )
+
+        # Fuse image features at image token position
+        inputs_embeds = self._replace_tokens(
+            op, inputs_embeds, inputs_ids, image_features, self._image_token_ids
+        )
+
+        return input_embeds
+
+    def _replace_tokens(self, op, inputs_embeds, input_ids, features, token_id):
+        """Replace token positions with encoder features (masked_scatter equivalent)."""
+        mask = op.Equal(input_ids, op.Constant(value_int=token_id))
+        mask_3d = op.Unsqueeze(mask, [-1])
+
+        # Pad with zero row for safety (text-only case: no features)
+        feature_dim = op.Shape(features, start=1, end=2)
+        zero_shape = op.Concat(op.Constant(value_ints=[1]), feature_dim, axis=0)
+        zero_row = op.ConstantOfShape(zero_shape, value=ir.tensor(np.zeros(1, dtype=np.float32)))
+        padded = op.Concat(zero_row, features, axis=0)
+
+        # CumSum to get gather indices
+        mask_int = op.Cast(mask, to=7)
+        flat = op.Reshape(mask_int, op.Constant(value_ints=[-1]))
+        indices = op.CumSum(flat, op.Constant(value_int=0))
+        indices = op.Mul(indices, flat)
+        indices = op.Reshape(indices, op.Shape(input_ids))
+
+        gathered = op.Gather(padded, indices, axis=0)
+        return op.Where(mask_3d, gathered, inputs_embeds)
+
 
 class Qwen25OmniDecoderModel(nn.Module):
-    pass
+    """Qwen2.5-Omni text decoder: inputs_embeds → logits + KV cache.
+
+    Standard Qwen2 decoder with MRoPE (3D position_ids).
+    No QK norm (unlike Qwen3-ASR which uses attn_qk_norm=True).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self._dtype = config.dtype
+        self.layers = nn.ModuleList(
+            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = initialize_rope(config)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values=None):
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(op, position_ids)
+
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=inputs_embeds,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
+
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer, past_kv in zip(self.layers, past_kvs):
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=attention_bias,
+                position_embeddings=position_embeddings,
+                past_key_value=past_kv,
+            )
+            present_key_values.append(present_kv)
+
+        hidden_states = self.norm(op, hidden_states)
+        logits = self.lm_head(op, hidden_states)
+        return logits, present_key_values
+        )
 
 class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
     pass
