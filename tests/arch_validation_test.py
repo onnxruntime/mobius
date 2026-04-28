@@ -70,12 +70,24 @@ _ARCH_PARAMS = [
 
 
 def _get_rss_bytes() -> int:
-    """Return current RSS (resident set size) in bytes, or 0 on Windows."""
+    """Return current RSS (resident set size) in bytes.
+
+    Uses ``psutil`` for accurate *current* RSS rather than
+    ``resource.ru_maxrss`` which reports *peak* RSS and never
+    decreases within a process — giving false positives when
+    many tests run sequentially.
+    """
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss
+    except ImportError:
+        pass
     if resource is None:
         return 0  # resource module unavailable on Windows
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    # ru_maxrss is in KB on Linux
-    return usage.ru_maxrss * 1024
+    # Fallback: ru_maxrss is peak RSS in KB on Linux — less accurate
+    # but better than nothing.
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
 def _load_hf_config(model_id: str):

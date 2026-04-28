@@ -968,11 +968,14 @@ class ArchitectureConfig(BaseModelConfig):
                 getattr(config, "hidden_act", None)
                 or getattr(config, "hidden_activation", None)
                 or getattr(config, "activation_function", None)
+                or getattr(config, "ff_activation", None)
                 or getattr(config, "dense_act_fn", None)
                 or getattr(config, "activation", None)
                 or getattr(config, "afn", None)
                 # Qwen v1 configs have no activation attr; default to silu
+                # XLM uses gelu_activation=True (boolean, not string)
                 or ("silu" if model_type in ("qwen",) else None)
+                or ("gelu" if getattr(config, "gelu_activation", False) else None)
             ),
             layer_types=(
                 getattr(config, "layer_types", None)
