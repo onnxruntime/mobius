@@ -617,6 +617,10 @@ class BloomCausalLMModel(FalconCausalLMModel):
         config = dataclasses.replace(config, alibi=True)
         super().__init__(config)
         self.transformer = _BloomTextModel(config)
+        # Re-tie lm_head after overriding self.transformer; the parent's
+        # __init__ tied lm_head to the old _FalconTextModel's embeddings.
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.transformer.word_embeddings.weight
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

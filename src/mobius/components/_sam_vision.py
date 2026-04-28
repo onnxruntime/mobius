@@ -511,3 +511,43 @@ class SAMVisionEncoder(nn.Module):
             x = self.net_3(op, x)  # (B, 896, 16, 16)
 
         return x
+
+
+def preprocess_sam_encoder_weights(
+    hf_state_dict: dict[str, object],
+) -> dict[str, object]:
+    """Map HuggingFace SamVisionEncoder weight names to SAMVisionEncoder names.
+
+    HF → ONNX mappings:
+    - patch_embed.projection.* → patch_embed.proj.*
+    - layers.N.layer_norm1.* → blocks.N.norm1.*
+    - layers.N.layer_norm2.* → blocks.N.norm2.*
+    - layers.N.attn.* → blocks.N.attn.*  (sublayer names match)
+    - layers.N.mlp.* → blocks.N.mlp.*  (sublayer names match)
+    - neck.conv1.* → neck.0.*
+    - neck.layer_norm1.* → neck.1.*
+    - neck.conv2.* → neck.2.*
+    - neck.layer_norm2.* → neck.3.*
+    - mlp.lin1.* → mlp.up_proj.*
+    - mlp.lin2.* → mlp.down_proj.*
+    """
+    renamed = {}
+    for key, value in hf_state_dict.items():
+        new_key = key
+        # patch_embed.projection → patch_embed.proj (our nn.Parameter)
+        new_key = new_key.replace("patch_embed.projection.", "patch_embed.proj.")
+        # Neck conv/layernorm to indexed (BEFORE generic layer_norm)
+        new_key = new_key.replace("neck.conv1.", "neck.0.")
+        new_key = new_key.replace("neck.layer_norm1.", "neck.1.")
+        new_key = new_key.replace("neck.conv2.", "neck.2.")
+        new_key = new_key.replace("neck.layer_norm2.", "neck.3.")
+        # layers → blocks
+        new_key = new_key.replace("layers.", "blocks.")
+        # Block-level: layer_norm1 → norm1, layer_norm2 → norm2
+        new_key = new_key.replace(".layer_norm1.", ".norm1.")
+        new_key = new_key.replace(".layer_norm2.", ".norm2.")
+        # MLP: HF lin1/lin2 → ONNX FCMLP up_proj/down_proj
+        new_key = new_key.replace(".mlp.lin1.", ".mlp.up_proj.")
+        new_key = new_key.replace(".mlp.lin2.", ".mlp.down_proj.")
+        renamed[new_key] = value
+    return renamed
