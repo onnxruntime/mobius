@@ -355,12 +355,11 @@ def _write_genai_config(
             model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
-                sms = getattr(vision_cfg, "spatial_merge_size", 2)
-                vision_kwargs["spatial_merge_size"] = sms
-                vision_kwargs["config_filename"] = "image_processor.json"
+                vision_kwargs["spatial_merge_size"] = getattr(
+                    vision_cfg, "spatial_merge_size", 2
+                )
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "image_processor.json"
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
