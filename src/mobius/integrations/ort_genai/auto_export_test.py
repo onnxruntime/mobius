@@ -17,6 +17,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files_from_local,
     _graph_input_names,
     _resolve_ort_genai_model_type,
+    _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
     write_ort_genai_config,
@@ -92,6 +93,41 @@ class TestWriteProcessorConfig:
             data = json.load(f)
         assert data["image_size"] == 224
         assert data["patch_size"] == 16
+
+    def test_audio_no_audio_returns_none(self, tmp_path):
+        config = mock.MagicMock(spec=[])
+        del config.audio
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_non_gemma4_returns_none(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "whisper"
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "gemma4"
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("audio_feature_extraction.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        # Must use feature_extraction.sequence, not processor.transforms
+        assert "feature_extraction" in data
+        seq = data["feature_extraction"]["sequence"]
+        assert len(seq) == 2
+        assert seq[0]["operation"]["type"] == "AudioDecoder"
+        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
+        attrs = seq[1]["operation"]["attrs"]
+        assert attrs["feature_size"] == 128
+        assert attrs["sampling_rate"] == 16000
+        assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
+        assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
+        assert attrs["mel_floor"] == 0.001  # noqa: RUF069
 
 
 class TestCopyTokenizerFiles:
@@ -379,6 +415,139 @@ class TestExportForOrtGenai:
         assert op1["attrs"]["patch_size"] == 16
         assert op1["attrs"]["max_soft_tokens"] == 260
         assert op1["attrs"]["pooling_kernel_size"] == 3
+
+    def test_gemma4_audio_processor_json_written(self, tmp_path):
+        """Gemma4 writes audio_feature_extraction.json with feature_extraction.sequence schema."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            feature_size: int = 128
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "audio_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        # Should write audio_feature_extraction.json
+        assert "audio_processor" in result
+        audio_path = result["audio_processor"]
+        assert audio_path.endswith("audio_feature_extraction.json")
+        assert os.path.isfile(audio_path)
+
+        with open(audio_path) as f:
+            data = json.load(f)
+
+        # Verify feature_extraction.sequence schema (not processor.transforms)
+        assert "feature_extraction" in data
+        assert "processor" not in data
+        seq = data["feature_extraction"]["sequence"]
+        assert len(seq) == 2
+
+        # First op: AudioDecoder
+        op0 = seq[0]["operation"]
+        assert op0["type"] == "AudioDecoder"
+
+        # Second op: Gemma4LogMel with expected attrs
+        op1 = seq[1]["operation"]
+        assert op1["type"] == "Gemma4LogMel"
+        assert op1["attrs"]["feature_size"] == 128
+        assert op1["attrs"]["sampling_rate"] == 16000
+        assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
+
+    def test_gemma4_audio_processor_not_written_without_audio(self, tmp_path):
+        """No audio_feature_extraction.json when config has no audio attr."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        assert "audio_processor" not in result
+        assert not os.path.exists(os.path.join(str(tmp_path), "audio_feature_extraction.json"))
+
+    def test_gemma4_genai_config_speech_section(self, tmp_path):
+        """Gemma4 with audio_encoder writes speech section with correct config_filename and input mapping."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            feature_size: int = 128
+            audio_token_id: int = 255999
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            boa_token_id: int = 255998
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "audio_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        # Speech section must exist
+        assert "speech" in data["model"], (
+            "genai_config.json should have a speech section for Gemma4 with audio_encoder"
+        )
+        speech = data["model"]["speech"]
+
+        # config_filename must point to the onnxruntime-extensions audio config
+        assert speech["config_filename"] == "audio_feature_extraction.json"
+
+        # filename must point to the audio encoder ONNX model
+        assert speech["filename"] == "audio_encoder/model.onnx"
+
+        # input_names mapping: genai internal name -> ONNX model input name
+        assert speech["inputs"]["audio_embeds"] == "input_features"
+        assert speech["inputs"]["attention_mask"] == "input_features_mask"
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
