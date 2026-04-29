@@ -7,6 +7,7 @@ import dataclasses
 
 import onnx_ir as ir
 import torch
+import math
 from onnx_ir import tensor_adapters
 
 DEFAULT_INT = -42
@@ -325,12 +326,16 @@ def _extract_rope_config(config) -> RoPEConfig | None:
     )
     # rope_theta alone is a weaker signal but still indicates RoPE intent
     # for many models (Arctic, Jamba, etc.) that don't set rope_scaling.
-    has_rope_theta = getattr(config, "rope_theta", None) is not None
+    # Only treat it as a signal when it differs from the common default
+    # (10000.0) to avoid false positives on NoPE models that inherit
+    # rope_theta as dead config data.
+    raw_rope_theta = getattr(config, "rope_theta", None)
+    has_nondefault_rope_theta = raw_rope_theta is not None and not math.isclose(raw_rope_theta, 10_000.0)
     if (
         raw_rope_scaling is None
         and raw_rope_parameters is None
         and not has_legacy_rope
-        and not has_rope_theta
+        and not has_nondefault_rope_theta
     ):
         return None
 
