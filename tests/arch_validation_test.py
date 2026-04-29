@@ -182,7 +182,6 @@ class TestArchValidation:
             assert len(model.graph.outputs) > 0, f"{component_name} has no outputs"
 
         del pkg
-        gc.collect()
 
     @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
     def test_graph_shapes_consistent(self, model_type: str, model_id: str):
@@ -210,5 +209,3 @@ class TestArchValidation:
                 assert output.name, f"{component_name} has an unnamed output"
 
         del pkg
-        gc.collect()
-
