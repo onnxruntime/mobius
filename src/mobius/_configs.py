@@ -282,6 +282,16 @@ def _first_not_none(*values, default=None):
     return default
 
 
+# Model types that use RoPE but don't expose rope_scaling/rope_parameters
+# in their HF config JSON.  Maps model_type → default rope_theta.
+_IMPLICIT_ROPE_DEFAULTS: dict[str, float] = {
+    "chatglm": 10_000.0,
+    "deepseek_vl_v2": 10_000.0,
+    "jamba": 8_000.0,
+    "qwen3_omni_moe": 1_000_000.0,
+}
+
+
 def _extract_rope_config(config) -> RoPEConfig | None:
     """Extract and normalize RoPE-related config fields.
 
@@ -313,7 +323,15 @@ def _extract_rope_config(config) -> RoPEConfig | None:
         or getattr(config, "rotary_pct", None) is not None
         or getattr(config, "rotary_emb_base", None) is not None
     )
-    if raw_rope_scaling is None and raw_rope_parameters is None and not has_legacy_rope:
+    # rope_theta alone is a weaker signal but still indicates RoPE intent
+    # for many models (Arctic, Jamba, etc.) that don't set rope_scaling.
+    has_rope_theta = getattr(config, "rope_theta", None) is not None
+    if (
+        raw_rope_scaling is None
+        and raw_rope_parameters is None
+        and not has_legacy_rope
+        and not has_rope_theta
+    ):
         return None
 
     rope_scaling = raw_rope_scaling or {}
@@ -421,8 +439,10 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
         _intermediate = getattr(vc, "intermediate_size", None)
         if _intermediate is None:
             _mlp_ratio = getattr(vc, "mlp_ratio", None)
-            if _mlp_ratio is not None and _vis_hidden is not None:
-                _intermediate = int(_vis_hidden * _mlp_ratio)
+            # _vis_hidden may be a list for multi-stage models (Florence2)
+            _scalar_hidden = _first(_vis_hidden) if _vis_hidden is not None else None
+            if _mlp_ratio is not None and _scalar_hidden is not None:
+                _intermediate = int(_scalar_hidden * _mlp_ratio)
 
         vision_fields.update(
             hidden_size=_vis_hidden,
@@ -909,6 +929,15 @@ class ArchitectureConfig(BaseModelConfig):
         rope_config = _extract_rope_config(config)
         mrope_fields = _extract_mrope_fields(config)
 
+        # Models that use RoPE but don't expose rope_scaling/rope_parameters
+        # in their HF config (e.g. loaded without trust_remote_code, or
+        # because the HF code hardcodes defaults internally).
+        if rope_config is None and model_type in _IMPLICIT_ROPE_DEFAULTS:
+            rope_config = RoPEConfig(
+                rope_type="default",
+                rope_theta=_IMPLICIT_ROPE_DEFAULTS[model_type],
+            )
+
         # Some hierarchical models (Segformer, Swin) use plural list attrs
         # instead of scalar ones.  Resolve to a scalar for the base config.
         hidden_size = (
@@ -974,8 +1003,10 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "afn", None)
                 # Qwen v1 configs have no activation attr; default to silu
                 # XLM uses gelu_activation=True (boolean, not string)
+                # CTRL has no hidden_act attr; uses relu
                 or ("silu" if model_type in ("qwen",) else None)
                 or ("gelu" if getattr(config, "gelu_activation", False) else None)
+                or ("relu" if model_type in ("ctrl",) else None)
             ),
             layer_types=(
                 getattr(config, "layer_types", None)
@@ -1132,14 +1163,20 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             # MoE
             num_local_experts=(
-                getattr(config, "num_local_experts", None)
-                or getattr(config, "num_experts", None)
-                or getattr(config, "n_routed_experts", None)
+                _first(getattr(config, "num_local_experts", None))
+                or _first(getattr(config, "num_experts", None))
+                or _first(getattr(config, "n_routed_experts", None))
+                or _first(getattr(config, "moe_num_experts", None))
             ),
-            num_experts_per_tok=(getattr(config, "num_experts_per_tok", None)),
-            moe_intermediate_size=(getattr(config, "moe_intermediate_size", None)),
+            num_experts_per_tok=(
+                _first(getattr(config, "num_experts_per_tok", None))
+                or _first(getattr(config, "moe_k", None))
+                or _first(getattr(config, "moe_topk", None))
+            ),
+            moe_intermediate_size=_first(getattr(config, "moe_intermediate_size", None)),
             shared_expert_intermediate_size=(
                 getattr(config, "shared_expert_intermediate_size", None)
+                or _shared_expert_size(config)
             ),
             norm_topk_prob=(getattr(config, "norm_topk_prob", True)),
             post_feedforward_norm=(model_type in ("flex_olmo",)),
@@ -1450,8 +1487,14 @@ def _as_int(value) -> int:
     """Coerce *value* to int, taking the first element if it is a list/tuple.
 
     Some HuggingFace configs express ``image_size`` or ``patch_size`` as
-    ``[H, W]`` lists.  We take the first element (height) for simplicity.
+    ``[H, W]`` lists or ``{"height": H, "width": W}`` dicts.
+    We take the first element (height) for simplicity.
     """
+    if isinstance(value, dict):
+        # PVT-v2 etc. use {"height": H, "width": W} for image_size
+        if "height" in value:
+            return int(value["height"])
+        return int(next(iter(value.values())))
     if isinstance(value, (list, tuple)):
         return int(value[0])
     return int(value)
@@ -1462,6 +1505,24 @@ def _first(value):
     if isinstance(value, (list, tuple)) and value:
         return value[0]
     return value
+
+
+def _shared_expert_size(config) -> int | None:
+    """Compute shared_expert_intermediate_size from moe_intermediate_size * n_shared_experts.
+
+    ERNIE-4.5 uses ``moe_num_shared_experts``, GLM-4.5 uses ``n_shared_experts``,
+    and Hunyuan uses ``num_shared_expert`` (singular, per-layer list).
+    Both share ``moe_intermediate_size`` as the per-expert FFN hidden size.
+    """
+    moe_dim = _first(getattr(config, "moe_intermediate_size", None))
+    n_shared = _first(
+        getattr(config, "moe_num_shared_experts", None)
+        or getattr(config, "n_shared_experts", None)
+        or getattr(config, "num_shared_expert", None)
+    )
+    if moe_dim is not None and n_shared is not None:
+        return int(moe_dim) * int(n_shared)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1837,6 +1898,10 @@ class Sam2Config(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Sam2Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        # SAM2 uses gelu in its backbone MLP but doesn't expose a single
+        # hidden_act field — default to gelu.
+        if base.hidden_act is None:
+            base = dataclasses.replace(base, hidden_act="gelu")
         return cls(
             **_shallow_fields(base),
             sam2_embed_dims=getattr(config, "sam2_embed_dims", None),

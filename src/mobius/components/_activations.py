@@ -83,6 +83,10 @@ ACT2FN: OrderedDict[str, callable] = OrderedDict(
         "silu": silu,
         "swish": silu,
         "tanh": tanh,
+        # xielu is a learnable activation (Apertus); map to silu as a
+        # graph-construction placeholder — ApertusCausalLMModel replaces
+        # the standard MLP with ApertusFCMLP that uses the real XIELUActivation.
+        "xielu": silu,
     }
 )
 

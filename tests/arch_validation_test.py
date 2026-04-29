@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 
 try:
     import resource
@@ -53,6 +52,16 @@ _MAX_RSS_BYTES = 1.5 * 1024 * 1024 * 1024
 # Build parametrized test cases from registry entries that have a test_model_id
 _KNOWN_XFAILS: dict[str, str] = {
     "phi3small": "gegelu activation not implemented (gated GELU variant)",
+    # VL models with missing/incomplete vision_config when loaded without
+    # trust_remote_code — the HF config JSON doesn't expose vision fields.
+    "deepseek_vl": "VisionConfig.hidden_size missing without trust_remote_code",
+    "deepseek_vl_hybrid": "VisionConfig.hidden_size missing without trust_remote_code",
+    "fuyu": "FuyuConfig has no vision_config (image processing is in-model)",
+    "florence2": "Florence2 DaViT vision encoder is multi-stage (not standard ViT)",
+    "got_ocr2": "VisionConfig missing without trust_remote_code",
+    "janus": "VisionConfig.hidden_size missing without trust_remote_code",
+    "molmo": "VisionConfig missing without trust_remote_code",
+    "ovis2": "VisionConfig missing without trust_remote_code",
 }
 
 _ARCH_PARAMS = [
@@ -113,7 +122,12 @@ def _resolve_hf_config(hf_config):
     """
     parent_config = hf_config
     if hasattr(hf_config, "talker_config"):
-        hf_config = hf_config.talker_config
+        talker = hf_config.talker_config
+        # Qwen3-Omni talker nests the real model config under text_config
+        if hasattr(talker, "text_config"):
+            hf_config = talker.text_config
+        else:
+            hf_config = talker
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
         if hasattr(thinker, "text_config"):
