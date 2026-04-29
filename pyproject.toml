@@ -44,7 +44,6 @@ testing = [
     "Pillow",
     "librosa",
     "jsonschema>=4.0",
-    "psutil",
 ]
 ort-genai = ["onnxruntime-genai"]
 docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]

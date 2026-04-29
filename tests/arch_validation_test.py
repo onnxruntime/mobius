@@ -26,13 +26,7 @@ They require network access to download config.json from HuggingFace.
 
 from __future__ import annotations
 
-import gc
 import logging
-
-try:
-    import resource
-except ImportError:
-    resource = None  # Windows
 
 import pytest
 
@@ -45,9 +39,6 @@ from mobius._registry import registry
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
-
-# 1.5 GB RSS limit — leave headroom below the 2 GB target
-_MAX_RSS_BYTES = 1.5 * 1024 * 1024 * 1024
 
 # Build parametrized test cases from registry entries that have a test_model_id
 _KNOWN_XFAILS: dict[str, str] = {
@@ -76,29 +67,6 @@ _ARCH_PARAMS = [
     for model_type in sorted(registry.architectures())
     if (registration := registry.get_registration(model_type)).test_model_id is not None
 ]
-
-
-def _get_rss_bytes() -> int:
-    """Return current RSS (resident set size) in bytes.
-
-    Uses ``psutil`` for accurate *current* RSS rather than
-    ``resource.ru_maxrss`` which reports *peak* RSS and never
-    decreases within a process — giving false positives when
-    many tests run sequentially.
-    """
-    try:
-        import psutil
-
-        return psutil.Process().memory_info().rss
-    except ImportError:
-        pass
-    if resource is None:
-        return 0  # resource module unavailable on Windows
-    # Fallback: ru_maxrss is peak RSS in KB on Linux, bytes on macOS
-    import sys
-
-    multiplier = 1 if sys.platform == "darwin" else 1024
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * multiplier
 
 
 def _load_hf_config(model_id: str):
@@ -244,22 +212,3 @@ class TestArchValidation:
         del pkg
         gc.collect()
 
-    @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
-    def test_memory_stays_within_budget(self, model_type: str, model_id: str):
-        """Log RSS after graph construction (informational only).
-
-        Does NOT fail on memory usage — just logs it for monitoring.
-        """
-        pkg = _build_graph(model_type, model_id)
-
-        rss = _get_rss_bytes()
-        rss_mb = rss / (1024 * 1024)
-        logger.info(
-            "%s (%s): RSS after build = %.0f MB",
-            model_type,
-            model_id,
-            rss_mb,
-        )
-
-        del pkg
-        gc.collect()
