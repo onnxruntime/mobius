@@ -94,9 +94,11 @@ def _get_rss_bytes() -> int:
         pass
     if resource is None:
         return 0  # resource module unavailable on Windows
-    # Fallback: ru_maxrss is peak RSS in KB on Linux — less accurate
-    # but better than nothing.
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    # Fallback: ru_maxrss is peak RSS in KB on Linux, bytes on macOS
+    import sys
+
+    multiplier = 1 if sys.platform == "darwin" else 1024
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * multiplier
 
 
 def _load_hf_config(model_id: str):

@@ -974,3 +974,63 @@ class TestGemma4Config:
 
         config = Gemma4Config.from_transformers(text_config)
         assert config.boa_token_id is None
+
+
+class TestActivationFallbacks:
+    """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
+
+    def test_ff_activation_fallback(self):
+        """ff_activation is used when hidden_act is absent (XLNet pattern)."""
+
+        class FakeConfig:
+            model_type = "xlnet"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            ff_activation = "gelu"
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_true_fallback(self):
+        """gelu_activation=True maps to 'gelu' (XLM pattern)."""
+
+        class FakeConfig:
+            model_type = "xlm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = True
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_false_does_not_set_gelu(self):
+        """gelu_activation=False should not set hidden_act to gelu."""
+
+        class FakeConfig:
+            model_type = "some_model"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = False
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # With gelu_activation=False and no other activation attr,
+        # hidden_act should be None (not "gelu")
+        assert config.hidden_act is None

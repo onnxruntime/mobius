@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import onnx_ir as ir
 import torch
-import math
 from onnx_ir import tensor_adapters
 
 DEFAULT_INT = -42
@@ -330,7 +330,9 @@ def _extract_rope_config(config) -> RoPEConfig | None:
     # (10000.0) to avoid false positives on NoPE models that inherit
     # rope_theta as dead config data.
     raw_rope_theta = getattr(config, "rope_theta", None)
-    has_nondefault_rope_theta = raw_rope_theta is not None and not math.isclose(raw_rope_theta, 10_000.0)
+    has_nondefault_rope_theta = raw_rope_theta is not None and not math.isclose(
+        raw_rope_theta, 10_000.0
+    )
     if (
         raw_rope_scaling is None
         and raw_rope_parameters is None
