@@ -28,6 +28,37 @@ def _resolve_dtype(config) -> ir.DataType | None:
     return None
 
 
+def _resolve_hidden_act(config, model_type: str) -> str | None:
+    """Resolve the hidden activation function from HF config patterns.
+
+    Fallback order (first truthy value wins):
+      hidden_act            — standard field (most models)
+      hidden_activation     — some encoder models
+      activation_function   — GPT-2 family
+      ff_activation         — XLNet
+      dense_act_fn          — some BERT variants
+      activation            — generic fallback
+      afn                   — older BERT configs
+      "silu"  (qwen)        — Qwen v1 hardcodes silu; no activation attr
+      "gelu"  (XLM)         — gelu_activation=True is a boolean flag
+      "relu"  (ctrl)        — CTRL hardcodes relu; no hidden_act attr
+    """
+    return (
+        getattr(config, "hidden_act", None)
+        or getattr(config, "hidden_activation", None)
+        or getattr(config, "activation_function", None)
+        or getattr(config, "ff_activation", None)
+        or getattr(config, "dense_act_fn", None)
+        or getattr(config, "activation", None)
+        or getattr(config, "afn", None)
+        or ("silu" if model_type in ("qwen",) else None)
+        # gelu_activation is a boolean (XLM) — must be after all string
+        # attrs so it cannot override an explicit hidden_act.
+        or ("gelu" if getattr(config, "gelu_activation", False) else None)
+        or ("relu" if model_type in ("ctrl",) else None)
+    )
+
+
 def _nested_rope_theta(rope_scaling: dict, key: str) -> float | None:
     """Extract rope_theta from a nested rope_scaling dict (e.g. Gemma3)."""
     sub = rope_scaling.get(key)
@@ -286,10 +317,18 @@ def _first_not_none(*values, default=None):
 # Model types that use RoPE but don't expose rope_scaling/rope_parameters
 # in their HF config JSON.  Maps model_type → default rope_theta.
 _IMPLICIT_ROPE_DEFAULTS: dict[str, float] = {
+    # chatglm: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
+    # uses default rope_theta=10000.0 hardcoded in modeling code.
     "chatglm": 10_000.0,
+    # deepseek_vl_v2: config JSON has no rope_theta attr;
+    # uses default rope_theta=10000.0 hardcoded in modeling code.
     "deepseek_vl_v2": 10_000.0,
+    # jamba: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
+    # uses rope_theta=8000.0 hardcoded in modeling code.
     "jamba": 8_000.0,
-    "qwen3_omni_moe": 1_000_000.0,
+    # NOTE: qwen3_omni_moe removed — its config JSON contains
+    # rope_scaling (with embedded rope_theta=1e6), so
+    # _extract_rope_config() already handles it via the rope_scaling path.
 }
 
 
@@ -1000,21 +1039,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "decoder_ffn_dim", None)
                 or 4 * _as_int(hidden_size)
             ),
-            hidden_act=(
-                getattr(config, "hidden_act", None)
-                or getattr(config, "hidden_activation", None)
-                or getattr(config, "activation_function", None)
-                or getattr(config, "ff_activation", None)
-                or getattr(config, "dense_act_fn", None)
-                or getattr(config, "activation", None)
-                or getattr(config, "afn", None)
-                # Qwen v1 configs have no activation attr; default to silu
-                # XLM uses gelu_activation=True (boolean, not string)
-                # CTRL has no hidden_act attr; uses relu
-                or ("silu" if model_type in ("qwen",) else None)
-                or ("gelu" if getattr(config, "gelu_activation", False) else None)
-                or ("relu" if model_type in ("ctrl",) else None)
-            ),
+            hidden_act=_resolve_hidden_act(config, model_type),
             layer_types=(
                 getattr(config, "layer_types", None)
                 or getattr(config, "attention_layers", None)
