@@ -110,16 +110,20 @@ def linear_attention(
     uses_beta = update_rule in ("delta", "gated_delta")
 
     # --- Define function inputs ---
-    # All 6 inputs are always declared.  Call sites that don't need
-    # trailing inputs (decay, beta) simply omit them — onnx-shape-inference
-    # >=0.1.9 accepts trailing optional inputs (matching ONNX C++ behavior).
-    inputs: list[ir.Value | None] = [
+    # Always declare the full 6-input signature:
+    # (query, key, value, past_state, decay, beta).
+    # Update-rule-specific paths inside the function body ignore unused
+    # trailing inputs so every variant exposes the same ir.Function
+    # interface.  Call sites that don't need trailing inputs (decay, beta)
+    # simply omit them — onnx-shape-inference >=0.1.9 accepts trailing
+    # optional inputs (matching ONNX C++ behavior).
+    inputs: list[ir.Value] = [
         ir.Value(name="query"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="key"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="value"),  # (B, T, kv_num_heads * d_v)
         ir.Value(name="past_state"),
-        ir.Value(name="decay") if uses_decay else None,
-        ir.Value(name="beta") if uses_beta else None,
+        ir.Value(name="decay"),
+        ir.Value(name="beta"),
     ]
 
     def body(op, query_v, key_v, value_v, past_state_v, decay_v, beta_v):
