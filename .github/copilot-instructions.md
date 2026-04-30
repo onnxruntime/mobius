@@ -158,3 +158,5 @@ See the `adding-a-new-model` skill for the full guide.
 ### Git commits
 
 Linear commit history. Always signoff commits with --signoff.
+
+- **Write descriptive commit messages.** Title should summarize the change; body should explain what and why.

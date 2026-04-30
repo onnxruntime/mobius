@@ -15,6 +15,8 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _fix_chat_template,
+    _fix_tokenizer_config,
     _graph_input_names,
     _resolve_ort_genai_model_type,
     _write_audio_processor_config,
@@ -68,6 +70,11 @@ class TestResolveOrtGenaiModelType:
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 
+    def test_mistral3_model_type(self):
+        assert _resolve_ort_genai_model_type("mistral3") == "mistral3"
+        # Text-only mistral is a separate mapping
+        assert _resolve_ort_genai_model_type("mistral") == "mistral"
+
     def test_phi4mm_model_types(self):
         assert _resolve_ort_genai_model_type("phi4mm") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
@@ -80,19 +87,170 @@ class TestWriteProcessorConfig:
         del config.vision  # ensure no vision attribute
         assert _write_vision_processor_config(config, str(tmp_path)) is None
 
-    def test_writes_vision_config(self, tmp_path):
+    def test_writes_transform_pipeline(self, tmp_path):
+        """Generates full transform pipeline for generic VLMs."""
         vision = mock.MagicMock()
-        vision.image_size = 224
-        vision.patch_size = 16
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
         config = mock.MagicMock()
         config.vision = vision
+        config.spatial_merge_size = 2
 
         path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
-        assert data["image_size"] == 224
-        assert data["patch_size"] == 16
+
+        proc = data["processor"]
+        assert proc["name"] == "image_processor"
+        transforms = proc["transforms"]
+        assert len(transforms) == 5
+        assert transforms[0]["operation"]["type"] == "DecodeImage"
+        assert transforms[1]["operation"]["type"] == "ConvertRGB"
+        assert transforms[2]["operation"]["type"] == "Resize"
+        assert transforms[3]["operation"]["type"] == "Rescale"
+        assert transforms[4]["operation"]["type"] == "Normalize"
+
+        # Check resize attrs
+        resize_attrs = transforms[2]["operation"]["attrs"]
+        assert resize_attrs["patch_size"] == 14
+        assert resize_attrs["merge_size"] == 2
+
+        # Check normalization defaults (CLIP-standard)
+        norm_attrs = transforms[4]["operation"]["attrs"]
+        assert len(norm_attrs["mean"]) == 3
+        assert len(norm_attrs["std"]) == 3
+
+    def test_pixtral_vision_config(self, tmp_path):
+        """Generates pixtral-specific processor config with 7 transforms."""
+        vision = mock.MagicMock()
+        vision.image_size = 1540
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "pixtral"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.spatial_merge_size = 2
+        config.model_type = "mistral3"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "pixtral_image_processor"
+        transforms = proc["transforms"]
+        assert len(transforms) == 7
+
+        # Verify all 7 transform types in order
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+            "PixtralImageSizes",
+        ]
+
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["height"] == 1540
+        assert resize["width"] == 1540
+
+        # Permute3D has correct dims
+        permute = transforms[5]["operation"]["attrs"]
+        assert permute["dims"] == [2, 0, 1]
+
+    def test_hf_processor_fallback_to_clip_defaults(self, tmp_path):
+        """Falls back to CLIP-standard defaults when HF processor can't be loaded."""
+        vision = mock.MagicMock()
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.spatial_merge_size = 2
+        config.model_type = "qwen2"
+
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            side_effect=OSError("model not found"),
+        ):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="nonexistent/model"
+            )
+
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        # Should use CLIP-standard normalization defaults
+        normalize = proc["transforms"][4]["operation"]["attrs"]
+        assert normalize["mean"] == pytest.approx([0.48145466, 0.4578275, 0.40821073])
+        assert normalize["std"] == pytest.approx([0.26862954, 0.26130258, 0.27577711])
+
+
+class TestFixTokenizerConfig:
+    def test_remaps_tokenizers_backend(self, tmp_path):
+        tc = {"tokenizer_class": "TokenizersBackend"}
+        tc_path = tmp_path / "tokenizer_config.json"
+        tc_path.write_text(json.dumps(tc))
+
+        assert _fix_tokenizer_config(str(tmp_path)) is True
+
+        fixed = json.loads(tc_path.read_text())
+        assert fixed["tokenizer_class"] == "LlamaTokenizer"
+
+    def test_no_fix_needed(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+    def test_no_tokenizer_config(self, tmp_path):
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+
+class TestFixChatTemplate:
+    def test_adds_chat_template(self, tmp_path):
+        """Adds chat_template from HF tokenizer when missing."""
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+
+        fake_tokenizer = mock.MagicMock()
+        fake_tokenizer.chat_template = "{{ bos_token }}"
+
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=fake_tokenizer,
+        ):
+            result = _fix_chat_template(str(tmp_path), "fake/model")
+
+        assert result is True
+        fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert fixed["chat_template"] == "{{ bos_token }}"
+
+    def test_skips_when_template_exists(self, tmp_path):
+        tc = {
+            "tokenizer_class": "LlamaTokenizer",
+            "chat_template": "existing",
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
+
+    def test_skips_without_model_id(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), None) is False
+
+    def test_skips_without_file(self, tmp_path):
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
 
     def test_audio_no_audio_returns_none(self, tmp_path):
         config = mock.MagicMock(spec=[])
@@ -128,6 +286,22 @@ class TestWriteProcessorConfig:
         assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
         assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
         assert attrs["mel_floor"] == 0.001  # noqa: RUF069
+
+    def test_handles_tokenizer_load_error(self, tmp_path):
+        """Gracefully handles AutoTokenizer.from_pretrained raising."""
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=RuntimeError("model not available"),
+        ):
+            result = _fix_chat_template(str(tmp_path), "fake/model")
+
+        assert result is False
+        # Original config is unchanged
+        fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert "chat_template" not in fixed
 
 
 class TestCopyTokenizerFiles:
@@ -315,6 +489,8 @@ class TestExportForOrtGenai:
         class FakeVision:
             image_size: int = 448
             patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str | None = None
 
         @dataclasses.dataclass
         class FakeConfig:
@@ -325,6 +501,7 @@ class TestExportForOrtGenai:
             num_attention_heads: int = 4
             num_key_value_heads: int = 2
             head_dim: int = 16
+            spatial_merge_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
         pkg = ModelPackage(
@@ -341,7 +518,13 @@ class TestExportForOrtGenai:
         assert os.path.isfile(result["processor_config"])
         with open(result["processor_config"]) as f:
             data = json.load(f)
-        assert data["image_size"] == 448
+        # New format: transform pipeline under "processor"
+        assert "processor" in data
+        transforms = data["processor"]["transforms"]
+        assert len(transforms) >= 4
+        # Verify resize uses config values
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["patch_size"] == 14
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -858,6 +1041,76 @@ class TestGemma4GenaiConfig:
         emb_inputs = data["model"]["embedding"]["inputs"]
         assert "input_ids" in emb_inputs
         assert "image_features" in emb_inputs
+
+
+class TestPixtralGenaiConfig:
+    """Tests for Pixtral/Ministral-3-specific genai_config generation."""
+
+    @staticmethod
+    def _make_pixtral_pkg():
+        """Build a mock Pixtral VLM package with graph inputs."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 1540
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str = "pixtral"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "mistral3"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 10
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        decoder = _mock_model_with_inputs(
+            ["input_ids", "attention_mask", "past_key_values.0.key"]
+        )
+        vision = _mock_model_with_inputs(["pixel_values"])
+        embedding = _mock_model_with_inputs(["input_ids", "image_features"])
+
+        return ModelPackage(
+            {
+                "model": decoder,
+                "vision_encoder": vision,
+                "embedding": embedding,
+            },
+            config=FakeConfig(),
+        )
+
+    def test_pixtral_config_filename_is_processor_config(self, tmp_path):
+        """Pixtral genai_config.json references processor_config.json, not image_processor.json."""
+        pkg = self._make_pixtral_pkg()
+        path = _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="mistral3",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        vision = data["model"]["vision"]
+        assert vision["config_filename"] == "processor_config.json"
+        assert vision["spatial_merge_size"] == 2
+        assert data["model"]["image_token_id"] == 10
 
 
 class TestGraphInputNames:

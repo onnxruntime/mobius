@@ -283,6 +283,12 @@ class TestGenaiConfigGeneratorVLM:
         assert "inputs_embeds" in inputs
         assert "input_ids" not in inputs
 
+    def test_vlm_decoder_filename_uses_subdirectory(self):
+        """VLM decoder filename includes the decoder/ subdirectory."""
+        config = self._make_vlm_gen().generate()
+        decoder = config["model"]["decoder"]
+        assert decoder["filename"] == "decoder/model.onnx"
+
     def test_vlm_token_ids_at_model_level(self):
         """VLM-specific token IDs are at the model level."""
         config = self._make_vlm_gen().generate()
