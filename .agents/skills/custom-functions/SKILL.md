@@ -66,6 +66,24 @@ then passes all collected functions to `_make_model(graph,
 builder.functions.values())`, which attaches them to the `ir.Model`.
 You never need to manually register functions.
 
+### Why parametric functions still pass kwargs to `op.call()`
+
+Parametric factories (like `linear_attention(q_num_heads=8, ...)`) bake
+config values into the **function body** (e.g. reshape dimensions, loop
+bounds). However, the same values are also passed as `op.call()` keyword
+arguments (`q_num_heads=8, update_rule="gated_delta"`). This is because
+keyword arguments become **formal ONNX attributes** on the emitted node
+in the graph. These attributes serve two purposes:
+
+1. **Runtime dispatch** — native kernels read attributes to select the
+   right code path without parsing the function body.
+2. **Graph inspection** — tools and rewrite rules can read attributes
+   without expanding the function.
+
+The function body and the node attributes encode the same information
+redundantly by design — the body is the portable fallback, the attributes
+are the fast path.
+
 ## Static vs parametric functions
 
 There are two kinds of custom functions in mobius:
