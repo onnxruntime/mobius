@@ -3929,15 +3929,15 @@ def test_qwen35_deltanet_single_layer_parity():
 
     # HF forward (single-token decode with pre-filled cache)
     cache = DynamicCache(config=tc)
+    # Use the cache API to pre-fill states so that dtype/device/initialized flags
+    # are all set correctly.  Direct attribute assignment bypasses lazy_initialization
+    # and leaves 'dtype' unset, causing AttributeError on the first update call.
     # HF conv_state shape is (batch, conv_dim, conv_kernel_size) —
-    # pad with one extra left position vs ONNX (kernel_size - 1)
-    cache.layers[0].conv_states = torch.from_numpy(
-        np.pad(conv_np, ((0, 0), (0, 0), (1, 0))),
-    ).float()
-    cache.layers[0].recurrent_states = torch.from_numpy(rec_np).float()
-    # Signal that previous state exists so the forward uses decode-mode path.
-    # In newer transformers the flag is not set automatically by direct assignment.
-    cache.layers[0].has_previous_state = True
+    # pad with one extra left position vs ONNX (kernel_size - 1).
+    # update_conv_state also sets has_previous_state = True (decode-mode trigger).
+    padded_conv = torch.from_numpy(np.pad(conv_np, ((0, 0), (0, 0), (1, 0)))).float()
+    cache.update_conv_state(padded_conv, layer_idx=0)
+    cache.update_recurrent_state(torch.from_numpy(rec_np).float(), layer_idx=0)
 
     with torch.no_grad():
         hf_output = hf_dn(
