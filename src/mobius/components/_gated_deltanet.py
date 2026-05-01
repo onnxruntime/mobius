@@ -152,13 +152,6 @@ class GatedDeltaNet(nn.Module):
         # Output projection
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
 
-        # Pre-built ir.Function for LinearAttention (cached at init)
-        self._attn_fn = linear_attention(
-            update_rule="gated_delta",
-            scale=1.0 / (self.head_k_dim**0.5),
-            stash_type=config.dtype,
-        )
-
     def forward(
         self,
         op: builder.OpBuilder,
@@ -264,9 +257,8 @@ class GatedDeltaNet(nn.Module):
         # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
-        attn_fn = self._attn_fn
         output_3d, new_recurrent_state = op.call(
-            attn_fn,
+            linear_attention(),
             query,  # (B, T, num_k_heads * head_k_dim)
             key,  # (B, T, num_k_heads * head_k_dim)
             value,  # (B, T, num_v_heads * head_v_dim)

@@ -338,13 +338,6 @@ class Mamba2Block(nn.Module):
         )
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
-        # Pre-built ir.Function for LinearAttention (cached at init)
-        self._attn_fn = linear_attention(
-            update_rule="gated",
-            scale=1.0,
-            stash_type=ir.DataType.FLOAT,
-        )
-
     def forward(
         self,
         op: builder.OpBuilder,
@@ -438,13 +431,20 @@ class Mamba2Block(nn.Module):
         # decay: (B, T, num_heads) — per-head scalar in log-space
         # state: (B, num_heads, d_state, d_head) = (B, H, d_k, d_v)
         ssm_state_f32 = op.Cast(ssm_state, to=ir.DataType.FLOAT)
+        # Dummy beta for gated mode (LinearAttention body uses gated_delta
+        # superset; beta=0 makes the delta term vanish: beta*(v - retrieval) = 0)
+        dummy_beta = op.Expand(
+            op.Constant(value_float=0.0),
+            op.Shape(decay),  # (B, T, num_heads)
+        )
         la_output, new_ssm_state = op.call(
-            self._attn_fn,
+            linear_attention(),
             c_expanded,
             b_expanded,
             value,
             ssm_state_f32,
             decay,
+            dummy_beta,
             scale=1.0,
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,

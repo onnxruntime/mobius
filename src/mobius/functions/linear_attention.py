@@ -43,56 +43,39 @@ from mobius.components._scan_utils import (
 DOMAIN = "com.microsoft"
 
 
-def linear_attention(
-    *,
-    update_rule: str = "gated_delta",
-    scale: float = 1.0,
-    stash_type: ir.DataType = ir.DataType.FLOAT,
-) -> ir.Function:
-    """Build an ir.Function for LinearAttention.
+def linear_attention() -> ir.Function:
+    """Build a static ``ir.Function`` for LinearAttention.
 
-    Head counts (``q_num_heads``, ``kv_num_heads``) are derived
-    dynamically from tensor shapes inside the function body, so the
-    function definition is independent of model configuration.
+    Returns a single function definition whose body implements the
+    gated-delta recurrence (the most general variant).  Callers pass
+    model-specific attribute values as ``op.call()`` kwargs::
+
+        op.call(fn, q, k, v, state, decay, beta,
+                scale=0.5, q_num_heads=8, kv_num_heads=8,
+                update_rule="gated_delta", _outputs=2)
+
+    Head counts are derived from tensor shapes inside the body.
+    The ``scale``, ``update_rule``, ``q_num_heads``, and
+    ``kv_num_heads`` attributes appear on the calling node for
+    runtime kernels to consume.
 
     Inputs:
         query:      (B, T, q_num_heads * d_k)
         key:        (B, T, q_num_heads * d_k)
         value:      (B, T, kv_num_heads * d_v)
         past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
-        decay:      (B, T, kv_num_heads * d_k) — required when update_rule in ("gated", "gated_delta")
-        beta:       (B, T, kv_num_heads) — required when update_rule in ("delta", "gated_delta")
+        decay:      (B, T, kv_num_heads * d_k)
+        beta:       (B, T, kv_num_heads)
 
     Outputs:
         output:        (B, T, kv_num_heads * d_v) — attention output (3D)
         present_state: (B, kv_num_heads, d_k, d_v) — updated state
-
-    Callers should pass ONNX attributes as kwargs to ``op.call()``::
-
-        op.call(fn, q, k, v, state, decay, beta,
-                scale=0.5, q_num_heads=8, kv_num_heads=8,
-                update_rule="gated_delta", _outputs=2)
-
-    Args:
-        update_rule: One of "linear", "gated", "delta", "gated_delta".
-            Controls which recurrence variant the Scan body implements.
-        scale: Scalar multiplier applied to query before the recurrence.
-            Per the ONNX LinearAttention op spec, should be set to
-            ``1/sqrt(head_dim)`` for correct scaling.
-        stash_type: Element type for the Scan body's internal
-            computation.  Must match the precision of the inputs
-            passed at the call site.  Defaults to ``FLOAT``.
-
-    The function body handles 3D→4D reshape, GQA expansion, query
-    scaling, and uses an ONNX Scan op for the sequential recurrence.
-    Output is reshaped back to 3D.  A fused kernel can replace the
-    entire function for 10-50x speedup.
     """
-    valid_rules = ("linear", "gated", "delta", "gated_delta")
-    if update_rule not in valid_rules:
-        raise ValueError(
-            f"Unknown update_rule: {update_rule!r}. Expected one of {valid_rules}."
-        )
+    # Static body uses gated_delta (superset) with FLOAT precision.
+    # Runtime kernels use the node-level attributes for correct dispatch.
+    update_rule = "gated_delta"
+    scale = 1.0
+    stash_type = ir.DataType.FLOAT
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
