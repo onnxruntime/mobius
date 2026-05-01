@@ -335,6 +335,22 @@ class TestExtractRopeConfig:
 
         assert _extract_rope_config(Cfg()) is None
 
+    def test_nondefault_rope_theta_without_rope_scaling_activates_rope(self):
+        """Non-default rope_theta alone (e.g. 50000) is treated as a RoPE signal.
+
+        Models like Arctic and Jamba set a custom rope_theta without
+        exposing rope_scaling in their config JSON.  The non-default value
+        distinguishes them from NoPE models that inherit 10000.0 as dead data.
+        """
+
+        class Cfg:
+            rope_theta = 50_000.0  # no rope_scaling, no rope_parameters
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+        assert result.rope_theta == pytest.approx(50_000.0)
+
     def test_rope_parameters_activates_rope(self):
         """``rope_parameters`` on the HF config is the modern RoPE signal."""
 
@@ -974,3 +990,63 @@ class TestGemma4Config:
 
         config = Gemma4Config.from_transformers(text_config)
         assert config.boa_token_id is None
+
+
+class TestActivationFallbacks:
+    """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
+
+    def test_ff_activation_fallback(self):
+        """ff_activation is used when hidden_act is absent (XLNet pattern)."""
+
+        class FakeConfig:
+            model_type = "xlnet"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            ff_activation = "gelu"
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_true_fallback(self):
+        """gelu_activation=True maps to 'gelu' (XLM pattern)."""
+
+        class FakeConfig:
+            model_type = "xlm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = True
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_false_does_not_set_gelu(self):
+        """gelu_activation=False should not set hidden_act to gelu."""
+
+        class FakeConfig:
+            model_type = "some_model"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = False
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # With gelu_activation=False and no other activation attr,
+        # hidden_act should be None (not "gelu")
+        assert config.hidden_act is None

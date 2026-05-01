@@ -2213,7 +2213,7 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
     arch_config = ArchitectureConfig.from_transformers(config)
     arch_config.dtype = ir.DataType.FLOAT
     onnx_module = onnx_module_cls(arch_config)
-    pkg = build_from_module(onnx_module, arch_config, task="text-generation")
+    pkg = build_from_module(onnx_module, arch_config, task="hybrid-text-generation")
     onnx_model = pkg["model"]
 
     # Apply HF random weights
@@ -2257,11 +2257,12 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
             feeds[name] = np.zeros(kv_shape, dtype=np.float32)
         elif name.endswith((".conv_state", ".recurrent_state")):
             # Hybrid cache: use shape from the graph input.
-            # Batch dim (dim 0) must match actual batch size — see
-            # _build_and_compare_qwen35 for the full explanation.
+            # Batch dim (dim 0) must match actual batch size.
+            # Conv state has shape (B, D, K-1) where K-1 is concrete.
+            # Recurrent state may have symbolic dims that default to 0.
             batch_size = input_ids.shape[0]
             shape = tuple(
-                d if isinstance(d, int) else batch_size if i == 0 else 0
+                d if isinstance(d, int) else batch_size if i == 0 else 1
                 for i, d in enumerate(inp.shape)
             )
             feeds[name] = np.zeros(shape, dtype=np.float32)

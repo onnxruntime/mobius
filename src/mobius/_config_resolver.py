@@ -115,6 +115,20 @@ def _dict_to_pretrained_config(d: dict):
     """
     import transformers
 
+    # Some composite configs (e.g. Phi4-MM) have rope_scaling at the
+    # top level without max_position_embeddings, which crashes
+    # PretrainedConfig.__post_init__ rope standardization.  Strip rope
+    # fields proactively when the guard field is absent — the nested
+    # text_config will carry its own rope_scaling.
+    has_rope_fields = "rope_scaling" in d or "rope_parameters" in d
+    has_max_pos = "max_position_embeddings" in d
+    if has_rope_fields and not has_max_pos:
+        logger.debug(
+            "Stripping top-level rope fields from %s config: "
+            "rope_scaling present without max_position_embeddings",
+            d.get("model_type", "unknown"),
+        )
+        d = {k: v for k, v in d.items() if k not in ("rope_scaling", "rope_parameters")}
     config = transformers.PretrainedConfig(**d)
     # Recursively convert known nested config keys
     nested_keys = (

@@ -18,7 +18,7 @@ import torch
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, LongcatFlashConfig
 from mobius.components import (
     MLP,
     Embedding,
@@ -435,6 +435,7 @@ class LongcatFlashCausalLMModel(CausalLMModel):
 
     default_task: str = "text-generation"
     category: str = "Mixture of Experts"
+    config_class: type = LongcatFlashConfig
 
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)

@@ -15,7 +15,10 @@ from mobius.components._common import INT64_MAX
 
 
 def _get_default_inv_freq(config: ArchitectureConfig) -> np.ndarray:
-    dim = int(config.head_dim * config.partial_rotary_factor)
+    # For MLA models (MiniCPM3, DeepSeek-V2), rope applies only to the
+    # qk_rope portion — use qk_rope_head_dim instead of full head_dim.
+    rope_head_dim = config.qk_rope_head_dim or config.head_dim
+    dim = int(rope_head_dim * config.partial_rotary_factor)
     return 1.0 / (config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
 
 
