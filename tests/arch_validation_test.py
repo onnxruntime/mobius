@@ -209,3 +209,45 @@ class TestArchValidation:
                 assert output.name, f"{component_name} has an unnamed output"
 
         del pkg
+
+
+class TestRegistryConsistency:
+    """Verify registry and model class metadata are consistent."""
+
+    def test_config_class_declared_on_model(self):
+        """Registry config_class must match the model class declaration.
+
+        When a registry entry specifies a non-default config_class,
+        the model class must also declare it (not silently inherit a
+        different one from a parent).
+
+        Catches bugs like LongcatFlash where a missing config_class
+        declaration caused the model to load with the wrong config,
+        producing incorrect ONNX graphs without any error.
+        """
+        from mobius._configs import ArchitectureConfig, CausalLMConfig
+
+        issues = []
+        for model_type, reg in registry._map.items():
+            reg_config = reg.config_class
+            if reg_config is None or reg_config is ArchitectureConfig:
+                continue
+
+            cls = reg.module_class
+            model_config = getattr(cls, "config_class", None)
+
+            # If registry specifies a specialized config (not the base
+            # CausalLMConfig), the model class should agree — unless the
+            # model doesn't define config_class at all (multimodal models
+            # that aren't CausalLMModel subclasses rely on the registry).
+            if (
+                reg_config is not CausalLMConfig
+                and model_config is not None
+                and model_config is not reg_config
+            ):
+                issues.append(
+                    f"{model_type}: registry says "
+                    f"{reg_config.__name__} but {cls.__name__} "
+                    f"has {getattr(model_config, '__name__', None)}"
+                )
+        assert not issues, "Registry/model config_class mismatch:\n" + "\n".join(issues)
