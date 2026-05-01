@@ -23,33 +23,23 @@ class AdapterTask(ModelTask):
         module,
         config,
     ) -> ModelPackage:
+        graph, builder = _make_graph()
+        op = builder.op
+
         # Determine input shape based on adapter type
         if hasattr(config, "in_channels"):
             # T2I-Adapter: conditioning image input
-            condition = ir.Value(
-                name="condition",
-                type=ir.TensorType(ir.DataType.FLOAT),
-                shape=ir.Shape(("batch", config.in_channels, "height", "width")),
-            )
+            condition = builder.input("condition", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
         else:
             # IP-Adapter: image embedding input
-            condition = ir.Value(
-                name="image_embeds",
-                type=ir.TensorType(ir.DataType.FLOAT),
-                shape=ir.Shape(("batch", config.image_embed_dim)),
-            )
-
-        graph, builder = _make_graph([condition])
-        op = builder.op
+            condition = builder.input("image_embeds", dtype=ir.DataType.FLOAT, shape=["batch", config.image_embed_dim])
 
         outputs = module(op, condition)
 
         if isinstance(outputs, list):
             for i, out in enumerate(outputs):
-                out.name = f"feature_{i}"
-                graph.outputs.append(out)
+                builder.add_output(out, f"feature_{i}")
         else:
-            outputs.name = "adapter_output"
-            graph.outputs.append(outputs)
+            builder.add_output(outputs, "adapter_output")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

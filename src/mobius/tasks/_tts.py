@@ -90,26 +90,24 @@ class TTSTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="talker")
+
+        inputs_embeds = builder.input(
+            "inputs_embeds", dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
         # MRoPE: 3D position_ids (3, batch, seq_len)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([3, batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
         )
 
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -117,9 +115,7 @@ class TTSTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="talker")
         logits, last_hidden_state, present_key_values = talker(
             builder.op,
             inputs_embeds=inputs_embeds,
@@ -128,11 +124,9 @@ class TTSTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        last_hidden_state.name = "last_hidden_state"
-        graph.outputs.append(logits)
-        graph.outputs.append(last_hidden_state)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        builder.add_output(last_hidden_state, "last_hidden_state")
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
     def _build_code_predictor(
@@ -166,39 +160,29 @@ class TTSTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
+        graph, builder = _make_graph(name="code_predictor")
+
         # Pre-embedded input in talker_hidden space (constructed by
         # generation loop). The model projects to cp_hidden internally.
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        inputs_embeds = builder.input(
+            "inputs_embeds", dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
         # Step index: selects which lm_head to use (0..14)
-        step_index = ir.Value(
-            name="step_index",
-            shape=ir.Shape([]),
-            type=ir.TensorType(ir.DataType.INT64),
+        step_index = builder.input(
+            "step_index", dtype=ir.DataType.INT64, shape=[],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
         # 1D RoPE: 2D position_ids (batch, seq_len)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
         )
 
-        graph_inputs = [
-            inputs_embeds,
-            step_index,
-            attention_mask,
-            position_ids,
-        ]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             cp_num_hidden_layers,
             cp_num_key_value_heads,
             cp_head_dim,
@@ -206,9 +190,7 @@ class TTSTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="code_predictor")
         logits, present_key_values, codec_embeddings = code_predictor(
             builder.op,
             inputs_embeds=inputs_embeds,
@@ -218,14 +200,12 @@ class TTSTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
         # Expose stacked codec embeddings for generation loop to extract.
         # The Identity node ensures renaming the output doesn't affect
         # the initializer name used for weight loading.
-        codec_embeddings.name = "codec_embeddings"
-        graph.outputs.append(codec_embeddings)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(codec_embeddings, "codec_embeddings")
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
     def _build_embedding(
@@ -238,28 +218,23 @@ class TTSTask(ModelTask):
         text_seq = ir.SymbolicDim("text_sequence_len")
         codec_seq = ir.SymbolicDim("codec_sequence_len")
 
-        text_ids = ir.Value(
-            name="text_ids",
-            shape=ir.Shape([batch, text_seq]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph(name="embedding")
+
+        text_ids = builder.input(
+            "text_ids", dtype=ir.DataType.INT64, shape=[batch, text_seq],
         )
-        codec_ids = ir.Value(
-            name="codec_ids",
-            shape=ir.Shape([batch, codec_seq]),
-            type=ir.TensorType(ir.DataType.INT64),
+        codec_ids = builder.input(
+            "codec_ids", dtype=ir.DataType.INT64, shape=[batch, codec_seq],
         )
 
-        graph, builder = _make_graph([text_ids, codec_ids], name="embedding")
         text_embeds, codec_embeds = embedding(
             builder.op,
             text_ids=text_ids,
             codec_ids=codec_ids,
         )
 
-        text_embeds.name = "text_embeds"
-        codec_embeds.name = "codec_embeds"
-        graph.outputs.append(text_embeds)
-        graph.outputs.append(codec_embeds)
+        builder.add_output(text_embeds, "text_embeds")
+        builder.add_output(codec_embeds, "codec_embeds")
         return _make_model(graph)
 
     def _build_speaker_encoder(
@@ -274,15 +249,13 @@ class TTSTask(ModelTask):
         se = tts.speaker_encoder if tts else None
         mel_dim = se.mel_dim if se else 128
 
-        mel_input = ir.Value(
-            name="mel_input",
-            shape=ir.Shape([batch, mel_seq, mel_dim]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="speaker_encoder")
+
+        mel_input = builder.input(
+            "mel_input", dtype=config.dtype, shape=[batch, mel_seq, mel_dim],
         )
 
-        graph, builder = _make_graph([mel_input], name="speaker_encoder")
         speaker_embedding = speaker_encoder(builder.op, mel_input)
 
-        speaker_embedding.name = "speaker_embedding"
-        graph.outputs.append(speaker_embedding)
+        builder.add_output(speaker_embedding, "speaker_embedding")
         return _make_model(graph)

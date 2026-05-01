@@ -103,16 +103,17 @@ class ComponentSpec:
 
 
 def _make_graph(
-    inputs: list[ir.Value],
     name: str = "main_graph",
 ) -> tuple[ir.Graph, GraphBuilder]:
     """Create an empty graph and its builder.
+
+    Inputs should be added after creation via ``builder.input()``.
 
     Returns:
         ``(graph, builder)`` — call ``builder.op`` to get the op handle.
     """
     graph = ir.Graph(
-        inputs,
+        [],
         [],
         nodes=[],
         name=name,
@@ -237,35 +238,36 @@ def build_decoder_from_embeds(
     seq_len = ir.SymbolicDim("sequence_len")
     past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-    inputs_embeds = ir.Value(
-        name="inputs_embeds",
-        shape=ir.Shape([batch, seq_len, config.hidden_size]),
-        type=ir.TensorType(config.dtype),
+    graph, builder = _make_graph()
+    inputs_embeds = builder.input(
+        "inputs_embeds",
+        dtype=config.dtype,
+        shape=[batch, seq_len, config.hidden_size],
     )
-    attention_mask = ir.Value(
-        name="attention_mask",
-        shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-        type=ir.TensorType(ir.DataType.INT64),
+    attention_mask = builder.input(
+        "attention_mask",
+        dtype=ir.DataType.INT64,
+        shape=[batch, "past_seq_len + seq_len"],
     )
     # MRoPE: 3D position IDs (temporal, height, width) — shape [3, batch, seq_len]
     # Standard: shape [batch, seq_len]
-    position_ids = ir.Value(
-        name="position_ids",
-        shape=ir.Shape([3, batch, seq_len] if mrope else [batch, seq_len]),
-        type=ir.TensorType(ir.DataType.INT64),
+    position_ids = builder.input(
+        "position_ids",
+        dtype=ir.DataType.INT64,
+        shape=[3, batch, seq_len] if mrope else [batch, seq_len],
     )
 
-    graph_inputs = [inputs_embeds, attention_mask, position_ids]
-
     if hybrid:
-        cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+        past_key_values = _make_hybrid_cache_inputs(
+            builder,
             config,
             config.dtype,
             batch,
             past_seq_len,
         )
     else:
-        cache_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -273,9 +275,7 @@ def build_decoder_from_embeds(
             batch,
             past_seq_len,
         )
-    graph_inputs.extend(cache_inputs)
 
-    graph, builder = _make_graph(graph_inputs)
     logits, present_key_values = decoder(
         builder.op,
         inputs_embeds=inputs_embeds,
@@ -284,12 +284,11 @@ def build_decoder_from_embeds(
         past_key_values=past_key_values,
     )
 
-    logits.name = "logits"
-    graph.outputs.append(logits)
+    builder.add_output(logits, "logits")
 
     if hybrid:
         _register_hybrid_cache_outputs(
-            graph,
+            builder,
             present_key_values,
             config.layer_types or [],
         )
@@ -297,7 +296,7 @@ def build_decoder_from_embeds(
         _register_linear_attention_functions(model, config)
         return model
     else:
-        _register_kv_cache_outputs(graph, present_key_values)
+        _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
 
@@ -328,24 +327,23 @@ def build_embedding_from_features(
     seq_len = ir.SymbolicDim("sequence_len")
     num_feature_tokens = ir.SymbolicDim("num_feature_tokens")
 
-    input_ids = ir.Value(
-        name="input_ids",
-        shape=ir.Shape([batch, seq_len]),
-        type=ir.TensorType(ir.DataType.INT64),
+    graph, builder = _make_graph(name="embedding")
+    input_ids = builder.input(
+        "input_ids",
+        dtype=ir.DataType.INT64,
+        shape=[batch, seq_len],
     )
-    features = ir.Value(
-        name=feature_name,
-        shape=ir.Shape([num_feature_tokens, feature_dim]),
-        type=ir.TensorType(config.dtype),
+    features = builder.input(
+        feature_name,
+        dtype=config.dtype,
+        shape=[num_feature_tokens, feature_dim],
     )
 
-    graph, builder = _make_graph([input_ids, features], name="embedding")
     inputs_embeds = embedding(
         builder.op,
         input_ids=input_ids,
         **{feature_name: features},
     )
 
-    inputs_embeds.name = "inputs_embeds"
-    graph.outputs.append(inputs_embeds)
+    builder.add_output(inputs_embeds, "inputs_embeds")
     return _make_model(graph)

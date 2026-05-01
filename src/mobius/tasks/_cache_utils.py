@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import onnx_ir as ir
+from onnxscript._internal.builder import GraphBuilder
 
 from mobius._configs import BaseModelConfig
 
@@ -64,6 +65,7 @@ def linear_attention_dims(config: BaseModelConfig) -> LinearAttentionDims:
 
 
 def _make_kv_cache_inputs(
+    builder: GraphBuilder,
     num_layers: int,
     num_kv_heads: int,
     head_dim: int,
@@ -74,42 +76,41 @@ def _make_kv_cache_inputs(
     prefix: str = "past_key_values",
     key_head_dim: int | None = None,
     value_head_dim: int | None = None,
-) -> tuple[list[ir.Value], list[tuple[ir.Value, ir.Value]]]:
+) -> list[tuple[ir.Value, ir.Value]]:
     """Create KV cache input values for ``num_layers`` layers.
 
+    Uses ``builder.input()`` to create and register graph inputs directly.
+
     Args:
+        builder: The graph builder to register inputs on.
         key_head_dim: Head dim for keys. Defaults to ``head_dim``.
             For MLA attention, this is ``qk_nope_head_dim + qk_rope_head_dim``.
         value_head_dim: Head dim for values. Defaults to ``head_dim``.
             For MLA attention, this is ``v_head_dim``.
 
     Returns:
-        ``(flat_inputs, kv_pairs)`` where *flat_inputs* is a flat list
-        suitable for extending ``graph_inputs`` and *kv_pairs* is a list
-        of ``(key, value)`` tuples for passing to the module.
+        A list of ``(key, value)`` tuples for passing to the module.
     """
     k_dim = key_head_dim if key_head_dim is not None else head_dim
     v_dim = value_head_dim if value_head_dim is not None else head_dim
-    flat: list[ir.Value] = []
     pairs: list[tuple[ir.Value, ir.Value]] = []
     for i in range(num_layers):
-        past_key = ir.Value(
-            name=f"{prefix}.{i}.key",
-            shape=ir.Shape([batch, num_kv_heads, past_seq_len, k_dim]),
-            type=ir.TensorType(dtype),
+        past_key = builder.input(
+            f"{prefix}.{i}.key",
+            dtype=dtype,
+            shape=[batch, num_kv_heads, past_seq_len, k_dim],
         )
-        past_value = ir.Value(
-            name=f"{prefix}.{i}.value",
-            shape=ir.Shape([batch, num_kv_heads, past_seq_len, v_dim]),
-            type=ir.TensorType(dtype),
+        past_value = builder.input(
+            f"{prefix}.{i}.value",
+            dtype=dtype,
+            shape=[batch, num_kv_heads, past_seq_len, v_dim],
         )
-        flat.extend([past_key, past_value])
         pairs.append((past_key, past_value))
-    return flat, pairs
+    return pairs
 
 
 def _register_kv_cache_outputs(
-    graph: ir.Graph,
+    builder: GraphBuilder,
     present_key_values: list[tuple[ir.Value, ir.Value]],
     *,
     prefix: str = "present",
@@ -120,22 +121,22 @@ def _register_kv_cache_outputs(
     that runs during model optimization.
     """
     for i, (present_key, present_value) in enumerate(present_key_values):
-        present_key.name = f"{prefix}.{i}.key"
-        present_value.name = f"{prefix}.{i}.value"
-
-        graph.outputs.append(present_key)
-        graph.outputs.append(present_value)
+        builder.add_output(present_key, f"{prefix}.{i}.key")
+        builder.add_output(present_value, f"{prefix}.{i}.value")
 
 
 def _make_hybrid_cache_inputs(
+    builder: GraphBuilder,
     config: BaseModelConfig,
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
     *,
     prefix: str = "past_key_values",
-) -> tuple[list[ir.Value], list[StatePair]]:
+) -> list[StatePair]:
     """Create cache inputs for hybrid models with mixed layer types.
+
+    Uses ``builder.input()`` to create and register graph inputs directly.
 
     Supported layer types:
         ``"full_attention"`` — standard KV cache (key + value).
@@ -146,13 +147,10 @@ def _make_hybrid_cache_inputs(
         ``"mlp"`` — stateless, produces ``(None, None)`` pair.
 
     Returns:
-        ``(flat_inputs, state_pairs)`` — *flat_inputs* contains only
-        the ``ir.Value`` entries (no graph inputs for MLP layers);
-        *state_pairs* has one entry per layer, with ``(None, None)``
+        A list of state pairs, one per layer, with ``(None, None)``
         for stateless MLP layers.
     """
     layer_types = config.layer_types or []
-    flat: list[ir.Value] = []
     pairs: list[StatePair] = []
 
     # DeltaNet dimensions from config (computed once via shared helper)
@@ -187,91 +185,79 @@ def _make_hybrid_cache_inputs(
         if ltype == "lightning_attention":
             # Lightning Attention: single recurrent state only (no conv_state)
             # State: (B, num_heads, head_dim, head_dim) — square matrix accumulator
-            rec_state = ir.Value(
-                name=f"{prefix}.{i}.recurrent_state",
-                shape=ir.Shape(
-                    [batch, config.num_attention_heads, config.head_dim, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
+            rec_state = builder.input(
+                f"{prefix}.{i}.recurrent_state",
+                dtype=dtype,
+                shape=[batch, config.num_attention_heads, config.head_dim, config.head_dim],
             )
-            flat.append(rec_state)
             pairs.append((rec_state,))  # 1-tuple: lightning has no conv_state
         elif ltype == "linear_attention":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, dims.conv_dim, dims.conv_kernel - 1]),
-                type=ir.TensorType(dtype),
+            conv_state = builder.input(
+                f"{prefix}.{i}.conv_state",
+                dtype=dtype,
+                shape=[batch, dims.conv_dim, dims.conv_kernel - 1],
             )
-            rec_state = ir.Value(
-                name=f"{prefix}.{i}.recurrent_state",
-                shape=ir.Shape([batch, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim]),
-                type=ir.TensorType(dtype),
+            rec_state = builder.input(
+                f"{prefix}.{i}.recurrent_state",
+                dtype=dtype,
+                shape=[batch, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim],
             )
-            flat.extend([conv_state, rec_state])
             pairs.append((conv_state, rec_state))
         elif ltype == "conv":
             # ShortConv layers: conv_state only (no SSM state)
             # State: (batch, hidden_size, short_conv_kernel - 1)
             short_conv_kernel = getattr(config, "short_conv_kernel", 3)
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, config.hidden_size, short_conv_kernel - 1]),
-                type=ir.TensorType(dtype),
+            conv_state = builder.input(
+                f"{prefix}.{i}.conv_state",
+                dtype=dtype,
+                shape=[batch, config.hidden_size, short_conv_kernel - 1],
             )
-            flat.append(conv_state)
             pairs.append((conv_state,))  # 1-tuple: conv has no second state
         elif ltype in ("mlp", "moe"):
             # MLP and MoE layers are stateless — no cache inputs needed
             pairs.append((None, None))
         elif ltype == "mamba":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, mamba_d_inner, mamba_d_conv - 1]),
-                type=ir.TensorType(dtype),
+            conv_state = builder.input(
+                f"{prefix}.{i}.conv_state",
+                dtype=dtype,
+                shape=[batch, mamba_d_inner, mamba_d_conv - 1],
             )
-            ssm_state = ir.Value(
-                name=f"{prefix}.{i}.ssm_state",
-                shape=ir.Shape([batch, mamba_d_inner, mamba_d_state]),
-                type=ir.TensorType(dtype),
+            ssm_state = builder.input(
+                f"{prefix}.{i}.ssm_state",
+                dtype=dtype,
+                shape=[batch, mamba_d_inner, mamba_d_state],
             )
-            flat.extend([conv_state, ssm_state])
             pairs.append((conv_state, ssm_state))
         elif ltype == "mamba2":
-            conv_state = ir.Value(
-                name=f"{prefix}.{i}.conv_state",
-                shape=ir.Shape([batch, mamba2_conv_dim, mamba_d_conv - 1]),
-                type=ir.TensorType(dtype),
+            conv_state = builder.input(
+                f"{prefix}.{i}.conv_state",
+                dtype=dtype,
+                shape=[batch, mamba2_conv_dim, mamba_d_conv - 1],
             )
-            ssm_state = ir.Value(
-                name=f"{prefix}.{i}.ssm_state",
-                shape=ir.Shape([batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head]),
-                type=ir.TensorType(dtype),
+            ssm_state = builder.input(
+                f"{prefix}.{i}.ssm_state",
+                dtype=dtype,
+                shape=[batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head],
             )
-            flat.extend([conv_state, ssm_state])
             pairs.append((conv_state, ssm_state))
         else:
-            past_key = ir.Value(
-                name=f"{prefix}.{i}.key",
-                shape=ir.Shape(
-                    [batch, config.num_key_value_heads, past_seq_len, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
+            past_key = builder.input(
+                f"{prefix}.{i}.key",
+                dtype=dtype,
+                shape=[batch, config.num_key_value_heads, past_seq_len, config.head_dim],
             )
-            past_value = ir.Value(
-                name=f"{prefix}.{i}.value",
-                shape=ir.Shape(
-                    [batch, config.num_key_value_heads, past_seq_len, config.head_dim]
-                ),
-                type=ir.TensorType(dtype),
+            past_value = builder.input(
+                f"{prefix}.{i}.value",
+                dtype=dtype,
+                shape=[batch, config.num_key_value_heads, past_seq_len, config.head_dim],
             )
-            flat.extend([past_key, past_value])
             pairs.append((past_key, past_value))
 
-    return flat, pairs
+    return pairs
 
 
 def _register_hybrid_cache_outputs(
-    graph: ir.Graph,
+    builder: GraphBuilder,
     present_key_values: list[tuple[ir.Value, ...]],
     layer_types: list[str],
     *,
@@ -295,27 +281,22 @@ def _register_hybrid_cache_outputs(
         if ltype == "lightning_attention":
             # Single recurrent state only (no conv_state for lightning)
             (state_a,) = states
-            state_a.name = f"{prefix}.{i}.recurrent_state"
-            graph.outputs.append(state_a)
+            builder.add_output(state_a, f"{prefix}.{i}.recurrent_state")
         elif ltype == "conv":
             # ShortConv: single conv_state only
             (state_a,) = states
-            state_a.name = f"{prefix}.{i}.conv_state"
-            graph.outputs.append(state_a)
+            builder.add_output(state_a, f"{prefix}.{i}.conv_state")
         else:
             state_a, state_b = states
             if ltype == "linear_attention":
-                state_a.name = f"{prefix}.{i}.conv_state"
-                state_b.name = f"{prefix}.{i}.recurrent_state"
+                builder.add_output(state_a, f"{prefix}.{i}.conv_state")
+                builder.add_output(state_b, f"{prefix}.{i}.recurrent_state")
             elif ltype in ("mamba", "mamba2"):
-                state_a.name = f"{prefix}.{i}.conv_state"
-                state_b.name = f"{prefix}.{i}.ssm_state"
+                builder.add_output(state_a, f"{prefix}.{i}.conv_state")
+                builder.add_output(state_b, f"{prefix}.{i}.ssm_state")
             else:
-                state_a.name = f"{prefix}.{i}.key"
-                state_b.name = f"{prefix}.{i}.value"
-
-            graph.outputs.append(state_a)
-            graph.outputs.append(state_b)
+                builder.add_output(state_a, f"{prefix}.{i}.key")
+                builder.add_output(state_b, f"{prefix}.{i}.value")
 
 
 def _register_linear_attention_functions(

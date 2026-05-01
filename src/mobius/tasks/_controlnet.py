@@ -28,33 +28,13 @@ class ControlNetTask(ModelTask):
         module,
         config: ControlNetConfig,
     ) -> ModelPackage:
-        sample = ir.Value(
-            name="sample",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", config.in_channels, "height", "width")),
-        )
-        timestep = ir.Value(
-            name="timestep",
-            type=ir.TensorType(ir.DataType.INT64),
-            shape=ir.Shape(("batch",)),
-        )
-        encoder_hidden_states = ir.Value(
-            name="encoder_hidden_states",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", "sequence_length", config.cross_attention_dim)),
-        )
-        controlnet_cond = ir.Value(
-            name="controlnet_cond",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(
-                ("batch", config.conditioning_channels, "cond_height", "cond_width")
-            ),
-        )
-
-        graph, builder = _make_graph(
-            [sample, timestep, encoder_hidden_states, controlnet_cond]
-        )
+        graph, builder = _make_graph()
         op = builder.op
+
+        sample = builder.input("sample", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
+        timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
+        encoder_hidden_states = builder.input("encoder_hidden_states", dtype=ir.DataType.FLOAT, shape=["batch", "sequence_length", config.cross_attention_dim])
+        controlnet_cond = builder.input("controlnet_cond", dtype=ir.DataType.FLOAT, shape=["batch", config.conditioning_channels, "cond_height", "cond_width"])
 
         down_outputs, mid_output = module(
             op,
@@ -66,9 +46,7 @@ class ControlNetTask(ModelTask):
 
         # Register outputs
         for i, out in enumerate(down_outputs):
-            out.name = f"down_block_res_{i}"
-            graph.outputs.append(out)
-        mid_output.name = "mid_block_res"
-        graph.outputs.append(mid_output)
+            builder.add_output(out, f"down_block_res_{i}")
+        builder.add_output(mid_output, "mid_block_res")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

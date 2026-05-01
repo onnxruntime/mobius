@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import onnx_ir as ir
 from onnxscript import nn
+from onnxscript._internal.builder import GraphBuilder
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
@@ -110,23 +111,19 @@ class CausalLMTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
+        # --- Build graph first, then create inputs via builder ---
+        graph, builder = _make_graph()
+        op = builder.op
+
         # --- Inputs common to both modes ---
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
         # --- Cache setup (static vs dynamic) ---
         if static:
             attention_mask = None
-            graph_inputs = [input_ids, position_ids]
-            cache_inputs, past_key_values = _make_static_cache_inputs(
+            position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+            past_key_values = _make_static_cache_inputs(
+                builder,
                 config.num_hidden_layers,
                 config.num_key_value_heads,
                 config.head_dim,
@@ -136,12 +133,10 @@ class CausalLMTask(ModelTask):
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
-            attention_mask = ir.Value(
-                name="attention_mask",
-                shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-                type=ir.TensorType(ir.DataType.INT64),
+            attention_mask = builder.input(
+                "attention_mask", dtype=ir.DataType.INT64, shape=[batch, "past_seq_len + seq_len"],
             )
-            graph_inputs = [input_ids, attention_mask, position_ids]
+            position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
             # MLA attention: K/V heads equal q heads (no GQA reduction in
             # latent space).  The ONNX Attention op is called with
@@ -154,7 +149,8 @@ class CausalLMTask(ModelTask):
                 config.num_attention_heads if use_mla else config.num_key_value_heads
             )
 
-            cache_inputs, past_key_values = _make_kv_cache_inputs(
+            past_key_values = _make_kv_cache_inputs(
+                builder,
                 config.num_hidden_layers,
                 num_kv_cache_heads,
                 config.head_dim,
@@ -166,12 +162,6 @@ class CausalLMTask(ModelTask):
                 value_head_dim=config.v_head_dim or None,
             )
 
-        graph_inputs.extend(cache_inputs)
-
-        # --- Build graph, invoke module, collect outputs ---
-        graph, builder = _make_graph(graph_inputs)
-        op = builder.op
-
         logits, present_key_values = module(
             op,
             input_ids=input_ids,
@@ -180,18 +170,17 @@ class CausalLMTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
 
         # --- Output registration (static vs dynamic) ---
         if static:
             _register_static_cache_outputs(
-                graph,
+                builder,
                 present_key_values,
             )
         else:
             _register_kv_cache_outputs(
-                graph,
+                builder,
                 present_key_values,
             )
 
@@ -228,34 +217,22 @@ class HybridCausalLMTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
+        graph, builder = _make_graph()
+        op = builder.op
 
-        graph_inputs = [input_ids, attention_mask, position_ids]
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, "past_seq_len + seq_len"],
+        )
+        position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
-        cache_inputs, past_key_values = _make_hybrid_cache_inputs(
+        past_key_values = _make_hybrid_cache_inputs(
+            builder,
             config,
             config.dtype,
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(cache_inputs)
-
-        graph, builder = _make_graph(graph_inputs)
-        op = builder.op
 
         logits, present_key_values = module(
             op,
@@ -265,10 +242,9 @@ class HybridCausalLMTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
-            graph,
+            builder,
             present_key_values,
             config.layer_types or [],
         )
@@ -279,51 +255,45 @@ class HybridCausalLMTask(ModelTask):
 
 
 def _make_static_cache_inputs(
+    builder: GraphBuilder,
     num_layers: int,
     num_key_value_heads: int,
     head_dim: int,
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     max_seq_len: int,
-) -> tuple[list[ir.Value], list[StaticCacheState]]:
+) -> list[StaticCacheState]:
     """Create static KV cache inputs for ``num_layers`` layers.
 
+    Uses ``builder.input()`` to create and register graph inputs directly.
+
     Returns:
-        ``(flat_inputs, static_caches)`` where *flat_inputs* is a flat
-        list suitable for extending ``graph_inputs``, and
-        *static_caches* is a list of :class:`StaticCacheState` tuples
-        for passing to the module via ``past_key_values``.
+        A list of :class:`StaticCacheState` tuples for passing to the
+        module via ``past_key_values``.
     """
     kv_hidden = num_key_value_heads * head_dim
-    flat: list[ir.Value] = []
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
 
     for i in range(num_layers):
-        key_cache = ir.Value(
-            name=f"key_cache.{i}",
-            shape=ir.Shape([batch, max_seq_len, kv_hidden]),
-            type=ir.TensorType(dtype),
+        key_cache = builder.input(
+            f"key_cache.{i}",
+            dtype=dtype,
+            shape=[batch, max_seq_len, kv_hidden],
         )
-        value_cache = ir.Value(
-            name=f"value_cache.{i}",
-            shape=ir.Shape([batch, max_seq_len, kv_hidden]),
-            type=ir.TensorType(dtype),
+        value_cache = builder.input(
+            f"value_cache.{i}",
+            dtype=dtype,
+            shape=[batch, max_seq_len, kv_hidden],
         )
-        flat.extend([key_cache, value_cache])
         cache_pairs.append((key_cache, value_cache))
 
     # Shared inputs across all layers
-    write_indices = ir.Value(
-        name="write_indices",
-        shape=ir.Shape([batch]),
-        type=ir.TensorType(ir.DataType.INT64),
+    write_indices = builder.input(
+        "write_indices", dtype=ir.DataType.INT64, shape=[batch],
     )
-    nonpad_kv_seqlen = ir.Value(
-        name="nonpad_kv_seqlen",
-        shape=ir.Shape([batch]),
-        type=ir.TensorType(ir.DataType.INT64),
+    nonpad_kv_seqlen = builder.input(
+        "nonpad_kv_seqlen", dtype=ir.DataType.INT64, shape=[batch],
     )
-    flat.extend([write_indices, nonpad_kv_seqlen])
 
     # Build StaticCacheState for each layer (shared indices)
     static_caches: list[StaticCacheState] = []
@@ -337,11 +307,11 @@ def _make_static_cache_inputs(
             )
         )
 
-    return flat, static_caches
+    return static_caches
 
 
 def _register_static_cache_outputs(
-    graph: ir.Graph,
+    builder: GraphBuilder,
     present_key_values: list[tuple[ir.Value, ir.Value]],
 ) -> None:
     """Name and register static cache outputs on the graph.
@@ -350,10 +320,8 @@ def _register_static_cache_outputs(
     that runs during model optimization.
     """
     for i, (updated_key, updated_value) in enumerate(present_key_values):
-        updated_key.name = f"updated_key_cache.{i}"
-        updated_value.name = f"updated_value_cache.{i}"
-        graph.outputs.append(updated_key)
-        graph.outputs.append(updated_value)
+        builder.add_output(updated_key, f"updated_key_cache.{i}")
+        builder.add_output(updated_value, f"updated_value_cache.{i}")
 
 
 def _validate_static_cache_support(module: nn.Module) -> None:
