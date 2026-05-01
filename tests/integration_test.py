@@ -3935,13 +3935,14 @@ def test_qwen35_deltanet_single_layer_parity():
         np.pad(conv_np, ((0, 0), (0, 0), (1, 0))),
     ).float()
     cache.layers[0].recurrent_states = torch.from_numpy(rec_np).float()
-    # has_previous_state is True once conv_states[0] is set
+    # Signal that previous state exists so the forward uses decode-mode path.
+    # In newer transformers the flag is not set automatically by direct assignment.
+    cache.layers[0].has_previous_state = True
 
     with torch.no_grad():
         hf_output = hf_dn(
             hidden_states=torch.from_numpy(hidden_np).float(),
             cache_params=cache,
-            cache_position=torch.tensor([conv_kernel - 1]),
         ).numpy()
     hf_rec = cache.layers[0].recurrent_states.numpy()
 
