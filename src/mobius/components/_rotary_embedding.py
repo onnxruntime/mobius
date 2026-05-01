@@ -98,6 +98,10 @@ def apply_rotary_pos_emb(
 class BaseRope(nn.Module):
     """Base class for rotary position embeddings.
 
+    Subclasses that accept an ``ArchitectureConfig`` should pass
+    ``dtype=config.dtype`` to ``super().__init__()`` so that cos/sin
+    embeddings are cast to the model compute dtype.
+
     Args:
         cos_cache_data: Precomputed cosine cache (numpy float32).
         sin_cache_data: Precomputed sine cache (numpy float32).
