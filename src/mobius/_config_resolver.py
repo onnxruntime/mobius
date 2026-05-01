@@ -149,7 +149,7 @@ def _dict_to_pretrained_config(d: dict):
         # set max_position_embeddings before accessing it).  Strip rope
         # fields, construct the config, then restore them as attributes
         # so _extract_rope_config can still read them.
-        logger.debug(
+        logger.warning(
             "Retrying %s config without rope fields after PretrainedConfig init failure: %s",
             d.get("model_type", "unknown"),
             e,
