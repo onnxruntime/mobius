@@ -45,12 +45,14 @@ _DOMAIN = "com.microsoft"
 
 # Registry mapping (domain, name, overload) → zero-arg factory function.
 #
-# Each factory returns a static ir.Function whose body serves as a
-# standard-ONNX fallback.  Model-specific attribute values (num_heads,
-# scale, etc.) are passed at callsites via op.call() kwargs.
+# This registry is for **config-independent** function bodies — ops whose
+# standard-ONNX fallback doesn't depend on model shape or head counts.
 # These are attached to every model by ``register_function_bodies()``.
+#
+# ``CausalConvWithState`` and ``LinearAttention`` are **parametric** factories
+# (kernel_size, channels, num_heads are baked into the function body) and are
+# registered per-model by ``tasks._base._register_linear_attention_functions``.
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
-    (_DOMAIN, "LinearAttention", ""): linear_attention,
     (_DOMAIN, "PackedMultiHeadAttention", ""): packed_multi_head_attention,
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,

@@ -94,6 +94,15 @@ class LightningAttention(nn.Module):
             layer_idx, config.num_hidden_layers, self.num_heads
         )
 
+        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        self._attn_fn = linear_attention(
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
+            scale=1.0 / math.sqrt(self.head_dim),
+            stash_type=config.dtype,
+        )
+
     def forward(
         self,
         op: builder.OpBuilder,
@@ -148,25 +157,13 @@ class LightningAttention(nn.Module):
         # LinearAttention "gated": S_t = exp(g_t) * S_{t-1} + k_t ⊗ v_t
         # scale = 1/sqrt(head_dim) for proper scaling
         scale = 1.0 / math.sqrt(self.head_dim)
-        # Dummy beta for gated mode (body uses gated_delta superset;
-        # beta=0 makes the delta correction term vanish)
-        dummy_beta = op.Expand(
-            op.Constant(value_float=0.0),
-            op.Concat(
-                batch_dim,
-                seq_dim,
-                op.Constant(value_ints=[self.num_heads]),
-                axis=0,
-            ),
-        )
         attn_out, new_state = op.call(
-            linear_attention(),
+            self._attn_fn,
             query,
             key,
             value,
             recurrent_state,
             decay,
-            dummy_beta,
             scale=scale,
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,
