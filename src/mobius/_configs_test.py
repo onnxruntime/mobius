@@ -335,6 +335,22 @@ class TestExtractRopeConfig:
 
         assert _extract_rope_config(Cfg()) is None
 
+    def test_nondefault_rope_theta_without_rope_scaling_activates_rope(self):
+        """Non-default rope_theta alone (e.g. 50000) is treated as a RoPE signal.
+
+        Models like Arctic and Jamba set a custom rope_theta without
+        exposing rope_scaling in their config JSON.  The non-default value
+        distinguishes them from NoPE models that inherit 10000.0 as dead data.
+        """
+
+        class Cfg:
+            rope_theta = 50_000.0  # no rope_scaling, no rope_parameters
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+        assert result.rope_theta == pytest.approx(50_000.0)
+
     def test_rope_parameters_activates_rope(self):
         """``rope_parameters`` on the HF config is the modern RoPE signal."""
 

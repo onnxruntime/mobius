@@ -314,8 +314,14 @@ def _first_not_none(*values, default=None):
     return default
 
 
-# Model types that use RoPE but don't expose rope_scaling/rope_parameters
-# in their HF config JSON.  Maps model_type → default rope_theta.
+# Models that use RoPE but hardcode rope_theta entirely in model __init__,
+# not in config JSON.  These are NOT detectable via config introspection
+# without trust_remote_code.  When a new model fails L2 with missing RoPE:
+# 1. Confirm the model's HF source uses rotary embeddings
+# 2. Find the hardcoded rope_theta in the transformers source
+# 3. Add an entry here: model_type → rope_theta
+# TODO: migrate to a registry annotation (uses_rope: bool, rope_theta: float)
+# once the registry schema supports per-model capability flags.
 _IMPLICIT_ROPE_DEFAULTS: dict[str, float] = {
     # chatglm: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
     # uses default rope_theta=10000.0 hardcoded in modeling code.
