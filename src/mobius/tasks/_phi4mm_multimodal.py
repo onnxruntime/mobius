@@ -100,7 +100,7 @@ class Phi4MMMultiModalTask(ModelTask):
         image_features = vision(builder.op, pixel_values, image_sizes=image_sizes)
 
         builder.add_output(image_features, "image_features")
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_speech(
         self,
@@ -143,7 +143,7 @@ class Phi4MMMultiModalTask(ModelTask):
         )
 
         builder.add_output(speech_out, "audio_features")
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_embedding(
         self,
@@ -182,4 +182,4 @@ class Phi4MMMultiModalTask(ModelTask):
         )
 
         builder.add_output(inputs_embeds, "inputs_embeds")
-        return _make_model(graph)
+        return _make_model(graph, builder)

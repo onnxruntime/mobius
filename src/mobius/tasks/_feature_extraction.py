@@ -57,4 +57,4 @@ class FeatureExtractionTask(ModelTask):
 
         builder.add_output(last_hidden_state, "last_hidden_state")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        return ModelPackage({"model": _make_model(graph, builder)}, config=config)

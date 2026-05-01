@@ -189,7 +189,7 @@ class CausalLMTask(ModelTask):
                 present_key_values,
             )
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
 
 
 class HybridCausalLMTask(ModelTask):
@@ -258,7 +258,7 @@ class HybridCausalLMTask(ModelTask):
             config.layer_types or [],
         )
 
-        model = _make_model(graph)
+        model = _make_model(graph, builder)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
 

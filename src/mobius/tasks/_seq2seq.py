@@ -69,7 +69,7 @@ class Seq2SeqTask(ModelTask):
 
         builder.add_output(encoder_hidden_states, "last_hidden_state")
 
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_decoder_graph(
         self,
@@ -153,4 +153,4 @@ class Seq2SeqTask(ModelTask):
             builder.add_output(k, f"present.{i}.cross.key")
             builder.add_output(v, f"present.{i}.cross.value")
 
-        return _make_model(graph)
+        return _make_model(graph, builder)

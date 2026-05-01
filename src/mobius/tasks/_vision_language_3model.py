@@ -91,7 +91,7 @@ class VisionLanguageTask(ModelTask):
         image_features = vision(builder.op, pixel_values=pixel_values)
 
         builder.add_output(image_features, "image_features")
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
 
 class QwenVLTask(VisionLanguageTask):
@@ -152,7 +152,7 @@ class QwenVLTask(VisionLanguageTask):
         )
 
         builder.add_output(image_features, "image_features")
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
 
 class HybridQwenVLTask(QwenVLTask):
@@ -228,7 +228,7 @@ class PixtralVLTask(VisionLanguageTask):
 
         builder.add_output(image_features, "image_features")
 
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
 
 class MllamaVisionLanguageTask(VisionLanguageTask):
@@ -341,4 +341,4 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)
 
-        return _make_model(graph)
+        return _make_model(graph, builder)

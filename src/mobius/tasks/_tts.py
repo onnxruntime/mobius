@@ -130,7 +130,7 @@ class TTSTask(ModelTask):
         builder.add_output(logits, "logits")
         builder.add_output(last_hidden_state, "last_hidden_state")
         _register_kv_cache_outputs(builder, present_key_values)
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_code_predictor(
         self,
@@ -215,7 +215,7 @@ class TTSTask(ModelTask):
         # the initializer name used for weight loading.
         builder.add_output(codec_embeddings, "codec_embeddings")
         _register_kv_cache_outputs(builder, present_key_values)
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_embedding(
         self,
@@ -248,7 +248,7 @@ class TTSTask(ModelTask):
 
         builder.add_output(text_embeds, "text_embeds")
         builder.add_output(codec_embeds, "codec_embeds")
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
     def _build_speaker_encoder(
         self,
@@ -273,4 +273,4 @@ class TTSTask(ModelTask):
         speaker_embedding = speaker_encoder(builder.op, mel_input)
 
         builder.add_output(speaker_embedding, "speaker_embedding")
-        return _make_model(graph)
+        return _make_model(graph, builder)
