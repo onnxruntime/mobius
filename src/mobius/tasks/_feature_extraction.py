@@ -41,8 +41,12 @@ class FeatureExtractionTask(ModelTask):
         op = builder.op
 
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
-        attention_mask = builder.input("attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len])
-        token_type_ids = builder.input("token_type_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
+        token_type_ids = builder.input(
+            "token_type_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         last_hidden_state = module(
             op,

@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import onnx_ir as ir
-from onnxscript._internal.builder import GraphBuilder
+from onnxscript import GraphBuilder
 
 from mobius._configs import BaseModelConfig
 

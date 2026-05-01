@@ -59,7 +59,9 @@ class Seq2SeqTask(ModelTask):
         op = builder.op
 
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
-        attention_mask = builder.input("attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         encoder_hidden_states = module.encoder(
             op, input_ids=input_ids, attention_mask=attention_mask
@@ -83,14 +85,18 @@ class Seq2SeqTask(ModelTask):
         op = builder.op
 
         input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=[batch, dec_seq_len],
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, dec_seq_len],
         )
         encoder_hidden_states = builder.input(
-            "encoder_hidden_states", dtype=config.dtype,
+            "encoder_hidden_states",
+            dtype=config.dtype,
             shape=[batch, enc_seq_len, config.hidden_size],
         )
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64,
+            "attention_mask",
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + dec_seq_len"],
         )
 
@@ -102,11 +108,13 @@ class Seq2SeqTask(ModelTask):
         past_self_kvs: list[tuple[ir.Value, ir.Value]] = []
         for i in range(num_decoder_layers):
             past_key = builder.input(
-                f"past_key_values.{i}.self.key", dtype=config.dtype,
+                f"past_key_values.{i}.self.key",
+                dtype=config.dtype,
                 shape=[batch, num_heads, past_seq_len, head_dim],
             )
             past_value = builder.input(
-                f"past_key_values.{i}.self.value", dtype=config.dtype,
+                f"past_key_values.{i}.self.value",
+                dtype=config.dtype,
                 shape=[batch, num_heads, past_seq_len, head_dim],
             )
             past_self_kvs.append((past_key, past_value))
@@ -115,11 +123,13 @@ class Seq2SeqTask(ModelTask):
         cross_past_kvs: list[tuple[ir.Value, ir.Value]] = []
         for i in range(num_decoder_layers):
             past_key = builder.input(
-                f"past_key_values.{i}.cross.key", dtype=config.dtype,
+                f"past_key_values.{i}.cross.key",
+                dtype=config.dtype,
                 shape=[batch, num_heads, enc_seq_len, head_dim],
             )
             past_value = builder.input(
-                f"past_key_values.{i}.cross.value", dtype=config.dtype,
+                f"past_key_values.{i}.cross.value",
+                dtype=config.dtype,
                 shape=[batch, num_heads, enc_seq_len, head_dim],
             )
             cross_past_kvs.append((past_key, past_value))

@@ -31,10 +31,22 @@ class ControlNetTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        sample = builder.input("sample", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
+        sample = builder.input(
+            "sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.in_channels, "height", "width"],
+        )
         timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
-        encoder_hidden_states = builder.input("encoder_hidden_states", dtype=ir.DataType.FLOAT, shape=["batch", "sequence_length", config.cross_attention_dim])
-        controlnet_cond = builder.input("controlnet_cond", dtype=ir.DataType.FLOAT, shape=["batch", config.conditioning_channels, "cond_height", "cond_width"])
+        encoder_hidden_states = builder.input(
+            "encoder_hidden_states",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", "sequence_length", config.cross_attention_dim],
+        )
+        controlnet_cond = builder.input(
+            "controlnet_cond",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.conditioning_channels, "cond_height", "cond_width"],
+        )
 
         down_outputs, mid_output = module(
             op,

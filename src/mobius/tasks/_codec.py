@@ -89,7 +89,9 @@ class CodecTask(ModelTask):
         audio_len = ir.SymbolicDim("audio_length")
 
         graph, builder = _make_graph(name="encoder")
-        waveform = builder.input("waveform", dtype=ir.DataType.FLOAT, shape=[batch, 1, audio_len])
+        waveform = builder.input(
+            "waveform", dtype=ir.DataType.FLOAT, shape=[batch, 1, audio_len]
+        )
 
         codes = encoder(builder.op, waveform)
 

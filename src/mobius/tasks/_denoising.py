@@ -31,9 +31,17 @@ class DenoisingTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        sample = builder.input("sample", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
+        sample = builder.input(
+            "sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.in_channels, "height", "width"],
+        )
         timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
-        encoder_hidden_states = builder.input("encoder_hidden_states", dtype=ir.DataType.FLOAT, shape=["batch", "sequence_length", config.cross_attention_dim])
+        encoder_hidden_states = builder.input(
+            "encoder_hidden_states",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", "sequence_length", config.cross_attention_dim],
+        )
 
         noise_pred = module(
             op,

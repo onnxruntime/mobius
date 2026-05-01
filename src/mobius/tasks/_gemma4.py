@@ -22,8 +22,7 @@ entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal.builder import GraphBuilder
+from onnxscript import GraphBuilder, nn
 
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
@@ -38,14 +37,14 @@ from mobius.tasks._cache_utils import (
 
 
 def _make_gemma4_kv_cache_inputs(
-    graph_builder: GraphBuilder,
+    builder: GraphBuilder,
     config: Gemma4Config,
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
 ) -> list[tuple[ir.Value, ir.Value]]:
     """Create per-layer KV cache inputs accounting for dual head_dim and KV sharing.
 
-    Uses ``graph_builder.input()`` to create and register graph inputs directly.
+    Uses ``builder.input()`` to create and register graph inputs directly.
 
     Local (sliding_attention) layers use ``config.head_dim``;
     global (full_attention) layers use ``config.global_head_dim``.
@@ -75,12 +74,12 @@ def _make_gemma4_kv_cache_inputs(
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
         kv_heads = config.num_key_value_heads
-        past_key = graph_builder.input(
+        past_key = builder.input(
             f"past_key_values.{i}.key",
             dtype=config.dtype,
             shape=[batch, kv_heads, past_seq_len, hd],
         )
-        past_value = graph_builder.input(
+        past_value = builder.input(
             f"past_key_values.{i}.value",
             dtype=config.dtype,
             shape=[batch, kv_heads, past_seq_len, hd],
@@ -119,26 +118,26 @@ class Gemma4TextCausalLMTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        graph, graph_builder = _make_graph()
-        op = graph_builder.op
+        graph, builder = _make_graph()
+        op = builder.op
 
-        input_ids = graph_builder.input(
+        input_ids = builder.input(
             "input_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        attention_mask = graph_builder.input(
+        attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = graph_builder.input(
+        position_ids = builder.input(
             "position_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
 
-        past_key_values = _make_gemma4_kv_cache_inputs(graph_builder, config, batch, past_seq_len)
+        past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
 
         logits, present_key_values = module(
             op,
@@ -147,8 +146,8 @@ class Gemma4TextCausalLMTask(ModelTask):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
-        graph_builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(graph_builder, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
@@ -225,31 +224,31 @@ class Gemma4Task(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        graph, graph_builder = _make_graph(name="decoder")
-        op = graph_builder.op
+        graph, builder = _make_graph(name="decoder")
+        op = builder.op
 
-        inputs_embeds = graph_builder.input(
+        inputs_embeds = builder.input(
             "inputs_embeds",
             dtype=config.dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = graph_builder.input(
+        attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = graph_builder.input(
+        position_ids = builder.input(
             "position_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        input_ids = graph_builder.input(
+        input_ids = builder.input(
             "input_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
 
-        past_key_values = _make_gemma4_kv_cache_inputs(graph_builder, config, batch, past_seq_len)
+        past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
 
         logits, present_key_values = decoder(
             op,
@@ -260,8 +259,8 @@ class Gemma4Task(ModelTask):
             past_key_values=past_key_values,
         )
 
-        graph_builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(graph_builder, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return _make_model(graph)
 
@@ -288,15 +287,15 @@ class Gemma4Task(ModelTask):
         patch_size = config.vision.patch_size or 16 if config.vision else 16
         pixel_dim = 3 * patch_size * patch_size
 
-        graph, graph_builder = _make_graph(name="vision_encoder")
-        op = graph_builder.op
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
 
-        pixel_values = graph_builder.input(
+        pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
             shape=[batch, num_patches, pixel_dim],
         )
-        pixel_position_ids = graph_builder.input(
+        pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, num_patches, 2],
@@ -308,7 +307,7 @@ class Gemma4Task(ModelTask):
             pixel_position_ids=pixel_position_ids,
         )
 
-        graph_builder.add_output(image_features, "image_features")
+        builder.add_output(image_features, "image_features")
 
         return _make_model(graph)
 
@@ -340,15 +339,15 @@ class Gemma4Task(ModelTask):
         time = ir.SymbolicDim("time")
         input_size = (config.audio.input_size if config.audio else None) or 128
 
-        graph, graph_builder = _make_graph(name="audio_encoder")
-        op = graph_builder.op
+        graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
 
-        input_features = graph_builder.input(
+        input_features = builder.input(
             "input_features",
             dtype=config.dtype,
             shape=[batch, time, input_size],
         )
-        input_features_mask = graph_builder.input(
+        input_features_mask = builder.input(
             "input_features_mask",
             dtype=ir.DataType.BOOL,
             shape=[batch, time],
@@ -359,10 +358,10 @@ class Gemma4Task(ModelTask):
             input_features,
             input_features_mask=input_features_mask,
         )
-        graph_builder.add_output(audio_features, "audio_features")
+        builder.add_output(audio_features, "audio_features")
 
         if downsampled_mask is not None:
-            graph_builder.add_output(downsampled_mask, "audio_features_mask")
+            builder.add_output(downsampled_mask, "audio_features_mask")
 
         return _make_model(graph)
 
@@ -376,15 +375,15 @@ class Gemma4Task(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         num_image_tokens = ir.SymbolicDim("num_image_tokens")
 
-        graph, graph_builder = _make_graph(name="embedding")
-        op = graph_builder.op
+        graph, builder = _make_graph(name="embedding")
+        op = builder.op
 
-        input_ids = graph_builder.input(
+        input_ids = builder.input(
             "input_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        image_features = graph_builder.input(
+        image_features = builder.input(
             "image_features",
             dtype=config.dtype,
             shape=[num_image_tokens, config.hidden_size],
@@ -394,7 +393,7 @@ class Gemma4Task(ModelTask):
 
         if config.audio is not None:
             num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
-            audio_features_val = graph_builder.input(
+            audio_features_val = builder.input(
                 "audio_features",
                 dtype=config.dtype,
                 shape=[num_audio_tokens, config.hidden_size],
@@ -406,5 +405,5 @@ class Gemma4Task(ModelTask):
             image_features=image_features,
             audio_features=audio_features_val,
         )
-        graph_builder.add_output(inputs_embeds, "inputs_embeds")
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)

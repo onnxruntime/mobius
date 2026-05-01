@@ -51,15 +51,20 @@ class Qwen3VLVisionLanguageTask(ModelTask):
         op = builder.op
 
         input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64,
+            "attention_mask",
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         # MRoPE: 3D position IDs (temporal, height, width)
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64, shape=[3, batch, seq_len],
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
         )
         # Flattened image patches
         patch_size = config.vision.patch_size or 16 if config.vision else 16
@@ -67,12 +72,16 @@ class Qwen3VLVisionLanguageTask(ModelTask):
         in_channels = config.vision.in_channels if config.vision else 3
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
         pixel_values = builder.input(
-            "pixel_values", dtype=config.dtype, shape=[total_patches, pixel_dim],
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[total_patches, pixel_dim],
         )
         # Image grid dimensions for position embedding interpolation
         num_images = ir.SymbolicDim("num_images")
         grid_thw = builder.input(
-            "grid_thw", dtype=ir.DataType.INT64, shape=[num_images, 3],
+            "grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
         )
 
         past_key_values = _make_kv_cache_inputs(

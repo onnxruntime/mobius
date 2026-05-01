@@ -85,7 +85,8 @@ class SpeechLanguageTask(ModelTask):
         graph, builder = _make_graph(name="audio_encoder")
 
         input_features = builder.input(
-            "input_features", dtype=config.dtype,
+            "input_features",
+            dtype=config.dtype,
             shape=[batch, n_mels, mel_seq],
         )
 

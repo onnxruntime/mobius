@@ -56,25 +56,32 @@ class MultiModalTask(ModelTask):
         op = builder.op
 
         input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64,
+            "attention_mask",
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
         image_size = config.vision.image_size or 224 if config.vision else 224
         pixel_values = builder.input(
-            "pixel_values", dtype=config.dtype,
+            "pixel_values",
+            dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
 
         audio_input_size = (config.audio.input_size if config.audio else None) or 80
         audio_features = builder.input(
-            "audio_features", dtype=config.dtype,
+            "audio_features",
+            dtype=config.dtype,
             shape=[batch, "audio_seq_len", audio_input_size],
         )
 

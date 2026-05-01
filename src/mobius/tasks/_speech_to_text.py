@@ -73,7 +73,8 @@ class SpeechToTextTask(ModelTask):
         op = builder.op
 
         input_features = builder.input(
-            "input_features", dtype=ir.DataType.FLOAT,
+            "input_features",
+            dtype=ir.DataType.FLOAT,
             shape=[batch, config.num_mel_bins, audio_seq_len],
         )
 
@@ -97,14 +98,19 @@ class SpeechToTextTask(ModelTask):
         op = builder.op
 
         decoder_input_ids = builder.input(
-            "decoder_input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "decoder_input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
         encoder_hidden_states = builder.input(
-            "encoder_hidden_states", dtype=config.dtype,
+            "encoder_hidden_states",
+            dtype=config.dtype,
             shape=[batch, encoder_seq_len, config.hidden_size],
         )
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
         past_key_values = _make_kv_cache_inputs(

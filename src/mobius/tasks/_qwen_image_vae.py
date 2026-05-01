@@ -43,7 +43,9 @@ class QwenImageVAETask(ModelTask):
         graph, builder = _make_graph(name="vae_encoder")
         op = builder.op
 
-        sample = builder.input("sample", dtype=ir.DataType.FLOAT, shape=["batch", 3, "frames", "height", "width"])
+        sample = builder.input(
+            "sample", dtype=ir.DataType.FLOAT, shape=["batch", 3, "frames", "height", "width"]
+        )
 
         hidden_states = module.encoder(op, sample)
         hidden_states = module.quant_conv(op, hidden_states)
@@ -60,7 +62,11 @@ class QwenImageVAETask(ModelTask):
         graph, builder = _make_graph(name="vae_decoder")
         op = builder.op
 
-        latent_sample = builder.input("latent_sample", dtype=ir.DataType.FLOAT, shape=["batch", config.z_dim, "frames", "height", "width"])
+        latent_sample = builder.input(
+            "latent_sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.z_dim, "frames", "height", "width"],
+        )
 
         hidden_states = module.post_quant_conv(op, latent_sample)
         hidden_states = module.decoder(op, hidden_states)

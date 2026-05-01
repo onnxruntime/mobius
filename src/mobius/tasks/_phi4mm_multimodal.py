@@ -87,11 +87,13 @@ class Phi4MMMultiModalTask(ModelTask):
         graph, builder = _make_graph(name="vision_encoder")
 
         pixel_values = builder.input(
-            "pixel_values", dtype=config.dtype,
+            "pixel_values",
+            dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
         image_sizes = builder.input(
-            "image_sizes", dtype=ir.DataType.INT64,
+            "image_sizes",
+            dtype=ir.DataType.INT64,
             shape=[num_images, 2],
         )
 
@@ -118,15 +120,18 @@ class Phi4MMMultiModalTask(ModelTask):
         graph, builder = _make_graph(name="audio_encoder")
 
         audio_embeds = builder.input(
-            "audio_embeds", dtype=config.dtype,
+            "audio_embeds",
+            dtype=config.dtype,
             shape=[batch, audio_seq_len, input_size],
         )
         audio_sizes = builder.input(
-            "audio_sizes", dtype=ir.DataType.INT64,
+            "audio_sizes",
+            dtype=ir.DataType.INT64,
             shape=[num_audio_clips],
         )
         audio_projection_mode = builder.input(
-            "audio_projection_mode", dtype=ir.DataType.INT64,
+            "audio_projection_mode",
+            dtype=ir.DataType.INT64,
             shape=[],
         )
 
@@ -154,15 +159,18 @@ class Phi4MMMultiModalTask(ModelTask):
         graph, builder = _make_graph(name="embedding")
 
         input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64,
+            "input_ids",
+            dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
         image_features = builder.input(
-            "image_features", dtype=config.dtype,
+            "image_features",
+            dtype=config.dtype,
             shape=[num_image_tokens, config.hidden_size],
         )
         audio_features = builder.input(
-            "audio_features", dtype=config.dtype,
+            "audio_features",
+            dtype=config.dtype,
             shape=[num_speech_tokens, config.hidden_size],
         )
 

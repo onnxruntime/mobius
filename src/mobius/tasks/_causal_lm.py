@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal.builder import GraphBuilder
+from onnxscript import GraphBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
@@ -121,7 +120,9 @@ class CausalLMTask(ModelTask):
         # --- Cache setup (static vs dynamic) ---
         if static:
             attention_mask = None
-            position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+            position_ids = builder.input(
+                "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+            )
             past_key_values = _make_static_cache_inputs(
                 builder,
                 config.num_hidden_layers,
@@ -134,9 +135,13 @@ class CausalLMTask(ModelTask):
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
             attention_mask = builder.input(
-                "attention_mask", dtype=ir.DataType.INT64, shape=[batch, "past_seq_len + seq_len"],
+                "attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, "past_seq_len + seq_len"],
             )
-            position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+            position_ids = builder.input(
+                "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+            )
 
             # MLA attention: K/V heads equal q heads (no GQA reduction in
             # latent space).  The ONNX Attention op is called with
@@ -222,9 +227,13 @@ class HybridCausalLMTask(ModelTask):
 
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, "past_seq_len + seq_len"],
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = builder.input("position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         past_key_values = _make_hybrid_cache_inputs(
             builder,
@@ -289,10 +298,14 @@ def _make_static_cache_inputs(
 
     # Shared inputs across all layers
     write_indices = builder.input(
-        "write_indices", dtype=ir.DataType.INT64, shape=[batch],
+        "write_indices",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
     )
     nonpad_kv_seqlen = builder.input(
-        "nonpad_kv_seqlen", dtype=ir.DataType.INT64, shape=[batch],
+        "nonpad_kv_seqlen",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
     )
 
     # Build StaticCacheState for each layer (shared indices)

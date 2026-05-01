@@ -93,16 +93,19 @@ class TTSTask(ModelTask):
         graph, builder = _make_graph(name="talker")
 
         inputs_embeds = builder.input(
-            "inputs_embeds", dtype=config.dtype,
+            "inputs_embeds",
+            dtype=config.dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64,
+            "attention_mask",
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         # MRoPE: 3D position_ids (3, batch, seq_len)
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64,
+            "position_ids",
+            dtype=ir.DataType.INT64,
             shape=[3, batch, seq_len],
         )
 
@@ -165,20 +168,26 @@ class TTSTask(ModelTask):
         # Pre-embedded input in talker_hidden space (constructed by
         # generation loop). The model projects to cp_hidden internally.
         inputs_embeds = builder.input(
-            "inputs_embeds", dtype=config.dtype,
+            "inputs_embeds",
+            dtype=config.dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
         # Step index: selects which lm_head to use (0..14)
         step_index = builder.input(
-            "step_index", dtype=ir.DataType.INT64, shape=[],
+            "step_index",
+            dtype=ir.DataType.INT64,
+            shape=[],
         )
         attention_mask = builder.input(
-            "attention_mask", dtype=ir.DataType.INT64,
+            "attention_mask",
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         # 1D RoPE: 2D position_ids (batch, seq_len)
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len],
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
         past_key_values = _make_kv_cache_inputs(
@@ -221,10 +230,14 @@ class TTSTask(ModelTask):
         graph, builder = _make_graph(name="embedding")
 
         text_ids = builder.input(
-            "text_ids", dtype=ir.DataType.INT64, shape=[batch, text_seq],
+            "text_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, text_seq],
         )
         codec_ids = builder.input(
-            "codec_ids", dtype=ir.DataType.INT64, shape=[batch, codec_seq],
+            "codec_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, codec_seq],
         )
 
         text_embeds, codec_embeds = embedding(
@@ -252,7 +265,9 @@ class TTSTask(ModelTask):
         graph, builder = _make_graph(name="speaker_encoder")
 
         mel_input = builder.input(
-            "mel_input", dtype=config.dtype, shape=[batch, mel_seq, mel_dim],
+            "mel_input",
+            dtype=config.dtype,
+            shape=[batch, mel_seq, mel_dim],
         )
 
         speaker_embedding = speaker_encoder(builder.op, mel_input)

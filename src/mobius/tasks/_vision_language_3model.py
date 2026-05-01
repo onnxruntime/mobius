@@ -82,15 +82,15 @@ class VisionLanguageTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         image_size = (config.vision.image_size if config.vision else None) or 224
 
-        graph, graph_builder = _make_graph(name="vision_encoder")
-        pixel_values = graph_builder.input(
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
-        image_features = vision(graph_builder.op, pixel_values=pixel_values)
+        image_features = vision(builder.op, pixel_values=pixel_values)
 
-        graph_builder.add_output(image_features, "image_features")
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
 
@@ -133,25 +133,25 @@ class QwenVLTask(VisionLanguageTask):
         in_channels = config.vision.in_channels if config.vision else 3
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
-        graph, graph_builder = _make_graph(name="vision_encoder")
-        pixel_values = graph_builder.input(
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
             shape=[total_patches, pixel_dim],
         )
-        image_grid_thw = graph_builder.input(
+        image_grid_thw = builder.input(
             "image_grid_thw",
             dtype=ir.DataType.INT64,
             shape=[num_images, 3],
         )
 
         image_features = vision(
-            graph_builder.op,
+            builder.op,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
 
-        graph_builder.add_output(image_features, "image_features")
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
 
@@ -208,13 +208,13 @@ class PixtralVLTask(VisionLanguageTask):
         height = ir.SymbolicDim("height")
         width = ir.SymbolicDim("width")
 
-        graph, graph_builder = _make_graph(name="vision_encoder")
-        pixel_values = graph_builder.input(
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
             shape=[batch, 3, height, width],
         )
-        op = graph_builder.op
+        op = builder.op
 
         image_features = vision(
             op,
@@ -226,7 +226,7 @@ class PixtralVLTask(VisionLanguageTask):
         # vision encoder always processes one image at a time.
         image_features = op.Squeeze(image_features, [0])
 
-        graph_builder.add_output(image_features, "image_features")
+        builder.add_output(image_features, "image_features")
 
         return _make_model(graph)
 
@@ -285,24 +285,24 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         cross_seq_len = ir.SymbolicDim("cross_sequence_len")
         cross_past_seq_len = ir.SymbolicDim("cross_past_seq_len")
 
-        graph, graph_builder = _make_graph()
-        inputs_embeds = graph_builder.input(
+        graph, builder = _make_graph()
+        inputs_embeds = builder.input(
             "inputs_embeds",
             dtype=config.dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = graph_builder.input(
+        attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = graph_builder.input(
+        position_ids = builder.input(
             "position_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
         # Vision features: full on prefill, empty (0-length) on decode
-        cross_attention_states = graph_builder.input(
+        cross_attention_states = builder.input(
             "cross_attention_states",
             dtype=config.dtype,
             shape=[batch, cross_seq_len, config.hidden_size],
@@ -315,19 +315,19 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
 
         for i in range(config.num_hidden_layers):
             psl = cross_past_seq_len if i in cross_attention_layers else past_seq_len
-            past_key = graph_builder.input(
+            past_key = builder.input(
                 f"past_key_values.{i}.key",
                 dtype=config.dtype,
                 shape=[batch, config.num_key_value_heads, psl, config.head_dim],
             )
-            past_value = graph_builder.input(
+            past_value = builder.input(
                 f"past_key_values.{i}.value",
                 dtype=config.dtype,
                 shape=[batch, config.num_key_value_heads, psl, config.head_dim],
             )
             past_key_values.append((past_key, past_value))
 
-        op = graph_builder.op
+        op = builder.op
 
         logits, present_key_values = decoder(
             op,
@@ -338,7 +338,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
             past_key_values=past_key_values,
         )
 
-        graph_builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(graph_builder, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return _make_model(graph)

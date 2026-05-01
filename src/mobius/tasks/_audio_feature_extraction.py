@@ -31,7 +31,9 @@ class AudioFeatureExtractionTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        input_values = builder.input("input_values", dtype=ir.DataType.FLOAT, shape=["batch", "time"])
+        input_values = builder.input(
+            "input_values", dtype=ir.DataType.FLOAT, shape=["batch", "time"]
+        )
 
         last_hidden_state = module(op, input_values=input_values)
 

@@ -41,7 +41,11 @@ class ObjectDetectionTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        pixel_values = builder.input("pixel_values", dtype=ir.DataType.FLOAT, shape=[batch, num_channels, image_size, image_size])
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, num_channels, image_size, image_size],
+        )
 
         logits, pred_boxes = module(op, pixel_values=pixel_values)
 

@@ -43,7 +43,11 @@ class VAETask(ModelTask):
         graph, builder = _make_graph(name="vae_encoder")
         op = builder.op
 
-        sample = builder.input("sample", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
+        sample = builder.input(
+            "sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.in_channels, "height", "width"],
+        )
 
         hidden_states = module.encoder(op, sample=sample)
         if module.quant_conv is not None:
@@ -61,7 +65,11 @@ class VAETask(ModelTask):
         graph, builder = _make_graph(name="vae_decoder")
         op = builder.op
 
-        latent_sample = builder.input("latent_sample", dtype=ir.DataType.FLOAT, shape=["batch", config.latent_channels, "height", "width"])
+        latent_sample = builder.input(
+            "latent_sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.latent_channels, "height", "width"],
+        )
 
         hidden_states = latent_sample
         if module.post_quant_conv is not None:

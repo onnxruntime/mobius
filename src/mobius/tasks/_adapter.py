@@ -29,10 +29,18 @@ class AdapterTask(ModelTask):
         # Determine input shape based on adapter type
         if hasattr(config, "in_channels"):
             # T2I-Adapter: conditioning image input
-            condition = builder.input("condition", dtype=ir.DataType.FLOAT, shape=["batch", config.in_channels, "height", "width"])
+            condition = builder.input(
+                "condition",
+                dtype=ir.DataType.FLOAT,
+                shape=["batch", config.in_channels, "height", "width"],
+            )
         else:
             # IP-Adapter: image embedding input
-            condition = builder.input("image_embeds", dtype=ir.DataType.FLOAT, shape=["batch", config.image_embed_dim])
+            condition = builder.input(
+                "image_embeds",
+                dtype=ir.DataType.FLOAT,
+                shape=["batch", config.image_embed_dim],
+            )
 
         outputs = module(op, condition)
 

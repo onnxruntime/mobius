@@ -56,11 +56,13 @@ def _build_ssm_task(
     past_states: list[tuple[ir.Value, ir.Value]] = []
     for i in range(config.num_hidden_layers):
         conv_state = builder.input(
-            f"past_states.{i}.conv_state", dtype=config.dtype,
+            f"past_states.{i}.conv_state",
+            dtype=config.dtype,
             shape=[batch, *conv_state_shape],
         )
         ssm_state = builder.input(
-            f"past_states.{i}.ssm_state", dtype=config.dtype,
+            f"past_states.{i}.ssm_state",
+            dtype=config.dtype,
             shape=[batch, *ssm_state_shape],
         )
         past_states.append((conv_state, ssm_state))

@@ -9,8 +9,7 @@ from abc import ABC, abstractmethod
 from typing import ClassVar
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal.builder import GraphBuilder
+from onnxscript import GraphBuilder, nn
 
 import mobius
 from mobius._configs import BaseModelConfig
@@ -108,6 +107,7 @@ def _make_graph(
     """Create an empty graph and its builder.
 
     Inputs should be added after creation via ``builder.input()``.
+    Outputs should be registered via ``builder.add_output()``.
 
     Returns:
         ``(graph, builder)`` — call ``builder.op`` to get the op handle.
