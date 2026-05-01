@@ -195,6 +195,12 @@ class _Mamba2DepthwiseConv1d(nn.Module):
         self.bias = nn.Parameter([channels]) if bias else None
         self._channels = channels
         self._kernel_size = kernel_size
+        self._conv_fn = causal_conv_nd_with_state(
+            kernel_size=kernel_size,
+            channels=channels,
+            ndim=1,
+            activation="silu",
+        )
 
     def forward(
         self,
@@ -221,18 +227,8 @@ class _Mamba2DepthwiseConv1d(nn.Module):
                 op.CastLike(op.Constant(value_float=0.0), self.weight),
                 op.Constant(value_ints=[self._channels]),
             )
-        # Build fresh function per call (function bodies are mutable
-        # and must not be shared across model builds).
-        # Invariant: all layers share the same kernel_size and channels,
-        # so a single CausalConvWithState specialisation suffices per model.
-        conv_fn = causal_conv_nd_with_state(
-            kernel_size=self._kernel_size,
-            channels=self._channels,
-            ndim=1,
-            activation="silu",
-        )
         return op.call(
-            conv_fn,
+            self._conv_fn,
             input_val,
             self.weight,
             conv_bias,
@@ -342,6 +338,15 @@ class Mamba2Block(nn.Module):
         )
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
+        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        self._attn_fn = linear_attention(
+            q_num_heads=num_heads,
+            kv_num_heads=num_heads,
+            update_rule="gated",
+            scale=1.0,
+            stash_type=ir.DataType.FLOAT,
+        )
+
     def forward(
         self,
         op: builder.OpBuilder,
@@ -435,15 +440,8 @@ class Mamba2Block(nn.Module):
         # decay: (B, T, num_heads) — per-head scalar in log-space
         # state: (B, num_heads, d_state, d_head) = (B, H, d_k, d_v)
         ssm_state_f32 = op.Cast(ssm_state, to=ir.DataType.FLOAT)
-        attn_fn = linear_attention(
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
-            update_rule="gated",
-            scale=1.0,
-            stash_type=ir.DataType.FLOAT,
-        )
         la_output, new_ssm_state = op.call(
-            attn_fn,
+            self._attn_fn,
             c_expanded,
             b_expanded,
             value,

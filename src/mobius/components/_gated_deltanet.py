@@ -61,6 +61,12 @@ class _DepthwiseConv1d(nn.Module):
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self._channels = channels
         self._kernel_size = kernel_size
+        self._conv_fn = causal_conv_nd_with_state(
+            kernel_size=kernel_size,
+            channels=channels,
+            ndim=1,
+            activation="silu",
+        )
 
     def forward(
         self,
@@ -85,18 +91,8 @@ class _DepthwiseConv1d(nn.Module):
             op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
-        # Build fresh function per call (function bodies are mutable
-        # and must not be shared across model builds).
-        # Invariant: all layers share the same kernel_size and channels,
-        # so a single CausalConvWithState specialisation suffices per model.
-        conv_fn = causal_conv_nd_with_state(
-            kernel_size=self._kernel_size,
-            channels=self._channels,
-            ndim=1,
-            activation="silu",
-        )
         return op.call(
-            conv_fn,
+            self._conv_fn,
             input_val,
             self.weight,
             conv_bias,
@@ -155,6 +151,15 @@ class GatedDeltaNet(nn.Module):
 
         # Output projection
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
+
+        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        self._attn_fn = linear_attention(
+            q_num_heads=self.num_k_heads,
+            kv_num_heads=self.num_v_heads,
+            update_rule="gated_delta",
+            scale=1.0 / (self.head_k_dim**0.5),
+            stash_type=config.dtype,
+        )
 
     def forward(
         self,
@@ -261,13 +266,7 @@ class GatedDeltaNet(nn.Module):
         # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
-        attn_fn = linear_attention(
-            q_num_heads=self.num_k_heads,
-            kv_num_heads=self.num_v_heads,
-            update_rule="gated_delta",
-            scale=1.0 / (self.head_k_dim**0.5),
-            stash_type=self._dtype,
-        )
+        attn_fn = self._attn_fn
         output_3d, new_recurrent_state = op.call(
             attn_fn,
             query,  # (B, T, num_k_heads * head_k_dim)
