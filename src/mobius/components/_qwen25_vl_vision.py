@@ -143,6 +143,7 @@ class Qwen25VLVisionAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.qkv = Linear(hidden_size, hidden_size * 3, bias=True)
         self.proj = Linear(hidden_size, hidden_size, bias=True)
+        self._pmha_fn = packed_multi_head_attention()
 
     def forward(
         self,
@@ -218,11 +219,9 @@ class Qwen25VLVisionAttention(nn.Module):
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
-        # PackedMultiHeadAttention via op.call (auto-registers function).
-        # Static function — no per-model parameters baked in.
-        pmha_fn = packed_multi_head_attention()
+        # PackedMultiHeadAttention via op.call (auto-registers function)
         attn_out = op.call(
-            pmha_fn,
+            self._pmha_fn,
             query,
             key,
             value,
