@@ -340,19 +340,24 @@ def _extract_rope_config(config) -> RoPEConfig | None:
 
     Returns ``None`` when the source config has no RoPE signal at all —
     i.e. it declares neither the modern ``rope_parameters``/``rope_scaling``
-    fields nor the legacy ``rotary_dim``/``rotary_pct``/``rotary_emb_base``
-    fields. This is the "NoPE" case (e.g. NemotronH, GraniteMoeHybrid,
-    GPT-2 family, BERT family, OPT) — the model does not use rotary
-    position embeddings at all, and callers should treat RoPE as absent
-    rather than manufacturing defaults that would silently introduce RoPE
-    operations into the ONNX graph.
+    fields, nor the legacy ``rotary_dim``/``rotary_pct``/``rotary_emb_base``
+    fields, nor a non-default ``rope_theta``.  This is the "NoPE" case
+    (e.g. NemotronH, GraniteMoeHybrid, GPT-2 family, BERT family, OPT) —
+    the model does not use rotary position embeddings at all, and callers
+    should treat RoPE as absent rather than manufacturing defaults that
+    would silently introduce RoPE operations into the ONNX graph.
 
-    Note: ``rope_theta`` alone is NOT a sufficient RoPE signal because
-    models like NemotronH carry ``rope_theta`` in their config as dead
-    data despite not using RoPE. HuggingFace's ``rope_parameters`` field
-    (populated by ``PretrainedConfig.__post_init__``) is the authoritative
-    modern signal; legacy GPT-J / GPT-NeoX / CodeGen models predate it
-    and use the ``rotary_*`` fields instead.
+    RoPE signal detection:
+      - ``rope_parameters`` / ``rope_scaling``: authoritative modern signal
+        (populated by ``PretrainedConfig.__post_init__``).
+      - ``rotary_dim`` / ``rotary_pct`` / ``rotary_emb_base``: legacy
+        signal used by GPT-J / GPT-NeoX / CodeGen models that predate
+        ``rope_parameters``.
+      - ``rope_theta`` with a non-default value (≠ 10000.0): treated as a
+        RoPE indicator for models like Arctic and Jamba that set a custom
+        ``rope_theta`` without exposing ``rope_scaling``.  The HF default
+        of 10000.0 is excluded via ``math.isclose()`` because NoPE models
+        (e.g. NemotronH) inherit it as dead config data.
     """
     # Check for RoPE signals BEFORE the `or {}` fallback below —
     # `or {}` converts None to empty dict, destroying the absence signal.
