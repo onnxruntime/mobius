@@ -82,7 +82,7 @@ class SpeechToTextTask(ModelTask):
 
         builder.add_output(encoder_hidden_states, "encoder_hidden_states")
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_decoder(
         self,
@@ -134,4 +134,4 @@ class SpeechToTextTask(ModelTask):
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())

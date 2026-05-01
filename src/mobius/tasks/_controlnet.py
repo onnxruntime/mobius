@@ -61,4 +61,6 @@ class ControlNetTask(ModelTask):
             builder.add_output(out, f"down_block_res_{i}")
         builder.add_output(mid_output, "mid_block_res")
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )

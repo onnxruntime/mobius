@@ -78,7 +78,9 @@ def _build_ssm_task(
         builder.add_output(conv_state, f"present.{i}.conv_state")
         builder.add_output(ssm_state, f"present.{i}.ssm_state")
 
-    return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+    return ModelPackage(
+        {"model": _make_model(graph, builder.functions.values())}, config=config
+    )
 
 
 class SSMCausalLMTask(ModelTask):

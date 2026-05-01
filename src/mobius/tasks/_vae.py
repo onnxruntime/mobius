@@ -55,7 +55,7 @@ class VAETask(ModelTask):
 
         builder.add_output(hidden_states, "latent_dist")
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_decoder_graph(
         self,
@@ -78,4 +78,4 @@ class VAETask(ModelTask):
 
         builder.add_output(hidden_states, "sample")
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())

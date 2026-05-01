@@ -188,7 +188,9 @@ class CausalLMTask(ModelTask):
                 present_key_values,
             )
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )
 
 
 class HybridCausalLMTask(ModelTask):
@@ -257,7 +259,7 @@ class HybridCausalLMTask(ModelTask):
             config.layer_types or [],
         )
 
-        model = _make_model(graph, builder)
+        model = _make_model(graph, builder.functions.values())
         return ModelPackage({"model": model}, config=config)
 
 

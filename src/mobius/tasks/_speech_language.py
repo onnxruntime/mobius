@@ -93,4 +93,4 @@ class SpeechLanguageTask(ModelTask):
         audio_features = audio_encoder(builder.op, input_features)
 
         builder.add_output(audio_features, "audio_features")
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())

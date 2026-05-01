@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import ClassVar
 
 import onnx_ir as ir
@@ -124,22 +125,23 @@ def _make_graph(
 
 def _make_model(
     graph: ir.Graph,
-    builder: GraphBuilder | None = None,
+    functions: Iterable[ir.Function] = (),
 ) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata.
 
-    If *builder* is provided, any ``ir.Function`` objects registered via
-    ``op.call()`` are transferred to the model's function table.  This
-    makes manual ``model.functions[...] = fn`` calls unnecessary for
-    functions invoked through ``op.call()``.
+    Args:
+        graph: The graph to wrap in a model.
+        functions: ``ir.Function`` objects to register on the model
+            (e.g. from ``builder.functions.values()``).  Functions
+            already present in the model are not overwritten.
     """
     model = ir.Model(graph, ir_version=11)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
-    if builder is not None:
-        for op_id, fn in builder.functions.items():
-            if op_id not in model.functions:
-                model.functions[op_id] = fn
+    for fn in functions:
+        op_id = fn.identifier()
+        if op_id not in model.functions:
+            model.functions[op_id] = fn
     return model
 
 
@@ -304,10 +306,10 @@ def build_decoder_from_embeds(
             present_key_values,
             config.layer_types or [],
         )
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
     else:
         _register_kv_cache_outputs(builder, present_key_values)
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
 
 def build_embedding_from_features(
@@ -356,4 +358,4 @@ def build_embedding_from_features(
     )
 
     builder.add_output(inputs_embeds, "inputs_embeds")
-    return _make_model(graph, builder)
+    return _make_model(graph, builder.functions.values())

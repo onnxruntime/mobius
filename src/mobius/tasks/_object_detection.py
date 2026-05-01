@@ -52,4 +52,6 @@ class ObjectDetectionTask(ModelTask):
         builder.add_output(logits, "logits")
         builder.add_output(pred_boxes, "pred_boxes")
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )

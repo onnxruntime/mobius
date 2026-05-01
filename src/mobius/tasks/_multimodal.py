@@ -108,4 +108,6 @@ class MultiModalTask(ModelTask):
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )

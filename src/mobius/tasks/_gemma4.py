@@ -157,7 +157,9 @@ class Gemma4TextCausalLMTask(ModelTask):
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )
 
 
 class Gemma4Task(ModelTask):
@@ -270,7 +272,7 @@ class Gemma4Task(ModelTask):
         builder.add_output(logits, "logits")
         _register_kv_cache_outputs(builder, present_key_values)
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_vision(
         self,
@@ -317,7 +319,7 @@ class Gemma4Task(ModelTask):
 
         builder.add_output(image_features, "image_features")
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_audio(
         self,
@@ -371,7 +373,7 @@ class Gemma4Task(ModelTask):
         if downsampled_mask is not None:
             builder.add_output(downsampled_mask, "audio_features_mask")
 
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_embedding(
         self,
@@ -414,4 +416,4 @@ class Gemma4Task(ModelTask):
             audio_features=audio_features_val,
         )
         builder.add_output(inputs_embeds, "inputs_embeds")
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())

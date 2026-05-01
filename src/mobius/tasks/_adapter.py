@@ -50,4 +50,6 @@ class AdapterTask(ModelTask):
         else:
             builder.add_output(outputs, "adapter_output")
 
-        return ModelPackage({"model": _make_model(graph, builder)}, config=config)
+        return ModelPackage(
+            {"model": _make_model(graph, builder.functions.values())}, config=config
+        )

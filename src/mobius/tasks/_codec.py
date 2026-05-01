@@ -71,7 +71,7 @@ class CodecTask(ModelTask):
         waveform = decoder(builder.op, codes)
 
         builder.add_output(waveform, "waveform")
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
 
     def _build_encoder(
         self,
@@ -96,4 +96,4 @@ class CodecTask(ModelTask):
         codes = encoder(builder.op, waveform)
 
         builder.add_output(codes, "codes")
-        return _make_model(graph, builder)
+        return _make_model(graph, builder.functions.values())
