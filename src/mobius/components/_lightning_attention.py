@@ -162,6 +162,10 @@ class LightningAttention(nn.Module):
             value,
             recurrent_state,
             decay,
+            scale=scale,
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
             _outputs=2,
         )
         # attn_out: (B, T, num_heads * head_dim)

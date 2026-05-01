@@ -237,6 +237,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
             self.weight,
             conv_bias,
             conv_state,
+            activation="silu",
             _outputs=2,
         )
 
@@ -448,6 +449,10 @@ class Mamba2Block(nn.Module):
             value,
             ssm_state_f32,
             decay,
+            scale=1.0,
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
             _outputs=2,
         )
         # la_output: (B, T, num_heads * d_head) in f32

@@ -101,6 +101,7 @@ class _DepthwiseConv1d(nn.Module):
             self.weight,
             conv_bias,
             conv_state,
+            activation="silu",
             _outputs=2,
         )
 
@@ -275,6 +276,10 @@ class GatedDeltaNet(nn.Module):
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
             g,  # (B, T, num_v_heads) — decay in log-space
             beta,  # (B, T, num_v_heads) — update rate
+            scale=1.0 / (self.head_k_dim**0.5),
+            q_num_heads=self.num_k_heads,
+            kv_num_heads=self.num_v_heads,
+            update_rule="gated_delta",
             _outputs=2,
         )
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
