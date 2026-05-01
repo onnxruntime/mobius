@@ -323,6 +323,9 @@ def _first_not_none(*values, default=None):
 # TODO: migrate to a registry annotation (uses_rope: bool, rope_theta: float)
 # once the registry schema supports per-model capability flags.
 _IMPLICIT_ROPE_DEFAULTS: dict[str, float] = {
+    # arctic: config JSON has rope_theta=10000 (default) and rope_scaling=null;
+    # no signal triggers _extract_rope_config, but the model uses RoPE.
+    "arctic": 10_000.0,
     # chatglm: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
     # uses default rope_theta=10000.0 hardcoded in modeling code.
     "chatglm": 10_000.0,
