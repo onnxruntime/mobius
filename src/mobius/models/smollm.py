@@ -78,14 +78,17 @@ class SmolLM3TextModel(nn.Module):
             attn_bias = (
                 sliding_attn_bias if layer_type == "sliding_attention" else full_attn_bias
             )
-            # SmolLM3 uses no_rope_layers to gate RoPE per layer:
-            # no_rope_layers[i] == 1 → skip RoPE, 0 → apply RoPE
-            skip_rope = (
-                self.no_rope_layers is not None
-                and i < len(self.no_rope_layers)
-                and self.no_rope_layers[i] == 1
+            # SmolLM3 uses no_rope_layers to gate RoPE per layer.
+            # Despite the name, the HF convention is:
+            #   no_rope_layers[i] == 1 → USE RoPE
+            #   no_rope_layers[i] == 0 → skip RoPE
+            # (HF assigns self.use_rope = config.no_rope_layers[layer_idx])
+            use_rope = (
+                self.no_rope_layers is None
+                or i >= len(self.no_rope_layers)
+                or self.no_rope_layers[i] == 1
             )
-            rope = None if skip_rope else position_embeddings
+            rope = position_embeddings if use_rope else None
 
             hidden_states, present_kv = layer(
                 op,

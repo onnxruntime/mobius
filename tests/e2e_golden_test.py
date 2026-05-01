@@ -155,7 +155,7 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
     "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
     "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
-    "text-generation/smollm3-3b": "SmolLM3 3B decode loop diverges from HF (FP32 precision with 3B params)",
+
     # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
     "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
