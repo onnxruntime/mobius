@@ -1050,3 +1050,29 @@ class TestActivationFallbacks:
         # With gelu_activation=False and no other activation attr,
         # hidden_act should be None (not "gelu")
         assert config.hidden_act is None
+
+
+class TestImplicitRopeDefaults:
+    """Tests for models in _IMPLICIT_ROPE_DEFAULTS."""
+
+    def test_arctic_gets_rope_config(self):
+        """Arctic (rope_theta=10000, rope_scaling=null) should get RoPE."""
+
+        class FakeConfig:
+            model_type = "arctic"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 4096
+            head_dim = 32
+            hidden_act = "silu"
+            # Arctic has rope_theta=10000 (default) and no rope_scaling
+            rope_theta = 10_000.0
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # Arctic must get RoPE via _IMPLICIT_ROPE_DEFAULTS
+        assert config.rope_type == "default"
+        assert config.rope_theta == pytest.approx(10_000.0)

@@ -143,15 +143,16 @@ def _dict_to_pretrained_config(d: dict):
 
     try:
         config = transformers.PretrainedConfig(**d)
-    except (AttributeError, KeyError, TypeError):
+    except (AttributeError, KeyError, TypeError) as e:
         # Newer transformers may crash during rope standardization
         # (e.g. Phi4-MM longrope format where PretrainedConfig doesn't
         # set max_position_embeddings before accessing it).  Strip rope
         # fields, construct the config, then restore them as attributes
         # so _extract_rope_config can still read them.
         logger.debug(
-            "Retrying %s config without rope fields after PretrainedConfig init failure",
+            "Retrying %s config without rope fields after PretrainedConfig init failure: %s",
             d.get("model_type", "unknown"),
+            e,
         )
         saved_rope = {k: d[k] for k in rope_keys if k in d}
         d_clean = {k: v for k, v in d.items() if k not in rope_keys}
