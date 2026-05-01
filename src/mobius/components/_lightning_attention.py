@@ -94,10 +94,8 @@ class LightningAttention(nn.Module):
             layer_idx, config.num_hidden_layers, self.num_heads
         )
 
-        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        # Pre-built ir.Function for LinearAttention (cached at init)
         self._attn_fn = linear_attention(
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
             update_rule="gated",
             scale=1.0 / math.sqrt(self.head_dim),
             stash_type=config.dtype,

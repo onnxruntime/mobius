@@ -152,10 +152,8 @@ class GatedDeltaNet(nn.Module):
         # Output projection
         self.out_proj = Linear(self.value_dim, self.hidden_size, bias=False)
 
-        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        # Pre-built ir.Function for LinearAttention (cached at init)
         self._attn_fn = linear_attention(
-            q_num_heads=self.num_k_heads,
-            kv_num_heads=self.num_v_heads,
             update_rule="gated_delta",
             scale=1.0 / (self.head_k_dim**0.5),
             stash_type=config.dtype,

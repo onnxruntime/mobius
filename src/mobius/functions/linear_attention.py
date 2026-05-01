@@ -45,15 +45,17 @@ DOMAIN = "com.microsoft"
 
 def linear_attention(
     *,
-    q_num_heads: int,
-    kv_num_heads: int,
     update_rule: str = "gated_delta",
     scale: float = 1.0,
     stash_type: ir.DataType = ir.DataType.FLOAT,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
-    Inputs (conditional):
+    Head counts (``q_num_heads``, ``kv_num_heads``) are derived
+    dynamically from tensor shapes inside the function body, so the
+    function definition is independent of model configuration.
+
+    Inputs:
         query:      (B, T, q_num_heads * d_k)
         key:        (B, T, q_num_heads * d_k)
         value:      (B, T, kv_num_heads * d_v)
@@ -65,25 +67,15 @@ def linear_attention(
         output:        (B, T, kv_num_heads * d_v) — attention output (3D)
         present_state: (B, kv_num_heads, d_k, d_v) — updated state
 
+    Callers should pass ONNX attributes as kwargs to ``op.call()``::
+
+        op.call(fn, q, k, v, state, decay, beta,
+                scale=0.5, q_num_heads=8, kv_num_heads=8,
+                update_rule="gated_delta", _outputs=2)
+
     Args:
-        q_num_heads: Number of heads for Q/K (may be fewer than V
-            for GQA).  Matches ``kv_num_heads`` in the standard
-            Attention op (Q/K are the "key-query" pair here).
-        kv_num_heads: Number of heads for V and the output.  Matches
-            ``q_num_heads`` in the standard Attention op (V determines
-            the output head count).
-
-    .. note:: **Naming convention vs standard Attention**
-
-       In standard GQA (``Attention`` op), Q has *more* heads than K/V,
-       so ``q_num_heads >= kv_num_heads``.  In LinearAttention the roles
-       are flipped: Q/K are the *key-query* pair (fewer heads) while V
-       determines the *output* head count (more heads).  The attribute
-       names ``q_num_heads`` and ``kv_num_heads`` therefore map to the
-       *opposite* head counts compared to the standard Attention op.
-       This matches the ONNX LinearAttention op proposal
-       (onnx/onnx#7689) which uses the same naming convention.
         update_rule: One of "linear", "gated", "delta", "gated_delta".
+            Controls which recurrence variant the Scan body implements.
         scale: Scalar multiplier applied to query before the recurrence.
             Per the ONNX LinearAttention op spec, should be set to
             ``1/sqrt(head_dim)`` for correct scaling.
@@ -101,10 +93,6 @@ def linear_attention(
         raise ValueError(
             f"Unknown update_rule: {update_rule!r}. Expected one of {valid_rules}."
         )
-    if q_num_heads <= 0:
-        raise ValueError(f"q_num_heads must be > 0; got {q_num_heads}")
-    if kv_num_heads <= 0:
-        raise ValueError(f"kv_num_heads must be > 0; got {kv_num_heads}")
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
@@ -128,7 +116,16 @@ def linear_attention(
 
     def body(op, query_v, key_v, value_v, past_state_v, decay_v, beta_v):
 
-        # --- Reshape 3D → 4D using head counts ---
+        # --- Derive head counts from tensor shapes ---
+        # past_state: (B, kv_num_heads, d_k, d_v)
+        kv_num_heads_dim = op.Shape(past_state_v, start=1, end=2)  # [kv_num_heads]
+        d_k_dim = op.Shape(past_state_v, start=2, end=3)  # [d_k]
+
+        # q_num_heads = query.shape[2] / d_k
+        q_last_dim = op.Shape(query_v, start=2, end=3)  # [q_num_heads * d_k]
+        q_num_heads_dim = op.Div(q_last_dim, d_k_dim)  # [q_num_heads]
+
+        # --- Reshape 3D → 4D using derived head counts ---
         b_dim = op.Shape(query_v, start=0, end=1)
         t_dim = op.Shape(query_v, start=1, end=2)
 
@@ -137,7 +134,8 @@ def linear_attention(
         qk_4d_shape = op.Concat(
             b_dim,
             t_dim,
-            op.Constant(value_ints=[q_num_heads, -1]),
+            q_num_heads_dim,
+            op.Constant(value_ints=[-1]),
             axis=0,
         )
         query_4d = op.Transpose(
@@ -148,11 +146,11 @@ def linear_attention(
         )  # [B, q_num_heads, T, d_k]
 
         # V: [B, T, kv_num_heads*d_v] → [B, kv_num_heads, T, d_v]
-        # Reuse kv_4d_shape for both V and decay (same [B, T, kv_num_heads, -1]).
         kv_4d_shape = op.Concat(
             b_dim,
             t_dim,
-            op.Constant(value_ints=[kv_num_heads, -1]),
+            kv_num_heads_dim,
+            op.Constant(value_ints=[-1]),
             axis=0,
         )
         value_4d = op.Transpose(
@@ -160,28 +158,24 @@ def linear_attention(
         )  # [B, kv_num_heads, T, d_v]
 
         # --- GQA: expand Q/K heads to match V head count ---
-        if kv_num_heads % q_num_heads != 0:
-            raise ValueError(
-                f"kv_num_heads ({kv_num_heads}) must be divisible by q_num_heads ({q_num_heads})"
-            )
-        gqa_ratio = kv_num_heads // q_num_heads
-        query_expanded, key_expanded = _expand_kv_heads(
-            op, query_4d, key_4d, gqa_ratio=gqa_ratio
+        # Compute ratio dynamically: gqa_ratio = kv_num_heads / q_num_heads
+        query_expanded, key_expanded = _expand_kv_heads_dynamic(
+            op,
+            query_4d,
+            key_4d,
+            q_num_heads_dim=q_num_heads_dim,
+            kv_num_heads_dim=kv_num_heads_dim,
         )
 
         # --- Reshape decay/beta 3D → 4D (only when used) ---
-        # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
-        #     → transpose to (B, kv_num_heads, T, d_k)
         if uses_decay:
             decay_4d = op.Transpose(
                 op.Reshape(decay_v, kv_4d_shape), perm=[0, 2, 1, 3]
             )  # [B, kv_num_heads, T, d_k]
         if uses_beta:
-            # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
             beta_3d = op.Transpose(beta_v, perm=[0, 2, 1])  # [B, kv_num_heads, T]
 
-        # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
-        # CastLike ensures scale constant matches the input dtype.
+        # --- Apply query scale ---
         scaled_query = op.Mul(
             query_expanded,
             op.CastLike(op.Constant(value_float=scale), query_expanded),
@@ -197,24 +191,21 @@ def linear_attention(
 
         scan_inputs = [q_t, k_t, v_t]
         if uses_decay:
-            decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])  # (T, B, H, d_k)
+            decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])
             scan_inputs.append(decay_t)
         if uses_beta:
-            beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])  # (T, B, H)
+            beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])
             scan_inputs.append(beta_t)
 
         present_state_v, output_t = op.Scan(
-            past_state_v,  # carry: (B, H, d_k, d_v)
+            past_state_v,
             *scan_inputs,
             body=scan_body,
             num_scan_inputs=len(scan_inputs),
             _outputs=2,
         )
-        # present_state_v: (B, H, d_k, d_v)
-        # output_t: (T, B, H, d_v)
 
         # --- Reshape output 4D → 3D ---
-        # (T, B, H, d_v) → (B, T, H, d_v) → (B, T, H*d_v)
         output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
         out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
         output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
@@ -234,25 +225,21 @@ def linear_attention(
                 "update_rule",
                 ir.AttributeType.STRING,
                 update_rule,
-                ref_attr_name="update_rule",
             ),
             ir.Attr(
                 "scale",
                 ir.AttributeType.FLOAT,
                 scale,
-                ref_attr_name="scale",
             ),
             ir.Attr(
                 "q_num_heads",
                 ir.AttributeType.INT,
-                q_num_heads,
-                ref_attr_name="q_num_heads",
+                0,
             ),
             ir.Attr(
                 "kv_num_heads",
                 ir.AttributeType.INT,
-                kv_num_heads,
-                ref_attr_name="kv_num_heads",
+                0,
             ),
         ],
         opset_imports={"": OPSET_VERSION},
@@ -388,9 +375,53 @@ def _expand_kv_heads(op, query, key, *, gqa_ratio: int):
     k_tiled = op.Tile(k_5d, repeat_vec)
 
     # Reshape: (B, H_kv, ratio, T, d_k) -> (B, H_kv*ratio, T, d_k)
-    # Extract B, T, d_k from the original 4D query to build the target shape.
-    # We cannot use '0' sentinels because ONNX Reshape copies from the same
-    # positional index, and the 5D→4D dimension mapping doesn't align.
+    b_dim = op.Shape(query, start=0, end=1)
+    t_dim = op.Shape(query, start=2, end=3)
+    dk_dim = op.Shape(query, start=3, end=4)
+    expanded_shape = op.Concat(
+        b_dim,
+        op.Constant(value_ints=[-1]),
+        t_dim,
+        dk_dim,
+        axis=0,
+    )
+    return op.Reshape(q_tiled, expanded_shape), op.Reshape(k_tiled, expanded_shape)
+
+
+def _expand_kv_heads_dynamic(op, query, key, *, q_num_heads_dim, kv_num_heads_dim):
+    """Expand Q/K heads to match V head count for GQA (dynamic ratio).
+
+    Like :func:`_expand_kv_heads` but computes the expansion ratio
+    dynamically from shape tensors, allowing the function body to be
+    independent of specific head counts.
+
+    Args:
+        op: ONNX op builder.
+        query: (B, q_num_heads, T, d_k)
+        key: (B, q_num_heads, T, d_k)
+        q_num_heads_dim: 1-element tensor with q_num_heads value.
+        kv_num_heads_dim: 1-element tensor with kv_num_heads value.
+
+    Returns:
+        query: (B, kv_num_heads, T, d_k)
+        key: (B, kv_num_heads, T, d_k)
+    """
+    # gqa_ratio = kv_num_heads / q_num_heads
+    gqa_ratio = op.Div(kv_num_heads_dim, q_num_heads_dim)  # [ratio]
+
+    # (B, q_num_heads, T, d_k) -> (B, q_num_heads, 1, T, d_k)
+    axes_2 = op.Constant(value_ints=[2])
+    q_5d = op.Unsqueeze(query, axes_2)
+    k_5d = op.Unsqueeze(key, axes_2)
+
+    # Tile along dim 2 by the dynamic ratio
+    ones = op.Constant(value_ints=[1, 1])
+    ones2 = op.Constant(value_ints=[1, 1])
+    repeat_vec = op.Concat(ones, gqa_ratio, ones2, axis=0)  # [1, 1, R, 1, 1]
+    q_tiled = op.Tile(q_5d, repeat_vec)
+    k_tiled = op.Tile(k_5d, repeat_vec)
+
+    # Reshape: (B, q_num_heads, ratio, T, d_k) -> (B, kv_num_heads, T, d_k)
     b_dim = op.Shape(query, start=0, end=1)
     t_dim = op.Shape(query, start=2, end=3)
     dk_dim = op.Shape(query, start=3, end=4)

@@ -338,10 +338,8 @@ class Mamba2Block(nn.Module):
         )
         self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
-        # Pre-built ir.Function for LinearAttention (parametric, cached)
+        # Pre-built ir.Function for LinearAttention (cached at init)
         self._attn_fn = linear_attention(
-            q_num_heads=num_heads,
-            kv_num_heads=num_heads,
             update_rule="gated",
             scale=1.0,
             stash_type=ir.DataType.FLOAT,
