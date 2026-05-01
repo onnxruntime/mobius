@@ -101,7 +101,7 @@ specialized `ir.Function`.
 | Function | Domain | Config parameters |
 |----------|--------|-------------------|
 | `CausalConvWithState` | `com.microsoft` | `kernel_size`, `channels`, `ndim`, `activation` |
-| `LinearAttention` | `com.microsoft` | `update_rule`, `scale`, `stash_type` |
+| `LinearAttention` | `com.microsoft` | `q_num_heads`, `kv_num_heads`, `update_rule`, `scale`, `stash_type` |
 
 Parametric factories require arguments:
 
@@ -246,12 +246,17 @@ To add a new ir.Function factory:
 
 ### 1. Create the function file
 
+The pattern uses `builder.build_function()` which takes a body callback,
+input declarations, and function metadata. Study `causal_conv.py` or
+`linear_attention.py` for real examples.
+
 ```python
 # src/mobius/functions/my_custom_op.py
 from __future__ import annotations
 
 import onnx_ir as ir
 from onnxscript._internal import builder
+
 from mobius._constants import OPSET_VERSION
 
 DOMAIN = "com.microsoft"
@@ -264,26 +269,41 @@ def my_custom_op(*, param1: int, param2: float) -> ir.Function:
         param1: Description of parameter.
         param2: Description of parameter.
     """
-    b = builder.GraphBuilder(OPSET_VERSION)
-    # Define inputs
-    x = b.input("x", ir.DataType.FLOAT, shape=["B", "T", param1])
-    state = b.input("state", ir.DataType.FLOAT, shape=["B", param1])
 
-    # Build the function body using standard ONNX ops
-    op = b.op
-    result = op.Add(x, state)
-    new_state = op.ReduceMean(x, keepdims=False)
+    def body(op, x, state):
+        # Build the function body using standard ONNX ops.
+        # `op` is an OpBuilder — same API as component forward().
+        # `x` and `state` are ir.Value inputs matching the declarations below.
+        result = op.Add(x, state)
+        new_state = op.ReduceMean(x, keepdims=False)
+        result.name = "output"
+        new_state.name = "new_state"
+        return result, new_state
 
-    b.output(result)
-    b.output(new_state)
-
-    return b.create_function(
-        DOMAIN,
-        "MyCustomOp",
-        # Declare attributes the caller can pass
-        attributes={"scale": ir.AttributeType.FLOAT},
+    return builder.build_function(
+        body,
+        # Input declarations — ir.Value with name only (shapes are symbolic)
+        [
+            ir.Value(name="x"),
+            ir.Value(name="state"),
+        ],
+        domain=DOMAIN,
+        name="MyCustomOp",
+        # Declare attributes the caller can pass via op.call() kwargs
+        attributes=[
+            ir.Attr("scale", ir.AttributeType.FLOAT, param2),
+        ],
+        opset_imports={"": OPSET_VERSION},
     )
 ```
+
+**Key API details:**
+- `builder.build_function(body, inputs, domain, name, attributes, opset_imports)`
+  is the actual API — NOT `builder.GraphBuilder()` or `b.create_function()`
+- The `body` callback receives `(op, *input_values)` matching the input list
+- Attributes are declared with `ir.Attr(name, type, default_value)`
+- Config-dependent values (like `param1`) are captured in the closure and
+  baked into the function body
 
 ### 2. Export from `__init__.py`
 
