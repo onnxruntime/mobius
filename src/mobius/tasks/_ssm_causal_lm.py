@@ -156,10 +156,4 @@ class SSM2CausalLMTask(ModelTask):
             # LinearAttention convention: (H, d_k, d_v) = (H, d_state, d_head)
             ssm_state_shape=[config.num_heads, state_size, config.head_dim],
         )
-        # Register CausalConvWithState and LinearAttention function ops.
-        from mobius.tasks._cache_utils import (
-            _register_linear_attention_functions_for_ssm2,
-        )
-
-        _register_linear_attention_functions_for_ssm2(pkg["model"], config)
         return pkg

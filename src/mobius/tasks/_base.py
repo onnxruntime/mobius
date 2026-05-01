@@ -244,7 +244,6 @@ def build_decoder_from_embeds(
         _make_kv_cache_inputs,
         _register_hybrid_cache_outputs,
         _register_kv_cache_outputs,
-        _register_linear_attention_functions,
     )
 
     batch = ir.SymbolicDim("batch")
@@ -305,9 +304,7 @@ def build_decoder_from_embeds(
             present_key_values,
             config.layer_types or [],
         )
-        model = _make_model(graph, builder)
-        _register_linear_attention_functions(model, config)
-        return model
+        return _make_model(graph, builder)
     else:
         _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph, builder)

@@ -21,7 +21,6 @@ from mobius.tasks._cache_utils import (
     _make_kv_cache_inputs,
     _register_hybrid_cache_outputs,
     _register_kv_cache_outputs,
-    _register_linear_attention_functions,
 )
 
 
@@ -259,7 +258,6 @@ class HybridCausalLMTask(ModelTask):
         )
 
         model = _make_model(graph, builder)
-        _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
 
 
