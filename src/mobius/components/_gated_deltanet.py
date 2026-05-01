@@ -87,6 +87,8 @@ class _DepthwiseConv1d(nn.Module):
         )
         # Build fresh function per call (function bodies are mutable
         # and must not be shared across model builds).
+        # Invariant: all layers share the same kernel_size and channels,
+        # so a single CausalConvWithState specialisation suffices per model.
         conv_fn = causal_conv_nd_with_state(
             kernel_size=self._kernel_size,
             channels=self._channels,

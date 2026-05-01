@@ -338,7 +338,10 @@ def _register_linear_attention_functions(
             scale=1.0 / (dims.head_k_dim**0.5),
             stash_type=config.dtype,
         )
-        # Skip if already registered by op.call() auto-registration
+        # Dual registration fallback: op.call() auto-registers functions
+        # in builder._functions (transferred to model via _make_model).
+        # This explicit registration is the fallback for models that
+        # don't yet use op.call() — skip if already present.
         conv_id = conv_func.identifier()
         if conv_id not in model.functions:
             model.functions[conv_id] = conv_func

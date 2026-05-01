@@ -243,6 +243,8 @@ class Qwen3VLVisionAttention(nn.Module):
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
+        # PackedMultiHeadAttention via op.call (auto-registers function).
+        # Static function — no per-model parameters baked in.
         pmha_fn = packed_multi_head_attention()
         attn_output = op.call(
             pmha_fn,
