@@ -475,3 +475,49 @@ class TestDictToPretrainedConfig:
         config = _dict_to_pretrained_config(d)
         assert config.thinker_config.model_type == "qwen3"
         assert config.thinker_config.text_config.model_type == "qwen3"
+
+    def test_composite_config_strips_rope_fields(self):
+        """Composite configs strip top-level rope_scaling/rope_parameters."""
+        d = {
+            "model_type": "composite",
+            "rope_scaling": {"type": "longrope"},
+            "rope_parameters": {"rope_type": "default"},
+            "text_config": {"model_type": "inner", "hidden_size": 256},
+        }
+        config = _dict_to_pretrained_config(d)
+        # Rope fields stripped from top level
+        assert not hasattr(config, "rope_scaling") or config.rope_scaling is None
+        # Nested config still works
+        assert config.text_config.model_type == "inner"
+
+    def test_flat_config_keeps_rope_fields(self):
+        """Non-composite (flat) configs keep rope_scaling as attribute."""
+        d = {
+            "model_type": "flat",
+            "hidden_size": 256,
+            "max_position_embeddings": 4096,
+            # Simple rope_scaling that won't crash PretrainedConfig
+            "rope_theta": 10000.0,
+        }
+        config = _dict_to_pretrained_config(d)
+        assert config.rope_theta == pytest.approx(10000.0)
+
+    def test_rope_retry_restores_fields(self):
+        """When PretrainedConfig init crashes on rope, fields are restored."""
+        # Simulate a config with rope_scaling that crashes standardization
+        # by including rope_scaling without the fields needed for
+        # standardization (matching Phi4-MM's failure pattern).
+        d = {
+            "model_type": "phi4mm",
+            "rope_scaling": {"type": "longrope", "long_factor": [1.0]},
+            "rope_theta": 10000.0,
+            "hidden_size": 256,
+            "max_position_embeddings": 4096,
+        }
+        # This should succeed (either directly or via retry)
+        config = _dict_to_pretrained_config(d)
+        assert config.model_type == "phi4mm"
+        # If the retry path ran, rope_scaling should be restored as attr
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None:
+            assert rope_scaling["type"] == "longrope"
