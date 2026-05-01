@@ -210,6 +210,50 @@ position IDs instead of an explicit mask.
    `op.Cast(to=ir.DataType.FLOAT)`, compute, then cast back with `op.CastLike(result, input)`.
    For dtype-adaptive parameters, use `op.CastLike(param, reference)`.
 
+## Calling custom ONNX functions (`op.call()`)
+
+Some components invoke custom ONNX operators defined as `ir.Function`
+objects — for example, `LinearAttention` and `CausalConvWithState` in
+hybrid recurrent/attention models.
+
+Use `op.call(ir_function, *args, **attr_kwargs)` in `forward()`:
+
+```python
+from mobius.functions import linear_attention
+
+class MyRecurrentLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # Create the ir.Function at init time (parametric)
+        self._attn_fn = linear_attention(
+            update_rule="gated", scale=1.0 / math.sqrt(config.head_dim),
+        )
+
+    def forward(self, op, hidden_states, recurrent_state, decay):
+        output, new_state = op.call(
+            self._attn_fn,
+            query, key, value, recurrent_state, decay,
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.kv_num_heads,
+            update_rule="gated",
+            _outputs=2,   # number of outputs
+        )
+        return output, new_state
+```
+
+**Key points:**
+- `op.call()` auto-registers the function — no manual registration needed
+- Use `_outputs=N` to specify the number of outputs (default 1)
+- Keyword arguments become ONNX attributes on the emitted node
+- Function factories live in `src/mobius/functions/`
+
+**Don't confuse with contrib ops:** `op.MoE(..., _domain="com.microsoft")`
+is a different pattern for ORT contrib ops that have no `ir.Function` body.
+
+> See `.agents/skills/custom-functions/SKILL.md` for the full guide on
+> static vs parametric functions, creating new function factories, and
+> which models use custom functions.
+
 ## ONNX op patterns overview
 
 Key patterns for building components:
@@ -228,6 +272,7 @@ Key patterns for building components:
 
 ## Cross-references
 
+- **Custom ONNX functions:** `.agents/skills/custom-functions/SKILL.md`
 - **Weight name alignment:** `.agents/skills/weight-name-alignment/SKILL.md`
 - **Multimodal components:** `.agents/skills/multimodal-models/SKILL.md`
 - **MoE components:** `.agents/skills/moe-models/SKILL.md`

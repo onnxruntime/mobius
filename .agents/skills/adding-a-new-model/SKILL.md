@@ -155,6 +155,7 @@ Common variations to look for:
 | Vision encoder | Gemma3 | See the **multimodal-models** skill |
 | Gated attention output | Qwen3.5 | Subclass `Attention` with doubled q_proj → Q+gate split |
 | Hybrid layer types | Qwen3.5 | Use `config.layer_types` list to dispatch per-layer |
+| Recurrent layers | SmolLM3, MiniMax | Use `op.call()` with ir.Functions — see **custom-functions** skill |
 | Fused QKV / gate+up | ModernBERT | Split in `preprocess_weights` |
 | Subclass-only (weight rename) | BLIP, TrOCR | Override only `preprocess_weights` |
 
@@ -290,6 +291,67 @@ Quick reference:
 Many models can be registered as aliases of existing classes if the
 architecture matches.
 
+## Example: adding a hybrid model with custom functions
+
+Hybrid models (e.g. Qwen3.5, SmolLM3, NemotronH, MiniMax) interleave
+standard attention layers with recurrent/state-space layers (Mamba2,
+GatedDeltaNet, LightningAttention). These use custom ONNX functions via
+`op.call()`.
+
+### Key steps for hybrid models
+
+1. **Use `config.layer_types`** to dispatch per-layer between attention
+   and recurrent components:
+
+   ```python
+   for i, layer_type in enumerate(config.layer_types):
+       if layer_type == "attention":
+           self.layers.append(AttentionDecoderLayer(config))
+       elif layer_type == "recurrent":
+           self.layers.append(RecurrentLayer(config))
+   ```
+
+2. **Create `ir.Function` objects in component `__init__`** — parametric
+   functions bake config values (kernel size, head counts) into the body:
+
+   ```python
+   from mobius.functions import linear_attention, causal_conv_nd_with_state
+
+   class RecurrentLayer(nn.Module):
+       def __init__(self, config):
+           super().__init__()
+           self._attn_fn = linear_attention(
+               update_rule="gated_delta",
+               scale=1.0 / math.sqrt(config.head_dim),
+           )
+           self._conv_fn = causal_conv_nd_with_state(
+               kernel_size=config.conv_kernel,
+               channels=config.intermediate_size,
+           )
+   ```
+
+3. **Call via `op.call()` in `forward()`** — the function is
+   auto-registered on the model:
+
+   ```python
+   output, new_state = op.call(
+       self._attn_fn, query, key, value, state, decay,
+       q_num_heads=self.num_heads,
+       kv_num_heads=self.kv_num_heads,
+       update_rule="gated_delta",
+       _outputs=2,
+   )
+   ```
+
+4. **Recurrent layers carry state** (conv_state, recurrent_state) instead
+   of KV cache. The task layer handles state I/O.
+
+> See `.agents/skills/custom-functions/SKILL.md` for the full guide on
+> `op.call()`, static vs parametric functions, and all available factories.
+
+Reference models: `models/smollm.py` (Mamba2), `models/minimax.py`
+(LightningAttention), `models/qwen35.py` (GatedDeltaNet).
+
 ## ModelPackage key conventions
 
 Multi-model tasks produce a `ModelPackage` with standardised keys:
@@ -396,6 +458,7 @@ parameters between the loaded model and the safetensors checkpoint.
 
 ## Cross-references
 
+- **[custom-functions](../custom-functions/SKILL.md)** — `op.call()` for ir.Functions, hybrid model patterns
 - **[moe-models](../moe-models/SKILL.md)** — MoE gate variants, expert weight naming
 - **[multimodal-models](../multimodal-models/SKILL.md)** — Vision encoders, projectors, VisionLanguageTask
 - **[diffusion-models](../diffusion-models/SKILL.md)** — UNet, VAE, DiT, Flux, SD3
