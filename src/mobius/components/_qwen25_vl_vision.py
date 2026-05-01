@@ -36,6 +36,7 @@ from mobius.components._scan_utils import (
     create_body_graph,
     rename_subgraph_values,
 )
+from mobius.functions import packed_multi_head_attention
 
 
 class Qwen25VLPatchEmbed(nn.Module):
@@ -217,8 +218,10 @@ class Qwen25VLVisionAttention(nn.Module):
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
-        # Emit PackedMultiHeadAttention
-        attn_out = op.PackedMultiHeadAttention(
+        # Emit PackedMultiHeadAttention via op.call (auto-registers function)
+        pmha_fn = packed_multi_head_attention()
+        attn_out = op.call(
+            pmha_fn,
             query,
             key,
             value,
@@ -226,8 +229,6 @@ class Qwen25VLVisionAttention(nn.Module):
             cu_seqlens_int32,
             num_heads=self.num_heads,
             scale=float(1.0 / math.sqrt(self.head_dim)),
-            _domain="com.microsoft",
-            _outputs=["packed_attn_out"],
         )  # (token_count, hidden_size)
 
         return attn_out

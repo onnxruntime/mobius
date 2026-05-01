@@ -122,11 +122,24 @@ def _make_graph(
     return graph, GraphBuilder(graph)
 
 
-def _make_model(graph: ir.Graph) -> ir.Model:
-    """Create an ``ir.Model`` with standard producer metadata."""
+def _make_model(
+    graph: ir.Graph,
+    builder: GraphBuilder | None = None,
+) -> ir.Model:
+    """Create an ``ir.Model`` with standard producer metadata.
+
+    If *builder* is provided, any ``ir.Function`` objects registered via
+    ``op.call()`` are transferred to the model's function table.  This
+    makes manual ``model.functions[...] = fn`` calls unnecessary for
+    functions invoked through ``op.call()``.
+    """
     model = ir.Model(graph, ir_version=11)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
+    if builder is not None:
+        for op_id, fn in builder.functions.items():
+            if op_id not in model.functions:
+                model.functions[op_id] = fn
     return model
 
 
@@ -292,12 +305,12 @@ def build_decoder_from_embeds(
             present_key_values,
             config.layer_types or [],
         )
-        model = _make_model(graph)
+        model = _make_model(graph, builder)
         _register_linear_attention_functions(model, config)
         return model
     else:
         _register_kv_cache_outputs(builder, present_key_values)
-        return _make_model(graph)
+        return _make_model(graph, builder)
 
 
 def build_embedding_from_features(
@@ -346,4 +359,4 @@ def build_embedding_from_features(
     )
 
     builder.add_output(inputs_embeds, "inputs_embeds")
-    return _make_model(graph)
+    return _make_model(graph, builder)

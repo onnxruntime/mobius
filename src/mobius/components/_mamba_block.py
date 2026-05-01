@@ -26,6 +26,7 @@ from onnxscript._internal import builder
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm
 from mobius.components._ssm import SelectiveScan
+from mobius.functions import causal_conv_nd_with_state, linear_attention
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -193,6 +194,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self.bias = nn.Parameter([channels]) if bias else None
         self._channels = channels
+        self._kernel_size = kernel_size
 
     def forward(
         self,
@@ -219,13 +221,18 @@ class _Mamba2DepthwiseConv1d(nn.Module):
                 op.CastLike(op.Constant(value_float=0.0), self.weight),
                 op.Constant(value_ints=[self._channels]),
             )
-        return op.CausalConvWithState(
+        conv_fn = causal_conv_nd_with_state(
+            kernel_size=self._kernel_size,
+            channels=self._channels,
+            ndim=1,
+            activation="silu",
+        )
+        return op.call(
+            conv_fn,
             input_val,
             self.weight,
             conv_bias,
             conv_state,
-            activation="silu",
-            _domain="com.microsoft",
             _outputs=2,
         )
 
@@ -423,17 +430,20 @@ class Mamba2Block(nn.Module):
         # decay: (B, T, num_heads) — per-head scalar in log-space
         # state: (B, num_heads, d_state, d_head) = (B, H, d_k, d_v)
         ssm_state_f32 = op.Cast(ssm_state, to=ir.DataType.FLOAT)
-        la_output, new_ssm_state = op.LinearAttention(
+        attn_fn = linear_attention(
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
+            scale=1.0,
+            stash_type=ir.DataType.FLOAT,
+        )
+        la_output, new_ssm_state = op.call(
+            attn_fn,
             c_expanded,
             b_expanded,
             value,
             ssm_state_f32,
             decay,
-            scale=1.0,
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
-            update_rule="gated",
-            _domain="com.microsoft",
             _outputs=2,
         )
         # la_output: (B, T, num_heads * d_head) in f32

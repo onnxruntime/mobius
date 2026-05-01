@@ -37,6 +37,7 @@ from onnxscript._internal import builder
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
+from mobius.functions import linear_attention
 
 DOMAIN = "com.microsoft"
 
@@ -147,17 +148,20 @@ class LightningAttention(nn.Module):
         # LinearAttention "gated": S_t = exp(g_t) * S_{t-1} + k_t ⊗ v_t
         # scale = 1/sqrt(head_dim) for proper scaling
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_out, new_state = op.LinearAttention(
+        attn_fn = linear_attention(
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            update_rule="gated",
+            scale=scale,
+            stash_type=self._dtype,
+        )
+        attn_out, new_state = op.call(
+            attn_fn,
             query,
             key,
             value,
             recurrent_state,
             decay,
-            update_rule="gated",
-            q_num_heads=self.num_heads,
-            kv_num_heads=self.num_heads,
-            scale=scale,
-            _domain=DOMAIN,
             _outputs=2,
         )
         # attn_out: (B, T, num_heads * head_dim)

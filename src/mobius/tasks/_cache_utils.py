@@ -338,8 +338,13 @@ def _register_linear_attention_functions(
             scale=1.0 / (dims.head_k_dim**0.5),
             stash_type=config.dtype,
         )
-        model.functions[conv_func.identifier()] = conv_func
-        model.functions[attn_func.identifier()] = attn_func
+        # Skip if already registered by op.call() auto-registration
+        conv_id = conv_func.identifier()
+        if conv_id not in model.functions:
+            model.functions[conv_id] = conv_func
+        attn_id = attn_func.identifier()
+        if attn_id not in model.functions:
+            model.functions[attn_id] = attn_func
 
     if has_lightning:
         head_dim = config.head_dim
@@ -350,7 +355,9 @@ def _register_linear_attention_functions(
             scale=1.0 / (head_dim**0.5),
             stash_type=config.dtype,
         )
-        model.functions[attn_func_gated.identifier()] = attn_func_gated
+        gated_id = attn_func_gated.identifier()
+        if gated_id not in model.functions:
+            model.functions[gated_id] = attn_func_gated
 
     if has_mamba2:
         mamba2_n_heads = getattr(config, "mamba_n_heads", 0)
@@ -378,8 +385,12 @@ def _register_linear_attention_functions(
             scale=1.0,
             stash_type=ir.DataType.FLOAT,
         )
-        model.functions[conv_func.identifier()] = conv_func
-        model.functions[attn_func.identifier()] = attn_func
+        conv_id = conv_func.identifier()
+        if conv_id not in model.functions:
+            model.functions[conv_id] = conv_func
+        attn_id = attn_func.identifier()
+        if attn_id not in model.functions:
+            model.functions[attn_id] = attn_func
 
     model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1
 
@@ -422,6 +433,10 @@ def _register_linear_attention_functions_for_ssm2(
         scale=1.0,
         stash_type=ir.DataType.FLOAT,
     )
-    model.functions[conv_func.identifier()] = conv_func
-    model.functions[attn_func.identifier()] = attn_func
+    conv_id = conv_func.identifier()
+    if conv_id not in model.functions:
+        model.functions[conv_id] = conv_func
+    attn_id = attn_func.identifier()
+    if attn_id not in model.functions:
+        model.functions[attn_id] = attn_func
     model.graph.opset_imports[_FUNCTIONS_DOMAIN] = 1

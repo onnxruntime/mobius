@@ -36,6 +36,7 @@ from onnxscript._internal import builder
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import PostGatedRMSNorm
+from mobius.functions import causal_conv_nd_with_state, linear_attention
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -59,6 +60,7 @@ class _DepthwiseConv1d(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self._channels = channels
+        self._kernel_size = kernel_size
 
     def forward(
         self,
@@ -83,13 +85,20 @@ class _DepthwiseConv1d(nn.Module):
             op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
-        return op.CausalConvWithState(
+        # Build fresh function per call (function bodies are mutable
+        # and must not be shared across model builds).
+        conv_fn = causal_conv_nd_with_state(
+            kernel_size=self._kernel_size,
+            channels=self._channels,
+            ndim=1,
+            activation="silu",
+        )
+        return op.call(
+            conv_fn,
             input_val,
             self.weight,
             conv_bias,
             conv_state,
-            activation="silu",
-            _domain="com.microsoft",
             _outputs=2,
         )
 
@@ -249,17 +258,21 @@ class GatedDeltaNet(nn.Module):
         # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
-        output_3d, new_recurrent_state = op.LinearAttention(
+        attn_fn = linear_attention(
+            q_num_heads=self.num_k_heads,
+            kv_num_heads=self.num_v_heads,
+            update_rule="gated_delta",
+            scale=1.0 / (self.head_k_dim**0.5),
+            stash_type=self._dtype,
+        )
+        output_3d, new_recurrent_state = op.call(
+            attn_fn,
             query,  # (B, T, num_k_heads * head_k_dim)
             key,  # (B, T, num_k_heads * head_k_dim)
             value,  # (B, T, num_v_heads * head_v_dim)
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
-            g,  # (B, T, num_v_heads) — decay in log-space, broadcasts over d_k
+            g,  # (B, T, num_v_heads) — decay in log-space
             beta,  # (B, T, num_v_heads) — update rate
-            scale=1.0 / (self.head_k_dim**0.5),
-            q_num_heads=self.num_k_heads,
-            kv_num_heads=self.num_v_heads,
-            _domain="com.microsoft",
             _outputs=2,
         )
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
