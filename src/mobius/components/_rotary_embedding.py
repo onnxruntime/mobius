@@ -150,9 +150,7 @@ class BaseRope(nn.Module):
         return cos, sin
 
     def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
-        cos, sin = get_rotary_pos_emb(
-            op, position_ids, self.cos_cache, self.sin_cache
-        )
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
         return self._cast_embeddings(op, cos, sin)
 
 
@@ -306,9 +304,7 @@ class LongRope(BaseRope):
             )
             offset = op.Mul(use_long, self.original_max_position_embeddings)
             position_ids = op.Add(position_ids, offset)
-        cos, sin = get_rotary_pos_emb(
-            op, position_ids, self.cos_cache, self.sin_cache
-        )
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
         return self._cast_embeddings(op, cos, sin)
 
 
@@ -394,9 +390,7 @@ class YarnRope(BaseRope):
         self._llama4_original_max_pos = float(original_max_pos)
 
     def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
-        cos, sin = get_rotary_pos_emb(
-            op, position_ids, self.cos_cache, self.sin_cache
-        )
+        cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
         cos, sin = self._cast_embeddings(op, cos, sin)
         if self._llama4_beta is None:
             return cos, sin
