@@ -357,6 +357,14 @@ def _gemma4_postprocess(
     global_head_dim = metadata.get(f"{arch}.attention.key_length")
     if swa_head_dim is not None:
         config = dataclasses.replace(config, head_dim=int(swa_head_dim))
+    elif global_head_dim is not None:
+        logger.warning(
+            "GGUF file missing non-standard key '%s.attention.key_length_swa'. "
+            "Using global head_dim (%d) for sliding-window layers — "
+            "this may be incorrect for Gemma4.",
+            arch,
+            int(global_head_dim),
+        )
 
     # --- Dual RoPE theta ---
     # Base extractor sets rope_theta from rope.freq_base (global, 1M).
@@ -365,6 +373,14 @@ def _gemma4_postprocess(
     global_rope_theta = metadata.get(f"{arch}.rope.freq_base")
     if swa_rope_theta is not None:
         config = dataclasses.replace(config, rope_theta=float(swa_rope_theta))
+    elif global_rope_theta is not None:
+        logger.warning(
+            "GGUF file missing non-standard key '%s.rope.freq_base_swa'. "
+            "Using global rope_theta (%.1f) for sliding-window layers — "
+            "this may be incorrect for Gemma4.",
+            arch,
+            float(global_rope_theta),
+        )
 
     # --- Partial rotary factor ---
     # Global layers use partial rotation: rotary_dim / global_head_dim.
@@ -372,6 +388,8 @@ def _gemma4_postprocess(
     # but the actual HF partial_rotary_factor is 0.25, meaning only 128
     # of 512 dims are rotated.  This isn't directly in GGUF metadata,
     # so use the known Gemma4 default.
+    # Source: HF Gemma4Config.global_partial_rotary_factor default value
+    # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/configuration_gemma4.py
     global_partial_rotary_factor = 0.25
 
     # SWA layers use full rotation (partial_rotary_factor = 1.0), which
