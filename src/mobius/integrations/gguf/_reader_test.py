@@ -142,6 +142,168 @@ def tied_gguf(tmp_path: Path) -> Path:
     return path
 
 
+def _write_gemma4_test_gguf(
+    path: Path,
+    hidden_size: int = 64,
+    num_layers: int = 6,
+    num_heads: int = 4,
+    num_kv_heads_sliding: int = 2,
+    num_kv_heads_full: int = 2,
+    intermediate_size: int = 128,
+    vocab_size: int = 256,
+    context_length: int = 512,
+    sliding_window: int = 128,
+    global_head_dim: int = 32,
+    swa_head_dim: int = 16,
+    global_rope_theta: float = 1_000_000.0,
+    swa_rope_theta: float = 10_000.0,
+    final_logit_softcapping: float = 30.0,
+    num_kv_shared_layers: int = 0,
+    hidden_size_per_layer_input: int = 0,
+) -> None:
+    """Write a minimal Gemma4 GGUF file for testing.
+
+    Creates a syntactically valid GGUF with Gemma4-specific metadata:
+    dual head_dim, dual RoPE theta, sliding_window_pattern, softcapping,
+    and per-layer KV head counts.
+    """
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "gemma4")
+
+    # Core metadata
+    writer.add_context_length(context_length)
+    writer.add_embedding_length(hidden_size)
+    writer.add_feed_forward_length(intermediate_size)
+    writer.add_block_count(num_layers)
+    writer.add_head_count(num_heads)
+    writer.add_vocab_size(vocab_size)
+
+    # Per-layer KV head counts: sliding layers get more, full layers get fewer.
+    # Pattern: every 3rd layer (0-indexed: 2, 5, ...) is full_attention.
+    sliding_pattern = [(i + 1) % 3 != 0 for i in range(num_layers)]
+    kv_heads_per_layer = [
+        num_kv_heads_sliding if is_sliding else num_kv_heads_full
+        for is_sliding in sliding_pattern
+    ]
+    writer.add_head_count_kv(kv_heads_per_layer)
+    writer.add_sliding_window_pattern(sliding_pattern)
+
+    # Dual head_dim
+    writer.add_key_length(global_head_dim)
+    # key_length_swa is a non-standard extension — write it as a raw key
+    writer.add_uint32("gemma4.attention.key_length_swa", swa_head_dim)
+
+    # Dual RoPE theta
+    writer.add_rope_freq_base(global_rope_theta)
+    writer.add_rope_freq_base_swa(swa_rope_theta)
+    writer.add_rope_dimension_count(global_head_dim)
+
+    # Gemma4-specific metadata
+    writer.add_sliding_window(sliding_window)
+    writer.add_final_logit_softcapping(final_logit_softcapping)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_shared_kv_layers(num_kv_shared_layers)
+    writer.add_embedding_length_per_layer_input(hidden_size_per_layer_input)
+
+    # Tensors
+    # token_embd.weight: (vocab_size, hidden_size)
+    writer.add_tensor(
+        "token_embd.weight",
+        np.random.randn(vocab_size, hidden_size).astype(np.float32),
+    )
+
+    for i in range(num_layers):
+        is_sliding = sliding_pattern[i]
+        head_dim = swa_head_dim if is_sliding else global_head_dim
+        kv_heads = num_kv_heads_sliding if is_sliding else num_kv_heads_full
+
+        writer.add_tensor(
+            f"blk.{i}.attn_q.weight",
+            np.random.randn(num_heads * head_dim, hidden_size).astype(np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.attn_k.weight",
+            np.random.randn(kv_heads * head_dim, hidden_size).astype(np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.attn_v.weight",
+            np.random.randn(kv_heads * head_dim, hidden_size).astype(np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.attn_output.weight",
+            np.random.randn(hidden_size, num_heads * head_dim).astype(np.float32),
+        )
+        # Q/K norms (per-head)
+        writer.add_tensor(
+            f"blk.{i}.attn_q_norm.weight",
+            np.ones(head_dim, dtype=np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.attn_k_norm.weight",
+            np.ones(head_dim, dtype=np.float32),
+        )
+        # MLP weights
+        writer.add_tensor(
+            f"blk.{i}.ffn_gate.weight",
+            np.random.randn(intermediate_size, hidden_size).astype(np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.ffn_up.weight",
+            np.random.randn(intermediate_size, hidden_size).astype(np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.ffn_down.weight",
+            np.random.randn(hidden_size, intermediate_size).astype(np.float32),
+        )
+        # Norm weights (Gemma4 has 4 norms per layer)
+        writer.add_tensor(
+            f"blk.{i}.attn_norm.weight",
+            np.ones(hidden_size, dtype=np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.post_attention_norm.weight",
+            np.ones(hidden_size, dtype=np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.ffn_norm.weight",
+            np.ones(hidden_size, dtype=np.float32),
+        )
+        writer.add_tensor(
+            f"blk.{i}.post_ffw_norm.weight",
+            np.ones(hidden_size, dtype=np.float32),
+        )
+        # Layer scalar
+        writer.add_tensor(
+            f"blk.{i}.layer_output_scale.weight",
+            np.ones(1, dtype=np.float32),
+        )
+
+    # Output norm
+    writer.add_tensor(
+        "output_norm.weight",
+        np.ones(hidden_size, dtype=np.float32),
+    )
+    # Output (lm_head)
+    writer.add_tensor(
+        "output.weight",
+        np.random.randn(vocab_size, hidden_size).astype(np.float32),
+    )
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+@pytest.fixture
+def gemma4_gguf(tmp_path: Path) -> Path:
+    """Create a minimal Gemma4 GGUF file for testing."""
+    path = tmp_path / "test_gemma4.gguf"
+    _write_gemma4_test_gguf(path)
+    return path
+
+
 class TestGGUFModelReader:
     """Tests for GGUFModel reading and metadata extraction."""
 
@@ -318,6 +480,109 @@ class TestConfigMapping:
             gguf_to_config(model)
 
 
+class TestGemma4ConfigMapping:
+    """Tests for Gemma4-specific GGUF → Gemma4Config extraction."""
+
+    def test_gemma4_maps_to_text_model_type(self):
+        assert GGUF_ARCH_TO_MODEL_TYPE["gemma4"] == "gemma4_text"
+
+    def test_gemma4_returns_gemma4_config(self, gemma4_gguf: Path):
+        from mobius._configs import Gemma4Config
+
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert isinstance(config, Gemma4Config)
+        assert config.model_type == "gemma4_text"
+
+    def test_gemma4_dual_head_dim(self, gemma4_gguf: Path):
+        """head_dim should be the SWA value; global_head_dim the full value."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.head_dim == 16  # SWA head_dim
+        assert config.global_head_dim == 32  # global head_dim
+
+    def test_gemma4_dual_rope_theta(self, gemma4_gguf: Path):
+        """rope_theta should be the SWA value; global_rope_theta the full value."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.rope_theta == pytest.approx(10_000.0)  # SWA
+        assert config.global_rope_theta == pytest.approx(1_000_000.0)  # global
+
+    def test_gemma4_layer_types(self, gemma4_gguf: Path):
+        """sliding_window_pattern bool[] → layer_types str[]."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        # 6 layers, every 3rd (idx 2, 5) is full_attention
+        assert config.layer_types == [
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+
+    def test_gemma4_sliding_window(self, gemma4_gguf: Path):
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.sliding_window == 128
+
+    def test_gemma4_softcapping(self, gemma4_gguf: Path):
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.final_logit_softcapping == pytest.approx(30.0)
+        # attn_logit_softcapping not set in test fixture → defaults to 0.0
+        assert config.attn_logit_softcapping == pytest.approx(0.0)
+
+    def test_gemma4_kv_shared_layers(self, gemma4_gguf: Path):
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.num_kv_shared_layers == 0
+
+    def test_gemma4_per_layer_input(self, gemma4_gguf: Path):
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        # hidden_size_per_layer_input=0 → vocab_size_per_layer_input=0
+        assert config.hidden_size_per_layer_input == 0
+        assert config.vocab_size_per_layer_input == 0
+
+    def test_gemma4_per_layer_kv_heads_uses_majority(self, tmp_path: Path):
+        """Per-layer KV head array should collapse to the majority value."""
+        path = tmp_path / "gemma4_mixed_kv.gguf"
+        _write_gemma4_test_gguf(path, num_kv_heads_full=1)
+        model = GGUFModel(path)
+        config = gguf_to_config(model)
+        # 4 sliding layers with 2 kv_heads, 2 full layers with 1 → majority is 2
+        assert config.num_key_value_heads == 2
+
+    def test_gemma4_partial_rotary_factor(self, gemma4_gguf: Path):
+        """Base partial_rotary_factor should be 1.0 (full rotation for SWA)."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.partial_rotary_factor == pytest.approx(1.0)
+        assert config.global_partial_rotary_factor == pytest.approx(0.25)
+
+    def test_gemma4_basic_fields(self, gemma4_gguf: Path):
+        """Verify basic fields are correctly extracted."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        assert config.hidden_size == 64
+        assert config.intermediate_size == 128
+        assert config.num_hidden_layers == 6
+        assert config.num_attention_heads == 4
+        assert config.vocab_size == 256
+        assert config.rms_norm_eps == pytest.approx(1e-6)
+
+    def test_gemma4_per_layer_input_enables_vocab(self, tmp_path: Path):
+        """When hidden_size_per_layer_input > 0, vocab_size_per_layer_input = vocab_size."""
+        path = tmp_path / "gemma4_pli.gguf"
+        _write_gemma4_test_gguf(path, hidden_size_per_layer_input=16)
+        model = GGUFModel(path)
+        config = gguf_to_config(model)
+        assert config.hidden_size_per_layer_input == 16
+        assert config.vocab_size_per_layer_input == 256  # = vocab_size
+
+
 class TestBuildFromGguf:
     """Tests for the build_from_gguf pipeline (integration)."""
 
@@ -344,5 +609,14 @@ class TestBuildFromGguf:
         pkg = build_from_gguf(llama_gguf)
         assert "model" in pkg
         # Check the model has a graph
+        model = pkg["model"]
+        assert model.graph is not None
+
+    def test_build_gemma4_from_gguf(self, gemma4_gguf: Path):
+        """Build a Gemma4 text model from GGUF and verify the graph."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        pkg = build_from_gguf(gemma4_gguf)
+        assert "model" in pkg
         model = pkg["model"]
         assert model.graph is not None
