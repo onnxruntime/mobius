@@ -925,6 +925,11 @@ class Gemma4DecoderLayer(nn.Module):
     def __init__(self, config: Gemma4Config, layer_idx: int):
         super().__init__()
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                f"Gemma4Config.layer_types length ({len(layer_types)}) "
+                f"must match num_hidden_layers ({config.num_hidden_layers})"
+            )
         first_kv_shared = config.num_hidden_layers - config.num_kv_shared_layers
         layer_type = layer_types[layer_idx]
         is_full = layer_type == "full_attention"

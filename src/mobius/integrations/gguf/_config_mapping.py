@@ -402,6 +402,13 @@ def _gemma4_postprocess(
     sliding_pattern = metadata.get(f"{arch}.attention.sliding_window_pattern")
     layer_types: list[str] | None = None
     if sliding_pattern is not None:
+        if len(sliding_pattern) != config.num_hidden_layers:
+            raise ValueError(
+                f"GGUF metadata length mismatch: "
+                f"attention.sliding_window_pattern has "
+                f"{len(sliding_pattern)} entries but "
+                f"num_hidden_layers is {config.num_hidden_layers}."
+            )
         layer_types = [
             "sliding_attention" if is_sliding else "full_attention"
             for is_sliding in sliding_pattern
@@ -430,6 +437,14 @@ def _gemma4_postprocess(
     num_global_key_value_heads: int | None = None
     raw_kv_heads = metadata.get(f"{arch}.attention.head_count_kv")
     if isinstance(raw_kv_heads, (list, np.ndarray)) and sliding_pattern is not None:
+        if len(raw_kv_heads) != len(sliding_pattern):
+            raise ValueError(
+                f"GGUF metadata length mismatch: "
+                f"attention.head_count_kv has {len(raw_kv_heads)} entries "
+                f"but attention.sliding_window_pattern has "
+                f"{len(sliding_pattern)} entries. "
+                f"Both must equal num_hidden_layers."
+            )
         full_kv_heads = {
             int(raw_kv_heads[i])
             for i, is_sliding in enumerate(sliding_pattern)
