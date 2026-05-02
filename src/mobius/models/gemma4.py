@@ -591,9 +591,17 @@ class Gemma4TextAttention(nn.Module):
     ):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = head_dim
         self.scaling = 1.0
+
+        # Full-attention layers may use fewer KV heads than sliding layers
+        # (HF: attention_k_eq_v + num_global_key_value_heads).
+        layer_type = layer_types[layer_idx]
+        is_full = layer_type == "full_attention"
+        if is_full and config.num_global_key_value_heads is not None:
+            self.num_key_value_heads = config.num_global_key_value_heads
+        else:
+            self.num_key_value_heads = config.num_key_value_heads
         # attn_logit_softcapping maps directly to the ONNX Attention op's
         # native ``softcap`` attribute (opset 24). No manual Tanh/scale ops needed.
         self.softcap = config.attn_logit_softcapping
@@ -633,10 +641,10 @@ class Gemma4TextAttention(nn.Module):
         # KV-shared layers borrow K,V — no projections needed
         if not self.is_kv_shared_layer:
             self.k_proj = Linear(
-                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
+                config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
             self.v_proj = Linear(
-                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
+                config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 

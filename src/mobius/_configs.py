@@ -1741,6 +1741,10 @@ class Gemma4Config(VisionLanguageConfig):
       (1_000_000 for Gemma4).
     - ``global_partial_rotary_factor``: fraction of head_dim to rotate for
       global attention (0.25, so rotary_dim = 512 * 0.25 = 128).
+    - ``num_global_key_value_heads``: KV head count for full-attention layers
+      (4 for Gemma4 31B).  When ``None``, all layers use
+      ``num_key_value_heads``.  HF calls this ``num_global_key_value_heads``
+      and gates it behind ``attention_k_eq_v``.
     - ``hidden_size_per_layer_input``: per-layer input gating dimension
       (256 for Gemma4); 0 disables per-layer input entirely.
     - ``vocab_size_per_layer_input``: vocabulary size for per-layer embeddings.
@@ -1762,6 +1766,7 @@ class Gemma4Config(VisionLanguageConfig):
     global_head_dim: int | None = None
     global_rope_theta: float = 1_000_000.0
     global_partial_rotary_factor: float = 0.25
+    num_global_key_value_heads: int | None = None
     hidden_size_per_layer_input: int = 0
     vocab_size_per_layer_input: int = 0
     num_kv_shared_layers: int = 0
@@ -1818,11 +1823,18 @@ class Gemma4Config(VisionLanguageConfig):
             # Override with the correct sliding-attention theta (e.g. 10_000 for E2B/E4B).
             base = dataclasses.replace(base, rope_theta=float(sliding_rope["rope_theta"]))
 
+        # num_global_key_value_heads: only set when attention_k_eq_v is True
+        # (full-attention layers use fewer KV heads than sliding layers).
+        num_global_kv = None
+        if getattr(config, "attention_k_eq_v", False):
+            num_global_kv = getattr(config, "num_global_key_value_heads", None)
+
         return cls(
             **_shallow_fields(base),
             global_head_dim=getattr(config, "global_head_dim", None),
             global_rope_theta=float(full_rope.get("rope_theta", 1_000_000.0)),
             global_partial_rotary_factor=float(full_rope.get("partial_rotary_factor", 0.25)),
+            num_global_key_value_heads=num_global_kv,
             hidden_size_per_layer_input=int(
                 getattr(config, "hidden_size_per_layer_input", 0) or 0
             ),

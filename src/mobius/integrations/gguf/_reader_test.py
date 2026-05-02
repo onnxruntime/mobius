@@ -582,6 +582,24 @@ class TestGemma4ConfigMapping:
         assert config.hidden_size_per_layer_input == 16
         assert config.vocab_size_per_layer_input == 256  # = vocab_size
 
+    def test_gemma4_global_kv_heads_from_mixed_array(self, tmp_path: Path):
+        """When GGUF has mixed per-layer KV heads, extract num_global_key_value_heads."""
+        path = tmp_path / "gemma4_mixed_kv.gguf"
+        _write_gemma4_test_gguf(path, num_kv_heads_full=1)
+        model = GGUFModel(path)
+        config = gguf_to_config(model)
+        # Sliding layers have 2 KV heads, full layers have 1
+        assert config.num_key_value_heads == 2  # majority (sliding)
+        assert config.num_global_key_value_heads == 1  # minority (full)
+
+    def test_gemma4_uniform_kv_heads_no_global(self, gemma4_gguf: Path):
+        """When all layers have the same KV heads, num_global_key_value_heads is None."""
+        model = GGUFModel(gemma4_gguf)
+        config = gguf_to_config(model)
+        # Default fixture has uniform KV heads (2 for all layers)
+        assert config.num_key_value_heads == 2
+        assert config.num_global_key_value_heads is None
+
 
 class TestBuildFromGguf:
     """Tests for the build_from_gguf pipeline (integration)."""

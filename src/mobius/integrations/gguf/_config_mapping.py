@@ -405,6 +405,23 @@ def _gemma4_postprocess(
     # --- Per-layer input gating ---
     hidden_size_per_layer_input = metadata.get(f"{arch}.embedding_length_per_layer_input")
 
+    # --- Per-layer KV heads (num_global_key_value_heads) ---
+    # GGUF stores per-layer KV head counts as an array.  When full-attention
+    # layers use fewer KV heads than sliding layers, extract the minority
+    # value as num_global_key_value_heads.
+    num_global_key_value_heads: int | None = None
+    raw_kv_heads = metadata.get(f"{arch}.attention.head_count_kv")
+    if isinstance(raw_kv_heads, (list, np.ndarray)) and sliding_pattern is not None:
+        full_kv_heads = {
+            int(raw_kv_heads[i])
+            for i, is_sliding in enumerate(sliding_pattern)
+            if not is_sliding
+        }
+        if len(full_kv_heads) == 1:
+            global_kv = full_kv_heads.pop()
+            if global_kv != config.num_key_value_heads:
+                num_global_key_value_heads = global_kv
+
     return Gemma4Config(
         # Inherit all base ArchitectureConfig fields
         **{f.name: getattr(config, f.name) for f in dataclasses.fields(ArchitectureConfig)},
@@ -414,6 +431,7 @@ def _gemma4_postprocess(
         if global_rope_theta is not None
         else 1_000_000.0,
         global_partial_rotary_factor=global_partial_rotary_factor,
+        num_global_key_value_heads=num_global_key_value_heads,
         final_logit_softcapping=float(final_logit_softcapping or 0.0),
         attn_logit_softcapping=float(attn_logit_softcapping or 0.0),
         num_kv_shared_layers=int(num_kv_shared_layers)
