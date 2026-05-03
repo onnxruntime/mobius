@@ -38,7 +38,7 @@ Usage::
     python examples/qwen3_asr.py --model Qwen/Qwen3-ASR-1.7B
 
     # GPU inference with half precision
-    python examples/qwen3_asr.py --device cuda --dtype fp16
+    python examples/qwen3_asr.py --device cuda --dtype f16
 
     # Disable streaming output
     python examples/qwen3_asr.py --no-stream
@@ -577,9 +577,9 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        default="fp32",
-        choices=["fp32", "fp16"],
-        help="Model precision (default: fp32).",
+        default="f32",
+        choices=["f32", "f16", "bf16"],
+        help="Model precision (default: f32).",
     )
     parser.add_argument(
         "--no-stream",
@@ -617,13 +617,9 @@ def main():
         parser.error(f"Unknown language {args.language!r}. Supported: auto, {supported}")
     forced_language = LANGUAGE_MAP[lang_key]  # Empty string for "auto"
 
-    # Map dtype flag to mobius dtype string
-    dtype_map = {"fp32": "f32", "fp16": "f16"}
-    dtype = dtype_map[args.dtype]
-
     # Build the 3 ONNX models (auto-detected from model_type)
     print(f"Building ONNX models from {args.model!r} (dtype={args.dtype}) ...")
-    pkg = build(args.model, dtype=dtype, load_weights=not args.save_to)
+    pkg = build(args.model, dtype=args.dtype, load_weights=not args.save_to)
     config = pkg.config
 
     if args.save_to:
