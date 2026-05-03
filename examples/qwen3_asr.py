@@ -475,7 +475,9 @@ def transcribe(
 
     # Decode loop: feed each new token back through embedding + decoder
     eos_ids = {151643, 151645}  # <|endoftext|>, <|im_end|>
-    streaming = False  # Start streaming after <asr_text>
+    # When language is forced, <asr_text> is already in the prefill prompt,
+    # so the streaming gate should be open immediately.
+    streaming = bool(language)
     for _ in range(max_new_tokens - 1):
         if next_token in eos_ids:
             break
