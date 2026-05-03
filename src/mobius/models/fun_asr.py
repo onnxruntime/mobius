@@ -318,7 +318,7 @@ class FunASREmbeddingModel(nn.Module):
         self.audio_adaptor = FunASRAudioAdaptor(config)
 
         audio = config.audio
-        audio_token_id = audio.audio_token_id if audio else 151676
+        audio_token_id = (audio.audio_token_id if audio else None) or 151676
         self._audio_token_id = audio_token_id
         self._llm_hidden_size = config.hidden_size
 

@@ -305,6 +305,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
             kernel_size=enc.get("kernel_size", 11),
             tp_num_blocks=enc.get("tp_blocks", 20),
             output_dim=enc.get("output_size", 512),
+            audio_token_id=151676,  # <|audio_pad|> token ID
             adaptor_proj_dim=adaptor.get("ffn_dim", 2048),
             adaptor_num_blocks=adaptor.get("n_layer", 2),
             adaptor_ffn_dim=256,  # FFN hidden dim inside adaptor blocks (from weights)
