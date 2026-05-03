@@ -54,6 +54,7 @@ import sys
 import threading
 
 import numpy as np
+import ml_dtypes  # noqa: F401 — registers bfloat16 with numpy
 import transformers
 
 from mobius import build
@@ -656,7 +657,7 @@ def main():
     stream = not args.no_stream
 
     # Map mobius dtype string to numpy dtype for inference arrays
-    np_dtype_map = {"f32": np.float32, "f16": np.float16, "bf16": np.float32}
+    np_dtype_map = {"f32": np.float32, "f16": np.float16, "bf16": ml_dtypes.bfloat16}
     # Note: bf16 uses float32 for numpy arrays since numpy lacks bfloat16;
     # ORT handles the actual bf16 computation internally.
     np_dtype = np_dtype_map[args.dtype]
