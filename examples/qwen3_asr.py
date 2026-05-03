@@ -32,6 +32,8 @@ Usage::
     python examples/qwen3_asr.py --language yue          # Cantonese / 粤语
     python examples/qwen3_asr.py --language en           # English
     python examples/qwen3_asr.py --language ja           # Japanese
+    python examples/qwen3_asr.py --language dongbei      # Dongbei dialect / 东北话
+    python examples/qwen3_asr.py --language 四川话        # Sichuan dialect
 
     # Use a different model size
     python examples/qwen3_asr.py --model Qwen/Qwen3-ASR-1.7B
@@ -85,41 +87,208 @@ NEWLINE_ID = 198  # "\n"
 # Keys are CLI aliases; values are the language names used in the model's
 # "language <NAME><asr_text>" generation prefix.
 # 语言/方言映射：键为命令行别名，值为模型使用的语言名称。
+#
+# Supports 30 languages + 22 Chinese dialects.
 LANGUAGE_MAP: dict[str, str] = {
     # Auto-detect (default: model decides the language)
     "auto": "",
-    # Mandarin / 普通话
+    # --- Languages (30) ---
+    # Chinese / 中文 / 普通话
     "zh": "Chinese",
     "chinese": "Chinese",
     "mandarin": "Chinese",
     "普通话": "Chinese",
+    "中文": "Chinese",
+    # English / 英语
+    "en": "English",
+    "english": "English",
+    "英语": "English",
+    # Japanese / 日语
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "日语": "Japanese",
+    # Korean / 韩语
+    "ko": "Korean",
+    "korean": "Korean",
+    "韩语": "Korean",
+    # Arabic / 阿拉伯语
+    "ar": "Arabic",
+    "arabic": "Arabic",
+    "阿拉伯语": "Arabic",
+    # German / 德语
+    "de": "German",
+    "german": "German",
+    "德语": "German",
+    # French / 法语
+    "fr": "French",
+    "french": "French",
+    "法语": "French",
+    # Spanish / 西班牙语
+    "es": "Spanish",
+    "spanish": "Spanish",
+    "西班牙语": "Spanish",
+    # Portuguese / 葡萄牙语
+    "pt": "Portuguese",
+    "portuguese": "Portuguese",
+    "葡萄牙语": "Portuguese",
+    # Indonesian / 印尼语
+    "id": "Indonesian",
+    "indonesian": "Indonesian",
+    "印尼语": "Indonesian",
+    # Italian / 意大利语
+    "it": "Italian",
+    "italian": "Italian",
+    "意大利语": "Italian",
+    # Russian / 俄语
+    "ru": "Russian",
+    "russian": "Russian",
+    "俄语": "Russian",
+    # Thai / 泰语
+    "th": "Thai",
+    "thai": "Thai",
+    "泰语": "Thai",
+    # Vietnamese / 越南语
+    "vi": "Vietnamese",
+    "vietnamese": "Vietnamese",
+    "越南语": "Vietnamese",
+    # Turkish / 土耳其语
+    "tr": "Turkish",
+    "turkish": "Turkish",
+    "土耳其语": "Turkish",
+    # Hindi / 印地语
+    "hi": "Hindi",
+    "hindi": "Hindi",
+    "印地语": "Hindi",
+    # Malay / 马来语
+    "ms": "Malay",
+    "malay": "Malay",
+    "马来语": "Malay",
+    # Dutch / 荷兰语
+    "nl": "Dutch",
+    "dutch": "Dutch",
+    "荷兰语": "Dutch",
+    # Swedish / 瑞典语
+    "sv": "Swedish",
+    "swedish": "Swedish",
+    "瑞典语": "Swedish",
+    # Danish / 丹麦语
+    "da": "Danish",
+    "danish": "Danish",
+    "丹麦语": "Danish",
+    # Finnish / 芬兰语
+    "fi": "Finnish",
+    "finnish": "Finnish",
+    "芬兰语": "Finnish",
+    # Polish / 波兰语
+    "pl": "Polish",
+    "polish": "Polish",
+    "波兰语": "Polish",
+    # Czech / 捷克语
+    "cs": "Czech",
+    "czech": "Czech",
+    "捷克语": "Czech",
+    # Filipino / 菲律宾语
+    "fil": "Filipino",
+    "filipino": "Filipino",
+    "菲律宾语": "Filipino",
+    # Persian / 波斯语
+    "fa": "Persian",
+    "persian": "Persian",
+    "波斯语": "Persian",
+    # Greek / 希腊语
+    "el": "Greek",
+    "greek": "Greek",
+    "希腊语": "Greek",
+    # Hungarian / 匈牙利语
+    "hu": "Hungarian",
+    "hungarian": "Hungarian",
+    "匈牙利语": "Hungarian",
+    # Macedonian / 马其顿语
+    "mk": "Macedonian",
+    "macedonian": "Macedonian",
+    "马其顿语": "Macedonian",
+    # Romanian / 罗马尼亚语
+    "ro": "Romanian",
+    "romanian": "Romanian",
+    "罗马尼亚语": "Romanian",
+    # --- Chinese Dialects (22) ---
     # Cantonese / 粤语
     "yue": "Cantonese",
     "cantonese": "Cantonese",
     "粤语": "Cantonese",
-    # Wu / Shanghainese / 上海话
+    # Cantonese-HK / 香港粤语
+    "cantonese-hk": "Cantonese-HK",
+    "香港粤语": "Cantonese-HK",
+    # Cantonese-GD / 广东粤语
+    "cantonese-gd": "Cantonese-GD",
+    "广东粤语": "Cantonese-GD",
+    # Wu / Shanghainese / 吴语 / 上海话
     "wuu": "Shanghainese",
+    "wu": "Shanghainese",
     "shanghainese": "Shanghainese",
+    "吴语": "Shanghainese",
     "上海话": "Shanghainese",
-    # Sichuan dialect / 四川话
-    "sichuan": "Sichuan",
-    "四川话": "Sichuan",
     # Min Nan / Hokkien / 闽南语
     "minnan": "Minnan",
-    "闽南语": "Minnan",
     "hokkien": "Minnan",
+    "闽南语": "Minnan",
     # Hakka / 客家话
     "hakka": "Hakka",
     "客家话": "Hakka",
-    # English
-    "en": "English",
-    "english": "English",
-    # Japanese
-    "ja": "Japanese",
-    "japanese": "Japanese",
-    # Korean
-    "ko": "Korean",
-    "korean": "Korean",
+    # Sichuan / 四川话
+    "sichuan": "Sichuan",
+    "四川话": "Sichuan",
+    # Anhui / 安徽话
+    "anhui": "Anhui",
+    "安徽话": "Anhui",
+    # Dongbei / 东北话
+    "dongbei": "Dongbei",
+    "东北话": "Dongbei",
+    # Fujian / 福建话
+    "fujian": "Fujian",
+    "福建话": "Fujian",
+    # Gansu / 甘肃话
+    "gansu": "Gansu",
+    "甘肃话": "Gansu",
+    # Guizhou / 贵州话
+    "guizhou": "Guizhou",
+    "贵州话": "Guizhou",
+    # Hebei / 河北话
+    "hebei": "Hebei",
+    "河北话": "Hebei",
+    # Henan / 河南话
+    "henan": "Henan",
+    "河南话": "Henan",
+    # Hubei / 湖北话
+    "hubei": "Hubei",
+    "湖北话": "Hubei",
+    # Hunan / 湖南话
+    "hunan": "Hunan",
+    "湖南话": "Hunan",
+    # Jiangxi / 江西话
+    "jiangxi": "Jiangxi",
+    "江西话": "Jiangxi",
+    # Ningxia / 宁夏话
+    "ningxia": "Ningxia",
+    "宁夏话": "Ningxia",
+    # Shandong / 山东话
+    "shandong": "Shandong",
+    "山东话": "Shandong",
+    # Shaanxi / 陕西话
+    "shaanxi": "Shaanxi",
+    "陕西话": "Shaanxi",
+    # Shanxi / 山西话
+    "shanxi": "Shanxi",
+    "山西话": "Shanxi",
+    # Tianjin / 天津话
+    "tianjin": "Tianjin",
+    "天津话": "Tianjin",
+    # Yunnan / 云南话
+    "yunnan": "Yunnan",
+    "云南话": "Yunnan",
+    # Zhejiang / 浙江话
+    "zhejiang": "Zhejiang",
+    "浙江话": "Zhejiang",
 }
 
 
@@ -419,8 +588,13 @@ def main():
         default="auto",
         help=(
             "Force language/dialect / 强制指定语言或方言. "
-            "Options: auto, zh, yue, wuu, sichuan, minnan, hakka, en, ja, ko "
-            "(or: 普通话, 粤语, 上海话, 四川话, 闽南语, 客家话). "
+            "Languages: auto, zh, en, ja, ko, ar, de, fr, es, pt, id, it, "
+            "ru, th, vi, tr, hi, ms, nl, sv, da, fi, pl, cs, fil, fa, el, "
+            "hu, mk, ro. "
+            "Dialects: yue, wuu, sichuan, minnan, hakka, anhui, dongbei, "
+            "fujian, gansu, guizhou, hebei, henan, hubei, hunan, jiangxi, "
+            "ningxia, shandong, shaanxi, shanxi, tianjin, yunnan, zhejiang. "
+            "Chinese aliases also accepted (普通话, 粤语, 四川话, etc). "
             "Default: auto (model auto-detects)."
         ),
     )
