@@ -27,13 +27,12 @@ Usage::
     python examples/qwen3_asr.py --continuous
 
     # Force language detection (useful for dialects)
-    # 指定语言（支持方言）
-    python examples/qwen3_asr.py --language zh          # Mandarin / 普通话
-    python examples/qwen3_asr.py --language yue          # Cantonese / 粤语
+    python examples/qwen3_asr.py --language zh          # Mandarin
+    python examples/qwen3_asr.py --language yue          # Cantonese
     python examples/qwen3_asr.py --language en           # English
     python examples/qwen3_asr.py --language ja           # Japanese
-    python examples/qwen3_asr.py --language dongbei      # Dongbei dialect / 东北话
-    python examples/qwen3_asr.py --language 四川话        # Sichuan dialect
+    python examples/qwen3_asr.py --language dongbei      # Dongbei dialect
+    python examples/qwen3_asr.py --language 四川话        # Sichuan dialect (Chinese aliases work)
 
     # Use a different model size
     python examples/qwen3_asr.py --model Qwen/Qwen3-ASR-1.7B
@@ -84,209 +83,209 @@ ASSISTANT_ID = 77091  # "assistant"
 NEWLINE_ID = 198  # "\n"
 
 # Language / dialect mapping.
-# Keys are CLI aliases; values are the language names used in the model's
+# Keys are CLI aliases (including Chinese character aliases);
+# values are the language names used in the model's
 # "language <NAME><asr_text>" generation prefix.
-# 语言/方言映射：键为命令行别名，值为模型使用的语言名称。
 #
 # Supports 30 languages + 22 Chinese dialects.
 LANGUAGE_MAP: dict[str, str] = {
     # Auto-detect (default: model decides the language)
     "auto": "",
     # --- Languages (30) ---
-    # Chinese / 中文 / 普通话
+    # Chinese / Mandarin
     "zh": "Chinese",
     "chinese": "Chinese",
     "mandarin": "Chinese",
     "普通话": "Chinese",
     "中文": "Chinese",
-    # English / 英语
+    # English
     "en": "English",
     "english": "English",
     "英语": "English",
-    # Japanese / 日语
+    # Japanese
     "ja": "Japanese",
     "japanese": "Japanese",
     "日语": "Japanese",
-    # Korean / 韩语
+    # Korean
     "ko": "Korean",
     "korean": "Korean",
     "韩语": "Korean",
-    # Arabic / 阿拉伯语
+    # Arabic
     "ar": "Arabic",
     "arabic": "Arabic",
     "阿拉伯语": "Arabic",
-    # German / 德语
+    # German
     "de": "German",
     "german": "German",
     "德语": "German",
-    # French / 法语
+    # French
     "fr": "French",
     "french": "French",
     "法语": "French",
-    # Spanish / 西班牙语
+    # Spanish
     "es": "Spanish",
     "spanish": "Spanish",
     "西班牙语": "Spanish",
-    # Portuguese / 葡萄牙语
+    # Portuguese
     "pt": "Portuguese",
     "portuguese": "Portuguese",
     "葡萄牙语": "Portuguese",
-    # Indonesian / 印尼语
+    # Indonesian
     "id": "Indonesian",
     "indonesian": "Indonesian",
     "印尼语": "Indonesian",
-    # Italian / 意大利语
+    # Italian
     "it": "Italian",
     "italian": "Italian",
     "意大利语": "Italian",
-    # Russian / 俄语
+    # Russian
     "ru": "Russian",
     "russian": "Russian",
     "俄语": "Russian",
-    # Thai / 泰语
+    # Thai
     "th": "Thai",
     "thai": "Thai",
     "泰语": "Thai",
-    # Vietnamese / 越南语
+    # Vietnamese
     "vi": "Vietnamese",
     "vietnamese": "Vietnamese",
     "越南语": "Vietnamese",
-    # Turkish / 土耳其语
+    # Turkish
     "tr": "Turkish",
     "turkish": "Turkish",
     "土耳其语": "Turkish",
-    # Hindi / 印地语
+    # Hindi
     "hi": "Hindi",
     "hindi": "Hindi",
     "印地语": "Hindi",
-    # Malay / 马来语
+    # Malay
     "ms": "Malay",
     "malay": "Malay",
     "马来语": "Malay",
-    # Dutch / 荷兰语
+    # Dutch
     "nl": "Dutch",
     "dutch": "Dutch",
     "荷兰语": "Dutch",
-    # Swedish / 瑞典语
+    # Swedish
     "sv": "Swedish",
     "swedish": "Swedish",
     "瑞典语": "Swedish",
-    # Danish / 丹麦语
+    # Danish
     "da": "Danish",
     "danish": "Danish",
     "丹麦语": "Danish",
-    # Finnish / 芬兰语
+    # Finnish
     "fi": "Finnish",
     "finnish": "Finnish",
     "芬兰语": "Finnish",
-    # Polish / 波兰语
+    # Polish
     "pl": "Polish",
     "polish": "Polish",
     "波兰语": "Polish",
-    # Czech / 捷克语
+    # Czech
     "cs": "Czech",
     "czech": "Czech",
     "捷克语": "Czech",
-    # Filipino / 菲律宾语
+    # Filipino
     "fil": "Filipino",
     "filipino": "Filipino",
     "菲律宾语": "Filipino",
-    # Persian / 波斯语
+    # Persian
     "fa": "Persian",
     "persian": "Persian",
     "波斯语": "Persian",
-    # Greek / 希腊语
+    # Greek
     "el": "Greek",
     "greek": "Greek",
     "希腊语": "Greek",
-    # Hungarian / 匈牙利语
+    # Hungarian
     "hu": "Hungarian",
     "hungarian": "Hungarian",
     "匈牙利语": "Hungarian",
-    # Macedonian / 马其顿语
+    # Macedonian
     "mk": "Macedonian",
     "macedonian": "Macedonian",
     "马其顿语": "Macedonian",
-    # Romanian / 罗马尼亚语
+    # Romanian
     "ro": "Romanian",
     "romanian": "Romanian",
     "罗马尼亚语": "Romanian",
     # --- Chinese Dialects (22) ---
-    # Cantonese / 粤语
+    # Cantonese
     "yue": "Cantonese",
     "cantonese": "Cantonese",
     "粤语": "Cantonese",
-    # Cantonese-HK / 香港粤语
+    # Cantonese (Hong Kong)
     "cantonese-hk": "Cantonese-HK",
     "香港粤语": "Cantonese-HK",
-    # Cantonese-GD / 广东粤语
+    # Cantonese (Guangdong)
     "cantonese-gd": "Cantonese-GD",
     "广东粤语": "Cantonese-GD",
-    # Wu / Shanghainese / 吴语 / 上海话
+    # Wu / Shanghainese
     "wuu": "Shanghainese",
     "wu": "Shanghainese",
     "shanghainese": "Shanghainese",
     "吴语": "Shanghainese",
     "上海话": "Shanghainese",
-    # Min Nan / Hokkien / 闽南语
+    # Min Nan / Hokkien
     "minnan": "Minnan",
     "hokkien": "Minnan",
     "闽南语": "Minnan",
-    # Hakka / 客家话
+    # Hakka
     "hakka": "Hakka",
     "客家话": "Hakka",
-    # Sichuan / 四川话
+    # Sichuan
     "sichuan": "Sichuan",
     "四川话": "Sichuan",
-    # Anhui / 安徽话
+    # Anhui
     "anhui": "Anhui",
     "安徽话": "Anhui",
-    # Dongbei / 东北话
+    # Dongbei (Northeastern)
     "dongbei": "Dongbei",
     "东北话": "Dongbei",
-    # Fujian / 福建话
+    # Fujian
     "fujian": "Fujian",
     "福建话": "Fujian",
-    # Gansu / 甘肃话
+    # Gansu
     "gansu": "Gansu",
     "甘肃话": "Gansu",
-    # Guizhou / 贵州话
+    # Guizhou
     "guizhou": "Guizhou",
     "贵州话": "Guizhou",
-    # Hebei / 河北话
+    # Hebei
     "hebei": "Hebei",
     "河北话": "Hebei",
-    # Henan / 河南话
+    # Henan
     "henan": "Henan",
     "河南话": "Henan",
-    # Hubei / 湖北话
+    # Hubei
     "hubei": "Hubei",
     "湖北话": "Hubei",
-    # Hunan / 湖南话
+    # Hunan
     "hunan": "Hunan",
     "湖南话": "Hunan",
-    # Jiangxi / 江西话
+    # Jiangxi
     "jiangxi": "Jiangxi",
     "江西话": "Jiangxi",
-    # Ningxia / 宁夏话
+    # Ningxia
     "ningxia": "Ningxia",
     "宁夏话": "Ningxia",
-    # Shandong / 山东话
+    # Shandong
     "shandong": "Shandong",
     "山东话": "Shandong",
-    # Shaanxi / 陕西话
+    # Shaanxi
     "shaanxi": "Shaanxi",
     "陕西话": "Shaanxi",
-    # Shanxi / 山西话
+    # Shanxi
     "shanxi": "Shanxi",
     "山西话": "Shanxi",
-    # Tianjin / 天津话
+    # Tianjin
     "tianjin": "Tianjin",
     "天津话": "Tianjin",
-    # Yunnan / 云南话
+    # Yunnan
     "yunnan": "Yunnan",
     "云南话": "Yunnan",
-    # Zhejiang / 浙江话
+    # Zhejiang
     "zhejiang": "Zhejiang",
     "浙江话": "Zhejiang",
 }
@@ -569,25 +568,25 @@ def parse_asr_output(raw: str) -> str:
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Qwen3-ASR speech recognition with ONNX models.\nQwen3-ASR 语音识别（ONNX 模型）。"
+            "Qwen3-ASR speech recognition with ONNX models."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--model",
         default=MODEL_ID,
-        help="HuggingFace model ID / 模型 ID (default: %(default)s).",
+        help="HuggingFace model ID (default: %(default)s).",
     )
     parser.add_argument(
         "--audio",
         default=None,
-        help="Path to an audio file / 音频文件路径. If omitted, records from mic.",
+        help="Path to an audio file. If omitted, records from mic.",
     )
     parser.add_argument(
         "--language",
         default="auto",
         help=(
-            "Force language/dialect / 强制指定语言或方言. "
+            "Force language/dialect. "
             "Languages: auto, zh, en, ja, ko, ar, de, fr, es, pt, id, it, "
             "ru, th, vi, tr, hi, ms, nl, sv, da, fi, pl, cs, fil, fa, el, "
             "hu, mk, ro. "
@@ -602,35 +601,35 @@ def main():
         "--device",
         default="cpu",
         choices=["cpu", "cuda", "webgpu"],
-        help="Execution provider / 推理设备 (default: cpu).",
+        help="Execution provider (default: cpu).",
     )
     parser.add_argument(
         "--dtype",
         default="fp32",
         choices=["fp32", "fp16"],
-        help="Model precision / 模型精度 (default: fp32).",
+        help="Model precision (default: fp32).",
     )
     parser.add_argument(
         "--no-stream",
         action="store_true",
-        help="Disable streaming output / 禁用流式输出 (print all at once).",
+        help="Disable streaming output (print all at once).",
     )
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Continuously record and transcribe / 连续识别模式 (loop until Ctrl+C).",
+        help="Continuously record and transcribe (loop until Ctrl+C).",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=MAX_NEW_TOKENS,
-        help="Maximum tokens to generate / 最大生成令牌数 (default: %(default)s).",
+        help="Maximum tokens to generate (default: %(default)s).",
     )
     parser.add_argument(
         "--save-to",
         metavar="DIR",
         default=None,
-        help="Save ONNX models to DIR and exit / 保存模型到目录 (no inference).",
+        help="Save ONNX models to DIR and exit (no inference).",
     )
     parser.add_argument(
         "--ci",
