@@ -348,12 +348,12 @@ def transcribe(
     # Step 1: Compute LFR fbank features
     input_features = preprocess_audio(audio).astype(model_dtype)  # (1, T, 560)
 
-    # Step 2: Run audio encoder
+    # Step 2: Run audio encoder (includes adaptor → LLM-dim output)
     audio_out = sessions["audio_encoder"].run({"input_features": input_features})
-    audio_features = audio_out["audio_features"]  # (1, audio_seq, dim)
+    audio_features = audio_out["audio_features"]  # (1, audio_seq, llm_hidden)
     num_audio_tokens = audio_features.shape[1]
 
-    # Flatten to (num_audio_tokens, encoder_dim) for the embedding model
+    # Flatten to (num_audio_tokens, llm_hidden) for the embedding model
     audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
 
     # Step 3: Build prompt with audio token placeholder

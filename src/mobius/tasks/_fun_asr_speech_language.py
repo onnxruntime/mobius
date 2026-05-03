@@ -4,13 +4,14 @@
 """Fun-ASR speech-language 3-model split task.
 
 Builds three separate ONNX models:
-1. **audio_encoder**: input_features (batch, seq_len, input_dim) → audio_features
-2. **embedding**: input_ids + audio_features → inputs_embeds (with adaptor)
+1. **audio_encoder**: input_features (batch, seq_len, input_dim) → audio_features (LLM dim)
+2. **embedding**: input_ids + audio_features (LLM dim) → inputs_embeds (token scatter)
 3. **decoder**: inputs_embeds → logits + KV cache
 
 Unlike the base :class:`SpeechLanguageTask`, the audio encoder accepts
 LFR-processed fbank features with shape ``(batch, seq_len, input_dim)``
-rather than mel spectrograms ``(batch, n_mels, mel_seq)``.
+rather than mel spectrograms ``(batch, n_mels, mel_seq)``. The audio
+encoder includes the adaptor, so its output is already in LLM dimension.
 """
 
 from __future__ import annotations
@@ -65,14 +66,13 @@ class FunASRSpeechLanguageTask(ModelTask):
 
         models["audio_encoder"] = self._build_audio_encoder(module.audio_tower, config)
 
-        # The audio encoder outputs encoder_dim features; the adaptor
-        # (inside the embedding model) projects to llm_hidden_size.
-        encoder_dim = (config.audio.attention_dim if config.audio else None) or 512
+        # The audio encoder includes the adaptor, so output is LLM hidden size.
+        llm_hidden = config.hidden_size
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
             feature_name="audio_features",
-            feature_dim=encoder_dim,
+            feature_dim=llm_hidden,
         )
 
         # Standard decoder (no MRoPE — Fun-ASR uses standard RoPE)

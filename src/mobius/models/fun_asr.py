@@ -4,14 +4,16 @@
 """Fun-ASR-Nano: Audio speech recognition with Qwen3-0.6B text decoder.
 
 Architecture:
-  - Audio encoder (SenseVoiceEncoderSmall): 3 stacks of SANM layers with
-    temporal pooling that halves the sequence length.
-  - Audio adaptor: 2-layer MLP + 2 transformer blocks projecting 512→1024.
+  - Audio encoder (SenseVoiceEncoderSmall + adaptor): 3 stacks of SANM layers
+    with temporal pooling, then a 2-layer MLP + 2 transformer blocks
+    projecting 512→1024 (LLM hidden dimension).
   - Text decoder: Qwen3-0.6B (reused from existing Qwen3 decoder code).
-  - Fusion: Audio features replace audio_token_id positions in text embeddings.
+  - Fusion: Audio features (already LLM-dim) replace audio_token_id positions
+    in text embeddings.
 
-The encoder outputs 512-dim features which the adaptor projects to 1024
-(the LLM hidden_size) before fusing with text embeddings.
+The encoder outputs 512-dim features which the built-in adaptor projects to
+1024 (the LLM hidden_size). The embedding model receives LLM-dimension
+features and performs simple token scatter without further projection.
 
 Reference: https://huggingface.co/FunAudioLLM/Fun-ASR-Nano
 HuggingFace class: FunASRForConditionalGeneration
@@ -48,18 +50,20 @@ if TYPE_CHECKING:
 
 
 class FunASRAudioEncoder(nn.Module):
-    """Fun-ASR Nano audio encoder: SenseVoiceEncoderSmall.
+    """Fun-ASR Nano audio encoder: SenseVoiceEncoderSmall + adaptor.
 
     Three stacks of SANM (Self-Attention with Normalization and Memory)
-    encoder layers with temporal pooling between the second and third stack:
+    encoder layers with temporal pooling between the second and third stack,
+    followed by an adaptor that projects to the LLM hidden dimension:
 
     1. ``encoders0``: 1 SANM layer projecting input_dim (560) → hidden_dim (512)
     2. ``encoders``: N-1 SANM layers at hidden_dim (512)
     3. Temporal pooling: average adjacent frame pairs (T → T//2)
     4. ``tp_encoders``: M SANM layers at hidden_dim (512)
+    5. ``adaptor``: MLP + transformer blocks projecting 512 → LLM hidden (1024)
 
     Input: ``(batch, seq_len, input_dim)`` — LFR-processed fbank features
-    Output: ``(batch, out_seq_len, hidden_dim)`` — audio features (T//2)
+    Output: ``(batch, out_seq_len, llm_hidden_size)`` — LLM-dimension features
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -97,14 +101,17 @@ class FunASRAudioEncoder(nn.Module):
         )
         self.tp_norm = LayerNorm(hidden_size)
 
+        # Adaptor: projects encoder hidden_dim (512) → LLM hidden_size (1024)
+        self.adaptor = FunASRAudioAdaptor(config)
+
     def forward(self, op: builder.OpBuilder, input_features: ir.Value) -> ir.Value:
-        """Encode LFR-processed fbank features to audio embeddings.
+        """Encode LFR-processed fbank features to LLM-dimension audio embeddings.
 
         Args:
             input_features: ``(batch, seq_len, input_dim)`` fbank features.
 
         Returns:
-            audio_features: ``(batch, seq_len // 2, hidden_dim)``
+            audio_features: ``(batch, seq_len // 2, llm_hidden_size)``
         """
         # input_features: (batch, seq_len, input_dim)
         hidden_states = input_features
@@ -142,8 +149,10 @@ class FunASRAudioEncoder(nn.Module):
         for layer in self.tp_encoders:
             tp_hidden = layer(op, tp_hidden)
 
-        tp_hidden = self.tp_norm(op, tp_hidden)
-        return tp_hidden  # (batch, T//2, hidden_dim)
+        hidden = self.tp_norm(op, tp_hidden)
+        # Project encoder features (512) to LLM dimension (1024) via adaptor
+        hidden = self.adaptor(op, hidden)
+        return hidden  # (batch, T//2, llm_hidden_size)
 
 
 # ── Adaptor Attention ──────────────────────────────────────────────────
@@ -272,39 +281,36 @@ class FunASRAudioAdaptor(nn.Module):
         """Project audio features from encoder dim to LLM hidden dim.
 
         Args:
-            audio_features: ``(num_tokens, encoder_dim)`` — flat features
+            audio_features: ``(batch, seq_len, encoder_dim)`` — 3D features
 
         Returns:
-            projected: ``(num_tokens, llm_hidden_size)``
+            projected: ``(batch, seq_len, llm_hidden_size)``
         """
         # MLP projection: encoder_dim → proj_dim → llm_hidden
-        hidden = self.linear1(op, audio_features)  # (N, proj_dim)
+        hidden = self.linear1(op, audio_features)  # (B, T, proj_dim)
         hidden = op.Relu(hidden)
-        hidden = self.linear2(op, hidden)  # (N, llm_hidden)
+        hidden = self.linear2(op, hidden)  # (B, T, llm_hidden)
 
-        # Transformer blocks need 3D input (batch, seq, hidden)
-        # Add batch=1 dimension for the Attention op
-        hidden = op.Unsqueeze(hidden, [0])  # (1, N, llm_hidden)
+        # Transformer blocks refine the projected features
         for block in self.blocks:
             hidden = block(op, hidden)
-        hidden = op.Squeeze(hidden, [0])  # (N, llm_hidden)
 
-        return hidden
+        return hidden  # (B, T, llm_hidden)
 
 
 # ── Embedding Model ────────────────────────────────────────────────────
 
 
 class FunASREmbeddingModel(nn.Module):
-    """Fun-ASR embedding model: adaptor + text/audio embedding fusion.
+    """Fun-ASR embedding model: text/audio embedding fusion.
 
-    Runs the audio adaptor on raw audio features (512-dim from encoder)
-    to project them to LLM dimension (1024), then replaces audio_token_id
-    positions in the text embedding with the projected audio features.
+    Audio features arrive already projected to LLM dimension (from the
+    audio encoder's built-in adaptor). This module replaces audio_token_id
+    positions in the text embedding with the provided audio features.
 
     Inputs:
         input_ids: ``(batch, seq_len)`` token IDs
-        audio_features: ``(num_audio_tokens, encoder_dim)`` from audio encoder
+        audio_features: ``(num_audio_tokens, llm_hidden_size)`` from audio encoder
 
     Output:
         inputs_embeds: ``(batch, seq_len, hidden_size)``
@@ -315,7 +321,6 @@ class FunASREmbeddingModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.audio_adaptor = FunASRAudioAdaptor(config)
 
         audio = config.audio
         audio_token_id = (audio.audio_token_id if audio else None) or 151676
@@ -328,15 +333,12 @@ class FunASREmbeddingModel(nn.Module):
         input_ids: ir.Value,
         audio_features: ir.Value,
     ) -> ir.Value:
-        """Fuse text embeddings with adaptor-projected audio features.
+        """Fuse text embeddings with LLM-dimension audio features.
 
-        Audio features are first projected through the adaptor (512 → 1024),
-        then placed at audio_token_id positions via Gather + Where.
+        Audio features are already projected to LLM hidden size by the
+        audio encoder's adaptor, so we just scatter them at audio_token_id
+        positions via Gather + Where.
         """
-        # Project audio features: (num_audio_tokens, encoder_dim)
-        #   → (num_audio_tokens, llm_hidden_size)
-        projected = self.audio_adaptor(op, audio_features)
-
         # Text embeddings: (batch, seq_len, hidden_size)
         inputs_embeds = self.embed_tokens(op, input_ids)
 
@@ -351,12 +353,12 @@ class FunASREmbeddingModel(nn.Module):
         zero_row = op.Unsqueeze(
             op.CastLike(
                 op.Constant(value_floats=[0.0] * self._llm_hidden_size),
-                projected,
+                audio_features,
             ),
             [0],
         )
         # Prepend zero row: (num_audio_tokens + 1, llm_hidden)
-        padded_features = op.Concat(zero_row, projected, axis=0)
+        padded_features = op.Concat(zero_row, audio_features, axis=0)
 
         # Cumulative sum of audio mask → 1-based indices into padded_features
         is_audio_int = op.Cast(is_audio, to=7)  # INT64
@@ -446,8 +448,8 @@ class FunASRForConditionalGeneration(nn.Module):
     """Fun-ASR-Nano composite model for speech recognition.
 
     Contains:
-    - ``audio_tower``: Audio encoder (fbank → 512-dim audio features)
-    - ``embedding``: Adaptor (512→1024) + text/audio embedding fusion
+    - ``audio_tower``: Audio encoder + adaptor (fbank → LLM-dim features)
+    - ``embedding``: Text/audio embedding fusion (no adaptor)
     - ``decoder``: Text decoder with KV cache (Qwen3-based)
 
     The 3-model split for ONNX export is handled by the
@@ -503,7 +505,7 @@ class FunASRForConditionalGeneration(nn.Module):
             audio_encoder.tp_encoders.N.*   → audio_tower.tp_encoders.N.*
             audio_encoder.after_norm.*      → audio_tower.after_norm.*
             audio_encoder.tp_norm.*         → audio_tower.tp_norm.*
-            audio_adaptor.*                 → embedding.audio_adaptor.*
+            audio_adaptor.*                 → audio_tower.adaptor.*
             llm.model.embed_tokens.*        → embedding.embed_tokens.*
             llm.model.layers.N.*            → decoder.layers.N.*
             llm.model.norm.*                → decoder.norm.*
@@ -517,9 +519,10 @@ class FunASRForConditionalGeneration(nn.Module):
                 cleaned[f"audio_tower.{inner}"] = value
                 continue
 
-            # Route audio_adaptor weights → embedding.audio_adaptor
+            # Route audio_adaptor weights → audio_tower.adaptor
             if key.startswith("audio_adaptor."):
-                cleaned[f"embedding.{key}"] = value
+                inner = key[len("audio_adaptor."):]
+                cleaned[f"audio_tower.adaptor.{inner}"] = value
                 continue
 
             # Route llm.lm_head to decoder.lm_head
