@@ -1,0 +1,26 @@
+model_id: "FunAudioLLM/Fun-ASR-Nano-2512"
+revision: "main"
+task_type: "fun-asr-speech-language"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+level: "L4+L5"
+
+skip_reason: >
+  Fun-ASR-Nano uses non-standard HuggingFace packaging (model.pt + config.yaml
+  instead of safetensors + config.json). Standard weight loading and
+  AutoProcessor are not available. Golden data will be generated once a
+  safetensors conversion is available.
+
+notes: >
+  Fun-ASR-Nano speech recognition. 3-model split: audio_encoder (SANM +
+  temporal pooling) + embedding (adaptor + text/audio fusion) + decoder
+  (Qwen3-0.6B). Audio input is LFR fbank features (batch, seq_len, 560).
