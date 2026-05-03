@@ -294,7 +294,7 @@ def compute_mel_spectrogram(
         return_tensors="np",
         padding=False,
     )
-    return out["input_features"].astype(np.float32)
+    return out["input_features"].astype(np.float32)  # Always float32; caller casts to model dtype
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +371,7 @@ def transcribe(
     max_new_tokens: int = MAX_NEW_TOKENS,
     language: str = "",
     stream: bool = True,
+    model_dtype: np.dtype = np.float32,
 ) -> str:
     """Full ASR pipeline: audio → text.
 
@@ -383,11 +384,12 @@ def transcribe(
         language: If non-empty, force language by prepending
             ``language <NAME><asr_text>`` as the assistant prefix.
         stream: If True, print tokens as they are generated.
+        model_dtype: Numpy dtype matching the model precision.
     """
     batch_size = 1
 
     # Step 1: Compute mel spectrogram
-    mel = compute_mel_spectrogram(audio)  # (1, n_mels, time)
+    mel = compute_mel_spectrogram(audio).astype(model_dtype)  # (1, n_mels, time)
 
     # Step 2: Run audio encoder
     audio_out = sessions["audio_encoder"].run({"input_features": mel})
@@ -441,10 +443,10 @@ def transcribe(
     past_kv = {}
     for i in range(num_layers):
         past_kv[f"past_key_values.{i}.key"] = np.zeros(
-            (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+            (batch_size, num_kv_heads, 0, head_dim), dtype=model_dtype
         )
         past_kv[f"past_key_values.{i}.value"] = np.zeros(
-            (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
+            (batch_size, num_kv_heads, 0, head_dim), dtype=model_dtype
         )
 
     # Prefill pass with fused embeddings
@@ -485,7 +487,7 @@ def transcribe(
         # For decode steps, use embedding with single token
         # (no audio features — zeros since there are no audio tokens)
         cur_ids = np.array([[next_token]], dtype=np.int64)
-        dummy_audio = np.zeros((0, audio_features_2d.shape[-1]), dtype=np.float32)
+        dummy_audio = np.zeros((0, audio_features_2d.shape[-1]), dtype=model_dtype)
         embed_out = sessions["embedding"].run(
             {"input_ids": cur_ids, "audio_features": dummy_audio}
         )
@@ -643,6 +645,12 @@ def main():
 
     stream = not args.no_stream
 
+    # Map mobius dtype string to numpy dtype for inference arrays
+    np_dtype_map = {"f32": np.float32, "f16": np.float16, "bf16": np.float32}
+    # Note: bf16 uses float32 for numpy arrays since numpy lacks bfloat16;
+    # ORT handles the actual bf16 computation internally.
+    np_dtype = np_dtype_map[args.dtype]
+
     def do_transcribe(audio_data):
         return transcribe(
             sessions,
@@ -652,6 +660,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             language=forced_language,
             stream=stream,
+            model_dtype=np_dtype,
         )
 
     if args.audio:
