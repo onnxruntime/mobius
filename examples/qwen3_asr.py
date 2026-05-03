@@ -525,17 +525,38 @@ def transcribe(
             stream_ids.append(next_token)
             if stream:
                 full_text = tokenizer.decode(stream_ids, skip_special_tokens=True)
-                # Strip trailing replacement chars (incomplete UTF-8 from
-                # multi-token CJK characters) — they'll resolve next iteration.
-                printable = full_text.rstrip("\ufffd")
-                if len(printable) > printed_len:
-                    print(printable[printed_len:], end="", flush=True)
-                    printed_len = len(printable)
+                new_text = full_text[printed_len:]
+                # Find safe print boundary: print up to (but not including)
+                # any replacement character. Replacement chars indicate
+                # incomplete multi-byte sequences that will resolve when
+                # the next token arrives.
+                safe_end = new_text.find("\ufffd")
+                if safe_end == -1:
+                    # No replacement chars — print everything
+                    if new_text:
+                        print(new_text, end="", flush=True)
+                        printed_len = len(full_text)
+                elif safe_end > 0:
+                    # Print up to the first replacement char
+                    print(new_text[:safe_end], end="", flush=True)
+                    printed_len += safe_end
+                # else: safe_end == 0 means new text starts with replacement
+                # char — skip printing, wait for next token to resolve it
 
         for i in range(num_layers):
             past_kv[f"past_key_values.{i}.key"] = out[f"present.{i}.key"]
             past_kv[f"past_key_values.{i}.value"] = out[f"present.{i}.value"]
         past_seq_len = total_seq_len
+
+    # Flush any remaining buffered characters from streaming
+    if stream and stream_ids:
+        final_text = tokenizer.decode(stream_ids, skip_special_tokens=True)
+        remaining = final_text[printed_len:]
+        if remaining:
+            # Strip replacement chars at the very end
+            remaining = remaining.replace("\ufffd", "")
+            if remaining:
+                print(remaining, end="", flush=True)
 
     print()
     raw = tokenizer.decode(generated_ids, skip_special_tokens=True)
