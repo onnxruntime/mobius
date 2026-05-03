@@ -480,6 +480,10 @@ def transcribe(
     # When language is forced, <asr_text> is already in the prefill prompt,
     # so the streaming gate should be open immediately.
     streaming = bool(language)
+    # Track how many characters have been printed for delta streaming.
+    # Decoding the full token sequence avoids incomplete UTF-8 byte issues
+    # that occur when individual BPE tokens split multi-byte characters.
+    printed_len = 0
     for _ in range(max_new_tokens - 1):
         if next_token in eos_ids:
             break
@@ -509,12 +513,15 @@ def transcribe(
         next_token = int(np.argmax(logits[:, -1, :]))
         generated_ids.append(next_token)
 
-        # Stream output (skip prefix tokens before <asr_text>)
+        # Stream output: decode full sequence and print only new characters.
+        # This avoids broken UTF-8 from per-token decode of multi-byte chars.
         if next_token == ASR_TEXT_TOKEN:
             streaming = True
         elif streaming and stream:
-            text = tokenizer.decode([next_token], skip_special_tokens=True)
-            print(text, end="", flush=True)
+            full_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            if len(full_text) > printed_len:
+                print(full_text[printed_len:], end="", flush=True)
+                printed_len = len(full_text)
 
         for i in range(num_layers):
             past_kv[f"past_key_values.{i}.key"] = out[f"present.{i}.key"]
