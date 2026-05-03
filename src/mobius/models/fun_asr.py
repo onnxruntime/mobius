@@ -504,16 +504,16 @@ class FunASRForConditionalGeneration(nn.Module):
             audio_encoder.after_norm.*      → audio_tower.after_norm.*
             audio_encoder.tp_norm.*         → audio_tower.tp_norm.*
             audio_adaptor.*                 → embedding.audio_adaptor.*
-            model.embed_tokens.*            → embedding.embed_tokens.*
-            model.layers.N.*               → decoder.layers.N.*
-            model.norm.*                   → decoder.norm.*
-            lm_head.*                      → decoder.lm_head.*
+            llm.model.embed_tokens.*        → embedding.embed_tokens.*
+            llm.model.layers.N.*            → decoder.layers.N.*
+            llm.model.norm.*                → decoder.norm.*
+            llm.lm_head.*                   → decoder.lm_head.*
         """
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             # Route audio_encoder weights → audio_tower
             if key.startswith("audio_encoder."):
-                inner = key[len("audio_encoder.") :]
+                inner = key[len("audio_encoder."):]
                 cleaned[f"audio_tower.{inner}"] = value
                 continue
 
@@ -522,14 +522,15 @@ class FunASRForConditionalGeneration(nn.Module):
                 cleaned[f"embedding.{key}"] = value
                 continue
 
-            # Route lm_head to decoder
-            if key.startswith("lm_head."):
-                cleaned[f"decoder.{key}"] = value
+            # Route llm.lm_head to decoder.lm_head
+            if key.startswith("llm.lm_head."):
+                inner = key[len("llm."):]
+                cleaned[f"decoder.{inner}"] = value
                 continue
 
-            # Route model.* to appropriate sub-module
-            if key.startswith("model."):
-                inner = key[len("model.") :]
+            # Route llm.model.* to appropriate sub-module
+            if key.startswith("llm.model."):
+                inner = key[len("llm.model."):]
 
                 # embed_tokens → embedding module
                 if inner.startswith("embed_tokens."):
