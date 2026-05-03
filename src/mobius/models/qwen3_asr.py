@@ -179,6 +179,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
             seq_len,
             op.Constant(value_ints=[0]),
         )
+        # CastLike ensures PE matches hidden_states dtype (f16/bf16)
+        pe_slice = op.CastLike(pe_slice, hidden_states)
         hidden_states = op.Add(hidden_states, pe_slice)
 
         # Encoder layers
@@ -244,6 +246,7 @@ class Qwen3ASREmbeddingModel(nn.Module):
             zero_row_shape,
             value=ir.tensor(np.zeros(1, dtype=np.float32)),
         )
+        zero_row = op.CastLike(zero_row, audio_features)
         # Prepend zero row: (num_audio_tokens + 1, output_dim)
         padded_features = op.Concat(zero_row, audio_features, axis=0)
 
