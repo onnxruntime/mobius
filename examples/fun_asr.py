@@ -75,20 +75,16 @@ LFR_M = 7  # Stack 7 consecutive frames
 LFR_N = 6  # Subsample by 6
 N_MELS = 80  # Mel filter bank bins
 
-# Chat template token IDs (Qwen3 tokenizer)
-IM_START = 151644  # <|im_start|>
-IM_END = 151645  # <|im_end|>
-NEWLINE_ID = 198  # "\n"
-
 # Language mapping for Fun-ASR-Nano-2512 (zh, en, ja).
+# Values are Chinese language names used in the prompt: "语音转写成{language}："
 LANGUAGE_MAP: dict[str, str] = {
     "auto": "",
-    "zh": "Chinese",
-    "chinese": "Chinese",
-    "en": "English",
-    "english": "English",
-    "ja": "Japanese",
-    "japanese": "Japanese",
+    "zh": "中文",
+    "chinese": "中文",
+    "en": "英文",
+    "english": "英文",
+    "ja": "日文",
+    "japanese": "日文",
 }
 
 
@@ -356,43 +352,41 @@ def transcribe(
     # Flatten to (num_audio_tokens, llm_hidden) for the embedding model
     audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
 
-    # Step 3: Build prompt with audio token placeholder
-    # Fun-ASR uses the Qwen3 chat template with a simple audio placeholder.
-    # The audio_token_id from the config marks where audio features are injected.
-    audio_token_id = (config.audio.audio_token_id if config.audio else None) or 100
-    system_text = "You are a helpful assistant."
-    system_ids = tokenizer.encode(system_text, add_special_tokens=False)
-    system_id = tokenizer.encode("system", add_special_tokens=False)
-    user_id = tokenizer.encode("user", add_special_tokens=False)
-    assistant_id = tokenizer.encode("assistant", add_special_tokens=False)
-
-    prompt_ids = (
-        [IM_START]
-        + system_id
-        + [NEWLINE_ID]
-        + system_ids
-        + [IM_END, NEWLINE_ID, IM_START]
-        + user_id
-        + [NEWLINE_ID]
-        + [audio_token_id] * num_audio_tokens
-        + [IM_END, NEWLINE_ID, IM_START]
-        + assistant_id
-        + [NEWLINE_ID]
-    )
-
-    # When language is forced, prepend the language hint in the assistant response
+    # Step 3: Build prompt with Fun-ASR format
+    # Fun-ASR uses: system="You are a helpful assistant."
+    #   user="语音转写成{language}：" + fake_tokens (zeros) for audio positions
+    # The fake tokens get replaced with audio embeddings in step 4.
     if language:
-        prefix_text = f"language {language}"
-        prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-        prompt_ids.extend(prefix_ids)
+        user_text = f"语音转写成{language}："
+    else:
+        user_text = "语音转写："
 
+    system_prompt = "You are a helpful assistant."
+    # Build chat template: <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user_text}
+    chat_prefix = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_text}"
+    prefix_ids = tokenizer.encode(chat_prefix, add_special_tokens=False)
+
+    # Audio placeholder: fake token IDs (zeros) — will be overwritten with audio embeddings
+    audio_placeholder_ids = [0] * num_audio_tokens
+    fbank_beg = len(prefix_ids)  # position where audio starts
+
+    chat_suffix = "<|im_end|>\n<|im_start|>assistant\n"
+    suffix_ids = tokenizer.encode(chat_suffix, add_special_tokens=False)
+
+    prompt_ids = prefix_ids + audio_placeholder_ids + suffix_ids
     input_ids = np.array([prompt_ids], dtype=np.int64)
 
-    # Step 4: Run embedding model (fuse text + audio)
+    # Step 4: Build inputs_embeds by embedding text + overwriting audio positions
+    # Run embedding model to get text embeddings
     embed_out = sessions["embedding"].run(
         {"input_ids": input_ids, "audio_features": audio_features_2d}
     )
     inputs_embeds = embed_out["inputs_embeds"]  # (1, seq_len, hidden)
+
+    # Overwrite audio positions with encoder output (position-based, like FunASR)
+    inputs_embeds[0, fbank_beg:fbank_beg + num_audio_tokens, :] = (
+        audio_features_2d[:num_audio_tokens, :].astype(inputs_embeds.dtype)
+    )
 
     # Step 5: Autoregressive decoding with the decoder model
     num_layers = config.num_hidden_layers
