@@ -635,7 +635,9 @@ def main():
     from huggingface_hub import hf_hub_download
 
     weights_path = hf_hub_download(args.model, "model.pt")
-    state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
+    # model.pt wraps the actual weights in a 'state_dict' key
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     if hasattr(module, "preprocess_weights"):
         state_dict = module.preprocess_weights(state_dict)
     prefix_map = getattr(module, "weight_prefix_map", None)
