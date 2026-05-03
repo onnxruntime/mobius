@@ -2263,6 +2263,7 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         "fun_asr",
         {
             "attn_qk_norm": True,
+            "rope_type": "default",
             "audio": AudioConfig(
                 input_size=32,
                 attention_dim=64,

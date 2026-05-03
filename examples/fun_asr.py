@@ -292,6 +292,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
         ),
         rms_norm_eps=llm_cfg.get("rms_norm_eps", 1e-6),
         rope_theta=llm_cfg.get("rope_theta", 1000000.0),
+        rope_type="default",
         max_position_embeddings=llm_cfg.get("max_position_embeddings", 40960),
         attn_qk_norm=True,
         dtype=dtype_map.get(dtype, DataType.FLOAT),
