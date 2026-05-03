@@ -26,7 +26,7 @@ Usage::
     # Continuous mic mode (Ctrl+C to exit)
     python examples/qwen3_asr.py --continuous
 
-    # Force language detection (useful for dialects)
+    # Force a specific language/dialect and skip auto-detection
     python examples/qwen3_asr.py --language zh          # Mandarin
     python examples/qwen3_asr.py --language yue          # Cantonese
     python examples/qwen3_asr.py --language en           # English
