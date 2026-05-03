@@ -94,6 +94,7 @@ from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -507,6 +508,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
+    "fun_asr": ModelRegistration(
+        FunASRForConditionalGeneration, task="fun-asr-speech-language"
+    ),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
@@ -845,6 +849,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
+    "fun_asr": "FunAudioLLM/Fun-ASR-Nano",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -1010,6 +1015,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
+    "fun_asr": "qwen",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",

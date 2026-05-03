@@ -237,6 +237,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "pixtral": "VL model — no test_model_id yet",
     "qdqbert": "Quantised BERT — no test_model_id yet",
     "qwen3_5_vl": "VL model — no test_model_id yet",
+    "fun_asr": "Audio model — no test_model_id yet",
     "qwen3_asr": "Audio model — no test_model_id yet",
     "qwen3_forced_aligner": "Speech model — no test_model_id yet",
     "qwen3_tts": "TTS model — no test_model_id yet",

@@ -33,6 +33,43 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
+class _FSMNBlock(nn.Module):
+    """FSMN depthwise conv1d block.
+
+    Applies a depthwise 1-D convolution over the input (channels-first)
+    using a learnable weight.  Weight shape: ``[n_feat, 1, kernel_size]``
+    (groups = n_feat for depthwise convolution).
+
+    The forward method must be called through ``self(op, x)`` so that
+    onnxscript qualifies the weight parameter name correctly in the graph.
+    """
+
+    def __init__(self, n_feat: int, kernel_size: int):
+        super().__init__()
+        self.weight = nn.Parameter([n_feat, 1, kernel_size])
+        self._n_feat = n_feat
+        self._kernel_size = kernel_size
+
+    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+        """Apply depthwise Conv1d.
+
+        Args:
+            x: ``(batch, n_feat, time)`` — channels-first input.
+
+        Returns:
+            ``(batch, n_feat, time)`` — convolved output.
+        """
+        left_pad = (self._kernel_size - 1) // 2
+        right_pad = self._kernel_size - 1 - left_pad
+        return op.Conv(
+            x,
+            self.weight,
+            kernel_shape=[self._kernel_size],
+            pads=[left_pad, right_pad],
+            group=self._n_feat,
+        )
+
+
 class SANMAttention(nn.Module):
     """SANM self-attention with FSMN memory block.
 
@@ -63,16 +100,13 @@ class SANMAttention(nn.Module):
 
         # FSMN depthwise conv1d on values
         # Weight shape: [n_feat, 1, kernel_size] (groups=n_feat)
-        self.fsmn_block = nn.Module()
-        self.fsmn_block.weight = nn.Parameter([out_size, 1, kernel_size])
+        self.fsmn_block = _FSMNBlock(out_size, kernel_size)
 
         # Output projection: [out_size] → [out_size]
         self.linear_out = Linear(out_size, out_size, bias=True)
 
         self._n_heads = n_heads
         self._head_dim = out_size // n_heads
-        self._out_size = out_size
-        self._kernel_size = kernel_size
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # hidden_states: [B, T, in_size]
@@ -86,16 +120,8 @@ class SANMAttention(nn.Module):
         # Transpose V to channels-first: [B, T, n_feat] → [B, n_feat, T]
         v_conv = op.Transpose(v, perm=[0, 2, 1])
 
-        # Depthwise Conv1d with causal-style padding
-        left_pad = (self._kernel_size - 1) // 2
-        right_pad = self._kernel_size - 1 - left_pad
-        v_conv = op.Conv(
-            v_conv,
-            self.fsmn_block.weight,
-            kernel_shape=[self._kernel_size],
-            pads=[left_pad, right_pad],
-            group=self._out_size,
-        )  # [B, n_feat, T]
+        # Depthwise Conv1d via FSMN block
+        v_conv = self.fsmn_block(op, v_conv)  # [B, n_feat, T]
 
         # Transpose back: [B, n_feat, T] → [B, T, n_feat]
         v_conv = op.Transpose(v_conv, perm=[0, 2, 1])

@@ -27,6 +27,7 @@ __all__ = [
     "ControlNetTask",
     "DenoisingTask",
     "FeatureExtractionTask",
+    "FunASRSpeechLanguageTask",
     "Gemma4Task",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
@@ -74,6 +75,7 @@ from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
+from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
@@ -127,6 +129,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
+    "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

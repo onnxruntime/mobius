@@ -2258,6 +2258,29 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    # --- Fun-ASR-Nano (speech-language, 3-model split with SANM encoder) ---
+    (
+        "fun_asr",
+        {
+            "attn_qk_norm": True,
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=64,
+                attention_heads=4,
+                num_blocks=3,
+                linear_units=128,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=64,
+                audio_token_id=100,
+                adaptor_proj_dim=128,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=4,
+            ),
+        },
+        True,
+    ),
     # --- Qwen3-TTS Codec Tokenizer (codec, 2-model split) ---
     (
         "qwen3_tts_tokenizer_12hz",

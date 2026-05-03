@@ -71,6 +71,18 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
 
+        # Both Add inputs must have at least 2 dimensions.  This prevents
+        # fusing a bias-Add (e.g. MatMul + 1D bias → LayerNorm) which
+        # would produce a SkipLayerNormalization with a 1D skip input
+        # that ORT rejects.
+        for i, inp in enumerate(producer.inputs):
+            if inp is not None and inp.shape is not None:
+                rank = len(inp.shape)
+                if rank < 2:
+                    return result.fail(
+                        f"Add input[{i}] has rank {rank}, need ≥ 2 for skip connection"
+                    )
+
         # Don't fuse if add_out is itself a graph output — that indicates we're inside
         # an ONNX function body where replace_all_uses_with would fail or produce
         # nested fusion.
@@ -142,6 +154,16 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         producer = add_out.producer()
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to LayerNorm is not from an Add node")
+
+        # Both Add inputs must have at least 2 dimensions — reject
+        # bias-Add patterns (e.g. MatMul + 1D bias → LayerNorm).
+        for i, inp in enumerate(producer.inputs):
+            if inp is not None and inp.shape is not None:
+                rank = len(inp.shape)
+                if rank < 2:
+                    return result.fail(
+                        f"Add input[{i}] has rank {rank}, need ≥ 2 for skip connection"
+                    )
 
         # Don't fuse if add_out is itself a graph output — that indicates we're inside
         # an ONNX function body where replace_all_uses_with would fail or produce
