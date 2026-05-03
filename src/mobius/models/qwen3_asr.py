@@ -217,6 +217,7 @@ class Qwen3ASREmbeddingModel(nn.Module):
         )
         audio_token_id = config.audio.audio_token_id if config.audio else 151676
         self._audio_token_id = audio_token_id
+        self._audio_output_dim = (config.audio.output_dim or 1024) if config.audio else 1024
 
     def forward(
         self,
@@ -239,14 +240,15 @@ class Qwen3ASREmbeddingModel(nn.Module):
         is_audio_3d = op.Unsqueeze(is_audio, [-1])
 
         # Pad audio_features with a zero row at index 0 to handle
-        # the case where no audio tokens exist in the sequence
-        feature_dim = op.Shape(audio_features, start=1, end=2)
-        zero_row_shape = op.Concat(op.Constant(value_ints=[1]), feature_dim, axis=0)
-        zero_row = op.ConstantOfShape(
-            zero_row_shape,
-            value=ir.tensor(np.zeros(1, dtype=np.float32)),
+        # the case where no audio tokens exist in the sequence.
+        # Use static Constant (not ConstantOfShape) to preserve shape inference.
+        zero_row = op.Unsqueeze(
+            op.CastLike(
+                op.Constant(value_floats=[0.0] * self._audio_output_dim),
+                audio_features,
+            ),
+            [0],
         )
-        zero_row = op.CastLike(zero_row, audio_features)
         # Prepend zero row: (num_audio_tokens + 1, output_dim)
         padded_features = op.Concat(zero_row, audio_features, axis=0)
 
