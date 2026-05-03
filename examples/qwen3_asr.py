@@ -26,13 +26,11 @@ Usage::
     # Continuous mic mode (Ctrl+C to exit)
     python examples/qwen3_asr.py --continuous
 
-    # Force a specific language/dialect and skip auto-detection
+    # Force a specific language and skip auto-detection
     python examples/qwen3_asr.py --language zh          # Mandarin
     python examples/qwen3_asr.py --language yue          # Cantonese
     python examples/qwen3_asr.py --language en           # English
     python examples/qwen3_asr.py --language ja           # Japanese
-    python examples/qwen3_asr.py --language dongbei      # Dongbei dialect
-    python examples/qwen3_asr.py --language 四川话        # Sichuan dialect (Chinese aliases work)
 
     # Use a different model size
     python examples/qwen3_asr.py --model Qwen/Qwen3-ASR-1.7B
@@ -83,12 +81,11 @@ USER_ID = 872  # "user"
 ASSISTANT_ID = 77091  # "assistant"
 NEWLINE_ID = 198  # "\n"
 
-# Language / dialect mapping.
-# Keys are CLI aliases (including Chinese character aliases);
-# values are the language names used in the model's
+# Language mapping.
+# Keys are CLI aliases; values are the language names used in the model's
 # "language <NAME><asr_text>" generation prefix.
 #
-# Supports 30 languages + 22 Chinese dialects.
+# 30 supported languages matching the official Qwen3-ASR language list.
 LANGUAGE_MAP: dict[str, str] = {
     # Auto-detect (default: model decides the language)
     "auto": "",
@@ -97,8 +94,6 @@ LANGUAGE_MAP: dict[str, str] = {
     "zh": "Chinese",
     "chinese": "Chinese",
     "mandarin": "Chinese",
-    "普通话": "Chinese",
-    "中文": "Chinese",
     # English
     "en": "English",
     "english": "English",
@@ -183,69 +178,9 @@ LANGUAGE_MAP: dict[str, str] = {
     # Romanian
     "ro": "Romanian",
     "romanian": "Romanian",
-    # --- Chinese Dialects ---
-    # All Chinese dialects map to "Chinese" — the model auto-detects the
-    # specific dialect within Chinese. Cantonese is treated as a separate
-    # language by the model and keeps its own mapping.
     # Cantonese (separate language in the model)
     "yue": "Cantonese",
     "cantonese": "Cantonese",
-    "粤语": "Cantonese",
-    # Cantonese regional variants (still map to Cantonese)
-    "cantonese-hk": "Cantonese",
-    "香港粤语": "Cantonese",
-    "cantonese-gd": "Cantonese",
-    "广东粤语": "Cantonese",
-    # Wu / Shanghainese
-    "wuu": "Chinese",
-    "wu": "Chinese",
-    "shanghainese": "Chinese",
-    "吴语": "Chinese",
-    "上海话": "Chinese",
-    # Min Nan / Hokkien
-    "minnan": "Chinese",
-    "hokkien": "Chinese",
-    "闽南语": "Chinese",
-    # Hakka (not officially supported — maps to Chinese as best effort)
-    "hakka": "Chinese",
-    "客家话": "Chinese",
-    # Regional dialects — all map to Chinese
-    "sichuan": "Chinese",
-    "四川话": "Chinese",
-    "anhui": "Chinese",
-    "安徽话": "Chinese",
-    "dongbei": "Chinese",
-    "东北话": "Chinese",
-    "fujian": "Chinese",
-    "福建话": "Chinese",
-    "gansu": "Chinese",
-    "甘肃话": "Chinese",
-    "guizhou": "Chinese",
-    "贵州话": "Chinese",
-    "hebei": "Chinese",
-    "河北话": "Chinese",
-    "henan": "Chinese",
-    "河南话": "Chinese",
-    "hubei": "Chinese",
-    "湖北话": "Chinese",
-    "hunan": "Chinese",
-    "湖南话": "Chinese",
-    "jiangxi": "Chinese",
-    "江西话": "Chinese",
-    "ningxia": "Chinese",
-    "宁夏话": "Chinese",
-    "shandong": "Chinese",
-    "山东话": "Chinese",
-    "shaanxi": "Chinese",
-    "陕西话": "Chinese",
-    "shanxi": "Chinese",
-    "山西话": "Chinese",
-    "tianjin": "Chinese",
-    "天津话": "Chinese",
-    "yunnan": "Chinese",
-    "云南话": "Chinese",
-    "zhejiang": "Chinese",
-    "浙江话": "Chinese",
 }
 
 
@@ -617,14 +552,10 @@ def main():
         "--language",
         default="auto",
         help=(
-            "Force language/dialect. "
-            "Languages: auto, zh, en, ja, ko, ar, de, fr, es, pt, id, it, "
-            "ru, th, vi, tr, hi, ms, nl, sv, da, fi, pl, cs, fil, fa, el, "
-            "hu, mk, ro. "
-            "Dialects: yue, wuu, sichuan, minnan, hakka, anhui, dongbei, "
-            "fujian, gansu, guizhou, hebei, henan, hubei, hunan, jiangxi, "
-            "ningxia, shandong, shaanxi, shanxi, tianjin, yunnan, zhejiang. "
-            "Chinese aliases also accepted (普通话, 粤语, 四川话, etc). "
+            "Force language. "
+            "Languages: auto, zh, en, yue, ar, de, fr, es, pt, id, it, "
+            "ko, ru, th, vi, ja, tr, hi, ms, nl, sv, da, fi, pl, cs, "
+            "fil, fa, el, hu, mk, ro. "
             "Default: auto (model auto-detects)."
         ),
     )
@@ -703,13 +634,6 @@ def main():
     print("Ready.\n")
     if forced_language:
         print(f"Language: {forced_language} (forced)")
-        # Warn about potentially unsupported dialects
-        unsupported_hint = {"hakka", "客家话"}
-        if lang_key in unsupported_hint:
-            print(
-                "  Warning: Hakka is not officially supported by the model. "
-                "Results may be inaccurate."
-            )
     else:
         print("Language: auto-detect")
 
