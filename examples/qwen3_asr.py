@@ -486,10 +486,16 @@ def main():
         print(f"Saved to {args.save_to}")
         return
 
-    # Create ORT sessions for each model
+    # Create ORT sessions for each model.
+    # ort_easy.load() accepts device="cpu"/"cuda"/"webgpu" directly.
+    # For DML, use the providers kwarg with DmlExecutionProvider.
     device = args.device
     print(f"Creating inference sessions (device={device}) ...")
-    sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
+    if device == "dml":
+        session_kwargs = {"providers": ["DmlExecutionProvider"]}
+    else:
+        session_kwargs = {"device": device}
+    sessions = {name: OnnxModelSession(model, **session_kwargs) for name, model in pkg.items()}
 
     # Load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
