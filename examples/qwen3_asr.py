@@ -427,7 +427,7 @@ def main():
     parser.add_argument(
         "--device",
         default="cpu",
-        choices=["cpu", "cuda"],
+        choices=["cpu", "cuda", "webgpu"],
         help="Execution provider / 推理设备 (default: cpu).",
     )
     parser.add_argument(
