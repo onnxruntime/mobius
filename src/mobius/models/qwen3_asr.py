@@ -160,12 +160,10 @@ class Qwen3ASRAudioEncoder(nn.Module):
         hidden_states = op.Gelu(self.conv2d3(op, hidden_states))
 
         # Reshape: (batch, channels, freq, time) → (batch, time, channels*freq)
-        # Permute to (batch, time, channels, freq) then flatten last two dims
+        # Permute to (batch, time, channels, freq) then flatten last two dims.
+        # Use 0 sentinel (copy from input) to avoid dynamic Shape ops.
         hidden_states = op.Transpose(hidden_states, perm=[0, 3, 1, 2])
-        batch_dim = op.Shape(hidden_states, start=0, end=1)
-        time_dim = op.Shape(hidden_states, start=1, end=2)
-        new_shape = op.Concat(batch_dim, time_dim, op.Constant(value_ints=[-1]), axis=0)
-        hidden_states = op.Reshape(hidden_states, new_shape)
+        hidden_states = op.Reshape(hidden_states, op.Constant(value_ints=[0, 0, -1]))
 
         # Linear projection to d_model
         hidden_states = self.conv_out(op, hidden_states)
@@ -255,12 +253,8 @@ class Qwen3ASREmbeddingModel(nn.Module):
         # Compute gather indices: cumulative sum of audio mask gives
         # 1-based indices into padded_features (0 = zero padding row)
         is_audio_int = op.Cast(is_audio, to=7)  # INT64
-        # Flatten across batch for cumsum then reshape
-        flat_mask = op.Reshape(is_audio_int, op.Constant(value_ints=[-1]))
-        flat_indices = op.CumSum(flat_mask, 0)
-        flat_indices = op.Mul(flat_indices, flat_mask)
-        # Reshape back to (batch, seq_len)
-        indices = op.Reshape(flat_indices, op.Shape(input_ids))
+        cumsum = op.CumSum(is_audio_int, op.Constant(value_int=1))  # axis=1 (seq dim)
+        indices = op.Mul(cumsum, is_audio_int)  # zero out non-audio positions
 
         # Gather audio features using computed indices
         gathered = op.Gather(padded_features, indices, axis=0)
