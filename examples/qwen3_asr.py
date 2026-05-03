@@ -67,7 +67,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 MODEL_ID = "Qwen/Qwen3-ASR-0.6B"
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 60
-MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS = 4096
 
 # Qwen3-ASR special tokens
 AUDIO_START_TOKEN_ID = 151669
@@ -183,84 +183,69 @@ LANGUAGE_MAP: dict[str, str] = {
     # Romanian
     "ro": "Romanian",
     "romanian": "Romanian",
-    # --- Chinese Dialects (22) ---
-    # Cantonese
+    # --- Chinese Dialects ---
+    # All Chinese dialects map to "Chinese" — the model auto-detects the
+    # specific dialect within Chinese. Cantonese is treated as a separate
+    # language by the model and keeps its own mapping.
+    # Cantonese (separate language in the model)
     "yue": "Cantonese",
     "cantonese": "Cantonese",
     "粤语": "Cantonese",
-    # Cantonese (Hong Kong)
-    "cantonese-hk": "Cantonese-HK",
-    "香港粤语": "Cantonese-HK",
-    # Cantonese (Guangdong)
-    "cantonese-gd": "Cantonese-GD",
-    "广东粤语": "Cantonese-GD",
+    # Cantonese regional variants (still map to Cantonese)
+    "cantonese-hk": "Cantonese",
+    "香港粤语": "Cantonese",
+    "cantonese-gd": "Cantonese",
+    "广东粤语": "Cantonese",
     # Wu / Shanghainese
-    "wuu": "Shanghainese",
-    "wu": "Shanghainese",
-    "shanghainese": "Shanghainese",
-    "吴语": "Shanghainese",
-    "上海话": "Shanghainese",
+    "wuu": "Chinese",
+    "wu": "Chinese",
+    "shanghainese": "Chinese",
+    "吴语": "Chinese",
+    "上海话": "Chinese",
     # Min Nan / Hokkien
-    "minnan": "Minnan",
-    "hokkien": "Minnan",
-    "闽南语": "Minnan",
-    # Hakka
-    "hakka": "Hakka",
-    "客家话": "Hakka",
-    # Sichuan
-    "sichuan": "Sichuan",
-    "四川话": "Sichuan",
-    # Anhui
-    "anhui": "Anhui",
-    "安徽话": "Anhui",
-    # Dongbei (Northeastern)
-    "dongbei": "Dongbei",
-    "东北话": "Dongbei",
-    # Fujian
-    "fujian": "Fujian",
-    "福建话": "Fujian",
-    # Gansu
-    "gansu": "Gansu",
-    "甘肃话": "Gansu",
-    # Guizhou
-    "guizhou": "Guizhou",
-    "贵州话": "Guizhou",
-    # Hebei
-    "hebei": "Hebei",
-    "河北话": "Hebei",
-    # Henan
-    "henan": "Henan",
-    "河南话": "Henan",
-    # Hubei
-    "hubei": "Hubei",
-    "湖北话": "Hubei",
-    # Hunan
-    "hunan": "Hunan",
-    "湖南话": "Hunan",
-    # Jiangxi
-    "jiangxi": "Jiangxi",
-    "江西话": "Jiangxi",
-    # Ningxia
-    "ningxia": "Ningxia",
-    "宁夏话": "Ningxia",
-    # Shandong
-    "shandong": "Shandong",
-    "山东话": "Shandong",
-    # Shaanxi
-    "shaanxi": "Shaanxi",
-    "陕西话": "Shaanxi",
-    # Shanxi
-    "shanxi": "Shanxi",
-    "山西话": "Shanxi",
-    # Tianjin
-    "tianjin": "Tianjin",
-    "天津话": "Tianjin",
-    # Yunnan
-    "yunnan": "Yunnan",
-    "云南话": "Yunnan",
-    # Zhejiang
-    "zhejiang": "Zhejiang",
-    "浙江话": "Zhejiang",
+    "minnan": "Chinese",
+    "hokkien": "Chinese",
+    "闽南语": "Chinese",
+    # Hakka (not officially supported — maps to Chinese as best effort)
+    "hakka": "Chinese",
+    "客家话": "Chinese",
+    # Regional dialects — all map to Chinese
+    "sichuan": "Chinese",
+    "四川话": "Chinese",
+    "anhui": "Chinese",
+    "安徽话": "Chinese",
+    "dongbei": "Chinese",
+    "东北话": "Chinese",
+    "fujian": "Chinese",
+    "福建话": "Chinese",
+    "gansu": "Chinese",
+    "甘肃话": "Chinese",
+    "guizhou": "Chinese",
+    "贵州话": "Chinese",
+    "hebei": "Chinese",
+    "河北话": "Chinese",
+    "henan": "Chinese",
+    "河南话": "Chinese",
+    "hubei": "Chinese",
+    "湖北话": "Chinese",
+    "hunan": "Chinese",
+    "湖南话": "Chinese",
+    "jiangxi": "Chinese",
+    "江西话": "Chinese",
+    "ningxia": "Chinese",
+    "宁夏话": "Chinese",
+    "shandong": "Chinese",
+    "山东话": "Chinese",
+    "shaanxi": "Chinese",
+    "陕西话": "Chinese",
+    "shanxi": "Chinese",
+    "山西话": "Chinese",
+    "tianjin": "Chinese",
+    "天津话": "Chinese",
+    "yunnan": "Chinese",
+    "云南话": "Chinese",
+    "zhejiang": "Chinese",
+    "浙江话": "Chinese",
 }
 
 
@@ -573,6 +558,41 @@ def parse_asr_output(raw: str) -> str:
     return raw
 
 
+def transcribe_long(
+    sessions,
+    tokenizer,
+    audio: np.ndarray,
+    config,
+    *,
+    chunk_length: float = 30.0,
+    **kwargs,
+) -> str:
+    """Transcribe audio of any length by chunking.
+
+    Splits audio into segments of ``chunk_length`` seconds and
+    transcribes each independently, concatenating the results.
+    """
+    samples_per_chunk = int(chunk_length * SAMPLE_RATE)
+    total_samples = len(audio)
+
+    if total_samples <= samples_per_chunk:
+        return transcribe(sessions, tokenizer, audio, config, **kwargs)
+
+    num_chunks = (total_samples + samples_per_chunk - 1) // samples_per_chunk
+    results = []
+    for i in range(num_chunks):
+        start = i * samples_per_chunk
+        end = min(start + samples_per_chunk, total_samples)
+        chunk = audio[start:end]
+        if len(chunk) < SAMPLE_RATE * 0.3:
+            continue  # Skip very short trailing chunks
+        print(f"\n[Chunk {i + 1}/{num_chunks}] ", end="", flush=True)
+        text = transcribe(sessions, tokenizer, chunk, config, **kwargs)
+        results.append(text.strip())
+
+    return " ".join(results)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -634,7 +654,13 @@ def main():
         "--max-new-tokens",
         type=int,
         default=MAX_NEW_TOKENS,
-        help="Maximum tokens to generate (default: %(default)s).",
+        help="Maximum tokens to generate per chunk (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--chunk-length",
+        type=float,
+        default=30.0,
+        help="Audio chunk length in seconds for long files (default: 30).",
     )
     parser.add_argument(
         "--save-to",
@@ -677,6 +703,13 @@ def main():
     print("Ready.\n")
     if forced_language:
         print(f"Language: {forced_language} (forced)")
+        # Warn about potentially unsupported dialects
+        unsupported_hint = {"hakka", "客家话"}
+        if lang_key in unsupported_hint:
+            print(
+                "  Warning: Hakka is not officially supported by the model. "
+                "Results may be inaccurate."
+            )
     else:
         print("Language: auto-detect")
 
@@ -684,20 +717,23 @@ def main():
 
     # Map mobius dtype string to numpy dtype for inference arrays
     np_dtype_map = {"f32": np.float32, "f16": np.float16, "bf16": ml_dtypes.bfloat16}
-    # Note: bf16 uses float32 for numpy arrays since numpy lacks bfloat16;
-    # ORT handles the actual bf16 computation internally.
     np_dtype = np_dtype_map[args.dtype]
 
+    transcribe_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        language=forced_language,
+        stream=stream,
+        model_dtype=np_dtype,
+    )
+
     def do_transcribe(audio_data):
-        return transcribe(
+        return transcribe_long(
             sessions,
             tokenizer,
             audio_data,
             config,
-            max_new_tokens=args.max_new_tokens,
-            language=forced_language,
-            stream=stream,
-            model_dtype=np_dtype,
+            chunk_length=args.chunk_length,
+            **transcribe_kwargs,
         )
 
     if args.audio:
