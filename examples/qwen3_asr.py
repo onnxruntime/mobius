@@ -101,115 +101,87 @@ LANGUAGE_MAP: dict[str, str] = {
     # English
     "en": "English",
     "english": "English",
-    "英语": "English",
     # Japanese
     "ja": "Japanese",
     "japanese": "Japanese",
-    "日语": "Japanese",
     # Korean
     "ko": "Korean",
     "korean": "Korean",
-    "韩语": "Korean",
     # Arabic
     "ar": "Arabic",
     "arabic": "Arabic",
-    "阿拉伯语": "Arabic",
     # German
     "de": "German",
     "german": "German",
-    "德语": "German",
     # French
     "fr": "French",
     "french": "French",
-    "法语": "French",
     # Spanish
     "es": "Spanish",
     "spanish": "Spanish",
-    "西班牙语": "Spanish",
     # Portuguese
     "pt": "Portuguese",
     "portuguese": "Portuguese",
-    "葡萄牙语": "Portuguese",
     # Indonesian
     "id": "Indonesian",
     "indonesian": "Indonesian",
-    "印尼语": "Indonesian",
     # Italian
     "it": "Italian",
     "italian": "Italian",
-    "意大利语": "Italian",
     # Russian
     "ru": "Russian",
     "russian": "Russian",
-    "俄语": "Russian",
     # Thai
     "th": "Thai",
     "thai": "Thai",
-    "泰语": "Thai",
     # Vietnamese
     "vi": "Vietnamese",
     "vietnamese": "Vietnamese",
-    "越南语": "Vietnamese",
     # Turkish
     "tr": "Turkish",
     "turkish": "Turkish",
-    "土耳其语": "Turkish",
     # Hindi
     "hi": "Hindi",
     "hindi": "Hindi",
-    "印地语": "Hindi",
     # Malay
     "ms": "Malay",
     "malay": "Malay",
-    "马来语": "Malay",
     # Dutch
     "nl": "Dutch",
     "dutch": "Dutch",
-    "荷兰语": "Dutch",
     # Swedish
     "sv": "Swedish",
     "swedish": "Swedish",
-    "瑞典语": "Swedish",
     # Danish
     "da": "Danish",
     "danish": "Danish",
-    "丹麦语": "Danish",
     # Finnish
     "fi": "Finnish",
     "finnish": "Finnish",
-    "芬兰语": "Finnish",
     # Polish
     "pl": "Polish",
     "polish": "Polish",
-    "波兰语": "Polish",
     # Czech
     "cs": "Czech",
     "czech": "Czech",
-    "捷克语": "Czech",
     # Filipino
     "fil": "Filipino",
     "filipino": "Filipino",
-    "菲律宾语": "Filipino",
     # Persian
     "fa": "Persian",
     "persian": "Persian",
-    "波斯语": "Persian",
     # Greek
     "el": "Greek",
     "greek": "Greek",
-    "希腊语": "Greek",
     # Hungarian
     "hu": "Hungarian",
     "hungarian": "Hungarian",
-    "匈牙利语": "Hungarian",
     # Macedonian
     "mk": "Macedonian",
     "macedonian": "Macedonian",
-    "马其顿语": "Macedonian",
     # Romanian
     "ro": "Romanian",
     "romanian": "Romanian",
-    "罗马尼亚语": "Romanian",
     # --- Chinese Dialects (22) ---
     # Cantonese
     "yue": "Cantonese",
@@ -567,9 +539,7 @@ def parse_asr_output(raw: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Qwen3-ASR speech recognition with ONNX models."
-        ),
+        description=("Qwen3-ASR speech recognition with ONNX models."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
