@@ -26,8 +26,21 @@ Usage::
     # Continuous mic mode (Ctrl+C to exit)
     python examples/qwen3_asr.py --continuous
 
+    # Force language detection (useful for dialects)
+    # 指定语言（支持方言）
+    python examples/qwen3_asr.py --language zh          # Mandarin / 普通话
+    python examples/qwen3_asr.py --language yue          # Cantonese / 粤语
+    python examples/qwen3_asr.py --language en           # English
+    python examples/qwen3_asr.py --language ja           # Japanese
+
     # Use a different model size
     python examples/qwen3_asr.py --model Qwen/Qwen3-ASR-1.7B
+
+    # GPU inference with half precision
+    python examples/qwen3_asr.py --device cuda --dtype fp16
+
+    # Disable streaming output
+    python examples/qwen3_asr.py --no-stream
 
     # Save ONNX models without running inference
     python examples/qwen3_asr.py --save-to output/qwen3-asr/
@@ -67,6 +80,47 @@ SYSTEM_ID = 8948  # "system"
 USER_ID = 872  # "user"
 ASSISTANT_ID = 77091  # "assistant"
 NEWLINE_ID = 198  # "\n"
+
+# Language / dialect mapping.
+# Keys are CLI aliases; values are the language names used in the model's
+# "language <NAME><asr_text>" generation prefix.
+# 语言/方言映射：键为命令行别名，值为模型使用的语言名称。
+LANGUAGE_MAP: dict[str, str] = {
+    # Auto-detect (default: model decides the language)
+    "auto": "",
+    # Mandarin / 普通话
+    "zh": "Chinese",
+    "chinese": "Chinese",
+    "mandarin": "Chinese",
+    "普通话": "Chinese",
+    # Cantonese / 粤语
+    "yue": "Cantonese",
+    "cantonese": "Cantonese",
+    "粤语": "Cantonese",
+    # Wu / Shanghainese / 上海话
+    "wuu": "Shanghainese",
+    "shanghainese": "Shanghainese",
+    "上海话": "Shanghainese",
+    # Sichuan dialect / 四川话
+    "sichuan": "Sichuan",
+    "四川话": "Sichuan",
+    # Min Nan / Hokkien / 闽南语
+    "minnan": "Minnan",
+    "闽南语": "Minnan",
+    "hokkien": "Minnan",
+    # Hakka / 客家话
+    "hakka": "Hakka",
+    "客家话": "Hakka",
+    # English
+    "en": "English",
+    "english": "English",
+    # Japanese
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    # Korean
+    "ko": "Korean",
+    "korean": "Korean",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +229,8 @@ def transcribe(
     config,
     *,
     max_new_tokens: int = MAX_NEW_TOKENS,
+    language: str = "",
+    stream: bool = True,
 ) -> str:
     """Full ASR pipeline: audio → text.
 
@@ -182,6 +238,11 @@ def transcribe(
     1. Audio encoder: mel spectrogram → audio features
     2. Embedding: fuse text tokens with audio features
     3. Decoder: autoregressive text generation with KV cache
+
+    Args:
+        language: If non-empty, force language by prepending
+            ``language <NAME><asr_text>`` as the assistant prefix.
+        stream: If True, print tokens as they are generated.
     """
     batch_size = 1
 
@@ -215,6 +276,14 @@ def transcribe(
         + [AUDIO_TOKEN_ID] * num_audio_tokens
         + [AUDIO_END_TOKEN_ID, IM_END, NEWLINE_ID, IM_START, ASSISTANT_ID, NEWLINE_ID]
     )
+
+    # When language is forced, append "language <NAME><asr_text>" tokens
+    # as the assistant's initial response to skip language detection.
+    if language:
+        prefix_text = f"language {language}<asr_text>"
+        prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+        prompt_ids.extend(prefix_ids)
+
     input_ids = np.array([prompt_ids], dtype=np.int64)
 
     # Step 4: Run embedding model (fuse text + audio)
@@ -299,7 +368,7 @@ def transcribe(
         # Stream output (skip prefix tokens before <asr_text>)
         if next_token == ASR_TEXT_TOKEN:
             streaming = True
-        elif streaming:
+        elif streaming and stream:
             text = tokenizer.decode([next_token], skip_special_tokens=True)
             print(text, end="", flush=True)
 
@@ -330,34 +399,64 @@ def parse_asr_output(raw: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qwen3-ASR speech recognition with ONNX models.",
+        description=(
+            "Qwen3-ASR speech recognition with ONNX models.\nQwen3-ASR 语音识别（ONNX 模型）。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--model",
         default=MODEL_ID,
-        help="HuggingFace model ID (default: %(default)s).",
+        help="HuggingFace model ID / 模型 ID (default: %(default)s).",
     )
     parser.add_argument(
         "--audio",
         default=None,
-        help="Path to an audio file. If omitted, records from mic.",
+        help="Path to an audio file / 音频文件路径. If omitted, records from mic.",
+    )
+    parser.add_argument(
+        "--language",
+        default="auto",
+        help=(
+            "Force language/dialect / 强制指定语言或方言. "
+            "Options: auto, zh, yue, wuu, sichuan, minnan, hakka, en, ja, ko "
+            "(or: 普通话, 粤语, 上海话, 四川话, 闽南语, 客家话). "
+            "Default: auto (model auto-detects)."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "cuda", "dml"],
+        help="Execution provider / 推理设备 (default: cpu).",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="fp32",
+        choices=["fp32", "fp16"],
+        help="Model precision / 模型精度 (default: fp32).",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming output / 禁用流式输出 (print all at once).",
     )
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Continuously record and transcribe (loop until Ctrl+C).",
+        help="Continuously record and transcribe / 连续识别模式 (loop until Ctrl+C).",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=MAX_NEW_TOKENS,
-        help="Maximum tokens to generate (default: %(default)s).",
+        help="Maximum tokens to generate / 最大生成令牌数 (default: %(default)s).",
     )
     parser.add_argument(
         "--save-to",
         metavar="DIR",
         default=None,
-        help="Save ONNX models to DIR and exit (no inference).",
+        help="Save ONNX models to DIR and exit / 保存模型到目录 (no inference).",
     )
     parser.add_argument(
         "--ci",
@@ -366,9 +465,20 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve language
+    lang_key = args.language.lower().strip()
+    if lang_key not in LANGUAGE_MAP:
+        supported = ", ".join(sorted(set(LANGUAGE_MAP.keys()) - {"auto"}))
+        parser.error(f"Unknown language {args.language!r}. Supported: auto, {supported}")
+    forced_language = LANGUAGE_MAP[lang_key]  # Empty string for "auto"
+
+    # Map dtype flag to mobius dtype string
+    dtype_map = {"fp32": "f32", "fp16": "f16"}
+    dtype = dtype_map[args.dtype]
+
     # Build the 3 ONNX models (auto-detected from model_type)
-    print(f"Building ONNX models from {args.model!r} ...")
-    pkg = build(args.model, dtype="f32", load_weights=not args.save_to)
+    print(f"Building ONNX models from {args.model!r} (dtype={args.dtype}) ...")
+    pkg = build(args.model, dtype=dtype, load_weights=not args.save_to)
     config = pkg.config
 
     if args.save_to:
@@ -377,13 +487,20 @@ def main():
         return
 
     # Create ORT sessions for each model
-    print("Creating inference sessions ...")
-    sessions = {name: OnnxModelSession(model) for name, model in pkg.items()}
+    device = args.device
+    print(f"Creating inference sessions (device={device}) ...")
+    sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
 
     # Load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     print("Ready.\n")
+    if forced_language:
+        print(f"Language: {forced_language} (forced)")
+    else:
+        print("Language: auto-detect")
+
+    stream = not args.no_stream
 
     def do_transcribe(audio_data):
         return transcribe(
@@ -392,6 +509,8 @@ def main():
             audio_data,
             config,
             max_new_tokens=args.max_new_tokens,
+            language=forced_language,
+            stream=stream,
         )
 
     if args.audio:
