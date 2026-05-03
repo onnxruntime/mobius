@@ -427,7 +427,7 @@ def main():
     parser.add_argument(
         "--device",
         default="cpu",
-        choices=["cpu", "cuda", "dml"],
+        choices=["cpu", "cuda"],
         help="Execution provider / 推理设备 (default: cpu).",
     )
     parser.add_argument(
@@ -487,15 +487,9 @@ def main():
         return
 
     # Create ORT sessions for each model.
-    # ort_easy.load() accepts device="cpu"/"cuda"/"webgpu" directly.
-    # For DML, use the providers kwarg with DmlExecutionProvider.
     device = args.device
     print(f"Creating inference sessions (device={device}) ...")
-    if device == "dml":
-        session_kwargs = {"providers": ["DmlExecutionProvider"]}
-    else:
-        session_kwargs = {"device": device}
-    sessions = {name: OnnxModelSession(model, **session_kwargs) for name, model in pkg.items()}
+    sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
 
     # Load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
