@@ -659,8 +659,8 @@ def main():
     parser.add_argument(
         "--chunk-length",
         type=float,
-        default=30.0,
-        help="Audio chunk length in seconds for long files (default: 30).",
+        default=600.0,
+        help="Audio chunk length in seconds for long files (default: 600).",
     )
     parser.add_argument(
         "--save-to",
