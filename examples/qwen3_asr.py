@@ -53,8 +53,8 @@ import argparse
 import sys
 import threading
 
+import ml_dtypes
 import numpy as np
-import ml_dtypes  # noqa: F401 — registers bfloat16 with numpy
 import transformers
 
 from mobius import build
@@ -295,7 +295,9 @@ def compute_mel_spectrogram(
         return_tensors="np",
         padding=False,
     )
-    return out["input_features"].astype(np.float32)  # Always float32; caller casts to model dtype
+    return out["input_features"].astype(
+        np.float32
+    )  # Always float32; caller casts to model dtype
 
 
 # ---------------------------------------------------------------------------
@@ -523,9 +525,12 @@ def transcribe(
             stream_ids.append(next_token)
             if stream:
                 full_text = tokenizer.decode(stream_ids, skip_special_tokens=True)
-                if len(full_text) > printed_len:
-                    print(full_text[printed_len:], end="", flush=True)
-                    printed_len = len(full_text)
+                # Strip trailing replacement chars (incomplete UTF-8 from
+                # multi-token CJK characters) — they'll resolve next iteration.
+                printable = full_text.rstrip("\ufffd")
+                if len(printable) > printed_len:
+                    print(printable[printed_len:], end="", flush=True)
+                    printed_len = len(printable)
 
         for i in range(num_layers):
             past_kv[f"past_key_values.{i}.key"] = out[f"present.{i}.key"]
