@@ -47,16 +47,16 @@ $HOME/cuda13.0/bin/nvcc --version
 ## Step 2: Install cuDNN 9.x
 
 ```bash
-wget https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz
+wget https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.8.0.87_cuda13-archive.tar.xz
 mkdir -p $HOME/cudnn9.8
-tar -xf cudnn-linux-x86_64-9.8.0.87_cuda12-archive.tar.xz \
+tar -xf cudnn-linux-x86_64-9.8.0.87_cuda13-archive.tar.xz \
   -C $HOME/cudnn9.8 --strip-components=1
 ```
 
 Alternative — install cuDNN via pip and create symlinks:
 
 ```bash
-pip install nvidia-cudnn-cu12
+pip install nvidia-cudnn-cu13
 mkdir -p ~/cudnn9/{lib,include}
 CUDNN_PKG=$(python -c "import nvidia.cudnn; import pathlib; print(pathlib.Path(nvidia.cudnn.__file__).parent)")
 ln -sf $CUDNN_PKG/lib/* ~/cudnn9/lib/
