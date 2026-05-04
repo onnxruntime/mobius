@@ -579,6 +579,13 @@ class FunASRForConditionalGeneration(nn.Module):
 
             cleaned[key] = value
 
+        # Transpose FSMN conv weights if needed: (C, K, 1) → (C, 1, K)
+        for key in list(cleaned.keys()):
+            if "fsmn_block.weight" in key:
+                w = cleaned[key]
+                if w.ndim == 3 and w.shape[2] == 1 and w.shape[1] > 1:
+                    cleaned[key] = w.transpose(1, 2)
+
         # Weight tying: embed_tokens → lm_head
         embed_key = "embedding.embed_tokens.weight"
         lm_key = "decoder.lm_head.weight"

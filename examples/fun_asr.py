@@ -243,22 +243,53 @@ def load_audio_file(path: str, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
 def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfig:
     """Build an ArchitectureConfig for Fun-ASR from the HF repo files.
 
-    Fun-ASR uses a config.yaml (not a standard HF config.json with model_type),
-    so we construct the config manually from:
-    - config.yaml: audio encoder and adaptor hyperparameters
-    - Qwen3-0.6B/config.json: LLM backbone hyperparameters
+    Supports two config formats:
+    - config.yaml + Qwen3-0.6B/config.json (original FunAudioLLM format)
+    - config.json (mlx-community format with all config in one file)
     """
     import json
 
-    import yaml
     from huggingface_hub import hf_hub_download
 
-    # Load config.yaml
+    # Try config.json first (mlx-community format)
+    try:
+        cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        if "encoder" in cfg and "llm" in cfg:
+            # mlx-community format: flat config.json
+            enc_raw = cfg["encoder"]
+            adaptor_raw = cfg.get("adaptor", {})
+            llm_cfg = cfg["llm"]
+            enc = {
+                "output_size": enc_raw.get("encoder_dim", 512),
+                "attention_heads": enc_raw.get("num_heads", 4),
+                "linear_units": enc_raw.get("ffn_dim", 2048),
+                "kernel_size": enc_raw.get("kernel_size", 11),
+                "num_blocks": enc_raw.get("num_encoders0", 1)
+                + enc_raw.get("num_encoders", 49),
+                "tp_blocks": enc_raw.get("num_tp_encoders", 20),
+            }
+            adaptor = {
+                "linear_size": adaptor_raw.get("llm_dim", 1024),
+                "num_blocks": adaptor_raw.get("n_layer", 2),
+                "ffn_dim": adaptor_raw.get("ffn_dim", 2048),
+                "attention_heads": adaptor_raw.get("attention_heads", 8),
+            }
+            input_size = enc_raw.get(
+                "input_dim", cfg.get("lfr_m", LFR_M) * cfg.get("n_mels", N_MELS)
+            )
+            return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
+    except Exception:
+        pass
+
+    # Fall back to config.yaml (original format)
+    import yaml
+
     yaml_path = hf_hub_download(model_id, "config.yaml")
     with open(yaml_path) as f:
         cfg = yaml.safe_load(f)
 
-    # Load LLM config (Qwen3-0.6B subfolder)
     llm_subfolder = cfg.get("llm_conf", {}).get("init_param_path", "Qwen3-0.6B")
     llm_config_path = hf_hub_download(model_id, f"{llm_subfolder}/config.json")
     with open(llm_config_path) as f:
@@ -267,12 +298,17 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
     enc = cfg.get("audio_encoder_conf", {})
     adaptor = cfg.get("audio_adaptor_conf", {})
     frontend = cfg.get("frontend_conf", {})
-
-    # input_size = lfr_m * n_mels (7 * 80 = 560)
     lfr_m = frontend.get("lfr_m", LFR_M)
     n_mels = frontend.get("n_mels", N_MELS)
     input_size = lfr_m * n_mels
 
+    return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
+
+
+def _build_config(
+    enc: dict, adaptor: dict, llm_cfg: dict, input_size: int, dtype: str
+) -> ArchitectureConfig:
+    """Build ArchitectureConfig from parsed encoder/adaptor/llm dicts."""
     from onnx_ir import DataType
 
     dtype_map = {"f32": DataType.FLOAT, "f16": DataType.FLOAT16, "bf16": DataType.BFLOAT16}
@@ -661,12 +697,17 @@ def main():
     print(f"Creating inference sessions (device={device}) ...")
     sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
 
-    # Load tokenizer from the Qwen3-0.6B subfolder
+    # Load tokenizer — try subfolder first (original format), then root
     import transformers
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.model, subfolder="Qwen3-0.6B", trust_remote_code=True
-    )
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model, subfolder="Qwen3-0.6B", trust_remote_code=True
+        )
+    except Exception:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True
+        )
 
     print("Ready.\n")
     if forced_language:
