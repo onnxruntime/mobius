@@ -21,8 +21,8 @@ HuggingFace class: FunASRForConditionalGeneration
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import numpy as np
+import onnx_ir as ir
 import torch
 from onnxscript import nn
 from onnxscript._internal import builder
@@ -42,8 +42,23 @@ from mobius.components._sanm_attention import (
     SANMEncoderLayer,
 )
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+def _sinusoidal_position_embedding(max_positions: int, d_model: int) -> np.ndarray:
+    """Compute sinusoidal positional embeddings (1-indexed, like FunASR).
+
+    Uses log-timescale increments. Layout: [sin, cos] per position.
+    Positions are 1-indexed: arange(1, max_positions+1).
+    """
+    channels = d_model
+    log_timescale_increment = np.log(10000.0) / (channels // 2 - 1)
+    inv_timescales = np.exp(
+        -log_timescale_increment * np.arange(channels // 2, dtype=np.float32)
+    )
+    # 1-indexed positions (FunASR convention)
+    positions = np.arange(1, max_positions + 1, dtype=np.float32)
+    scaled_time = positions[:, np.newaxis] * inv_timescales[np.newaxis, :]
+    pe = np.concatenate([np.sin(scaled_time), np.cos(scaled_time)], axis=1)
+    return pe.astype(np.float32)
 
 
 # ── Audio Encoder ──────────────────────────────────────────────────────
@@ -78,6 +93,18 @@ class FunASRAudioEncoder(nn.Module):
         kernel_size = audio.kernel_size or 11
         num_blocks = audio.num_blocks or 50
         tp_blocks = audio.tp_num_blocks or 20
+
+        self._hidden_size = hidden_size
+        self._input_size = input_size
+
+        # Sinusoidal positional encoding (precomputed, input_dim = input_size)
+        max_positions = 6000  # max LFR frames for ~6 min audio
+        pe_data = _sinusoidal_position_embedding(max_positions, input_size)
+        self.positional_embedding = nn.Parameter(
+            [max_positions, input_size],
+            name="positional_embedding",
+            data=ir.tensor(pe_data),
+        )
 
         # Stack 1: 1 layer projecting input_size → hidden_size
         self.encoders0 = nn.ModuleList(
@@ -114,7 +141,24 @@ class FunASRAudioEncoder(nn.Module):
             audio_features: ``(batch, seq_len // 2, llm_hidden_size)``
         """
         # input_features: (batch, seq_len, input_dim)
-        hidden_states = input_features
+
+        # Step 1: Scale input by sqrt(hidden_size) (FunASR convention)
+        scale = float(self._hidden_size**0.5)
+        hidden_states = op.Mul(
+            input_features,
+            op.CastLike(op.Constant(value_float=scale), input_features),
+        )
+
+        # Step 2: Add sinusoidal positional encoding (input_dim, before projection)
+        seq_len = op.Shape(hidden_states, start=1, end=2)
+        pe_slice = op.Slice(
+            self.positional_embedding,
+            op.Constant(value_ints=[0]),
+            seq_len,
+            op.Constant(value_ints=[0]),
+        )
+        pe_slice = op.CastLike(pe_slice, hidden_states)
+        hidden_states = op.Add(hidden_states, pe_slice)
 
         # Stack 1: input projection (560 → 512)
         for layer in self.encoders0:
