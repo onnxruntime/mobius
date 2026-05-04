@@ -216,8 +216,6 @@ def _save_package(
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
     if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
-        import logging
-
         logging.getLogger(__name__).warning(
             "Safetensors external data does not guarantee 256-byte offset "
             "alignment, which can cause CUBLAS misaligned address errors on "
