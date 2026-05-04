@@ -78,13 +78,34 @@ N_MELS = 80  # Mel filter bank bins
 # Language mapping for Fun-ASR-Nano-2512 (zh, en, ja).
 # Values are Chinese language names used in the prompt (fullwidth colon is required).
 LANGUAGE_MAP: dict[str, str] = {
+    # Standard language codes
     "auto": "",
     "zh": "中文",
-    "chinese": "中文",
     "en": "英文",
-    "english": "英文",
     "ja": "日文",
+    # English aliases
+    "chinese": "中文",
+    "english": "英文",
     "japanese": "日文",
+    "hakka": "客家话",
+    "cantonese": "粤语",
+    "yue": "粤语",
+    "wu": "吴语",
+    "minnan": "闽南语",
+    "gan": "赣语",
+    "xiang": "湘语",
+    "jin": "晋语",
+    # Chinese names (pass-through)
+    "中文": "中文",
+    "英文": "英文",
+    "日文": "日文",
+    "客家话": "客家话",
+    "粤语": "粤语",
+    "吴语": "吴语",
+    "闽南语": "闽南语",
+    "赣语": "赣语",
+    "湘语": "湘语",
+    "晋语": "晋语",
 }
 
 
