@@ -29,19 +29,19 @@ Use this skill when:
 ## Step 1: Install CUDA toolkit
 
 ```bash
-# CUDA 12.8
-wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
-sudo sh cuda_12.8.1_570.124.06_linux.run \
-  --toolkit --toolkitpath=$HOME/cuda12.8 \
+# CUDA 13.0
+wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_13.0.1_575.51.03_linux.run
+sudo sh cuda_13.0.1_575.51.03_linux.run \
+  --toolkit --toolkitpath=$HOME/cuda13.0 \
   --silent --override --no-man-page
 
-# Or CUDA 13.0 if available — adjust the URL and path accordingly
+# Or adjust the URL and path for a different CUDA version
 ```
 
 Verify:
 
 ```bash
-$HOME/cuda12.8/bin/nvcc --version
+$HOME/cuda13.0/bin/nvcc --version
 ```
 
 ## Step 2: Install cuDNN 9.x
@@ -67,8 +67,8 @@ ln -sf $CUDNN_PKG/include/* ~/cudnn9/include/
 ## Step 3: Set environment
 
 ```bash
-export PATH=$HOME/cuda12.8/bin:$PATH
-export LD_LIBRARY_PATH=$HOME/cuda12.8/lib64:$HOME/cudnn9.8/lib:$LD_LIBRARY_PATH
+export PATH=$HOME/cuda13.0/bin:$PATH
+export LD_LIBRARY_PATH=$HOME/cuda13.0/lib64:$HOME/cudnn9.8/lib:$LD_LIBRARY_PATH
 ```
 
 Add these to your shell profile (`~/.bashrc`) or conda
@@ -83,7 +83,7 @@ cd ~/dev/onnxruntime
 ./build.sh \
   --config Release \
   --use_cuda \
-  --cuda_home $HOME/cuda12.8 \
+  --cuda_home $HOME/cuda13.0 \
   --cudnn_home $HOME/cudnn9.8 \
   --cmake_extra_defines \
     CMAKE_CUDA_ARCHITECTURES=native \
@@ -153,7 +153,7 @@ cd ~/dev/onnxruntime-genai
 python build.py \
   --config Release \
   --use_cuda \
-  --cuda_home $HOME/cuda12.8 \
+  --cuda_home $HOME/cuda13.0 \
   --ort_home ~/ort-install \
   --parallel \
   --skip_tests \
@@ -206,7 +206,7 @@ CUDA EP missing from providers.
 **Fix:**
 
 ```bash
-export LD_LIBRARY_PATH=$HOME/cuda12.8/lib64:$HOME/cudnn9.8/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$HOME/cuda13.0/lib64:$HOME/cudnn9.8/lib:$LD_LIBRARY_PATH
 ```
 
 ### 3. pip packages overriding custom builds
