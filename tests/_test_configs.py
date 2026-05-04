@@ -2316,6 +2316,22 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     ("speecht5", {}, False),
     ("voxtral_encoder", {}, False),
     ("mctct", {}, False),
+    # --- SenseVoiceSmall (CTC encoder-only ASR) ---
+    (
+        "sensevoice_small",
+        {
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                num_blocks=3,
+                tp_num_blocks=2,
+            ),
+        },
+        True,
+    ),
 ]
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS

@@ -117,6 +117,7 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
@@ -511,6 +512,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
     ),
+    "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
     "whisper": ModelRegistration(
