@@ -761,6 +761,4 @@ class TestGenaiConfigGeneratorEp:
             session_opts = config["model"][block]["session_options"]
             provider_options = session_opts["provider_options"]
             assert len(provider_options) == 1, f"{block} missing CUDA provider options"
-            assert "cuda" in provider_options[0], (
-                f"{block} has wrong EP in provider_options"
-            )
+            assert "cuda" in provider_options[0], f"{block} has wrong EP in provider_options"
