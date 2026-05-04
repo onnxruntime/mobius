@@ -98,10 +98,40 @@ def apply_lfr(fbank: np.ndarray, lfr_m: int = LFR_M, lfr_n: int = LFR_N) -> np.n
     return np.stack(lfr_frames, axis=0)  # (T_lfr, lfr_m * d)
 
 
-def preprocess_audio(waveform: np.ndarray) -> np.ndarray:
-    """Full frontend: fbank → LFR → (1, T, 560)."""
+def load_cmvn(cmvn_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load CMVN stats from Kaldi am.mvn file.
+
+    Returns (means, vars) arrays of shape (560,) each.
+    CMVN is applied as: features = (features + means) * vars
+    """
+    with open(cmvn_path) as f:
+        lines = f.readlines()
+    means = None
+    variances = None
+    for i, line in enumerate(lines):
+        parts = line.split()
+        if parts[0] == "<AddShift>":
+            next_parts = lines[i + 1].split()
+            if next_parts[0] == "<LearnRateCoef>":
+                means = np.array(next_parts[3:-1], dtype=np.float32)
+        elif parts[0] == "<Rescale>":
+            next_parts = lines[i + 1].split()
+            if next_parts[0] == "<LearnRateCoef>":
+                variances = np.array(next_parts[3:-1], dtype=np.float32)
+    assert means is not None and variances is not None, "Failed to parse am.mvn"
+    return means, variances
+
+
+def preprocess_audio(
+    waveform: np.ndarray,
+    cmvn: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Full frontend: fbank → LFR → CMVN → (1, T, 560)."""
     fbank = compute_fbank(waveform)
     lfr = apply_lfr(fbank)
+    if cmvn is not None:
+        means, variances = cmvn
+        lfr = (lfr + means) * variances
     return lfr[np.newaxis, :, :]  # (1, T, 560)
 
 
@@ -243,6 +273,12 @@ def main():
         choices=["f32", "f16", "bf16"],
         help="Model precision (default: f32).",
     )
+    parser.add_argument(
+        "--chunk-length",
+        type=float,
+        default=30.0,
+        help="Audio chunk length in seconds for long files (default: 30).",
+    )
     args = parser.parse_args()
 
     # Resolve language
@@ -282,6 +318,15 @@ def main():
     with open(tok_path) as f:
         tokens = json.load(f)
 
+    # Load CMVN stats
+    try:
+        cmvn_path = hf_hub_download(args.model, "am.mvn")
+        cmvn = load_cmvn(cmvn_path)
+        print("CMVN: loaded from am.mvn")
+    except Exception:
+        cmvn = None
+        print("CMVN: not available (skipping)")
+
     print("Ready.\n")
     lang_name = {0: "auto", 3: "zh", 4: "en", 7: "yue", 11: "ja", 12: "ko"}.get(
         language_id, str(language_id)
@@ -296,16 +341,36 @@ def main():
     audio = load_audio_file(args.audio)
     print(f"Audio: {len(audio) / SAMPLE_RATE:.1f}s\n")
 
-    # Preprocess
-    input_features = preprocess_audio(audio).astype(np.float32)
     language_ids = np.array([[language_id]], dtype=np.int64)
 
-    # Run inference
-    out = session.run({"input_features": input_features, "language_id": language_ids})
-    logits = out["logits"][0]  # (T, vocab)
+    def transcribe_chunk(chunk_audio: np.ndarray) -> str:
+        """Transcribe a single audio chunk."""
+        input_features = preprocess_audio(chunk_audio, cmvn=cmvn).astype(np.float32)
+        out = session.run({"input_features": input_features, "language_id": language_ids})
+        logits = out["logits"][0]  # (T, vocab)
+        return ctc_greedy_decode(logits, tokens, blank_id=0)
 
-    # CTC decode
-    text = ctc_greedy_decode(logits, tokens, blank_id=0)
+    # Chunked transcription for long audio
+    samples_per_chunk = int(args.chunk_length * SAMPLE_RATE)
+    total_samples = len(audio)
+
+    if total_samples <= samples_per_chunk:
+        text = transcribe_chunk(audio)
+    else:
+        num_chunks = (total_samples + samples_per_chunk - 1) // samples_per_chunk
+        results = []
+        for i in range(num_chunks):
+            start = i * samples_per_chunk
+            end = min(start + samples_per_chunk, total_samples)
+            chunk = audio[start:end]
+            if len(chunk) < SAMPLE_RATE * 0.3:
+                continue
+            print(f"[Chunk {i + 1}/{num_chunks}] ", end="", flush=True)
+            chunk_text = transcribe_chunk(chunk)
+            print(chunk_text)
+            results.append(chunk_text.strip())
+        text = " ".join(results)
+
     print(f"\U0001f4dd Result: {text}")
 
 
