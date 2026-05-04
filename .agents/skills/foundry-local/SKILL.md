@@ -290,8 +290,11 @@ a new model_type registered), build both from source:
 3. Install both wheels, then install `foundry-local-sdk`, then
    **reinstall your custom wheels** (see warning above)
 
-For the full build tutorial with step-by-step instructions, see
-[issue #245](https://github.com/onnxruntime/mobius/issues/245).
+See the **building-ort-genai** skill
+(`.agents/skills/building-ort-genai/SKILL.md`) for the full
+step-by-step guide, and
+[issue #245](https://github.com/onnxruntime/mobius/issues/245) for a
+complete end-to-end tutorial.
 
 ### 3. No CUDA EP in pip SDK version
 
@@ -373,6 +376,7 @@ foundry model run qwen2.5-7b
 
 ## Cross-references
 
+- **Building ORT/GenAI:** `.agents/skills/building-ort-genai/SKILL.md`
 - **Exporting models:** `.agents/skills/onnx-export-quantization/SKILL.md`
 - **ORT GenAI config:** `.agents/skills/ort-genai-config/SKILL.md`
 - **Quality checklist (L5):** `.agents/skills/quality-checklist/SKILL.md`
