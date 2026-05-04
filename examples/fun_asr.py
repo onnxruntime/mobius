@@ -129,8 +129,15 @@ def apply_lfr(fbank: np.ndarray, lfr_m: int = LFR_M, lfr_n: int = LFR_N) -> np.n
     Stacks ``lfr_m`` consecutive frames and subsamples every ``lfr_n`` frames,
     producing features of dimension ``lfr_m * n_mels`` (typically 7*80 = 560).
 
+    Left-pads by ``(lfr_m - 1) // 2`` frames (FunASR convention) so that the
+    first output frame is centered on the first input frame.
+
     Returns array of shape ``(T_out, lfr_m * n_mels)``.
     """
+    # Left-pad by (lfr_m - 1) // 2 frames (FunASR convention)
+    left_pad = (lfr_m - 1) // 2  # = 3 for lfr_m=7
+    fbank = np.pad(fbank, ((left_pad, 0), (0, 0)), mode="edge")
+
     num_frames = fbank.shape[0]
     # Pad to multiple of lfr_n
     pad_len = (lfr_n - (num_frames % lfr_n)) % lfr_n

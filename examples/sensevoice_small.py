@@ -84,10 +84,18 @@ def compute_fbank(
 
 
 def apply_lfr(fbank: np.ndarray, lfr_m: int = LFR_M, lfr_n: int = LFR_N) -> np.ndarray:
-    """Apply Low Frame Rate (LFR) stacking: stack lfr_m frames, stride lfr_n."""
+    """Apply Low Frame Rate (LFR) stacking: stack lfr_m frames, stride lfr_n.
+
+    Left-pads by ``(lfr_m - 1) // 2`` frames (FunASR convention) so that the
+    first output frame is centered on the first input frame.
+    """
+    # Left-pad by (lfr_m - 1) // 2 frames (FunASR convention)
+    left_pad = (lfr_m - 1) // 2  # = 3 for lfr_m=7
+    fbank = np.pad(fbank, ((left_pad, 0), (0, 0)), mode="edge")
+
     t, _d = fbank.shape
     num_lfr = (t + lfr_n - 1) // lfr_n
-    # Pad to multiple of lfr_n
+    # Pad to ensure enough frames for the last window
     pad_len = num_lfr * lfr_n + (lfr_m - lfr_n) - t
     if pad_len > 0:
         fbank = np.pad(fbank, ((0, pad_len), (0, 0)), mode="edge")
