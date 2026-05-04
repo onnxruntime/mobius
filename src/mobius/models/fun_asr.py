@@ -5,8 +5,8 @@
 
 Architecture:
   - Audio encoder (SenseVoiceEncoderSmall + adaptor): 3 stacks of SANM layers
-    with temporal pooling, then a 2-layer MLP + 2 transformer blocks
-    projecting 512→1024 (LLM hidden dimension).
+    followed by a 2-layer MLP + 2 transformer blocks projecting 512→1024
+    (LLM hidden dimension). Sequence length is preserved (no temporal pooling).
   - Text decoder: Qwen3-0.6B (reused from existing Qwen3 decoder code).
   - Fusion: Audio features (already LLM-dim) replace audio_token_id positions
     in text embeddings.
@@ -68,8 +68,8 @@ class FunASRAudioEncoder(nn.Module):
     """Fun-ASR Nano audio encoder: SenseVoiceEncoderSmall + adaptor.
 
     Three stacks of SANM (Self-Attention with Normalization and Memory)
-    encoder layers with temporal pooling between the second and third stack,
-    followed by an adaptor that projects to the LLM hidden dimension:
+    encoder layers (sequence length is preserved throughout), followed by
+    an adaptor that projects to the LLM hidden dimension:
 
     1. ``encoders0``: 1 SANM layer projecting input_dim (560) → hidden_dim (512)
     2. ``encoders``: N-1 SANM layers at hidden_dim (512)
@@ -119,7 +119,7 @@ class FunASRAudioEncoder(nn.Module):
         )
         self.after_norm = LayerNorm(hidden_size)
 
-        # Stack 3: tp_blocks layers at hidden_size (after temporal pooling)
+        # Stack 3: tp_blocks layers at hidden_size (refinement, no temporal pooling)
         self.tp_encoders = nn.ModuleList(
             [
                 SANMEncoderLayer(hidden_size, hidden_size, n_heads, ffn_dim, kernel_size)

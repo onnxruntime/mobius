@@ -65,7 +65,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
+MODEL_ID = "justinchuby/Fun-ASR-Nano-2512"
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 60
 MAX_NEW_TOKENS = 4096
@@ -328,6 +328,7 @@ def transcribe(
     language: str = "",
     stream: bool = True,
     model_dtype: np.dtype = np.float32,
+    embed_table: np.ndarray | None = None,
 ) -> str:
     """Full ASR pipeline: audio → text.
 
@@ -341,6 +342,9 @@ def transcribe(
             ``language <NAME>`` as the assistant prefix.
         stream: If True, print tokens as they are generated.
         model_dtype: Numpy dtype matching the model precision.
+        embed_table: Pre-extracted embedding weight table for decode steps.
+            Used to avoid token_id=0 collision with the audio placeholder
+            during autoregressive decoding.
     """
     batch_size = 1
 
@@ -437,13 +441,19 @@ def transcribe(
         if next_token in eos_ids:
             break
 
-        # Decode step: embed single token (no audio features)
-        cur_ids = np.array([[next_token]], dtype=np.int64)
-        dummy_audio = np.zeros((0, audio_features_2d.shape[-1]), dtype=model_dtype)
-        embed_out = sessions["embedding"].run(
-            {"input_ids": cur_ids, "audio_features": dummy_audio}
-        )
-        cur_embeds = embed_out["inputs_embeds"]
+        # Decode step: embed single token via numpy lookup.
+        # Avoids using the ONNX embedding model to prevent token_id=0
+        # collision with the audio placeholder during autoregressive decoding.
+        if embed_table is not None:
+            cur_embeds = embed_table[next_token][np.newaxis, np.newaxis, :]
+            cur_embeds = cur_embeds.astype(model_dtype)
+        else:
+            cur_ids = np.array([[next_token]], dtype=np.int64)
+            dummy_audio = np.zeros((0, audio_features_2d.shape[-1]), dtype=model_dtype)
+            embed_out = sessions["embedding"].run(
+                {"input_ids": cur_ids, "audio_features": dummy_audio}
+            )
+            cur_embeds = embed_out["inputs_embeds"]
 
         total_seq_len = past_seq_len + 1
         position_ids = np.array([[past_seq_len]], dtype=np.int64)  # (1, 1)
@@ -585,8 +595,9 @@ def main():
     parser.add_argument(
         "--chunk-length",
         type=float,
-        default=600.0,
-        help="Audio chunk length in seconds for long files (default: 600).",
+        default=30.0,
+        help="Audio chunk length in seconds for long files (default: 30). "
+        "Must be ≤360s to stay within the encoder's 6000-frame PE table.",
     )
     parser.add_argument(
         "--save-to",
@@ -624,21 +635,25 @@ def main():
         print(f"Saved to {args.save_to}")
         return
 
-    # Apply weights from HF checkpoint.
-    # Fun-ASR stores weights in model.pt (a single PyTorch checkpoint),
-    # not the standard HuggingFace safetensors layout.
-    import torch
+    # Apply weights from safetensors checkpoint on HuggingFace Hub.
     from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
 
-    weights_path = hf_hub_download(args.model, "model.pt")
-    # weights_only=False required: model.pt uses pickle format with nested
-    # state_dict structure, not safetensors
-    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
-    # model.pt wraps the actual weights in a 'state_dict' key
-    state_dict = checkpoint.get("state_dict", checkpoint)
+    weights_path = hf_hub_download(args.model, "model.safetensors")
+    state_dict = load_file(weights_path)
     if hasattr(module, "preprocess_weights"):
         state_dict = module.preprocess_weights(state_dict)
     prefix_map = getattr(module, "weight_prefix_map", None)
+
+    # Extract embedding table for decode steps before apply_weights consumes it.
+    # This avoids token_id=0 collision with the audio placeholder when the
+    # model generates token 0 during autoregressive decoding.
+    embed_table = None
+    for key, tensor in state_dict.items():
+        if "embed_tokens.weight" in key:
+            embed_table = tensor.float().numpy()
+            break
+
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
 
     # Create ORT sessions for each model
@@ -673,6 +688,7 @@ def main():
         language=forced_language,
         stream=do_stream,
         model_dtype=np_dtype,
+        embed_table=embed_table,
     )
 
     def do_transcribe(audio_data):
