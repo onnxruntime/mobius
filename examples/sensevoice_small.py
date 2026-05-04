@@ -194,26 +194,35 @@ def ctc_greedy_decode(logits: np.ndarray, tokens: list[str], blank_id: int = 0) 
 
 
 def build_sensevoice_config(model_id: str, dtype: str = "f32") -> ArchitectureConfig:
-    """Build ArchitectureConfig from HF repo config.yaml."""
-    import yaml
+    """Build ArchitectureConfig from HF repo (config.json or config.yaml)."""
     from huggingface_hub import hf_hub_download
 
-    yaml_path = hf_hub_download(model_id, "config.yaml")
-    with open(yaml_path) as f:
-        cfg = yaml.safe_load(f)
+    # Try config.json first (mlx-community format), fall back to config.yaml
+    try:
+        cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception:
+        import yaml
+
+        cfg_path = hf_hub_download(model_id, "config.yaml")
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
 
     enc = cfg.get("encoder_conf", {})
     frontend = cfg.get("frontend_conf", {})
 
     lfr_m = frontend.get("lfr_m", LFR_M)
     n_mels = frontend.get("n_mels", N_MELS)
-    input_size = lfr_m * n_mels
+    input_size = cfg.get("input_size", lfr_m * n_mels)
+    vocab_size = cfg.get("vocab_size", None)
 
-    # Load tokens.json for vocab_size
-    tok_path = hf_hub_download(model_id, "tokens.json")
-    with open(tok_path) as f:
-        tokens = json.load(f)
-    vocab_size = len(tokens)
+    # If vocab_size not in config, try tokens.json
+    if vocab_size is None:
+        tok_path = hf_hub_download(model_id, "tokens.json")
+        with open(tok_path) as f:
+            tokens_list = json.load(f)
+        vocab_size = len(tokens_list)
 
     from onnx_ir import DataType
 
@@ -313,10 +322,29 @@ def main():
     print(f"Creating inference session (device={args.device}) ...")
     session = OnnxModelSession(pkg["model"], device=args.device)
 
-    # Load tokens
-    tok_path = hf_hub_download(args.model, "tokens.json")
-    with open(tok_path) as f:
-        tokens = json.load(f)
+    # Load tokens vocabulary
+    tokens = None
+    try:
+        tok_path = hf_hub_download(args.model, "tokens.json")
+        with open(tok_path) as f:
+            tokens = json.load(f)
+    except Exception:
+        pass
+
+    if tokens is None:
+        # Fall back to sentencepiece BPE model
+        try:
+            import sentencepiece as spm
+
+            bpe_path = hf_hub_download(args.model, "chn_jpn_yue_eng_ko_spectok.bpe.model")
+            sp = spm.SentencePieceProcessor(model_file=bpe_path)
+            tokens = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
+            # Pad to vocab_size if needed
+            while len(tokens) < config.vocab_size:
+                tokens.append(f"<extra_{len(tokens)}>")
+        except Exception as e:
+            print(f"Warning: Could not load tokens ({e})")
+            tokens = [f"<id_{i}>" for i in range(config.vocab_size)]
 
     # Load CMVN stats
     try:
