@@ -54,7 +54,7 @@ from mobius.models.base import CausalLMModel
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
-    from mobius.components._attention import GQAContext
+    from mobius.components._attention import GQAContext, StaticCacheState
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +874,7 @@ class Gemma4TextAttention(nn.Module):
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
         is_causal: int = 1,
+        static_cache: StaticCacheState | None = None,
     ):
         from mobius.components._attention import (
             GQAContext,
@@ -1123,6 +1124,7 @@ class Gemma4TextAttention(nn.Module):
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
+                static_cache=static_cache,
                 is_causal=is_causal,
             )
 
@@ -1332,9 +1334,19 @@ class Gemma4DecoderLayer(nn.Module):
         position_embeddings: tuple | None,
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
-        past_key_value: tuple | None,
+        past_key_value: tuple | StaticCacheState | None,
         is_causal: int = 1,
     ):
+        # Dispatch StaticCacheState: extract it from past_key_value so that
+        # the attention module receives it as a separate parameter.
+        from mobius.components._attention import StaticCacheState
+
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
+            past_key_value = None
+        else:
+            static_cache = None
+
         # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
@@ -1345,6 +1357,7 @@ class Gemma4DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             shared_kv_states=shared_kv_states,
             past_key_value=past_key_value,
+            static_cache=static_cache,
             is_causal=is_causal,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
@@ -1810,7 +1823,7 @@ class Gemma4TextModel(nn.Module):
         self,
         op: OpBuilder,
         input_ids: ir.Value | None,
-        attention_mask: ir.Value,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
@@ -1850,7 +1863,6 @@ class Gemma4TextModel(nn.Module):
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
-
         # Bidirectional vision-block overlay (Gemma4 larger models). When
         # active, contiguous vision-token blocks attend bidirectionally on
         # BOTH full and sliding layers. This cannot be expressed by the
@@ -1886,8 +1898,12 @@ class Gemma4TextModel(nn.Module):
             )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 
+        # Static cache mode: attention_mask is None, skip GQA and fallback
+        # mask construction — the Attention op uses is_causal=1 with
+        # nonpad_kv_seqlen for masking instead.
+        static_cache_mode = attention_mask is None
         use_gqa = (
-            attention_mask is not None
+            not static_cache_mode
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
             and not use_block_overlay
@@ -1959,7 +1975,9 @@ class Gemma4TextModel(nn.Module):
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa
-        if need_fallback:
+        if need_fallback and not static_cache_mode:
+            # Static cache mode skips mask construction entirely — the
+            # Attention op handles masking via is_causal=1 + nonpad_kv_seqlen.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
@@ -2003,9 +2021,13 @@ class Gemma4TextModel(nn.Module):
         ):
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
-            # Per-layer decision: use GQA when available. KV-shared layers
-            # also use GQA (with empty K/V and shared past buffer).
-            if use_gqa:
+            # Per-layer decision: use GQA when available.
+            # Static cache mode: no GQA, no fallback bias — Attention op
+            # uses is_causal=1 + nonpad_kv_seqlen from the StaticCacheState.
+            if static_cache_mode:
+                attn_bias = None
+                pos_emb = position_embeddings_dict[layer_type]
+            elif use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:

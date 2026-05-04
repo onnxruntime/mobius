@@ -41,6 +41,86 @@ from mobius.tasks._cache_utils import (
 )
 
 
+def _make_gemma4_static_cache_inputs(
+    builder: GraphBuilder,
+    config: Gemma4Config,
+    batch: ir.SymbolicDim,
+    max_seq_len: int,
+) -> list:
+    """Create per-layer static KV cache inputs for Gemma4.
+
+    Like :func:`_make_gemma4_kv_cache_inputs` but creates pre-allocated
+    fixed-size cache buffers ``[B, max_seq_len, kv_hidden]`` for use with
+    TensorScatter.  KV-shared layers get ``None`` entries (no own cache).
+
+    Returns a list with one entry per decoder layer:
+    - :class:`StaticCacheState` for layers with independent KV projections
+    - ``None`` for KV-shared layers
+    """
+    from mobius.components._attention import StaticCacheState
+
+    local_head_dim = config.head_dim
+    global_head_dim = config.global_head_dim or config.head_dim
+    num_kv_shared = config.num_kv_shared_layers or 0
+    num_kv_layers = config.num_hidden_layers - num_kv_shared
+    layer_types = config.layer_types or (
+        ["sliding_attention"] * config.num_hidden_layers
+    )
+
+    # Shared control inputs
+    write_indices = builder.input(
+        "write_indices",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
+    )
+    nonpad_kv_seqlen = builder.input(
+        "nonpad_kv_seqlen",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
+    )
+
+    cache_states: list[StaticCacheState] = []
+    for i in range(num_kv_layers):
+        lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
+        hd = global_head_dim if lt == "full_attention" else local_head_dim
+        is_full = lt == "full_attention"
+        if is_full and config.num_global_key_value_heads is not None:
+            kv_heads = config.num_global_key_value_heads
+        else:
+            kv_heads = config.num_key_value_heads
+
+        kv_hidden = kv_heads * hd
+        key_cache = builder.input(
+            f"key_cache.{i}",
+            dtype=config.dtype,
+            shape=[batch, max_seq_len, kv_hidden],
+        )
+        value_cache = builder.input(
+            f"value_cache.{i}",
+            dtype=config.dtype,
+            shape=[batch, max_seq_len, kv_hidden],
+        )
+        cache_states.append(
+            StaticCacheState(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                write_indices=write_indices,
+                nonpad_kv_seqlen=nonpad_kv_seqlen,
+            )
+        )
+
+    # Expand to full per-layer list: StaticCacheState for non-shared,
+    # None for KV-shared layers (matching the dynamic cache pattern).
+    state_iter = iter(cache_states)
+    full_list: list = []
+    for i in range(config.num_hidden_layers):
+        if i >= num_kv_layers:
+            full_list.append(None)
+        else:
+            full_list.append(next(state_iter))
+    return full_list
+
+
 def _make_gemma4_kv_cache_inputs(
     builder: GraphBuilder,
     config: Gemma4Config,
@@ -112,7 +192,10 @@ class Gemma4TextCausalLMTask(ModelTask):
     - the last ``config.num_kv_shared_layers`` layers share K,V and have no
       independent cache entries
 
-    Inputs:
+    Supports ``static_cache=True`` for pre-allocated TensorScatter-based
+    KV cache (requires ORT ≥ 1.25.0).
+
+    Inputs (dynamic cache):
         - input_ids: [batch, sequence_len] INT64
         - attention_mask: [batch, past_seq_len + seq_len] INT64
         - position_ids: [batch, sequence_len] INT64
@@ -120,16 +203,51 @@ class Gemma4TextCausalLMTask(ModelTask):
     Outputs:
         - logits: FLOAT
         - present.{i}.key / present.{i}.value for i in 0..num_kv_layers-1
+
+    Inputs (static cache):
+        - input_ids: [batch, sequence_len] INT64
+        - position_ids: [batch, sequence_len] INT64
+        - key_cache.{i} / value_cache.{i}: [batch, max_seq_len, kv_hidden]
+        - write_indices: [batch] INT64
+        - nonpad_kv_seqlen: [batch] INT64
+    Outputs:
+        - logits: FLOAT
+        - updated_key_cache.{i} / updated_value_cache.{i}
     """
+
+    def __init__(
+        self,
+        *,
+        static_cache: bool = False,
+        max_seq_len: int | None = None,
+    ):
+        self._static_cache = static_cache
+        self._max_seq_len = max_seq_len
 
     def build(
         self,
         module: nn.Module,
         config: Gemma4Config,
     ) -> ModelPackage:
+        from mobius.tasks._causal_lm import (
+            _register_static_cache_outputs,
+            _validate_static_cache_support,
+        )
+
+        static = self._static_cache
+
+        if static:
+            max_seq_len = self._max_seq_len
+            if max_seq_len is None:
+                max_seq_len = getattr(config, "max_position_embeddings", None)
+            if max_seq_len is None or max_seq_len <= 0:
+                raise ValueError(
+                    "max_seq_len must be a positive integer for static cache."
+                )
+            _validate_static_cache_support(module)
+
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
-        past_seq_len = ir.SymbolicDim("past_sequence_len")
 
         graph, builder = _make_graph()
         op = builder.op
@@ -139,18 +257,32 @@ class Gemma4TextCausalLMTask(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        attention_mask = builder.input(
-            "attention_mask",
-            dtype=ir.DataType.INT64,
-            shape=[batch, "past_seq_len + seq_len"],
-        )
-        position_ids = builder.input(
-            "position_ids",
-            dtype=ir.DataType.INT64,
-            shape=[batch, seq_len],
-        )
 
-        past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
+        if static:
+            attention_mask = None
+            position_ids = builder.input(
+                "position_ids",
+                dtype=ir.DataType.INT64,
+                shape=[batch, seq_len],
+            )
+            past_key_values = _make_gemma4_static_cache_inputs(
+                builder, config, batch, max_seq_len,
+            )
+        else:
+            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            attention_mask = builder.input(
+                "attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, "past_seq_len + seq_len"],
+            )
+            position_ids = builder.input(
+                "position_ids",
+                dtype=ir.DataType.INT64,
+                shape=[batch, seq_len],
+            )
+            past_key_values = _make_gemma4_kv_cache_inputs(
+                builder, config, batch, past_seq_len,
+            )
 
         logits, present_key_values = module(
             op,
@@ -160,7 +292,11 @@ class Gemma4TextCausalLMTask(ModelTask):
             past_key_values=past_key_values,
         )
         builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(builder, present_key_values)
+
+        if static:
+            _register_static_cache_outputs(builder, present_key_values)
+        else:
+            _register_kv_cache_outputs(builder, present_key_values)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 

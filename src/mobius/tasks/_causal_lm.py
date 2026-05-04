@@ -427,10 +427,22 @@ def _validate_static_cache_support(module: nn.Module) -> None:
         TypeError: If any decoder layer is not a supported type.
     """
     from mobius.components._decoder import DecoderLayer
+    from mobius.models.gemma4 import Gemma4DecoderLayer
     from mobius.models.moe import MoEDecoderLayer
 
+    # Only validate decoder layers (not vision/audio encoder layers).
+    # The heuristic: scan ModuleLists whose parent path looks like a text
+    # decoder backbone (e.g. "model.layers", "decoder.model.layers").
+    # Skip modules under "vision_encoder", "audio_encoder", etc.
+    encoder_prefixes = (
+        "vision_encoder", "audio_encoder", "vision_model",
+        "speech_encoder", "image_encoder",
+    )
     for name, child in module.named_modules():
         if not isinstance(child, nn.ModuleList):
+            continue
+        # Skip encoder sub-modules
+        if any(prefix in name for prefix in encoder_prefixes):
             continue
         for i, layer in enumerate(child):
             if not isinstance(layer, nn.Module):
@@ -440,7 +452,9 @@ def _validate_static_cache_support(module: nn.Module) -> None:
             # "attn" (GPT-2 style).
             if not hasattr(layer, "self_attn") and not hasattr(layer, "attn"):
                 continue
-            if not isinstance(layer, (DecoderLayer, MoEDecoderLayer)):
+            if not isinstance(
+                layer, (DecoderLayer, MoEDecoderLayer, Gemma4DecoderLayer)
+            ):
                 raise TypeError(
                     f"Static cache mode requires decoder layers that "
                     f"inherit from DecoderLayer or MoEDecoderLayer, but "
