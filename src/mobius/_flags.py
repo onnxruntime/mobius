@@ -98,7 +98,7 @@ class _Flags:
            (ORT ≤1.24.x workaround).
        * - ``gqa_max_head_dim``
          - ``MOBIUS_GQA_MAX_HEAD_DIM``
-         - ``512``
+         - ``256``
          - Maximum head_dim for the Attention→GQA rewrite rule.
            Set to 256 for ORT ≤1.24.
     """
@@ -134,7 +134,7 @@ class _Flags:
     """
 
     gqa_max_head_dim: int = dataclasses.field(
-        default_factory=lambda: _env_int("MOBIUS_GQA_MAX_HEAD_DIM", 512)
+        default_factory=lambda: _env_int("MOBIUS_GQA_MAX_HEAD_DIM", 256)
     )
     """Maximum head_dim for the Attention→GroupQueryAttention rewrite rule.
 

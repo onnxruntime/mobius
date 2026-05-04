@@ -116,7 +116,7 @@ class TestGqaMaxHeadDim:
     def test_default_is_512(self, monkeypatch):
         monkeypatch.delenv("MOBIUS_GQA_MAX_HEAD_DIM", raising=False)
         f = _flags._Flags()
-        assert f.gqa_max_head_dim == 512
+        assert f.gqa_max_head_dim == 256
 
     def test_env_var_override(self, monkeypatch):
         monkeypatch.setenv("MOBIUS_GQA_MAX_HEAD_DIM", "256")
@@ -126,7 +126,7 @@ class TestGqaMaxHeadDim:
     def test_env_var_invalid_falls_back(self, monkeypatch):
         monkeypatch.setenv("MOBIUS_GQA_MAX_HEAD_DIM", "not_a_number")
         f = _flags._Flags()
-        assert f.gqa_max_head_dim == 512
+        assert f.gqa_max_head_dim == 256
 
     def test_override_flags_with_int(self):
         original = _flags.flags.gqa_max_head_dim
@@ -146,11 +146,11 @@ class TestGqaMaxHeadDim:
         mock_key = MagicMock()
         mock_key.shape = [1, 8, 0, 384]
 
-        # With default (512), head_dim=384 should pass
+        # With limit=512, head_dim=384 should pass
         with _flags.override_flags(gqa_max_head_dim=512):
             assert _head_dim_exceeds_gqa_limit(mock_key) is None
 
-        # With limit=256, head_dim=384 should fail
+        # With default (256), head_dim=384 should fail
         with _flags.override_flags(gqa_max_head_dim=256):
             assert _head_dim_exceeds_gqa_limit(mock_key) == 384
 
