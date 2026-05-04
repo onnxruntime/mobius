@@ -409,7 +409,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     ("qwen3_vl_text", {"attn_qk_norm": True}, False),
-    ("smollm3", {}, False),
+    ("smollm3", {"no_rope_layers": [1, 0]}, True),  # exercise per-layer RoPE gating
     # === Mixture of Experts ===
     (
         "phimoe",

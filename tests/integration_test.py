@@ -86,6 +86,8 @@ _TEXT_MODELS = [
     # CausalLMModel (base: llama/mistral/qwen2 architecture)
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
     pytest.param("HuggingFaceTB/SmolLM-135M", False, id="smollm-135m"),
+    # SmolLM3 (per-layer RoPE gating via no_rope_layers)
+    pytest.param("HuggingFaceTB/SmolLM3-3B", False, id="smollm3-3b"),
     # Gemma
     pytest.param("google/gemma-3-1b-pt", False, id="gemma3-1b"),
     # Granite
