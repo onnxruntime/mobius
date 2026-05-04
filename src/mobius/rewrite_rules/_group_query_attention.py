@@ -50,10 +50,10 @@ from onnxscript.rewriter._rewrite_rule import (
 )
 
 # CUDA EP's GroupQueryAttention kernel historically enforced MAX_HEAD_SIZE = 256.
-# Latest ORT (unreleased) supports head_dim=512 for Gemma4 full-attention layers.
-# The rewrite rule (Attention → GQA) still skips head_dim > 512 to avoid
-# generating nodes that would fail on older runtimes.
-_MAX_GQA_HEAD_DIM = 512
+# Keep the rewrite-rule limit conservative until GQA fusion is gated on a
+# runtime/EP capability check. This avoids emitting GroupQueryAttention nodes
+# with head_dim=512 that can still fail on released ORT builds.
+_MAX_GQA_HEAD_DIM = 256
 
 
 def _head_dim_exceeds_gqa_limit(past_key) -> int | None:
