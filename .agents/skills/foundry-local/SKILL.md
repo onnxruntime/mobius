@@ -27,6 +27,23 @@ Use this skill when:
    pip install foundry-local-sdk
    ```
 
+   > ⚠️ **WARNING: Dependency override.** `pip install foundry-local-sdk`
+   > installs its own versions of `onnxruntime` and
+   > `onnxruntime-genai`, which **override any custom builds** you may
+   > have installed. If you need a specific ORT or GenAI version (e.g.
+   > built from source with CUDA support), you must reinstall your
+   > wheels **after** installing foundry-local-sdk:
+   >
+   > ```bash
+   > pip install foundry-local-sdk
+   > pip install --force-reinstall <your_ort_wheel>.whl
+   > pip install --force-reinstall <your_genai_wheel>.whl
+   > ```
+   >
+   > This works because Foundry's native core symlinks to the
+   > Python-installed `.so` files — replacing them takes effect
+   > immediately.
+
 2. **ONNX model exported by mobius** with `--runtime ort-genai`:
 
    ```bash
@@ -254,14 +271,29 @@ the Foundry Local SDK:
 
 ```bash
 pip install foundry-local-sdk
-# Override with your specific GenAI build
-pip install onnxruntime-genai==<version> --force-reinstall --no-deps
+# Override with your specific GenAI build (and ORT if needed)
+pip install --force-reinstall <your_ort_wheel>.whl
+pip install --force-reinstall <your_genai_wheel>.whl
 ```
 
-This replaces the bundled GenAI with your version. Use `--no-deps` to
-avoid re-installing Foundry's other dependencies.
+This replaces the bundled GenAI with your version. Foundry's native
+core symlinks to the Python-installed `.so` files, so replacing them
+takes effect immediately.
 
-### 2. No CUDA EP in pip SDK version
+### 2. Building ORT and GenAI from source
+
+If you need a custom ORT GenAI build (e.g. with CUDA support, or with
+a new model_type registered), build both from source:
+
+1. **Build ORT** with CUDA EP enabled
+2. **Build GenAI** linked against your custom ORT build
+3. Install both wheels, then install `foundry-local-sdk`, then
+   **reinstall your custom wheels** (see warning above)
+
+For the full build tutorial with step-by-step instructions, see
+[issue #245](https://github.com/onnxruntime/mobius/issues/245).
+
+### 3. No CUDA EP in pip SDK version
 
 The pip-installed `foundry-local-sdk` does not include CUDA execution
 provider support. Models run on CPU by default.
@@ -269,7 +301,7 @@ provider support. Models run on CPU by default.
 For GPU inference, use the standalone Foundry Local application (not
 the pip package) or set up ORT GenAI with CUDA EP directly.
 
-### 3. Multimodal models require GenAI 0.14+
+### 4. Multimodal models require GenAI 0.14+
 
 Vision-language and audio-language models need `onnxruntime-genai`
 version 0.14 or later for multi-model pipeline support. Check your
@@ -280,13 +312,13 @@ import onnxruntime_genai as og
 print(og.__version__)
 ```
 
-### 4. Custom model discovery
+### 5. Custom model discovery
 
 The Python SDK's `FoundryLocalManager.list_models()` uses a catalog
 service that may not index custom models in the cache. Use the CLI
 or direct HTTP API as a reliable alternative.
 
-### 5. Model type compatibility
+### 6. Model type compatibility
 
 Foundry Local uses ORT GenAI internally, which has a model_type
 whitelist (see the `ort-genai-config` skill). If your model uses an
