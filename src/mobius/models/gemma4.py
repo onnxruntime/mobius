@@ -2151,4 +2151,22 @@ class Gemma4Model(nn.Module):
             else:
                 renamed[key] = value
 
+        # Map HF expert weight names to our 3D stacked parameter names.
+        # HF: decoder.model.layers.N.experts.gate_up_proj [E, 2*inter, H]
+        # Us: decoder.model.layers.N.fc1_experts_weights  [E, 2*inter, H]
+        for key in list(renamed.keys()):
+            if ".experts.gate_up_proj" in key:
+                new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
+                renamed[new_key] = renamed.pop(key)
+            elif ".experts.down_proj" in key:
+                new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
+                renamed[new_key] = renamed.pop(key)
+
+        # Fold hidden_size^-0.5 into router.scale
+        if self.config.enable_moe_block:
+            scale_factor = float(self.config.hidden_size**-0.5)
+            for key in list(renamed.keys()):
+                if ".router.scale" in key and ".per_expert_scale" not in key:
+                    renamed[key] = renamed[key] * scale_factor
+
         return renamed
