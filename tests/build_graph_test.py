@@ -5275,6 +5275,149 @@ class TestBuildStaticCacheGraph:
         _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-static")
 
 
+class TestBuildGemma4StaticCacheGraph:
+    """Verify Gemma4TextCausalLMTask(static_cache=True) builds a valid graph."""
+
+    MAX_SEQ_LEN = 128
+
+    @staticmethod
+    def _gemma4_config(**overrides):
+        from mobius._configs import Gemma4Config
+
+        defaults = dict(
+            num_hidden_layers=6,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            global_head_dim=32,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            layer_types=[
+                "sliding_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "full_attention",
+            ],
+            sliding_window=64,
+            rope_theta=10000.0,
+            global_rope_theta=1000000.0,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=256,
+            hidden_size_per_layer_input=0,
+            num_kv_shared_layers=0,
+        )
+        defaults.update(overrides)
+        return Gemma4Config(**defaults)
+
+    def _build(self, **config_overrides):
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = self._gemma4_config(**config_overrides)
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask(
+            static_cache=True, max_seq_len=self.MAX_SEQ_LEN
+        )
+        pkg = task.build(module, config)
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_builds(self):
+        """Build Gemma4 with static cache and verify basic graph structure."""
+        model, config = self._build()
+
+        assert model.graph is not None
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        assert "attention_mask" not in input_names
+        assert "write_indices" in input_names
+        assert "nonpad_kv_seqlen" in input_names
+
+    def test_gemma4_static_cache_dual_head_dim(self):
+        """Verify per-layer cache shapes respect dual head_dim."""
+        model, config = self._build()
+
+        input_map = {inp.name: inp for inp in model.graph.inputs}
+
+        # Layer 0-4: sliding (head_dim=16, kv_heads=2 → kv_hidden=32)
+        k0 = input_map["key_cache.0"]
+        assert k0.shape is not None
+        # shape is [batch, max_seq, kv_hidden]
+        kv_hidden_sliding = config.num_key_value_heads * config.head_dim
+        assert k0.shape[2] == kv_hidden_sliding
+
+        # Layer 5: full_attention (global_head_dim=32, kv_heads=2 → kv_hidden=64)
+        k5 = input_map["key_cache.5"]
+        kv_hidden_full = config.num_key_value_heads * config.global_head_dim
+        assert k5.shape[2] == kv_hidden_full
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Verify TensorScatter ops and no GQA in static cache mode."""
+        model, config = self._build()
+
+        op_counts = {}
+        for n in model.graph:
+            op_counts[n.op_type] = op_counts.get(n.op_type, 0) + 1
+
+        # TensorScatter: 2 per non-shared layer (key + value)
+        num_kv_layers = config.num_hidden_layers - (config.num_kv_shared_layers or 0)
+        assert op_counts.get("TensorScatter", 0) == 2 * num_kv_layers
+        assert op_counts.get("Attention", 0) == config.num_hidden_layers
+        assert op_counts.get("GroupQueryAttention", 0) == 0
+
+    def test_gemma4_static_cache_kv_shared(self):
+        """Verify KV-shared layers are excluded from cache I/O."""
+        model, config = self._build(
+            num_hidden_layers=8,
+            num_kv_shared_layers=2,
+            layer_types=[
+                "sliding_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "full_attention",
+            ],
+        )
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        output_names = {out.name for out in model.graph.outputs}
+
+        # 6 non-shared layers → 12 cache inputs, 12 cache outputs
+        num_kv_layers = config.num_hidden_layers - config.num_kv_shared_layers
+        for i in range(num_kv_layers):
+            assert f"key_cache.{i}" in input_names
+            assert f"updated_key_cache.{i}" in output_names
+
+        # Shared layers (6, 7) should NOT have cache entries
+        assert f"key_cache.{num_kv_layers}" not in input_names
+        assert f"updated_key_cache.{num_kv_layers}" not in output_names
+
+        # TensorScatter only for non-shared layers
+        op_counts = {}
+        for n in model.graph:
+            op_counts[n.op_type] = op_counts.get(n.op_type, 0) + 1
+        assert op_counts.get("TensorScatter", 0) == 2 * num_kv_layers
+        # All 8 layers still have Attention ops
+        assert op_counts.get("Attention", 0) == config.num_hidden_layers
+
+    def test_gemma4_static_cache_input_ordering(self):
+        """Verify write_indices/nonpad_kv_seqlen come after cache inputs."""
+        model, config = self._build()
+
+        input_names = [inp.name for inp in model.graph.inputs]
+        # write_indices and nonpad_kv_seqlen should come after all cache inputs
+        last_cache_idx = max(
+            i for i, n in enumerate(input_names) if "cache" in n
+        )
+        write_idx = input_names.index("write_indices")
+        nonpad_idx = input_names.index("nonpad_kv_seqlen")
+        assert write_idx > last_cache_idx, (
+            "write_indices should come after all cache inputs"
+        )
+        assert nonpad_idx > last_cache_idx, (
+            "nonpad_kv_seqlen should come after all cache inputs"
+        )
+
+
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
 

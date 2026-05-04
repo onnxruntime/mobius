@@ -67,19 +67,7 @@ def _make_gemma4_static_cache_inputs(
         ["sliding_attention"] * config.num_hidden_layers
     )
 
-    # Shared control inputs
-    write_indices = builder.input(
-        "write_indices",
-        dtype=ir.DataType.INT64,
-        shape=[batch],
-    )
-    nonpad_kv_seqlen = builder.input(
-        "nonpad_kv_seqlen",
-        dtype=ir.DataType.INT64,
-        shape=[batch],
-    )
-
-    cache_states: list[StaticCacheState] = []
+    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
     for i in range(num_kv_layers):
         lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if lt == "full_attention" else local_head_dim
@@ -100,6 +88,22 @@ def _make_gemma4_static_cache_inputs(
             dtype=config.dtype,
             shape=[batch, max_seq_len, kv_hidden],
         )
+        cache_pairs.append((key_cache, value_cache))
+
+    # Shared control inputs (after all cache tensors, matching standard pattern)
+    write_indices = builder.input(
+        "write_indices",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
+    )
+    nonpad_kv_seqlen = builder.input(
+        "nonpad_kv_seqlen",
+        dtype=ir.DataType.INT64,
+        shape=[batch],
+    )
+
+    cache_states: list[StaticCacheState] = []
+    for key_cache, value_cache in cache_pairs:
         cache_states.append(
             StaticCacheState(
                 key_cache=key_cache,

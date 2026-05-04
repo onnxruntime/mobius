@@ -253,21 +253,25 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = model_module.preprocess_weights(state_dict)
             pkg.apply_weights(state_dict)
     else:
-        # Resolve static cache task if needed (requires model_type detection)
         model_id_or_path = args.model
+        extra_build_kwargs: dict = {}
         if static_cache_params is not None:
+            # Static cache: detect model type to resolve the correct task.
+            # For multimodal models, override to use the text-only model class.
             import transformers
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 model_id_or_path, trust_remote_code=trust_remote_code
             )
             mt = getattr(hf_config, "model_type", "")
-            # For multimodal models (e.g. gemma4), use the text sub-config
-            # so build() resolves to the text-only model class for static cache.
             if hasattr(hf_config, "text_config"):
                 text_mt = getattr(hf_config.text_config, "model_type", "")
-                if text_mt:
+                if text_mt and text_mt != mt:
                     mt = text_mt
+                    # Override module_class so build() uses the text-only model
+                    from mobius._registry import registry as _registry
+
+                    extra_build_kwargs["module_class"] = _registry.get(mt)
             task = _resolve_static_cache_task(mt)
 
         pkg = build(
@@ -277,7 +281,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
-            text_only=args.text_only or static_cache_params is not None,
+            text_only=args.text_only,
+            **extra_build_kwargs,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
