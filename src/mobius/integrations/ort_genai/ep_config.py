@@ -17,12 +17,14 @@ from typing import Any
 
 from mobius._execution_providers import ep_registry
 
-# ORT GenAI provider name mapping (internal name → ORT GenAI provider string)
+# ORT GenAI provider name mapping (internal name → ORT GenAI provider string).
+# GenAI expects short lowercase names (e.g. "cuda", "dml"), not the full
+# ORT EP class names (e.g. "CUDAExecutionProvider").
 _ORT_PROVIDER_NAMES: dict[str, str] = {
-    "cpu": "CPUExecutionProvider",
-    "cuda": "CUDAExecutionProvider",
-    "dml": "DmlExecutionProvider",
-    "webgpu": "WebGpuExecutionProvider",
+    "cpu": "cpu",
+    "cuda": "cuda",
+    "dml": "dml",
+    "webgpu": "webgpu",
     "trt-rtx": "NvTensorRtRtx",
 }
 
