@@ -2272,6 +2272,183 @@ class TestBuildGraphQwen3ASR:
         assert logits.shape[1] == seq_len
 
 
+class TestBuildGraphFunASR:
+    """Verify Fun-ASR-Nano 3-model split with FunASRSpeechLanguageTask."""
+
+    def _fun_asr_config(self):
+        return _base_config(
+            attn_qk_norm=True,
+            hidden_act="silu",
+            audio=AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                num_blocks=3,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=TINY_HIDDEN,
+                audio_token_id=100,
+                adaptor_proj_dim=TINY_INTERMEDIATE,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=TINY_HEADS,
+            ),
+        )
+
+    def test_package_builds_3_models(self):
+        """Build Fun-ASR and verify 3-model package."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        assert "audio_encoder" in pkg
+        assert "embedding" in pkg
+        assert "decoder" in pkg
+
+    def test_audio_encoder_io(self):
+        """Verify audio encoder inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        input_names = {inp.name for inp in encoder.graph.inputs}
+        assert "input_features" in input_names
+
+        output_names = {out.name for out in encoder.graph.outputs}
+        assert "audio_features" in output_names
+
+    def test_embedding_io(self):
+        """Verify embedding model inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        embedding = pkg["embedding"]
+
+        input_names = {inp.name for inp in embedding.graph.inputs}
+        assert "input_ids" in input_names
+        assert "audio_features" in input_names
+
+        output_names = {out.name for out in embedding.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_decoder_io(self):
+        """Verify decoder has standard position_ids and KV cache."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        decoder = pkg["decoder"]
+
+        input_names = {inp.name for inp in decoder.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+
+        output_names = {out.name for out in decoder.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+
+    def test_registry_lookup(self):
+        """Verify fun_asr is registered with fun-asr-speech-language task."""
+        model_cls = registry.get("fun_asr")
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+
+        assert model_cls is FunASRForConditionalGeneration
+        assert _default_task_for_model("fun_asr") == "fun-asr-speech-language"
+
+    def test_3model_pipeline_runs_with_ort(self):
+        """Run audio_encoder → embedding → decoder with ORT."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        # Step 1: Audio encoder — random fbank input
+        # Sequence length must be even (temporal pooling halves it)
+        input_dim = config.audio.input_size
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        fbank = np.random.randn(1, 100, input_dim).astype(np.float32)
+        enc_out = enc_sess.run({"input_features": fbank})
+        audio_features = enc_out["audio_features"]
+        num_audio_tokens = audio_features.shape[1]
+        audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+        enc_sess.close()
+
+        # Step 2: Embedding — mix text + audio tokens
+        audio_token_id = config.audio.audio_token_id
+        prefix = [1, 2, 3]
+        suffix = [4, 5]
+        input_ids = np.array(
+            [prefix + [audio_token_id] * num_audio_tokens + suffix],
+            dtype=np.int64,
+        )
+
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_out = embed_sess.run(
+            {
+                "input_ids": input_ids,
+                "audio_features": audio_features_2d,
+            }
+        )
+        inputs_embeds = embed_out["inputs_embeds"]
+        embed_sess.close()
+
+        seq_len = inputs_embeds.shape[1]
+        assert seq_len == input_ids.shape[1]
+        assert inputs_embeds.shape[2] == config.hidden_size
+
+        # Step 3: Decoder — single forward pass
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        past_kv = {}
+        for i in range(config.num_hidden_layers):
+            past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+            past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+
+        pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": pos,
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        logits = dec_out["logits"]
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == seq_len
+
+
 class TestBuildGraphQwen3TTS:
     """Verify Qwen3-TTS 4-model split with TTSTask."""
 
@@ -3923,6 +4100,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "wav2vec2-conformer",
     "wavlm",
     # Audio/TTS dedicated tests
+    "fun_asr",
     "qwen3_asr",
     "qwen3_forced_aligner",
     "qwen3_tts",

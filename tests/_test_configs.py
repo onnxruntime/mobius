@@ -2258,6 +2258,30 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    # --- Fun-ASR-Nano (speech-language, 3-model split with SANM encoder) ---
+    (
+        "fun_asr",
+        {
+            "attn_qk_norm": True,
+            "rope_type": "default",
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=64,
+                attention_heads=4,
+                num_blocks=3,
+                linear_units=128,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=64,
+                audio_token_id=100,
+                adaptor_proj_dim=128,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=4,
+            ),
+        },
+        True,
+    ),
     # --- Qwen3-TTS Codec Tokenizer (codec, 2-model split) ---
     (
         "qwen3_tts_tokenizer_12hz",
@@ -2316,6 +2340,22 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     ("speecht5", {}, False),
     ("voxtral_encoder", {}, False),
     ("mctct", {}, False),
+    # --- SenseVoiceSmall (CTC encoder-only ASR) ---
+    (
+        "sensevoice_small",
+        {
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                num_blocks=3,
+                tp_num_blocks=2,
+            ),
+        },
+        True,
+    ),
 ]
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS
