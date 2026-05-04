@@ -53,9 +53,20 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+from pathlib import Path
 
 import ml_dtypes
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from asr_utils import (
+    LFR_M,
+    N_MELS,
+    SAMPLE_RATE,
+    load_audio_file,
+    preprocess_audio,
+)
 
 from mobius import ArchitectureConfig, build_from_module
 from mobius._configs import AudioConfig
@@ -66,14 +77,8 @@ from mobius._testing.ort_inference import OnnxModelSession
 # ---------------------------------------------------------------------------
 
 MODEL_ID = "justinchuby/Fun-ASR-Nano-2512"
-SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 60
 MAX_NEW_TOKENS = 4096
-
-# LFR (Low Frame Rate) parameters from config.yaml
-LFR_M = 7  # Stack 7 consecutive frames
-LFR_N = 6  # Subsample by 6
-N_MELS = 80  # Mel filter bank bins
 
 # Language mapping for Fun-ASR-Nano-2512 (zh, en, ja).
 # Values are Chinese language names used in the prompt (fullwidth colon is required).
@@ -89,97 +94,6 @@ LANGUAGE_MAP: dict[str, str] = {
     "japanese": "日文",
     "日文": "日文",
 }
-
-
-# ---------------------------------------------------------------------------
-# Audio frontend: fbank → LFR → CMVN
-# ---------------------------------------------------------------------------
-
-
-def compute_fbank(
-    audio: np.ndarray,
-    *,
-    sample_rate: int = SAMPLE_RATE,
-    n_mels: int = N_MELS,
-    frame_length: int = 25,
-    frame_shift: int = 10,
-) -> np.ndarray:
-    """Compute 80-dim fbank features using Kaldi-compatible extraction.
-
-    Returns array of shape ``(num_frames, n_mels)``.
-    """
-    import torch
-    import torchaudio
-
-    waveform = torch.from_numpy(audio).float()
-    fbank = torchaudio.compliance.kaldi.fbank(
-        waveform.unsqueeze(0),
-        num_mel_bins=n_mels,
-        frame_length=frame_length,
-        frame_shift=frame_shift,
-        sample_frequency=sample_rate,
-        window_type="hamming",
-    )
-    return fbank.numpy()  # (num_frames, 80)
-
-
-def apply_lfr(fbank: np.ndarray, lfr_m: int = LFR_M, lfr_n: int = LFR_N) -> np.ndarray:
-    """Apply Low Frame Rate stacking and subsampling.
-
-    Stacks ``lfr_m`` consecutive frames and subsamples every ``lfr_n`` frames,
-    producing features of dimension ``lfr_m * n_mels`` (typically 7*80 = 560).
-
-    Left-pads by ``(lfr_m - 1) // 2`` frames (FunASR convention) so that the
-    first output frame is centered on the first input frame.
-
-    Returns array of shape ``(T_out, lfr_m * n_mels)``.
-    """
-    # Left-pad by (lfr_m - 1) // 2 frames (FunASR convention)
-    left_pad = (lfr_m - 1) // 2  # = 3 for lfr_m=7
-    fbank = np.pad(fbank, ((left_pad, 0), (0, 0)), mode="edge")
-
-    num_frames = fbank.shape[0]
-    # Pad to multiple of lfr_n
-    pad_len = (lfr_n - (num_frames % lfr_n)) % lfr_n
-    if pad_len > 0:
-        fbank = np.pad(fbank, ((0, pad_len), (0, 0)), mode="edge")
-    t_padded = fbank.shape[0]
-
-    lfr_frames = []
-    for i in range(0, t_padded, lfr_n):
-        end = min(i + lfr_m, t_padded)
-        chunk = fbank[i:end]
-        if chunk.shape[0] < lfr_m:
-            chunk = np.pad(chunk, ((0, lfr_m - chunk.shape[0]), (0, 0)), mode="edge")
-        lfr_frames.append(chunk.flatten())
-    return np.array(lfr_frames)  # (T_out, 560)
-
-
-def apply_cmvn(features: np.ndarray) -> np.ndarray:
-    """Apply CMVN (Cepstral Mean and Variance Normalization).
-
-    The Fun-ASR-Nano config has ``cmvn_file: null``, so this is currently
-    an identity transform.
-
-    TODO: If a cmvn_file is provided in the model config, load the mean/var
-    statistics and apply (features - mean) / sqrt(var + eps).
-    """
-    return features
-
-
-def preprocess_audio(
-    audio: np.ndarray,
-    *,
-    sample_rate: int = SAMPLE_RATE,
-) -> np.ndarray:
-    """Full audio frontend: fbank → LFR → CMVN.
-
-    Returns array of shape ``(1, T_out, 560)`` ready for the audio encoder.
-    """
-    fbank = compute_fbank(audio, sample_rate=sample_rate)
-    lfr_features = apply_lfr(fbank)
-    features = apply_cmvn(lfr_features)
-    return features[np.newaxis, :, :]  # (1, T_out, 560)
 
 
 # ---------------------------------------------------------------------------
@@ -231,17 +145,6 @@ def record_until_enter(
     return audio
 
 
-def load_audio_file(path: str, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Load an audio file and resample to target sample rate."""
-    import torchaudio
-
-    waveform, sr = torchaudio.load(path)
-    if sr != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
-    # Mono, float32
-    return waveform.mean(dim=0).numpy().astype(np.float32)
-
-
 # ---------------------------------------------------------------------------
 # Model config construction
 # ---------------------------------------------------------------------------
@@ -287,7 +190,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
                 "input_dim", cfg.get("lfr_m", LFR_M) * cfg.get("n_mels", N_MELS)
             )
             return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
-    except Exception:
+    except Exception:  # config.json missing or wrong format — try config.yaml
         pass
 
     # Fall back to config.yaml (original format)
@@ -711,7 +614,7 @@ def main():
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             args.model, subfolder="Qwen3-0.6B", trust_remote_code=True
         )
-    except Exception:
+    except Exception:  # No Qwen3-0.6B subfolder — tokenizer at repo root
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             args.model, trust_remote_code=True
         )

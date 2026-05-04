@@ -43,7 +43,7 @@ class AudioCTCTask(ModelTask):
 
         input_features = builder.input(
             "input_features",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype or ir.DataType.FLOAT,
             shape=["batch", "time", input_dim],
         )
         language_id = builder.input(

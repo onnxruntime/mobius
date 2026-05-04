@@ -138,7 +138,7 @@ class FunASRAudioEncoder(nn.Module):
             input_features: ``(batch, seq_len, input_dim)`` fbank features.
 
         Returns:
-            audio_features: ``(batch, seq_len // 2, llm_hidden_size)``
+            audio_features: ``(batch, seq_len, llm_hidden_size)``
         """
         # input_features: (batch, seq_len, input_dim)
 

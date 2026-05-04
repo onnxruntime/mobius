@@ -20,8 +20,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from asr_utils import (
+    LFR_M,
+    N_MELS,
+    SAMPLE_RATE,
+    load_audio_file,
+    load_cmvn,
+    preprocess_audio,
+)
 
 from mobius._configs import ArchitectureConfig, AudioConfig
 from mobius._testing.ort_inference import OnnxModelSession
@@ -31,10 +44,6 @@ from mobius._testing.ort_inference import OnnxModelSession
 # ---------------------------------------------------------------------------
 
 MODEL_ID = "justinchuby/SenseVoiceSmall-Hakka"
-SAMPLE_RATE = 16000
-LFR_M = 7  # LFR stack factor
-LFR_N = 6  # LFR stride
-N_MELS = 80
 
 # Language ID mapping (from SenseVoiceSmall source)
 LANGUAGE_MAP: dict[str, int] = {
@@ -54,106 +63,6 @@ LANGUAGE_MAP: dict[str, int] = {
 
 # Textnorm query IDs
 TEXTNORM_WOITN = 15  # without ITN (default)
-
-
-# ---------------------------------------------------------------------------
-# Audio frontend: fbank → LFR (same as Fun-ASR)
-# ---------------------------------------------------------------------------
-
-
-def compute_fbank(
-    waveform: np.ndarray,
-    sample_rate: int = SAMPLE_RATE,
-    n_mels: int = N_MELS,
-) -> np.ndarray:
-    """Compute log-mel filterbank features using torchaudio."""
-    import torch
-    import torchaudio
-
-    wav = torch.from_numpy(waveform).float().unsqueeze(0)
-    fbank = torchaudio.compliance.kaldi.fbank(
-        wav,
-        num_mel_bins=n_mels,
-        sample_frequency=sample_rate,
-        window_type="hamming",
-        frame_length=25.0,
-        frame_shift=10.0,
-        dither=0.0,
-    )
-    return fbank.numpy()  # (T, n_mels)
-
-
-def apply_lfr(fbank: np.ndarray, lfr_m: int = LFR_M, lfr_n: int = LFR_N) -> np.ndarray:
-    """Apply Low Frame Rate (LFR) stacking: stack lfr_m frames, stride lfr_n.
-
-    Left-pads by ``(lfr_m - 1) // 2`` frames (FunASR convention) so that the
-    first output frame is centered on the first input frame.
-    """
-    # Left-pad by (lfr_m - 1) // 2 frames (FunASR convention)
-    left_pad = (lfr_m - 1) // 2  # = 3 for lfr_m=7
-    fbank = np.pad(fbank, ((left_pad, 0), (0, 0)), mode="edge")
-
-    t, _d = fbank.shape
-    num_lfr = (t + lfr_n - 1) // lfr_n
-    # Pad to ensure enough frames for the last window
-    pad_len = num_lfr * lfr_n + (lfr_m - lfr_n) - t
-    if pad_len > 0:
-        fbank = np.pad(fbank, ((0, pad_len), (0, 0)), mode="edge")
-    lfr_frames = []
-    for i in range(num_lfr):
-        start = i * lfr_n
-        lfr_frames.append(fbank[start : start + lfr_m].reshape(-1))
-    return np.stack(lfr_frames, axis=0)  # (T_lfr, lfr_m * d)
-
-
-def load_cmvn(cmvn_path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load CMVN stats from Kaldi am.mvn file.
-
-    Returns (means, vars) arrays of shape (560,) each.
-    CMVN is applied as: features = (features + means) * vars
-    """
-    with open(cmvn_path) as f:
-        lines = f.readlines()
-    means = None
-    variances = None
-    for i, line in enumerate(lines):
-        parts = line.split()
-        if parts[0] == "<AddShift>":
-            next_parts = lines[i + 1].split()
-            if next_parts[0] == "<LearnRateCoef>":
-                means = np.array(next_parts[3:-1], dtype=np.float32)
-        elif parts[0] == "<Rescale>":
-            next_parts = lines[i + 1].split()
-            if next_parts[0] == "<LearnRateCoef>":
-                variances = np.array(next_parts[3:-1], dtype=np.float32)
-    assert means is not None and variances is not None, "Failed to parse am.mvn"
-    return means, variances
-
-
-def preprocess_audio(
-    waveform: np.ndarray,
-    cmvn: tuple[np.ndarray, np.ndarray] | None = None,
-) -> np.ndarray:
-    """Full frontend: fbank → LFR → CMVN → (1, T, 560)."""
-    fbank = compute_fbank(waveform)
-    lfr = apply_lfr(fbank)
-    if cmvn is not None:
-        means, variances = cmvn
-        lfr = (lfr + means) * variances
-    return lfr[np.newaxis, :, :]  # (1, T, 560)
-
-
-def load_audio_file(path: str) -> np.ndarray:
-    """Load audio file and resample to 16kHz mono."""
-    import torchaudio
-
-    waveform, sr = torchaudio.load(path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != SAMPLE_RATE:
-        waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
-    return waveform.squeeze(0).numpy()
-
 
 # ---------------------------------------------------------------------------
 # CTC Decoding
@@ -210,7 +119,7 @@ def build_sensevoice_config(model_id: str, dtype: str = "f32") -> ArchitectureCo
         cfg_path = hf_hub_download(model_id, "config.json")
         with open(cfg_path) as f:
             cfg = json.load(f)
-    except Exception:
+    except Exception:  # config.json missing — try config.yaml
         import yaml
 
         cfg_path = hf_hub_download(model_id, "config.yaml")
@@ -336,7 +245,7 @@ def main():
         tok_path = hf_hub_download(args.model, "tokens.json")
         with open(tok_path) as f:
             tokens = json.load(f)
-    except Exception:
+    except Exception:  # tokens.json not available — try sentencepiece
         pass
 
     if tokens is None:
@@ -359,7 +268,7 @@ def main():
         cmvn_path = hf_hub_download(args.model, "am.mvn")
         cmvn = load_cmvn(cmvn_path)
         print("CMVN: loaded from am.mvn")
-    except Exception:
+    except Exception:  # am.mvn not available — skip CMVN
         cmvn = None
         print("CMVN: not available (skipping)")
 
