@@ -281,7 +281,7 @@ class AudioConfig:
     audio_start_token_id: int | None = None
     audio_end_token_id: int | None = None
     classify_num: int | None = None
-    # Fun-ASR encoder config
+    # Fun-ASR / SenseVoice encoder config
     tp_num_blocks: int | None = None
     adaptor_proj_dim: int | None = None
     adaptor_num_blocks: int | None = None
