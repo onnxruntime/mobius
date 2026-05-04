@@ -119,7 +119,7 @@ def build_sensevoice_config(model_id: str, dtype: str = "f32") -> ArchitectureCo
         cfg_path = hf_hub_download(model_id, "config.json")
         with open(cfg_path) as f:
             cfg = json.load(f)
-    except Exception:  # config.json missing — try config.yaml
+    except Exception:  # config.json missing — try config.yaml (expected for FunASR repos)
         import yaml
 
         cfg_path = hf_hub_download(model_id, "config.yaml")
@@ -245,8 +245,8 @@ def main():
         tok_path = hf_hub_download(args.model, "tokens.json")
         with open(tok_path) as f:
             tokens = json.load(f)
-    except Exception:  # tokens.json not available — try sentencepiece
-        pass
+    except Exception:  # tokens.json not available — fall back to sentencepiece
+        pass  # tokens remains None, handled below
 
     if tokens is None:
         # Fall back to sentencepiece BPE model
@@ -268,7 +268,7 @@ def main():
         cmvn_path = hf_hub_download(args.model, "am.mvn")
         cmvn = load_cmvn(cmvn_path)
         print("CMVN: loaded from am.mvn")
-    except Exception:  # am.mvn not available — skip CMVN
+    except Exception:  # am.mvn not available — skip CMVN (identity normalization)
         cmvn = None
         print("CMVN: not available (skipping)")
 

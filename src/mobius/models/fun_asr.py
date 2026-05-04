@@ -73,12 +73,11 @@ class FunASRAudioEncoder(nn.Module):
 
     1. ``encoders0``: 1 SANM layer projecting input_dim (560) → hidden_dim (512)
     2. ``encoders``: N-1 SANM layers at hidden_dim (512)
-    3. Temporal pooling: average adjacent frame pairs (T → T//2)
-    4. ``tp_encoders``: M SANM layers at hidden_dim (512)
-    5. ``adaptor``: MLP + transformer blocks projecting 512 → LLM hidden (1024)
+    3. ``tp_encoders``: M SANM layers at hidden_dim (512) — refinement, no pooling
+    4. ``adaptor``: MLP + transformer blocks projecting 512 → LLM hidden (1024)
 
     Input: ``(batch, seq_len, input_dim)`` — LFR-processed fbank features
-    Output: ``(batch, out_seq_len, llm_hidden_size)`` — LLM-dimension features
+    Output: ``(batch, seq_len, llm_hidden_size)`` — LLM-dimension features
     """
 
     def __init__(self, config: ArchitectureConfig):

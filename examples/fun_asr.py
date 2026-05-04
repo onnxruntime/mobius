@@ -191,7 +191,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
             )
             return _build_config(enc, adaptor, llm_cfg, input_size, dtype)
     except Exception:  # config.json missing or wrong format — try config.yaml
-        pass
+        pass  # Expected for repos using config.yaml format (e.g. original FunASR)
 
     # Fall back to config.yaml (original format)
     import yaml
