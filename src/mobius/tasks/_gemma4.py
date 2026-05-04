@@ -320,6 +320,10 @@ class Gemma4Task(ModelTask):
     Decoder KV cache is per-layer with the correct head_dim for each layer type
     (local vs global), unlike the uniform head_dim in :class:`VisionLanguageTask`.
 
+    Supports ``static_cache=True`` for pre-allocated TensorScatter-based
+    KV cache on the decoder (requires ORT ≥ 1.25.0).  Vision, audio, and
+    embedding models are unaffected by the static cache setting.
+
     Batching strategies
     -------------------
     Each sub-model uses a different strategy for variable-size inputs:
@@ -339,12 +343,19 @@ class Gemma4Task(ModelTask):
         Conformer attention. The export strips padding inside the ONNX
         graph and returns ``audio_features [num_valid, hidden_size]``.
 
-    **Decoder** — standard ``attention_mask`` for KV cache padding.
-        ``attention_mask [B, past+current]`` is a 1/0 int mask indicating
-        valid token positions across the full sequence (past cache +
-        current input).  The ``Attention`` / ``GroupQueryAttention`` ops
-        handle causal masking internally via ``is_causal=1``.
+    **Decoder** — standard ``attention_mask`` for KV cache padding
+        (dynamic mode), or ``write_indices``/``nonpad_kv_seqlen`` for
+        pre-allocated cache (static mode).
     """
+
+    def __init__(
+        self,
+        *,
+        static_cache: bool = False,
+        max_seq_len: int | None = None,
+    ):
+        self._static_cache = static_cache
+        self._max_seq_len = max_seq_len
 
     def build(
         self,
@@ -389,9 +400,24 @@ class Gemma4Task(ModelTask):
         would exceed it, split per-layer tables are used in the decoder instead,
         so ``input_ids`` is passed and ``per_layer_inputs`` is omitted.
         """
+        from mobius.tasks._causal_lm import (
+            _register_static_cache_outputs,
+            _validate_static_cache_support,
+        )
+
+        static = self._static_cache
+        if static:
+            max_seq_len = self._max_seq_len
+            if max_seq_len is None:
+                max_seq_len = getattr(config, "max_position_embeddings", None)
+            if max_seq_len is None or max_seq_len <= 0:
+                raise ValueError(
+                    "max_seq_len must be a positive integer for static cache."
+                )
+            _validate_static_cache_support(decoder)
+
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
-        past_seq_len = ir.SymbolicDim("past_sequence_len")
 
         graph, builder = _make_graph(name="decoder")
         op = builder.op
@@ -401,11 +427,17 @@ class Gemma4Task(ModelTask):
             dtype=config.dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = builder.input(
-            "attention_mask",
-            dtype=ir.DataType.INT64,
-            shape=[batch, "past_seq_len + seq_len"],
-        )
+
+        if static:
+            attention_mask = None
+        else:
+            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            attention_mask = builder.input(
+                "attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, "past_seq_len + seq_len"],
+            )
+
         position_ids = builder.input(
             "position_ids",
             dtype=ir.DataType.INT64,
@@ -440,7 +472,14 @@ class Gemma4Task(ModelTask):
                 shape=[batch, seq_len],
             )
 
-        past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
+        if static:
+            past_key_values = _make_gemma4_static_cache_inputs(
+                builder, config, batch, max_seq_len,
+            )
+        else:
+            past_key_values = _make_gemma4_kv_cache_inputs(
+                builder, config, batch, past_seq_len,
+            )
 
         logits, present_key_values = decoder(
             op,
@@ -453,7 +492,10 @@ class Gemma4Task(ModelTask):
         )
 
         builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(builder, present_key_values)
+        if static:
+            _register_static_cache_outputs(builder, present_key_values)
+        else:
+            _register_kv_cache_outputs(builder, present_key_values)
 
         return _make_model(graph)
 
