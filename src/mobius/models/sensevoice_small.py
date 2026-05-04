@@ -153,17 +153,18 @@ class SenseVoiceSmallModel(nn.Module):
         event_emo_query = self.query_embed(op, event_emo_ids)  # (2, input_dim)
         # Expand to (batch, 2, input_dim)
         batch_size = op.Shape(input_features, start=0, end=1)
-        ones = op.Expand(
-            op.Constant(value_int=1),
-            op.Concat(batch_size, op.Constant(value_ints=[1, 1]), axis=0),
+        target_shape_2 = op.Concat(
+            batch_size, op.Constant(value_ints=[2, self._input_size]), axis=0
         )
-        event_emo_query = op.Mul(op.Unsqueeze(event_emo_query, [0]), ones)
+        event_emo_query = op.Expand(op.Unsqueeze(event_emo_query, [0]), target_shape_2)
 
         # textnorm query (woitn=15 by default)
         textnorm_ids = op.Constant(value_ints=[15])
         textnorm_query = self.query_embed(op, textnorm_ids)  # (1, input_dim)
-        textnorm_query = op.Unsqueeze(textnorm_query, [0])
-        textnorm_query = op.Mul(textnorm_query, ones)
+        target_shape_1 = op.Concat(
+            batch_size, op.Constant(value_ints=[1, self._input_size]), axis=0
+        )
+        textnorm_query = op.Expand(op.Unsqueeze(textnorm_query, [0]), target_shape_1)
 
         # Prepend: [textnorm, language, event, emo] + input_features
         # FunASR order: textnorm prepended first, then [language, event, emo]
