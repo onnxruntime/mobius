@@ -75,10 +75,13 @@ class SANMAttention(nn.Module):
 
     Forward pass:
         1. Fused QKV projection → split into Q, K, V  [B, T, n_feat] each
-        2. Depthwise Conv1d on V (FSMN memory) with residual → V_fsmn
-        3. Reshape Q, K, V_fsmn to multi-head layout
-        4. Scaled dot-product attention via ``op.Attention``
-        5. Output projection
+        2. FSMN memory: depthwise Conv1d on V + residual → fsmn_memory
+        3. Scaled dot-product attention on Q, K, V (original V, NOT fsmn V)
+        4. Output = linear_out(attention_output + fsmn_memory)
+
+    The FSMN memory is ADDED to the attention output, not fed as V
+    into the attention computation. This matches the reference:
+    ``return att_outs + fsmn_memory``
 
     Args:
         in_size: Input feature dimension (may differ from out_size).
@@ -117,33 +120,32 @@ class SANMAttention(nn.Module):
         q, k, v = op.Split(qkv, axis=-1, num_outputs=3, _outputs=3)
 
         # --- FSMN memory block: depthwise Conv1d on V with residual ---
+        # The FSMN output is ADDED to the attention output (not fed as V).
         # Transpose V to channels-first: [B, T, n_feat] → [B, n_feat, T]
-        v_conv = op.Transpose(v, perm=[0, 2, 1])
+        v_for_fsmn = op.Transpose(v, perm=[0, 2, 1])
+        v_conv = self.fsmn_block(op, v_for_fsmn)  # [B, n_feat, T]
+        v_conv = op.Transpose(v_conv, perm=[0, 2, 1])  # [B, T, n_feat]
+        # FSMN memory = Conv1d(V) + V (residual)
+        fsmn_memory = op.Add(v_conv, v)  # [B, T, out_size]
 
-        # Depthwise Conv1d via FSMN block
-        v_conv = self.fsmn_block(op, v_conv)  # [B, n_feat, T]
-
-        # Transpose back: [B, n_feat, T] → [B, T, n_feat]
-        v_conv = op.Transpose(v_conv, perm=[0, 2, 1])
-
-        # Residual connection: V_fsmn = Conv1d(V) + V
-        v_fsmn = op.Add(v_conv, v)  # [B, T, out_size]
-
-        # --- Scaled dot-product attention via op.Attention ---
-        # Q, K, V_fsmn are [B, T, n_feat] (3-D packed format for Attention op)
+        # --- Scaled dot-product attention using ORIGINAL V ---
+        # Q, K, V are [B, T, n_feat] (3-D packed format for Attention op)
         scale = self._head_dim**-0.5
         attn_output, _, _ = op.Attention(
             q,
             k,
-            v_fsmn,
+            v,
             q_num_heads=self._n_heads,
             kv_num_heads=self._n_heads,
             scale=scale,
             _outputs=3,
         )  # [B, T, out_size]
 
+        # Combine: attention output + FSMN memory
+        combined = op.Add(attn_output, fsmn_memory)  # [B, T, out_size]
+
         # Output projection
-        return self.linear_out(op, attn_output)  # [B, T, out_size]
+        return self.linear_out(op, combined)  # [B, T, out_size]
 
 
 class SANMFFN(nn.Module):
