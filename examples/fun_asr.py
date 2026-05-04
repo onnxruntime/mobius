@@ -301,7 +301,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
             kernel_size=enc.get("kernel_size", 11),
             tp_num_blocks=enc.get("tp_blocks", 20),
             output_dim=enc.get("output_size", 512),
-            audio_token_id=151676,  # <|audio_pad|> token ID
+            audio_token_id=0,  # Fun-ASR uses token_id=0 as audio placeholder
             adaptor_proj_dim=adaptor.get("ffn_dim", 2048),
             adaptor_num_blocks=adaptor.get("n_layer", 2),
             adaptor_ffn_dim=256,  # FFN hidden dim inside adaptor blocks (from weights)
@@ -354,21 +354,19 @@ def transcribe(
 
     # Step 3: Build prompt with Fun-ASR format
     # Fun-ASR uses: system="You are a helpful assistant."
-    #   user="语音转写成{language}：" + fake_tokens (zeros) for audio positions
-    # The fake tokens get replaced with audio embeddings in step 4.
+    #   user="语音转写成{language}：" + fake_tokens for audio positions
     if language:
         user_text = f"语音转写成{language}："
     else:
         user_text = "语音转写："
 
     system_prompt = "You are a helpful assistant."
-    # Build chat template: <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user_text}
     chat_prefix = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_text}"
     prefix_ids = tokenizer.encode(chat_prefix, add_special_tokens=False)
 
-    # Audio placeholder: fake token IDs (zeros) — will be overwritten with audio embeddings
+    # Audio placeholder tokens — will be overwritten with audio embeddings
     audio_placeholder_ids = [0] * num_audio_tokens
-    fbank_beg = len(prefix_ids)  # position where audio starts
+    fbank_beg = len(prefix_ids)  # token index where audio starts
 
     chat_suffix = "<|im_end|>\n<|im_start|>assistant\n"
     suffix_ids = tokenizer.encode(chat_suffix, add_special_tokens=False)
@@ -376,17 +374,16 @@ def transcribe(
     prompt_ids = prefix_ids + audio_placeholder_ids + suffix_ids
     input_ids = np.array([prompt_ids], dtype=np.int64)
 
-    # Step 4: Build inputs_embeds by embedding text + overwriting audio positions
-    # Run embedding model to get text embeddings
+    # Step 4: Run embedding model to fuse text + audio
+    # The ONNX embedding model:
+    #   1. Embeds input_ids via embed_tokens
+    #   2. Identifies token_id=0 positions (audio placeholders)
+    #   3. Replaces those positions with audio_features
+    #   4. Outputs fused inputs_embeds
     embed_out = sessions["embedding"].run(
         {"input_ids": input_ids, "audio_features": audio_features_2d}
     )
     inputs_embeds = embed_out["inputs_embeds"]  # (1, seq_len, hidden)
-
-    # Overwrite audio positions with encoder output (position-based, like FunASR)
-    inputs_embeds[0, fbank_beg:fbank_beg + num_audio_tokens, :] = (
-        audio_features_2d[:num_audio_tokens, :].astype(inputs_embeds.dtype)
-    )
 
     # Step 5: Autoregressive decoding with the decoder model
     num_layers = config.num_hidden_layers
