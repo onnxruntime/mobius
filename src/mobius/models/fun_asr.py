@@ -348,7 +348,9 @@ class FunASREmbeddingModel(nn.Module):
         )
 
         audio = config.audio
-        audio_token_id = audio.audio_token_id if audio and audio.audio_token_id is not None else 151676
+        audio_token_id = (
+            audio.audio_token_id if audio and audio.audio_token_id is not None else 151676
+        )
         self._audio_token_id = audio_token_id
         self._llm_hidden_size = config.hidden_size
 
@@ -540,25 +542,25 @@ class FunASRForConditionalGeneration(nn.Module):
         for key, value in state_dict.items():
             # Route audio_encoder weights → audio_tower
             if key.startswith("audio_encoder."):
-                inner = key[len("audio_encoder."):]
+                inner = key[len("audio_encoder.") :]
                 cleaned[f"audio_tower.{inner}"] = value
                 continue
 
             # Route audio_adaptor weights → audio_tower.adaptor
             if key.startswith("audio_adaptor."):
-                inner = key[len("audio_adaptor."):]
+                inner = key[len("audio_adaptor.") :]
                 cleaned[f"audio_tower.adaptor.{inner}"] = value
                 continue
 
             # Route llm.lm_head to decoder.lm_head
             if key.startswith("llm.lm_head."):
-                inner = key[len("llm."):]
+                inner = key[len("llm.") :]
                 cleaned[f"decoder.{inner}"] = value
                 continue
 
             # Route llm.model.* to appropriate sub-module
             if key.startswith("llm.model."):
-                inner = key[len("llm.model."):]
+                inner = key[len("llm.model.") :]
 
                 # embed_tokens → embedding module
                 if inner.startswith("embed_tokens."):

@@ -76,7 +76,7 @@ LFR_N = 6  # Subsample by 6
 N_MELS = 80  # Mel filter bank bins
 
 # Language mapping for Fun-ASR-Nano-2512 (zh, en, ja).
-# Values are Chinese language names used in the prompt: "语音转写成{language}："
+# Values are Chinese language names used in the prompt (fullwidth colon is required).
 LANGUAGE_MAP: dict[str, str] = {
     "auto": "",
     "zh": "中文",
@@ -354,19 +354,20 @@ def transcribe(
 
     # Step 3: Build prompt with Fun-ASR format
     # Fun-ASR uses: system="You are a helpful assistant."
-    #   user="语音转写成{language}：" + fake_tokens for audio positions
+    #   user="语音转写成{language}：" + fake_tokens for audio positions  # noqa: RUF003
     if language:
-        user_text = f"语音转写成{language}："
+        user_text = f"语音转写成{language}："  # noqa: RUF001
     else:
-        user_text = "语音转写："
+        user_text = "语音转写："  # noqa: RUF001
 
     system_prompt = "You are a helpful assistant."
-    chat_prefix = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_text}"
+    chat_prefix = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_text}"
+    )
     prefix_ids = tokenizer.encode(chat_prefix, add_special_tokens=False)
 
     # Audio placeholder tokens — will be overwritten with audio embeddings
     audio_placeholder_ids = [0] * num_audio_tokens
-    fbank_beg = len(prefix_ids)  # token index where audio starts
 
     chat_suffix = "<|im_end|>\n<|im_start|>assistant\n"
     suffix_ids = tokenizer.encode(chat_suffix, add_special_tokens=False)
@@ -629,7 +630,7 @@ def main():
     weights_path = hf_hub_download(args.model, "model.pt")
     checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
     # model.pt wraps the actual weights in a 'state_dict' key
-    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    state_dict = checkpoint.get("state_dict", checkpoint)
     if hasattr(module, "preprocess_weights"):
         state_dict = module.preprocess_weights(state_dict)
     prefix_map = getattr(module, "weight_prefix_map", None)
