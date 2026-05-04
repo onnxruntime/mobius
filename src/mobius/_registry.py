@@ -509,6 +509,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
+    # Fun-ASR uses config.yaml (not config.json). build() auto-detection
+    # won't work — use build_from_module() with manual config construction.
+    # See examples/fun_asr.py for the full pipeline.
     "fun_asr": ModelRegistration(
         FunASRForConditionalGeneration, task="fun-asr-speech-language"
     ),

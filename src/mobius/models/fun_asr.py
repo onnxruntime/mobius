@@ -365,6 +365,11 @@ class FunASREmbeddingModel(nn.Module):
         Audio features are already projected to LLM hidden size by the
         audio encoder's adaptor, so we just scatter them at audio_token_id
         positions via Gather + Where.
+
+        Note: When ``audio_token_id`` is 0, any generated token 0 during
+        autoregressive decoding would collide with audio placeholders.
+        Callers should bypass this model for decode steps and use the
+        embed_tokens weight table directly (see examples/fun_asr.py).
         """
         # Text embeddings: (batch, seq_len, hidden_size)
         inputs_embeds = self.embed_tokens(op, input_ids)
