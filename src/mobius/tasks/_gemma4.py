@@ -73,7 +73,11 @@ def _make_gemma4_kv_cache_inputs(
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
-        kv_heads = config.num_key_value_heads
+        kv_heads = (
+            config.num_global_key_value_heads
+            if layer_type == "full_attention" and config.num_global_key_value_heads is not None
+            else config.num_key_value_heads
+        )
         past_key = builder.input(
             f"past_key_values.{i}.key",
             dtype=config.dtype,
