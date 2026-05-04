@@ -126,33 +126,14 @@ class FunASRAudioEncoder(nn.Module):
 
         hidden_states = self.after_norm(op, hidden_states)
 
-        # Temporal pooling: average pairs of adjacent frames
-        # (batch, T, D) → reshape to (batch, T//2, 2, D) → mean on axis 2
-        batch_dim = op.Shape(hidden_states, start=0, end=1)
-        seq_dim = op.Shape(hidden_states, start=1, end=2)
-        feat_dim = op.Shape(hidden_states, start=2, end=3)
-        half_seq = op.Div(seq_dim, op.Constant(value_ints=[2]))
-
-        # Reshape: [B, T, D] → [B, T//2, 2, D]
-        new_shape = op.Concat(
-            batch_dim,
-            half_seq,
-            op.Constant(value_ints=[2]),
-            feat_dim,
-            axis=0,
-        )
-        hidden_states = op.Reshape(hidden_states, new_shape)
-        # ReduceMean on axis=2: [B, T//2, 2, D] → [B, T//2, D]
-        tp_hidden = op.ReduceMean(hidden_states, [2], keepdims=False)
-
-        # Stack 3: temporal pooling encoder
+        # Stack 3: tp_encoders (additional refinement layers — no temporal pooling)
         for layer in self.tp_encoders:
-            tp_hidden = layer(op, tp_hidden)
+            hidden_states = layer(op, hidden_states)
 
-        hidden = self.tp_norm(op, tp_hidden)
+        hidden_states = self.tp_norm(op, hidden_states)
         # Project encoder features (512) to LLM dimension (1024) via adaptor
-        hidden = self.adaptor(op, hidden)
-        return hidden  # (batch, T//2, llm_hidden_size)
+        hidden_states = self.adaptor(op, hidden_states)
+        return hidden_states  # (batch, T, llm_hidden_size)
 
 
 # ── Adaptor Attention ──────────────────────────────────────────────────
