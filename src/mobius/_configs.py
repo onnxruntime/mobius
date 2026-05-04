@@ -1774,6 +1774,7 @@ class Gemma4Config(VisionLanguageConfig):
     final_logit_softcapping: float = 0.0
     attn_logit_softcapping: float = 0.0
     enable_moe_block: bool = False
+    attention_k_eq_v: bool = False
     boa_token_id: int | None = None
 
     @classmethod
@@ -1846,6 +1847,7 @@ class Gemma4Config(VisionLanguageConfig):
             final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
             attn_logit_softcapping=(getattr(config, "attn_logit_softcapping", 0.0) or 0.0),
             enable_moe_block=getattr(config, "enable_moe_block", False),
+            attention_k_eq_v=getattr(config, "attention_k_eq_v", False),
             boa_token_id=getattr(parent_config, "boa_token_id", None),
         )
 

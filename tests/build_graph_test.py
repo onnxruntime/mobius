@@ -1415,6 +1415,74 @@ class TestBuildGraphVisionLanguage:
         assert "present.1.key" not in output_names
         assert "present.1.value" not in output_names
 
+    def test_gemma4_k_eq_v_with_global_kv_heads(self):
+        """Verify attention_k_eq_v removes v_proj and num_global_key_value_heads sets KV cache shapes.
+
+        Config: attention_k_eq_v=True, num_key_value_heads=4 (sliding),
+        num_global_key_value_heads=2 (full). Full-attention layers should:
+        - Have no v_proj initializer (V=K)
+        - Use num_global_key_value_heads=2 for KV cache shapes
+        Sliding layers should use num_key_value_heads=4.
+        """
+        from mobius._configs import Gemma4Config
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            # Layer 0: sliding, Layer 1: full (k_eq_v + global heads)
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            attention_k_eq_v=True,
+            num_global_key_value_heads=2,
+        )
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask()
+        pkg = task.build(module, config)
+        decoder = pkg["model"]
+
+        # Check initializer names: full-attention layer (1) should have no v_proj
+        init_names = set(decoder.graph.initializers)
+        # Sliding layer 0 has k_proj, v_proj
+        assert "model.layers.0.self_attn.k_proj.weight" in init_names
+        assert "model.layers.0.self_attn.v_proj.weight" in init_names
+        # Full layer 1 has k_proj but NO v_proj (k_eq_v: V=K)
+        assert "model.layers.1.self_attn.k_proj.weight" in init_names
+        assert "model.layers.1.self_attn.v_proj.weight" not in init_names
+
+        # KV cache shapes:
+        # Layer 0 (sliding): num_key_value_heads=4
+        # Layer 1 (full): num_global_key_value_heads=2
+        input_shapes = {i.name: list(i.shape) for i in decoder.graph.inputs}
+        # Layer 0: kv_heads=4
+        layer0_key_shape = input_shapes["past_key_values.0.key"]
+        assert layer0_key_shape[1] == 4, (
+            f"Sliding layer 0 should have 4 KV heads, got {layer0_key_shape[1]}"
+        )
+        # Layer 1: kv_heads=2 (num_global_key_value_heads)
+        layer1_key_shape = input_shapes["past_key_values.1.key"]
+        assert layer1_key_shape[1] == 2, (
+            f"Full layer 1 should have 2 KV heads "
+            f"(num_global_key_value_heads), got {layer1_key_shape[1]}"
+        )
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
