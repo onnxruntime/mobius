@@ -1474,7 +1474,8 @@ class Gemma4TextModel(nn.Module):
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa or any(
-            layer.self_attn.is_kv_shared_layer for layer in self.layers
+            layer.self_attn.is_kv_shared_layer or layer.self_attn.head_dim > 256
+            for layer in self.layers
         )
         if need_fallback:
             if use_gqa:
