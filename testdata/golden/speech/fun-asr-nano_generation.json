@@ -1,0 +1,29 @@
+{
+  "model_id": "justinchuby/Fun-ASR-Nano-2512",
+  "prompt": "testdata/652-129742-0006.flac",
+  "generated_tokens": [
+    34,
+    4943,
+    76773,
+    1231,
+    13459,
+    1064,
+    1896,
+    9255,
+    65085,
+    95870,
+    1438,
+    1119,
+    23091,
+    7842,
+    12021,
+    24353,
+    323,
+    46105,
+    311,
+    3200,
+    13,
+    151645
+  ],
+  "generated_text": "Cauliflower mayonnaise take cold boiled cauliflower break into branches adding salt pepper and vinegar to season."
+}
