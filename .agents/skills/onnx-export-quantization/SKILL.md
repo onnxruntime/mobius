@@ -27,7 +27,6 @@ Use this skill when:
 mobius build \
   --model <hf-model-id> \
   --dtype <f16|bf16> \
-  --optimize \
   --ep <default|cuda|onnx-standard> \
   --runtime ort-genai \
   --external-data safetensors \
@@ -41,9 +40,9 @@ mobius build \
 |------|-------------|
 | `--model <id>` | HuggingFace model ID (e.g. `google/gemma-4-27b-it`) |
 | `--dtype <f16\|bf16>` | Model precision — `f16` (float16) or `bf16` (bfloat16) |
-| `--optimize` | Apply ONNX graph optimizations (constant folding, fusion) |
+| `--optimize [RULES]` | Apply mobius rewrite rules after building (e.g. `group_query_attention`, `packed_attention`, `skip_norm`). Use without value for all rules, or specify comma-separated names. Not needed for basic exports. |
 | `--ep <variant>` | Execution provider variant (see below) |
-| `--runtime ort-genai` | Generate `genai_config.json` for ORT GenAI runtime |
+| `--runtime ort-genai` | Generate `genai_config.json` and copy tokenizer files for ORT GenAI runtime |
 | `--external-data safetensors` | Store weights externally in safetensors format |
 | `--max-shard-size 5GB` | Split external data into shards ≤ 5GB |
 
@@ -54,9 +53,12 @@ rewrites and fused ops:
 
 | EP | Flag | When to use |
 |----|------|-------------|
-| `default` | `--ep default` | CPU inference. No custom ops — pure standard ONNX. Compatible with all runtimes. |
+| `default` | `--ep default` | Portable ONNX — no vendor-specific fusions. Compatible with all execution providers and runtimes. This is the default if `--ep` is omitted. |
 | `cuda` | `--ep cuda` | NVIDIA GPU inference. Emits `com.microsoft` fused ops (GroupQueryAttention, MoE, etc.) for maximum CUDA performance. |
-| `onnx-standard` | `--ep onnx-standard` | DirectML / cross-platform GPU. Standard ONNX ops only — no contrib ops. Works on AMD, Intel, and NVIDIA via DML. |
+| `onnx-standard` | `--ep onnx-standard` | Strict ONNX-only — inlines all custom-domain functions into standard ONNX ops. Use when targeting runtimes that don't support `com.microsoft` ops. |
+
+Other EPs are available (`cpu`, `dml`, `webgpu`, `trt-rtx`). Run
+`mobius list eps` to see all options.
 
 **Typical export matrix:** Build each dtype × EP combination:
 
@@ -64,7 +66,7 @@ rewrites and fused ops:
 for dtype in f16 bf16; do
   for ep in default cuda onnx-standard; do
     mobius build --model google/gemma-4-12b-it \
-      --dtype $dtype --optimize --ep $ep \
+      --dtype $dtype --ep $ep \
       --runtime ort-genai \
       --external-data safetensors --max-shard-size 5GB \
       output/${dtype}/${ep}/
@@ -118,22 +120,26 @@ pip install cupy-cuda12x
 K-quant quantization uses mixed block sizes with importance-based bit
 allocation. Q4_K_M is a good balance of quality and size.
 
-```python
-from olive.passes.onnx import OnnxKQuantQuantization
+The repo uses Olive's config-driven `olive.run()` pattern (see
+`examples/olive/` for working examples). A typical Olive config for
+k-quant quantization:
 
-pass_config = OnnxKQuantQuantization(bits=4, block_size=32)
-result = pass_config.run(model_path, output_dir)
+```json
+{
+  "input_model": { "type": "OnnxModel", "model_path": "decoder/model.onnx" },
+  "passes": {
+    "kquant": {
+      "type": "OnnxKQuantQuantization",
+      "bits": 4,
+      "block_size": 32
+    }
+  },
+  "output_dir": "output/Q4_K_M/default/decoder"
+}
 ```
 
-**CLI equivalent with Olive:**
-
 ```bash
-olive quantize \
-  --method kquant \
-  --bits 4 \
-  --block-size 32 \
-  --input-model output/f16/default/decoder/model.onnx \
-  --output-dir output/Q4_K_M/default/decoder/
+olive run --config kquant_config.json
 ```
 
 ### NF4 quantization (4-bit NormalFloat)
@@ -141,12 +147,21 @@ olive quantize \
 NF4 uses a normal-distribution-optimized 4-bit format. Fast native C++
 implementation — no GPU needed.
 
-```python
-from olive.passes.onnx import OnnxBnb4Quantization
-
-pass_config = OnnxBnb4Quantization(precision="nf4")
-result = pass_config.run(model_path, output_dir)
+```json
+{
+  "input_model": { "type": "OnnxModel", "model_path": "decoder/model.onnx" },
+  "passes": {
+    "nf4": {
+      "type": "OnnxBnb4Quantization",
+      "precision": "nf4"
+    }
+  },
+  "output_dir": "output/NF4/default/decoder"
+}
 ```
+
+> See `examples/olive/ministral-3-3b-vlm/` for a complete working
+> example that combines mobius export with Olive quantization.
 
 ### GPU acceleration with cupy
 
@@ -168,19 +183,26 @@ pip install cupy-cuda12x
 ### Quantizing multi-model exports
 
 Quantize each sub-model independently. Typically only the decoder is
-quantized (it has the most parameters):
+quantized (it has the most parameters). Copy all other files needed
+for a complete ORT GenAI package:
 
 ```bash
 # Quantize decoder only (largest model)
-olive quantize --method kquant --bits 4 --block-size 32 \
-  --input-model output/f16/default/decoder/model.onnx \
-  --output-dir output/Q4_K_M/default/decoder/
+olive run --config kquant_decoder.json
 
 # Copy other sub-models as-is (already small)
 cp -r output/f16/default/embedding/ output/Q4_K_M/default/embedding/
 cp -r output/f16/default/vision_encoder/ output/Q4_K_M/default/vision_encoder/
-cp -r output/f16/default/genai_config.json output/Q4_K_M/default/
+
+# IMPORTANT: Copy config, tokenizer, and processor files too
+cp output/f16/default/genai_config.json output/Q4_K_M/default/
+cp output/f16/default/tokenizer* output/Q4_K_M/default/
+cp output/f16/default/image_processor.json output/Q4_K_M/default/ 2>/dev/null
+cp output/f16/default/audio_processor.json output/Q4_K_M/default/ 2>/dev/null
 ```
+
+Without the tokenizer and processor config files, ORT GenAI will fail
+to load the model.
 
 ## HuggingFace upload structure
 
@@ -189,9 +211,9 @@ cp -r output/f16/default/genai_config.json output/Q4_K_M/default/
 ```
 <org>/<model>-onnx/
 ├── f16/
-│   ├── default/          # CPU EP
-│   ├── cuda/             # CUDA EP
-│   └── onnx-standard/   # DML/cross-platform EP
+│   ├── default/          # Portable ONNX (no vendor fusions)
+│   ├── cuda/             # CUDA EP (fused ops)
+│   └── onnx-standard/   # Strict ONNX-only (inlined functions)
 ├── bf16/
 │   ├── default/
 │   ├── cuda/
@@ -304,17 +326,33 @@ section on precision behaviour.
 
 ### L4: Golden data generation
 
-Generate reference outputs from the full-precision model, then compare
-quantized model outputs:
+Generate reference outputs from the full-precision HuggingFace model
+using the golden data generation script:
+
+```bash
+# Generate golden files for all test cases
+python scripts/generate_golden.py
+
+# Generate for a specific task type
+python scripts/generate_golden.py --task-type causal-lm
+
+# Generate for a single test case
+python scripts/generate_golden.py --case testdata/cases/causal-lm/gpt2.yaml
+
+# Use GPU for large models
+python scripts/generate_golden.py --device cuda
+```
+
+Golden reference files are stored in `testdata/golden/` as JSON. Use
+`compare_golden()` from `mobius._testing.parity` to compare model
+outputs against the reference:
 
 ```python
-# Generate golden data from f16 model
-from mobius._testing import generate_golden_data
+from mobius._testing.parity import compare_golden
 
-generate_golden_data(
-    model_path="output/f16/default/",
-    output_path="golden/f16_default.npz",
-    prompt="Hello, world!",
+compare_golden(
+    model_output=output_logits,
+    golden_path="testdata/golden/causal-lm/my_model.json",
 )
 ```
 
