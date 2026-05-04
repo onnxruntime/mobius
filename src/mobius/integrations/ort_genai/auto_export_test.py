@@ -796,7 +796,7 @@ class TestExportForOrtGenai:
             data = json.load(f)
         provider_opts = data["model"]["decoder"]["session_options"]["provider_options"]
         assert len(provider_opts) == 1
-        assert "CUDAExecutionProvider" in provider_opts[0]
+        assert "cuda" in provider_opts[0]
 
     def test_raises_when_pkg_config_is_none(self, tmp_path):
         """ValueError is raised when pkg.config is None."""
