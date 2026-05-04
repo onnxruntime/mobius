@@ -71,16 +71,16 @@ def _extract_field_docstrings(class_def: ast.ClassDef) -> dict[str, str]:
     return docs
 
 
-def _extract_env_info(class_def: ast.ClassDef) -> dict[str, tuple[str, bool]]:
-    """Map field names → (env_var_name, default_value) from _env_bool calls."""
-    info: dict[str, tuple[str, bool]] = {}
+def _extract_env_info(class_def: ast.ClassDef) -> dict[str, tuple[str, object]]:
+    """Map field names → (env_var_name, default_value) from _env_bool/_env_int calls."""
+    info: dict[str, tuple[str, object]] = {}
     for node in class_def.body:
         if not (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)):
             continue
         name = node.target.id
         if node.value is None:
             continue
-        # Walk node.value looking for Lambda → _env_bool(env_var, default)
+        # Walk node.value looking for Lambda → _env_bool/_env_int(env_var, default)
         for sub in ast.walk(node.value):
             if not isinstance(sub, ast.Lambda):
                 continue
@@ -88,13 +88,17 @@ def _extract_env_info(class_def: ast.ClassDef) -> dict[str, tuple[str, bool]]:
             if (
                 isinstance(body, ast.Call)
                 and isinstance(body.func, ast.Name)
-                and body.func.id == "_env_bool"
+                and body.func.id in ("_env_bool", "_env_int")
                 and len(body.args) >= 2
                 and isinstance(body.args[0], ast.Constant)
                 and isinstance(body.args[1], ast.Constant)
             ):
                 env_var: str = body.args[0].value
-                default: bool = bool(body.args[1].value)
+                default = body.args[1].value
+                if body.func.id == "_env_bool":
+                    default = bool(default)
+                else:
+                    default = int(default)
                 info[name] = (env_var, default)
                 break
     return info

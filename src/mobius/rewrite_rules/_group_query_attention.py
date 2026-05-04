@@ -168,7 +168,7 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
 
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
+        # Skip when head_dim exceeds gqa_max_head_dim flag (default 512).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
             return result.fail(
@@ -608,7 +608,7 @@ class AttentionToGQA(RewriteRuleClassBase):
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
 
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
+        # Skip when head_dim exceeds gqa_max_head_dim flag (default 512).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
             return result.fail(
