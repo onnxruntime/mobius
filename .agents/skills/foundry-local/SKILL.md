@@ -36,8 +36,11 @@ Use this skill when:
      output/
    ```
 
-   The output directory must contain `genai_config.json`, tokenizer
-   files, and the model sub-directories (decoder/, embedding/, etc.).
+   The output directory must contain `genai_config.json` and tokenizer
+   files. For single-model exports (text-only LLMs), model files
+   (`model.onnx` + external data) are in the output root. For
+   multi-model exports (VLMs, ALMs), sub-directories like `decoder/`,
+   `embedding/`, `vision_encoder/` contain each model.
 
 ## Custom model registration
 
@@ -64,18 +67,34 @@ mkdir -p "${CACHE_DIR}/models/Custom/${MODEL_NAME}"
 
 ### Step 3: Copy model files
 
-Copy the entire mobius export output into the model directory:
+Copy the entire mobius export output into the model directory. The
+simplest approach copies everything:
 
 ```bash
-# Copy all model files
-cp -r output/decoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
+cp -r output/* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
+```
+
+Or copy selectively (handles both single-model and multi-model layouts):
+
+```bash
+# Model files — single-model (root-level) and multi-model (sub-dirs)
+cp output/model.onnx* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
+cp -r output/decoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
 cp -r output/embedding/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
 cp -r output/vision_encoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
 cp -r output/audio_encoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
+
+# Config and tokenizer files (required)
 cp output/genai_config.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
 cp output/tokenizer* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
+
+# Processor configs for VLMs (copy whichever exist)
 cp output/image_processor.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
+cp output/processor_config.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
 cp output/audio_processor.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
+
+# External data shards (single-model layout)
+cp output/*.safetensors "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
 ```
 
 ### Step 4: Create `inference_model.json`
@@ -271,8 +290,16 @@ or direct HTTP API as a reliable alternative.
 
 Foundry Local uses ORT GenAI internally, which has a model_type
 whitelist (see the `ort-genai-config` skill). If your model uses an
-unregistered model_type, set `model_type: "decoder"` in
-`genai_config.json` as a workaround.
+unregistered model_type, set `"type": "decoder"` under the `"model"`
+key in `genai_config.json` as a workaround:
+
+```json
+{
+  "model": {
+    "type": "decoder"
+  }
+}
+```
 
 ## End-to-end example
 
