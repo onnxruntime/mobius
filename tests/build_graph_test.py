@@ -5295,11 +5295,10 @@ class TestBuildGemma4StaticCacheGraph:
             vocab_size=256,
             rms_norm_eps=1e-6,
             hidden_act="gelu_pytorch_tanh",
-            layer_types=[
-                "sliding_attention", "sliding_attention", "sliding_attention",
-                "sliding_attention", "sliding_attention", "full_attention",
-            ],
-            sliding_window=64,
+            # Static cache does not support sliding window — use
+            # full_attention for all layers in the default test config.
+            layer_types=["full_attention"] * 6,
+            sliding_window=0,
             rope_theta=10000.0,
             global_rope_theta=1000000.0,
             partial_rotary_factor=0.5,
@@ -5335,22 +5334,20 @@ class TestBuildGemma4StaticCacheGraph:
         assert "nonpad_kv_seqlen" in input_names
 
     def test_gemma4_static_cache_dual_head_dim(self):
-        """Verify per-layer cache shapes respect dual head_dim."""
+        """Verify per-layer cache shapes use global_head_dim for full-attention."""
         model, config = self._build()
 
         input_map = {inp.name: inp for inp in model.graph.inputs}
 
-        # Layer 0-4: sliding (head_dim=16, kv_heads=2 → kv_hidden=32)
-        k0 = input_map["key_cache.0"]
-        assert k0.shape is not None
-        # shape is [batch, max_seq, kv_hidden]
-        kv_hidden_sliding = config.num_key_value_heads * config.head_dim
-        assert k0.shape[2] == kv_hidden_sliding
-
-        # Layer 5: full_attention (global_head_dim=32, kv_heads=2 → kv_hidden=64)
-        k5 = input_map["key_cache.5"]
+        # All layers are full_attention → global_head_dim=32, kv_heads=2 → kv_hidden=64
         kv_hidden_full = config.num_key_value_heads * config.global_head_dim
-        assert k5.shape[2] == kv_hidden_full
+        for i in range(config.num_hidden_layers):
+            k = input_map[f"key_cache.{i}"]
+            assert k.shape is not None
+            assert k.shape[2] == kv_hidden_full, (
+                f"key_cache.{i} has kv_hidden={k.shape[2]}, "
+                f"expected {kv_hidden_full}"
+            )
 
     def test_gemma4_static_cache_has_tensorscatter(self):
         """Verify TensorScatter ops and no GQA in static cache mode."""
@@ -5371,11 +5368,7 @@ class TestBuildGemma4StaticCacheGraph:
         model, config = self._build(
             num_hidden_layers=8,
             num_kv_shared_layers=2,
-            layer_types=[
-                "sliding_attention", "sliding_attention", "sliding_attention",
-                "sliding_attention", "sliding_attention", "full_attention",
-                "sliding_attention", "full_attention",
-            ],
+            layer_types=["full_attention"] * 8,
         )
 
         input_names = {inp.name for inp in model.graph.inputs}
@@ -5416,6 +5409,25 @@ class TestBuildGemma4StaticCacheGraph:
         assert nonpad_idx > last_cache_idx, (
             "nonpad_kv_seqlen should come after all cache inputs"
         )
+
+    def test_gemma4_static_cache_rejects_sliding_window(self):
+        """Verify static cache raises ValueError for sliding_window > 0."""
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = self._gemma4_config(
+            sliding_window=64,
+            layer_types=[
+                "sliding_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention", "full_attention",
+            ],
+        )
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask(
+            static_cache=True, max_seq_len=self.MAX_SEQ_LEN
+        )
+        with pytest.raises(ValueError, match="sliding-window attention"):
+            task.build(module, config)
 
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
