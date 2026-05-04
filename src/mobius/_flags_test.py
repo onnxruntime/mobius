@@ -108,3 +108,51 @@ class TestListFlags:
         original = _flags.flags.suppress_dedup_warning
         with _flags.override_flags(suppress_dedup_warning=not original):
             assert snapshot["suppress_dedup_warning"] == original
+
+
+class TestGqaMaxHeadDim:
+    """Tests for the gqa_max_head_dim integer flag."""
+
+    def test_default_is_512(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_GQA_MAX_HEAD_DIM", raising=False)
+        f = _flags._Flags()
+        assert f.gqa_max_head_dim == 512
+
+    def test_env_var_override(self, monkeypatch):
+        monkeypatch.setenv("MOBIUS_GQA_MAX_HEAD_DIM", "256")
+        f = _flags._Flags()
+        assert f.gqa_max_head_dim == 256
+
+    def test_env_var_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv("MOBIUS_GQA_MAX_HEAD_DIM", "not_a_number")
+        f = _flags._Flags()
+        assert f.gqa_max_head_dim == 512
+
+    def test_override_flags_with_int(self):
+        original = _flags.flags.gqa_max_head_dim
+        with _flags.override_flags(gqa_max_head_dim=256):
+            assert _flags.flags.gqa_max_head_dim == 256
+        assert _flags.flags.gqa_max_head_dim == original
+
+    def test_gqa_rewrite_respects_flag(self):
+        """GQA rewrite rule's head_dim check respects the flag value."""
+        from unittest.mock import MagicMock
+
+        from mobius.rewrite_rules._group_query_attention import (
+            _head_dim_exceeds_gqa_limit,
+        )
+
+        # Create mock past_key with head_dim=384
+        mock_key = MagicMock()
+        mock_key.shape = [1, 8, 0, 384]
+
+        # With default (512), head_dim=384 should pass
+        with _flags.override_flags(gqa_max_head_dim=512):
+            assert _head_dim_exceeds_gqa_limit(mock_key) is None
+
+        # With limit=256, head_dim=384 should fail
+        with _flags.override_flags(gqa_max_head_dim=256):
+            assert _head_dim_exceeds_gqa_limit(mock_key) == 384
+
+    def test_in_list_flags(self):
+        assert "gqa_max_head_dim" in _flags.list_flags()

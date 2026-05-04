@@ -49,22 +49,24 @@ from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleSet,
 )
 
+from mobius._flags import flags
+
 # CUDA EP's GroupQueryAttention kernel historically enforced MAX_HEAD_SIZE = 256.
-# Keep the rewrite-rule limit conservative until GQA fusion is gated on a
-# runtime/EP capability check. This avoids emitting GroupQueryAttention nodes
-# with head_dim=512 that can still fail on released ORT builds.
-_MAX_GQA_HEAD_DIM = 256
+# The limit is now configurable via the ``gqa_max_head_dim`` flag (default 512
+# for newer ORT builds).  Set ``MOBIUS_GQA_MAX_HEAD_DIM=256`` to restore the
+# old limit for ORT ≤1.24.
 
 
 def _head_dim_exceeds_gqa_limit(past_key) -> int | None:
     """Return the head_dim if it exceeds the GQA kernel limit, else None.
 
     ``past_key`` is expected to have shape ``(batch, kv_heads, seq, head_dim)``.
+    The limit is read from :data:`mobius._flags.flags.gqa_max_head_dim`.
     """
     if past_key is None or past_key.shape is None or len(past_key.shape) < 4:
         return None
     hd = past_key.shape[3]
-    if isinstance(hd, int) and hd > _MAX_GQA_HEAD_DIM:
+    if isinstance(hd, int) and hd > flags.gqa_max_head_dim:
         return hd
     return None
 
@@ -169,7 +171,9 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
+            return result.fail(
+                f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={flags.gqa_max_head_dim}"
+            )
 
         return result
 
@@ -607,7 +611,9 @@ class AttentionToGQA(RewriteRuleClassBase):
         # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
+            return result.fail(
+                f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={flags.gqa_max_head_dim}"
+            )
 
         return result
 
