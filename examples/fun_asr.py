@@ -628,6 +628,8 @@ def main():
     from huggingface_hub import hf_hub_download
 
     weights_path = hf_hub_download(args.model, "model.pt")
+    # weights_only=False required: model.pt uses pickle format with nested
+    # state_dict structure, not safetensors
     checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
     # model.pt wraps the actual weights in a 'state_dict' key
     state_dict = checkpoint.get("state_dict", checkpoint)

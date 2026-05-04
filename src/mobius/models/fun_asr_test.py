@@ -157,10 +157,14 @@ class TestFunASRPipelineShapes:
         return pkg, config
 
     def test_audio_encoder_output_shape(self, package):
-        """Audio encoder: (B, T, D_in) → (B, T//2, D_hidden)."""
+        """Audio encoder: (B, T, D_in) → (B, T, D_hidden).
+
+        No temporal pooling — tp_encoders are refinement layers that
+        preserve sequence length.
+        """
         pkg, config = package
         input_dim = config.audio.input_size
-        seq_len = 100  # must be even
+        seq_len = 100
         fbank = np.random.randn(1, seq_len, input_dim).astype(np.float32)
 
         sess = OnnxModelSession(pkg["audio_encoder"])
@@ -172,7 +176,7 @@ class TestFunASRPipelineShapes:
         audio_features = out["audio_features"]
         assert audio_features.shape == (
             1,
-            seq_len // 2,
+            seq_len,
             config.audio.attention_dim,
         )
 
@@ -242,11 +246,11 @@ class TestFunASRPipelineShapes:
         )
 
 
-class TestFunASRTemporalPooling:
-    """Test audio encoder temporal pooling edge cases.
+class TestFunASRSequenceLength:
+    """Test audio encoder sequence length preservation.
 
-    The temporal pooling step reshapes (B, T, D) → (B, T//2, 2, D) and
-    averages. This requires T to be even.
+    The tp_encoders are refinement layers, NOT temporal pooling.
+    Input sequence length is preserved through the encoder.
     """
 
     @pytest.fixture(scope="class")
@@ -255,8 +259,8 @@ class TestFunASRTemporalPooling:
         return pkg, config
 
     @pytest.mark.parametrize("seq_len", [2, 4, 50, 100, 200])
-    def test_even_sequence_lengths(self, package, seq_len):
-        """Various even sequence lengths should all work."""
+    def test_sequence_lengths_preserved(self, package, seq_len):
+        """Various sequence lengths should all pass through unchanged."""
         pkg, config = package
         input_dim = config.audio.input_size
         fbank = np.random.randn(1, seq_len, input_dim).astype(np.float32)
@@ -268,11 +272,11 @@ class TestFunASRTemporalPooling:
             sess.close()
 
         audio_features = out["audio_features"]
-        assert audio_features.shape[1] == seq_len // 2
+        assert audio_features.shape[1] == seq_len
         assert not np.any(np.isnan(audio_features))
 
     def test_minimum_sequence_length(self, package):
-        """Minimum viable sequence length (T=2, pooled to T=1)."""
+        """Minimum viable sequence length (T=2)."""
         pkg, config = package
         input_dim = config.audio.input_size
         fbank = np.random.randn(1, 2, input_dim).astype(np.float32)
@@ -283,7 +287,7 @@ class TestFunASRTemporalPooling:
         finally:
             sess.close()
 
-        assert out["audio_features"].shape[1] == 1
+        assert out["audio_features"].shape[1] == 2
 
 
 class TestFunASRFullPipeline:
@@ -309,7 +313,7 @@ class TestFunASRFullPipeline:
         assert not np.any(np.isinf(logits))
 
     def test_pipeline_with_short_audio(self, package):
-        """Short audio input (T=4, pools to T=2)."""
+        """Short audio input (T=4, no pooling)."""
         pkg, config = package
         input_dim = config.audio.input_size
         fbank = np.random.randn(1, 4, input_dim).astype(np.float32)
@@ -317,8 +321,8 @@ class TestFunASRFullPipeline:
         result = _run_pipeline(pkg, config, fbank, prefix_ids=[1], suffix_ids=[2])
 
         logits = result["logits"]
-        # 2 audio tokens (from T=4→T=2) + 1 prefix + 1 suffix = 4
-        assert logits.shape[1] == 4
+        # 4 audio tokens (no pooling) + 1 prefix + 1 suffix = 6
+        assert logits.shape[1] == 6
         assert not np.any(np.isnan(logits))
 
     def test_pipeline_no_prefix_suffix(self, package):
@@ -330,8 +334,8 @@ class TestFunASRFullPipeline:
         result = _run_pipeline(pkg, config, fbank, prefix_ids=[], suffix_ids=[])
 
         logits = result["logits"]
-        # 10 audio tokens only (20 → 10 after pooling)
-        assert logits.shape[1] == 10
+        # 20 audio tokens only (no pooling)
+        assert logits.shape[1] == 20
         assert not np.any(np.isnan(logits))
 
     def test_pipeline_long_prefix(self, package):
@@ -344,8 +348,8 @@ class TestFunASRFullPipeline:
         result = _run_pipeline(pkg, config, fbank, prefix_ids=prefix, suffix_ids=[51])
 
         logits = result["logits"]
-        # 50 prefix + 10 audio + 1 suffix = 61
-        assert logits.shape[1] == 61
+        # 50 prefix + 20 audio (no pooling) + 1 suffix = 71
+        assert logits.shape[1] == 71
 
     def test_decoder_step_with_kv_cache(self, package):
         """Verify decoder handles autoregressive step (seq_len=1 with cache)."""
@@ -465,7 +469,7 @@ class TestFunASRWeightNames:
         assert "audio_tower.tp_norm.weight" in result
 
     def test_adaptor_weight_routing(self):
-        """Verify audio_adaptor.* maps to embedding.audio_adaptor.*."""
+        """Verify audio_adaptor.* maps to audio_tower.adaptor.*."""
         config = _tiny_config()
         module = FunASRForConditionalGeneration(config)
         import torch
@@ -476,20 +480,22 @@ class TestFunASRWeightNames:
         }
         result = module.preprocess_weights(fake_sd)
 
-        assert "embedding.audio_adaptor.linear1.weight" in result
-        assert "embedding.audio_adaptor.blocks.0.norm1.weight" in result
+        assert "audio_tower.adaptor.linear1.weight" in result
+        assert "audio_tower.adaptor.blocks.0.norm1.weight" in result
 
     def test_decoder_weight_routing(self):
-        """Verify model.layers/norm/lm_head route to decoder.*."""
+        """Verify llm.model.layers/norm/lm_head route to decoder.*."""
         config = _tiny_config()
         module = FunASRForConditionalGeneration(config)
         import torch
 
         fake_sd = {
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(TINY_HIDDEN, TINY_HIDDEN),
-            "model.norm.weight": torch.zeros(TINY_HIDDEN),
-            "lm_head.weight": torch.zeros(TINY_VOCAB, TINY_HIDDEN),
-            "model.embed_tokens.weight": torch.zeros(TINY_VOCAB, TINY_HIDDEN),
+            "llm.model.layers.0.self_attn.q_proj.weight": torch.zeros(
+                TINY_HIDDEN, TINY_HIDDEN
+            ),
+            "llm.model.norm.weight": torch.zeros(TINY_HIDDEN),
+            "llm.lm_head.weight": torch.zeros(TINY_VOCAB, TINY_HIDDEN),
+            "llm.model.embed_tokens.weight": torch.zeros(TINY_VOCAB, TINY_HIDDEN),
         }
         result = module.preprocess_weights(fake_sd)
 
@@ -505,7 +511,7 @@ class TestFunASRWeightNames:
         import torch
 
         fake_sd = {
-            "model.embed_tokens.weight": torch.ones(TINY_VOCAB, TINY_HIDDEN),
+            "llm.model.embed_tokens.weight": torch.ones(TINY_VOCAB, TINY_HIDDEN),
         }
         result = module.preprocess_weights(fake_sd)
 
