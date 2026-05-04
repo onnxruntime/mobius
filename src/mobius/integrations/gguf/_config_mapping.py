@@ -465,6 +465,9 @@ def _gemma4_postprocess(
         else 1_000_000.0,
         global_partial_rotary_factor=global_partial_rotary_factor,
         num_global_key_value_heads=num_global_key_value_heads,
+        # attention_k_eq_v: derive from per-layer KV head counts. When
+        # full-attention layers use fewer KV heads, V = K (no v_proj).
+        attention_k_eq_v=num_global_key_value_heads is not None,
         final_logit_softcapping=float(final_logit_softcapping or 0.0),
         attn_logit_softcapping=float(attn_logit_softcapping or 0.0),
         num_kv_shared_layers=int(num_kv_shared_layers)

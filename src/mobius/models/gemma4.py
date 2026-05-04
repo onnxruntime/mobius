@@ -55,6 +55,39 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
 
+
+# ---------------------------------------------------------------------------
+# Shared weight preprocessing helpers
+# ---------------------------------------------------------------------------
+
+
+def _remap_moe_expert_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> None:
+    """Rename HF MoE expert weights and fold router scale in-place.
+
+    Shared by ``Gemma4CausalLMModel`` and ``Gemma4Model`` to avoid
+    duplicating the rename/fold logic.
+    """
+    # experts.gate_up_proj → fc1_experts_weights
+    # experts.down_proj    → fc2_experts_weights
+    for key in list(state_dict.keys()):
+        if ".experts.gate_up_proj" in key:
+            new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+        elif ".experts.down_proj" in key:
+            new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+
+    # Fold hidden_size^-0.5 into router.scale
+    if config.enable_moe_block:
+        scale_factor = float(config.hidden_size**-0.5)
+        for key in list(state_dict.keys()):
+            if ".router.scale" in key and ".per_expert_scale" not in key:
+                state_dict[key] = state_dict[key] * scale_factor
+
+
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
 # ---------------------------------------------------------------------------
@@ -1653,27 +1686,8 @@ class Gemma4CausalLMModel(CausalLMModel):
                 for i in range(num_layers):
                     shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
                     state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = shard
-        # Map HF expert weight names to our 3D stacked parameter names.
-        # HF stores: layers.N.experts.gate_up_proj [E, 2*inter, H]
-        #             layers.N.experts.down_proj     [E, H, inter]
-        # We store:  layers.N.fc1_experts_weights   [E, 2*inter, H]
-        #             layers.N.fc2_experts_weights   [E, H, inter]
-        for key in list(state_dict.keys()):
-            if ".experts.gate_up_proj" in key:
-                new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
-                state_dict[new_key] = state_dict.pop(key)
-            elif ".experts.down_proj" in key:
-                new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
-                state_dict[new_key] = state_dict.pop(key)
-        # Fold hidden_size^-0.5 into router.scale.
-        # The router computes: x_normed * scale * hidden_size^-0.5.
-        # We pre-multiply scale by hidden_size^-0.5 here so the forward only needs
-        # x_normed * self.scale, avoiding float-constant name collisions across layers.
-        if self.config.enable_moe_block:
-            scale_factor = float(self.config.hidden_size**-0.5)
-            for key in list(state_dict.keys()):
-                if ".router.scale" in key:
-                    state_dict[key] = state_dict[key] * scale_factor
+        # Map HF expert weight names and fold router scale
+        _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
 
 
@@ -2150,22 +2164,7 @@ class Gemma4Model(nn.Module):
             else:
                 renamed[key] = value
 
-        # Map HF expert weight names to our 3D stacked parameter names.
-        # HF: decoder.model.layers.N.experts.gate_up_proj [E, 2*inter, H]
-        # Us: decoder.model.layers.N.fc1_experts_weights  [E, 2*inter, H]
-        for key in list(renamed.keys()):
-            if ".experts.gate_up_proj" in key:
-                new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
-                renamed[new_key] = renamed.pop(key)
-            elif ".experts.down_proj" in key:
-                new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
-                renamed[new_key] = renamed.pop(key)
-
-        # Fold hidden_size^-0.5 into router.scale
-        if self.config.enable_moe_block:
-            scale_factor = float(self.config.hidden_size**-0.5)
-            for key in list(renamed.keys()):
-                if ".router.scale" in key and ".per_expert_scale" not in key:
-                    renamed[key] = renamed[key] * scale_factor
+        # Map HF expert weight names and fold router scale
+        _remap_moe_expert_weights(renamed, self.config)
 
         return renamed
