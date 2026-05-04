@@ -1859,7 +1859,7 @@ class Gemma4TextModel(nn.Module):
         # KV-shared layers fall back to standard Attention because they
         # borrow K,V from another layer (no own KV cache).
         from mobius._build_context import get_build_dtype
-        from mobius.components._attention import GQAContext
+        from mobius.components._attention import GQAContext, StaticCacheState
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
@@ -1898,10 +1898,12 @@ class Gemma4TextModel(nn.Module):
             )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 
-        # Static cache mode: attention_mask is None, skip GQA and fallback
-        # mask construction — the Attention op uses is_causal=1 with
-        # nonpad_kv_seqlen for masking instead.
-        static_cache_mode = attention_mask is None
+        # Detect static cache mode from past_key_values content: if any
+        # entry is a StaticCacheState, the Attention op uses is_causal=1
+        # with nonpad_kv_seqlen — no attention_mask or GQA needed.
+        static_cache_mode = past_key_values is not None and any(
+            isinstance(kv, StaticCacheState) for kv in past_key_values if kv is not None
+        )
         use_gqa = (
             not static_cache_mode
             and dtype in caps.gqa_dtypes
