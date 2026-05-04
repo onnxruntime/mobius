@@ -49,24 +49,21 @@ from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleSet,
 )
 
-from mobius._flags import flags
-
-# CUDA EP's GroupQueryAttention kernel historically enforced MAX_HEAD_SIZE = 256.
-# The limit is now configurable via the ``gqa_max_head_dim`` flag (default 256
-# for newer ORT builds).  Set ``MOBIUS_GQA_MAX_HEAD_DIM=256`` to restore the
-# old limit for ORT ≤1.24.
+# CUDA EP's GroupQueryAttention kernel has a compile-time MAX_HEAD_SIZE.
+# ORT 1.25+ supports head_dim up to 512 (needed for Gemma4 global attention).
+# CPU EP is unaffected by this limit.
+_MAX_GQA_HEAD_DIM = 512
 
 
 def _head_dim_exceeds_gqa_limit(past_key) -> int | None:
     """Return the head_dim if it exceeds the GQA kernel limit, else None.
 
     ``past_key`` is expected to have shape ``(batch, kv_heads, seq, head_dim)``.
-    The limit is read from :data:`mobius._flags.flags.gqa_max_head_dim`.
     """
     if past_key is None or past_key.shape is None or len(past_key.shape) < 4:
         return None
     hd = past_key.shape[3]
-    if isinstance(hd, int) and hd > flags.gqa_max_head_dim:
+    if isinstance(hd, int) and hd > _MAX_GQA_HEAD_DIM:
         return hd
     return None
 
@@ -168,12 +165,10 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
 
-        # Skip when head_dim exceeds gqa_max_head_dim flag (default 256).
+        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
-            return result.fail(
-                f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={flags.gqa_max_head_dim}"
-            )
+            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
 
         return result
 
@@ -608,12 +603,10 @@ class AttentionToGQA(RewriteRuleClassBase):
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
 
-        # Skip when head_dim exceeds gqa_max_head_dim flag (default 256).
+        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
         hd = _head_dim_exceeds_gqa_limit(past_key)
         if hd is not None:
-            return result.fail(
-                f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={flags.gqa_max_head_dim}"
-            )
+            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
 
         return result
 

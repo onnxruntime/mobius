@@ -55,18 +55,6 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-def _env_int(name: str, default: int) -> int:
-    """Read an integer from an environment variable.
-
-    Returns *default* if the variable is unset or not a valid integer.
-    """
-    val = os.environ.get(name, "")
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
-
 @dataclasses.dataclass
 class _Flags:
     """Runtime feature flags singleton.
@@ -96,11 +84,6 @@ class _Flags:
          - ``True``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT ≤1.24.x workaround).
-       * - ``gqa_max_head_dim``
-         - ``MOBIUS_GQA_MAX_HEAD_DIM``
-         - ``256``
-         - Maximum head_dim for the Attention→GQA rewrite rule.
-           Set to 256 for ORT ≤1.24.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -133,20 +116,6 @@ class _Flags:
     opset 24 kernel support.
     """
 
-    gqa_max_head_dim: int = dataclasses.field(
-        default_factory=lambda: _env_int("MOBIUS_GQA_MAX_HEAD_DIM", 256)
-    )
-    """Maximum head_dim for the Attention→GroupQueryAttention rewrite rule.
-
-    The CUDA GQA kernel has a compile-time ``MAX_HEAD_SIZE`` limit.  Older
-    ORT builds (≤1.24) only support head_dim ≤ 256; newer builds support
-    up to 512.  When head_dim exceeds this limit, the GQA rewrite rule is
-    skipped and the model keeps the standard Attention op.
-
-    Set ``MOBIUS_GQA_MAX_HEAD_DIM=256`` to restore the old limit for older
-    ORT builds.
-    """
-
 
 # Global singleton — import and use this directly.
 flags = _Flags()
@@ -158,7 +127,7 @@ def list_flags() -> dict[str, object]:
 
 
 @contextmanager
-def override_flags(**kwargs: bool | int) -> Iterator[None]:
+def override_flags(**kwargs: bool) -> Iterator[None]:
     """Temporarily override one or more flags within a ``with`` block.
 
     Restores the original values on exit, even if an exception is raised.
