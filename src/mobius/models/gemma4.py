@@ -1474,8 +1474,7 @@ class Gemma4TextModel(nn.Module):
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa or any(
-            layer.self_attn.is_kv_shared_layer or layer.self_attn.head_dim > 256
-            for layer in self.layers
+            layer.self_attn.is_kv_shared_layer for layer in self.layers
         )
         if need_fallback:
             if use_gqa:
@@ -1550,11 +1549,9 @@ class Gemma4TextModel(nn.Module):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
             # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared layers
-            # and layers where head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
+            # available, fall back to standard Attention for KV-shared layers.
             is_shared = layer.self_attn.is_kv_shared_layer
-            gqa_head_dim_ok = layer.self_attn.head_dim <= 256
-            if use_gqa and not is_shared and gqa_head_dim_ok:
+            if use_gqa and not is_shared:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:
