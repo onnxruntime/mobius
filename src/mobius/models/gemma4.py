@@ -607,11 +607,12 @@ class Gemma4TextAttention(nn.Module):
         self._use_alternative_attention = (
             getattr(config, "attention_k_eq_v", False) and not is_sliding
         )
-        self.num_key_value_heads = (
-            (config.num_global_key_value_heads or config.num_key_value_heads)
-            if self._use_alternative_attention
-            else config.num_key_value_heads
-        )
+        # Full-attention layers use num_global_key_value_heads when set,
+        # independent of the k_eq_v flag.
+        if not is_sliding and config.num_global_key_value_heads is not None:
+            self.num_key_value_heads = config.num_global_key_value_heads
+        else:
+            self.num_key_value_heads = config.num_key_value_heads
 
         # KV sharing: layers >= first_kv_shared_layer_idx borrow K,V from source
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
