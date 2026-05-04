@@ -119,17 +119,13 @@ class SANMAttention(nn.Module):
         # Split into Q, K, V each [B, T, out_size]
         q, k, v = op.Split(qkv, axis=-1, num_outputs=3, _outputs=3)
 
-        # --- FSMN memory block: depthwise Conv1d on V with residual ---
-        # The FSMN output is ADDED to the attention output (not fed as V).
-        # Transpose V to channels-first: [B, T, n_feat] → [B, n_feat, T]
-        v_for_fsmn = op.Transpose(v, perm=[0, 2, 1])
-        v_conv = self.fsmn_block(op, v_for_fsmn)  # [B, n_feat, T]
+        # --- FSMN path (parallel): Conv1d on V with residual ---
+        v_t = op.Transpose(v, perm=[0, 2, 1])  # [B, n_feat, T]
+        v_conv = self.fsmn_block(op, v_t)  # [B, n_feat, T]
         v_conv = op.Transpose(v_conv, perm=[0, 2, 1])  # [B, T, n_feat]
-        # FSMN memory = Conv1d(V) + V (residual)
         fsmn_memory = op.Add(v_conv, v)  # [B, T, out_size]
 
-        # --- Scaled dot-product attention using ORIGINAL V ---
-        # Q, K, V are [B, T, n_feat] (3-D packed format for Attention op)
+        # --- Attention path (parallel): uses ORIGINAL v ---
         scale = self._head_dim**-0.5
         attn_output, _, _ = op.Attention(
             q,
@@ -140,12 +136,10 @@ class SANMAttention(nn.Module):
             scale=scale,
             _outputs=3,
         )  # [B, T, out_size]
+        attn_output = self.linear_out(op, attn_output)  # [B, T, out_size]
 
-        # Combine: attention output + FSMN memory
-        combined = op.Add(attn_output, fsmn_memory)  # [B, T, out_size]
-
-        # Output projection
-        return self.linear_out(op, combined)  # [B, T, out_size]
+        # Sum parallel paths: attention + FSMN memory
+        return op.Add(attn_output, fsmn_memory)  # [B, T, out_size]
 
 
 class SANMFFN(nn.Module):
