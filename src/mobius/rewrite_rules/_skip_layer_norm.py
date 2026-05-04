@@ -74,7 +74,8 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         # Both Add inputs must have at least 2 dimensions.  This prevents
         # fusing a bias-Add (e.g. MatMul + 1D bias → LayerNorm) which
         # would produce a SkipLayerNormalization with a 1D skip input
-        # that ORT rejects.
+        # that ORT rejects.  Unknown shapes are allowed through since
+        # most intermediate values lack static shape info.
         for i, inp in enumerate(producer.inputs):
             if inp is not None and inp.shape is not None:
                 rank = len(inp.shape)
@@ -157,6 +158,8 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
 
         # Both Add inputs must have at least 2 dimensions — reject
         # bias-Add patterns (e.g. MatMul + 1D bias → LayerNorm).
+        # Unknown shapes are allowed through since most intermediate
+        # values lack static shape info.
         for i, inp in enumerate(producer.inputs):
             if inp is not None and inp.shape is not None:
                 rank = len(inp.shape)

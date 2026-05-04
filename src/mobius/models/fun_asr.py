@@ -338,6 +338,17 @@ class FunASREmbeddingModel(nn.Module):
 
     Output:
         inputs_embeds: ``(batch, seq_len, hidden_size)``
+
+    Note:
+        This model only supports ``batch=1``. The CumSum-based audio scatter
+        uses a flat ``audio_features`` table shared across the batch, so with
+        ``batch > 1`` each row's cumsum restarts at 1 and indexes the same
+        prefix of ``audio_features``.
+
+        When ``audio_token_id`` is 0, generated token 0 during autoregressive
+        decoding would collide with audio placeholders. Callers should bypass
+        this model for decode steps and use the embed_tokens weight table
+        directly (see ``examples/fun_asr.py``).
     """
 
     def __init__(self, config: ArchitectureConfig):
