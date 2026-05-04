@@ -53,7 +53,9 @@ def _make_gemma4_kv_cache_inputs(
     layers and do NOT have their own cache entries — only
     ``num_hidden_layers - num_kv_shared_layers`` entries are created.
 
-    All layers use the original ``num_key_value_heads`` (no expansion).
+    All layers use the original ``num_key_value_heads`` except
+    alternative-attention (``attention_k_eq_v``) full layers which use
+    ``num_global_key_value_heads`` (fewer KV heads).
     The Attention op supports GQA head counts natively.  CUDA EP limitations
     are tracked in microsoft/onnxruntime#28195 and #28196.
     """
@@ -73,9 +75,11 @@ def _make_gemma4_kv_cache_inputs(
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
+        # Alternative attention (k_eq_v) uses fewer KV heads for full_attention
+        use_alt = getattr(config, "attention_k_eq_v", False) and layer_type == "full_attention"
         kv_heads = (
-            config.num_global_key_value_heads
-            if layer_type == "full_attention" and config.num_global_key_value_heads is not None
+            (config.num_global_key_value_heads or config.num_key_value_heads)
+            if use_alt
             else config.num_key_value_heads
         )
         past_key = builder.input(

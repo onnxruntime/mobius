@@ -593,15 +593,6 @@ class Gemma4TextAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = head_dim
         self.scaling = 1.0
-
-        # Full-attention layers may use fewer KV heads than sliding layers
-        # (HF: attention_k_eq_v + num_global_key_value_heads).
-        layer_type = layer_types[layer_idx]
-        is_full = layer_type == "full_attention"
-        if is_full and config.num_global_key_value_heads is not None:
-            self.num_key_value_heads = config.num_global_key_value_heads
-        else:
-            self.num_key_value_heads = config.num_key_value_heads
         # attn_logit_softcapping maps directly to the ONNX Attention op's
         # native ``softcap`` attribute (opset 24). No manual Tanh/scale ops needed.
         self.softcap = config.attn_logit_softcapping
@@ -609,6 +600,18 @@ class Gemma4TextAttention(nn.Module):
         self.rotary_embedding_dim = rotary_embedding_dim
         self._rope_interleave = config.rope_interleave
         self.layer_idx = layer_idx
+
+        # Alternative attention: full_attention layers with k_eq_v share V=K
+        # (no separate v_proj). Uses fewer KV heads (num_global_key_value_heads).
+        is_sliding = layer_types[layer_idx] == "sliding_attention"
+        self._use_alternative_attention = (
+            getattr(config, "attention_k_eq_v", False) and not is_sliding
+        )
+        self.num_key_value_heads = (
+            (config.num_global_key_value_heads or config.num_key_value_heads)
+            if self._use_alternative_attention
+            else config.num_key_value_heads
+        )
 
         # KV sharing: layers >= first_kv_shared_layer_idx borrow K,V from source
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
@@ -643,9 +646,11 @@ class Gemma4TextAttention(nn.Module):
             self.k_proj = Linear(
                 config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
-            self.v_proj = Linear(
-                config.hidden_size, self.num_key_value_heads * head_dim, bias=False
-            )
+            # Alternative attention (k_eq_v): V = K, no separate v_proj
+            if not self._use_alternative_attention:
+                self.v_proj = Linear(
+                    config.hidden_size, self.num_key_value_heads * head_dim, bias=False
+                )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -721,15 +726,19 @@ class Gemma4TextAttention(nn.Module):
             gqa_ctx = attention_bias
 
             # K projection + per-head K norm (no manual RoPE — GQA does it)
-            key_states = self.k_proj(op, hidden_states)
-            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_raw = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_raw, [0, 0, -1, self.head_dim])
             key_states = self.k_norm(op, key_states)
             key_states = op.Reshape(key_states, [0, 0, -1])
 
-            # V projection + parameterless per-head V normalisation
-            value_states = self.v_proj(op, hidden_states)
+            # V: separate projection, or V=K (alternative attention)
+            if self._use_alternative_attention:
+                value_raw = key_raw
+            else:
+                value_raw = self.v_proj(op, hidden_states)
+            # Parameterless per-head V normalisation
             value_states = op.Reshape(
-                value_states,
+                value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
             sq = op.Mul(value_states, value_states)
@@ -780,8 +789,8 @@ class Gemma4TextAttention(nn.Module):
                 )
         else:
             # K projection + per-head K norm + optional RoPE
-            key_states = self.k_proj(op, hidden_states)
-            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_raw = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_raw, [0, 0, -1, self.head_dim])
             key_states = self.k_norm(op, key_states)
             key_states = op.Reshape(key_states, [0, 0, -1])
 
@@ -795,10 +804,14 @@ class Gemma4TextAttention(nn.Module):
                     interleaved=self._rope_interleave,
                 )
 
-            # V projection + parameterless per-head V normalisation
-            value_states = self.v_proj(op, hidden_states)
+            # V: separate projection, or V=K (alternative attention)
+            if self._use_alternative_attention:
+                value_raw = key_raw
+            else:
+                value_raw = self.v_proj(op, hidden_states)
+            # Parameterless per-head V normalisation
             value_states = op.Reshape(
-                value_states,
+                value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
             sq = op.Mul(value_states, value_states)
