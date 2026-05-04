@@ -305,7 +305,7 @@ def build_fun_asr_config(model_id: str, dtype: str = "f32") -> ArchitectureConfi
             adaptor_proj_dim=adaptor.get("ffn_dim", 2048),
             adaptor_num_blocks=adaptor.get("n_layer", 2),
             adaptor_ffn_dim=256,  # FFN hidden dim inside adaptor blocks (from weights)
-            adaptor_num_heads=enc.get("attention_heads", 4),
+            adaptor_num_heads=8,  # Reference defaults to 8 for adaptor attention
         ),
     )
 
