@@ -108,11 +108,9 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        # Constant all-ones scale (not a learnable parameter).
-        # Set const_value so no external weight is needed.
-        self.weight = nn.Parameter([dim])
-        self.weight.const_value = ir.Tensor(
-            np.ones(dim, dtype=np.float32), name="scale_free_ones"
+        # Constant all-ones scale (not a learnable parameter from HF).
+        self.weight = nn.Parameter(
+            [dim], data=ir.Tensor(np.ones(dim, dtype=np.float32))
         )
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
