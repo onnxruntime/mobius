@@ -8,6 +8,10 @@ Builds an ONNX model for Gemma 4 (text-only) with mobius, saves it with
 genai_config.json, and runs multi-step text generation via onnxruntime-genai.
 Reports tokens/sec for benchmarking.
 
+**Important:** Gemma 4 ``-it`` (instruction-tuned) models require chat-formatted
+prompts. Raw text prompts produce degenerate repetitive output. This script
+automatically wraps prompts in the Gemma chat template.
+
 Requirements::
 
     pip install mobius-ai[transformers] onnxruntime-genai
@@ -16,6 +20,9 @@ Usage::
 
     # CPU generation (default):
     python examples/gemma4_genai.py
+
+    # Custom prompt:
+    python examples/gemma4_genai.py --prompt "Explain quantum computing"
 
     # CUDA generation:
     python examples/gemma4_genai.py --device cuda
@@ -49,8 +56,30 @@ import time
 # ---------------------------------------------------------------------------
 
 MODEL_ID = "google/gemma-4-E2B-it"
-DEFAULT_PROMPT = "The capital of France is"
+DEFAULT_PROMPT = "What is the capital of France?"
 MAX_NEW_TOKENS = 50
+
+
+# ---------------------------------------------------------------------------
+# Chat template
+# ---------------------------------------------------------------------------
+
+
+def format_chat_prompt(user_message: str) -> str:
+    """Wrap a user message in Gemma 4's chat template.
+
+    Gemma 4 instruction-tuned models expect this format::
+
+        <start_of_turn>user
+        {message}<end_of_turn>
+        <start_of_turn>model
+
+    Raw prompts without the template produce degenerate output.
+    """
+    return (
+        f"<start_of_turn>user\n{user_message}<end_of_turn>\n"
+        f"<start_of_turn>model\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -96,14 +125,20 @@ def generate(
     max_new_tokens: int = MAX_NEW_TOKENS,
     device: str = "cpu",
 ) -> tuple[str, float]:
-    """Run text generation with ORT GenAI.  Returns (text, tokens_per_sec)."""
+    """Run text generation with ORT GenAI.  Returns (text, tokens_per_sec).
+
+    The prompt should already be wrapped in the chat template via
+    :func:`format_chat_prompt`.
+    """
     import onnxruntime_genai as og
 
     print(f"Loading model from {model_dir!r} (device={device}) ...")
     model = og.Model(model_dir)
     tokenizer = og.Tokenizer(model)
 
-    input_ids = tokenizer.encode(prompt)
+    # Apply chat template so the -it model produces coherent output
+    chat_prompt = format_chat_prompt(prompt)
+    input_ids = tokenizer.encode(chat_prompt)
     params = og.GeneratorParams(model)
     params.set_search_options(max_length=len(input_ids) + max_new_tokens)
 
