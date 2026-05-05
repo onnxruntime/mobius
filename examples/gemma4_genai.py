@@ -141,7 +141,7 @@ def generate(
         else 0
     )
 
-    print(f"\n📊 Performance:")
+    print("\n📊 Performance:")
     print(f"   Tokens generated: {num_tokens}")
     print(f"   Total time:       {total_time:.2f}s")
     print(f"   Time to first:    {ttft:.3f}s")
@@ -228,7 +228,7 @@ def main() -> None:
     print(f"Gemma 4 — ORT GenAI (device={args.device}, dtype={args.dtype})")
     print("=" * 60)
 
-    output, tps = generate(
+    output, _tps = generate(
         model_dir,
         args.prompt,
         max_new_tokens=args.max_new_tokens,
