@@ -42,8 +42,6 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_attention_bias,
-    create_padding_mask,
-    create_sliding_window_mask,
     initialize_rope,
 )
 from mobius.components._activations import get_activation
@@ -695,7 +693,7 @@ class Gemma4TextAttention(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value | GQAContext,
+        attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None = None,
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
@@ -1079,7 +1077,7 @@ class Gemma4DecoderLayer(nn.Module):
         self,
         op: builder.OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value | GQAContext,
+        attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None,
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
@@ -1526,6 +1524,9 @@ class Gemma4TextModel(nn.Module):
                 # causality, and omitting the mask allows ORT to use MEA
                 # (CUTLASS FMHA) for head_dim=512 without bias alignment
                 # issues that would force the slow unfused path.
+                # NOTE: This assumes no padding in the input (batch_size=1
+                # or all-ones attention_mask). Padded batched inputs will
+                # attend to pad tokens in full-attention KV-shared layers.
                 # Sliding-window: use float additive bias (bool masks cause
                 # NaN on CUDA in ORT's ConvertAttnMaskToBias path).
                 fallback_bias_dict = {
