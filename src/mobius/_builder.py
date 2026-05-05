@@ -37,6 +37,7 @@ from mobius._configs import (
     BaseModelConfig,
 )
 from mobius._execution_providers import ep_registry
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
@@ -208,6 +209,17 @@ def build_from_module(
             model_role=role,
             trace=trace_optimization,
         )
+
+    # Lower default-domain opset from 24 to 23 when the target EP doesn't
+    # register opset 24 kernels for standard ops (Reshape, RMSNormalization,
+    # etc.). Without this, those ops fall to CPU and produce ~280 memcpy
+    # nodes that destroy performance. The flag defaults to True; set
+    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
+    # opset 24 natively.
+    if flags.ort_lower_opset_for_ep and execution_provider != "default":
+        for model in pkg.values():
+            if "" in model.graph.opset_imports:
+                model.graph.opset_imports[""] = 23
     return pkg
 
 
