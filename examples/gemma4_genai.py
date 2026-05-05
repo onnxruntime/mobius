@@ -66,11 +66,17 @@ def build_and_export(
 ) -> None:
     """Build ONNX model with mobius CLI and write ORT GenAI config."""
     cmd = [
-        sys.executable, "-m", "mobius", "build",
-        "--model", model_id,
-        "--dtype", dtype,
+        sys.executable,
+        "-m",
+        "mobius",
+        "build",
+        "--model",
+        model_id,
+        "--dtype",
+        dtype,
         "--optimize",
-        "--runtime", "ort-genai",
+        "--runtime",
+        "ort-genai",
         output_dir,
     ]
     print(f"Running: {' '.join(cmd)}")
@@ -135,11 +141,7 @@ def generate(
 
     ttft = (t_first_token - t_start) if t_first_token else 0
     decode_time = t_end - t_first_token if t_first_token else total_time
-    decode_tps = (
-        (num_tokens - 1) / decode_time
-        if decode_time > 0 and num_tokens > 1
-        else 0
-    )
+    decode_tps = (num_tokens - 1) / decode_time if decode_time > 0 and num_tokens > 1 else 0
 
     print("\n📊 Performance:")
     print(f"   Tokens generated: {num_tokens}")
