@@ -1443,8 +1443,11 @@ class Gemma4TextModel(nn.Module):
         # supports local_window_size for sliding-window layers.
         # KV-shared layers fall back to standard Attention because they
         # borrow K,V from another layer (no own KV cache).
+        # Layers with head_dim > 256 also fall back because ORT's GQA
+        # CUDA kernel doesn't support larger head dimensions.
         from mobius._build_context import get_build_dtype
         from mobius.components._attention import GQAContext
+        from mobius.rewrite_rules._group_query_attention import _MAX_GQA_HEAD_DIM
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
@@ -1504,11 +1507,14 @@ class Gemma4TextModel(nn.Module):
             }
 
         # Fallback attention bias for non-GQA layers (KV-shared layers always
-        # use this, plus all layers when use_gqa is False).
+        # use this, layers with head_dim > GQA limit, plus all layers when
+        # use_gqa is False).
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa or any(
-            layer.self_attn.is_kv_shared_layer for layer in self.layers
+            layer.self_attn.is_kv_shared_layer
+            or layer.self_attn.head_dim > _MAX_GQA_HEAD_DIM
+            for layer in self.layers
         )
         if need_fallback:
             if use_gqa:
@@ -1577,15 +1583,20 @@ class Gemma4TextModel(nn.Module):
         else:
             past_kvs = [None] * len(self.layers)
 
+        # ORT's GQA CUDA kernel supports head_dim up to 256.
+        # Layers with head_dim > 256 (e.g. full_attention) must use
+        # standard Attention with manual RoPE.
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
             # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared layers.
+            # available, fall back to standard Attention for KV-shared
+            # layers or layers with head_dim exceeding the GQA kernel limit.
             is_shared = layer.self_attn.is_kv_shared_layer
-            if use_gqa and not is_shared:
+            gqa_compatible = layer.self_attn.head_dim <= _MAX_GQA_HEAD_DIM
+            if use_gqa and not is_shared and gqa_compatible:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:
