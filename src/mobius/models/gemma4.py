@@ -116,11 +116,15 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         # Manual RMSNorm: x / sqrt(mean(x²) + ε), scale = 1.0 (scale-free).
         # Using primitive ops avoids ORT's SkipLayerNorm fusion pattern which
         # would corrupt the skip shape when an upstream Add uses a 1D bias.
-        square = op.Mul(hidden_states, hidden_states)
+        # Compute in FP32 to avoid FP16 overflow: values > 256 squared exceed
+        # the FP16 max (65504), producing inf → mean(inf) → sqrt(inf) → 0.
+        x_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        square = op.Mul(x_f32, x_f32)
         mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
-        eps = op.CastLike(op.Constant(value_float=self.eps), mean_sq)
+        eps = op.Constant(value_float=self.eps)
         rms = op.Sqrt(op.Add(mean_sq, eps))
-        return op.Div(hidden_states, rms)
+        result_f32 = op.Div(x_f32, rms)
+        return op.CastLike(result_f32, hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -770,16 +774,18 @@ class Gemma4TextAttention(nn.Module):
                 value_raw = key_raw
             else:
                 value_raw = self.v_proj(op, hidden_states)
-            # Parameterless per-head V normalisation
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
                 value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             # Build GQA attributes
@@ -843,19 +849,21 @@ class Gemma4TextAttention(nn.Module):
                 value_raw = key_raw
             else:
                 value_raw = self.v_proj(op, hidden_states)
-            # Parameterless per-head V normalisation
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
                 value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             # Use op.Constant to create a 1D tensor node (not a scalar initializer).
             # Scalar Python floats use a type-keyed cache that can fail when upstream
             # type information is missing (e.g., after custom ops like com.microsoft.MoE).
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             attn_output, present_key, present_value = _apply_attention(
