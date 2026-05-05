@@ -459,20 +459,3 @@ def _validate_static_cache_support(module: nn.Module) -> None:
                     f"{type(layer).__name__}.forward()."
                 )
 
-    # Reject models with sliding-window attention: static cache uses
-    # is_causal=1 without local_window_size (the ONNX Attention op does
-    # not have this attribute — only com.microsoft.GroupQueryAttention
-    # supports it). This would silently produce wrong outputs for
-    # sequences longer than the window.
-    sliding_window = getattr(module, "sliding_window", None)
-    if sliding_window is None:
-        text_model = getattr(module, "model", None)
-        sliding_window = getattr(text_model, "sliding_window", None)
-    if sliding_window and sliding_window > 0:
-        raise ValueError(
-            f"Static cache mode is not supported for models with "
-            f"sliding-window attention (sliding_window={sliding_window}). "
-            f"The ONNX Attention op does not support local_window_size, "
-            f"so window constraints cannot be enforced. Use dynamic cache "
-            f"(without --static-cache) for correct sliding-window behavior."
-        )

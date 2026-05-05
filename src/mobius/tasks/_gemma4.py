@@ -41,21 +41,46 @@ from mobius.tasks._cache_utils import (
 )
 
 
+def _register_hybrid_cache_outputs(
+    builder: GraphBuilder,
+    present_key_values: list[tuple[ir.Value, ir.Value]],
+    config: Gemma4Config,
+) -> None:
+    """Register cache outputs for hybrid static/dynamic Gemma4 models.
+
+    Full-attention layers use ``updated_key_cache.{i}`` / ``updated_value_cache.{i}``.
+    Sliding-attention layers use ``present.{i}.key`` / ``present.{i}.value``.
+    """
+    layer_types = config.layer_types or (
+        ["sliding_attention"] * config.num_hidden_layers
+    )
+
+    for i, (k, v) in enumerate(present_key_values):
+        lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
+        if lt == "full_attention":
+            builder.add_output(k, f"updated_key_cache.{i}")
+            builder.add_output(v, f"updated_value_cache.{i}")
+        else:
+            builder.add_output(k, f"present.{i}.key")
+            builder.add_output(v, f"present.{i}.value")
+
+
 def _make_gemma4_static_cache_inputs(
     builder: GraphBuilder,
     config: Gemma4Config,
     batch: ir.SymbolicDim,
     max_seq_len: int,
+    past_seq_len: ir.SymbolicDim | None = None,
 ) -> list:
-    """Create per-layer static KV cache inputs for Gemma4.
+    """Create per-layer hybrid KV cache inputs for Gemma4 static cache mode.
 
-    Like :func:`_make_gemma4_kv_cache_inputs` but creates pre-allocated
-    fixed-size cache buffers ``[B, max_seq_len, kv_hidden]`` for use with
-    TensorScatter.  KV-shared layers get ``None`` entries (no own cache).
+    Full-attention layers get :class:`StaticCacheState` (TensorScatter).
+    Sliding-attention layers get dynamic ``(past_key, past_value)`` tuples
+    (GQA with ``local_window_size``).  KV-shared layers get ``None``.
 
-    Returns a list with one entry per decoder layer:
-    - :class:`StaticCacheState` for layers with independent KV projections
-    - ``None`` for KV-shared layers
+    Args:
+        past_seq_len: Symbolic dim for dynamic cache sequence length.
+            Required when the config has sliding-attention layers.
     """
     from mobius.components._attention import StaticCacheState
 
@@ -67,7 +92,8 @@ def _make_gemma4_static_cache_inputs(
         ["sliding_attention"] * config.num_hidden_layers
     )
 
-    cache_pairs: list[tuple[ir.Value, ir.Value]] = []
+    # Per non-shared layer: static or dynamic cache
+    layer_entries: list[tuple[str, object]] = []  # ("static"|"dynamic", cache)
     for i in range(num_kv_layers):
         lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if lt == "full_attention" else local_head_dim
@@ -77,51 +103,67 @@ def _make_gemma4_static_cache_inputs(
         else:
             kv_heads = config.num_key_value_heads
 
-        kv_hidden = kv_heads * hd
-        key_cache = builder.input(
-            f"key_cache.{i}",
-            dtype=config.dtype,
-            shape=[batch, max_seq_len, kv_hidden],
-        )
-        value_cache = builder.input(
-            f"value_cache.{i}",
-            dtype=config.dtype,
-            shape=[batch, max_seq_len, kv_hidden],
-        )
-        cache_pairs.append((key_cache, value_cache))
-
-    # Shared control inputs (after all cache tensors, matching standard pattern)
-    write_indices = builder.input(
-        "write_indices",
-        dtype=ir.DataType.INT64,
-        shape=[batch],
-    )
-    nonpad_kv_seqlen = builder.input(
-        "nonpad_kv_seqlen",
-        dtype=ir.DataType.INT64,
-        shape=[batch],
-    )
-
-    cache_states: list[StaticCacheState] = []
-    for key_cache, value_cache in cache_pairs:
-        cache_states.append(
-            StaticCacheState(
-                key_cache=key_cache,
-                value_cache=value_cache,
-                write_indices=write_indices,
-                nonpad_kv_seqlen=nonpad_kv_seqlen,
+        if is_full:
+            kv_hidden = kv_heads * hd
+            key_cache = builder.input(
+                f"key_cache.{i}",
+                dtype=config.dtype,
+                shape=[batch, max_seq_len, kv_hidden],
             )
+            value_cache = builder.input(
+                f"value_cache.{i}",
+                dtype=config.dtype,
+                shape=[batch, max_seq_len, kv_hidden],
+            )
+            layer_entries.append(("static", (key_cache, value_cache)))
+        else:
+            assert past_seq_len is not None, (
+                "past_seq_len required for sliding-attention dynamic cache"
+            )
+            past_key = builder.input(
+                f"past_key_values.{i}.key",
+                dtype=config.dtype,
+                shape=[batch, kv_heads, past_seq_len, hd],
+            )
+            past_value = builder.input(
+                f"past_key_values.{i}.value",
+                dtype=config.dtype,
+                shape=[batch, kv_heads, past_seq_len, hd],
+            )
+            layer_entries.append(("dynamic", (past_key, past_value)))
+
+    # Shared control inputs for static cache layers
+    has_static = any(t == "static" for t, _ in layer_entries)
+    write_indices = nonpad_kv_seqlen = None
+    if has_static:
+        write_indices = builder.input(
+            "write_indices",
+            dtype=ir.DataType.INT64,
+            shape=[batch],
+        )
+        nonpad_kv_seqlen = builder.input(
+            "nonpad_kv_seqlen",
+            dtype=ir.DataType.INT64,
+            shape=[batch],
         )
 
-    # Expand to full per-layer list: StaticCacheState for non-shared,
-    # None for KV-shared layers (matching the dynamic cache pattern).
-    state_iter = iter(cache_states)
+    # Build full per-layer list
+    entry_iter = iter(layer_entries)
     full_list: list = []
     for i in range(config.num_hidden_layers):
         if i >= num_kv_layers:
             full_list.append(None)
         else:
-            full_list.append(next(state_iter))
+            cache_type, pair = next(entry_iter)
+            if cache_type == "static":
+                k, v = pair
+                full_list.append(StaticCacheState(
+                    key_cache=k, value_cache=v,
+                    write_indices=write_indices,
+                    nonpad_kv_seqlen=nonpad_kv_seqlen,
+                ))
+            else:
+                full_list.append(pair)
     return full_list
 
 
@@ -263,14 +305,21 @@ class Gemma4TextCausalLMTask(ModelTask):
         )
 
         if static:
-            attention_mask = None
+            # Hybrid mode: sliding layers need attention_mask + dynamic cache,
+            # full-attention layers use write_indices/nonpad_kv_seqlen.
+            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            attention_mask = builder.input(
+                "attention_mask",
+                dtype=ir.DataType.INT64,
+                shape=[batch, "past_seq_len + seq_len"],
+            )
             position_ids = builder.input(
                 "position_ids",
                 dtype=ir.DataType.INT64,
                 shape=[batch, seq_len],
             )
             past_key_values = _make_gemma4_static_cache_inputs(
-                builder, config, batch, max_seq_len,
+                builder, config, batch, max_seq_len, past_seq_len,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -298,7 +347,7 @@ class Gemma4TextCausalLMTask(ModelTask):
         builder.add_output(logits, "logits")
 
         if static:
-            _register_static_cache_outputs(builder, present_key_values)
+            _register_hybrid_cache_outputs(builder, present_key_values, config)
         else:
             _register_kv_cache_outputs(builder, present_key_values)
 
@@ -428,9 +477,7 @@ class Gemma4Task(ModelTask):
             shape=[batch, seq_len, config.hidden_size],
         )
 
-        if static:
-            attention_mask = None
-        else:
+        if not static:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
             attention_mask = builder.input(
                 "attention_mask",
@@ -474,7 +521,7 @@ class Gemma4Task(ModelTask):
 
         if static:
             past_key_values = _make_gemma4_static_cache_inputs(
-                builder, config, batch, max_seq_len,
+                builder, config, batch, max_seq_len, past_seq_len,
             )
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
@@ -493,7 +540,7 @@ class Gemma4Task(ModelTask):
 
         builder.add_output(logits, "logits")
         if static:
-            _register_static_cache_outputs(builder, present_key_values)
+            _register_hybrid_cache_outputs(builder, present_key_values, config)
         else:
             _register_kv_cache_outputs(builder, present_key_values)
 

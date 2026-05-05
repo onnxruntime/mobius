@@ -1898,14 +1898,11 @@ class Gemma4TextModel(nn.Module):
             )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 
-        # Detect static cache mode from past_key_values content: if any
-        # entry is a StaticCacheState, the Attention op uses is_causal=1
-        # with nonpad_kv_seqlen — no attention_mask or GQA needed.
-        static_cache_mode = past_key_values is not None and any(
-            isinstance(kv, StaticCacheState) for kv in past_key_values if kv is not None
-        )
+        # GQA is available when attention_mask exists and the EP supports it.
+        # In hybrid mode, sliding layers use GQA while full-attention layers
+        # use the static Attention path with TensorScatter.
         use_gqa = (
-            not static_cache_mode
+            attention_mask is not None
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
             and not use_block_overlay
@@ -1967,6 +1964,12 @@ class Gemma4TextModel(nn.Module):
                 "sliding_attention": None,
                 "full_attention": None,
             }
+            # In hybrid mode, static-cache full-attention layers need RoPE
+            # embeddings for the standard Attention path (not GQA).
+            if past_key_values is not None and any(
+                isinstance(kv, StaticCacheState) for kv in past_key_values if kv is not None
+            ):
+                position_embeddings_dict["full_attention"] = global_pos_emb
         else:
             position_embeddings_dict = {
                 "sliding_attention": self.rotary_emb_local(op, position_ids),
@@ -1977,8 +1980,7 @@ class Gemma4TextModel(nn.Module):
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa
-        if need_fallback and not static_cache_mode:
-            # Static cache mode skips mask construction entirely — the
+        if need_fallback and attention_mask is not None:
             # Attention op handles masking via is_causal=1 + nonpad_kv_seqlen.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
@@ -2023,18 +2025,24 @@ class Gemma4TextModel(nn.Module):
         ):
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
-            # Per-layer decision: use GQA when available.
-            # Static cache mode: no GQA, no fallback bias — Attention op
-            # uses is_causal=1 + nonpad_kv_seqlen from the StaticCacheState.
-            if static_cache_mode:
+            # Per-layer cache/attention dispatch:
+            # - StaticCacheState → static path (TensorScatter + Attention)
+            # - Dynamic tuple → GQA path (with local_window_size)
+            # - None (no cache) → fallback Attention path
+            is_layer_static = isinstance(past_kv, StaticCacheState)
+
+            if is_layer_static:
                 attn_bias = None
                 pos_emb = position_embeddings_dict[layer_type]
             elif use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
-            else:
+            elif fallback_bias_dict:
                 attn_bias = fallback_bias_dict[layer_type]
                 pos_emb = fallback_pos_dict[layer_type]
+            else:
+                attn_bias = None
+                pos_emb = position_embeddings_dict.get(layer_type)
 
             hidden_states, present_kv = layer(
                 op,
