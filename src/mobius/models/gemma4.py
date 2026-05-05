@@ -1511,42 +1511,26 @@ class Gemma4TextModel(nn.Module):
             layer.self_attn.is_kv_shared_layer for layer in self.layers
         )
         if need_fallback:
-            if use_gqa:
-                # GQA is active for non-shared layers. KV-shared layers use
-                # the standard Attention op with is_causal=1, so we only need
-                # bool masks (not additive float bias). This avoids the
-                # CumSum/GreaterOrEqual chain used by create_attention_bias.
-                # Full-attention: simple padding mask (causality handled by op)
-                # Sliding-window: still needs CumSum for window constraint
-                fallback_bias_dict = {
-                    "sliding_attention": create_sliding_window_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        window_size=self.sliding_window or 512,
-                    ),
-                    "full_attention": create_padding_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                    ),
-                }
-            else:
-                fallback_bias_dict = {
-                    "sliding_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        sliding_window=self.sliding_window,
-                        dtype=self._dtype,
-                    ),
-                    "full_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        dtype=self._dtype,
-                    ),
-                }
+            # Use float16 additive attention bias for all fallback layers.
+            # Bool masks (create_sliding_window_mask / create_padding_mask)
+            # cause NaN in ORT's CUDA Attention kernel due to a bug in the
+            # bool-to-float ConvertAttnMaskToBias path. Float16 masks work
+            # correctly and match the default EP model's behavior.
+            fallback_bias_dict = {
+                "sliding_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                ),
+            }
             # KV-shared layers also need position embeddings for the
             # standard Attention path (manual RoPE). Reuse the embeddings
             # already gathered when realizing cos/sin caches above.
