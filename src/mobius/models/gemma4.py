@@ -1513,11 +1513,12 @@ class Gemma4TextModel(nn.Module):
         if need_fallback:
             if use_gqa:
                 # GQA is active for non-shared layers. KV-shared layers use
-                # the standard Attention op with is_causal=1, so we only need
-                # bool masks (not additive float bias). This avoids the
-                # CumSum/GreaterOrEqual chain used by create_attention_bias.
-                # Full-attention: simple padding mask (causality handled by op)
-                # Sliding-window: still needs CumSum for window constraint
+                # the standard Attention op with is_causal=1.
+                # Full-attention: omit mask entirely — is_causal=1 handles
+                # causality, and omitting the mask allows ORT to use MEA
+                # (CUTLASS FMHA) for head_dim=512 without bias alignment
+                # issues that would force the slow unfused path.
+                # Sliding-window: still needs CumSum for window constraint.
                 fallback_bias_dict = {
                     "sliding_attention": create_sliding_window_mask(
                         op,
@@ -1525,11 +1526,7 @@ class Gemma4TextModel(nn.Module):
                         attention_mask=attention_mask,
                         window_size=self.sliding_window or 512,
                     ),
-                    "full_attention": create_padding_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                    ),
+                    "full_attention": None,
                 }
             else:
                 fallback_bias_dict = {
