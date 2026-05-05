@@ -18,9 +18,10 @@ class TestMakeProviderOptions:
         assert make_provider_options("cpu") == []
 
     def test_cuda_default(self):
-        # CUDA without explicit options returns empty — GenAI handles internally
         result = make_provider_options("cuda")
-        assert result == []
+        assert len(result) == 1
+        assert "cuda" in result[0]
+        assert result[0]["cuda"] == {}
 
     def test_cuda_with_graph(self):
         result = make_provider_options("cuda", enable_cuda_graph=True)
@@ -29,8 +30,8 @@ class TestMakeProviderOptions:
 
     def test_dml(self):
         result = make_provider_options("dml")
-        # DML may return empty if no default options registered
-        assert isinstance(result, list)
+        assert len(result) == 1
+        assert "dml" in result[0]
 
     def test_webgpu_default(self):
         result = make_provider_options("webgpu")
@@ -120,7 +121,7 @@ class TestMakeGenaiDecoderConfig:
         assert result["num_hidden_layers"] == 24
         assert result["num_key_value_heads"] == 8
         assert "session_options" in result
-        assert isinstance(result["session_options"]["provider_options"], list)
+        assert len(result["session_options"]["provider_options"]) == 1
 
     def test_cpu_no_provider_options(self):
         result = make_genai_decoder_config(

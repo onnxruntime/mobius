@@ -692,12 +692,13 @@ class TestMakeSessionOptions:
         assert opts["provider_options"] == []
 
     def test_cuda_has_cuda_provider_options(self):
-        """CUDA EP may return empty provider_options (GenAI handles internally)."""
+        """CUDA EP includes provider_options entry for GenAI EP registration."""
         from mobius.integrations.ort_genai.genai_config import _make_session_options
 
         opts = _make_session_options("cuda")
         assert opts["log_id"] == "onnxruntime-genai"
-        assert isinstance(opts.get("provider_options", []), list)
+        assert len(opts["provider_options"]) == 1
+        assert "cuda" in opts["provider_options"][0]
 
     def test_dml_has_dml_provider_options(self):
         """DML EP produces a provider_options entry for dml."""

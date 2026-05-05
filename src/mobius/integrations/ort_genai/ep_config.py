@@ -45,9 +45,8 @@ def make_provider_options(
 
     Returns:
         A list with a single dict mapping the EP name to its options.
-        Empty list when no provider-specific options are needed (CPU,
-        or CUDA without explicit options — GenAI handles CUDA EP setup
-        internally).
+        A list with a single dict mapping the EP name to its options.
+        Empty list for CPU (no provider_options needed).
     """
     if ep == "cpu":
         return []
@@ -63,11 +62,8 @@ def make_provider_options(
         options["enableGraphCapture"] = "1"
         options["validationMode"] = "disabled"
 
-    # Return empty list when no options to avoid overriding GenAI's
-    # internal EP configuration (which handles multimodal CUDA setup).
-    if not options:
-        return []
-
+    # Always return the EP entry — GenAI derives its providers list
+    # from provider_options names. An empty list means CPU-only.
     return [{ep_name: options}]
 
 
