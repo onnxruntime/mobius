@@ -109,9 +109,7 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         # Constant all-ones scale (not a learnable parameter from HF).
-        self.weight = nn.Parameter(
-            [dim], data=ir.Tensor(np.ones(dim, dtype=np.float32))
-        )
+        self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # stash_type=1 means accumulate variance in float32, avoiding

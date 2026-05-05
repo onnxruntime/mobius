@@ -5,9 +5,8 @@
 
 from __future__ import annotations
 
-import torch
-
 import onnx_ir as ir
+import torch
 
 from mobius._configs import Gemma4Config
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4Model
@@ -131,8 +130,6 @@ class TestScaleFreeRMSNormOverflow:
         to avoid inf/NaN from the variance computation.
         """
         import numpy as np
-
-        from onnxscript import GraphBuilder
 
         from mobius._testing.ort_inference import OnnxModelSession
         from mobius.models.gemma4 import _Gemma4ScaleFreeRMSNorm
