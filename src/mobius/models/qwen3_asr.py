@@ -116,9 +116,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
                 f"n_window_infer ({n_window_infer}) must be a multiple of "
                 f"2 * n_window ({self._chunk_size_mel})"
             )
-        self._block_size = (
-            self._tokens_per_chunk * (n_window_infer // self._chunk_size_mel)
-        )
+        self._block_size = self._tokens_per_chunk * (n_window_infer // self._chunk_size_mel)
 
         # 3x Conv2d downsampling: (1, mel, seq) → (dhs, mel//8, seq//8)
         self.conv2d1 = Conv2d(
@@ -318,9 +316,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         )  # (B,) int64
         num_full_chunks = op.Div(valid_mel, chunk_size_mel_const)
         full_contrib = op.Mul(num_full_chunks, tokens_per_chunk_const)
-        remainder = op.Sub(
-            valid_mel, op.Mul(num_full_chunks, chunk_size_mel_const)
-        )
+        remainder = op.Sub(valid_mel, op.Mul(num_full_chunks, chunk_size_mel_const))
         s1 = op.Div(op.Add(remainder, one_const), two_const)
         s2 = op.Div(op.Add(s1, one_const), two_const)
         s3 = op.Div(op.Add(s2, one_const), two_const)
