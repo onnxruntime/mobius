@@ -89,8 +89,24 @@ class SpeechLanguageTask(ModelTask):
             dtype=config.dtype,
             shape=[batch, n_mels, mel_seq],
         )
+        # Mask is required: without it the encoder consumes padded mel
+        # frames as if they were real audio, which causes the
+        # downstream LLM to emit degenerate loops on any input padded
+        # to 30s by the standard HF processor.
+        feature_attention_mask = builder.input(
+            "feature_attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, mel_seq],
+        )
 
-        audio_features = audio_encoder(builder.op, input_features)
+        audio_features, audio_feature_lengths = audio_encoder(
+            builder.op, input_features, feature_attention_mask
+        )
 
         builder.add_output(audio_features, "audio_features")
+        # Number of valid audio tokens per batch item, after the 8x
+        # time downsampling. Callers must crop ``audio_features`` to
+        # this length before feeding into the embedding model so the
+        # decoder never sees padding-derived audio tokens.
+        builder.add_output(audio_feature_lengths, "audio_feature_lengths")
         return _make_model(graph)
