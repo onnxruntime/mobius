@@ -43,6 +43,7 @@ class OffsetRMSNorm(nn.Module):
             effective_weight,
             epsilon=self.variance_epsilon,
             axis=-1,
+            stash_type=1,
         )
 
 
@@ -189,4 +190,7 @@ def apply_rms_norm(op: builder.OpBuilder, x, weight, eps):
     Returns:
         Normalized tensor with the same shape as input.
     """
-    return op.RMSNormalization(x, weight, epsilon=eps, axis=-1)
+    # stash_type=1 (FLOAT) ensures the variance computation uses FP32
+    # internally even when the input is FP16/BF16, preventing overflow
+    # when squaring large values.
+    return op.RMSNormalization(x, weight, epsilon=eps, axis=-1, stash_type=1)
