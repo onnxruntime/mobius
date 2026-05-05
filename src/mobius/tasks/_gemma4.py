@@ -78,6 +78,17 @@ def _make_gemma4_static_cache_inputs(
     Sliding-attention layers get dynamic ``(past_key, past_value)`` tuples
     (GQA with ``local_window_size``).  KV-shared layers get ``None``.
 
+    Why sliding window layers can't use static cache:
+        Sliding window attention requires only attending to the most recent
+        N tokens.  The standard ONNX Attention op lacks a
+        ``local_window_size`` parameter to enforce this constraint.  With a
+        static (pre-allocated) KV cache, stale entries beyond the window
+        remain in the buffer and would be incorrectly attended to.
+        ``GroupQueryAttention`` (GQA) supports ``local_window_size``
+        natively and manages its own KV cache, so sliding window layers use
+        GQA with dynamic cache while full-attention layers use
+        TensorScatter with static cache.
+
     Args:
         past_seq_len: Symbolic dim for dynamic cache sequence length.
             Required when the config has sliding-attention layers.
