@@ -45,7 +45,6 @@ def make_provider_options(
 
     Returns:
         A list with a single dict mapping the EP name to its options.
-        A list with a single dict mapping the EP name to its options.
         Empty list for CPU (no provider_options needed).
     """
     if ep == "cpu":
