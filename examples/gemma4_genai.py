@@ -24,6 +24,12 @@ Usage::
     # Custom prompt:
     python examples/gemma4_genai.py --prompt "Explain quantum computing"
 
+    # Image + text (multimodal):
+    python examples/gemma4_genai.py --image photo.jpg --prompt "Describe this image"
+
+    # Audio + text (multimodal):
+    python examples/gemma4_genai.py --audio speech.wav --prompt "Transcribe this audio"
+
     # CUDA generation:
     python examples/gemma4_genai.py --device cuda
 
@@ -76,10 +82,7 @@ def format_chat_prompt(user_message: str) -> str:
 
     Raw prompts without the template produce degenerate output.
     """
-    return (
-        f"<start_of_turn>user\n{user_message}<end_of_turn>\n"
-        f"<start_of_turn>model\n"
-    )
+    return f"<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +193,111 @@ def generate(
     return output, tokens_per_sec
 
 
+def generate_multimodal(
+    model_dir: str,
+    prompt: str,
+    *,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    device: str = "cpu",
+) -> tuple[str, float]:
+    """Run multimodal generation with ORT GenAI.  Returns (text, tokens_per_sec).
+
+    Uses the GenAI MultiModalProcessor to handle image/audio inputs.
+    The model directory must contain a VLM export (decoder + vision + embedding).
+    """
+    import onnxruntime_genai as og
+
+    print(f"Loading VLM model from {model_dir!r} (device={device}) ...")
+    model = og.Model(model_dir)
+    tokenizer = og.Tokenizer(model)
+    processor = model.create_multimodal_processor()
+
+    # Build chat prompt with multimodal content
+    content_parts = []
+    if image_path:
+        content_parts.append({"type": "image", "image": image_path})
+    if audio_path:
+        content_parts.append({"type": "audio", "audio": audio_path})
+    content_parts.append({"type": "text", "text": prompt})
+
+    # Use HF processor for chat template with multimodal placeholders
+    from transformers import AutoProcessor as HFProcessor
+
+    hf_proc = HFProcessor.from_pretrained(MODEL_ID)
+    messages = [{"role": "user", "content": content_parts}]
+    full_prompt = hf_proc.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # Load media
+    images = og.Images.open(image_path) if image_path else None
+    audios = og.Audios.open(audio_path) if audio_path else None
+
+    # Process inputs
+    kwargs = {"images": images} if images else {}
+    if audios:
+        kwargs["audios"] = audios
+    inputs = processor(full_prompt, **kwargs)
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=8192)
+    generator = og.Generator(model, params)
+    generator.set_inputs(inputs)
+
+    modality = []
+    if image_path:
+        modality.append(f"image={image_path}")
+    if audio_path:
+        modality.append(f"audio={audio_path}")
+    print(f"\nPrompt: {prompt}")
+    if modality:
+        print(f"Media: {', '.join(modality)}")
+    print("-" * 60)
+
+    tokenizer_stream = tokenizer.create_stream()
+    generated_tokens: list[int] = []
+
+    t_start = time.perf_counter()
+    t_first_token = None
+
+    while not generator.is_done():
+        generator.generate_next_token()
+        token = generator.get_next_tokens()[0]
+        generated_tokens.append(token)
+
+        if t_first_token is None:
+            t_first_token = time.perf_counter()
+
+        print(tokenizer_stream.decode(token), end="", flush=True)
+        if len(generated_tokens) >= max_new_tokens:
+            break
+
+    t_end = time.perf_counter()
+    print()
+    print("-" * 60)
+
+    total_time = t_end - t_start
+    num_tokens = len(generated_tokens)
+    tokens_per_sec = num_tokens / total_time if total_time > 0 else 0
+
+    ttft = (t_first_token - t_start) if t_first_token else 0
+    decode_time = t_end - t_first_token if t_first_token else total_time
+    decode_tps = (num_tokens - 1) / decode_time if decode_time > 0 and num_tokens > 1 else 0
+
+    print("\n📊 Performance:")
+    print(f"   Tokens generated: {num_tokens}")
+    print(f"   Total time:       {total_time:.2f}s")
+    print(f"   Time to first:    {ttft:.3f}s")
+    print(f"   Overall:          {tokens_per_sec:.1f} tok/s")
+    print(f"   Decode:           {decode_tps:.1f} tok/s")
+
+    del generator
+    output = tokenizer.decode(generated_tokens)
+    return output, tokens_per_sec
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -228,6 +336,16 @@ def main() -> None:
         help="Text prompt (default: %(default)r).",
     )
     parser.add_argument(
+        "--image",
+        default=None,
+        help="Path to image file for multimodal generation.",
+    )
+    parser.add_argument(
+        "--audio",
+        default=None,
+        help="Path to audio file for multimodal generation.",
+    )
+    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=MAX_NEW_TOKENS,
@@ -246,6 +364,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    is_multimodal = args.image or args.audio
+
     # ----- Export-only path -----
     if args.save_to:
         build_and_export(args.model, args.save_to, dtype=args.dtype)
@@ -255,22 +375,34 @@ def main() -> None:
     if args.model_dir:
         model_dir = args.model_dir
     else:
-        default_dir = os.path.join("output", "gemma4_text")
+        suffix = "vlm" if is_multimodal else "text"
+        default_dir = os.path.join("output", f"gemma4_{suffix}")
         model_dir = default_dir
         if not os.path.isfile(os.path.join(model_dir, "genai_config.json")):
             build_and_export(args.model, model_dir, dtype=args.dtype)
 
     # ----- Inference -----
     print("=" * 60)
-    print(f"Gemma 4 — ORT GenAI (device={args.device}, dtype={args.dtype})")
+    mode = "multimodal" if is_multimodal else "text"
+    print(f"Gemma 4 — ORT GenAI ({mode}, device={args.device}, dtype={args.dtype})")
     print("=" * 60)
 
-    output, _tps = generate(
-        model_dir,
-        args.prompt,
-        max_new_tokens=args.max_new_tokens,
-        device=args.device,
-    )
+    if is_multimodal:
+        output, _tps = generate_multimodal(
+            model_dir,
+            args.prompt,
+            image_path=args.image,
+            audio_path=args.audio,
+            max_new_tokens=args.max_new_tokens,
+            device=args.device,
+        )
+    else:
+        output, _tps = generate(
+            model_dir,
+            args.prompt,
+            max_new_tokens=args.max_new_tokens,
+            device=args.device,
+        )
 
     print(f"\n📝 Output: {output}")
 
