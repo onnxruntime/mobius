@@ -207,10 +207,12 @@ def _register_builtins() -> None:
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_packed_multi_head_attention=True,
-            provider_options={
-                "enable_cuda_graph": "0",
-                "enable_skip_layer_norm_strict_mode": "1",
-            },
+            # provider_options intentionally empty for CUDA EP.
+            # GenAI's C++ session setup handles CUDA EP configuration
+            # (including disable_mem_pattern). Explicit provider_options
+            # in genai_config.json conflict with GenAI's internal setup
+            # and cause NaN or crashes for multimodal models.
+            provider_options={},
         ),
         EpCapabilities(
             name="dml",
