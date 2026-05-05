@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import torch
 
+import onnx_ir as ir
+
 from mobius._configs import Gemma4Config
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4Model
 
@@ -117,3 +119,49 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.per_expert_scale"
         assert key in result
         assert torch.allclose(result[key], torch.ones(4))
+
+
+class TestScaleFreeRMSNormOverflow:
+    """V norm should handle FP16 overflow from squaring large values."""
+
+    def test_vnorm_fp16_no_nan(self):
+        """Values ~888 overflow FP16 when squared (888²=788K > 65504).
+
+        The scale-free RMSNorm must use stash_type=1 (float32 accumulation)
+        to avoid inf/NaN from the variance computation.
+        """
+        import numpy as np
+
+        from onnxscript import GraphBuilder
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _Gemma4ScaleFreeRMSNorm
+
+        dim = 64
+        norm = _Gemma4ScaleFreeRMSNorm(dim, eps=1e-6)
+
+        # Build a minimal ONNX graph for the norm
+        from mobius.tasks._base import _make_graph, _make_model
+
+        graph, builder = _make_graph()
+        op = builder.op
+        x = builder.input("x", dtype=ir.DataType.FLOAT16, shape=[1, 4, dim])
+        y = norm(op, x)
+        builder.add_output(y, "y")
+        model = _make_model(graph)
+
+        session = OnnxModelSession(model, device="cpu")
+
+        # Values that overflow FP16 when squared: 888² = 788,544 > 65504
+        test_input = np.full((1, 4, dim), 888.0, dtype=np.float16)
+        result = session.run({"x": test_input})
+        output = result["y"]
+
+        assert not np.any(np.isnan(output)), "V norm produced NaN for input 888"
+        assert not np.any(np.isinf(output)), "V norm produced Inf for input 888"
+        # RMSNorm of a constant vector: x/rms(x) = sign(x) ≈ 1.0
+        np.testing.assert_allclose(
+            output.astype(np.float32),
+            np.ones_like(output, dtype=np.float32),
+            atol=0.01,
+        )

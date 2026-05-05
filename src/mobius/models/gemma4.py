@@ -100,31 +100,33 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
     Used for V norms in the vision encoder, the vision projector pre-norm,
     and the audio pre-projection norm.
 
-    Implemented as manual ``x / sqrt(mean(x²) + ε)`` rather than
-    ``op.RMSNormalization`` to prevent ORT's graph optimizer from fusing
-    an upstream ``Add(bias)`` into ``SkipSimplifiedLayerNormalization``,
-    which requires the skip tensor to have the same shape as the input
-    (failing when the bias is 1D or has mismatched temporal dimension).
+    Uses ``op.RMSNormalization`` with ``stash_type=1`` (float32 accumulation)
+    to handle FP16 overflow: values > 256 squared exceed the FP16 max (65504).
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        # Constant all-ones scale (not a learnable parameter).
+        # Set const_value so no external weight is needed.
+        self.weight = nn.Parameter([dim])
+        self.weight.const_value = ir.Tensor(
+            np.ones(dim, dtype=np.float32), name="scale_free_ones"
+        )
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # Manual RMSNorm: x / sqrt(mean(x²) + ε), scale = 1.0 (scale-free).
-        # Using primitive ops avoids ORT's SkipLayerNorm fusion pattern which
-        # would corrupt the skip shape when an upstream Add uses a 1D bias.
-        # Compute in FP32 to avoid FP16 overflow: values > 256 squared exceed
-        # the FP16 max (65504), producing inf → mean(inf) → sqrt(inf) → 0.
-        x_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        square = op.Mul(x_f32, x_f32)
-        mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
-        eps = op.Constant(value_float=self.eps)
-        rms = op.Sqrt(op.Add(mean_sq, eps))
-        result_f32 = op.Div(x_f32, rms)
-        return op.CastLike(result_f32, hidden_states)
+        # stash_type=1 means accumulate variance in float32, avoiding
+        # FP16 overflow when squaring large values.
+        # CastLike ensures the weight matches the input dtype.
+        scale = op.CastLike(self.weight, hidden_states)
+        return op.RMSNormalization(
+            hidden_states,
+            scale,
+            axis=-1,
+            epsilon=self.eps,
+            stash_type=1,
+        )
 
 
 # ---------------------------------------------------------------------------
