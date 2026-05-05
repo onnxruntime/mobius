@@ -217,9 +217,19 @@ def build_from_module(
     # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
     # opset 24 natively.
     if flags.ort_lower_opset_for_ep and execution_provider != "default":
-        for model in pkg.values():
+        for name, model in pkg.items():
             if "" in model.graph.opset_imports:
+                original = model.graph.opset_imports[""]
                 model.graph.opset_imports[""] = 23
+                logger.info(
+                    "Lowered opset %d→23 for '%s' (EP=%s). "
+                    "ORT does not yet register opset %d kernels for this EP. "
+                    "Track https://github.com/microsoft/onnxruntime/pull/28368",
+                    original,
+                    name,
+                    execution_provider,
+                    original,
+                )
     return pkg
 
 
