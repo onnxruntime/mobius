@@ -445,9 +445,12 @@ class Gemma4VisionPooler(nn.Module):
         # --- 5. One-hot weight matrix ----------------------------------------
         # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
         # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
+        # Keep values as float32 — OneHot doesn't support bfloat16.
         on_val = 1.0 / float(k2)
-        one_hot_vals = op.CastLike(op.Constant(value_floats=[0.0, on_val]), vision_features)
-        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth]
+        one_hot_vals = op.Constant(value_floats=[0.0, on_val])
+        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth] f32
+        # Cast to model dtype for the subsequent MatMul
+        weights = op.CastLike(weights, vision_features)
 
         # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
         weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, valid_depth, T]
