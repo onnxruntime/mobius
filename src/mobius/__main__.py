@@ -268,9 +268,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             hf_config = transformers.AutoConfig.from_pretrained(
                 model_id_or_path, trust_remote_code=trust_remote_code
             )
-            task = _resolve_static_cache_task(
-                getattr(hf_config, "model_type", "")
-            )
+            task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
         pkg = build(
             model_id_or_path,

@@ -51,9 +51,7 @@ def _register_hybrid_cache_outputs(
     Full-attention layers use ``updated_key_cache.{i}`` / ``updated_value_cache.{i}``.
     Sliding-attention layers use ``present.{i}.key`` / ``present.{i}.value``.
     """
-    layer_types = config.layer_types or (
-        ["sliding_attention"] * config.num_hidden_layers
-    )
+    layer_types = config.layer_types or (["sliding_attention"] * config.num_hidden_layers)
 
     for i, (k, v) in enumerate(present_key_values):
         lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
@@ -99,9 +97,7 @@ def _make_gemma4_static_cache_inputs(
     global_head_dim = config.global_head_dim or config.head_dim
     num_kv_shared = config.num_kv_shared_layers or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
-    layer_types = config.layer_types or (
-        ["sliding_attention"] * config.num_hidden_layers
-    )
+    layer_types = config.layer_types or (["sliding_attention"] * config.num_hidden_layers)
 
     # Per non-shared layer: static or dynamic cache
     layer_entries: list[tuple[str, object]] = []  # ("static"|"dynamic", cache)
@@ -168,11 +164,14 @@ def _make_gemma4_static_cache_inputs(
             cache_type, pair = next(entry_iter)
             if cache_type == "static":
                 k, v = pair
-                full_list.append(StaticCacheState(
-                    key_cache=k, value_cache=v,
-                    write_indices=write_indices,
-                    nonpad_kv_seqlen=nonpad_kv_seqlen,
-                ))
+                full_list.append(
+                    StaticCacheState(
+                        key_cache=k,
+                        value_cache=v,
+                        write_indices=write_indices,
+                        nonpad_kv_seqlen=nonpad_kv_seqlen,
+                    )
+                )
             else:
                 full_list.append(pair)
     return full_list
@@ -287,7 +286,6 @@ class Gemma4TextCausalLMTask(ModelTask):
         config: Gemma4Config,
     ) -> ModelPackage:
         from mobius.tasks._causal_lm import (
-            _register_static_cache_outputs,
             _validate_static_cache_support,
         )
 
@@ -298,9 +296,7 @@ class Gemma4TextCausalLMTask(ModelTask):
             if max_seq_len is None:
                 max_seq_len = getattr(config, "max_position_embeddings", None)
             if max_seq_len is None or max_seq_len <= 0:
-                raise ValueError(
-                    "max_seq_len must be a positive integer for static cache."
-                )
+                raise ValueError("max_seq_len must be a positive integer for static cache.")
             _validate_static_cache_support(module)
 
         batch = ir.SymbolicDim("batch")
@@ -330,7 +326,11 @@ class Gemma4TextCausalLMTask(ModelTask):
                 shape=[batch, seq_len],
             )
             past_key_values = _make_gemma4_static_cache_inputs(
-                builder, config, batch, max_seq_len, past_seq_len,
+                builder,
+                config,
+                batch,
+                max_seq_len,
+                past_seq_len,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -345,7 +345,10 @@ class Gemma4TextCausalLMTask(ModelTask):
                 shape=[batch, seq_len],
             )
             past_key_values = _make_gemma4_kv_cache_inputs(
-                builder, config, batch, past_seq_len,
+                builder,
+                config,
+                batch,
+                past_seq_len,
             )
 
         logits, present_key_values = module(
@@ -461,7 +464,6 @@ class Gemma4Task(ModelTask):
         so ``input_ids`` is passed and ``per_layer_inputs`` is omitted.
         """
         from mobius.tasks._causal_lm import (
-            _register_static_cache_outputs,
             _validate_static_cache_support,
         )
 
@@ -471,9 +473,7 @@ class Gemma4Task(ModelTask):
             if max_seq_len is None:
                 max_seq_len = getattr(config, "max_position_embeddings", None)
             if max_seq_len is None or max_seq_len <= 0:
-                raise ValueError(
-                    "max_seq_len must be a positive integer for static cache."
-                )
+                raise ValueError("max_seq_len must be a positive integer for static cache.")
             _validate_static_cache_support(decoder)
 
         batch = ir.SymbolicDim("batch")
@@ -532,11 +532,18 @@ class Gemma4Task(ModelTask):
 
         if static:
             past_key_values = _make_gemma4_static_cache_inputs(
-                builder, config, batch, max_seq_len, past_seq_len,
+                builder,
+                config,
+                batch,
+                max_seq_len,
+                past_seq_len,
             )
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
-                builder, config, batch, past_seq_len,
+                builder,
+                config,
+                batch,
+                past_seq_len,
             )
 
         logits, present_key_values = decoder(

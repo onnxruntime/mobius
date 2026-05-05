@@ -5297,8 +5297,12 @@ class TestBuildGemma4StaticCacheGraph:
             hidden_act="gelu_pytorch_tanh",
             # Mixed: 5 sliding + 1 full (Gemma4-like hybrid pattern)
             layer_types=[
-                "sliding_attention", "sliding_attention", "sliding_attention",
-                "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
             ],
             sliding_window=64,
             rope_theta=10000.0,
@@ -5317,9 +5321,7 @@ class TestBuildGemma4StaticCacheGraph:
 
         config = self._gemma4_config(**config_overrides)
         module = Gemma4CausalLMModel(config)
-        task = Gemma4TextCausalLMTask(
-            static_cache=True, max_seq_len=self.MAX_SEQ_LEN
-        )
+        task = Gemma4TextCausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN)
         pkg = task.build(module, config)
         return pkg["model"], config
 
@@ -5366,10 +5368,7 @@ class TestBuildGemma4StaticCacheGraph:
         assert op_counts.get("TensorScatter", 0) == 2 * num_full
         # Sliding layers use either GQA (CUDA EP) or Attention (default EP)
         # In unit tests without EP context, all use standard Attention.
-        total_attn = (
-            op_counts.get("Attention", 0)
-            + op_counts.get("GroupQueryAttention", 0)
-        )
+        total_attn = op_counts.get("Attention", 0) + op_counts.get("GroupQueryAttention", 0)
         assert total_attn == config.num_hidden_layers
 
     def test_gemma4_static_cache_kv_shared(self):
@@ -5378,9 +5377,14 @@ class TestBuildGemma4StaticCacheGraph:
             num_hidden_layers=8,
             num_kv_shared_layers=2,
             layer_types=[
-                "sliding_attention", "sliding_attention", "sliding_attention",
-                "sliding_attention", "sliding_attention", "full_attention",
-                "sliding_attention", "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
             ],
         )
 
@@ -5405,18 +5409,13 @@ class TestBuildGemma4StaticCacheGraph:
 
         input_names = [inp.name for inp in model.graph.inputs]
         # write_indices and nonpad_kv_seqlen should come after all cache inputs
-        last_cache_idx = max(
-            i for i, n in enumerate(input_names) if "cache" in n
-        )
+        last_cache_idx = max(i for i, n in enumerate(input_names) if "cache" in n)
         write_idx = input_names.index("write_indices")
         nonpad_idx = input_names.index("nonpad_kv_seqlen")
-        assert write_idx > last_cache_idx, (
-            "write_indices should come after all cache inputs"
-        )
+        assert write_idx > last_cache_idx, "write_indices should come after all cache inputs"
         assert nonpad_idx > last_cache_idx, (
             "nonpad_kv_seqlen should come after all cache inputs"
         )
-
 
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
