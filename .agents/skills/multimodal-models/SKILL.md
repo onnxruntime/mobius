@@ -214,9 +214,57 @@ models this overflows ORT's CUDA Gather kernel. **Workaround:** Split into
 L separate `Embedding([V, D])` tables via `nn.ModuleList`, and use `Slice`
 instead of `Gather` for per-layer projection indexing.
 
+## Vision/audio encoder f32 input casting
+
+ORT GenAI's image and audio processors always output **float32** tensors,
+regardless of the model's compute dtype. This means vision and audio
+encoder ONNX graphs must accept f32 inputs even when the model is built
+in f16 or bf16.
+
+### How it works
+
+The encoder graph adds a `Cast(f32 → model_dtype)` at its entry point:
+
+```
+Input (f32 from GenAI processor)
+    ↓
+Cast(to=FLOAT16)    ← inserted automatically
+    ↓
+Vision/Audio encoder (weights in f16/bf16)
+    ↓
+Output (model_dtype)
+```
+
+This is handled automatically by mobius when building with
+`--runtime ort-genai`. The encoder weights still use the requested
+dtype (f16/bf16) for memory efficiency — only the graph inputs are f32.
+
+### Why this is needed
+
+- **GenAI image_processor:** Runs pixel normalization in f32 (resize,
+  normalize, tile). Outputs f32 tensors.
+- **GenAI audio_processor:** Runs mel spectrogram computation in f32.
+  Outputs f32 features.
+- **Model expects model_dtype:** The encoder's internal ops (attention,
+  conv, linear) are all in f16/bf16.
+
+Without the Cast-at-input, ORT throws a type mismatch error:
+```
+Type Error: Type parameter (T) bound to different types
+(tensor(float) and tensor(float16))
+```
+
+### For model authors
+
+If you're adding a new multimodal model, you don't need to handle this
+manually — the task layer inserts the Cast automatically when
+`--runtime ort-genai` is used. If you're building without `--runtime`,
+the graph inputs match the model dtype directly.
+
 ## Cross-references
 
 - **Multimodal debugging:** `.agents/skills/debugging-multimodal/SKILL.md`
 - **ORT GenAI config:** `.agents/skills/ort-genai-config/SKILL.md`
 - **Weight name alignment:** `.agents/skills/weight-name-alignment/SKILL.md`
 - **Reusable components (ClippableLinear):** `.agents/skills/reusable-components/SKILL.md`
+- **Profiling:** `.agents/skills/profiling-onnx-models/SKILL.md`
