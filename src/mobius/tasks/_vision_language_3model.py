@@ -21,6 +21,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -83,12 +84,14 @@ class VisionLanguageTask(ModelTask):
         image_size = (config.vision.image_size if config.vision else None) or 224
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
-        image_features = vision(builder.op, pixel_values=pixel_values)
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
+        image_features = vision(op, pixel_values=pixel_values)
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)
@@ -134,11 +137,13 @@ class QwenVLTask(VisionLanguageTask):
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_grid_thw = builder.input(
             "image_grid_thw",
             dtype=ir.DataType.INT64,
@@ -146,7 +151,7 @@ class QwenVLTask(VisionLanguageTask):
         )
 
         image_features = vision(
-            builder.op,
+            op,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
@@ -209,12 +214,13 @@ class PixtralVLTask(VisionLanguageTask):
         width = ir.SymbolicDim("width")
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, height, width],
         )
-        op = builder.op
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
 
         image_features = vision(
             op,

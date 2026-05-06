@@ -1176,9 +1176,7 @@ class TestSpeechLanguageTaskNoAudioConfig:
             def forward(self, op, input_features, feature_attention_mask):
                 # Return (audio_features, audio_feature_lengths) to match
                 # the SpeechLanguageTask contract.
-                lengths = op.ReduceSum(
-                    feature_attention_mask, keepdims=False
-                )
+                lengths = op.ReduceSum(feature_attention_mask, keepdims=False)
                 return op.Identity(input_features), lengths
 
         return _StubAudio()

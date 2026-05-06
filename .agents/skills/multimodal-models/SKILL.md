@@ -214,9 +214,77 @@ models this overflows ORT's CUDA Gather kernel. **Workaround:** Split into
 L separate `Embedding([V, D])` tables via `nn.ModuleList`, and use `Slice`
 instead of `Gather` for per-layer projection indexing.
 
+## Vision/audio encoder f32 input casting
+
+> **This applies to ALL multimodal models and ALL inference paths** —
+> not just ORT GenAI, and not architecture-specific.
+
+Image and audio preprocessing universally produces **float32** output.
+This is true across all frameworks and runtimes:
+
+- **PIL / torchvision:** Pixel normalization outputs f32
+- **torchaudio / librosa:** Mel spectrograms are f32
+- **ORT GenAI image_processor:** Resize, normalize, tile → f32
+- **ORT GenAI audio_processor:** Feature extraction → f32
+- **ORT Python API:** Custom preprocessing pipelines → typically f32
+- **Foundry Local:** Uses GenAI processors → f32
+
+This means vision and audio encoder ONNX graphs must accept f32 inputs
+even when the model is built in f16 or bf16. The encoder adds a
+`Cast(f32 → model_dtype)` at its graph entry point so that any runtime
+can feed it preprocessed data without worrying about the model's
+internal precision.
+
+### How it works
+
+```
+Input (f32 from ANY preprocessor — PIL, torchaudio, GenAI, etc.)
+    ↓
+Cast(to=FLOAT16)    ← inserted automatically by mobius
+    ↓
+Vision/Audio encoder (weights in f16/bf16)
+    ↓
+Output (model_dtype)
+```
+
+Encoder weights still use the requested dtype (f16/bf16) for memory
+efficiency — only the graph inputs are f32. The Cast is a lightweight
+op with negligible overhead.
+
+### Why f32 is the universal preprocessing dtype
+
+Preprocessing involves floating-point arithmetic (mean subtraction,
+std division, resampling interpolation) where f32 is the natural
+precision. Converting to f16/bf16 before these operations would lose
+precision in the preprocessing itself. The model's internal precision
+only matters after the preprocessed data enters the encoder.
+
+### What mobius does
+
+Mobius always builds encoder graphs with f32 inputs — this is the
+default behavior, not gated behind any flag. It works correctly
+regardless of the inference runtime:
+
+- `--runtime ort-genai` → f32 inputs (GenAI processors output f32)
+- No `--runtime` flag → f32 inputs (ORT Python API, custom runtimes)
+- Foundry Local → f32 inputs (uses GenAI internally)
+
+Without the Cast-at-input, ORT throws a type mismatch error:
+```
+Type Error: Type parameter (T) bound to different types
+(tensor(float) and tensor(float16))
+```
+
+### For model authors
+
+If you're adding a new multimodal model, you don't need to handle this
+manually — mobius inserts the Cast automatically for all encoder graphs.
+If the model dtype is already f32, no Cast is needed.
+
 ## Cross-references
 
 - **Multimodal debugging:** `.agents/skills/debugging-multimodal/SKILL.md`
 - **ORT GenAI config:** `.agents/skills/ort-genai-config/SKILL.md`
 - **Weight name alignment:** `.agents/skills/weight-name-alignment/SKILL.md`
 - **Reusable components (ClippableLinear):** `.agents/skills/reusable-components/SKILL.md`
+- **Profiling:** `.agents/skills/profiling-onnx-models/SKILL.md`

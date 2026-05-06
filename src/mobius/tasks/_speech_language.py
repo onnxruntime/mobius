@@ -23,6 +23,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -83,12 +84,14 @@ class SpeechLanguageTask(ModelTask):
         n_mels = (config.audio.num_mel_bins if config.audio else None) or 128
 
         graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
 
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, n_mels, mel_seq],
         )
+        input_features = _cast_encoder_input(op, input_features, config)
         # Mask is required: without it the encoder consumes padded mel
         # frames as if they were real audio, which causes the
         # downstream LLM to emit degenerate loops on any input padded
@@ -100,7 +103,7 @@ class SpeechLanguageTask(ModelTask):
         )
 
         audio_features, audio_feature_lengths = audio_encoder(
-            builder.op, input_features, feature_attention_mask
+            op, input_features, feature_attention_mask
         )
 
         builder.add_output(audio_features, "audio_features")

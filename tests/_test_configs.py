@@ -326,6 +326,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "rope_local_base_freq": 10_000.0,
             # 2-layer test: 1 sliding + 1 full (must match TINY_LAYERS=2)
             "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
             "global_head_dim": TINY_HEAD_DIM,
             "global_rope_theta": 10_000.0,
             "final_logit_softcapping": 30.0,
@@ -2055,6 +2056,7 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "attn_qk_norm": True,
             "rope_local_base_freq": 10_000.0,
             "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
             "global_head_dim": TINY_HEAD_DIM,
             "global_rope_theta": 10_000.0,
             "global_partial_rotary_factor": 0.25,
