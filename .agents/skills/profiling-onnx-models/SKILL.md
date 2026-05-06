@@ -270,14 +270,29 @@ print(f"Throughput: {num_tokens/decode_time:.1f} tok/s")
 | **Decode tok/s** | Tokens per second during generation | 10-100+ tok/s (depends on model size, GPU) |
 | **Prefill tok/s** | Prompt processing throughput | 500-5000 tok/s |
 
-### Real example: Gemma4 on H200
+### Real example: Gemma4-e2b on H200
 
 | Metric | Value |
 |--------|-------|
-| TTFT (short prompt) | ~85 ms |
-| Decode throughput | ~12-15 tok/s (CPU), ~60+ tok/s (CUDA) |
+| GenAI CUDA decode | **158 tok/s** |
+| ORT CUDA decode | 151.7 tok/s |
+| GenAI CPU decode | 11.8 tok/s |
+| VRAM usage | 12.2 GB |
 | cuBLAS warmup | ~40 ms (first step only) |
-| Steady-state decode | ~66 µs per MatMul |
+| Steady-state MatMul | ~66 µs |
+
+**Bandwidth analysis:**
+| Metric | Value |
+|--------|-------|
+| Theoretical max (H200) | 507 tok/s |
+| Achieved | 158 tok/s |
+| Bandwidth utilization | **31%** |
+| Primary bottleneck | Kernel launch overhead |
+
+The 31% utilization gap is dominated by kernel launch overhead — many
+small CUDA kernels between MatMuls add latency that isn't spent on
+memory or compute. Fusing more ops (e.g. skip-norm, activation)
+would close this gap.
 
 ## Debugging workflow
 
