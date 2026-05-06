@@ -280,6 +280,43 @@ Type Error: Type parameter (T) bound to different types
 If you're adding a new multimodal model, you don't need to handle this
 manually — mobius inserts the Cast automatically for all encoder graphs.
 
+### Task migration status
+
+Tasks that handle encoder inputs fall into three categories:
+
+**✅ f32 input + Cast pattern (correct):**
+
+| Task | Encoder inputs |
+|------|---------------|
+| `Gemma4Task` | vision `pixel_values`, audio `input_features` |
+| `Phi4mmMultimodalTask` | vision `pixel_values`, audio `audio_embeds` |
+| `VisionLanguage3ModelTask` | vision `pixel_values` |
+| `SpeechLanguageTask` | audio `input_features` |
+| `FunAsrSpeechLanguageTask` | audio `input_features` |
+
+These accept f32 inputs and `Cast(to=config.dtype)` at graph entry.
+
+**⚠️ Needs migration (uses `config.dtype` as input dtype):**
+
+| Task | Input | Issue |
+|------|-------|-------|
+| `VisionLanguageTask` | `pixel_values` | Uses `dtype=config.dtype` — should be f32 + Cast |
+
+**✅ Single-model tasks (hardcoded FLOAT — correct):**
+
+| Task | Notes |
+|------|-------|
+| `ImageClassificationTask` | Single-model, f32 input is correct |
+| `AudioFeatureExtractionTask` | Single-model, f32 input is correct |
+| `AudioCTCTask` | Uses `config.dtype or FLOAT` |
+| `CodecTask` | Single-model, f32 waveform input |
+| `QwenImageVAETask` | Single-model, f32 input |
+| `ObjectDetectionTask` | Single-model, f32 input |
+
+Single-model tasks don't need the Cast pattern because they're
+standalone ONNX models (not part of a multi-model GenAI pipeline).
+Their f32 inputs are consumed directly.
+
 ## Cross-references
 
 - **Multimodal debugging:** `.agents/skills/debugging-multimodal/SKILL.md`
