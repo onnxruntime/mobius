@@ -74,16 +74,23 @@ class MultiModalTask(ModelTask):
         image_size = config.vision.image_size or 224 if config.vision else 224
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
+        # Vision input is always f32 (matching image processor output).
+        # Cast at graph entry for f16/bf16 builds.
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
 
         audio_input_size = (config.audio.input_size if config.audio else None) or 80
         audio_features = builder.input(
             "audio_features",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, "audio_seq_len", audio_input_size],
         )
+        # Audio input is always f32 (matching audio processor output).
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            audio_features = op.Cast(audio_features, to=config.dtype)
 
         past_key_values = _make_kv_cache_inputs(
             builder,

@@ -73,9 +73,13 @@ class Qwen3VLVisionLanguageTask(ModelTask):
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
+        # Vision input is always f32 (matching image processor output).
+        # Cast at graph entry for f16/bf16 builds.
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
         # Image grid dimensions for position embedding interpolation
         num_images = ir.SymbolicDim("num_images")
         grid_thw = builder.input(

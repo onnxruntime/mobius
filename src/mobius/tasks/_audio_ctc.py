@@ -43,9 +43,13 @@ class AudioCTCTask(ModelTask):
 
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype or ir.DataType.FLOAT,
+            dtype=ir.DataType.FLOAT,
             shape=["batch", "time", input_dim],
         )
+        # Audio input is always f32 (matching audio processor output).
+        # Cast at graph entry for f16/bf16 builds.
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            input_features = op.Cast(input_features, to=config.dtype)
         language_id = builder.input(
             "language_id",
             dtype=ir.DataType.INT64,
