@@ -52,6 +52,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -64,27 +65,6 @@ import time
 MODEL_ID = "google/gemma-4-E2B-it"
 DEFAULT_PROMPT = "What is the capital of France?"
 MAX_NEW_TOKENS = 50
-
-
-# ---------------------------------------------------------------------------
-# Chat template
-# ---------------------------------------------------------------------------
-
-
-def format_chat_prompt(user_message: str) -> str:
-    """Wrap a user message in Gemma 4's chat template.
-
-    Gemma 4 instruction-tuned models expect this format::
-
-        <bos><start_of_turn>user
-        {message}<end_of_turn>
-        <start_of_turn>model
-
-    The ``<bos>`` prefix is required — the Gemma4 tokenizer has
-    ``add_bos_token=False``, so it must be included explicitly.
-    Raw prompts without the template produce degenerate output.
-    """
-    return f"<bos><start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +112,8 @@ def generate(
 ) -> tuple[str, float]:
     """Run text generation with ORT GenAI.  Returns (text, tokens_per_sec).
 
-    The prompt should already be wrapped in the chat template via
-    :func:`format_chat_prompt`.
+    Uses GenAI's ``tokenizer.apply_chat_template()`` to format the prompt
+    with the model's chat template (including ``<bos>``).
     """
     import onnxruntime_genai as og
 
@@ -141,8 +121,9 @@ def generate(
     model = og.Model(model_dir)
     tokenizer = og.Tokenizer(model)
 
-    # Apply chat template so the -it model produces coherent output
-    chat_prompt = format_chat_prompt(prompt)
+    # Apply chat template via GenAI tokenizer (handles <bos> automatically)
+    messages = json.dumps([{"role": "user", "content": prompt}])
+    chat_prompt = tokenizer.apply_chat_template(messages)
     input_ids = tokenizer.encode(chat_prompt)
     params = og.GeneratorParams(model)
     params.set_search_options(max_length=len(input_ids) + max_new_tokens)
