@@ -971,40 +971,27 @@ class Gemma4TextAttention(nn.Module):
                     src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
                     src_value = op.Reshape(src_value, [0, 0, shared_kv_hidden])
 
-                # For static source with nonpad_kv_seqlen, use the Attention
-                # op's external cache path (no mask, is_causal + nonpad).
-                if is_static_source and src_nonpad is not None:
-                    attn_output, _, _ = op.Attention(
-                        query_states,
-                        src_key,
-                        src_value,
-                        None,  # no mask
-                        None,  # no past_key
-                        None,  # no past_value
-                        src_nonpad,
-                        q_num_heads=self.num_attention_heads,
-                        kv_num_heads=self.num_key_value_heads,
-                        scale=self.scaling,
-                        softcap=self.softcap,
-                        is_causal=1,
-                        _outputs=3,
-                    )
-                    present_key, present_value = src_key, src_value
-                else:
-                    attn_output, present_key, present_value = _apply_attention(
-                        op,
-                        query_states,
-                        src_key,
-                        src_value,
-                        attention_bias,
-                        past_key=None,
-                        past_value=None,
-                        num_attention_heads=self.num_attention_heads,
-                        num_key_value_heads=self.num_key_value_heads,
-                        scale=self.scaling,
-                        softcap=self.softcap,
-                        is_causal=0,
-                    )
+                # KV-shared layers always use the dynamic Attention path with
+                # mask (attention_bias). Even when the source layer uses static
+                # cache, the KV-shared layer's Attention uses the source's full
+                # cache as K/V with past_key=None (no own KV concat).
+                # The nonpad_kv_seqlen path is NOT used here because ORT's
+                # is_causal=0 + nonpad_kv_seqlen triggers a CUDA kernel issue
+                # for KV-shared decode (S_q=1, S_kv=max_seq).
+                attn_output, present_key, present_value = _apply_attention(
+                    op,
+                    query_states,
+                    src_key,
+                    src_value,
+                    attention_bias,
+                    past_key=None,
+                    past_value=None,
+                    num_attention_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    scale=self.scaling,
+                    softcap=self.softcap,
+                    is_causal=0,
+                )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
             # The op fuses RoPE + attention + KV cache into a single op,
