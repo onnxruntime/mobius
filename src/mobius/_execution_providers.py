@@ -108,6 +108,13 @@ class EpCapabilities:
                 f"supports_fused_rope=False — UnpackQKV lowering always fires for "
                 f"this EP, so packing would be immediately undone."
             )
+        if self.cap_kv_buffer_max_length and not self.supports_past_present_share_buffer:
+            raise ValueError(
+                f"EP '{self.name}': cap_kv_buffer_max_length=True requires "
+                f"supports_past_present_share_buffer=True — the cap only matters "
+                f"when the runtime pre-allocates the full KV-cache buffer at load "
+                f"time, which is what buffer sharing enables."
+            )
 
 
 class EpRegistry:
@@ -260,6 +267,8 @@ def _register_builtins() -> None:
         # InlinePass to their standard-ONNX function bodies. No GQA or QKV
         # packing fusion is applied. Use this EP to produce models that run
         # on any conformant ONNX runtime without ORT extensions.
+        # KV buffer sharing is unsupported here: GQA isn't emitted, so
+        # standard Attention's concat-grow semantics handle the cache.
         EpCapabilities(
             name="onnx-standard",
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
@@ -267,7 +276,6 @@ def _register_builtins() -> None:
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
             supports_skip_layer_norm=False,  # inline SkipLayerNorm
             supports_packed_multi_head_attention=False,  # inline PackedMHA
-            supports_past_present_share_buffer=True,
         ),
     ]
     for caps in _builtins:
