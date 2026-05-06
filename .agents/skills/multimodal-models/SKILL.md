@@ -301,6 +301,8 @@ These accept f32 inputs and `Cast(to=config.dtype)` at graph entry.
 | Task | Input | Issue |
 |------|-------|-------|
 | `VisionLanguageTask` | `pixel_values` | Uses `dtype=config.dtype` — should be f32 + Cast |
+| `MultimodalTask` | `pixel_values`, `audio_features` | Uses `dtype=config.dtype` — should be f32 + Cast |
+| `AudioCTCTask` | `input_features` | Uses `config.dtype or FLOAT` — should always be f32 + Cast |
 
 **✅ Single-model tasks (hardcoded FLOAT — correct):**
 
@@ -308,7 +310,6 @@ These accept f32 inputs and `Cast(to=config.dtype)` at graph entry.
 |------|-------|
 | `ImageClassificationTask` | Single-model, f32 input is correct |
 | `AudioFeatureExtractionTask` | Single-model, f32 input is correct |
-| `AudioCTCTask` | Uses `config.dtype or FLOAT` |
 | `CodecTask` | Single-model, f32 waveform input |
 | `QwenImageVAETask` | Single-model, f32 input |
 | `ObjectDetectionTask` | Single-model, f32 input |
