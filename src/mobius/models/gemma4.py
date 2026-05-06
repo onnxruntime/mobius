@@ -151,14 +151,16 @@ class Gemma4VisionSelfAttention(nn.Module):
         norm_eps: float = 1e-6,
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
+        linear_class = ClippableLinear if use_clipped_linears else Linear
+        self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = linear_class(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -317,10 +319,12 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_act: str = "gelu_pytorch_tanh",
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
-            hidden_size, num_heads, norm_eps, rope_theta=rope_theta, max_position=max_position
+            hidden_size, num_heads, norm_eps, rope_theta=rope_theta,
+            max_position=max_position, use_clipped_linears=use_clipped_linears,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -328,7 +332,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
-        # Vision encoder uses ClippableLinear for all projections.
+        # Use ClippableLinear only when the checkpoint has clipping weights.
+        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -336,7 +341,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
             ),
-            linear_class=ClippableLinear,
+            linear_class=linear_class,
         )
 
     def forward(
@@ -554,6 +559,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     hidden_act=vc.hidden_act or "gelu_pytorch_tanh",
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
+                    use_clipped_linears=vc.use_clipped_linears,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
