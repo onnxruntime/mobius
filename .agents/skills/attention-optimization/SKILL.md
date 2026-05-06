@@ -24,8 +24,8 @@ Use this skill when:
 |----------|------------|-----|
 | Causal only | `attn_mask=None` + `is_causal=1` | Enables Flash (fastest for prefill) |
 | Padding (batch>1) | `nonpad_kv_seqlens` (best) or bool mask | `nonpad_kv_seqlens` enables Flash + shared buffer with no mask |
-| Sliding window | Float additive bias | Precise window control |
-| Complex (causal+sliding+padding) | Float additive bias | Most flexible, avoids construction bugs |
+| Sliding window (simple) | Bool mask | Equally precise as float, uses less memory |
+| Complex (sliding+KV-shared+dual head_dim) | Float additive bias | Avoids mask construction bugs in multi-constraint patterns |
 | Custom pattern | Float additive bias | Arbitrary values |
 
 ## Bool mask vs float additive bias
@@ -35,31 +35,31 @@ Use this skill when:
 | Pattern | Recommended mask type |
 |---------|----------------------|
 | Simple causal-only | No mask — use `is_causal=1` (enables Flash) |
-| Sliding window | Float additive bias |
+| Sliding window (simple model) | Bool mask (precise, less memory) |
 | KV-shared layers | Float additive bias |
 | Mixed head_dim (e.g. Gemma4) | Float additive bias |
-| Padding + causal | Float additive bias |
+| Padding + causal | `nonpad_kv_seqlens` or bool mask |
+| Multiple constraints combined | Float additive bias |
 
 ### Why float additive bias is safer for complex patterns
 
-ONNX `Attention` supports bool mask (`True`=attend, `False`=ignore).
-ORT correctly converts bool→float internally via
-`ConvertAttnMaskToBias()`. However, constructing correct bool masks
-for complex patterns is error-prone:
+Bool mask and float additive bias are **equally precise** — both can
+represent any attention pattern. ORT converts bool→float internally
+via `ConvertAttnMaskToBias()`, so they have identical kernel dispatch.
 
-- **Sliding window boundaries** must align with KV cache positions —
-  off-by-one errors silently produce wrong attention patterns
-- **KV-shared layers** borrow K/V from other layers — the mask shape
-  must match the borrowed KV dimensions, not the current layer's
-- **`is_causal=1` + bool mask** double-applies constraints — the
-  `is_causal` flag adds its own causal mask on top of the explicit one
-- **Dual head_dim** (e.g. Gemma4 local=128, global=256) means mask
-  shapes differ per layer type
+The reason we use float bias for complex models is **bug avoidance**,
+not a fundamental limitation of bool masks. Constructing correct bool
+masks for multi-constraint patterns is error-prone:
 
-Float additive bias gives explicit control:
-- `0.0` for "attend" positions
-- `-inf` (or `-10000.0`) for "ignore" positions
-- No ambiguity in kernel interpretation
+- **Sliding window + KV-shared** — mask shape must match borrowed KV
+  dimensions, not the current layer's. Off-by-one errors are silent.
+- **`is_causal=1` + bool mask** — double-applies causal constraints
+- **Dual head_dim** (e.g. Gemma4 local=128, global=256) — mask shapes
+  differ per layer type, increasing construction complexity
+
+For simpler models (e.g. Mistral with only sliding window), bool mask
+is fine and uses less memory. Float bias is recommended when multiple
+constraints interact.
 
 ### Common misconception: bool masks and Flash Attention
 
