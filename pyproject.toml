@@ -16,10 +16,12 @@ dependencies = [
     "huggingface_hub",
     "numpy>=1.24.0",
     "onnx_ir>=0.1.0",
-    "onnx-shape-inference==0.1.7",
+    "onnx-shape-inference>=0.1.9",
     "onnxscript>=0.7.0",
+    "safetensors",
     "torch>=2.1.0",
     "tqdm",
+    "transformers",  # >5.0 recommended
 ]
 
 [project.scripts]
@@ -29,6 +31,8 @@ mobius = "mobius.__main__:main"
 transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
+    "accelerate",
+    "diffusers",
     "onnxruntime-easy>=0.1.1",
     "torch",
     "transformers>=5.0",

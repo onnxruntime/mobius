@@ -160,12 +160,10 @@ class Qwen3ASRAudioEncoder(nn.Module):
         hidden_states = op.Gelu(self.conv2d3(op, hidden_states))
 
         # Reshape: (batch, channels, freq, time) → (batch, time, channels*freq)
-        # Permute to (batch, time, channels, freq) then flatten last two dims
+        # Permute to (batch, time, channels, freq) then flatten last two dims.
+        # Use 0 sentinel (copy from input) to avoid dynamic Shape ops.
         hidden_states = op.Transpose(hidden_states, perm=[0, 3, 1, 2])
-        batch_dim = op.Shape(hidden_states, start=0, end=1)
-        time_dim = op.Shape(hidden_states, start=1, end=2)
-        new_shape = op.Concat(batch_dim, time_dim, op.Constant(value_ints=[-1]), axis=0)
-        hidden_states = op.Reshape(hidden_states, new_shape)
+        hidden_states = op.Reshape(hidden_states, op.Constant(value_ints=[0, 0, -1]))
 
         # Linear projection to d_model
         hidden_states = self.conv_out(op, hidden_states)
@@ -179,6 +177,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
             seq_len,
             op.Constant(value_ints=[0]),
         )
+        # CastLike ensures PE matches hidden_states dtype (f16/bf16)
+        pe_slice = op.CastLike(pe_slice, hidden_states)
         hidden_states = op.Add(hidden_states, pe_slice)
 
         # Encoder layers
@@ -215,6 +215,7 @@ class Qwen3ASREmbeddingModel(nn.Module):
         )
         audio_token_id = config.audio.audio_token_id if config.audio else 151676
         self._audio_token_id = audio_token_id
+        self._audio_output_dim = (config.audio.output_dim or 1024) if config.audio else 1024
 
     def forward(
         self,
@@ -237,12 +238,14 @@ class Qwen3ASREmbeddingModel(nn.Module):
         is_audio_3d = op.Unsqueeze(is_audio, [-1])
 
         # Pad audio_features with a zero row at index 0 to handle
-        # the case where no audio tokens exist in the sequence
-        feature_dim = op.Shape(audio_features, start=1, end=2)
-        zero_row_shape = op.Concat(op.Constant(value_ints=[1]), feature_dim, axis=0)
-        zero_row = op.ConstantOfShape(
-            zero_row_shape,
-            value=ir.tensor(np.zeros(1, dtype=np.float32)),
+        # the case where no audio tokens exist in the sequence.
+        # Use static Constant (not ConstantOfShape) to preserve shape inference.
+        zero_row = op.Unsqueeze(
+            op.CastLike(
+                op.Constant(value_floats=[0.0] * self._audio_output_dim),
+                audio_features,
+            ),
+            [0],
         )
         # Prepend zero row: (num_audio_tokens + 1, output_dim)
         padded_features = op.Concat(zero_row, audio_features, axis=0)
@@ -250,12 +253,8 @@ class Qwen3ASREmbeddingModel(nn.Module):
         # Compute gather indices: cumulative sum of audio mask gives
         # 1-based indices into padded_features (0 = zero padding row)
         is_audio_int = op.Cast(is_audio, to=7)  # INT64
-        # Flatten across batch for cumsum then reshape
-        flat_mask = op.Reshape(is_audio_int, op.Constant(value_ints=[-1]))
-        flat_indices = op.CumSum(flat_mask, 0)
-        flat_indices = op.Mul(flat_indices, flat_mask)
-        # Reshape back to (batch, seq_len)
-        indices = op.Reshape(flat_indices, op.Shape(input_ids))
+        cumsum = op.CumSum(is_audio_int, op.Constant(value_int=1))  # axis=1 (seq dim)
+        indices = op.Mul(cumsum, is_audio_int)  # zero out non-audio positions
 
         # Gather audio features using computed indices
         gathered = op.Gather(padded_features, indices, axis=0)

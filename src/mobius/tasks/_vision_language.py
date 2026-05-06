@@ -12,6 +12,7 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -47,49 +48,46 @@ class Qwen3VLVisionLanguageTask(ModelTask):
         past_seq_len = ir.SymbolicDim("past_sequence_len")
         total_patches = ir.SymbolicDim("total_patches")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph()
+        op = builder.op
+
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
         # MRoPE: 3D position IDs (temporal, height, width)
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([3, batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
         )
         # Flattened image patches
         patch_size = config.vision.patch_size or 16 if config.vision else 16
         temporal_patch_size = config.temporal_patch_size
         in_channels = config.vision.in_channels if config.vision else 3
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([total_patches, pixel_dim]),
-            type=ir.TensorType(config.dtype),
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         # Image grid dimensions for position embedding interpolation
         num_images = ir.SymbolicDim("num_images")
-        grid_thw = ir.Value(
-            name="grid_thw",
-            shape=ir.Shape([num_images, 3]),
-            type=ir.TensorType(ir.DataType.INT64),
+        grid_thw = builder.input(
+            "grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
         )
 
-        graph_inputs = [
-            input_ids,
-            attention_mask,
-            position_ids,
-            pixel_values,
-            grid_thw,
-        ]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -97,10 +95,6 @@ class Qwen3VLVisionLanguageTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
-
-        graph, builder = _make_graph(graph_inputs)
-        op = builder.op
 
         logits, present_key_values = module(
             op,
@@ -112,8 +106,7 @@ class Qwen3VLVisionLanguageTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

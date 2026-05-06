@@ -65,17 +65,12 @@ class CodecTask(ModelTask):
         num_q = ir.SymbolicDim("num_quantizers")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        codes = ir.Value(
-            name="codes",
-            shape=ir.Shape([batch, num_q, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
+        graph, builder = _make_graph()
+        codes = builder.input("codes", dtype=ir.DataType.INT64, shape=[batch, num_q, seq_len])
 
-        graph, builder = _make_graph([codes])
         waveform = decoder(builder.op, codes)
 
-        waveform.name = "waveform"
-        graph.outputs.append(waveform)
+        builder.add_output(waveform, "waveform")
         return _make_model(graph)
 
     def _build_encoder(
@@ -93,15 +88,12 @@ class CodecTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         audio_len = ir.SymbolicDim("audio_length")
 
-        waveform = ir.Value(
-            name="waveform",
-            shape=ir.Shape([batch, 1, audio_len]),
-            type=ir.TensorType(ir.DataType.FLOAT),
+        graph, builder = _make_graph(name="encoder")
+        waveform = builder.input(
+            "waveform", dtype=ir.DataType.FLOAT, shape=[batch, 1, audio_len]
         )
 
-        graph, builder = _make_graph([waveform], name="encoder")
         codes = encoder(builder.op, waveform)
 
-        codes.name = "codes"
-        graph.outputs.append(codes)
+        builder.add_output(codes, "codes")
         return _make_model(graph)

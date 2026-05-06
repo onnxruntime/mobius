@@ -121,13 +121,12 @@ class Qwen25VLCausalLMModel(nn.Module):
                 renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
                 renamed[f"embedding.{stripped}"] = value
-                # Weight tying: also use as lm_head
-                if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
-                    renamed["decoder.lm_head.weight"] = value
+                # lm_head.weight is tied at graph level; no separate entry needed.
             elif key.startswith("model."):
                 renamed[f"decoder.{key}"] = value
             elif key.startswith("lm_head."):
-                renamed[f"decoder.{key}"] = value
+                if not self.config.tie_word_embeddings:
+                    renamed[f"decoder.{key}"] = value
         return renamed
 
 
@@ -146,6 +145,8 @@ class Qwen25VLDecoderModel(nn.Module):
         self.config = config
         self.model = TextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -182,10 +183,9 @@ class Qwen25VLDecoderModel(nn.Module):
                 continue
             renamed[key] = value
 
-        # Handle weight tying
+        # Handle weight tying: lm_head.weight is tied at graph level.
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            renamed.pop("lm_head.weight", None)
         return renamed
 
 
@@ -561,6 +561,8 @@ class _Qwen3VLForMultimodalLM(nn.Module):
         self.config = config
         self.model = _Qwen3VLTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -708,15 +710,10 @@ class Qwen3VLCausalLMModel(nn.Module):
                 new_key = new_key.replace("language_model.", "language_model.model.", 1)
             renamed[new_key] = value
 
-        # Handle weight tying
+        # lm_head.weight is tied at graph level; discard any separate checkpoint entry.
         config = self.config
         if config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
-            head_key = "language_model.lm_head.weight"
-            if head_key not in renamed and embed_key in renamed:
-                renamed[head_key] = renamed[embed_key]
-            elif embed_key not in renamed and head_key in renamed:
-                renamed[embed_key] = renamed[head_key]
+            renamed.pop("language_model.lm_head.weight", None)
         return renamed
 
 
@@ -783,14 +780,10 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                # Weight tying
-                if (
-                    self.config.tie_word_embeddings
-                    and stripped == "language_model.embed_tokens.weight"
-                ):
-                    renamed["decoder.lm_head.weight"] = value
+                # lm_head.weight is tied at graph level; no separate entry needed.
             elif stripped.startswith("language_model.lm_head."):
-                renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
+                if not self.config.tie_word_embeddings:
+                    renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("language_model."):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]
@@ -810,6 +803,8 @@ class Qwen3VLDecoderModel(nn.Module):
         self.config = config
         self.model = TextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -847,8 +842,8 @@ class Qwen3VLDecoderModel(nn.Module):
             renamed[stripped] = value
 
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            # lm_head.weight is tied at graph level; discard any separate key.
+            renamed.pop("lm_head.weight", None)
         return renamed
 
 

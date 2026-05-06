@@ -47,7 +47,7 @@ import onnx_ir as ir
 from onnxscript import nn
 from onnxscript._internal import builder
 
-from mobius.components._common import LayerNormNoBias, Linear
+from mobius.components._common import INT64_MAX, LayerNormNoBias, Linear
 from mobius.components._conv import CausalDepthwiseConv1d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 
@@ -62,7 +62,9 @@ if TYPE_CHECKING:
 
 def _gradient_clip(op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
     """Clamp activations to ±clip_val (gradient clipping for numerical stability)."""
-    return op.Clip(x, op.Constant(value_float=-clip_val), op.Constant(value_float=clip_val))
+    lo = op.CastLike(op.Constant(value_float=-clip_val), x)
+    hi = op.CastLike(op.Constant(value_float=clip_val), x)
+    return op.Clip(x, lo, hi)
 
 
 def _glu(op: builder.OpBuilder, x: ir.Value) -> ir.Value:
@@ -189,20 +191,75 @@ class Gemma4ConvSubsampling(nn.Module):
         x = op.Transpose(x, perm=[0, 3, 1, 2])  # [B, C_out, T', F']
         return op.Relu(x)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def _mask_and_downsample(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        mask: ir.Value | None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        """Zero out padded positions via *mask*, then downsample mask by stride 2.
+
+        Args:
+            x: hidden states ``[B, C, T, F]`` **before** the conv layer.
+            mask: bool ``[B, T]`` (True = valid).  ``None`` → no-op.
+
+        Returns:
+            ``(masked_x, downsampled_mask)`` where the mask time dimension
+            is halved (``mask[:, ::2]``).
+        """
+        if mask is None:
+            return x, None
+        # Broadcast mask [B, T] → [B, 1, T, 1] over C and F dims
+        mask_4d = op.Unsqueeze(mask, [1, 3])  # [B, 1, T, 1]
+        x = op.Mul(x, op.CastLike(mask_4d, x))
+        # Downsample mask by conv stride (2): mask[:, ::2]
+        mask = op.Slice(
+            mask,
+            [0],  # starts
+            [INT64_MAX],  # ends
+            [1],  # axes
+            [2],  # steps
+        )  # [B, T//2]
+        return x, mask
+
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        """Subsample audio features and propagate the padding mask.
+
+        Args:
+            x: mel-spectrogram ``[B, T, input_size]``.
+            input_features_mask: optional bool ``[B, T]``
+                (True = valid frame). Must be **contiguous**:
+                all True entries precede all False entries
+                (right-padded batch layout).
+
+        Returns:
+            ``(projected_features, downsampled_mask)`` where features
+            are ``[B, T//4, hidden_size]`` and mask is ``[B, T//4]``
+            (or ``None`` when no mask was provided).
+        """
         # x: [B, T, input_size]
         x = op.Unsqueeze(x, [1])  # [B, 1, T, input_size]
 
+        # Stage 0: mask + downsample → conv → norm → relu
+        x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv0, self.norm0)  # [B, c0, T//2, F//2]
+
+        # Stage 1: mask + downsample → conv → norm → relu
+        x, input_features_mask = self._mask_and_downsample(op, x, input_features_mask)
         x = self._conv_norm_relu(op, x, self.conv1, self.norm1)  # [B, c1, T//4, F//4]
 
         # [B, c1, T', F'] → [B, T', F'*c1]  (permute so T is dim 1, flatten C and F)
         x = op.Transpose(x, perm=[0, 2, 3, 1])  # [B, T', F', c1]
-        batch = op.Shape(x, start=0, end=1)
-        t_out = op.Shape(x, start=1, end=2)
-        x = op.Reshape(x, op.Concat(batch, t_out, op.Constant(value_ints=[-1]), axis=0))
+        x = op.Reshape(x, op.Constant(value_ints=[0, 0, -1]))  # [B, T', F'*c1]
 
-        return self.input_proj_linear(op, x)  # [B, T', hidden_size]
+        return self.input_proj_linear(
+            op, x
+        ), input_features_mask  # [B, T', hidden_size], [B, T']
 
 
 class Gemma4FeedForward(nn.Module):
@@ -253,7 +310,7 @@ class Gemma4FeedForward(nn.Module):
         x = self.ffw_layer_2(op, x)  # [B, T, h]
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.post_layer_norm(op, x)
-        x = op.Mul(x, op.Constant(value_float=self._residual_weight))
+        x = op.Mul(x, op.CastLike(op.Constant(value_float=self._residual_weight), x))
         return op.Add(x, residual)
 
 
@@ -442,9 +499,20 @@ class Gemma4Attention(nn.Module):
         )  # [T, T] float32
         return op.Unsqueeze(bias, [0, 1])  # [1, 1, T, T]
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ) -> ir.Value:
+        """Compute attention with optional padding mask.
+
+        Args:
+            x: ``[B, T, hidden_size]``
+            attention_mask: optional bool ``[B, T]`` (True = valid).
+                Used to prevent attending to padded key positions.
+        """
         # x: [B, T, hidden_size]
-        batch = op.Shape(x, start=0, end=1)
         seq_len = op.Shape(x, start=1, end=2)
         num_heads = self._num_heads
         head_dim = self._head_dim
@@ -460,25 +528,22 @@ class Gemma4Attention(nn.Module):
         v = op.Cast(v, to=ir.DataType.FLOAT)
 
         # Reshape: [B, T, H*D] → [B, T, num_heads, head_dim]
-        hd_shape = op.Concat(
-            batch, seq_len, op.Constant(value_ints=[num_heads, head_dim]), axis=0
-        )
-        q = op.Reshape(q, hd_shape)  # [B, T, num_heads, head_dim]
-        k = op.Reshape(k, hd_shape)
-        v = op.Reshape(v, hd_shape)
+        # Use static shape with 0 = "copy from input dim" to avoid
+        # dynamic Shape+Concat ops that fall to CPU on CUDA EP.
+        q = op.Reshape(q, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
+        k = op.Reshape(k, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
+        v = op.Reshape(v, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
 
         # Apply custom Q scale and per-dim scale: q *= q_scale * softplus(per_dim_scale)
         # Softplus(x) = log(1 + exp(x)); for numerical stability, cast scale param to fp32
         per_dim_f32 = op.Cast(self.per_dim_scale, to=ir.DataType.FLOAT)
         softplus_scale = op.Log(
-            op.Add(op.Constant(value_float=1.0), op.Exp(per_dim_f32))
+            op.Add(1.0, op.Exp(per_dim_f32))
         )  # [head_dim] softplus(per_dim_scale)
-        q_scale = op.Constant(value_float=self._q_scale)
-        q = op.Mul(q, op.Mul(q_scale, softplus_scale))  # [B, T, num_heads, head_dim]
+        q = op.Mul(q, op.Mul(self._q_scale, softplus_scale))  # [B, T, num_heads, head_dim]
 
         # Apply K scale (constant)
-        k_scale = op.Constant(value_float=self._k_scale)
-        k = op.Mul(k, k_scale)  # [B, T, num_heads, head_dim]
+        k = op.Mul(k, self._k_scale)  # [B, T, num_heads, head_dim]
 
         # Transpose to [B, num_heads, T, head_dim] for batched matmul
         q = op.Transpose(q, perm=[0, 2, 1, 3])  # [B, num_heads, T, head_dim]
@@ -490,9 +555,9 @@ class Gemma4Attention(nn.Module):
         scores = op.MatMul(q, k_t)  # [B, H, T, T]
 
         # Relative position bias: matrix_bd
-        # pos_embed: [context_left, hidden_size] - cast to fp32 then project
-        pos_f32 = op.Cast(self.pos_embed, to=ir.DataType.FLOAT)
-        rel_k = self.relative_k_proj(op, pos_f32)  # [context_left, num_heads*head_dim]
+        # pos_embed: [context_left, hidden_size] - project in model dtype, then cast
+        rel_k = self.relative_k_proj(op, self.pos_embed)  # [context_left, num_heads*head_dim]
+        rel_k = op.Cast(rel_k, to=ir.DataType.FLOAT)
         rel_k = op.Reshape(
             rel_k, op.Constant(value_ints=[-1, num_heads, head_dim])
         )  # [ctx, H, D]
@@ -537,6 +602,16 @@ class Gemma4Attention(nn.Module):
         window_mask = self._build_causal_window_mask(op, seq_len)
         scores = op.Add(scores, window_mask)
 
+        # Padding mask: block attention to padded key positions
+        if attention_mask is not None:
+            # attention_mask [B, T] bool → additive bias [B, 1, 1, T]
+            pad_bias = op.Where(
+                op.Unsqueeze(attention_mask, [1, 2]),
+                op.Constant(value_float=0.0),
+                op.Constant(value_float=-1e9),
+            )  # [B, 1, 1, T]
+            scores = op.Add(scores, pad_bias)
+
         # Softmax in float32 → attention weights
         attn_weights = op.Softmax(scores, axis=-1)  # [B, H, T, T]
 
@@ -546,8 +621,7 @@ class Gemma4Attention(nn.Module):
 
         # Reshape [B, num_heads, T, head_dim] → [B, T, H*D]
         context = op.Transpose(context, perm=[0, 2, 1, 3])  # [B, T, num_heads, head_dim]
-        out_shape = op.Concat(batch, seq_len, op.Constant(value_ints=[-1]), axis=0)
-        context = op.Reshape(context, out_shape)  # [B, T, H*D]
+        context = op.Reshape(context, op.Constant(value_ints=[0, 0, -1]))  # [B, T, H*D]
 
         # Cast back to input dtype and apply output projection
         context = op.CastLike(context, x)
@@ -608,14 +682,19 @@ class Gemma4AudioLayer(nn.Module):
         self.norm_post_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.norm_out = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        x: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ) -> ir.Value:
         gc = self._gradient_clipping
         x = self.feed_forward1(op, x)  # FF1 (handles residual internally)
 
         residual = x
         x = _gradient_clip(op, x, gc)
         x = self.norm_pre_attn(op, x)
-        x = self.self_attn(op, x)
+        x = self.self_attn(op, x, attention_mask=attention_mask)
         x = _gradient_clip(op, x, gc)
         x = self.norm_post_attn(op, x)
         x = op.Add(x, residual)
@@ -700,17 +779,39 @@ class Gemma4AudioEncoder(nn.Module):
             ]
         )
         # HF uses nn.Linear(..., bias=True) for the output projection.
-        # The bias would normally cause ORT to fuse Add(1D bias) + LayerNorm into
-        # SkipSimplifiedLayerNorm (with 1D skip, which ORT rejects).  This is avoided
-        # because _Gemma4ScaleFreeRMSNorm uses manual primitive ops rather than
-        # op.RMSNormalization, preventing ORT from recognizing the fusion pattern.
+        # ORT fuses Add(1D bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization, placing the 1D bias in the
+        # "skip" input position. The CUDA kernel rejects 1D skip.
+        # Keep bias=True here; the caller's pre_projection_norm must use
+        # manual primitive ops (not op.RMSNormalization) to prevent this
+        # fusion pattern.
         self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value):
+    def forward(
+        self,
+        op: builder.OpBuilder,
+        input_features: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        """Encode audio mel-spectrogram features.
+
+        Args:
+            input_features: ``[B, T, input_size]`` mel-spectrogram.
+            input_features_mask: optional bool ``[B, T]``
+                (True = valid frame).  Propagated through conv subsampling
+                and used as key-padding mask in Conformer attention.
+
+        Returns:
+            ``(encoded, downsampled_mask)`` where encoded is
+            ``[B, T//4, output_proj_dims]`` and downsampled_mask is
+            ``[B, T//4]`` bool (or ``None`` when no mask was provided).
+        """
         # input_features: [B, T, input_size]
-        x = self.subsample_conv_projection(op, input_features)  # [B, T//4, hidden_size]
+        x, attention_mask = self.subsample_conv_projection(
+            op, input_features, input_features_mask
+        )  # [B, T//4, hidden_size], [B, T//4] or None
 
         for layer in self.layers:
-            x = layer(op, x)  # [B, T//4, hidden_size]
+            x = layer(op, x, attention_mask=attention_mask)  # [B, T//4, hidden_size]
 
-        return self.output_proj(op, x)  # [B, T//4, output_proj_dims]
+        return self.output_proj(op, x), attention_mask

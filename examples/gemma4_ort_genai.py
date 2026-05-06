@@ -161,7 +161,7 @@ def _write_genai_config(
 
 
 def _write_processor_config(config: object, output_dir: str) -> None:
-    """Write processor_config.json for the SigLIP vision encoder.
+    """Write image_processor.json for the SigLIP vision encoder.
 
     Gemma 4 uses a SigLIP ViT with pan-and-scan tiling.  The ONNX vision
     model expects pre-patchified inputs; ORT GenAI's ``gemma4`` processor
@@ -182,7 +182,7 @@ def _write_processor_config(config: object, output_dir: str) -> None:
             "std": [0.5, 0.5, 0.5],
         }
     }
-    with open(os.path.join(output_dir, "processor_config.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(output_dir, "image_processor.json"), "w", encoding="utf-8") as f:
         json.dump(processor_config, f, indent=4)
 
 
@@ -234,7 +234,7 @@ def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
     )
 
     if mode == "vlm":
-        print("Writing processor_config.json ...")
+        print("Writing image_processor.json ...")
         _write_processor_config(pkg.config, output_dir)
 
     print(f"  Copying tokenizer files from {model_id!r} ...")
@@ -305,7 +305,7 @@ def generate_vlm(
     - ``pixel_position_ids [batch, num_patches, 2]``
 
     The ORT GenAI multimodal processor handles image tiling and
-    patchification internally using ``processor_config.json``.
+    patchification internally using ``image_processor.json``.
     """
     print(f"Loading model from {model_dir!r} ...")
     model = og.Model(model_dir)

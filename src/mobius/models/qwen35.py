@@ -373,17 +373,37 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         """Preprocess HuggingFace state dict for Qwen3.5-MoE.
 
         Handles:
-        - Dropping multi-token prediction (MTP) keys (``mtp_*``):
+        - Dropping multi-token prediction (MTP) keys (``mtp_*``, ``mtp.*``):
           MTP heads are auxiliary decoding heads used only during
           HuggingFace training; they are not needed for inference.
+        - Stripping ``language_model.`` prefix from HF checkpoint keys
+          (HF stores weights as ``model.language_model.*`` in safetensors)
+        - Dropping visual encoder keys (``model.visual.*``)
         - Weight tying (``tie_word_embeddings``)
         - Unpacking fused expert weights (``experts.gate_up_proj``,
           ``experts.down_proj``) into per-expert tensors
         """
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if key.startswith("mtp_"):
+            if key.startswith(("mtp_", "mtp.")):
                 continue
+
+            # Strip "model." prefix, then handle sub-prefixes
+            stripped = key
+            if stripped.startswith("model."):
+                stripped = stripped[len("model.") :]
+
+            # Drop visual encoder weights (not used by text-only MoE)
+            if stripped.startswith("visual."):
+                continue
+
+            # Strip "language_model." nesting and re-add "model." to
+            # match the ONNX module hierarchy (self.model = ...)
+            if stripped.startswith("language_model."):
+                stripped = stripped[len("language_model.") :]
+                key = f"model.{stripped}"
+            else:
+                key = f"model.{stripped}" if key.startswith("model.") else key
 
             # Unpack fused expert weights into per-expert tensors.
             # HF format: [num_experts, fused_dim, hidden] with gate+up fused
@@ -465,7 +485,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             # Drop multi-token prediction (MTP) keys: MTP heads are
             # auxiliary decoding heads used only during HuggingFace
             # training; they are not needed for inference.
-            if key.startswith("mtp_"):
+            if key.startswith(("mtp_", "mtp.")):
                 continue
 
             stripped = key
@@ -535,7 +555,7 @@ class Qwen35VLDecoderModel(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             # Drop MTP heads (training-only auxiliary decoders)
-            if key.startswith("mtp_"):
+            if key.startswith(("mtp_", "mtp.")):
                 continue
             stripped = key
             if stripped.startswith("model."):

@@ -24,7 +24,6 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     Attention,
     Embedding,
@@ -167,6 +166,8 @@ class InternLM2CausalLMModel(nn.Module):
         self.config = config
         self.model = _InternLMTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -196,9 +197,17 @@ class InternLM2CausalLMModel(nn.Module):
         2. wo → o_proj (Attention component uses o_proj)
         3. Grouped/interleaved wqkv split into separate q/k/v
         """
-        # Weight tying
+        # Weight tying: lm_head is tied at graph level; only embed_tokens.weight is needed.
+        # Handle both tok_embeddings (HF) → embed_tokens (our) rename for tied checkpoints.
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(state_dict)
+            if "model.embed_tokens.weight" not in state_dict:
+                # HF key before rename, or tied checkpoint with only lm_head.weight
+                src = state_dict.get("model.tok_embeddings.weight") or state_dict.get(
+                    "lm_head.weight"
+                )
+                if src is not None:
+                    state_dict["model.embed_tokens.weight"] = src
+            state_dict.pop("lm_head.weight", None)
 
         q_size = self.config.num_attention_heads * self.config.head_dim
         kv_size = self.config.num_key_value_heads * self.config.head_dim

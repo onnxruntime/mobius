@@ -290,6 +290,26 @@ Quick reference:
 Many models can be registered as aliases of existing classes if the
 architecture matches.
 
+## ModelPackage key conventions
+
+Multi-model tasks produce a `ModelPackage` with standardised keys:
+
+| Key | Role | On-disk path |
+|-----|------|-------------|
+| `"decoder"` | Text decoder | `decoder/model.onnx` |
+| `"vision_encoder"` | Vision encoder | `vision_encoder/model.onnx` |
+| `"audio_encoder"` | Audio encoder | `audio_encoder/model.onnx` |
+| `"embedding"` | Embedding | `embedding/model.onnx` |
+| `"model"` | Single-model (LLM) | `model.onnx` |
+
+Legacy keys (`"model"` for decoder, `"vision"` for vision encoder, `"audio"`
+for audio encoder, `"speech"` for audio) are mapped via `_MODEL_ROLE_MAP` in
+`_builder.py` for backward compatibility.
+New tasks should use the standardised keys above.
+
+Module attribute names on the model class (declared in `ComponentSpec`)
+also use `vision_encoder` and `audio_encoder`, matching the ModelPackage keys.
+
 ## Troubleshooting: common pitfalls
 
 ### 1. ORT rejects graph with `tensor(double)` / wrong dtype

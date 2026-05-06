@@ -37,6 +37,7 @@ from mobius._configs import (
     BaseModelConfig,
 )
 from mobius._execution_providers import ep_registry
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
@@ -108,11 +109,14 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
 _MODEL_ROLE_MAP: dict[str, str] = {
     "model": "decoder",
     "decoder": "decoder",
-    "vision": "vision",
+    "vision_encoder": "vision",
     "embedding": "embedding",
     "encoder": "encoder",
     # Audio sub-models are encoder-role; must not receive decoder-only fusions.
     "audio_encoder": "encoder",
+    # Backward compatibility aliases (deprecated — will be removed)
+    "vision": "vision",
+    "audio": "encoder",
     "speech": "encoder",
 }
 
@@ -188,6 +192,9 @@ def build_from_module(
     if hasattr(config, "validate"):
         config.validate()
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
+    # Cast all parameters to the target dtype. Vision/audio encoder weights
+    # are included — their graph inputs are kept at f32 (matching GenAI's
+    # image processor output) with a Cast at the graph entry.
     _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
     capabilities = ep_registry.require(execution_provider)
@@ -205,6 +212,27 @@ def build_from_module(
             model_role=role,
             trace=trace_optimization,
         )
+
+    # Lower default-domain opset from 24 to 23 when the target EP doesn't
+    # register opset 24 kernels for standard ops (Reshape, RMSNormalization,
+    # etc.). Without this, those ops fall to CPU and produce ~280 memcpy
+    # nodes that destroy performance. The flag defaults to True; set
+    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
+    # opset 24 natively.
+    if flags.ort_lower_opset_for_ep and execution_provider != "default":
+        for name, model in pkg.items():
+            if "" in model.graph.opset_imports:
+                original = model.graph.opset_imports[""]
+                model.graph.opset_imports[""] = 23
+                logger.warning(
+                    "Lowered opset %d→23 for '%s' (EP=%s). "
+                    "ORT does not yet register opset %d kernels for this EP. "
+                    "Track https://github.com/microsoft/onnxruntime/issues/27729",
+                    original,
+                    name,
+                    execution_provider,
+                    original,
+                )
     return pkg
 
 

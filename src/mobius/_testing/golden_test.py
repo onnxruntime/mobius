@@ -209,9 +209,9 @@ class TestGoldenRefRoundTrip:
         """Save and reload multi-model (VL) golden data."""
         json_path = tmp_path / "test_vl.json"
 
-        component_norms = {"vision": 42.5, "embedding": 38.2}
+        component_norms = {"vision_encoder": 42.5, "embedding": 38.2}
         component_shapes = {
-            "vision": (1, 577, 1024),
+            "vision_encoder": (1, 577, 1024),
             "embedding": (1, 583, 2048),
         }
 
@@ -232,7 +232,7 @@ class TestGoldenRefRoundTrip:
         assert golden.component_norms == pytest.approx(component_norms)
         # JSON stores shapes as lists, not tuples
         assert golden.component_shapes == {
-            "vision": [1, 577, 1024],
+            "vision_encoder": [1, 577, 1024],
             "embedding": [1, 583, 2048],
         }
 

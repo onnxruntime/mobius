@@ -224,3 +224,6 @@ cache_dir/**
 dashboard_preview.html
 docs/feature-flags.md
 .copilot/
+*.mp3
+*.m4a
+*.wav

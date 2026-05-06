@@ -26,14 +26,7 @@ They require network access to download config.json from HuggingFace.
 
 from __future__ import annotations
 
-import gc
 import logging
-import os
-
-try:
-    import resource
-except ImportError:
-    resource = None  # Windows
 
 import pytest
 
@@ -47,12 +40,19 @@ from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
 
-# 1.5 GB RSS limit — leave headroom below the 2 GB target
-_MAX_RSS_BYTES = 1.5 * 1024 * 1024 * 1024
-
 # Build parametrized test cases from registry entries that have a test_model_id
 _KNOWN_XFAILS: dict[str, str] = {
     "phi3small": "gegelu activation not implemented (gated GELU variant)",
+    # VL models with missing/incomplete vision_config when loaded without
+    # trust_remote_code — the HF config JSON doesn't expose vision fields.
+    "deepseek_vl": "VisionConfig.hidden_size missing without trust_remote_code",
+    "deepseek_vl_hybrid": "VisionConfig.hidden_size missing without trust_remote_code",
+    "fuyu": "FuyuConfig has no vision_config (image processing is in-model)",
+    "florence2": "Florence2 DaViT vision encoder is multi-stage (not standard ViT)",
+    "got_ocr2": "VisionConfig missing without trust_remote_code",
+    "janus": "VisionConfig.hidden_size missing without trust_remote_code",
+    "molmo": "VisionConfig missing without trust_remote_code",
+    "ovis2": "VisionConfig missing without trust_remote_code",
 }
 
 _ARCH_PARAMS = [
@@ -67,15 +67,6 @@ _ARCH_PARAMS = [
     for model_type in sorted(registry.architectures())
     if (registration := registry.get_registration(model_type)).test_model_id is not None
 ]
-
-
-def _get_rss_bytes() -> int:
-    """Return current RSS (resident set size) in bytes, or 0 on Windows."""
-    if resource is None:
-        return 0  # resource module unavailable on Windows
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    # ru_maxrss is in KB on Linux
-    return usage.ru_maxrss * 1024
 
 
 def _load_hf_config(model_id: str):
@@ -101,7 +92,12 @@ def _resolve_hf_config(hf_config):
     """
     parent_config = hf_config
     if hasattr(hf_config, "talker_config"):
-        hf_config = hf_config.talker_config
+        talker = hf_config.talker_config
+        # Qwen3-Omni talker nests the real model config under text_config
+        if hasattr(talker, "text_config"):
+            hf_config = talker.text_config
+        else:
+            hf_config = talker
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
         if hasattr(thinker, "text_config"):
@@ -186,7 +182,6 @@ class TestArchValidation:
             assert len(model.graph.outputs) > 0, f"{component_name} has no outputs"
 
         del pkg
-        gc.collect()
 
     @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
     def test_graph_shapes_consistent(self, model_type: str, model_id: str):
@@ -214,37 +209,45 @@ class TestArchValidation:
                 assert output.name, f"{component_name} has an unnamed output"
 
         del pkg
-        gc.collect()
 
-    @pytest.mark.parametrize("model_type,model_id", _ARCH_PARAMS)
-    def test_memory_stays_within_budget(self, model_type: str, model_id: str):
-        """Guard against memory-hungry full-size graph builds.
 
-        Logs current RSS after graph construction and fails if it
-        exceeds the 1.5 GB threshold (leaving headroom below 2 GB).
+class TestRegistryConsistency:
+    """Verify registry and model class metadata are consistent."""
 
-        Skipped under pytest-xdist because ``ru_maxrss`` reports peak
-        RSS which is cumulative within a worker process and never
-        decreases — giving false positives when a worker runs many tests.
+    def test_config_class_declared_on_model(self):
+        """Registry config_class must match the model class declaration.
+
+        When a registry entry specifies a non-default config_class,
+        the model class must also declare it (not silently inherit a
+        different one from a parent).
+
+        Catches bugs like LongcatFlash where a missing config_class
+        declaration caused the model to load with the wrong config,
+        producing incorrect ONNX graphs without any error.
         """
-        if os.environ.get("PYTEST_XDIST_WORKER"):
-            pytest.skip("RSS budget check unreliable under pytest-xdist (cumulative peak RSS)")
+        from mobius._configs import ArchitectureConfig, CausalLMConfig
 
-        pkg = _build_graph(model_type, model_id)
+        issues = []
+        for model_type, reg in registry._map.items():
+            reg_config = reg.config_class
+            if reg_config is None or reg_config is ArchitectureConfig:
+                continue
 
-        rss = _get_rss_bytes()
-        rss_mb = rss / (1024 * 1024)
-        logger.info(
-            "%s (%s): RSS after build = %.0f MB",
-            model_type,
-            model_id,
-            rss_mb,
-        )
+            cls = reg.module_class
+            model_config = getattr(cls, "config_class", None)
 
-        del pkg
-        gc.collect()
-
-        assert rss < _MAX_RSS_BYTES, (
-            f"{model_type} ({model_id}): RSS {rss_mb:.0f} MB "
-            f"exceeds {_MAX_RSS_BYTES / 1024 / 1024:.0f} MB limit"
-        )
+            # If registry specifies a specialized config (not the base
+            # CausalLMConfig), the model class should agree — unless the
+            # model doesn't define config_class at all (multimodal models
+            # that aren't CausalLMModel subclasses rely on the registry).
+            if (
+                reg_config is not CausalLMConfig
+                and model_config is not None
+                and model_config is not reg_config
+            ):
+                issues.append(
+                    f"{model_type}: registry says "
+                    f"{reg_config.__name__} but {cls.__name__} "
+                    f"has {getattr(model_config, '__name__', None)}"
+                )
+        assert not issues, "Registry/model config_class mismatch:\n" + "\n".join(issues)

@@ -94,6 +94,7 @@ from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -117,6 +118,7 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
@@ -387,7 +389,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "falcon_h1": ModelRegistration(FalconCausalLMModel),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
-    "gemma3": ModelRegistration(Gemma3CausalLMModel),
+    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
     "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
@@ -465,7 +467,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
-    "gemma3_multimodal": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "glm4v": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -508,10 +509,17 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
+    # Fun-ASR uses config.yaml (not config.json). build() auto-detection
+    # won't work — use build_from_module() with manual config construction.
+    # See examples/fun_asr.py for the full pipeline.
+    "fun_asr": ModelRegistration(
+        FunASRForConditionalGeneration, task="fun-asr-speech-language"
+    ),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
     ),
+    "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
     "whisper": ModelRegistration(
@@ -707,7 +715,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "command_r": "CohereForAI/c4ai-command-r-v01",
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
-    "nemotron_h": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
     "open-llama": "openlm-research/open_llama_3b",
     "persimmon": "adept/persimmon-8b-base",
     "shieldgemma2": "google/shieldgemma-2b",
@@ -718,7 +726,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bloom": "bigscience/bloom-560m",
     "gemma": "google/gemma-2b",
     "gemma2": "google/gemma-2-2b",
-    "gemma3": "google/gemma-3-1b-pt",
+    "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
     "gemma3n": "google/gemma-3n-E2B-pt",
     "gemma3n_text": "google/gemma-3n-E2B-pt",
@@ -803,7 +811,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    "gemma3_multimodal": "google/gemma-3-4b-it",
     "gemma4": "google/gemma-4-E2B-it",
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
@@ -847,6 +854,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
+    "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -987,7 +996,6 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "gemma3_text": "gemma",
     "gemma3n": "gemma",
     "gemma3n_text": "gemma",
-    "gemma3_multimodal": "gemma",
     "internlm2": "internlm",
     "internvl_chat": "internlm",
     "internvl2": "internlm",
@@ -1013,6 +1021,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
+    "fun_asr": "qwen",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",

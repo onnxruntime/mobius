@@ -24,7 +24,6 @@ from onnxscript import nn
 from onnxscript._internal import builder
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     Embedding,
     Linear,
@@ -485,5 +484,5 @@ class JetMoeCausalLMModel(CausalLMModel):
             renamed[key] = value
 
         if self.config.tie_word_embeddings:
-            tie_word_embeddings(renamed)
+            renamed.pop("lm_head.weight", None)
         return renamed

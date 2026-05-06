@@ -9,7 +9,7 @@ and processor outputs. For an overview, see the parent [SKILL.md](../SKILL.md).
 ## VLM prompt flow (3-model split)
 
 ```
-pixel_values + image_grid_thw  →  [vision.onnx]  →  image_features
+pixel_values + image_grid_thw  →  [vision_encoder/model.onnx]  →  image_features
                                                           │
 input_ids + image_features     →  [embedding.onnx] → inputs_embeds
                                                           │
@@ -93,7 +93,7 @@ def _write_genai_config(config, output_dir, model_type="qwen2_5_vl"):
                     "log_id": "onnxruntime-genai",
                     "provider_options": [],
                 },
-                "filename": "model.onnx",
+                "filename": "decoder/model.onnx",
                 "head_size": config.head_dim,
                 "hidden_size": config.hidden_size,
                 "inputs": {
@@ -113,7 +113,7 @@ def _write_genai_config(config, output_dir, model_type="qwen2_5_vl"):
                 "num_key_value_heads": config.num_key_value_heads,
             },
             "embedding": {
-                "filename": "embedding.onnx",
+                "filename": "embedding/model.onnx",
                 "inputs": {
                     "input_ids": "input_ids",
                     "image_features": "image_features",
@@ -123,7 +123,7 @@ def _write_genai_config(config, output_dir, model_type="qwen2_5_vl"):
                 },
             },
             "vision": {
-                "filename": "vision.onnx",
+                "filename": "vision_encoder/model.onnx",
                 "spatial_merge_size": 2,
                 "inputs": {
                     "pixel_values": "pixel_values",

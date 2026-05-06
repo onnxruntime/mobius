@@ -214,6 +214,14 @@ def _save_package(
         _apply_optimize(model, optimize)
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
+
+    if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
+        logging.getLogger(__name__).warning(
+            "Safetensors external data does not guarantee 256-byte offset "
+            "alignment, which can cause CUBLAS misaligned address errors on "
+            "CUDA. Consider using --external-data onnx for CUDA builds."
+        )
+
     pkg.save(
         output_dir,
         external_data=args.external_data,

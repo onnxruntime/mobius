@@ -20,6 +20,7 @@ from __future__ import annotations
 
 __all__ = [
     "AdapterTask",
+    "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
     "CodecTask",
@@ -27,6 +28,7 @@ __all__ = [
     "ControlNetTask",
     "DenoisingTask",
     "FeatureExtractionTask",
+    "FunASRSpeechLanguageTask",
     "Gemma4Task",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
@@ -59,6 +61,7 @@ __all__ = [
 
 from mobius._constants import OPSET_VERSION
 from mobius.tasks._adapter import AdapterTask
+from mobius.tasks._audio_ctc import AudioCTCTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
 from mobius.tasks._base import (
     ComponentSpec,
@@ -74,6 +77,7 @@ from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
+from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
@@ -105,6 +109,7 @@ from mobius.tasks._vision_language_3model import (
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "adapter": AdapterTask,
+    "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
     "codec": CodecTask,
     "controlnet": ControlNetTask,
@@ -127,6 +132,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
+    "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

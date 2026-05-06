@@ -188,7 +188,11 @@ def _rename_vit_weight(name: str) -> str | None:
         ):
             name = after
 
-    # Skip pooler and classifier heads
+    # Skip most pooler/classifier weights, but keep pooler.layernorm
+    # (BeiT uses pooler.layernorm as the final layernorm)
+    if name.startswith("pooler.layernorm."):
+        suffix = name[len("pooler.layernorm.") :]
+        return f"layernorm.{suffix}"
     if name.startswith(("pooler.", "classifier.")):
         return None
 
@@ -197,6 +201,9 @@ def _rename_vit_weight(name: str) -> str | None:
         return "embeddings.cls_token"
     if name == "embeddings.position_embeddings":
         return "embeddings.position_embeddings"
+    # DINOv2 mask_token: used during pre-training only; not needed for inference
+    if name == "embeddings.mask_token":
+        return None
     if name.startswith("embeddings.patch_embeddings.projection."):
         suffix = name[len("embeddings.patch_embeddings.projection.") :]
         return f"embeddings.patch_embeddings.projection.{suffix}"
@@ -212,6 +219,30 @@ def _rename_vit_weight(name: str) -> str | None:
         # layernorm_before / layernorm_after pass through
         if suffix.startswith("layernorm_"):
             return f"encoder.layer.{layer_idx}.{suffix}"
+        # DINOv2/DeiT-style norm1/norm2 → layernorm_before/layernorm_after
+        if suffix.startswith("norm1"):
+            remainder = suffix[len("norm1") :]
+            return f"encoder.layer.{layer_idx}.layernorm_before{remainder}"
+        if suffix.startswith("norm2"):
+            remainder = suffix[len("norm2") :]
+            return f"encoder.layer.{layer_idx}.layernorm_after{remainder}"
+        # DINOv2-style MLP: fc1 → up_proj, fc2 → down_proj
+        if suffix.startswith("mlp.fc1"):
+            remainder = suffix[len("mlp.fc1") :]
+            return f"encoder.layer.{layer_idx}.mlp.up_proj{remainder}"
+        if suffix.startswith("mlp.fc2"):
+            remainder = suffix[len("mlp.fc2") :]
+            return f"encoder.layer.{layer_idx}.mlp.down_proj{remainder}"
+        # DINOv2 layer_scale: layer_scale1/layer_scale2 (skip — not
+        # used in our ViT implementation)
+        if suffix.startswith("layer_scale"):
+            return None
+        # BeiT lambda_1/lambda_2 (layer scale — not implemented)
+        if suffix in ("lambda_1", "lambda_2"):
+            return None
+        # BeiT relative_position_bias (not implemented in base ViT)
+        if "relative_position_bias" in suffix:
+            return None
         for old, new in _VIT_LAYER_RENAMES.items():
             if suffix.startswith(old):
                 remainder = suffix[len(old) :]

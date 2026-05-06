@@ -163,7 +163,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "blip": "VL model — requires image inputs",
     "blip-2": "VL model — requires image inputs",
     "florence2": "VL model — requires image inputs",
-    "gemma3_multimodal": "VL model — requires image inputs",
+    "gemma3": "VL model — requires image inputs",
     "idefics2": "VL model — requires image inputs",
     "idefics3": "VL model — requires image inputs",
     "instructblip": "VL model — requires image inputs",

@@ -335,6 +335,22 @@ class TestExtractRopeConfig:
 
         assert _extract_rope_config(Cfg()) is None
 
+    def test_nondefault_rope_theta_without_rope_scaling_activates_rope(self):
+        """Non-default rope_theta alone (e.g. 50000) is treated as a RoPE signal.
+
+        Models like Arctic and Jamba set a custom rope_theta without
+        exposing rope_scaling in their config JSON.  The non-default value
+        distinguishes them from NoPE models that inherit 10000.0 as dead data.
+        """
+
+        class Cfg:
+            rope_theta = 50_000.0  # no rope_scaling, no rope_parameters
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+        assert result.rope_theta == pytest.approx(50_000.0)
+
     def test_rope_parameters_activates_rope(self):
         """``rope_parameters`` on the HF config is the modern RoPE signal."""
 
@@ -910,3 +926,153 @@ class TestArchitectureConfigValidate:
         msg = str(exc_info.value)
         assert "hidden_size" in msg
         assert "num_hidden_layers" in msg
+
+
+class TestGemma4Config:
+    """Tests for Gemma4Config.from_transformers."""
+
+    def test_boa_token_id_extracted_from_parent(self):
+        """boa_token_id lives on the parent HF config, not text_config."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+                "bos_token_id": 2,
+                "eos_token_id": 1,
+                "pad_token_id": 0,
+            },
+        )()
+        parent_config = type(
+            "ParentConfig",
+            (),
+            {"boa_token_id": 256000, "model_type": "gemma4"},
+        )()
+
+        config = Gemma4Config.from_transformers(text_config, parent_config=parent_config)
+        assert config.boa_token_id == 256000
+
+    def test_boa_token_id_none_when_absent(self):
+        """boa_token_id defaults to None when parent doesn't have it."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+            },
+        )()
+
+        config = Gemma4Config.from_transformers(text_config)
+        assert config.boa_token_id is None
+
+
+class TestActivationFallbacks:
+    """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
+
+    def test_ff_activation_fallback(self):
+        """ff_activation is used when hidden_act is absent (XLNet pattern)."""
+
+        class FakeConfig:
+            model_type = "xlnet"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            ff_activation = "gelu"
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_true_fallback(self):
+        """gelu_activation=True maps to 'gelu' (XLM pattern)."""
+
+        class FakeConfig:
+            model_type = "xlm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = True
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_false_does_not_set_gelu(self):
+        """gelu_activation=False should not set hidden_act to gelu."""
+
+        class FakeConfig:
+            model_type = "some_model"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = False
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # With gelu_activation=False and no other activation attr,
+        # hidden_act should be None (not "gelu")
+        assert config.hidden_act is None
+
+
+class TestImplicitRopeDefaults:
+    """Tests for models in _IMPLICIT_ROPE_DEFAULTS."""
+
+    def test_arctic_gets_rope_config(self):
+        """Arctic (rope_theta=10000, rope_scaling=null) should get RoPE."""
+
+        class FakeConfig:
+            model_type = "arctic"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 4096
+            head_dim = 32
+            hidden_act = "silu"
+            # Arctic has rope_theta=10000 (default) and no rope_scaling
+            rope_theta = 10_000.0
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # Arctic must get RoPE via _IMPLICIT_ROPE_DEFAULTS
+        assert config.rope_type == "default"
+        assert config.rope_theta == pytest.approx(10_000.0)

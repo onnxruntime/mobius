@@ -661,8 +661,8 @@ class TestBuildGraphLoRA:
         module = model_cls(config)
         task = Phi4MMMultiModalTask()
         pkg = task.build(module, config)
-        # LoRA adapters live in the decoder model (pkg["model"])
-        decoder = pkg["model"]
+        # LoRA adapters live in the decoder model (pkg["decoder"])
+        decoder = pkg["decoder"]
 
         init_names = list(decoder.graph.initializers)
         lora_names = [n for n in init_names if "lora" in n]
@@ -820,13 +820,13 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         # Verify 4-model package structure
-        assert "vision" in pkg, "Should have vision model"
-        assert "speech" in pkg, "Should have speech model"
+        assert "vision_encoder" in pkg, "Should have vision model"
+        assert "audio_encoder" in pkg, "Should have audio model"
         assert "embedding" in pkg, "Should have embedding model"
-        assert "model" in pkg, "Should have decoder model"
+        assert "decoder" in pkg, "Should have decoder model"
 
         # Vision model: pixel_values + image_sizes → image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         v_inputs = {inp.name for inp in vision.graph.inputs}
         v_outputs = {out.name for out in vision.graph.outputs}
         assert "pixel_values" in v_inputs
@@ -838,7 +838,7 @@ class TestBuildGraphVisionLanguage:
         )
 
         # Speech model: audio_embeds + metadata → audio_features (single output)
-        speech = pkg["speech"]
+        speech = pkg["audio_encoder"]
         s_inputs = {inp.name for inp in speech.graph.inputs}
         s_outputs = {out.name for out in speech.graph.outputs}
         assert "audio_embeds" in s_inputs
@@ -855,8 +855,8 @@ class TestBuildGraphVisionLanguage:
         assert "audio_features" in e_inputs
         assert "inputs_embeds" in e_outputs
 
-        # Decoder model (pkg["model"]): inputs_embeds → logits + KV cache
-        decoder = pkg["model"]
+        # Decoder model (pkg["decoder"]): inputs_embeds → logits + KV cache
+        decoder = pkg["decoder"]
         d_inputs = {inp.name for inp in decoder.graph.inputs}
         d_outputs = {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in d_inputs
@@ -884,13 +884,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -918,13 +918,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -965,7 +965,7 @@ class TestBuildGraphVisionLanguage:
         pkg = task.build(module, config)
 
         # 3-model split: decoder, vision, embedding
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         # Decoder: inputs_embeds → logits + KV cache
         decoder = pkg["decoder"]
@@ -973,7 +973,7 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
         # Vision: pixel_values → image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1022,7 +1022,7 @@ class TestBuildGraphVisionLanguage:
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         # Decoder should have logits output and inputs_embeds input
@@ -1065,7 +1065,7 @@ class TestBuildGraphVisionLanguage:
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
-        assert "vision" in pkg
+        assert "vision_encoder" in pkg
         assert "embedding" in pkg
 
         # Decoder should have logits output and inputs_embeds input
@@ -1127,14 +1127,14 @@ class TestBuildGraphVisionLanguage:
             mm_tokens_per_image=4,
             image_token_id=255999,
         )
-        model_cls = registry.get("gemma3_multimodal")
+        model_cls = registry.get("gemma3")
         module = model_cls(config)
-        task_name = _default_task_for_model("gemma3_multimodal")
+        task_name = _default_task_for_model("gemma3")
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
-        assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
+        assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
 
     def test_gemma4_multimodal_graph(self):
@@ -1183,7 +1183,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
             f"Vision-only Gemma4 should produce 3 models, got: {set(pkg.keys())}"
         )
         # Decoder: inputs_embeds -> logits + per-layer KV cache
@@ -1191,7 +1191,7 @@ class TestBuildGraphVisionLanguage:
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision: pixel_values + pixel_position_ids -> image_features
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         vision_input_names = {i.name for i in vision.graph.inputs}
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
@@ -1301,9 +1301,12 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "audio", "embedding"}, (
-            f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
-        )
+        assert set(pkg.keys()) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }, f"AnyToAny Gemma4 should produce 4 models (with 'audio'), got: {set(pkg.keys())}"
         # Decoder KV cache: num_hidden_layers - num_kv_shared_layers = 1 entry
         decoder = pkg["decoder"]
         decoder_input_names = {i.name for i in decoder.graph.inputs}
@@ -1312,14 +1315,16 @@ class TestBuildGraphVisionLanguage:
         assert "past_key_values.1.key" not in decoder_input_names  # shared layer
         assert "logits" in {o.name for o in decoder.graph.outputs}
         # Vision
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         vision_input_names = {i.name for i in vision.graph.inputs}
         assert "pixel_values" in vision_input_names
         assert "pixel_position_ids" in vision_input_names
         assert "image_features" in {o.name for o in vision.graph.outputs}
         # Audio encoder
-        audio = pkg["audio"]
-        assert "input_features" in {i.name for i in audio.graph.inputs}
+        audio = pkg["audio_encoder"]
+        audio_input_names = {i.name for i in audio.graph.inputs}
+        assert "input_features" in audio_input_names
+        assert "input_features_mask" in audio_input_names
         assert "audio_features" in {o.name for o in audio.graph.outputs}
         # Embedding: all three inputs
         embedding = pkg["embedding"]
@@ -1410,6 +1415,74 @@ class TestBuildGraphVisionLanguage:
         assert "present.1.key" not in output_names
         assert "present.1.value" not in output_names
 
+    def test_gemma4_k_eq_v_with_global_kv_heads(self):
+        """Verify attention_k_eq_v removes v_proj and num_global_key_value_heads sets KV cache shapes.
+
+        Config: attention_k_eq_v=True, num_key_value_heads=4 (sliding),
+        num_global_key_value_heads=2 (full). Full-attention layers should:
+        - Have no v_proj initializer (V=K)
+        - Use num_global_key_value_heads=2 for KV cache shapes
+        Sliding layers should use num_key_value_heads=4.
+        """
+        from mobius._configs import Gemma4Config
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            # Layer 0: sliding, Layer 1: full (k_eq_v + global heads)
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            attention_k_eq_v=True,
+            num_global_key_value_heads=2,
+        )
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask()
+        pkg = task.build(module, config)
+        decoder = pkg["model"]
+
+        # Check initializer names: full-attention layer (1) should have no v_proj
+        init_names = set(decoder.graph.initializers)
+        # Sliding layer 0 has k_proj, v_proj
+        assert "model.layers.0.self_attn.k_proj.weight" in init_names
+        assert "model.layers.0.self_attn.v_proj.weight" in init_names
+        # Full layer 1 has k_proj but NO v_proj (k_eq_v: V=K)
+        assert "model.layers.1.self_attn.k_proj.weight" in init_names
+        assert "model.layers.1.self_attn.v_proj.weight" not in init_names
+
+        # KV cache shapes:
+        # Layer 0 (sliding): num_key_value_heads=4
+        # Layer 1 (full): num_global_key_value_heads=2
+        input_shapes = {i.name: list(i.shape) for i in decoder.graph.inputs}
+        # Layer 0: kv_heads=4
+        layer0_key_shape = input_shapes["past_key_values.0.key"]
+        assert layer0_key_shape[1] == 4, (
+            f"Sliding layer 0 should have 4 KV heads, got {layer0_key_shape[1]}"
+        )
+        # Layer 1: kv_heads=2 (num_global_key_value_heads)
+        layer1_key_shape = input_shapes["past_key_values.1.key"]
+        assert layer1_key_shape[1] == 2, (
+            f"Full layer 1 should have 2 KV heads "
+            f"(num_global_key_value_heads), got {layer1_key_shape[1]}"
+        )
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -1436,7 +1509,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         # Decoder: inputs_embeds → logits + KV cache
         decoder = pkg["decoder"]
@@ -1444,7 +1517,7 @@ class TestBuildGraphVisionLanguage:
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
         # Vision: pixel_values → image_features (via ViT + Q-Former)
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1500,13 +1573,13 @@ class TestBuildGraphVisionLanguage:
             task = get_task(task_name)
             pkg = task.build(module, config)
 
-            assert set(pkg.keys()) == {"decoder", "vision", "embedding"}, (
+            assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}, (
                 f"{model_type} should produce 3 models"
             )
             assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}, (
                 f"{model_type} decoder missing logits"
             )
-            assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}, (
+            assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}, (
                 f"{model_type} vision missing pixel_values"
             )
 
@@ -1531,9 +1604,9 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
         assert "logits" in {o.name for o in pkg["decoder"].graph.outputs}
-        assert "pixel_values" in {i.name for i in pkg["vision"].graph.inputs}
+        assert "pixel_values" in {i.name for i in pkg["vision_encoder"].graph.inputs}
 
     def test_pixtral_preprocess_weights_remapping(self):
         """Verify _preprocess_pixtral_weights remaps HF weight names correctly."""
@@ -1618,7 +1691,7 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         dec_inputs = {i.name for i in decoder.graph.inputs}
@@ -1637,7 +1710,7 @@ class TestBuildGraphVisionLanguage:
         assert kv_shapes["past_key_values.1.key"] != kv_shapes["past_key_values.0.key"]
         assert kv_shapes["past_key_values.0.key"] == kv_shapes["past_key_values.2.key"]
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
 
         embed = pkg["embedding"]
@@ -1669,13 +1742,13 @@ class TestBuildGraphVisionLanguage:
         task = get_task(task_name)
         pkg = task.build(module, config)
 
-        assert set(pkg.keys()) == {"decoder", "vision", "embedding"}
+        assert set(pkg.keys()) == {"decoder", "vision_encoder", "embedding"}
 
         decoder = pkg["decoder"]
         assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
-        vision = pkg["vision"]
+        vision = pkg["vision_encoder"]
         assert "pixel_values" in {i.name for i in vision.graph.inputs}
         assert "image_features" in {o.name for o in vision.graph.outputs}
 
@@ -1708,6 +1781,52 @@ class TestBuildGraphVisionLanguage:
         assert registry.get("qwen3_5") is registry.get("qwen3_5_vl")
         assert _default_task_for_model("qwen3_5") == "hybrid-qwen-vl"
 
+    def test_qwen35_vl_preprocess_weights_model_prefix(self):
+        """Qwen3.5-VL preprocess handles model.language_model.* style keys."""
+        import torch
+
+        from mobius.models.qwen35 import Qwen35VL3ModelCausalLMModel
+
+        vision_config = VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_size=16,
+            in_channels=3,
+            out_hidden_size=64,
+            num_position_embeddings=16,
+        )
+        config = _base_config(vision=vision_config)
+        module = Qwen35VL3ModelCausalLMModel(config)
+        embed_weight = torch.zeros(config.vocab_size, config.hidden_size)
+        state_dict = {
+            "model.language_model.embed_tokens.weight": embed_weight,
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.zeros(
+                config.hidden_size, config.hidden_size
+            ),
+            "model.language_model.lm_head.weight": torch.zeros(
+                config.vocab_size, config.hidden_size
+            ),
+            "model.visual.blocks.0.mlp.linear_fc1.weight": torch.zeros(
+                vision_config.intermediate_size, vision_config.hidden_size
+            ),
+            "mtp_head.weight": torch.zeros(1),
+        }
+
+        result = module.preprocess_weights(state_dict)
+
+        assert "decoder.model.embed_tokens.weight" in result
+        assert "embedding.embed_tokens.weight" in result
+        assert (
+            result["decoder.model.embed_tokens.weight"]
+            is result["embedding.embed_tokens.weight"]
+        )
+        assert "decoder.model.layers.0.self_attn.q_proj.weight" in result
+        assert "decoder.lm_head.weight" in result
+        assert "vision_encoder.visual.blocks.0.mlp.up_proj.weight" in result
+        assert "mtp_head.weight" not in result
+
 
 class TestBuildGraphDtype:
     """Verify dtype casting for model initializers."""
@@ -1737,6 +1856,117 @@ class TestBuildGraphDtype:
             assert init.dtype == expected_dtype, (
                 f"Initializer '{name}' dtype is {init.dtype}, expected {expected_dtype}"
             )
+
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_multimodal_encoder_inputs_are_float32(self, dtype_str):
+        """Vision/audio encoder graph inputs stay f32 with Cast at entry.
+
+        When building multimodal models with f16/bf16, encoder graph inputs
+        (pixel_values, input_features) must remain FLOAT because ORT GenAI's
+        image/audio processors output f32. A Cast node at graph entry converts
+        to the target dtype for the encoder's internal computation.
+        """
+        # Use a VL model with 3-model split (vision_encoder is separate)
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=32000,
+        )
+        config.dtype = DTYPE_MAP[dtype_str]
+        model_cls = registry.get("llava")
+        module = model_cls(config)
+        task = get_task("vision-language")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values input must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pixel_values_input = vision_model.graph.inputs[0]
+        assert pixel_values_input.name == "pixel_values"
+        assert pixel_values_input.dtype == ir.DataType.FLOAT, (
+            f"Vision encoder input dtype is {pixel_values_input.dtype}, "
+            f"expected FLOAT (Cast should handle conversion to {dtype_str})"
+        )
+
+        # First non-input node should be Cast to target dtype
+        first_node = next(iter(vision_model.graph))
+        assert first_node.op_type == "Cast", (
+            f"Expected Cast as first node, got {first_node.op_type}"
+        )
+
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_gemma4_encoder_inputs_are_float32(self, dtype_str):
+        """Gemma4 vision and audio encoder inputs stay f32 in bf16/f16 builds."""
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                output_proj_dims=64,
+                audio_token_id=255998,
+            ),
+            dtype=DTYPE_MAP[dtype_str],
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task = get_task("gemma4")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pv_input = vision_model.graph.inputs[0]
+        assert pv_input.name == "pixel_values"
+        assert pv_input.dtype == ir.DataType.FLOAT
+
+        # Audio encoder input_features must be FLOAT
+        audio_model = pkg["audio_encoder"]
+        af_input = audio_model.graph.inputs[0]
+        assert af_input.name == "input_features"
+        assert af_input.dtype == ir.DataType.FLOAT
 
 
 class TestBuildGraphMultiModal:
@@ -1783,23 +2013,23 @@ class TestBuildGraphMultiModal:
 
         # Verify 4 models in package
         assert len(pkg) == 4, f"Expected 4 models, got {len(pkg)}"
-        for key in ("vision", "speech", "embedding", "model"):
+        for key in ("vision_encoder", "audio_encoder", "embedding", "decoder"):
             assert key in pkg, f"Missing model: {key}"
 
         # Vision model has SigLIP encoder initializers
-        vision_inits = list(pkg["vision"].graph.initializers)
+        vision_inits = list(pkg["vision_encoder"].graph.initializers)
         assert any("img_processor" in n for n in vision_inits), (
             "Vision model should have SigLIP initializers"
         )
 
         # Speech model has Conformer encoder initializers
-        speech_inits = list(pkg["speech"].graph.initializers)
+        speech_inits = list(pkg["audio_encoder"].graph.initializers)
         assert any("encoder" in n for n in speech_inits), (
             "Speech model should have Conformer initializers"
         )
 
-        # Decoder model (pkg["model"]) has LoRA initializers
-        decoder_inits = list(pkg["model"].graph.initializers)
+        # Decoder model (pkg["decoder"]) has LoRA initializers
+        decoder_inits = list(pkg["decoder"].graph.initializers)
         assert any("lora" in n for n in decoder_inits), (
             "Decoder model should have LoRA initializers"
         )
@@ -2143,6 +2373,183 @@ class TestBuildGraphQwen3ASR:
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": np.ones((1, seq_len), dtype=np.int64),
                 "position_ids": position_ids,
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        logits = dec_out["logits"]
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == seq_len
+
+
+class TestBuildGraphFunASR:
+    """Verify Fun-ASR-Nano 3-model split with FunASRSpeechLanguageTask."""
+
+    def _fun_asr_config(self):
+        return _base_config(
+            attn_qk_norm=True,
+            hidden_act="silu",
+            audio=AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                num_blocks=3,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=TINY_HIDDEN,
+                audio_token_id=100,
+                adaptor_proj_dim=TINY_INTERMEDIATE,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=TINY_HEADS,
+            ),
+        )
+
+    def test_package_builds_3_models(self):
+        """Build Fun-ASR and verify 3-model package."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        assert "audio_encoder" in pkg
+        assert "embedding" in pkg
+        assert "decoder" in pkg
+
+    def test_audio_encoder_io(self):
+        """Verify audio encoder inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        input_names = {inp.name for inp in encoder.graph.inputs}
+        assert "input_features" in input_names
+
+        output_names = {out.name for out in encoder.graph.outputs}
+        assert "audio_features" in output_names
+
+    def test_embedding_io(self):
+        """Verify embedding model inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        embedding = pkg["embedding"]
+
+        input_names = {inp.name for inp in embedding.graph.inputs}
+        assert "input_ids" in input_names
+        assert "audio_features" in input_names
+
+        output_names = {out.name for out in embedding.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_decoder_io(self):
+        """Verify decoder has standard position_ids and KV cache."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        decoder = pkg["decoder"]
+
+        input_names = {inp.name for inp in decoder.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+
+        output_names = {out.name for out in decoder.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+
+    def test_registry_lookup(self):
+        """Verify fun_asr is registered with fun-asr-speech-language task."""
+        model_cls = registry.get("fun_asr")
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+
+        assert model_cls is FunASRForConditionalGeneration
+        assert _default_task_for_model("fun_asr") == "fun-asr-speech-language"
+
+    def test_3model_pipeline_runs_with_ort(self):
+        """Run audio_encoder → embedding → decoder with ORT."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        # Step 1: Audio encoder — random fbank input
+        # Sequence length must be even (temporal pooling halves it)
+        input_dim = config.audio.input_size
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        fbank = np.random.randn(1, 100, input_dim).astype(np.float32)
+        enc_out = enc_sess.run({"input_features": fbank})
+        audio_features = enc_out["audio_features"]
+        num_audio_tokens = audio_features.shape[1]
+        audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+        enc_sess.close()
+
+        # Step 2: Embedding — mix text + audio tokens
+        audio_token_id = config.audio.audio_token_id
+        prefix = [1, 2, 3]
+        suffix = [4, 5]
+        input_ids = np.array(
+            [prefix + [audio_token_id] * num_audio_tokens + suffix],
+            dtype=np.int64,
+        )
+
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_out = embed_sess.run(
+            {
+                "input_ids": input_ids,
+                "audio_features": audio_features_2d,
+            }
+        )
+        inputs_embeds = embed_out["inputs_embeds"]
+        embed_sess.close()
+
+        seq_len = inputs_embeds.shape[1]
+        assert seq_len == input_ids.shape[1]
+        assert inputs_embeds.shape[2] == config.hidden_size
+
+        # Step 3: Decoder — single forward pass
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        past_kv = {}
+        for i in range(config.num_hidden_layers):
+            past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+            past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+
+        pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": pos,
                 **past_kv,
             }
         )
@@ -3772,7 +4179,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # VLM dedicated tests
     "blip-2",
     "deepseek_vl_v2",
-    "gemma3_multimodal",
+    "gemma3",
     "gemma4",
     "llava",
     "mllama",
@@ -3804,6 +4211,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "wav2vec2-conformer",
     "wavlm",
     # Audio/TTS dedicated tests
+    "fun_asr",
     "qwen3_asr",
     "qwen3_forced_aligner",
     "qwen3_tts",
@@ -4064,14 +4472,14 @@ class TestBuildVLGraph:
             assert "logits" in output_names
         else:
             assert "decoder" in pkg, f"{model_type} should produce 'decoder'"
-            assert "vision" in pkg, f"{model_type} should produce 'vision'"
+            assert "vision_encoder" in pkg, f"{model_type} should produce 'vision_encoder'"
             assert "embedding" in pkg, f"{model_type} should produce 'embedding'"
 
             decoder = pkg["decoder"]
             assert "inputs_embeds" in {i.name for i in decoder.graph.inputs}
             assert "logits" in {o.name for o in decoder.graph.outputs}
 
-            vision = pkg["vision"]
+            vision = pkg["vision_encoder"]
             assert "pixel_values" in {i.name for i in vision.graph.inputs}
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):

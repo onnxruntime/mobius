@@ -21,6 +21,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -47,12 +48,12 @@ class VisionLanguageTask(ModelTask):
 
     model_roles: ClassVar[dict[str, str]] = {
         "decoder": "decoder",
-        "vision": "encoder",
+        "vision_encoder": "encoder",
         "embedding": "embedding",
     }
     components = ComponentSpec(
         decoder="decoder",
-        vision="vision_encoder",
+        vision_encoder="vision_encoder",
         embedding="embedding",
     )
 
@@ -64,7 +65,7 @@ class VisionLanguageTask(ModelTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -82,17 +83,17 @@ class VisionLanguageTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         image_size = (config.vision.image_size if config.vision else None) or 224
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, 3, image_size, image_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, 3, image_size, image_size],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
+        image_features = vision(op, pixel_values=pixel_values)
 
-        graph, graph_builder = _make_graph([pixel_values], name="vision")
-        image_features = vision(graph_builder.op, pixel_values=pixel_values)
-
-        image_features.name = "image_features"
-        graph.outputs.append(image_features)
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
 
@@ -112,7 +113,7 @@ class QwenVLTask(VisionLanguageTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -135,26 +136,27 @@ class QwenVLTask(VisionLanguageTask):
         in_channels = config.vision.in_channels if config.vision else 3
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([total_patches, pixel_dim]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
         )
-        image_grid_thw = ir.Value(
-            name="image_grid_thw",
-            shape=ir.Shape([num_images, 3]),
-            type=ir.TensorType(ir.DataType.INT64),
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
         )
 
-        graph, graph_builder = _make_graph([pixel_values, image_grid_thw], name="vision")
         image_features = vision(
-            graph_builder.op,
+            op,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
 
-        image_features.name = "image_features"
-        graph.outputs.append(image_features)
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
 
@@ -177,7 +179,7 @@ class HybridQwenVLTask(QwenVLTask):
         models["decoder"] = build_decoder_from_embeds(
             module.decoder, config, mrope=True, hybrid=True
         )
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -211,16 +213,14 @@ class PixtralVLTask(VisionLanguageTask):
         height = ir.SymbolicDim("height")
         width = ir.SymbolicDim("width")
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, 3, height, width]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, 3, height, width],
         )
-
-        graph_inputs = [pixel_values]
-
-        graph, graph_builder = _make_graph(graph_inputs, name="vision")
-        op = graph_builder.op
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
 
         image_features = vision(
             op,
@@ -232,8 +232,7 @@ class PixtralVLTask(VisionLanguageTask):
         # vision encoder always processes one image at a time.
         image_features = op.Squeeze(image_features, [0])
 
-        image_features.name = "image_features"
-        graph.outputs.append(image_features)
+        builder.add_output(image_features, "image_features")
 
         return _make_model(graph)
 
@@ -257,7 +256,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
 
     components = ComponentSpec(
         decoder="decoder",
-        vision="vision_encoder",
+        vision_encoder="vision_encoder",
         embedding="embedding",
     )
 
@@ -269,7 +268,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         self._validate_components(module)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
-        models["vision"] = self._build_vision(module.vision_encoder, config)
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
             config,
@@ -292,60 +291,49 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
         cross_seq_len = ir.SymbolicDim("cross_sequence_len")
         cross_past_seq_len = ir.SymbolicDim("cross_past_seq_len")
 
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph()
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
         # Vision features: full on prefill, empty (0-length) on decode
-        cross_attention_states = ir.Value(
-            name="cross_attention_states",
-            shape=ir.Shape([batch, cross_seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        cross_attention_states = builder.input(
+            "cross_attention_states",
+            dtype=config.dtype,
+            shape=[batch, cross_seq_len, config.hidden_size],
         )
-
-        graph_inputs = [
-            inputs_embeds,
-            attention_mask,
-            position_ids,
-            cross_attention_states,
-        ]
 
         # Per-layer KV cache with separate dims for self-attention
         # (past_seq_len) and cross-attention (cross_past_seq_len)
         cross_attention_layers = set(config.cross_attention_layers or [])
-        flat_kv: list[ir.Value] = []
         past_key_values: list[tuple[ir.Value, ir.Value]] = []
 
         for i in range(config.num_hidden_layers):
             psl = cross_past_seq_len if i in cross_attention_layers else past_seq_len
-            past_key = ir.Value(
-                name=f"past_key_values.{i}.key",
-                shape=ir.Shape([batch, config.num_key_value_heads, psl, config.head_dim]),
-                type=ir.TensorType(config.dtype),
+            past_key = builder.input(
+                f"past_key_values.{i}.key",
+                dtype=config.dtype,
+                shape=[batch, config.num_key_value_heads, psl, config.head_dim],
             )
-            past_value = ir.Value(
-                name=f"past_key_values.{i}.value",
-                shape=ir.Shape([batch, config.num_key_value_heads, psl, config.head_dim]),
-                type=ir.TensorType(config.dtype),
+            past_value = builder.input(
+                f"past_key_values.{i}.value",
+                dtype=config.dtype,
+                shape=[batch, config.num_key_value_heads, psl, config.head_dim],
             )
-            flat_kv.extend([past_key, past_value])
             past_key_values.append((past_key, past_value))
 
-        graph_inputs.extend(flat_kv)
-
-        graph, graph_builder = _make_graph(graph_inputs)
-        op = graph_builder.op
+        op = builder.op
 
         logits, present_key_values = decoder(
             op,
@@ -356,8 +344,7 @@ class MllamaVisionLanguageTask(VisionLanguageTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return _make_model(graph)

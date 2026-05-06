@@ -40,20 +40,17 @@ class QwenImageVAETask(ModelTask):
         module,
         config: QwenImageVAEConfig,
     ) -> ir.Model:
-        sample = ir.Value(
-            name="sample",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", 3, "frames", "height", "width")),
-        )
-
-        graph, builder = _make_graph([sample], name="vae_encoder")
+        graph, builder = _make_graph(name="vae_encoder")
         op = builder.op
+
+        sample = builder.input(
+            "sample", dtype=ir.DataType.FLOAT, shape=["batch", 3, "frames", "height", "width"]
+        )
 
         hidden_states = module.encoder(op, sample)
         hidden_states = module.quant_conv(op, hidden_states)
 
-        hidden_states.name = "latent_dist"
-        graph.outputs.append(hidden_states)
+        builder.add_output(hidden_states, "latent_dist")
 
         return _make_model(graph)
 
@@ -62,19 +59,18 @@ class QwenImageVAETask(ModelTask):
         module,
         config: QwenImageVAEConfig,
     ) -> ir.Model:
-        latent_sample = ir.Value(
-            name="latent_sample",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", config.z_dim, "frames", "height", "width")),
-        )
-
-        graph, builder = _make_graph([latent_sample], name="vae_decoder")
+        graph, builder = _make_graph(name="vae_decoder")
         op = builder.op
+
+        latent_sample = builder.input(
+            "latent_sample",
+            dtype=ir.DataType.FLOAT,
+            shape=["batch", config.z_dim, "frames", "height", "width"],
+        )
 
         hidden_states = module.post_quant_conv(op, latent_sample)
         hidden_states = module.decoder(op, hidden_states)
 
-        hidden_states.name = "sample"
-        graph.outputs.append(hidden_states)
+        builder.add_output(hidden_states, "sample")
 
         return _make_model(graph)

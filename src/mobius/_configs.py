@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import onnx_ir as ir
 import torch
@@ -25,6 +26,37 @@ def _resolve_dtype(config) -> ir.DataType | None:
         if torch_dtype is not None:
             return tensor_adapters.from_torch_dtype(torch_dtype)
     return None
+
+
+def _resolve_hidden_act(config, model_type: str) -> str | None:
+    """Resolve the hidden activation function from HF config patterns.
+
+    Fallback order (first truthy value wins):
+      hidden_act            — standard field (most models)
+      hidden_activation     — some encoder models
+      activation_function   — GPT-2 family
+      ff_activation         — XLNet
+      dense_act_fn          — some BERT variants
+      activation            — generic fallback
+      afn                   — older BERT configs
+      "silu"  (qwen)        — Qwen v1 hardcodes silu; no activation attr
+      "gelu"  (XLM)         — gelu_activation=True is a boolean flag
+      "relu"  (ctrl)        — CTRL hardcodes relu; no hidden_act attr
+    """
+    return (
+        getattr(config, "hidden_act", None)
+        or getattr(config, "hidden_activation", None)
+        or getattr(config, "activation_function", None)
+        or getattr(config, "ff_activation", None)
+        or getattr(config, "dense_act_fn", None)
+        or getattr(config, "activation", None)
+        or getattr(config, "afn", None)
+        or ("silu" if model_type in ("qwen",) else None)
+        # gelu_activation is a boolean (XLM) — must be after all string
+        # attrs so it cannot override an explicit hidden_act.
+        or ("gelu" if getattr(config, "gelu_activation", False) else None)
+        or ("relu" if model_type in ("ctrl",) else None)
+    )
 
 
 def _nested_rope_theta(rope_scaling: dict, key: str) -> float | None:
@@ -249,6 +281,12 @@ class AudioConfig:
     audio_start_token_id: int | None = None
     audio_end_token_id: int | None = None
     classify_num: int | None = None
+    # Fun-ASR / SenseVoice encoder config
+    tp_num_blocks: int | None = None
+    adaptor_proj_dim: int | None = None
+    adaptor_num_blocks: int | None = None
+    adaptor_ffn_dim: int | None = None
+    adaptor_num_heads: int | None = None
     # LoRA config
     lora: dict | None = None
 
@@ -282,6 +320,33 @@ def _first_not_none(*values, default=None):
     return default
 
 
+# Models that use RoPE but hardcode rope_theta entirely in model __init__,
+# not in config JSON.  These are NOT detectable via config introspection
+# without trust_remote_code.  When a new model fails L2 with missing RoPE:
+# 1. Confirm the model's HF source uses rotary embeddings
+# 2. Find the hardcoded rope_theta in the transformers source
+# 3. Add an entry here: model_type → rope_theta
+# TODO: migrate to a registry annotation (uses_rope: bool, rope_theta: float)
+# once the registry schema supports per-model capability flags.
+_IMPLICIT_ROPE_DEFAULTS: dict[str, float] = {
+    # arctic: config JSON has rope_theta=10000 (default) and rope_scaling=null;
+    # no signal triggers _extract_rope_config, but the model uses RoPE.
+    "arctic": 10_000.0,
+    # chatglm: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
+    # uses default rope_theta=10000.0 hardcoded in modeling code.
+    "chatglm": 10_000.0,
+    # deepseek_vl_v2: config JSON has no rope_theta attr;
+    # uses default rope_theta=10000.0 hardcoded in modeling code.
+    "deepseek_vl_v2": 10_000.0,
+    # jamba: config JSON has no rope_theta/rope_scaling/rotary_* attrs;
+    # uses rope_theta=8000.0 hardcoded in modeling code.
+    "jamba": 8_000.0,
+    # NOTE: qwen3_omni_moe removed — its config JSON contains
+    # rope_scaling (with embedded rope_theta=1e6), so
+    # _extract_rope_config() already handles it via the rope_scaling path.
+}
+
+
 def _extract_rope_config(config) -> RoPEConfig | None:
     """Extract and normalize RoPE-related config fields.
 
@@ -290,19 +355,24 @@ def _extract_rope_config(config) -> RoPEConfig | None:
 
     Returns ``None`` when the source config has no RoPE signal at all —
     i.e. it declares neither the modern ``rope_parameters``/``rope_scaling``
-    fields nor the legacy ``rotary_dim``/``rotary_pct``/``rotary_emb_base``
-    fields. This is the "NoPE" case (e.g. NemotronH, GraniteMoeHybrid,
-    GPT-2 family, BERT family, OPT) — the model does not use rotary
-    position embeddings at all, and callers should treat RoPE as absent
-    rather than manufacturing defaults that would silently introduce RoPE
-    operations into the ONNX graph.
+    fields, nor the legacy ``rotary_dim``/``rotary_pct``/``rotary_emb_base``
+    fields, nor a non-default ``rope_theta``.  This is the "NoPE" case
+    (e.g. NemotronH, GraniteMoeHybrid, GPT-2 family, BERT family, OPT) —
+    the model does not use rotary position embeddings at all, and callers
+    should treat RoPE as absent rather than manufacturing defaults that
+    would silently introduce RoPE operations into the ONNX graph.
 
-    Note: ``rope_theta`` alone is NOT a sufficient RoPE signal because
-    models like NemotronH carry ``rope_theta`` in their config as dead
-    data despite not using RoPE. HuggingFace's ``rope_parameters`` field
-    (populated by ``PretrainedConfig.__post_init__``) is the authoritative
-    modern signal; legacy GPT-J / GPT-NeoX / CodeGen models predate it
-    and use the ``rotary_*`` fields instead.
+    RoPE signal detection:
+      - ``rope_parameters`` / ``rope_scaling``: authoritative modern signal
+        (populated by ``PretrainedConfig.__post_init__``).
+      - ``rotary_dim`` / ``rotary_pct`` / ``rotary_emb_base``: legacy
+        signal used by GPT-J / GPT-NeoX / CodeGen models that predate
+        ``rope_parameters``.
+      - ``rope_theta`` with a non-default value (≠ 10000.0): treated as a
+        RoPE indicator for models like Arctic and Jamba that set a custom
+        ``rope_theta`` without exposing ``rope_scaling``.  The HF default
+        of 10000.0 is excluded via ``math.isclose()`` because NoPE models
+        (e.g. NemotronH) inherit it as dead config data.
     """
     # Check for RoPE signals BEFORE the `or {}` fallback below —
     # `or {}` converts None to empty dict, destroying the absence signal.
@@ -313,7 +383,21 @@ def _extract_rope_config(config) -> RoPEConfig | None:
         or getattr(config, "rotary_pct", None) is not None
         or getattr(config, "rotary_emb_base", None) is not None
     )
-    if raw_rope_scaling is None and raw_rope_parameters is None and not has_legacy_rope:
+    # rope_theta alone is a weaker signal but still indicates RoPE intent
+    # for many models (Arctic, Jamba, etc.) that don't set rope_scaling.
+    # Only treat it as a signal when it differs from the common default
+    # (10000.0) to avoid false positives on NoPE models that inherit
+    # rope_theta as dead config data.
+    raw_rope_theta = getattr(config, "rope_theta", None)
+    has_nondefault_rope_theta = raw_rope_theta is not None and not math.isclose(
+        raw_rope_theta, 10_000.0
+    )
+    if (
+        raw_rope_scaling is None
+        and raw_rope_parameters is None
+        and not has_legacy_rope
+        and not has_nondefault_rope_theta
+    ):
         return None
 
     rope_scaling = raw_rope_scaling or {}
@@ -421,8 +505,10 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
         _intermediate = getattr(vc, "intermediate_size", None)
         if _intermediate is None:
             _mlp_ratio = getattr(vc, "mlp_ratio", None)
-            if _mlp_ratio is not None and _vis_hidden is not None:
-                _intermediate = int(_vis_hidden * _mlp_ratio)
+            # _vis_hidden may be a list for multi-stage models (Florence2)
+            _scalar_hidden = _first(_vis_hidden) if _vis_hidden is not None else None
+            if _mlp_ratio is not None and _scalar_hidden is not None:
+                _intermediate = int(_scalar_hidden * _mlp_ratio)
 
         vision_fields.update(
             hidden_size=_vis_hidden,
@@ -909,6 +995,15 @@ class ArchitectureConfig(BaseModelConfig):
         rope_config = _extract_rope_config(config)
         mrope_fields = _extract_mrope_fields(config)
 
+        # Models that use RoPE but don't expose rope_scaling/rope_parameters
+        # in their HF config (e.g. loaded without trust_remote_code, or
+        # because the HF code hardcodes defaults internally).
+        if rope_config is None and model_type in _IMPLICIT_ROPE_DEFAULTS:
+            rope_config = RoPEConfig(
+                rope_type="default",
+                rope_theta=_IMPLICIT_ROPE_DEFAULTS[model_type],
+            )
+
         # Some hierarchical models (Segformer, Swin) use plural list attrs
         # instead of scalar ones.  Resolve to a scalar for the base config.
         hidden_size = (
@@ -964,16 +1059,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or getattr(config, "decoder_ffn_dim", None)
                 or 4 * _as_int(hidden_size)
             ),
-            hidden_act=(
-                getattr(config, "hidden_act", None)
-                or getattr(config, "hidden_activation", None)
-                or getattr(config, "activation_function", None)
-                or getattr(config, "dense_act_fn", None)
-                or getattr(config, "activation", None)
-                or getattr(config, "afn", None)
-                # Qwen v1 configs have no activation attr; default to silu
-                or ("silu" if model_type in ("qwen",) else None)
-            ),
+            hidden_act=_resolve_hidden_act(config, model_type),
             layer_types=(
                 getattr(config, "layer_types", None)
                 or getattr(config, "attention_layers", None)
@@ -1129,14 +1215,20 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             # MoE
             num_local_experts=(
-                getattr(config, "num_local_experts", None)
-                or getattr(config, "num_experts", None)
-                or getattr(config, "n_routed_experts", None)
+                _first(getattr(config, "num_local_experts", None))
+                or _first(getattr(config, "num_experts", None))
+                or _first(getattr(config, "n_routed_experts", None))
+                or _first(getattr(config, "moe_num_experts", None))
             ),
-            num_experts_per_tok=(getattr(config, "num_experts_per_tok", None)),
-            moe_intermediate_size=(getattr(config, "moe_intermediate_size", None)),
+            num_experts_per_tok=(
+                _first(getattr(config, "num_experts_per_tok", None))
+                or _first(getattr(config, "moe_k", None))
+                or _first(getattr(config, "moe_topk", None))
+            ),
+            moe_intermediate_size=_first(getattr(config, "moe_intermediate_size", None)),
             shared_expert_intermediate_size=(
                 getattr(config, "shared_expert_intermediate_size", None)
+                or _shared_expert_size(config)
             ),
             norm_topk_prob=(getattr(config, "norm_topk_prob", True)),
             post_feedforward_norm=(model_type in ("flex_olmo",)),
@@ -1447,8 +1539,14 @@ def _as_int(value) -> int:
     """Coerce *value* to int, taking the first element if it is a list/tuple.
 
     Some HuggingFace configs express ``image_size`` or ``patch_size`` as
-    ``[H, W]`` lists.  We take the first element (height) for simplicity.
+    ``[H, W]`` lists or ``{"height": H, "width": W}`` dicts.
+    We take the first element (height) for simplicity.
     """
+    if isinstance(value, dict):
+        # PVT-v2 etc. use {"height": H, "width": W} for image_size
+        if "height" in value:
+            return int(value["height"])
+        return int(next(iter(value.values())))
     if isinstance(value, (list, tuple)):
         return int(value[0])
     return int(value)
@@ -1459,6 +1557,24 @@ def _first(value):
     if isinstance(value, (list, tuple)) and value:
         return value[0]
     return value
+
+
+def _shared_expert_size(config) -> int | None:
+    """Compute shared_expert_intermediate_size from moe_intermediate_size * n_shared_experts.
+
+    ERNIE-4.5 uses ``moe_num_shared_experts``, GLM-4.5 uses ``n_shared_experts``,
+    and Hunyuan uses ``num_shared_expert`` (singular, per-layer list).
+    Both share ``moe_intermediate_size`` as the per-expert FFN hidden size.
+    """
+    moe_dim = _first(getattr(config, "moe_intermediate_size", None))
+    n_shared = _first(
+        getattr(config, "moe_num_shared_experts", None)
+        or getattr(config, "n_shared_experts", None)
+        or getattr(config, "num_shared_expert", None)
+    )
+    if moe_dim is not None and n_shared is not None:
+        return int(moe_dim) * int(n_shared)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1631,6 +1747,10 @@ class Gemma4Config(VisionLanguageConfig):
       (1_000_000 for Gemma4).
     - ``global_partial_rotary_factor``: fraction of head_dim to rotate for
       global attention (0.25, so rotary_dim = 512 * 0.25 = 128).
+    - ``num_global_key_value_heads``: KV head count for full-attention layers
+      (4 for Gemma4 31B).  When ``None``, all layers use
+      ``num_key_value_heads``.  HF calls this ``num_global_key_value_heads``
+      and gates it behind ``attention_k_eq_v``.
     - ``hidden_size_per_layer_input``: per-layer input gating dimension
       (256 for Gemma4); 0 disables per-layer input entirely.
     - ``vocab_size_per_layer_input``: vocabulary size for per-layer embeddings.
@@ -1652,6 +1772,7 @@ class Gemma4Config(VisionLanguageConfig):
     global_head_dim: int | None = None
     global_rope_theta: float = 1_000_000.0
     global_partial_rotary_factor: float = 0.25
+    num_global_key_value_heads: int | None = None
     hidden_size_per_layer_input: int = 0
     vocab_size_per_layer_input: int = 0
     num_kv_shared_layers: int = 0
@@ -1659,6 +1780,8 @@ class Gemma4Config(VisionLanguageConfig):
     final_logit_softcapping: float = 0.0
     attn_logit_softcapping: float = 0.0
     enable_moe_block: bool = False
+    attention_k_eq_v: bool = False
+    boa_token_id: int | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
@@ -1707,11 +1830,18 @@ class Gemma4Config(VisionLanguageConfig):
             # Override with the correct sliding-attention theta (e.g. 10_000 for E2B/E4B).
             base = dataclasses.replace(base, rope_theta=float(sliding_rope["rope_theta"]))
 
+        # num_global_key_value_heads: only set when attention_k_eq_v is True
+        # (full-attention layers use fewer KV heads than sliding layers).
+        num_global_kv = None
+        if getattr(config, "attention_k_eq_v", False):
+            num_global_kv = getattr(config, "num_global_key_value_heads", None)
+
         return cls(
             **_shallow_fields(base),
             global_head_dim=getattr(config, "global_head_dim", None),
             global_rope_theta=float(full_rope.get("rope_theta", 1_000_000.0)),
             global_partial_rotary_factor=float(full_rope.get("partial_rotary_factor", 0.25)),
+            num_global_key_value_heads=num_global_kv,
             hidden_size_per_layer_input=int(
                 getattr(config, "hidden_size_per_layer_input", 0) or 0
             ),
@@ -1723,6 +1853,8 @@ class Gemma4Config(VisionLanguageConfig):
             final_logit_softcapping=(getattr(config, "final_logit_softcapping", 0.0) or 0.0),
             attn_logit_softcapping=(getattr(config, "attn_logit_softcapping", 0.0) or 0.0),
             enable_moe_block=getattr(config, "enable_moe_block", False),
+            attention_k_eq_v=getattr(config, "attention_k_eq_v", False),
+            boa_token_id=getattr(parent_config, "boa_token_id", None),
         )
 
 
@@ -1832,6 +1964,10 @@ class Sam2Config(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Sam2Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        # SAM2 uses gelu in its backbone MLP but doesn't expose a single
+        # hidden_act field — default to gelu.
+        if base.hidden_act is None:
+            base = dataclasses.replace(base, hidden_act="gelu")
         return cls(
             **_shallow_fields(base),
             sam2_embed_dims=getattr(config, "sam2_embed_dims", None),

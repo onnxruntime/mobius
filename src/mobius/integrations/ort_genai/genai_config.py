@@ -61,11 +61,14 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
 
     caps = ep_registry.get(ep)
     share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
-    if share_buffer:
-        # EPs that pre-allocate KV-cache for the full max_length at load time
-        # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
-        # buffers (~8 GB for 128K-token models) on consumer hardware.  Users
-        # can raise the limit in genai_config.json for their target device.
+    cap_length = caps.cap_kv_buffer_max_length if caps is not None else False
+    if share_buffer and cap_length:
+        # Memory-constrained EPs (e.g. WebGPU on consumer GPUs) pre-allocate
+        # KV-cache for the full max_length at load time.  Cap the default to
+        # avoid pre-allocating huge buffers (~8 GB for 128K-token models).
+        # Users can raise the limit in genai_config.json for their device.
+        # The cap only applies when buffer sharing is also active — without
+        # sharing, the runtime grows the cache on demand and no cap is needed.
         max_length = min(context_length, _SHARE_BUFFER_MAX_LENGTH_CAP)
     else:
         max_length = context_length
@@ -123,6 +126,12 @@ class GenaiConfigGenerator:
         bos_token_id: Beginning-of-sequence token ID.
         eos_token_id: End-of-sequence token ID(s).
         pad_token_id: Padding token ID.
+        decoder_inputs: Explicit decoder input name mapping. When
+            provided (e.g. from ONNX graph introspection), used
+            directly instead of the default mapping from
+            :func:`_default_decoder_inputs`. Must already include KV
+            cache template entries (``past_key_names``,
+            ``past_value_names``).
     """
 
     def __init__(
@@ -140,6 +149,8 @@ class GenaiConfigGenerator:
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
+        decoder_inputs: dict[str, str] | None = None,
+        decoder_filename: str | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -154,13 +165,21 @@ class GenaiConfigGenerator:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
+        # Explicit decoder inputs (from graph introspection); None → use defaults
+        self._decoder_inputs = decoder_inputs
+        # Explicit decoder filename; None → use "model.onnx"
+        self._decoder_filename = decoder_filename
+
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
 
-        # Optional speech fields (set via with_speech())
-        self._speech: dict[str, Any] | None = None
+        # Optional audio fields (set via with_audio())
+        self._audio: dict[str, Any] | None = None
+
+        # Search config overrides applied in generate()
+        self._search_overrides: dict[str, Any] = {}
 
     @classmethod
     def from_config(
@@ -173,6 +192,8 @@ class GenaiConfigGenerator:
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
+        decoder_inputs: dict[str, str] | None = None,
+        decoder_filename: str | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -204,18 +225,21 @@ class GenaiConfigGenerator:
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad,
+            decoder_inputs=decoder_inputs,
+            decoder_filename=decoder_filename,
         )
 
     def with_vision(
         self,
         *,
         image_token_id: int,
-        filename: str = "vision/model.onnx",
+        filename: str = "vision_encoder/model.onnx",
         embedding_filename: str = "embedding/model.onnx",
         spatial_merge_size: int | None = 2,
-        config_filename: str = "processor_config.json",
+        config_filename: str = "image_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
+        embedding_input_names: dict[str, str] | None = None,
         vision_start_token_id: int | None = None,
         video_token_id: int | None = None,
     ) -> GenaiConfigGenerator:
@@ -234,6 +258,10 @@ class GenaiConfigGenerator:
                 Defaults to pixel_values + image_grid_thw.
             output_names: Override vision model output name mapping.
                 Defaults to image_features.
+            embedding_input_names: Override embedding model input name
+                mapping.  When provided (e.g. from ONNX graph
+                introspection), used directly.  Defaults to
+                input_ids + image_features.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
 
@@ -246,6 +274,11 @@ class GenaiConfigGenerator:
             }
         if output_names is None:
             output_names = {
+                "image_features": "image_features",
+            }
+        if embedding_input_names is None:
+            embedding_input_names = {
+                "input_ids": "input_ids",
                 "image_features": "image_features",
             }
 
@@ -261,10 +294,7 @@ class GenaiConfigGenerator:
 
         self._embedding = {
             "filename": embedding_filename,
-            "inputs": {
-                "input_ids": "input_ids",
-                "image_features": "image_features",
-            },
+            "inputs": embedding_input_names,
             "outputs": {
                 "inputs_embeds": "inputs_embeds",
             },
@@ -277,25 +307,27 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["video_token_id"] = video_token_id
         return self
 
-    def with_speech(
+    def with_audio(
         self,
         *,
         audio_token_id: int | None = None,
-        filename: str = "speech/model.onnx",
-        config_filename: str = "speech_processor.json",
+        boa_token_id: int | None = None,
+        filename: str = "audio_encoder/model.onnx",
+        config_filename: str = "audio_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
-        """Add speech/audio model section for multimodal models.
+        """Add audio model section for multimodal models.
 
         Args:
             audio_token_id: Token ID for audio placeholders.
-            filename: Speech ONNX model filename.
-            config_filename: Speech processor config filename.
-            input_names: Override speech model input name mapping.
+            boa_token_id: Beginning-of-audio token ID.
+            filename: Audio ONNX model filename.
+            config_filename: Audio processor config filename.
+            input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
-            output_names: Override speech model output name mapping.
+            output_names: Override audio model output name mapping.
                 Defaults to audio_features.
 
         Returns self for chaining.
@@ -311,7 +343,7 @@ class GenaiConfigGenerator:
                 "audio_features": "audio_features",
             }
 
-        self._speech = {
+        self._audio = {
             "filename": filename,
             "config_filename": config_filename,
             "inputs": input_names,
@@ -321,20 +353,28 @@ class GenaiConfigGenerator:
 
         if audio_token_id is not None:
             self._vlm_token_ids["audio_token_id"] = audio_token_id
+        if boa_token_id is not None:
+            self._vlm_token_ids["boa_token_id"] = boa_token_id
 
         return self
 
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
-        is_multimodal = self._vision is not None or self._speech is not None
+        is_multimodal = self._vision is not None or self._audio is not None
 
-        # Decoder section
+        # Decoder section — use explicit inputs when available (from
+        # graph introspection), otherwise fall back to defaults.
+        if self._decoder_inputs is not None:
+            decoder_inputs = dict(self._decoder_inputs)
+        else:
+            decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
+        decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
-            "filename": "model.onnx",
+            "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
-            "inputs": _default_decoder_inputs(is_vlm=is_multimodal),
+            "inputs": decoder_inputs,
             "outputs": _default_decoder_outputs(),
             "num_attention_heads": self.num_attention_heads,
             "num_hidden_layers": self.num_hidden_layers,
@@ -360,17 +400,22 @@ class GenaiConfigGenerator:
         if self._vision is not None:
             model["vision"] = self._vision
         if self._embedding is not None:
-            # Add audio_features to embedding inputs when speech is enabled
-            if self._speech is not None:
+            # Add audio_features to embedding inputs when speech is
+            # enabled and not already present (graph-introspected
+            # inputs already include it).
+            if self._audio is not None and "audio_features" not in self._embedding["inputs"]:
                 self._embedding["inputs"]["audio_features"] = "audio_features"
             model["embedding"] = self._embedding
-        if self._speech is not None:
-            model["speech"] = self._speech
+        if self._audio is not None:
+            model["speech"] = self._audio
         model.update(self._vlm_token_ids)
+
+        search = _default_search_params(ep=self.ep, context_length=self.context_length)
+        search.update(self._search_overrides)
 
         return {
             "model": model,
-            "search": _default_search_params(ep=self.ep, context_length=self.context_length),
+            "search": search,
         }
 
     def write(self, output_dir: str) -> str:

@@ -23,6 +23,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -82,15 +83,17 @@ class SpeechLanguageTask(ModelTask):
         mel_seq = ir.SymbolicDim("mel_sequence_len")
         n_mels = (config.audio.num_mel_bins if config.audio else None) or 128
 
-        input_features = ir.Value(
-            name="input_features",
-            shape=ir.Shape([batch, n_mels, mel_seq]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
+
+        input_features = builder.input(
+            "input_features",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, n_mels, mel_seq],
         )
+        input_features = _cast_encoder_input(op, input_features, config)
 
-        graph, builder = _make_graph([input_features], name="audio_encoder")
-        audio_features = audio_encoder(builder.op, input_features)
+        audio_features = audio_encoder(op, input_features)
 
-        audio_features.name = "audio_features"
-        graph.outputs.append(audio_features)
+        builder.add_output(audio_features, "audio_features")
         return _make_model(graph)

@@ -40,11 +40,13 @@
     "task_type": {
       "type": "string",
       "enum": [
+        "audio-ctc",
         "audio-feature-extraction",
         "audio-to-audio",
         "codec",
         "depth-estimation",
         "feature-extraction",
+        "fun-asr-speech-language",
         "image-classification",
         "image-segmentation",
         "image-text-to-text",
