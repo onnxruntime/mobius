@@ -1514,10 +1514,11 @@ class Gemma4TextModel(nn.Module):
         has_kv_shared = any(layer.self_attn.is_kv_shared_layer for layer in self.layers)
         need_fallback = not use_gqa or (has_kv_shared and not flags.use_gqa_for_kv_shared)
         if need_fallback:
-            # KV-shared layers use the standard Attention op and need
-            # additive float masks. Float masks work with both the unfused
-            # and MEA kernel paths on CUDA EP (bool masks cause incorrect
-            # output on some CUDA code paths).
+            # Sliding-window KV-shared layers need a float additive mask
+            # encoding the window constraint (is_causal=1 alone cannot
+            # express "attend only to the last N tokens").
+            # Full-attention KV-shared layers omit the mask entirely —
+            # is_causal=1 handles causality, and batch=1 has no padding.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
@@ -1526,13 +1527,18 @@ class Gemma4TextModel(nn.Module):
                     sliding_window=self.sliding_window,
                     dtype=self._dtype,
                 ),
-                "full_attention": create_attention_bias(
+                "full_attention": None,
+            }
+            if not use_gqa:
+                # Non-GQA path: ALL layers use Attention, so full_attention
+                # layers also need an additive bias (no is_causal guarantee
+                # from GQA).
+                fallback_bias_dict["full_attention"] = create_attention_bias(
                     op,
                     input_ids=query_input,
                     attention_mask=attention_mask,
                     dtype=self._dtype,
-                ),
-            }
+                )
             # KV-shared layers also need position embeddings for the
             # standard Attention path (manual RoPE). Reuse the embeddings
             # already gathered when realizing cos/sin caches above.
