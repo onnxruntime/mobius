@@ -22,10 +22,10 @@ Use this skill when:
 
 | Scenario | Recommended | Why |
 |----------|------------|-----|
-| Causal only | `attn_mask=None` + `is_causal=1` | Enables Flash (fastest) |
-| Padding (batch>1) | Bool mask or `nonpad_kv_seqlens` | Simple, ORT optimized |
+| Causal only | `attn_mask=None` + `is_causal=1` | Enables Flash (fastest for prefill) |
+| Padding (batch>1) | `nonpad_kv_seqlens` (best) or bool mask | `nonpad_kv_seqlens` enables Flash + shared buffer with no mask |
 | Sliding window | Float additive bias | Precise window control |
-| Complex (causal+sliding+padding) | Float additive bias | Most flexible |
+| Complex (causal+sliding+padding) | Float additive bias | Most flexible, avoids construction bugs |
 | Custom pattern | Float additive bias | Arbitrary values |
 
 ## Bool mask vs float additive bias
@@ -65,7 +65,23 @@ Float additive bias gives explicit control:
 
 Bool masks do **NOT** enable Flash Attention. Flash Attention requires
 `attn_mask=nullptr` (no mask at all). Both bool and float masks route
-to Memory-Efficient Attention (MEA) or unfused attention.
+to Memory-Efficient Attention (MEA) or unfused attention — ORT
+converts bool masks to float additive bias internally via
+`ConvertAttnMaskToBias()`, so they have **identical kernel dispatch**.
+
+### Flash Attention: when it actually helps
+
+Flash Attention primarily helps during **prefill** (long prompt
+processing). During single-token **decode**, attention is
+memory-bandwidth bound regardless of kernel — Flash's compute
+advantages don't help when `seq_len=1`.
+
+**Gemma4 example:** Flash Attention cannot be used for *any* layer:
+- **Sliding window layers:** Require an explicit mask → disqualifies Flash
+- **Full attention layers:** `head_dim=512` → exceeds Flash's 256 limit
+
+MEA is the effective best kernel for Gemma4. This is representative
+of complex models — Flash is most beneficial for simple architectures.
 
 ### Recommendation
 
@@ -88,7 +104,9 @@ attention_bias = create_attention_bias(
 
 ## Flash Attention requirements
 
-Flash Attention is the fastest kernel path but has strict requirements:
+Flash Attention is the fastest kernel for **prefill** (long sequences)
+but has strict requirements and provides minimal benefit during
+single-token decode (memory-bandwidth bound regardless of kernel):
 
 | Requirement | Details |
 |-------------|---------|
@@ -98,7 +116,7 @@ Flash Attention is the fastest kernel path but has strict requirements:
 | Symmetric heads | `head_size == v_head_size` |
 | GPU | SM≥8.0 (Ampere or newer) |
 
-### `nonpad_kv_seqlens` — Flash with variable lengths
+### `nonpad_kv_seqlens` — the best padding solution
 
 ONNX Attention opset 24 adds `nonpad_kv_seqlens` input, which tells
 the kernel the actual (non-padded) KV sequence length per batch item.
