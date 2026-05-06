@@ -71,12 +71,21 @@ class EpCapabilities:
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
         enable_graph_capture: Whether this EP defaults to GPU graph capture.
-        supports_past_present_share_buffer: Whether this EP requires past and present
-            KV-cache tensors to share the same pre-allocated backing buffer.
-            ``True`` for WebGPU, which allocates the full KV-cache at model
-            load time and maps both past and present views into it.  ``False``
-            for all other EPs where the runtime manages KV-cache memory
-            dynamically.
+        supports_past_present_share_buffer: Whether past and present KV-cache
+            tensors alias the same pre-allocated buffer.  When ``True``, the
+            ORT GenAI runtime allocates a single KV-cache buffer at model load
+            and maps both past and present as views into it, avoiding a
+            per-step copy.  This is the recommended setting for every EP that
+            supports ``GroupQueryAttention`` (CPU, CUDA, DML, WebGPU,
+            TRT-RTX).  Set to ``False`` only for EPs that do not support GQA
+            or cannot handle aliased KV-cache buffers.
+        cap_kv_buffer_max_length: When ``True`` **and**
+            ``supports_past_present_share_buffer`` is also ``True``, the
+            generated ``max_length`` in genai_config is capped to avoid
+            pre-allocating huge KV-cache buffers on memory-constrained
+            devices.  ``True`` only for WebGPU (consumer GPU); ``False`` for
+            CUDA / CPU / DML / TRT-RTX where the runtime can handle large
+            pre-allocations.
     """
 
     name: str
@@ -90,6 +99,7 @@ class EpCapabilities:
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
+    cap_kv_buffer_max_length: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -97,6 +107,13 @@ class EpCapabilities:
                 f"EP '{self.name}': qkv_pack_dtypes must be frozenset() when "
                 f"supports_fused_rope=False — UnpackQKV lowering always fires for "
                 f"this EP, so packing would be immediately undone."
+            )
+        if self.cap_kv_buffer_max_length and not self.supports_past_present_share_buffer:
+            raise ValueError(
+                f"EP '{self.name}': cap_kv_buffer_max_length=True requires "
+                f"supports_past_present_share_buffer=True — the cap only matters "
+                f"when the runtime pre-allocates the full KV-cache buffer at load "
+                f"time, which is what buffer sharing enables."
             )
 
 
@@ -199,6 +216,7 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT}),
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT}),
             default_int4_accuracy_level=4,
+            supports_past_present_share_buffer=True,
         ),
         EpCapabilities(
             name="cuda",
@@ -211,6 +229,7 @@ def _register_builtins() -> None:
                 "enable_cuda_graph": "0",
                 "enable_skip_layer_norm_strict_mode": "1",
             },
+            supports_past_present_share_buffer=True,
         ),
         EpCapabilities(
             name="dml",
@@ -221,6 +240,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset(),
             supports_packed_multi_head_attention=True,
             supports_fused_rope=False,
+            supports_past_present_share_buffer=True,
         ),
         EpCapabilities(
             name="webgpu",
@@ -229,6 +249,7 @@ def _register_builtins() -> None:
             default_int4_accuracy_level=4,
             provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
             supports_past_present_share_buffer=True,
+            cap_kv_buffer_max_length=True,
         ),
         EpCapabilities(
             name="trt-rtx",
@@ -239,12 +260,15 @@ def _register_builtins() -> None:
             supports_skip_layer_norm=False,
             enable_graph_capture=True,
             provider_options={"enable_cuda_graph": "1"},
+            supports_past_present_share_buffer=True,
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
         # InlinePass to their standard-ONNX function bodies. No GQA or QKV
         # packing fusion is applied. Use this EP to produce models that run
         # on any conformant ONNX runtime without ORT extensions.
+        # KV buffer sharing is unsupported here: GQA isn't emitted, so
+        # standard Attention's concat-grow semantics handle the cache.
         EpCapabilities(
             name="onnx-standard",
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
