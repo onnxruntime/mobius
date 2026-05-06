@@ -279,6 +279,83 @@ print(f"Throughput: {num_tokens/decode_time:.1f} tok/s")
 | cuBLAS warmup | ~40 ms (first step only) |
 | Steady-state decode | ~66 µs per MatMul |
 
+## Benchmark methodology
+
+### Benchmark dimensions
+
+A thorough benchmark varies these dimensions independently:
+
+#### 1. Pipeline (inference framework)
+
+| Pipeline | Description |
+|----------|-------------|
+| ORT standalone CUDA | Raw ORT `InferenceSession` with CUDA EP |
+| GenAI CUDA | Full `onnxruntime-genai` pipeline with CUDA |
+| GenAI CPU | Full `onnxruntime-genai` pipeline, CPU only |
+| HF PyTorch CUDA | HuggingFace `transformers` baseline (GPU) |
+| HF PyTorch CPU | HuggingFace `transformers` baseline (CPU) |
+
+#### 2. Model dtype
+
+| Dtype | Notes |
+|-------|-------|
+| F16 | Default for GPU inference |
+| BF16 | Better numerical range, Ampere+ GPUs |
+| F32 | CPU inference, reference baseline |
+| Q4_K_M | INT4 k-quant (Olive) |
+| NF4 | INT4 NormalFloat (Olive) |
+
+#### 3. Execution provider variant
+
+| EP | Attention kernel | Notes |
+|----|-----------------|-------|
+| `default` | ONNX Attention → MEA | Portable, no vendor fusions |
+| `cuda` | GQA rewrite → hybrid GQA/Attention | Best CUDA perf for simple models |
+| `onnx-standard` | Inlined functions → standard ops | Strict ONNX-only |
+
+#### 4. Input modality
+
+| Modality | Example |
+|----------|---------|
+| Text only | Standard LLM prompt |
+| Image + text | VLM with image input |
+| Audio + text | ALM with speech input |
+| Image + audio + text | Multimodal (e.g. Gemma4) |
+
+#### 5. Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Decode tok/s** | Tokens per second AFTER first token |
+| **TTFT** | Time to first token — includes encoder + prefill |
+| **VRAM** | GPU memory usage (`nvidia-smi`) |
+| **Model size** | On-disk size of ONNX + weights |
+
+#### 6. Additional dimensions (for thorough studies)
+
+| Dimension | Values |
+|-----------|--------|
+| Cache type | Static cache vs dynamic cache |
+| Prompt length | Short (20), medium (500), long (2000+ tokens) |
+| Batch size | 1, 4, 8 |
+| Padding strategy | `nonpad_kv_seqlens` vs `attention_mask` |
+| KV buffer | `past_present_share_buffer`: true vs false |
+
+### Best practices
+
+- **One session, one build:** Run ALL benchmarks in a single session
+  with the SAME ORT/GenAI build to ensure comparability.
+- **Warm up:** Run 2-3 inference calls before timing to amortize
+  cuBLAS JIT compilation and CUDA context setup.
+- **Record the build:** Report which ORT/GenAI commit or version was
+  used — results are not reproducible across builds.
+- **Separate TTFT from decode:** TTFT includes encoder + prefill
+  overhead. Decode throughput measures steady-state generation.
+- **Sufficient output length:** Generate 50+ tokens to amortize TTFT
+  and get stable decode throughput numbers.
+- **Control for GPU state:** Avoid running other GPU workloads during
+  benchmarks. Check `nvidia-smi` for baseline memory usage.
+
 ## Debugging workflow
 
 1. **Profile the model** with ORT session profiling
