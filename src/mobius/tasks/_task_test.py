@@ -1173,8 +1173,13 @@ class TestSpeechLanguageTaskNoAudioConfig:
         from onnxscript import nn as onnx_nn
 
         class _StubAudio(onnx_nn.Module):
-            def forward(self, op, input_features):
-                return op.Identity(input_features)
+            def forward(self, op, input_features, feature_attention_mask):
+                # Return (audio_features, audio_feature_lengths) to match
+                # the SpeechLanguageTask contract.
+                lengths = op.ReduceSum(
+                    feature_attention_mask, keepdims=False
+                )
+                return op.Identity(input_features), lengths
 
         return _StubAudio()
 

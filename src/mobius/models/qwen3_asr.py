@@ -228,6 +228,11 @@ class Qwen3ASRAudioEncoder(nn.Module):
         #    num_chunks, chunk_size_mel) → (B, num_chunks,
         #    num_mel_bins, chunk_size_mel) → (B*num_chunks, 1,
         #    num_mel_bins, chunk_size_mel) for batched 2D conv.
+        #
+        #    Requires mel_seq divisible by chunk_size_mel. The
+        #    WhisperFeatureExtractor always pads to 3000 frames
+        #    (30s * 100 fps), which is divisible by the default
+        #    chunk_size_mel (2 * n_window = 100).
         # ----------------------------------------------------------
         chunked = op.Reshape(
             input_features,

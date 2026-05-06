@@ -108,5 +108,9 @@ class SpeechLanguageTask(ModelTask):
         # time downsampling. Callers must crop ``audio_features`` to
         # this length before feeding into the embedding model so the
         # decoder never sees padding-derived audio tokens.
+        #
+        # NOTE: ORT GenAI's speech pipeline does not yet wire this
+        # output. Custom inference scripts (e.g. examples/qwen3_asr.py)
+        # must read audio_feature_lengths and crop manually.
         builder.add_output(audio_feature_lengths, "audio_feature_lengths")
         return _make_model(graph)
