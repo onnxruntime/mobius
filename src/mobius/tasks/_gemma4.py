@@ -28,6 +28,7 @@ from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -303,6 +304,7 @@ class Gemma4Task(ModelTask):
             dtype=ir.DataType.FLOAT,
             shape=[batch, num_patches, pixel_dim],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
@@ -356,9 +358,10 @@ class Gemma4Task(ModelTask):
 
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, time, input_size],
         )
+        input_features = _cast_encoder_input(op, input_features, config)
         input_features_mask = builder.input(
             "input_features_mask",
             dtype=ir.DataType.BOOL,

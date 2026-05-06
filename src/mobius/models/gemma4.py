@@ -35,6 +35,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._flags import flags
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
@@ -42,8 +43,6 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_attention_bias,
-    create_padding_mask,
-    create_sliding_window_mask,
     initialize_rope,
 )
 from mobius.components._activations import get_activation
@@ -152,14 +151,16 @@ class Gemma4VisionSelfAttention(nn.Module):
         norm_eps: float = 1e-6,
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
+        linear_class = ClippableLinear if use_clipped_linears else Linear
+        self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = linear_class(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -318,10 +319,16 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_act: str = "gelu_pytorch_tanh",
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
-            hidden_size, num_heads, norm_eps, rope_theta=rope_theta, max_position=max_position
+            hidden_size,
+            num_heads,
+            norm_eps,
+            rope_theta=rope_theta,
+            max_position=max_position,
+            use_clipped_linears=use_clipped_linears,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -329,7 +336,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
-        # Vision encoder uses ClippableLinear for all projections.
+        # Use ClippableLinear only when the checkpoint has clipping weights.
+        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -337,7 +345,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
             ),
-            linear_class=ClippableLinear,
+            linear_class=linear_class,
         )
 
     def forward(
@@ -555,6 +563,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     hidden_act=vc.hidden_act or "gelu_pytorch_tanh",
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
+                    use_clipped_linears=vc.use_clipped_linears,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -1990,7 +1999,10 @@ class _Gemma4AudioEncoderModel(nn.Module):
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
-        self.pre_projection_norm = _Gemma4ScaleFreeRMSNorm(output_proj_dims, eps=rms_norm_eps)
+        # NOTE: We inline the RMSNorm in forward() using manual ops to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization (CUDA rejects 1D skip).
+        self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
         self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
@@ -2005,8 +2017,17 @@ class _Gemma4AudioEncoderModel(nn.Module):
         audio_features, downsampled_mask = self.encoder(
             op, input_features, input_features_mask=input_features_mask
         )
-        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
-        audio_features = self.pre_projection_norm(op, audio_features)
+        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm).
+        # Use manual primitive ops instead of op.RMSNormalization to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNorm into
+        # SkipSimplifiedLayerNormalization with a 1D bias as skip input
+        # (CUDA kernel rejects 1D skip, CPU kernel accepts it).
+        x_f32 = op.Cast(audio_features, to=ir.DataType.FLOAT)
+        sq = op.Mul(x_f32, x_f32)
+        mean_sq = op.ReduceMean(sq, op.Constant(value_ints=[-1]), keepdims=1)
+        eps = op.Constant(value_float=self._rms_norm_eps)
+        rms = op.Sqrt(op.Add(mean_sq, eps))
+        audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features), downsampled_mask
 

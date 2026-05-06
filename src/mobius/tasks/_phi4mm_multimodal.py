@@ -29,6 +29,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -85,19 +86,21 @@ class Phi4MMMultiModalTask(ModelTask):
         image_size = (config.vision.image_size if config.vision else None) or 448
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_sizes = builder.input(
             "image_sizes",
             dtype=ir.DataType.INT64,
             shape=[num_images, 2],
         )
 
-        image_features = vision(builder.op, pixel_values, image_sizes=image_sizes)
+        image_features = vision(op, pixel_values, image_sizes=image_sizes)
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)
@@ -118,12 +121,14 @@ class Phi4MMMultiModalTask(ModelTask):
         input_size = (config.audio.input_size if config.audio else None) or 80
 
         graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
 
         audio_embeds = builder.input(
             "audio_embeds",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, audio_seq_len, input_size],
         )
+        audio_embeds = _cast_encoder_input(op, audio_embeds, config)
         audio_sizes = builder.input(
             "audio_sizes",
             dtype=ir.DataType.INT64,
@@ -136,7 +141,7 @@ class Phi4MMMultiModalTask(ModelTask):
         )
 
         speech_out = speech(
-            builder.op,
+            op,
             audio_embeds,
             audio_sizes=audio_sizes,
             audio_projection_mode=audio_projection_mode,

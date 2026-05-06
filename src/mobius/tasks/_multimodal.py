@@ -12,6 +12,7 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -74,16 +75,18 @@ class MultiModalTask(ModelTask):
         image_size = config.vision.image_size or 224 if config.vision else 224
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
 
         audio_input_size = (config.audio.input_size if config.audio else None) or 80
         audio_features = builder.input(
             "audio_features",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, "audio_seq_len", audio_input_size],
         )
+        audio_features = _cast_encoder_input(op, audio_features, config)
 
         past_key_values = _make_kv_cache_inputs(
             builder,
