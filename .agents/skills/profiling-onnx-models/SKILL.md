@@ -220,6 +220,25 @@ Same cascade as MHA, with extra MEA constraints:
 | MEA | MHA conditions + `head_size == v_head_size` + not float32 |
 | Unfused | Always available, handles GQA via in-kernel reshape |
 
+### ONNX Attention GQA + float additive bias dispatch
+
+When using the standard ONNX `Attention` op with GQA
+(`q_num_heads != kv_num_heads`) and a float attention bias, Flash is
+disabled (mask != nullptr). The effective dispatch is:
+
+| Condition | Kernel |
+|-----------|--------|
+| fp16/bf16, `head_size == v_head_size`, `total_kv % 4 == 0` | MEA ✅ |
+| fp16/bf16, `head_size == v_head_size`, `total_kv % 4 != 0` | Unfused (bias alignment) |
+| fp16/bf16, `head_size != v_head_size` (asymmetric V) | Unfused |
+| fp32 (GQA) | Unfused (explicitly excluded) |
+| `qk_matmul_output_mode != kNone` | Unfused (or error) |
+
+This explains why Gemma4's KV-shared layers fall to unfused attention:
+KV-shared layers borrow K/V from another layer with a different
+`head_size`, creating `head_size != v_head_size` — which disqualifies
+MEA.
+
 ### Key takeaways
 
 - **Flash requires `attn_mask == nullptr`** — any explicit mask
