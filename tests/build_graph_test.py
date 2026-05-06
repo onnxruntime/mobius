@@ -1857,6 +1857,117 @@ class TestBuildGraphDtype:
                 f"Initializer '{name}' dtype is {init.dtype}, expected {expected_dtype}"
             )
 
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_multimodal_encoder_inputs_are_float32(self, dtype_str):
+        """Vision/audio encoder graph inputs stay f32 with Cast at entry.
+
+        When building multimodal models with f16/bf16, encoder graph inputs
+        (pixel_values, input_features) must remain FLOAT because ORT GenAI's
+        image/audio processors output f32. A Cast node at graph entry converts
+        to the target dtype for the encoder's internal computation.
+        """
+        # Use a VL model with 3-model split (vision_encoder is separate)
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=32000,
+        )
+        config.dtype = DTYPE_MAP[dtype_str]
+        model_cls = registry.get("llava")
+        module = model_cls(config)
+        task = get_task("vision-language")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values input must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pixel_values_input = vision_model.graph.inputs[0]
+        assert pixel_values_input.name == "pixel_values"
+        assert pixel_values_input.dtype == ir.DataType.FLOAT, (
+            f"Vision encoder input dtype is {pixel_values_input.dtype}, "
+            f"expected FLOAT (Cast should handle conversion to {dtype_str})"
+        )
+
+        # First non-input node should be Cast to target dtype
+        first_node = next(iter(vision_model.graph))
+        assert first_node.op_type == "Cast", (
+            f"Expected Cast as first node, got {first_node.op_type}"
+        )
+
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_gemma4_encoder_inputs_are_float32(self, dtype_str):
+        """Gemma4 vision and audio encoder inputs stay f32 in bf16/f16 builds."""
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                output_proj_dims=64,
+                audio_token_id=255998,
+            ),
+            dtype=DTYPE_MAP[dtype_str],
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task = get_task("gemma4")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pv_input = vision_model.graph.inputs[0]
+        assert pv_input.name == "pixel_values"
+        assert pv_input.dtype == ir.DataType.FLOAT
+
+        # Audio encoder input_features must be FLOAT
+        audio_model = pkg["audio_encoder"]
+        af_input = audio_model.graph.inputs[0]
+        assert af_input.name == "input_features"
+        assert af_input.dtype == ir.DataType.FLOAT
+
 
 class TestBuildGraphMultiModal:
     """Verify Phi4MM builds with Phi4MMMultiModalTask (4-model split)."""

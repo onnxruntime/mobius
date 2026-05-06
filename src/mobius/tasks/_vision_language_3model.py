@@ -83,12 +83,17 @@ class VisionLanguageTask(ModelTask):
         image_size = (config.vision.image_size if config.vision else None) or 224
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        # Vision encoder input is always f32 (matching GenAI's image processor
+        # output). Cast at graph entry for f16/bf16 builds.
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
-        image_features = vision(builder.op, pixel_values=pixel_values)
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
+        image_features = vision(op, pixel_values=pixel_values)
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)
@@ -134,11 +139,16 @@ class QwenVLTask(VisionLanguageTask):
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        # Vision encoder input is always f32 (matching GenAI's image processor
+        # output). Cast at graph entry for f16/bf16 builds.
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
         image_grid_thw = builder.input(
             "image_grid_thw",
             dtype=ir.DataType.INT64,
@@ -146,7 +156,7 @@ class QwenVLTask(VisionLanguageTask):
         )
 
         image_features = vision(
-            builder.op,
+            op,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         )
@@ -209,12 +219,16 @@ class PixtralVLTask(VisionLanguageTask):
         width = ir.SymbolicDim("width")
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        # Vision encoder input is always f32 (matching GenAI's image processor
+        # output). Cast at graph entry for f16/bf16 builds.
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, height, width],
         )
-        op = builder.op
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
 
         image_features = vision(
             op,

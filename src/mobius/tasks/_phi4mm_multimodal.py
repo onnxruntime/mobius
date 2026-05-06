@@ -85,19 +85,24 @@ class Phi4MMMultiModalTask(ModelTask):
         image_size = (config.vision.image_size if config.vision else None) or 448
 
         graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
 
+        # Vision encoder input is always f32 (matching GenAI's image processor
+        # output). Cast at graph entry for f16/bf16 builds.
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, 3, image_size, image_size],
         )
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
         image_sizes = builder.input(
             "image_sizes",
             dtype=ir.DataType.INT64,
             shape=[num_images, 2],
         )
 
-        image_features = vision(builder.op, pixel_values, image_sizes=image_sizes)
+        image_features = vision(op, pixel_values, image_sizes=image_sizes)
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)
@@ -118,12 +123,17 @@ class Phi4MMMultiModalTask(ModelTask):
         input_size = (config.audio.input_size if config.audio else None) or 80
 
         graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
 
+        # Audio encoder input is always f32 (matching audio processor output).
+        # Cast at graph entry for f16/bf16 builds.
         audio_embeds = builder.input(
             "audio_embeds",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, audio_seq_len, input_size],
         )
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            audio_embeds = op.Cast(audio_embeds, to=config.dtype)
         audio_sizes = builder.input(
             "audio_sizes",
             dtype=ir.DataType.INT64,
@@ -136,7 +146,7 @@ class Phi4MMMultiModalTask(ModelTask):
         )
 
         speech_out = speech(
-            builder.op,
+            op,
             audio_embeds,
             audio_sizes=audio_sizes,
             audio_projection_mode=audio_projection_mode,

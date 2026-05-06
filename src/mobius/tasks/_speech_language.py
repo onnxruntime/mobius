@@ -83,14 +83,19 @@ class SpeechLanguageTask(ModelTask):
         n_mels = (config.audio.num_mel_bins if config.audio else None) or 128
 
         graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
 
+        # Audio encoder input is always f32 (matching audio processor output).
+        # Cast at graph entry for f16/bf16 builds.
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, n_mels, mel_seq],
         )
+        if config.dtype and config.dtype != ir.DataType.FLOAT:
+            input_features = op.Cast(input_features, to=config.dtype)
 
-        audio_features = audio_encoder(builder.op, input_features)
+        audio_features = audio_encoder(op, input_features)
 
         builder.add_output(audio_features, "audio_features")
         return _make_model(graph)
