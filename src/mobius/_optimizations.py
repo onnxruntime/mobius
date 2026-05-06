@@ -263,6 +263,7 @@ def _get_optimization_passes(
     caps: EpCapabilities,
     dtype: ir.DataType,
     model_role: str = "decoder",
+    skip_gqa: bool = False,
 ) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
     """Return ``(fuse_stages, lower_stages)`` for the given capabilities.
 
@@ -274,6 +275,7 @@ def _get_optimization_passes(
         caps: EP capability descriptor from :data:`~mobius._execution_providers.ep_registry`.
         dtype: Model dtype for GQA/PackedAttn support checks.
         model_role: Semantic role. GQA fusion only applies to ``"decoder"``.
+        skip_gqa: Suppress GQA fusion even if the EP supports it.
 
     Returns:
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
@@ -283,11 +285,11 @@ def _get_optimization_passes(
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
 
     # --- Attention fusion (decoder only) ---
-    if model_role == "decoder" and dtype in caps.gqa_dtypes:
+    if model_role == "decoder" and dtype in caps.gqa_dtypes and not skip_gqa:
         fuse.append(("GQAFusion", list(group_query_attention_rules())))
 
     # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
-    if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:
+    if model_role == "decoder" and dtype in caps.qkv_pack_dtypes and not skip_gqa:
         fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
 
     # --- Normalization fusions (all roles, all dtypes) ---
@@ -321,6 +323,7 @@ def optimize_model(
     dtype: ir.DataType = ir.DataType.FLOAT,
     model_role: str = "decoder",
     trace: bool = False,
+    skip_gqa: bool = False,
 ) -> None:
     """Apply EP-aware optimization passes to *model* in-place.
 
@@ -345,6 +348,9 @@ def optimize_model(
         dtype: Model dtype for support-matrix lookups.
         model_role: Semantic role of this model component.
         trace: When ``True``, emit per-stage diagnostic logs at INFO level.
+        skip_gqa: When ``True``, suppress GroupQueryAttention fusion even if
+            the EP supports it.  Used for models with dual head_dim where
+            GenAI cannot manage KV caches with mixed head sizes.
 
     Raises:
         ValueError: If *ep* is not a registered execution provider.
@@ -378,7 +384,7 @@ def optimize_model(
             f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
         )
 
-    fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
+    fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role, skip_gqa=skip_gqa)
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.

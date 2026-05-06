@@ -198,6 +198,29 @@ def build_from_module(
     _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
     capabilities = ep_registry.require(execution_provider)
+
+    # Detect dual head_dim (e.g. Gemma4 with head_dim=256 for sliding,
+    # global_head_dim=512 for full-attention). GQA is incompatible because
+    # GenAI allocates uniform KV cache buffers per head_size — mixed head
+    # sizes cause buffer corruption. Disable GQA at both build time
+    # (by clearing gqa_dtypes from capabilities) and optimization time
+    # (via skip_gqa flag).
+    has_dual_head_dim = (
+        getattr(config, "global_head_dim", None) is not None
+        and config.global_head_dim != getattr(config, "head_dim", 0)
+    )
+    if has_dual_head_dim:
+        if execution_provider != "default":
+            logger.warning(
+                "Skipping GQA for %s EP: model has dual head_dim "
+                "(%d vs %d). GenAI cannot manage KV caches with mixed "
+                "head sizes when GroupQueryAttention is used.",
+                execution_provider,
+                getattr(config, "head_dim", 0),
+                config.global_head_dim,
+            )
+        capabilities = dataclasses.replace(capabilities, gqa_dtypes=frozenset())
+
     with build_context(capabilities, dtype):
         pkg = resolved_task.build(module, config)
 
@@ -211,6 +234,7 @@ def build_from_module(
             dtype=dtype,
             model_role=role,
             trace=trace_optimization,
+            skip_gqa=has_dual_head_dim,
         )
 
     # Lower default-domain opset from 24 to 23 when the target EP doesn't
