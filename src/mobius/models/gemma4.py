@@ -1610,7 +1610,6 @@ class Gemma4TextModel(nn.Module):
 
             # Per-layer decision: use GQA when available. KV-shared layers
             # also use GQA (with empty K/V and shared past buffer).
-            is_shared = layer.self_attn.is_kv_shared_layer
             if use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None

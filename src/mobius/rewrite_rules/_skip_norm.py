@@ -69,8 +69,10 @@ class AddRMSNormToSkipNorm(RewriteRuleClassBase):
         # indicates broadcasting (e.g. Add(MatMul, bias) where bias is 1D).
         input_a = producer.inputs[0]
         input_b = producer.inputs[1]
-        rank_a = input_a.shape.rank() if input_a.shape is not None else None
-        rank_b = input_b.shape.rank() if input_b.shape is not None else None
+        shape_a = input_a.shape
+        shape_b = input_b.shape
+        rank_a = len(shape_a) if shape_a is not None else None
+        rank_b = len(shape_b) if shape_b is not None else None
         if rank_a is not None and rank_b is not None and rank_a != rank_b:
             return result.fail(
                 f"Add inputs have different ranks ({rank_a} vs {rank_b}); "
