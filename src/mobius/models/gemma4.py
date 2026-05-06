@@ -1981,7 +1981,11 @@ class Gemma4TextModel(nn.Module):
         fallback_bias_dict: dict[str, ir.Value | None] = {}
         need_fallback = not use_gqa
         if need_fallback and attention_mask is not None:
-            # Attention op handles masking via is_causal=1 + nonpad_kv_seqlen.
+            # All fallback layers use float additive bias masks encoding
+            # causal + sliding window + padding constraints. Float bias
+            # works with both unfused and MEA kernel paths on CUDA EP.
+            # When attention_mask is None (static cache), the Attention
+            # op uses is_causal=1 + nonpad_kv_seqlen instead.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,

@@ -495,6 +495,10 @@ class Gemma4Task(ModelTask):
                 dtype=ir.DataType.INT64,
                 shape=[batch, "past_seq_len + seq_len"],
             )
+        else:
+            # Static cache still needs past_seq_len for sliding-window layers
+            # that use dynamic cache within the hybrid static/dynamic scheme.
+            past_seq_len = ir.SymbolicDim("past_sequence_len")
 
         position_ids = builder.input(
             "position_ids",
@@ -538,6 +542,7 @@ class Gemma4Task(ModelTask):
                 max_seq_len,
                 past_seq_len,
             )
+            attention_mask = None  # Static cache uses position-based attention
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
                 builder,
