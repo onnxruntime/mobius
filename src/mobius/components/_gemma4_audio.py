@@ -255,9 +255,7 @@ class Gemma4ConvSubsampling(nn.Module):
 
         # [B, c1, T', F'] → [B, T', F'*c1]  (permute so T is dim 1, flatten C and F)
         x = op.Transpose(x, perm=[0, 2, 3, 1])  # [B, T', F', c1]
-        batch = op.Shape(x, start=0, end=1)
-        t_out = op.Shape(x, start=1, end=2)
-        x = op.Reshape(x, op.Concat(batch, t_out, op.Constant(value_ints=[-1]), axis=0))
+        x = op.Reshape(x, op.Constant(value_ints=[0, 0, -1]))  # [B, T', F'*c1]
 
         return self.input_proj_linear(
             op, x
@@ -515,7 +513,6 @@ class Gemma4Attention(nn.Module):
                 Used to prevent attending to padded key positions.
         """
         # x: [B, T, hidden_size]
-        batch = op.Shape(x, start=0, end=1)
         seq_len = op.Shape(x, start=1, end=2)
         num_heads = self._num_heads
         head_dim = self._head_dim
@@ -531,12 +528,11 @@ class Gemma4Attention(nn.Module):
         v = op.Cast(v, to=ir.DataType.FLOAT)
 
         # Reshape: [B, T, H*D] → [B, T, num_heads, head_dim]
-        hd_shape = op.Concat(
-            batch, seq_len, op.Constant(value_ints=[num_heads, head_dim]), axis=0
-        )
-        q = op.Reshape(q, hd_shape)  # [B, T, num_heads, head_dim]
-        k = op.Reshape(k, hd_shape)
-        v = op.Reshape(v, hd_shape)
+        # Use static shape with 0 = "copy from input dim" to avoid
+        # dynamic Shape+Concat ops that fall to CPU on CUDA EP.
+        q = op.Reshape(q, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
+        k = op.Reshape(k, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
+        v = op.Reshape(v, op.Constant(value_ints=[0, 0, num_heads, head_dim]))
 
         # Apply custom Q scale and per-dim scale: q *= q_scale * softplus(per_dim_scale)
         # Softplus(x) = log(1 + exp(x)); for numerical stability, cast scale param to fp32
@@ -625,8 +621,7 @@ class Gemma4Attention(nn.Module):
 
         # Reshape [B, num_heads, T, head_dim] → [B, T, H*D]
         context = op.Transpose(context, perm=[0, 2, 1, 3])  # [B, T, num_heads, head_dim]
-        out_shape = op.Concat(batch, seq_len, op.Constant(value_ints=[-1]), axis=0)
-        context = op.Reshape(context, out_shape)  # [B, T, H*D]
+        context = op.Reshape(context, op.Constant(value_ints=[0, 0, -1]))  # [B, T, H*D]
 
         # Cast back to input dtype and apply output projection
         context = op.CastLike(context, x)
