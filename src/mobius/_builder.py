@@ -221,10 +221,10 @@ def build_from_module(
             if "" in model.graph.opset_imports:
                 original = model.graph.opset_imports[""]
                 model.graph.opset_imports[""] = 23
-                logger.info(
+                logger.warning(
                     "Lowered opset %d→23 for '%s' (EP=%s). "
                     "ORT does not yet register opset %d kernels for this EP. "
-                    "Track https://github.com/microsoft/onnxruntime/pull/28368",
+                    "Track https://github.com/microsoft/onnxruntime/issues/27729",
                     original,
                     name,
                     execution_provider,
