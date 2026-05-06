@@ -5349,7 +5349,7 @@ class TestBuildGemma4StaticCacheGraph:
 
         # Layer 5: full_attention → static cache (key_cache.5)
         assert "key_cache.5" in input_map
-        kv_hidden_full = config.num_key_value_heads * config.global_head_dim
+        kv_hidden_full = _config.num_key_value_heads * _config.global_head_dim
         k5 = input_map["key_cache.5"]
         assert k5.shape[2] == kv_hidden_full
 
@@ -5361,7 +5361,7 @@ class TestBuildGemma4StaticCacheGraph:
         for n in model.graph:
             op_counts[n.op_type] = op_counts.get(n.op_type, 0) + 1
 
-        layer_types = config.layer_types or []
+        layer_types = _config.layer_types or []
         num_full = sum(1 for lt in layer_types if lt == "full_attention")
 
         # TensorScatter: 2 per full-attention layer (key + value)
@@ -5369,7 +5369,7 @@ class TestBuildGemma4StaticCacheGraph:
         # Sliding layers use either GQA (CUDA EP) or Attention (default EP)
         # In unit tests without EP context, all use standard Attention.
         total_attn = op_counts.get("Attention", 0) + op_counts.get("GroupQueryAttention", 0)
-        assert total_attn == config.num_hidden_layers
+        assert total_attn == _config.num_hidden_layers
 
     def test_gemma4_static_cache_kv_shared(self):
         """Verify KV-shared layers are excluded from cache I/O."""
