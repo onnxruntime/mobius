@@ -28,6 +28,7 @@ from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -298,16 +299,12 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
 
-        # Vision encoder input is always f32 (matching GenAI's image processor
-        # output). When the model uses f16/bf16, add a Cast at the graph entry
-        # so weights can stay at the requested dtype for memory efficiency.
         pixel_values = builder.input(
             "pixel_values",
             dtype=ir.DataType.FLOAT,
             shape=[batch, num_patches, pixel_dim],
         )
-        if config.dtype and config.dtype != ir.DataType.FLOAT:
-            pixel_values = op.Cast(pixel_values, to=config.dtype)
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
@@ -357,11 +354,10 @@ class Gemma4Task(ModelTask):
 
         input_features = builder.input(
             "input_features",
-            dtype=ir.DataType.FLOAT,  # Always f32 (matching audio processor output)
+            dtype=ir.DataType.FLOAT,
             shape=[batch, time, input_size],
         )
-        if config.dtype and config.dtype != ir.DataType.FLOAT:
-            input_features = op.Cast(input_features, to=config.dtype)
+        input_features = _cast_encoder_input(op, input_features, config)
         input_features_mask = builder.input(
             "input_features_mask",
             dtype=ir.DataType.BOOL,

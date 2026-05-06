@@ -12,6 +12,7 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -76,10 +77,7 @@ class Qwen3VLVisionLanguageTask(ModelTask):
             dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
-        # Vision input is always f32 (matching image processor output).
-        # Cast at graph entry for f16/bf16 builds.
-        if config.dtype and config.dtype != ir.DataType.FLOAT:
-            pixel_values = op.Cast(pixel_values, to=config.dtype)
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
         # Image grid dimensions for position embedding interpolation
         num_images = ir.SymbolicDim("num_images")
         grid_thw = builder.input(

@@ -26,6 +26,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -93,15 +94,12 @@ class FunASRSpeechLanguageTask(ModelTask):
         graph, builder = _make_graph(name="audio_encoder")
         op = builder.op
 
-        # Audio encoder input is always f32 (matching audio processor output).
-        # Cast at graph entry for f16/bf16 builds.
         input_features = builder.input(
             "input_features",
             dtype=ir.DataType.FLOAT,
             shape=[batch, seq_len, input_dim],
         )
-        if config.dtype and config.dtype != ir.DataType.FLOAT:
-            input_features = op.Cast(input_features, to=config.dtype)
+        input_features = _cast_encoder_input(op, input_features, config)
 
         audio_features = audio_encoder(op, input_features)
 
