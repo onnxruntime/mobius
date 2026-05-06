@@ -388,6 +388,86 @@ attention_bias = create_attention_bias(
 # AVOID for complex patterns: bool mask with manual sliding window logic
 ```
 
+## ORT CUDA Attention Kernel Dispatch
+
+ORT selects attention kernels via a cascade — first match wins.
+Understanding the dispatch helps diagnose why a model uses a slower
+kernel than expected.
+
+### Contrib MultiHeadAttention (`com.microsoft`)
+
+Cascade: LeanAttention → Flash → cuDNN SDPA → TRT FusedCross →
+TRT FusedRunner → MEA → Unfused
+
+| Kernel | Required conditions |
+|--------|---------------------|
+| LeanAttention | `USE_LEAN_ATTENTION` build flag, `seq_len==1`, `past_seq>0`, no bias, no padding mask, `head_size==v_head_size` |
+| Flash | No bias, no padding mask, no `past_seq`, no `cache_indirection`, `head_size==v_head_size`, fp16/bf16, SM≥8.0 |
+| cuDNN SDPA | `enable_cudnn_flash_attention_`, mask NONE or 1D_KEY_SEQ_LEN |
+| TRT FusedCross | NOT unidirectional, no padding/bias/past, `hidden==v_hidden` |
+| TRT FusedRunner | NOT unidirectional, no bias, mask none or 1D, `seq_len==kv_seq_len` |
+| MEA (CUTLASS) | Long sequence, bias alignment OK (null or `seq % 4*sizeof(T) == 0`), no past/cache |
+| Unfused | Always available (fallback) |
+
+### Contrib GroupQueryAttention (`com.microsoft`)
+
+Cascade: XQA → Flash → MEA → Unfused. **Rejects `attention_bias`
+entirely.**
+
+| Kernel | Required conditions |
+|--------|---------------------|
+| XQA | SM≥8.0, `seq==1`, `past_present_share_buffer`, `softcap==0`, `local_window==-1`, `head_size ∈ {64, 128, 256}` |
+| Flash | fp16/bf16, SM≥8.0. FastDecode: `seq==1`, `past_present_share_buffer`, no KV quant |
+| MEA | No bias (rejected upstream), head_size check |
+| Unfused | Fallback |
+
+### ONNX Attention — MHA (`q_num_heads == kv_num_heads`)
+
+Cascade: Flash → MEA → Unfused
+
+| Kernel | Required conditions |
+|--------|---------------------|
+| Flash | fp16/bf16, `head_size ≤ 256`, `head_size == v_head_size`, `attn_mask == nullptr`, SM≥8.0 |
+| MEA | `head_size ≤ 1024` & `% 8 == 0`, if mask then `total_seq % 4 == 0`, if `past_key` then `head_size == v_head_size` |
+| Unfused | Always available |
+
+### ONNX Attention — GQA (`q_num_heads != kv_num_heads`)
+
+Same cascade as MHA with extra MEA constraints:
+
+| Kernel | Required conditions |
+|--------|---------------------|
+| Flash | Same as MHA |
+| MEA | MHA conditions + `head_size == v_head_size` + not float32 |
+| Unfused | Always available, handles GQA via in-kernel reshape |
+
+### GQA + float additive bias dispatch
+
+When using float bias with GQA, Flash is disabled (`attn_mask !=
+nullptr`). The effective dispatch:
+
+| Condition | Kernel |
+|-----------|--------|
+| fp16/bf16, `head_size == v_head_size`, `total_kv % 4 == 0` | MEA ✅ |
+| fp16/bf16, `head_size == v_head_size`, `total_kv % 4 != 0` | Unfused (bias alignment) |
+| fp16/bf16, `head_size != v_head_size` (asymmetric V) | Unfused |
+| fp32 (GQA) | Unfused (explicitly excluded) |
+| `qk_matmul_output_mode != kNone` | Unfused (or error) |
+
+This explains why Gemma4's KV-shared layers fall to unfused: they
+borrow K/V from a layer with different `head_size`, creating
+`head_size != v_head_size` which disqualifies MEA.
+
+### Key takeaways
+
+- **Flash requires `attn_mask == nullptr`** — any explicit mask
+  disables Flash.
+- **`nonpad_kv_seqlens`** enables Flash with variable-length sequences
+  without an explicit mask.
+- **GQA contrib op rejects `attention_bias`** — use standard ONNX
+  `Attention` if you need bias with GQA.
+- **SM≥8.0** (Ampere+) required for Flash on all paths.
+
 ## Reference files
 
 > Read these files for implementation details of the fix patterns:
