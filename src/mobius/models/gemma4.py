@@ -100,27 +100,29 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
     Used for V norms in the vision encoder, the vision projector pre-norm,
     and the audio pre-projection norm.
 
-    Implemented as manual ``x / sqrt(mean(x²) + ε)`` rather than
-    ``op.RMSNormalization`` to prevent ORT's graph optimizer from fusing
-    an upstream ``Add(bias)`` into ``SkipSimplifiedLayerNormalization``,
-    which requires the skip tensor to have the same shape as the input
-    (failing when the bias is 1D or has mismatched temporal dimension).
+    Uses ``op.RMSNormalization`` with ``stash_type=1`` (float32 accumulation)
+    to handle FP16 overflow: values > 256 squared exceed the FP16 max (65504).
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        # Constant all-ones scale (not a learnable parameter from HF).
+        self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # Manual RMSNorm: x / sqrt(mean(x²) + ε), scale = 1.0 (scale-free).
-        # Using primitive ops avoids ORT's SkipLayerNorm fusion pattern which
-        # would corrupt the skip shape when an upstream Add uses a 1D bias.
-        square = op.Mul(hidden_states, hidden_states)
-        mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
-        eps = op.CastLike(op.Constant(value_float=self.eps), mean_sq)
-        rms = op.Sqrt(op.Add(mean_sq, eps))
-        return op.Div(hidden_states, rms)
+        # stash_type=1 means accumulate variance in float32, avoiding
+        # FP16 overflow when squaring large values.
+        # CastLike ensures the weight matches the input dtype.
+        scale = op.CastLike(self.weight, hidden_states)
+        return op.RMSNormalization(
+            hidden_states,
+            scale,
+            axis=-1,
+            epsilon=self.eps,
+            stash_type=1,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -773,16 +775,18 @@ class Gemma4TextAttention(nn.Module):
                 value_raw = key_raw
             else:
                 value_raw = self.v_proj(op, hidden_states)
-            # Parameterless per-head V normalisation
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
                 value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             # Build GQA attributes
@@ -846,19 +850,21 @@ class Gemma4TextAttention(nn.Module):
                 value_raw = key_raw
             else:
                 value_raw = self.v_proj(op, hidden_states)
-            # Parameterless per-head V normalisation
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
                 value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             # Use op.Constant to create a 1D tensor node (not a scalar initializer).
             # Scalar Python floats use a type-keyed cache that can fail when upstream
             # type information is missing (e.g., after custom ops like com.microsoft.MoE).
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             attn_output, present_key, present_value = _apply_attention(
