@@ -300,7 +300,7 @@ class Gemma4Task(ModelTask):
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[batch, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(
@@ -308,6 +308,10 @@ class Gemma4Task(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[batch, num_patches, 2],
         )
+
+        # Cast float32 pixel_values from image processor to model dtype (e.g. fp16)
+        if config.dtype != ir.DataType.FLOAT:
+            pixel_values = op.Cast(pixel_values, to=config.dtype)
 
         image_features = vision(
             op,

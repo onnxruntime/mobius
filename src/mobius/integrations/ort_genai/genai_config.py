@@ -60,7 +60,7 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
     from mobius._execution_providers import ep_registry
 
     caps = ep_registry.get(ep)
-    share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
+    share_buffer = True
     if share_buffer:
         # EPs that pre-allocate KV-cache for the full max_length at load time
         # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
