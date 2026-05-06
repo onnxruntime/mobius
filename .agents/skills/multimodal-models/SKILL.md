@@ -216,6 +216,10 @@ instead of `Gather` for per-layer projection indexing.
 
 ## Vision/audio encoder f32 input casting
 
+> **This applies to ALL multimodal models** — Gemma3, Gemma4, LLaVA,
+> Phi-3-Vision, Qwen-VL, Whisper, and any future vision or audio model.
+> It is not architecture-specific.
+
 ORT GenAI's image and audio processors always output **float32** tensors,
 regardless of the model's compute dtype. This means vision and audio
 encoder ONNX graphs must accept f32 inputs even when the model is built
