@@ -5327,7 +5327,7 @@ class TestBuildGemma4StaticCacheGraph:
 
     def test_gemma4_static_cache_builds(self):
         """Build Gemma4 with static cache and verify basic graph structure."""
-        model, config = self._build()
+        model, _config = self._build()
 
         assert model.graph is not None
         input_names = {inp.name for inp in model.graph.inputs}
@@ -5340,7 +5340,7 @@ class TestBuildGemma4StaticCacheGraph:
 
     def test_gemma4_static_cache_hybrid_inputs(self):
         """Verify full-attention gets static cache, sliding gets dynamic."""
-        model, config = self._build()
+        model, _config = self._build()
 
         input_map = {inp.name: inp for inp in model.graph.inputs}
 
@@ -5355,7 +5355,7 @@ class TestBuildGemma4StaticCacheGraph:
 
     def test_gemma4_static_cache_has_tensorscatter(self):
         """Verify TensorScatter for full-attention layers in hybrid mode."""
-        model, config = self._build()
+        model, _config = self._build()
 
         op_counts = {}
         for n in model.graph:
@@ -5405,7 +5405,7 @@ class TestBuildGemma4StaticCacheGraph:
 
     def test_gemma4_static_cache_input_ordering(self):
         """Verify write_indices/nonpad_kv_seqlen come after cache inputs."""
-        model, config = self._build()
+        model, _config = self._build()
 
         input_names = [inp.name for inp in model.graph.inputs]
         # write_indices and nonpad_kv_seqlen should come after all cache inputs
