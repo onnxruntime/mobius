@@ -903,7 +903,12 @@ class Gemma4TextAttention(nn.Module):
 
         if self.is_kv_shared_layer:
             # KV-shared layers borrow K,V from a source layer (no own KV cache).
-            src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
+            src_key, src_value = shared_kv_states[self.kv_shared_layer_index][:2]
+            src_nonpad = (
+                shared_kv_states[self.kv_shared_layer_index][2]
+                if len(shared_kv_states[self.kv_shared_layer_index]) > 2
+                else None
+            )
 
             if use_gqa:
                 # GQA path for shared KV: pass empty K/V tensors and wire the
@@ -952,57 +957,54 @@ class Gemma4TextAttention(nn.Module):
                     **gqa_attrs,
                 )
             else:
-                # Fallback Attention path (non-GQA / CPU-style graphs).
-                #
-                # The shared K,V buffer is the source layer's present K/V, 4D
-                # BNSH [batch, kv_heads, kv_len, head_dim], and already contains
-                # the FULL sequence (with RoPE applied).  Transpose it to the 3D
-                # layout the Attention op expects:
-                #   [batch, kv_len, kv_heads * head_dim].
-                #
-                # Reshape to the STATIC ``kv_heads * head_dim`` hidden size (not a
-                # dynamic ``-1``): the source present-value comes out of an
-                # Attention op whose head_dim onnxruntime does not always
-                # propagate, so a ``-1`` here leaves the Attention op's value
-                # head size (and therefore this layer's attention output width)
-                # unknown.  onnxruntime then infers a mismatched o_proj input dim
-                # and rejects the graph at session creation with a MatMul
-                # "Incompatible dimensions" shape-inference error.  A concrete
-                # last dim lets it infer the attention output width correctly.
-                shared_kv_hidden = self.num_key_value_heads * self.head_dim
-                src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-                src_key = op.Reshape(src_key, [0, 0, shared_kv_hidden])
-                src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-                src_value = op.Reshape(src_value, [0, 0, shared_kv_hidden])
+                # Fallback Attention path: transpose shared KV from BNSH to 3D.
+                # Source K/V shape depends on whether the source layer uses
+                # static or dynamic cache:
+                #   Dynamic: [B, kv_heads, total_seq, head_dim] (4D present)
+                #   Static:  [B, max_seq, kv_heads*head_dim]    (3D updated cache)
+                # Static cache sources are already 3D — skip reshape.
+                is_static_source = src_key.shape is not None and len(src_key.shape) == 3
+                if not is_static_source:
+                    shared_kv_hidden = self.num_key_value_heads * self.head_dim
+                    src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+                    src_key = op.Reshape(src_key, [0, 0, shared_kv_hidden])
+                    src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
+                    src_value = op.Reshape(src_value, [0, 0, shared_kv_hidden])
 
-                # IMPORTANT: pass is_causal=0 here, NOT the caller's is_causal.
-                #
-                # We feed the FULL shared sequence as key/value with no past, so
-                # q_len < kv_len during decode.  ``attention_bias`` from
-                # ``create_attention_bias`` already bakes in the complete
-                # bottom-right causal (+ sliding + padding) mask, so causality is
-                # fully handled by the bias.  If we ALSO set is_causal=1 the
-                # Attention op applies its own built-in causal mask on top — and
-                # for q_len < kv_len the two EPs disagree on its alignment (per
-                # the ONNX spec is_causal is UPPER-LEFT aligned: CUDA follows the
-                # spec and a single decode query attends only to kv[0], while the
-                # CPU EP bottom-right aligns).  That double-masking is what made
-                # gemma4 decode diverge on CUDA.  Relying solely on the float
-                # bias (is_causal=0) is correct and identical on CPU and CUDA.
-                attn_output, present_key, present_value = _apply_attention(
-                    op,
-                    query_states,
-                    src_key,
-                    src_value,
-                    attention_bias,
-                    past_key=None,
-                    past_value=None,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    scale=self.scaling,
-                    softcap=self.softcap,
-                    is_causal=0,
-                )
+                # For static source with nonpad_kv_seqlen, use the Attention
+                # op's external cache path (no mask, is_causal + nonpad).
+                if is_static_source and src_nonpad is not None:
+                    attn_output, _, _ = op.Attention(
+                        query_states,
+                        src_key,
+                        src_value,
+                        None,  # no mask
+                        None,  # no past_key
+                        None,  # no past_value
+                        src_nonpad,
+                        q_num_heads=self.num_attention_heads,
+                        kv_num_heads=self.num_key_value_heads,
+                        scale=self.scaling,
+                        softcap=self.softcap,
+                        is_causal=1,
+                        _outputs=3,
+                    )
+                    present_key, present_value = src_key, src_value
+                else:
+                    attn_output, present_key, present_value = _apply_attention(
+                        op,
+                        query_states,
+                        src_key,
+                        src_value,
+                        attention_bias,
+                        past_key=None,
+                        past_value=None,
+                        num_attention_heads=self.num_attention_heads,
+                        num_key_value_heads=self.num_key_value_heads,
+                        scale=self.scaling,
+                        softcap=self.softcap,
+                        is_causal=0,
+                    )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
             # The op fuses RoPE + attention + KV cache into a single op,
@@ -1072,6 +1074,7 @@ class Gemma4TextAttention(nn.Module):
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
+                    None,  # no nonpad_kv_seqlen for GQA path
                 )
         else:
             # K projection + per-head K norm + optional RoPE
@@ -1129,10 +1132,14 @@ class Gemma4TextAttention(nn.Module):
             )
 
             # Source layers store K,V for downstream KV-shared layers.
+            # Include nonpad_kv_seqlen for static cache sources so
+            # KV-shared layers can pass it to the Attention op.
             if self.provides_shared_kv and shared_kv_states is not None:
+                nonpad = static_cache.nonpad_kv_seqlen if static_cache else None
                 shared_kv_states[self.layer_idx] = (
                     present_key,
                     present_value,
+                    nonpad,
                 )
 
         attn_output = self.o_proj(op, attn_output)
