@@ -192,6 +192,9 @@ def build_from_module(
     if hasattr(config, "validate"):
         config.validate()
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
+    # Cast all parameters to the target dtype. Vision/audio encoder weights
+    # are included — their graph inputs are kept at f32 (matching GenAI's
+    # image processor output) with a Cast at the graph entry.
     _cast_module_dtype(module, dtype)
     resolved_task = get_task(task)
     capabilities = ep_registry.require(execution_provider)
