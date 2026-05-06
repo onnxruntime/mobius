@@ -329,6 +329,65 @@ Not all CPU ops are equal.  Prioritize fixes by **tensor size**:
 Focus on ops that touch `[B, S, H]` or `[B, Q, T]` tensors first.  Shape
 and comparison ops on small metadata tensors rarely matter for throughput.
 
+## Bool mask vs float additive bias for attention
+
+### When to use each
+
+For complex attention patterns (sliding window + KV-shared layers +
+dual head_dim), use **float additive bias** instead of bool mask.
+
+| Pattern | Recommended mask type |
+|---------|----------------------|
+| Simple causal-only | Bool mask or `is_causal=1` (no explicit mask) |
+| Sliding window | Float additive bias |
+| KV-shared layers | Float additive bias |
+| Mixed head_dim (e.g. Gemma4) | Float additive bias |
+| Padding + causal | Float additive bias |
+
+### Why float additive bias is safer
+
+ONNX `Attention` supports bool mask (`True`=attend, `False`=ignore).
+ORT correctly converts bool→float internally via
+`ConvertAttnMaskToBias()`. However, constructing correct bool masks
+for complex patterns is error-prone:
+
+- **Sliding window boundaries** must align with KV cache positions —
+  off-by-one errors silently produce wrong attention patterns
+- **KV-shared layers** borrow K/V from other layers — the mask shape
+  must match the borrowed KV dimensions, not the current layer's
+- **`is_causal=1` + bool mask** double-applies constraints — the
+  `is_causal` flag adds its own causal mask on top of the explicit one
+- **Dual head_dim** (e.g. Gemma4 local=128, global=256) means mask
+  shapes differ per layer type
+
+Float additive bias gives explicit control:
+- `0.0` for "attend" positions
+- `-inf` (or `-10000.0`) for "ignore" positions
+- No ambiguity in kernel interpretation
+
+### Common misconception: bool masks and Flash Attention
+
+Bool masks do **NOT** enable Flash Attention. Flash Attention requires
+`attn_mask=nullptr` (no mask at all). Both bool and float masks route
+to Memory-Efficient Attention (MEA) or unfused attention. If you need
+Flash Attention, use `is_causal=1` with no explicit mask.
+
+### Recommendation
+
+Use float additive bias via `create_attention_bias()` for all models
+with complex attention patterns (Gemma4, sliding window models). Only
+use bool mask for simple causal-only patterns where `is_causal=1`
+suffices.
+
+```python
+# GOOD: float additive bias — explicit, correct for complex patterns
+attention_bias = create_attention_bias(
+    op, input_ids=input_ids, attention_mask=attention_mask,
+)
+
+# AVOID for complex patterns: bool mask with manual sliding window logic
+```
+
 ## Reference files
 
 > Read these files for implementation details of the fix patterns:
