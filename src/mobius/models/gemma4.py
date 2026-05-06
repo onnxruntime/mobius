@@ -323,8 +323,12 @@ class Gemma4VisionEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
-            hidden_size, num_heads, norm_eps, rope_theta=rope_theta,
-            max_position=max_position, use_clipped_linears=use_clipped_linears,
+            hidden_size,
+            num_heads,
+            norm_eps,
+            rope_theta=rope_theta,
+            max_position=max_position,
+            use_clipped_linears=use_clipped_linears,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
