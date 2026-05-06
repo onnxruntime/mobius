@@ -779,10 +779,12 @@ class Gemma4AudioEncoder(nn.Module):
             ]
         )
         # HF uses nn.Linear(..., bias=True) for the output projection.
-        # The bias would normally cause ORT to fuse Add(1D bias) + LayerNorm into
-        # SkipSimplifiedLayerNorm (with 1D skip, which ORT rejects).  This is avoided
-        # because _Gemma4ScaleFreeRMSNorm uses manual primitive ops rather than
-        # op.RMSNormalization, preventing ORT from recognizing the fusion pattern.
+        # ORT fuses Add(1D bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization, placing the 1D bias in the
+        # "skip" input position. The CUDA kernel rejects 1D skip.
+        # Keep bias=True here; the caller's pre_projection_norm must use
+        # manual primitive ops (not op.RMSNormalization) to prevent this
+        # fusion pattern.
         self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
 
     def forward(

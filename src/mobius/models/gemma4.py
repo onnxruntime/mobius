@@ -35,6 +35,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._flags import flags
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
@@ -42,8 +43,6 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_attention_bias,
-    create_padding_mask,
-    create_sliding_window_mask,
     initialize_rope,
 )
 from mobius.components._activations import get_activation
@@ -730,7 +729,11 @@ class Gemma4TextAttention(nn.Module):
             # KV-shared layers always use standard Attention path because
             # they borrow K,V from a source layer (no own KV cache).
             if use_gqa:
-                raise ValueError("KV-shared layers should not receive GQAContext")
+                raise ValueError(
+                    "KV-shared GQA path not yet implemented. "
+                    "Set MOBIUS_USE_GQA_FOR_KV_SHARED=0 or wait for "
+                    "ORT GQA new_kv_length=0 support."
+                )
             # Borrow full-history K,V from source layer.
             # present_key/value from the ONNX Attention op is 4D:
             #   [batch, kv_heads, total_seq, head_dim]
@@ -1512,50 +1515,33 @@ class Gemma4TextModel(nn.Module):
                 "full_attention": self.rotary_emb_global(op, position_ids),
             }
 
-        # Fallback attention bias for non-GQA layers (KV-shared layers always
-        # use this, plus all layers when use_gqa is False).
+        # Fallback attention bias for non-GQA layers (KV-shared layers use
+        # this when use_gqa_for_kv_shared is False, plus all layers when
+        # use_gqa is False).
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
-        need_fallback = not use_gqa or any(
-            layer.self_attn.is_kv_shared_layer for layer in self.layers
-        )
+        has_kv_shared = any(layer.self_attn.is_kv_shared_layer for layer in self.layers)
+        need_fallback = not use_gqa or (has_kv_shared and not flags.use_gqa_for_kv_shared)
         if need_fallback:
-            if use_gqa:
-                # GQA is active for non-shared layers. KV-shared layers use
-                # the standard Attention op with is_causal=1, so we only need
-                # bool masks (not additive float bias). This avoids the
-                # CumSum/GreaterOrEqual chain used by create_attention_bias.
-                # Full-attention: simple padding mask (causality handled by op)
-                # Sliding-window: still needs CumSum for window constraint
-                fallback_bias_dict = {
-                    "sliding_attention": create_sliding_window_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        window_size=self.sliding_window or 512,
-                    ),
-                    "full_attention": create_padding_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                    ),
-                }
-            else:
-                fallback_bias_dict = {
-                    "sliding_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        sliding_window=self.sliding_window,
-                        dtype=self._dtype,
-                    ),
-                    "full_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        dtype=self._dtype,
-                    ),
-                }
+            # All fallback layers use float additive bias masks encoding
+            # causal + sliding window + padding constraints. Float bias
+            # works with both unfused and MEA kernel paths on CUDA EP.
+            # Padding mask is required for batch > 1 correctness.
+            fallback_bias_dict = {
+                "sliding_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                ),
+            }
             # KV-shared layers also need position embeddings for the
             # standard Attention path (manual RoPE). Reuse the embeddings
             # already gathered when realizing cos/sin caches above.
@@ -1592,9 +1578,11 @@ class Gemma4TextModel(nn.Module):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
             # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared layers.
+            # available, fall back to standard Attention for KV-shared
+            # layers (unless the use_gqa_for_kv_shared flag is set).
             is_shared = layer.self_attn.is_kv_shared_layer
-            if use_gqa and not is_shared:
+            use_gqa_this_layer = use_gqa and (not is_shared or flags.use_gqa_for_kv_shared)
+            if use_gqa_this_layer:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:
@@ -1982,7 +1970,10 @@ class _Gemma4AudioEncoderModel(nn.Module):
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
-        self.pre_projection_norm = _Gemma4ScaleFreeRMSNorm(output_proj_dims, eps=rms_norm_eps)
+        # NOTE: We inline the RMSNorm in forward() using manual ops to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization (CUDA rejects 1D skip).
+        self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
         self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
@@ -1997,8 +1988,17 @@ class _Gemma4AudioEncoderModel(nn.Module):
         audio_features, downsampled_mask = self.encoder(
             op, input_features, input_features_mask=input_features_mask
         )
-        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
-        audio_features = self.pre_projection_norm(op, audio_features)
+        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm).
+        # Use manual primitive ops instead of op.RMSNormalization to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNorm into
+        # SkipSimplifiedLayerNormalization with a 1D bias as skip input
+        # (CUDA kernel rejects 1D skip, CPU kernel accepts it).
+        x_f32 = op.Cast(audio_features, to=ir.DataType.FLOAT)
+        sq = op.Mul(x_f32, x_f32)
+        mean_sq = op.ReduceMean(sq, op.Constant(value_ints=[-1]), keepdims=1)
+        eps = op.Constant(value_float=self._rms_norm_eps)
+        rms = op.Sqrt(op.Add(mean_sq, eps))
+        audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features), downsampled_mask
 
