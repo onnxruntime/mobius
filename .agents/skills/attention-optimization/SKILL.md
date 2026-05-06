@@ -18,6 +18,16 @@ Use this skill when:
 - Working with GQA models and attention bias
 - Optimizing attention for sliding window, KV-shared, or mixed head_dim
 
+## Mask type decision table
+
+| Scenario | Recommended | Why |
+|----------|------------|-----|
+| Causal only | `attn_mask=None` + `is_causal=1` | Enables Flash (fastest) |
+| Padding (batch>1) | Bool mask or `nonpad_kv_seqlens` | Simple, ORT optimized |
+| Sliding window | Float additive bias | Precise window control |
+| Complex (causal+sliding+padding) | Float additive bias | Most flexible |
+| Custom pattern | Float additive bias | Arbitrary values |
+
 ## Bool mask vs float additive bias
 
 ### When to use each
