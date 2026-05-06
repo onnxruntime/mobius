@@ -181,8 +181,9 @@ data transfer. Common culprits:
 - `ConstantOfShape` with unusual dtypes
 
 **Fix:** See the `debugging-memcpy` skill for root-cause analysis and
-fix patterns. The most impactful fix is usually lowering opset version
-or replacing unsupported ops with CUDA-friendly alternatives.
+fix patterns. The correct fix is to update ORT kernel registration for
+the missing opset versions (e.g. Equal opset 19 CUDA gap). As a
+secondary option, replace unsupported ops with CUDA-friendly alternatives.
 
 ### 2. cuBLAS warmup spike
 
