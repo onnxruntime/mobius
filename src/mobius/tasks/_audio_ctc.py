@@ -22,7 +22,12 @@ import onnx_ir as ir
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
-from mobius.tasks._base import ModelTask, _make_graph, _make_model
+from mobius.tasks._base import (
+    ModelTask,
+    _cast_encoder_input,
+    _make_graph,
+    _make_model,
+)
 
 
 class AudioCTCTask(ModelTask):
@@ -43,9 +48,10 @@ class AudioCTCTask(ModelTask):
 
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype or ir.DataType.FLOAT,
+            dtype=ir.DataType.FLOAT,
             shape=["batch", "time", input_dim],
         )
+        input_features = _cast_encoder_input(op, input_features, config)
         language_id = builder.input(
             "language_id",
             dtype=ir.DataType.INT64,

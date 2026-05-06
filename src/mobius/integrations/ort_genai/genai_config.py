@@ -178,6 +178,9 @@ class GenaiConfigGenerator:
         # Optional audio fields (set via with_audio())
         self._audio: dict[str, Any] | None = None
 
+        # Search config overrides applied in generate()
+        self._search_overrides: dict[str, Any] = {}
+
     @classmethod
     def from_config(
         cls,
@@ -407,9 +410,12 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
+        search = _default_search_params(ep=self.ep, context_length=self.context_length)
+        search.update(self._search_overrides)
+
         return {
             "model": model,
-            "search": _default_search_params(ep=self.ep, context_length=self.context_length),
+            "search": search,
         }
 
     def write(self, output_dir: str) -> str:

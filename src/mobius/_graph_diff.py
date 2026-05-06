@@ -191,6 +191,18 @@ def canonicalize_graph(graph: ir.Graph) -> dict:
 # =====================================================================
 
 
+def _describe_port_diff(base_port: dict, head_port: dict) -> str:
+    """Describe what changed between two I/O port dicts (dtype, shape)."""
+    parts: list[str] = []
+    bd, hd = base_port.get("dtype", "?"), head_port.get("dtype", "?")
+    if bd != hd:
+        parts.append(f"dtype {bd} → {hd}")
+    bs, hs = base_port.get("shape", []), head_port.get("shape", [])
+    if bs != hs:
+        parts.append(f"shape {bs} → {hs}")
+    return "; ".join(parts) or "changed"
+
+
 def diff_graphs(base: dict, head: dict) -> list[dict[str, Any]]:
     """Compare two canonical graph representations.
 
@@ -217,10 +229,12 @@ def diff_graphs(base: dict, head: dict) -> list[dict[str, Any]]:
         # Check for dtype/shape changes on matched ports
         for idx, (bv, hv) in enumerate(zip(b_in, h_in)):
             if bv != hv:
-                details_parts.append(f"input[{idx}] changed")
+                diffs = _describe_port_diff(bv, hv)
+                details_parts.append(f"input[{idx}]: {diffs}")
         for idx, (bv, hv) in enumerate(zip(b_out, h_out)):
             if bv != hv:
-                details_parts.append(f"output[{idx}] changed")
+                diffs = _describe_port_diff(bv, hv)
+                details_parts.append(f"output[{idx}]: {diffs}")
         changes.append(
             {
                 "type": "interface_change",
@@ -232,10 +246,26 @@ def diff_graphs(base: dict, head: dict) -> list[dict[str, Any]]:
     b_inits = base.get("initializers", [])
     h_inits = head.get("initializers", [])
     if b_inits != h_inits:
+        details_parts_init: list[str] = []
+        if len(b_inits) != len(h_inits):
+            details_parts_init.append(f"count {len(b_inits)} → {len(h_inits)}")
+        # Summarize dtype distribution changes
+        from collections import Counter
+
+        b_dtypes = Counter(i["dtype"] for i in b_inits)
+        h_dtypes = Counter(i["dtype"] for i in h_inits)
+        if b_dtypes != h_dtypes:
+            dtype_parts = []
+            for dt in sorted(set(b_dtypes) | set(h_dtypes)):
+                bc, hc = b_dtypes.get(dt, 0), h_dtypes.get(dt, 0)
+                if bc != hc:
+                    dtype_parts.append(f"{dt}: {bc} → {hc}")
+            if dtype_parts:
+                details_parts_init.append("dtype distribution: " + ", ".join(dtype_parts))
         changes.append(
             {
                 "type": "initializer_change",
-                "details": (f"initializer count {len(b_inits)} → {len(h_inits)}"),
+                "details": "; ".join(details_parts_init) or "initializers changed",
             }
         )
 

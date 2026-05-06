@@ -130,6 +130,18 @@ def _make_model(graph: ir.Graph) -> ir.Model:
     return model
 
 
+def _cast_encoder_input(op, tensor, config: BaseModelConfig):
+    """Cast an f32 encoder input to the model's compute dtype if needed.
+
+    Vision/audio processors output float32. Encoder graph inputs are
+    declared as FLOAT, and this helper adds a Cast when the model uses
+    f16/bf16 so that the first encoder op receives matching types.
+    """
+    if config.dtype and config.dtype != ir.DataType.FLOAT:
+        return op.Cast(tensor, to=config.dtype)
+    return tensor
+
+
 class ModelTask(ABC):
     """Abstract base defining how to wire a module into an ONNX graph.
 
