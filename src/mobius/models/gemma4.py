@@ -1970,7 +1970,10 @@ class _Gemma4AudioEncoderModel(nn.Module):
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
-        self.pre_projection_norm = _Gemma4ScaleFreeRMSNorm(output_proj_dims, eps=rms_norm_eps)
+        # NOTE: We inline the RMSNorm in forward() using manual ops to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization (CUDA rejects 1D skip).
+        self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
         self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
@@ -1985,8 +1988,17 @@ class _Gemma4AudioEncoderModel(nn.Module):
         audio_features, downsampled_mask = self.encoder(
             op, input_features, input_features_mask=input_features_mask
         )
-        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
-        audio_features = self.pre_projection_norm(op, audio_features)
+        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm).
+        # Use manual primitive ops instead of op.RMSNormalization to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNorm into
+        # SkipSimplifiedLayerNormalization with a 1D bias as skip input
+        # (CUDA kernel rejects 1D skip, CPU kernel accepts it).
+        x_f32 = op.Cast(audio_features, to=ir.DataType.FLOAT)
+        sq = op.Mul(x_f32, x_f32)
+        mean_sq = op.ReduceMean(sq, op.Constant(value_ints=[-1]), keepdims=1)
+        eps = op.Constant(value_float=self._rms_norm_eps)
+        rms = op.Sqrt(op.Add(mean_sq, eps))
+        audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features), downsampled_mask
 
