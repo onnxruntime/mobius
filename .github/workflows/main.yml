@@ -12,6 +12,14 @@ on:
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      changed_files:
+        description: >
+          Newline-separated list of file paths to feed to detect_affected_models.py
+          (e.g. "src/mobius/models/gemma.py"). Leave empty to run all tests.
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' }}
@@ -33,7 +41,7 @@ jobs:
   detect-affected:
     name: Detect affected models
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.changed_files != '')
     outputs:
       affected: ${{ steps.detect.outputs.affected }}
       run_all: ${{ steps.detect.outputs.run_all }}
@@ -46,8 +54,14 @@ jobs:
         id: changed
         env:
           BASE_REF: ${{ github.base_ref }}
+          INPUT_CHANGED_FILES: ${{ github.event.inputs.changed_files }}
         run: |
-          git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Using workflow_dispatch input files"
+            echo "$INPUT_CHANGED_FILES" > changed_files.txt
+          else
+            git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
+          fi
           echo "Changed files:"
           cat changed_files.txt
       - name: Detect affected models
@@ -110,7 +124,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
@@ -141,7 +155,7 @@ jobs:
           fi
           if [ "${{ needs.detect-affected.result }}" = "failure" ] || \
              [ "${{ needs.detect-affected.outputs.run_all }}" = "true" ] || \
-             [ "${{ github.event_name }}" != "pull_request" ]; then
+             [ "${{ needs.detect-affected.result }}" = "skipped" ]; then
             echo "Running all synthetic parity tests"
             pytest tests/synthetic_parity_test.py -v --tb=short -n auto \
               --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
@@ -178,7 +192,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     uses: ./.github/workflows/gpu_l4_golden_parity.yml
     with:
       affected_models: ${{ needs.detect-affected.outputs.affected }}
@@ -193,7 +207,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     uses: ./.github/workflows/gpu_l5_generation_e2e.yml
     with:
       affected_models: ${{ needs.detect-affected.outputs.affected }}
