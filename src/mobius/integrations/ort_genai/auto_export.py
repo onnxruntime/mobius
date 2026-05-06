@@ -655,6 +655,14 @@ def _write_genai_config(
             **audio_kwargs,
         )
 
+    # Disable past_present_share_buffer for models with dual head_dim
+    # (e.g., different head_dim for sliding vs full-attention layers).
+    # Shared buffers require uniform head_dim across all KV cache layers.
+    global_head_dim = getattr(config, "global_head_dim", None)
+    head_dim = getattr(config, "head_dim", None)
+    if global_head_dim and head_dim and global_head_dim != head_dim:
+        generator._search_overrides["past_present_share_buffer"] = False
+
     return generator.write(output_dir)
 
 
