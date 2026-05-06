@@ -76,13 +76,15 @@ def format_chat_prompt(user_message: str) -> str:
 
     Gemma 4 instruction-tuned models expect this format::
 
-        <start_of_turn>user
+        <bos><start_of_turn>user
         {message}<end_of_turn>
         <start_of_turn>model
 
+    The ``<bos>`` prefix is required — the Gemma4 tokenizer has
+    ``add_bos_token=False``, so it must be included explicitly.
     Raw prompts without the template produce degenerate output.
     """
-    return f"<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
+    return f"<bos><start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
 
 
 # ---------------------------------------------------------------------------
