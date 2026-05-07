@@ -35,7 +35,6 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
-from mobius._flags import flags
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
@@ -151,14 +150,16 @@ class Gemma4VisionSelfAttention(nn.Module):
         norm_eps: float = 1e-6,
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
+        linear_class = ClippableLinear if use_clipped_linears else Linear
+        self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = linear_class(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -317,10 +318,16 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_act: str = "gelu_pytorch_tanh",
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
-            hidden_size, num_heads, norm_eps, rope_theta=rope_theta, max_position=max_position
+            hidden_size,
+            num_heads,
+            norm_eps,
+            rope_theta=rope_theta,
+            max_position=max_position,
+            use_clipped_linears=use_clipped_linears,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -328,7 +335,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
-        # Vision encoder uses ClippableLinear for all projections.
+        # Use ClippableLinear only when the checkpoint has clipping weights.
+        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -336,7 +344,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
             ),
-            linear_class=ClippableLinear,
+            linear_class=linear_class,
         )
 
     def forward(
@@ -554,6 +562,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     hidden_act=vc.hidden_act or "gelu_pytorch_tanh",
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
+                    use_clipped_linears=vc.use_clipped_linears,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -726,41 +735,79 @@ class Gemma4TextAttention(nn.Module):
             )
 
         if self.is_kv_shared_layer:
-            # KV-shared layers always use standard Attention path because
-            # they borrow K,V from a source layer (no own KV cache).
-            if use_gqa:
-                raise ValueError(
-                    "KV-shared GQA path not yet implemented. "
-                    "Set MOBIUS_USE_GQA_FOR_KV_SHARED=0 or wait for "
-                    "ORT GQA new_kv_length=0 support."
-                )
-            # Borrow full-history K,V from source layer.
-            # present_key/value from the ONNX Attention op is 4D:
-            #   [batch, kv_heads, total_seq, head_dim]
-            # The Attention op expects key/value as 3D:
-            #   [batch, total_seq, kv_heads * head_dim]
-            # Transpose and reshape to match.
+            # KV-shared layers borrow K,V from a source layer (no own KV cache).
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
 
-            # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads*head_dim]
-            src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-            src_key = op.Reshape(src_key, [0, 0, -1])
-            src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-            src_value = op.Reshape(src_value, [0, 0, -1])
+            if use_gqa:
+                # GQA path for shared KV: pass empty K/V tensors and wire the
+                # source layer's present_key/value as past_key/past_value.
+                # The shared buffer is already in BNSH format, so GQA reads it
+                # directly — no Transpose/Reshape needed.
+                gqa_ctx = attention_bias
 
-            attn_output, present_key, present_value = _apply_attention(
-                op,
-                query_states,
-                src_key,
-                src_value,
-                attention_bias,
-                past_key=None,
-                past_value=None,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                scale=self.scaling,
-                softcap=self.softcap,
-            )
+                # Create empty K/V tensors with kv_sequence_length=0.
+                # Shape: [batch, 0, kv_heads * head_dim]
+                batch_dim = op.Shape(query_states, start=0, end=1)
+                kv_hidden = self.num_key_value_heads * self.head_dim
+                empty_shape = op.Concat(
+                    batch_dim,
+                    op.Constant(value_ints=[0, kv_hidden]),
+                    axis=0,
+                )
+                empty_kv = op.CastLike(op.ConstantOfShape(empty_shape), query_states)
+
+                gqa_attrs: dict = {
+                    "num_heads": self.num_attention_heads,
+                    "kv_num_heads": self.num_key_value_heads,
+                    "scale": self.scaling,
+                    "do_rotary": 1,
+                    "rotary_interleaved": int(self._rope_interleave),
+                }
+                if self.softcap:
+                    gqa_attrs["softcap"] = self.softcap
+                if self.rotary_embedding_dim:
+                    gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+                if gqa_ctx.local_window_size > 0:
+                    gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
+
+                attn_output, present_key, present_value = op.GroupQueryAttention(
+                    query_states,
+                    empty_kv,  # key: empty (kv_sequence_length=0)
+                    empty_kv,  # value: empty (kv_sequence_length=0)
+                    src_key,  # past_key: shared KV in BNSH
+                    src_value,  # past_value: shared KV in BNSH
+                    gqa_ctx.seqlens_k,
+                    gqa_ctx.total_seq_len,
+                    gqa_ctx.cos_cache,
+                    gqa_ctx.sin_cache,
+                    _domain="com.microsoft",
+                    _outputs=3,
+                    **gqa_attrs,
+                )
+            else:
+                # Fallback Attention path: transpose shared KV from BNSH to 3D.
+                # present_key/value from the ONNX Attention op is 4D:
+                #   [batch, kv_heads, total_seq, head_dim]
+                # The Attention op expects key/value as 3D:
+                #   [batch, total_seq, kv_heads * head_dim]
+                src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+                src_key = op.Reshape(src_key, [0, 0, -1])
+                src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
+                src_value = op.Reshape(src_value, [0, 0, -1])
+
+                attn_output, present_key, present_value = _apply_attention(
+                    op,
+                    query_states,
+                    src_key,
+                    src_value,
+                    attention_bias,
+                    past_key=None,
+                    past_value=None,
+                    num_attention_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    scale=self.scaling,
+                    softcap=self.softcap,
+                )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
             # The op fuses RoPE + attention + KV cache into a single op,
@@ -1467,11 +1514,12 @@ class Gemma4TextModel(nn.Module):
         )
 
         if use_gqa:
-            # Realize cos/sin caches as ONNX graph initializers.
-            # The returned gathered embeddings are saved for potential reuse
-            # by KV-shared layers that fall back to standard Attention.
-            local_pos_emb = self.rotary_emb_local(op, position_ids)
-            global_pos_emb = self.rotary_emb_global(op, position_ids)
+            # Calling forward() on the RoPE modules materializes their
+            # cos_cache / sin_cache nn.Parameters as ONNX graph initializers.
+            # GQA references these caches directly; without the call the
+            # parameters are never emitted into the graph.
+            _ = self.rotary_emb_local(op, position_ids)
+            _ = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
@@ -1515,18 +1563,11 @@ class Gemma4TextModel(nn.Module):
                 "full_attention": self.rotary_emb_global(op, position_ids),
             }
 
-        # Fallback attention bias for non-GQA layers (KV-shared layers use
-        # this when use_gqa_for_kv_shared is False, plus all layers when
-        # use_gqa is False).
+        # Fallback attention bias for non-GQA layers (used when use_gqa is False).
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
-        has_kv_shared = any(layer.self_attn.is_kv_shared_layer for layer in self.layers)
-        need_fallback = not use_gqa or (has_kv_shared and not flags.use_gqa_for_kv_shared)
+        need_fallback = not use_gqa
         if need_fallback:
-            # All fallback layers use float additive bias masks encoding
-            # causal + sliding window + padding constraints. Float bias
-            # works with both unfused and MEA kernel paths on CUDA EP.
-            # Padding mask is required for batch > 1 correctness.
             fallback_bias_dict = {
                 "sliding_attention": create_attention_bias(
                     op,
@@ -1542,16 +1583,7 @@ class Gemma4TextModel(nn.Module):
                     dtype=self._dtype,
                 ),
             }
-            # KV-shared layers also need position embeddings for the
-            # standard Attention path (manual RoPE). Reuse the embeddings
-            # already gathered when realizing cos/sin caches above.
-            if use_gqa:
-                fallback_pos_dict = {
-                    "sliding_attention": local_pos_emb,
-                    "full_attention": global_pos_emb,
-                }
-            else:
-                fallback_pos_dict = position_embeddings_dict
+            fallback_pos_dict = position_embeddings_dict
         else:
             fallback_pos_dict = {}
 
@@ -1577,12 +1609,9 @@ class Gemma4TextModel(nn.Module):
         ):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
-            # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared
-            # layers (unless the use_gqa_for_kv_shared flag is set).
-            is_shared = layer.self_attn.is_kv_shared_layer
-            use_gqa_this_layer = use_gqa and (not is_shared or flags.use_gqa_for_kv_shared)
-            if use_gqa_this_layer:
+            # Per-layer decision: use GQA when available. KV-shared layers
+            # also use GQA (with empty K/V and shared past buffer).
+            if use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:

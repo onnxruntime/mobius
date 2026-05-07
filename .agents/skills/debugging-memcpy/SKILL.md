@@ -342,3 +342,8 @@ and comparison ops on small metadata tensors rarely matter for throughput.
   bool mask fallback, GQA + sliding window
 - `src/mobius/_execution_providers.py` — `EpCapabilities` (gqa_dtypes,
   supports_fused_rope, supports_fused_moe)
+
+## Cross-references
+
+- **Attention optimization:** `.agents/skills/attention-optimization/SKILL.md`
+  — kernel dispatch tables, mask type selection, Flash requirements

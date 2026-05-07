@@ -196,10 +196,21 @@ def compute_mel_spectrogram(
     n_mels: int = 128,
     n_fft: int = 400,
     hop_length: int = 160,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute log-mel spectrogram using WhisperFeatureExtractor.
 
-    Returns array of shape ``(1, n_mels, time_frames)``.
+    The Whisper extractor pads to a fixed 30-second window
+    (``max_length=3000`` mel frames). Without the matching padding
+    mask, the mobius audio encoder treats trailing zero-padded frames
+    as real audio and the LLM downstream emits degenerate loops. We
+    therefore always request ``return_attention_mask=True`` so the
+    encoder can crop padding from the audio token stream.
+
+    Returns:
+        ``(input_features, feature_attention_mask)`` where
+        ``input_features`` has shape ``(1, n_mels, time_frames)`` and
+        ``feature_attention_mask`` has shape ``(1, time_frames)``
+        (1 = real audio, 0 = padding).
     """
     from transformers import WhisperFeatureExtractor
 
@@ -213,11 +224,12 @@ def compute_mel_spectrogram(
         audio,
         sampling_rate=sample_rate,
         return_tensors="np",
-        padding=False,
+        return_attention_mask=True,
     )
-    return out["input_features"].astype(
-        np.float32
-    )  # Always float32; caller casts to model dtype
+    # Always float32 for input_features; caller casts to model dtype.
+    input_features = out["input_features"].astype(np.float32)
+    feature_attention_mask = out["attention_mask"].astype(np.int64)
+    return input_features, feature_attention_mask
 
 
 # ---------------------------------------------------------------------------
@@ -312,11 +324,24 @@ def transcribe(
     batch_size = 1
 
     # Step 1: Compute mel spectrogram
-    mel = compute_mel_spectrogram(audio).astype(model_dtype)  # (1, n_mels, time)
+    mel, feature_attention_mask = compute_mel_spectrogram(audio)
+    mel = mel.astype(model_dtype)  # (1, n_mels, time)
 
     # Step 2: Run audio encoder
-    audio_out = sessions["audio_encoder"].run({"input_features": mel})
+    audio_out = sessions["audio_encoder"].run(
+        {
+            "input_features": mel,
+            "feature_attention_mask": feature_attention_mask,
+        }
+    )
     audio_features = audio_out["audio_features"]  # (1, audio_seq, dim)
+    audio_feature_lengths = audio_out["audio_feature_lengths"]  # (1,)
+    # Crop padding-derived rows so they never reach the embedding's
+    # gather. The encoder emits a fixed-length output equal to the
+    # padded mel length / 8, but only ``audio_feature_lengths[0]`` of
+    # those rows correspond to real audio.
+    valid_audio_tokens = int(audio_feature_lengths[0])
+    audio_features = audio_features[:, :valid_audio_tokens, :]
     num_audio_tokens = audio_features.shape[1]
 
     # Flatten to (num_audio_tokens, output_dim) for the embedding model
