@@ -3,10 +3,3 @@ pytest-cov
 pytest-xdist
 coverage[toml]
 gguf>=0.18.0
-flatbuffers
-numpy
-packaging
-protobuf
-sympy
-coloredlogs
-onnxruntime-gpu --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ --extra-index-url https://pypi.org/simple/
