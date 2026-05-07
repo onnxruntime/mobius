@@ -112,6 +112,12 @@ class SpeechLanguageTask(ModelTask):
         # ``audio_feature_lengths`` tokens per batch item are real.
         # Cropping inside the graph avoids callers needing to handle
         # the extra output and manual slicing.
+        #
+        # NOTE: This Slice uses a single ``ends`` value for the token
+        # axis, so it is only correct for batch_size=1 (the standard
+        # GenAI inference mode).  For batch>1 each item may have a
+        # different valid length; supporting that would require a
+        # per-batch crop (e.g. loop or ScatterND).
         # audio_features: [batch, max_tokens, hidden_size]
         # audio_feature_lengths: [batch] → reshape to [1] for Slice ends
         audio_features = builder.op.Slice(
