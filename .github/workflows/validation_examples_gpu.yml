@@ -67,14 +67,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache pip packages
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-examples-gpu-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
-          restore-keys: |
-            pip-examples-gpu-
-
       - name: Cache HuggingFace models
         uses: actions/cache@v5
         with:
