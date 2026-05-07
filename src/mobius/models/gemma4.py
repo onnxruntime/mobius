@@ -2177,5 +2177,3 @@ class Gemma4Model(nn.Module):
         _remap_moe_expert_weights(renamed, self.config)
 
         return renamed
-
-# THIS IS A CHANGE TO GEMMA TO TEST MOBIUS CI PIPELINES.
