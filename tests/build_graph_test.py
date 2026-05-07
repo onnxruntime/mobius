@@ -2230,9 +2230,11 @@ class TestBuildGraphQwen3ASR:
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "audio_features" in output_names
-        # audio_feature_lengths is no longer a separate output —
-        # the encoder crops padding internally via Slice.
-        assert "audio_feature_lengths" not in output_names
+        # audio_feature_lengths exposes the valid token count after
+        # the encoder's 8x time downsampling so downstream callers can
+        # crop padding-derived rows out of audio_features before the
+        # embedding gather.
+        assert "audio_feature_lengths" in output_names
 
     def test_audio_encoder_attention_uses_mask(self):
         """The encoder's Attention ops must receive the mask input.
@@ -2364,10 +2366,13 @@ class TestBuildGraphQwen3ASR:
             }
         )
         audio_features = enc_out["audio_features"]
-        # The encoder now crops padding internally — output contains only
-        # valid tokens.
+        audio_feature_lengths = enc_out["audio_feature_lengths"]
+        # Crop padding-derived rows before passing to the embedding —
+        # this mirrors what production callers must do.
+        valid_len = int(audio_feature_lengths[0])
+        assert 0 < valid_len <= audio_features.shape[1]
+        audio_features = audio_features[:, :valid_len, :]
         num_audio_tokens = audio_features.shape[1]
-        assert num_audio_tokens > 0
         # Flatten to 2D: (num_audio_tokens, output_dim)
         audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
         enc_sess.close()

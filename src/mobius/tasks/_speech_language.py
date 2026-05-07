@@ -106,26 +106,10 @@ class SpeechLanguageTask(ModelTask):
             op, input_features, feature_attention_mask
         )
 
-        # Crop padding-derived tokens so the output contains only valid
-        # audio features.  The encoder emits a fixed-length output equal
-        # to ceil(padded_mel_length / 8), but only the first
-        # ``audio_feature_lengths`` tokens per batch item are real.
-        # Cropping inside the graph avoids callers needing to handle
-        # the extra output and manual slicing.
-        #
-        # NOTE: This Slice uses a single ``ends`` value for the token
-        # axis, so it is only correct for batch_size=1 (the standard
-        # GenAI inference mode).  For batch>1 each item may have a
-        # different valid length; supporting that would require a
-        # per-batch crop (e.g. loop or ScatterND).
-        # audio_features: [batch, max_tokens, hidden_size]
-        # audio_feature_lengths: [batch] → reshape to [1] for Slice ends
-        audio_features = builder.op.Slice(
-            audio_features,
-            [0],  # starts
-            builder.op.Reshape(audio_feature_lengths, [-1]),  # ends
-            [1],  # axes (token dim)
-        )
-
         builder.add_output(audio_features, "audio_features")
+        # Number of valid audio tokens per batch item, after the 8×
+        # time downsampling.  Callers must crop ``audio_features`` to
+        # this length before feeding into the embedding model so the
+        # decoder never sees padding-derived audio tokens.
+        builder.add_output(audio_feature_lengths, "audio_feature_lengths")
         return _make_model(graph)
