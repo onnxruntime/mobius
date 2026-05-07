@@ -772,9 +772,9 @@ class Gemma4TextAttention(nn.Module):
 
                 attn_output, present_key, present_value = op.GroupQueryAttention(
                     query_states,
-                    empty_kv,   # key: empty (kv_sequence_length=0)
-                    empty_kv,   # value: empty (kv_sequence_length=0)
-                    src_key,    # past_key: shared KV in BNSH
+                    empty_kv,  # key: empty (kv_sequence_length=0)
+                    empty_kv,  # value: empty (kv_sequence_length=0)
+                    src_key,  # past_key: shared KV in BNSH
                     src_value,  # past_value: shared KV in BNSH
                     gqa_ctx.seqlens_k,
                     gqa_ctx.total_seq_len,
@@ -1514,8 +1514,10 @@ class Gemma4TextModel(nn.Module):
         )
 
         if use_gqa:
-            # Realize cos/sin caches as ONNX graph initializers so that
-            # the GQA op can reference them.
+            # Calling forward() on the RoPE modules materializes their
+            # cos_cache / sin_cache nn.Parameters as ONNX graph initializers.
+            # GQA references these caches directly; without the call the
+            # parameters are never emitted into the graph.
             self.rotary_emb_local(op, position_ids)
             self.rotary_emb_global(op, position_ids)
 
