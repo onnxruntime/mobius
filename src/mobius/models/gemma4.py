@@ -1518,8 +1518,8 @@ class Gemma4TextModel(nn.Module):
             # cos_cache / sin_cache nn.Parameters as ONNX graph initializers.
             # GQA references these caches directly; without the call the
             # parameters are never emitted into the graph.
-            self.rotary_emb_local(op, position_ids)
-            self.rotary_emb_global(op, position_ids)
+            _ = self.rotary_emb_local(op, position_ids)
+            _ = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
