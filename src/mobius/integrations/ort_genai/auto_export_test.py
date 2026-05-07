@@ -963,7 +963,7 @@ class TestExportPackage:
         assert save_calls[0]["progress_bar"] is False
 
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
-        """ep and context_length reach the generated genai_config.json."""
+        """The ep and context_length kwargs reach the generated genai_config.json."""
         from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = self._make_pkg()
