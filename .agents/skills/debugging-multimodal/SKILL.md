@@ -254,9 +254,26 @@ ORT bug: microsoft/onnxruntime#28107
 
 ### Opset 24 kernel registration
 
-ORT ≤1.24.x CUDA/TRT EPs don't register kernels for opset 24.
-**Fix:** Use the `ort_lower_opset_for_ep` feature flag (enabled by
-default). See `src/mobius/_flags.py`.
+ORT ≤1.24.x CUDA/TRT EPs didn't register kernels for opset 24.
+This has been fixed in newer ORT versions.  The `ort_lower_opset_for_ep`
+feature flag is available as a workaround (disabled by default, opt-in
+via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).  See `src/mobius/_flags.py`.
+
+### f32 Cast-at-entry for encoder inputs
+
+Vision and audio encoder inputs should be cast to float32 at the entry
+of the encoder sub-model to prevent FP16 overflow in encoder operations.
+Use the `_cast_encoder_input()` helper from `src/mobius/tasks/_base.py`
+in all encoder task builders.  This is now standard for all multimodal
+tasks.
+
+### GQA for KV-shared layers
+
+Models with KV-shared attention (e.g. Gemma4) can use
+`GroupQueryAttention` for KV-shared layers by setting
+`kv_sequence_length=0` to signal that the layer has no independent KV
+cache.  This eliminates Transpose/Reshape ops for cache handling.
+See ORT PR microsoft/onnxruntime#28242.
 
 ### NaN for large head_dim (> 256)
 

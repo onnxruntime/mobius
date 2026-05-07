@@ -135,10 +135,16 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
       overflow: microsoft/onnxruntime#28107)
 - [ ] No NaN from large head_dim > 256 (tracked in
       microsoft/onnxruntime#28195, #28196)
-- [ ] `ort_lower_opset_for_ep` flag handles opset 24→23 lowering for
-      CUDA EP (enabled by default in `src/mobius/_flags.py`)
+- [ ] `ort_lower_opset_for_ep` flag available for opset 24→23 lowering
+      on older ORT builds (disabled by default in `src/mobius/_flags.py`,
+      opt-in via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`)
 - [ ] Dead graph inputs removed after EP-aware optimization
       (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
+- [ ] `past_present_share_buffer` must be `false` in `genai_config.json`
+      for models with dual head_dim (e.g. Gemma4: 256 for sliding, 512
+      for full attention) — GenAI allocates uniform KV cache shapes
+- [ ] Encoder inputs (vision/audio) use `_cast_encoder_input()` to cast
+      to float32 at sub-model entry, preventing FP16 overflow
 
 ### 9. ORT GenAI runtime
 
