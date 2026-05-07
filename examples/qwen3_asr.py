@@ -334,14 +334,7 @@ def transcribe(
             "feature_attention_mask": feature_attention_mask,
         }
     )
-    audio_features = audio_out["audio_features"]  # (1, audio_seq, dim)
-    audio_feature_lengths = audio_out["audio_feature_lengths"]  # (1,)
-    # Crop padding-derived rows so they never reach the embedding's
-    # gather. The encoder emits a fixed-length output equal to the
-    # padded mel length / 8, but only ``audio_feature_lengths[0]`` of
-    # those rows correspond to real audio.
-    valid_audio_tokens = int(audio_feature_lengths[0])
-    audio_features = audio_features[:, :valid_audio_tokens, :]
+    audio_features = audio_out["audio_features"]  # (1, valid_tokens, dim)
     num_audio_tokens = audio_features.shape[1]
 
     # Flatten to (num_audio_tokens, output_dim) for the embedding model
