@@ -212,6 +212,13 @@ larger head dimensions (e.g. Gemma4 global attention with
 - For Gemma4 specifically, the GQA bypass was removed so models use
   standard attention ops with runtime kernel selection
 
+**Gemma4 Flash Attention note:** Flash Attention gives only 1-3%
+benefit for Gemma4. With float attention masks (KV-shared layers),
+only 7/35 layers are eligible for Flash. With all-GQA (PR #279),
+25/35 layers become eligible but the `head_dim=512` global layers
+still cannot use Flash. The performance impact is minimal because
+global attention layers dominate compute.
+
 ### 4. Batch size=1 on large GPUs
 
 **Symptom:** GPU utilization is low (10-30%). Throughput doesn't
@@ -366,6 +373,20 @@ A thorough benchmark varies these dimensions independently:
 5. **Compare prefill vs decode** — decode should be much faster
 6. **Measure GenAI throughput** — tok/s is the user-facing metric
 7. **Check GPU utilization** — `nvidia-smi` during inference
+
+## Quantization benchmark reference (Gemma4 E2B)
+
+Measured with Gemma4 E2B-IT on GenAI (text-only, 50+ token decode):
+
+| Dtype | CUDA tok/s | CPU tok/s | Notes |
+|-------|-----------|----------|-------|
+| F16 | 104 | 6.8 | Baseline |
+| Q4_K_M | 111 (+8%) | 16.2 (+138%) | **Recommended** — best speed, no quality loss |
+| NF4 | 93 (-10%) | 4.0 (-41%) | Slower than F16 on both EPs |
+
+**Recommendation:** Q4_K_M wins on both CPU and CUDA with no measurable
+quality degradation. NF4 is slower than even F16 and should be avoided
+for inference speed. Use Q4_K_M as the default quantization format.
 
 ## Cross-references
 

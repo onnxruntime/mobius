@@ -387,6 +387,22 @@ full-precision model. Expected tolerances:
 Verify that generated text is coherent and semantically correct rather
 than requiring exact numerical matches.
 
+## Inference speed: Q4_K_M vs NF4
+
+Benchmark with Gemma4 E2B-IT on GenAI (text-only, 50+ token decode):
+
+| Dtype | CUDA tok/s | CPU tok/s | Notes |
+|-------|-----------|----------|-------|
+| F16 | 104 | 6.8 | Baseline |
+| Q4_K_M | 111 (+8%) | 16.2 (+138%) | **Recommended** |
+| NF4 | 93 (-10%) | 4.0 (-41%) | Slower than F16 |
+
+**Q4_K_M is recommended over NF4** for both speed and quality:
+- Faster on both CPU (+138% vs F16) and CUDA (+8% vs F16)
+- NF4 is paradoxically *slower* than F16 on both EPs
+- Quality is comparable between Q4_K_M and NF4
+- Q4_K_M uses less memory than F16 (~4x compression)
+
 ## Cross-references
 
 - **Adding models:** `.agents/skills/adding-a-new-model/SKILL.md`

@@ -281,6 +281,33 @@ If you're adding a new multimodal model, you don't need to handle this
 manually — mobius inserts the Cast automatically for all encoder graphs.
 If the model dtype is already f32, no Cast is needed.
 
+## GQA for KV-shared layers (Gemma4)
+
+Models with KV-shared layers (e.g. Gemma4) borrow key/value from
+earlier source layers instead of projecting their own. With GQA
+(PR #279), shared layers use `GroupQueryAttention` with:
+
+- `key=None` (empty, `kv_sequence_length=0`)
+- `value=None` (empty)
+- `past_key=source_layer_present_key` (borrowed from source)
+- `past_value=source_layer_present_value` (borrowed from source)
+- `do_rotary=0` (RoPE already applied by source layer)
+
+This eliminates ~40 Transpose/Reshape ops per shared layer that
+were previously needed to convert the source KV from BNSH
+`[B, kv_heads, seq, head_dim]` to 3D `[B, seq, kv_hidden]` format.
+
+**Caveat:** Requires ORT to support `kv_sequence_length=0` in the
+GQA op. Tracked in microsoft/onnxruntime#28318.
+
+## Vision preprocessing: float-domain bicubic resize
+
+For HF parity in vision preprocessing, ort-extensions provides a
+float-domain bicubic resize (PR #1056) that avoids uint8 clamping
+artifacts. This eliminates 0.03-0.13 pixel differences that can
+cause token divergence in vision encoders. The utility operates in
+packed RGB with fused uint8→float rescale.
+
 ## Cross-references
 
 - **Multimodal debugging:** `.agents/skills/debugging-multimodal/SKILL.md`
