@@ -291,7 +291,7 @@ earlier source layers instead of projecting their own. With GQA
 - `value=None` (empty)
 - `past_key=source_layer_present_key` (borrowed from source)
 - `past_value=source_layer_present_value` (borrowed from source)
-- `do_rotary=0` (RoPE already applied by source layer)
+- `do_rotary=1` (RoPE applied to queries; source K already has RoPE)
 
 This eliminates ~40 Transpose/Reshape ops per shared layer that
 were previously needed to convert the source KV from BNSH
