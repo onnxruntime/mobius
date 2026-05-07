@@ -64,6 +64,21 @@ class AddRMSNormToSkipNorm(RewriteRuleClassBase):
         if producer is None or producer.op_type != "Add":
             return result.fail("Input to RMSNorm is not from an Add node")
 
+        # Both Add inputs must have the same rank (SkipSimplifiedLayerNormalization
+        # requires input and skip to have the same shape). A rank mismatch
+        # indicates broadcasting (e.g. Add(MatMul, bias) where bias is 1D).
+        input_a = producer.inputs[0]
+        input_b = producer.inputs[1]
+        shape_a = input_a.shape
+        shape_b = input_b.shape
+        rank_a = len(shape_a) if shape_a is not None else None
+        rank_b = len(shape_b) if shape_b is not None else None
+        if rank_a is not None and rank_b is not None and rank_a != rank_b:
+            return result.fail(
+                f"Add inputs have different ranks ({rank_a} vs {rank_b}); "
+                "SkipSimplifiedLayerNormalization requires same-shape inputs"
+            )
+
         # Don't fuse if add_out is itself a graph output — that indicates we're inside
         # an ONNX function body (e.g. SkipSimplifiedLayerNormalization_body) where
         # replace_all_uses_with would fail, or produce nested fusion.
