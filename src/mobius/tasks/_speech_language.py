@@ -107,7 +107,7 @@ class SpeechLanguageTask(ModelTask):
         )
 
         builder.add_output(audio_features, "audio_features")
-        # Number of valid audio tokens per batch item, after the 8×
+        # Number of valid audio tokens per batch item, after the 8x
         # time downsampling.  Callers must crop ``audio_features`` to
         # this length before feeding into the embedding model so the
         # decoder never sees padding-derived audio tokens.
