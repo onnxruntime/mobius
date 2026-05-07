@@ -1,4 +1,5 @@
 model_id: "OpenGVLab/InternVL2-1B"
+model_type: "internvl2"
 revision: "main"
 task_type: "image-text-to-text"
 dtype: "float32"

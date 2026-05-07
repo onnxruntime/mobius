@@ -1,4 +1,5 @@
 model_id: "google/siglip2-base-patch16-224"
+model_type: "siglip2"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

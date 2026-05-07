@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen3-VL-2B-Instruct"
+model_type: "qwen3_vl"
 revision: "89644892e4d85e24eaac8bacfd4f463576704203"
 task_type: "image-text-to-text"
 dtype: "float32"

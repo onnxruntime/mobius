@@ -1,4 +1,5 @@
 model_id: "Salesforce/codegen-350M-mono"
+model_type: "codegen"
 revision: "d9107f71cca463240db1143f4a75a927a27fcb27"
 task_type: "text-generation"
 dtype: "float32"

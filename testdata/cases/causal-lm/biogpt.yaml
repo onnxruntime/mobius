@@ -1,4 +1,5 @@
 model_id: "microsoft/biogpt"
+model_type: "biogpt"
 revision: "eb0d815e95434dc9e3b78f464e52b899bee7d923"
 task_type: "text-generation"
 dtype: "float32"

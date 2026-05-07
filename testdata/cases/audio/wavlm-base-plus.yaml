@@ -1,4 +1,5 @@
 model_id: "microsoft/wavlm-base-plus"
+model_type: "wavlm"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

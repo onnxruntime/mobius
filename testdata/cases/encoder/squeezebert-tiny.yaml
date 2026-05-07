@@ -1,4 +1,5 @@
 model_id: "optimum-intel-internal-testing/tiny-random-squeezebert"
+model_type: "squeezebert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

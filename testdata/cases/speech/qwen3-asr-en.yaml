@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen3-ASR-0.6B"
+model_type: "qwen3_asr"
 revision: "main"
 task_type: "speech-language"
 dtype: "float32"

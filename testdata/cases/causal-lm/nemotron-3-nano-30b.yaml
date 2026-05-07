@@ -1,4 +1,5 @@
 model_id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+model_type: "nemotron"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "CohereForAI/c4ai-command-r7b-12-2024"
+model_type: "cohere2"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

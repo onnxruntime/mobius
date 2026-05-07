@@ -29,6 +29,7 @@ from mobius._testing.golden import (
 
 MINIMAL_YAML = """\
 model_id: "test-org/test-model"
+model_type: "test_model"
 revision: "abc123"
 task_type: "text-generation"
 dtype: "float32"
@@ -40,6 +41,7 @@ inputs:
 
 VL_YAML = """\
 model_id: "test-org/test-vl"
+model_type: "test_vl"
 revision: "def456"
 task_type: "qwen-vl"
 dtype: "float32"
@@ -57,6 +59,7 @@ notes: "VL model test case"
 
 SKIP_YAML = """\
 model_id: "test-org/skip-model"
+model_type: "test_skip"
 revision: "aaa111"
 task_type: "text-generation"
 dtype: "float32"
@@ -293,19 +296,19 @@ class TestDiscoverTestCases:
         _write_yaml(
             causal,
             "model-a.yaml",
-            'model_id: "a"\nrevision: "1"\ntask_type: "text-generation"'
+            'model_id: "a"\nmodel_type: "a"\nrevision: "1"\ntask_type: "text-generation"'
             '\ndtype: "float32"\nlevel: "L4+L5"\n',
         )
         _write_yaml(
             causal,
             "model-b.yaml",
-            'model_id: "b"\nrevision: "2"\ntask_type: "text-generation"'
+            'model_id: "b"\nmodel_type: "b"\nrevision: "2"\ntask_type: "text-generation"'
             '\ndtype: "float32"\nlevel: "L4"\n',
         )
         _write_yaml(
             encoder,
             "model-c.yaml",
-            'model_id: "c"\nrevision: "3"\n'
+            'model_id: "c"\nmodel_type: "c"\nrevision: "3"\n'
             'task_type: "feature-extraction"'
             '\ndtype: "float32"\nlevel: "L4"\n',
         )
@@ -362,7 +365,7 @@ class TestDiscoverTestCases:
         _write_yaml(
             root,
             "good.yaml",
-            'model_id: "ok"\nrevision: "1"\n'
+            'model_id: "ok"\nmodel_type: "ok"\nrevision: "1"\n'
             'task_type: "text-generation"'
             '\ndtype: "float32"\nlevel: "L4"\n',
         )

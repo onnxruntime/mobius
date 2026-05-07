@@ -10,11 +10,8 @@ on:
       - v*
   pull_request:
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -33,7 +30,8 @@ jobs:
   detect-affected:
     name: Detect affected models
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Run on PRs and pushes to main. Skip on tag pushes — those go through release.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     outputs:
       affected: ${{ steps.detect.outputs.affected }}
       run_all: ${{ steps.detect.outputs.run_all }}
@@ -46,8 +44,20 @@ jobs:
         id: changed
         env:
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
-          git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only origin/"$BASE_REF"...HEAD > changed_files.txt
+          else
+            # push to main: diff the pushed range. Fall back to HEAD~1 when
+            # `before` is the zero SHA (e.g. first push of a new branch).
+            if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              git diff --name-only HEAD~1...HEAD > changed_files.txt
+            else
+              git diff --name-only "$BEFORE_SHA"..."$AFTER_SHA" > changed_files.txt
+            fi
+          fi
           echo "Changed files:"
           cat changed_files.txt
       - name: Detect affected models
@@ -110,7 +120,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
@@ -141,7 +151,7 @@ jobs:
           fi
           if [ "${{ needs.detect-affected.result }}" = "failure" ] || \
              [ "${{ needs.detect-affected.outputs.run_all }}" = "true" ] || \
-             [ "${{ github.event_name }}" != "pull_request" ]; then
+             [ "${{ needs.detect-affected.result }}" = "skipped" ]; then
             echo "Running all synthetic parity tests"
             pytest tests/synthetic_parity_test.py -v --tb=short -n auto \
               --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
@@ -178,7 +188,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     uses: ./.github/workflows/gpu_l4_golden_parity.yml
     with:
       affected_models: ${{ needs.detect-affected.outputs.affected }}
@@ -193,7 +203,7 @@ jobs:
       always() && !cancelled() &&
       (needs.detect-affected.result == 'failure' ||
        needs.detect-affected.outputs.has_affected == 'true' ||
-       github.event_name != 'pull_request')
+       needs.detect-affected.result == 'skipped')
     uses: ./.github/workflows/gpu_l5_generation_e2e.yml
     with:
       affected_models: ${{ needs.detect-affected.outputs.affected }}

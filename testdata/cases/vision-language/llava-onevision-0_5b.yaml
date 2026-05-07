@@ -1,4 +1,5 @@
 model_id: "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
+model_type: "llava_onevision"
 revision: "74dd0bf867a4"
 task_type: "image-text-to-text"
 dtype: "float32"

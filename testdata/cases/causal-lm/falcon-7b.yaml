@@ -1,4 +1,5 @@
 model_id: "tiiuae/falcon-7b"
+model_type: "falcon"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
