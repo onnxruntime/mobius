@@ -7,8 +7,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._attention import Qwen35Attention
@@ -68,7 +67,7 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple[ir.Value, ir.Value],
@@ -128,7 +127,7 @@ class Qwen35TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -252,7 +251,7 @@ class Qwen35MoEBlock(nn.Module):
         self.shared_expert = MLP(shared_config)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         # Loop-over-experts dispatch (same pattern as MoELayer)
@@ -320,7 +319,7 @@ class Qwen35MoETextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -467,7 +466,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen35VL3ModelCausalLMModel uses QwenVLTask "
             "which calls each sub-module separately."
@@ -531,7 +530,7 @@ class Qwen35VLDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

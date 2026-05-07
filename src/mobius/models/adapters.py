@@ -13,8 +13,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import GroupNorm as _GroupNorm
@@ -57,7 +56,7 @@ class _T2IAdapterBlock(nn.Module):
         for _ in range(num_res_blocks):
             self.resnets.append(_SimpleResBlock(out_channels))
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         if self.downsample is not None:
             hidden_states = self.downsample(op, hidden_states)
         for resnet in self.resnets:
@@ -76,7 +75,7 @@ class _SimpleResBlock(nn.Module):
         self.conv2 = _Conv2d(channels, channels)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.norm1(op, hidden_states)
         hidden_states = self._silu(op, hidden_states)
@@ -121,7 +120,7 @@ class T2IAdapterModel(nn.Module):
                 _Conv2d(channels[i], channels[i], kernel_size=3, stride=2, padding=1)
             )
 
-    def forward(self, op: builder.OpBuilder, condition: ir.Value):
+    def forward(self, op: OpBuilder, condition: ir.Value):
         """Forward pass: conditioning image → multi-scale features.
 
         Args:
@@ -189,7 +188,7 @@ class IPAdapterModel(nn.Module):
             config.num_tokens,
         )
 
-    def forward(self, op: builder.OpBuilder, image_embeds: ir.Value):
+    def forward(self, op: OpBuilder, image_embeds: ir.Value):
         """Project image embeddings to cross-attention tokens.
 
         Args:
@@ -217,7 +216,7 @@ class _ImageProjection(nn.Module):
         self._num_tokens = num_tokens
         self._cross_dim = cross_attention_dim
 
-    def forward(self, op: builder.OpBuilder, image_embeds: ir.Value):
+    def forward(self, op: OpBuilder, image_embeds: ir.Value):
         # [B, image_dim] → [B, num_tokens * cross_dim] → [B, num_tokens, cross_dim]
         hidden = self.proj(op, image_embeds)
         batch = op.Shape(hidden, start=0, end=1)
@@ -239,5 +238,5 @@ class _LayerNorm1D(nn.Module):
         self.bias = nn.Parameter((dim,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.LayerNormalization(x, self.weight, self.bias, axis=-1, epsilon=self._eps)

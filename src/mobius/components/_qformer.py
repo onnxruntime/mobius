@@ -21,8 +21,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 from mobius.components._mlp import FCMLP
@@ -68,7 +67,7 @@ class QFormerAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         key_value_states: ir.Value | None = None,
     ):
@@ -168,7 +167,7 @@ class QFormerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
     ):
@@ -259,7 +258,7 @@ class QFormer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         encoder_hidden_states: ir.Value,
     ):
         """Forward pass.

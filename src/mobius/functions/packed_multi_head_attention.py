@@ -36,7 +36,7 @@ Attributes:
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
@@ -153,7 +153,7 @@ def packed_multi_head_attention() -> ir.Function:
         # (1, token_count, v_hidden) → (token_count, v_hidden)
         return op.Squeeze(attention_output, [0])
 
-    return builder.build_function(
+    return build_function(
         body,
         [
             ir.Value(name="query"),

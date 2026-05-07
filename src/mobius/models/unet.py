@@ -21,8 +21,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import UNet2DConfig
 from mobius.components import Conv2d as _Conv2d
@@ -47,7 +46,7 @@ class _TimestepEmbedding(nn.Module):
         self.linear_2 = _Linear(time_embed_dim, time_embed_dim)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         sample = self.linear_1(op, sample)
         sample = self._silu(op, sample)
         sample = self.linear_2(op, sample)
@@ -85,7 +84,7 @@ class _ResNetBlock2DWithTime(nn.Module):
         else:
             self.conv_shortcut = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, temb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, temb: ir.Value):
         residual = hidden_states
 
         hidden_states = self.norm1(op, hidden_states)
@@ -140,7 +139,7 @@ class _CrossAttentionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value | None = None,
     ):
@@ -191,7 +190,7 @@ class _BasicAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = query_dim // num_heads
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, context: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, context: ir.Value):
         q = self.to_q(op, hidden_states)
         k = self.to_k(op, context)
         v = self.to_v(op, context)
@@ -217,7 +216,7 @@ class _LayerNorm1D(nn.Module):
         self.bias = nn.Parameter((dim,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.LayerNormalization(x, self.weight, self.bias, axis=-1, epsilon=self._eps)
 
 
@@ -230,7 +229,7 @@ class _FeedForward(nn.Module):
         self.proj_in = _Linear(dim, inner_dim * 2)
         self.proj_out = _Linear(inner_dim, dim)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         projected = self.proj_in(op, x)
         # Split into value and gate
         x1, gate = op.Split(projected, num_outputs=2, axis=-1, _outputs=2)
@@ -283,7 +282,7 @@ class _DownBlock2D(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         temb: ir.Value,
         encoder_hidden_states: ir.Value | None = None,
@@ -344,7 +343,7 @@ class _UpBlock2D(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         temb: ir.Value,
         skip_connections: ir.Value,
@@ -371,7 +370,7 @@ class _Downsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return self.conv(op, x)
 
 
@@ -382,7 +381,7 @@ class _Upsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Upsample 2x using nearest neighbor
         hidden_states = op.Resize(
             hidden_states,
@@ -426,7 +425,7 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         temb: ir.Value,
         encoder_hidden_states: ir.Value | None = None,
@@ -528,7 +527,7 @@ class UNet2DConditionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -572,7 +571,7 @@ class UNet2DConditionModel(nn.Module):
 
         return sample
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep):
         """Sinusoidal timestep embedding."""
         half_dim = self.time_proj_dim // 2
         exponent = -math.log(10000.0) / half_dim

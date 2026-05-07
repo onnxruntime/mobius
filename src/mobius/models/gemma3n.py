@@ -23,8 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Gemma3nConfig
 from mobius.components import (
@@ -60,7 +59,7 @@ class Gemma3nAttention(Attention):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states,
         attention_bias,
         position_embeddings=None,
@@ -142,7 +141,7 @@ class Gemma3nScaledWordEmbedding(Embedding):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.embed_scale = embed_scale
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
         embeddings = super().forward(op, input_ids)
         return op.Mul(embeddings, self.embed_scale)
 
@@ -159,7 +158,7 @@ class Gemma3nLaurelBlock(nn.Module):
         self.linear_right = Linear(laurel_rank, hidden_size, bias=False)
         self.post_laurel_norm = RMSNorm(hidden_size, eps=eps)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         laurel_hidden = self.linear_left(op, hidden_states)
         laurel_hidden = self.linear_right(op, laurel_hidden)
         normed = self.post_laurel_norm(op, laurel_hidden)
@@ -193,14 +192,14 @@ class Gemma3nAltUp(nn.Module):
         self.router_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.router_input_scale = float(config.hidden_size**-1.0)
 
-    def _compute_router_modalities(self, op: builder.OpBuilder, x):
+    def _compute_router_modalities(self, op: OpBuilder, x):
         """Compute router modalities: tanh(router(norm(x) * scale))."""
         router_input = self.router_norm(op, x)
         router_input = op.Mul(router_input, self.router_input_scale)
         routed = self.modality_router(op, router_input)
         return op.Tanh(routed)
 
-    def predict(self, op: builder.OpBuilder, hidden_states_list: list):
+    def predict(self, op: OpBuilder, hidden_states_list: list):
         """Predict step: modify inputs using learned prediction coefficients.
 
         Args:
@@ -240,7 +239,7 @@ class Gemma3nAltUp(nn.Module):
             predictions.append(pred_i)
         return predictions
 
-    def correct(self, op: builder.OpBuilder, predictions: list, activated):
+    def correct(self, op: OpBuilder, predictions: list, activated):
         """Correct step: propagate transformer output to all predictions.
 
         Args:
@@ -266,7 +265,7 @@ class Gemma3nAltUp(nn.Module):
             corrected.append(corrected_i)
         return corrected
 
-    def scale_corrected_output(self, op: builder.OpBuilder, corrected, scale):
+    def scale_corrected_output(self, op: OpBuilder, corrected, scale):
         """Apply per-dimension scaling to the corrected output."""
         return op.Mul(corrected, scale)
 
@@ -306,7 +305,7 @@ class Gemma3nDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states_list: list,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -438,7 +437,7 @@ class Gemma3nTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

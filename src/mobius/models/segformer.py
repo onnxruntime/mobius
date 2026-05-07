@@ -15,8 +15,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import SegformerConfig
 from mobius.components._activations import ACT2FN
@@ -45,7 +44,7 @@ class _OverlapPatchEmbeddings(nn.Module):
         )
         self.layer_norm = LayerNorm(hidden_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         embeddings = self.proj(op, pixel_values)
         # Save spatial dims for later reshape
         height = op.Shape(embeddings, start=2, end=3)
@@ -85,7 +84,7 @@ class _EfficientSelfAttention(nn.Module):
             self.sr_layer_norm = LayerNorm(hidden_size)
 
     def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
+        self, op: OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
     ):
         query = self.query(op, hidden_states)
 
@@ -137,7 +136,7 @@ class _DWConv(nn.Module):
         self.dwconv = Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
 
     def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
+        self, op: OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
     ):
         # [B, S, C] → [B, C, H, W]
         batch = op.Shape(hidden_states, start=0, end=1)
@@ -165,7 +164,7 @@ class _MixFFN(nn.Module):
         self._act_fn = ACT2FN[hidden_act]
 
     def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
+        self, op: OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
     ):
         hidden_states = self.dense1(op, hidden_states)
         hidden_states = self.dwconv(op, hidden_states, height, width)
@@ -194,7 +193,7 @@ class _SegformerLayer(nn.Module):
         self.mlp = _MixFFN(hidden_size, mlp_ratio, hidden_act)
 
     def forward(
-        self, op: builder.OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
+        self, op: OpBuilder, hidden_states: ir.Value, height: ir.Value, width: ir.Value
     ):
         # Attention block
         normed = self.layer_norm_1(op, hidden_states)
@@ -263,7 +262,7 @@ class _SegformerEncoder(nn.Module):
         self._num_stages = num_stages
         self._hidden_sizes = hidden_sizes
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = pixel_values
         all_hidden_states = []
 
@@ -302,7 +301,7 @@ class _LinearCStage(nn.Module):
         super().__init__()
         self.proj = Linear(in_features, out_features)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return self.proj(op, x)
 
 
@@ -330,7 +329,7 @@ class _SegformerDecodeHead(nn.Module):
         # Classifier
         self.classifier = Conv2d(dec_hidden, num_labels, kernel_size=1, padding=0)
 
-    def forward(self, op: builder.OpBuilder, encoder_hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, encoder_hidden_states: ir.Value):
         # Target spatial size = first stage output (largest resolution)
         target_h = op.Shape(encoder_hidden_states[0], start=2, end=3)
         target_w = op.Shape(encoder_hidden_states[0], start=3, end=4)
@@ -392,7 +391,7 @@ class SegformerForSemanticSegmentation(nn.Module):
         self.encoder = _SegformerEncoder(config)
         self.decode_head = _SegformerDecodeHead(config)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         encoder_hidden_states = self.encoder(op, pixel_values)
         logits = self.decode_head(op, encoder_hidden_states)
         return logits

@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import split_fused_qkv
@@ -73,7 +72,7 @@ class _PhiDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -117,7 +116,7 @@ class _PhiTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -169,7 +168,7 @@ class PhiCausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -399,7 +398,7 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             norm_eps=norm_eps,
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         return self.encoder(op, hidden_states)
 
@@ -407,7 +406,7 @@ class _Phi4MMSigLIPEncoder(nn.Module):
 class _GELUModule(nn.Module):
     """GELU activation as an nn.Module (no parameters)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Gelu(x)
 
 
@@ -431,7 +430,7 @@ class _Phi4MMProjectionMLP(nn.Module):
             setattr(self, str(i), layer)
         self._layers = layers
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         for layer in self._layers:
             x = layer(op, x)
         return x
@@ -451,7 +450,7 @@ class _Phi4MMImageEmbedding(nn.Module):
         self.glb_GN = nn.Parameter([1, 1, vision_hidden_size])
         self.sub_GN = nn.Parameter([1, 1, 1, vision_hidden_size])
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.img_processor(op, pixel_values)
         return self.img_projection(op, vision_features)
 
@@ -482,7 +481,7 @@ class _Phi4MMAudioEmbedding(nn.Module):
         self.speech = _Phi4MMProjectionMLP(audio_dim, text_hidden_size)
         self.vision = _Phi4MMProjectionMLP(audio_dim, text_hidden_size)
 
-    def forward(self, op: builder.OpBuilder, audio_features: ir.Value):
+    def forward(self, op: OpBuilder, audio_features: ir.Value):
         audio_hidden = self.encoder(op, audio_features)
         return self.speech(op, audio_hidden)
 
@@ -497,7 +496,7 @@ class _Phi4MMImageAudioEmbedding(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value | None = None,
         audio_features: ir.Value | None = None,
     ):
@@ -540,7 +539,7 @@ class _Phi4MMMultiModalTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -641,7 +640,7 @@ class _Phi4MMVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_sizes: ir.Value,
     ):
@@ -828,7 +827,7 @@ class _Phi4MMSpeechModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         audio_embeds: ir.Value,
         audio_sizes: ir.Value,
         audio_projection_mode: ir.Value,
@@ -875,7 +874,7 @@ class _Phi4MMEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value,
@@ -925,7 +924,7 @@ class _Phi4MMDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -982,7 +981,7 @@ class Phi4MMMultiModalModel(nn.Module):
         self.embedding = _Phi4MMEmbeddingModel(config)
         self.decoder = _Phi4MMDecoderModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Phi4MMMultiModalModel uses Phi4MMMultiModalTask "
             "which calls each sub-module (vision_encoder, "

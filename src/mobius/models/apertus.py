@@ -15,8 +15,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
@@ -44,7 +43,7 @@ class XIELUActivation(nn.Module):
         self.beta = nn.Parameter([1])
         self.eps = nn.Parameter([1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # Learnable activation scales
         alpha_p_act = op.Softplus(self.alpha_p)
         alpha_n_act = op.Add(op.Softplus(self.alpha_n), self.beta)
@@ -76,7 +75,7 @@ class ApertusFCMLP(nn.Module):
         self.down_proj = Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = XIELUActivation()
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         x = self.up_proj(op, x)
         x = self.act_fn(op, x)
         return self.down_proj(op, x)

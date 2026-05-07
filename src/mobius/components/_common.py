@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
@@ -25,7 +24,7 @@ class Linear(nn.Module):
         self.weight = nn.Parameter([out_features, in_features])
         self.bias = nn.Parameter([out_features]) if bias else None
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Transpose weight from [out_features, in_features] → [in_features, out_features]
         # so MatMul(x, w_t) computes x @ weight.T.
         # FoldTransposedInitializerPass (applied after weight loading) will
@@ -50,7 +49,7 @@ class Embedding(nn.Module):
         self.weight = nn.Parameter([num_embeddings, embedding_dim])
         self.padding_idx = padding_idx
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
         return op.Gather(self.weight, input_ids)
 
 
@@ -63,7 +62,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.LayerNormalization(
             hidden_states,
             self.weight,
@@ -87,7 +86,7 @@ class OffsetLayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         effective_weight = op.Add(self.weight, 1.0)
         return op.LayerNormalization(
             hidden_states,
@@ -110,7 +109,7 @@ class LayerNormNoBias(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.LayerNormalization(
             hidden_states,
             self.weight,
@@ -131,7 +130,7 @@ class LayerNormNoAffine(nn.Module):
         self._hidden_size = hidden_size
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # ONNX LayerNormalization requires a Scale input; use all-ones
         # since this is the no-affine variant (scale/shift come externally).
         # CastLike ensures Scale matches the input dtype (fp16/bf16/fp32).
@@ -150,14 +149,14 @@ class GroupNorm(nn.Module):
         self._num_groups = num_groups
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.GroupNormalization(
             x, self.weight, self.bias, num_groups=self._num_groups, epsilon=self._eps
         )
 
 
 def create_attention_bias(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     input_ids,
     attention_mask,
     sliding_window: int | None = None,
@@ -225,7 +224,7 @@ def create_attention_bias(
 
 
 def create_padding_mask(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     input_ids,
     attention_mask,
 ):
@@ -276,7 +275,7 @@ def create_padding_mask(
 
 
 def create_sliding_window_mask(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     input_ids: ir.Value,
     attention_mask: ir.Value,
     window_size: int,

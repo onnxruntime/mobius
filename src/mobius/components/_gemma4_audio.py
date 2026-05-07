@@ -44,8 +44,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, LayerNormNoBias, Linear
 from mobius.components._conv import CausalDepthwiseConv1d, Conv2dNoBias
@@ -60,20 +59,20 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-def _gradient_clip(op: builder.OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
+def _gradient_clip(op: OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
     """Clamp activations to ±clip_val (gradient clipping for numerical stability)."""
     lo = op.CastLike(op.Constant(value_float=-clip_val), x)
     hi = op.CastLike(op.Constant(value_float=clip_val), x)
     return op.Clip(x, lo, hi)
 
 
-def _glu(op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+def _glu(op: OpBuilder, x: ir.Value) -> ir.Value:
     """GLU: split last dim in half → a * sigmoid(b)."""
     a, b = op.Split(x, axis=-1, num_outputs=2, _outputs=2)
     return op.Mul(a, op.Sigmoid(b))
 
 
-def _swish(op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
     """SiLU/Swish activation: x * sigmoid(x)."""
     return op.Mul(x, op.Sigmoid(x))
 
@@ -115,7 +114,7 @@ class ClippableLinear(nn.Module):
         self.output_min = nn.Parameter([])
         self.output_max = nn.Parameter([])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # Clamp input activations
         x = op.Clip(x, self.input_min, self.input_max)
         # Linear: x @ weight.T [+ bias]
@@ -178,7 +177,7 @@ class Gemma4ConvSubsampling(nn.Module):
 
     def _conv_norm_relu(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         conv: Conv2dNoBias,
         norm: LayerNormNoBias,
@@ -193,7 +192,7 @@ class Gemma4ConvSubsampling(nn.Module):
 
     def _mask_and_downsample(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         mask: ir.Value | None,
     ) -> tuple[ir.Value, ir.Value | None]:
@@ -224,7 +223,7 @@ class Gemma4ConvSubsampling(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         input_features_mask: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value | None]:
@@ -301,7 +300,7 @@ class Gemma4FeedForward(nn.Module):
         self.ffw_layer_2 = ClippableLinear(hidden_size * 4, hidden_size, bias=False)
         self.post_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         residual = x
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.pre_layer_norm(op, x)
@@ -353,7 +352,7 @@ class Gemma4LightConv1d(nn.Module):
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.linear_end = ClippableLinear(hidden_size, hidden_size, bias=False)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         residual = x
         x = self.pre_layer_norm(op, x)  # [B, T, h]
         x = self.linear_start(op, x)  # [B, T, 2h]
@@ -474,7 +473,7 @@ class Gemma4Attention(nn.Module):
             [np.sin(scaled), np.cos(scaled)], axis=-1
         )  # [context_left, hidden_size]
 
-    def _build_causal_window_mask(self, op: builder.OpBuilder, seq_len: ir.Value) -> ir.Value:
+    def _build_causal_window_mask(self, op: OpBuilder, seq_len: ir.Value) -> ir.Value:
         """Build [1, 1, T, T] causal sliding-window attention bias."""
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
@@ -501,7 +500,7 @@ class Gemma4Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         attention_mask: ir.Value | None = None,
     ) -> ir.Value:
@@ -684,7 +683,7 @@ class Gemma4AudioLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         attention_mask: ir.Value | None = None,
     ) -> ir.Value:
@@ -789,7 +788,7 @@ class Gemma4AudioEncoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_features: ir.Value,
         input_features_mask: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value | None]:
