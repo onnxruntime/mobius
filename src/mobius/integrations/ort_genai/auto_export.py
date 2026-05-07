@@ -5,11 +5,13 @@
 
 Three entry points, in order of increasing convenience:
 
-- :func:`write_ort_genai_config` — config-only API. Takes an already-built
-  :class:`~mobius._model_package.ModelPackage` (with weights already saved
-  separately) and writes the ORT-GenAI config artifacts
-  (``genai_config.json``, tokenizer files, ``processor_config.json`` /
-  ``image_processor.json``) into a directory.
+- :func:`write_ort_genai_config` — config-only API.  Generates the ORT-GenAI
+  config artifacts (``genai_config.json``, tokenizer files,
+  ``processor_config.json`` / ``image_processor.json``) for an already-built
+  :class:`~mobius._model_package.ModelPackage`.  Does **not** write any ONNX
+  files — call :meth:`ModelPackage.save` separately if the ONNX models are
+  not already on disk.  The package only needs ``pkg.config`` and the model
+  graph metadata; weights need not have been written yet.
 
 - :func:`export_package` — save+config API. Takes an already-built
   ``ModelPackage`` and writes both the ONNX models AND the ORT-GenAI config
@@ -24,12 +26,15 @@ All three produce a directory that ``onnxruntime-genai`` can load directly.
 
 Example::
 
-    # Config-only — when ONNX is already on disk
+    # Config-only — assumes you've already saved the ONNX files yourself
+    from mobius import build
     from mobius.integrations.ort_genai import write_ort_genai_config
+
+    pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
+    pkg.save("/output/qwen3")  # write ONNX + weights first
     write_ort_genai_config(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B")
 
-    # Save + config — when you have a built package in memory
-    from mobius import build
+    # Save + config — single call, when you have a built package in memory
     from mobius.integrations.ort_genai import export_package
 
     pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
@@ -884,11 +889,14 @@ def export_package(
 
     Args:
         pkg: Already-built :class:`~mobius._model_package.ModelPackage` with
-            weights applied and ``config`` set.  Must contain all components
-            you want exported; partial exports are not supported because the
-            generated ``genai_config.json`` would reference components that
-            do not exist on disk.  Build a separate filtered package if you
-            need a subset.
+            weights applied and ``config`` set.  All components in *pkg* are
+            saved; selective export via :meth:`ModelPackage.save`'s
+            ``components`` filter is intentionally not exposed here, because
+            the ORT-GenAI runtime expects the on-disk file layout to match
+            what ``model.type`` in :file:`genai_config.json` declares (e.g. a
+            multimodal ``model.type`` implies a vision encoder file is
+            present).  If you need a partial export, build a separate
+            filtered ``ModelPackage`` first.
         output_dir: Output directory (created if needed).
         hf_model_id: HuggingFace model ID for tokenizer download / token-id
             resolution.  When ``None``, token IDs are read from ``pkg.config``
@@ -1036,7 +1044,8 @@ def auto_export(
             "Diffusion models are not yet supported."
         )
 
-    # Delegate save + config generation to the integration helper
+    # Delegate save + config generation to the integration helper.
+    # `export_package` already logs "Export complete" so we don't repeat it here.
     result = export_package(
         pkg,
         output_dir,
@@ -1047,5 +1056,4 @@ def auto_export(
         progress_bar=progress_bar,
     )
 
-    logger.info("Export complete: %d artifacts", len(result))
     return result
