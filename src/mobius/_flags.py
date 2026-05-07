@@ -81,9 +81,9 @@ class _Flags:
            deduplication pass.
        * - ``ort_lower_opset_for_ep``
          - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
-         - ``True``
+         - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
-           (ORT ≤1.24.x workaround).
+           (ORT ≤1.24.x workaround). Disabled by default.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -104,16 +104,16 @@ class _Flags:
     """
 
     ort_lower_opset_for_ep: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_ORT_LOWER_OPSET_FOR_EP", True)
+        default_factory=lambda: _env_bool("MOBIUS_ORT_LOWER_OPSET_FOR_EP", False)
     )
     """Lower the ONNX default-domain opset declaration to 23 when creating
     ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
 
-    ORT ≤1.24.x EPs don't register kernels for opset 24 standard ops
+    ORT ≤1.24.x EPs didn't register kernels for opset 24 standard ops
     (Squeeze, Reshape, etc.) even though the semantics are unchanged.
     Lowering the import declaration lets the EP find its existing kernels.
-    Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
-    opset 24 kernel support.
+    Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
+    an older ORT build without opset 24 kernel registration.
     """
 
 

@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen1.5-MoE-A2.7B-Chat"
+model_type: "qwen2_moe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

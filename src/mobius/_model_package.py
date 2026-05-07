@@ -78,6 +78,14 @@ class ModelPackage(UserDict[str, ir.Model]):
             external_data: External data format. ``"onnx"`` (default) saves
                 weights to ``model.onnx.data``. ``"safetensors"`` saves
                 weights in safetensors format.
+
+                .. warning::
+                    The safetensors format does not guarantee 256-byte offset
+                    alignment for tensor data within the file.  This can cause
+                    ``CUBLAS_STATUS_INVALID_VALUE`` ("misaligned address")
+                    errors on some CUDA/cuBLAS versions when loading weights
+                    via memory-mapped I/O.  Use ``"onnx"`` (the default) for
+                    models targeting CUDA execution.
             max_shard_size_bytes: Maximum shard size in bytes for safetensors
                 format.  Only used when *external_data* is ``"safetensors"``.
             components: Optional predicate ``(name) -> bool`` that selects

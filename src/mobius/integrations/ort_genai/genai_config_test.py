@@ -136,8 +136,8 @@ class TestGenaiConfigGeneratorLLM:
         assert search["top_p"] == pytest.approx(1.0)
         # max_length tracks the model's context window
         assert search["max_length"] == 8192
-        # CPU does not share past/present KV buffers
-        assert search["past_present_share_buffer"] is False
+        # CPU shares past/present KV buffers (all GQA-capable EPs do)
+        assert search["past_present_share_buffer"] is True
 
     def test_search_params_webgpu_sets_past_present_share_buffer(self):
         """WebGPU EP sets supports_past_present_share_buffer=True via EpCapabilities and caps max_length."""
@@ -174,8 +174,13 @@ class TestGenaiConfigGeneratorLLM:
         assert config["search"]["past_present_share_buffer"] is True
         assert config["search"]["max_length"] == 2048
 
-    def test_search_params_cuda_does_not_share_buffer(self):
-        """CUDA EP does not set past_present_share_buffer by default."""
+    def test_search_params_cuda_shares_buffer(self):
+        """CUDA EP sets past_present_share_buffer=True (all GQA-capable EPs do).
+
+        CUDA does NOT cap max_length — only memory-constrained EPs (WebGPU)
+        set ``cap_kv_buffer_max_length=True``.  Server-class GPUs handle
+        large pre-allocations.
+        """
         gen = GenaiConfigGenerator(
             "llama",
             vocab_size=32000,
@@ -185,15 +190,19 @@ class TestGenaiConfigGeneratorLLM:
             num_key_value_heads=8,
             head_dim=128,
             ep="cuda",
+            context_length=131072,
         )
         config = gen.generate()
-        assert config["search"]["past_present_share_buffer"] is False
+        assert config["search"]["past_present_share_buffer"] is True
+        # CUDA: full context_length, NOT capped at 4096
+        assert config["search"]["max_length"] == 131072
 
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
 
         This proves the value comes from EpCapabilities, not from a hardcoded
-        'ep == webgpu' check.
+        'ep == webgpu' check.  The custom EP does NOT set
+        ``cap_kv_buffer_max_length``, so max_length is the full context.
         """
         from mobius._execution_providers import EpCapabilities, ep_registry
 
@@ -215,11 +224,42 @@ class TestGenaiConfigGeneratorLLM:
             )
             config = gen.generate()
             assert config["search"]["past_present_share_buffer"] is True
-            # Buffer-sharing EP: max_length capped at 4096
-            assert config["search"]["max_length"] == 4096
+            # No cap_kv_buffer_max_length: max_length = full context_length
+            assert config["search"]["max_length"] == 8192
         finally:
             # Clean up the test EP so it doesn't bleed into other tests
             ep_registry._entries.pop("test-custom-ep", None)
+
+    def test_search_params_custom_ep_with_max_length_cap(self):
+        """A custom EP with cap_kv_buffer_max_length=True caps max_length at 4096."""
+        from mobius._execution_providers import EpCapabilities, ep_registry
+
+        ep_registry.register(
+            EpCapabilities(
+                name="test-capped-ep",
+                supports_past_present_share_buffer=True,
+                cap_kv_buffer_max_length=True,
+            ),
+            overwrite=True,
+        )
+        try:
+            gen = GenaiConfigGenerator(
+                "llama",
+                vocab_size=32000,
+                hidden_size=4096,
+                num_hidden_layers=32,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+                ep="test-capped-ep",
+                context_length=131072,
+            )
+            config = gen.generate()
+            assert config["search"]["past_present_share_buffer"] is True
+            # cap_kv_buffer_max_length=True: max_length capped at 4096
+            assert config["search"]["max_length"] == 4096
+        finally:
+            ep_registry._entries.pop("test-capped-ep", None)
 
     def test_session_options_present(self):
         """Decoder has session_options with log_id."""
@@ -282,6 +322,12 @@ class TestGenaiConfigGeneratorVLM:
         inputs = config["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in inputs
         assert "input_ids" not in inputs
+
+    def test_vlm_decoder_filename_uses_subdirectory(self):
+        """VLM decoder filename includes the decoder/ subdirectory."""
+        config = self._make_vlm_gen().generate()
+        decoder = config["model"]["decoder"]
+        assert decoder["filename"] == "decoder/model.onnx"
 
     def test_vlm_token_ids_at_model_level(self):
         """VLM-specific token IDs are at the model level."""
@@ -686,22 +732,22 @@ class TestMakeSessionOptions:
         assert opts["provider_options"] == []
 
     def test_cuda_has_cuda_provider_options(self):
-        """CUDA EP produces a provider_options entry for CUDAExecutionProvider."""
+        """CUDA EP produces a provider_options entry for cuda."""
         from mobius.integrations.ort_genai.genai_config import _make_session_options
 
         opts = _make_session_options("cuda")
         assert opts["log_id"] == "onnxruntime-genai"
         assert len(opts["provider_options"]) == 1
-        assert "CUDAExecutionProvider" in opts["provider_options"][0]
+        assert "cuda" in opts["provider_options"][0]
 
     def test_dml_has_dml_provider_options(self):
-        """DML EP produces a provider_options entry for DmlExecutionProvider."""
+        """DML EP produces a provider_options entry for dml."""
         from mobius.integrations.ort_genai.genai_config import _make_session_options
 
         opts = _make_session_options("dml")
         assert opts["log_id"] == "onnxruntime-genai"
         assert len(opts["provider_options"]) == 1
-        assert "DmlExecutionProvider" in opts["provider_options"][0]
+        assert "dml" in opts["provider_options"][0]
 
 
 class TestGenaiConfigGeneratorEp:
@@ -729,7 +775,7 @@ class TestGenaiConfigGeneratorEp:
         config = self._gen("cuda").generate()
         opts = config["model"]["decoder"]["session_options"]["provider_options"]
         assert len(opts) == 1
-        assert "CUDAExecutionProvider" in opts[0]
+        assert "cuda" in opts[0]
 
     def test_cuda_ep_all_blocks_have_cuda_session_options(self):
         """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, audio)."""
@@ -755,6 +801,4 @@ class TestGenaiConfigGeneratorEp:
             session_opts = config["model"][block]["session_options"]
             provider_options = session_opts["provider_options"]
             assert len(provider_options) == 1, f"{block} missing CUDA provider options"
-            assert "CUDAExecutionProvider" in provider_options[0], (
-                f"{block} has wrong EP in provider_options"
-            )
+            assert "cuda" in provider_options[0], f"{block} has wrong EP in provider_options"

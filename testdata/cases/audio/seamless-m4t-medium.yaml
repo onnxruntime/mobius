@@ -1,4 +1,5 @@
 model_id: "facebook/hf-seamless-m4t-medium"
+model_type: "seamless_m4t"
 revision: "main"
 task_type: "speech-to-text"
 dtype: "float32"

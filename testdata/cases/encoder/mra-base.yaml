@@ -1,4 +1,5 @@
 model_id: "uw-madison/mra-base-512-4"
+model_type: "mra"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

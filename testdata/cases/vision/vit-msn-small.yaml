@@ -1,4 +1,5 @@
 model_id: "facebook/vit-msn-small"
+model_type: "vit_msn"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

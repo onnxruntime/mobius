@@ -49,42 +49,34 @@ def _build_ssm_task(
     batch = ir.SymbolicDim("batch")
     seq_len = ir.SymbolicDim("sequence_len")
 
-    input_ids = ir.Value(
-        name="input_ids",
-        shape=ir.Shape([batch, seq_len]),
-        type=ir.TensorType(ir.DataType.INT64),
-    )
-    graph_inputs: list[ir.Value] = [input_ids]
+    graph, builder = _make_graph()
+
+    input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
     past_states: list[tuple[ir.Value, ir.Value]] = []
     for i in range(config.num_hidden_layers):
-        conv_state = ir.Value(
-            name=f"past_states.{i}.conv_state",
-            shape=ir.Shape([batch, *conv_state_shape]),
-            type=ir.TensorType(config.dtype),
+        conv_state = builder.input(
+            f"past_states.{i}.conv_state",
+            dtype=config.dtype,
+            shape=[batch, *conv_state_shape],
         )
-        ssm_state = ir.Value(
-            name=f"past_states.{i}.ssm_state",
-            shape=ir.Shape([batch, *ssm_state_shape]),
-            type=ir.TensorType(config.dtype),
+        ssm_state = builder.input(
+            f"past_states.{i}.ssm_state",
+            dtype=config.dtype,
+            shape=[batch, *ssm_state_shape],
         )
-        graph_inputs.extend([conv_state, ssm_state])
         past_states.append((conv_state, ssm_state))
 
-    graph, builder = _make_graph(graph_inputs)
     logits, present_states = module(
         builder.op,
         input_ids=input_ids,
         past_states=past_states,
     )
 
-    logits.name = "logits"
-    graph.outputs.append(logits)
+    builder.add_output(logits, "logits")
     for i, (conv_state, ssm_state) in enumerate(present_states):
-        conv_state.name = f"present.{i}.conv_state"
-        ssm_state.name = f"present.{i}.ssm_state"
-        graph.outputs.append(conv_state)
-        graph.outputs.append(ssm_state)
+        builder.add_output(conv_state, f"present.{i}.conv_state")
+        builder.add_output(ssm_state, f"present.{i}.ssm_state")
 
     return ModelPackage({"model": _make_model(graph)}, config=config)
 

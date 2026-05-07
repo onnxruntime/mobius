@@ -1,0 +1,16 @@
+model_id: "mlx-community/SenseVoiceSmall"
+model_type: "sensevoice_small"
+revision: "main"
+task_type: "audio-ctc"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+notes: >
+  SenseVoiceSmall CTC encoder-only ASR. Single model: SANM encoder + CTC head.
+  Audio input is LFR fbank features (batch, seq_len, 560) with language ID.
+  Weights in safetensors format at mlx-community/SenseVoiceSmall.

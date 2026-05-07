@@ -37,24 +37,16 @@ class FeatureExtractionTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-        token_type_ids = ir.Value(
-            name="token_type_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
-        )
-
-        graph, builder = _make_graph([input_ids, attention_mask, token_type_ids])
+        graph, builder = _make_graph()
         op = builder.op
+
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
+        token_type_ids = builder.input(
+            "token_type_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
 
         last_hidden_state = module(
             op,
@@ -63,7 +55,6 @@ class FeatureExtractionTask(ModelTask):
             token_type_ids=token_type_ids,
         )
 
-        last_hidden_state.name = "last_hidden_state"
-        graph.outputs.append(last_hidden_state)
+        builder.add_output(last_hidden_state, "last_hidden_state")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

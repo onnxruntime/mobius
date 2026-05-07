@@ -6,6 +6,7 @@
   "type": "object",
   "required": [
     "model_id",
+    "model_type",
     "revision",
     "task_type",
     "dtype",
@@ -22,6 +23,11 @@
         "google-bert/bert-base-uncased"
       ]
     },
+    "model_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Registry model_type key (e.g. 'llama', 'qwen2'). Must match a key in mobius._registry."
+    },
     "revision": {
       "type": "string",
       "minLength": 1,
@@ -34,11 +40,13 @@
     "task_type": {
       "type": "string",
       "enum": [
+        "audio-ctc",
         "audio-feature-extraction",
         "audio-to-audio",
         "codec",
         "depth-estimation",
         "feature-extraction",
+        "fun-asr-speech-language",
         "image-classification",
         "image-segmentation",
         "image-text-to-text",

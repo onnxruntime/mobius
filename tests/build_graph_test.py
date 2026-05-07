@@ -1415,6 +1415,74 @@ class TestBuildGraphVisionLanguage:
         assert "present.1.key" not in output_names
         assert "present.1.value" not in output_names
 
+    def test_gemma4_k_eq_v_with_global_kv_heads(self):
+        """Verify attention_k_eq_v removes v_proj and num_global_key_value_heads sets KV cache shapes.
+
+        Config: attention_k_eq_v=True, num_key_value_heads=4 (sliding),
+        num_global_key_value_heads=2 (full). Full-attention layers should:
+        - Have no v_proj initializer (V=K)
+        - Use num_global_key_value_heads=2 for KV cache shapes
+        Sliding layers should use num_key_value_heads=4.
+        """
+        from mobius._configs import Gemma4Config
+        from mobius.models.gemma4 import Gemma4CausalLMModel
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            # Layer 0: sliding, Layer 1: full (k_eq_v + global heads)
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            attention_k_eq_v=True,
+            num_global_key_value_heads=2,
+        )
+        module = Gemma4CausalLMModel(config)
+        task = Gemma4TextCausalLMTask()
+        pkg = task.build(module, config)
+        decoder = pkg["model"]
+
+        # Check initializer names: full-attention layer (1) should have no v_proj
+        init_names = set(decoder.graph.initializers)
+        # Sliding layer 0 has k_proj, v_proj
+        assert "model.layers.0.self_attn.k_proj.weight" in init_names
+        assert "model.layers.0.self_attn.v_proj.weight" in init_names
+        # Full layer 1 has k_proj but NO v_proj (k_eq_v: V=K)
+        assert "model.layers.1.self_attn.k_proj.weight" in init_names
+        assert "model.layers.1.self_attn.v_proj.weight" not in init_names
+
+        # KV cache shapes:
+        # Layer 0 (sliding): num_key_value_heads=4
+        # Layer 1 (full): num_global_key_value_heads=2
+        input_shapes = {i.name: list(i.shape) for i in decoder.graph.inputs}
+        # Layer 0: kv_heads=4
+        layer0_key_shape = input_shapes["past_key_values.0.key"]
+        assert layer0_key_shape[1] == 4, (
+            f"Sliding layer 0 should have 4 KV heads, got {layer0_key_shape[1]}"
+        )
+        # Layer 1: kv_heads=2 (num_global_key_value_heads)
+        layer1_key_shape = input_shapes["past_key_values.1.key"]
+        assert layer1_key_shape[1] == 2, (
+            f"Full layer 1 should have 2 KV heads "
+            f"(num_global_key_value_heads), got {layer1_key_shape[1]}"
+        )
+
     def test_blip2_vision_language_graph(self):
         """Build BLIP-2 with ViT + Q-Former + LLM 3-model split."""
         config = _base_config(
@@ -1789,6 +1857,117 @@ class TestBuildGraphDtype:
                 f"Initializer '{name}' dtype is {init.dtype}, expected {expected_dtype}"
             )
 
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_multimodal_encoder_inputs_are_float32(self, dtype_str):
+        """Vision/audio encoder graph inputs stay f32 with Cast at entry.
+
+        When building multimodal models with f16/bf16, encoder graph inputs
+        (pixel_values, input_features) must remain FLOAT because ORT GenAI's
+        image/audio processors output f32. A Cast node at graph entry converts
+        to the target dtype for the encoder's internal computation.
+        """
+        # Use a VL model with 3-model split (vision_encoder is separate)
+        config = _base_config(
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            image_token_id=32000,
+        )
+        config.dtype = DTYPE_MAP[dtype_str]
+        model_cls = registry.get("llava")
+        module = model_cls(config)
+        task = get_task("vision-language")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values input must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pixel_values_input = vision_model.graph.inputs[0]
+        assert pixel_values_input.name == "pixel_values"
+        assert pixel_values_input.dtype == ir.DataType.FLOAT, (
+            f"Vision encoder input dtype is {pixel_values_input.dtype}, "
+            f"expected FLOAT (Cast should handle conversion to {dtype_str})"
+        )
+
+        # First non-input node should be Cast to target dtype
+        first_node = next(iter(vision_model.graph))
+        assert first_node.op_type == "Cast", (
+            f"Expected Cast as first node, got {first_node.op_type}"
+        )
+
+    @pytest.mark.parametrize(
+        "dtype_str",
+        ["f16", "bf16"],
+    )
+    def test_gemma4_encoder_inputs_are_float32(self, dtype_str):
+        """Gemma4 vision and audio encoder inputs stay f32 in bf16/f16 builds."""
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "sliding_attention"],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=1,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                input_size=16,
+                hidden_size=32,
+                num_layers=1,
+                output_dim=64,
+                output_proj_dims=64,
+                audio_token_id=255998,
+            ),
+            dtype=DTYPE_MAP[dtype_str],
+        )
+        model_cls = registry.get("gemma4")
+        module = model_cls(config)
+        task = get_task("gemma4")
+        pkg = task.build(module, config)
+
+        # Vision encoder pixel_values must be FLOAT
+        vision_model = pkg["vision_encoder"]
+        pv_input = vision_model.graph.inputs[0]
+        assert pv_input.name == "pixel_values"
+        assert pv_input.dtype == ir.DataType.FLOAT
+
+        # Audio encoder input_features must be FLOAT
+        audio_model = pkg["audio_encoder"]
+        af_input = audio_model.graph.inputs[0]
+        assert af_input.name == "input_features"
+        assert af_input.dtype == ir.DataType.FLOAT
+
 
 class TestBuildGraphMultiModal:
     """Verify Phi4MM builds with Phi4MMMultiModalTask (4-model split)."""
@@ -2044,9 +2223,43 @@ class TestBuildGraphQwen3ASR:
 
         input_names = {inp.name for inp in encoder.graph.inputs}
         assert "input_features" in input_names
+        # feature_attention_mask is required so the encoder can ignore
+        # padded mel frames; without it the LLM emits degenerate loops
+        # on any input padded by the standard HF processor.
+        assert "feature_attention_mask" in input_names
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "audio_features" in output_names
+        # audio_feature_lengths exposes the valid token count after
+        # the encoder's 8x time downsampling so downstream callers can
+        # crop padding-derived rows out of audio_features before the
+        # embedding gather.
+        assert "audio_feature_lengths" in output_names
+
+    def test_audio_encoder_attention_uses_mask(self):
+        """The encoder's Attention ops must receive the mask input.
+
+        Guards against accidentally dropping the mask wiring inside
+        the encoder forward — the graph builds without it but the
+        encoder behaves the same as the pre-fix version.
+        """
+        from mobius.models.qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        from mobius.tasks import SpeechLanguageTask
+
+        config = self._asr_config()
+        module = Qwen3ASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=SpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        attention_nodes = [n for n in encoder.graph if n.op_type == "Attention"]
+        assert attention_nodes, "audio encoder must contain Attention ops"
+        for node in attention_nodes:
+            # 4th positional input on op.Attention is attn_mask; must
+            # be a wired value, not None / empty.
+            assert len(node.inputs) >= 4
+            assert node.inputs[3] is not None
 
     def test_embedding_io(self):
         """Verify embedding model inputs/outputs."""
@@ -2139,9 +2352,26 @@ class TestBuildGraphQwen3ASR:
 
         # Step 1: Audio encoder — random mel input
         enc_sess = OnnxModelSession(pkg["audio_encoder"])
-        mel = np.random.randn(1, config.audio.num_mel_bins, 100).astype(np.float32)
-        enc_out = enc_sess.run({"input_features": mel})
+        mel_seq = 100
+        mel = np.random.randn(1, config.audio.num_mel_bins, mel_seq).astype(np.float32)
+        # Mark the last 20 mel frames as padding to exercise the mask
+        # path. The encoder must crop the corresponding audio rows so
+        # they don't leak into the embedding's Gather.
+        feature_attention_mask = np.ones((1, mel_seq), dtype=np.int64)
+        feature_attention_mask[:, -20:] = 0
+        enc_out = enc_sess.run(
+            {
+                "input_features": mel,
+                "feature_attention_mask": feature_attention_mask,
+            }
+        )
         audio_features = enc_out["audio_features"]
+        audio_feature_lengths = enc_out["audio_feature_lengths"]
+        # Crop padding-derived rows before passing to the embedding —
+        # this mirrors what production callers must do.
+        valid_len = int(audio_feature_lengths[0])
+        assert 0 < valid_len <= audio_features.shape[1]
+        audio_features = audio_features[:, :valid_len, :]
         num_audio_tokens = audio_features.shape[1]
         # Flatten to 2D: (num_audio_tokens, output_dim)
         audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
@@ -2194,6 +2424,183 @@ class TestBuildGraphQwen3ASR:
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": np.ones((1, seq_len), dtype=np.int64),
                 "position_ids": position_ids,
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        logits = dec_out["logits"]
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == seq_len
+
+
+class TestBuildGraphFunASR:
+    """Verify Fun-ASR-Nano 3-model split with FunASRSpeechLanguageTask."""
+
+    def _fun_asr_config(self):
+        return _base_config(
+            attn_qk_norm=True,
+            hidden_act="silu",
+            audio=AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                num_blocks=3,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=TINY_HIDDEN,
+                audio_token_id=100,
+                adaptor_proj_dim=TINY_INTERMEDIATE,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=TINY_HEADS,
+            ),
+        )
+
+    def test_package_builds_3_models(self):
+        """Build Fun-ASR and verify 3-model package."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        assert "audio_encoder" in pkg
+        assert "embedding" in pkg
+        assert "decoder" in pkg
+
+    def test_audio_encoder_io(self):
+        """Verify audio encoder inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        input_names = {inp.name for inp in encoder.graph.inputs}
+        assert "input_features" in input_names
+
+        output_names = {out.name for out in encoder.graph.outputs}
+        assert "audio_features" in output_names
+
+    def test_embedding_io(self):
+        """Verify embedding model inputs/outputs."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        embedding = pkg["embedding"]
+
+        input_names = {inp.name for inp in embedding.graph.inputs}
+        assert "input_ids" in input_names
+        assert "audio_features" in input_names
+
+        output_names = {out.name for out in embedding.graph.outputs}
+        assert "inputs_embeds" in output_names
+
+    def test_decoder_io(self):
+        """Verify decoder has standard position_ids and KV cache."""
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+        decoder = pkg["decoder"]
+
+        input_names = {inp.name for inp in decoder.graph.inputs}
+        assert "inputs_embeds" in input_names
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
+
+        output_names = {out.name for out in decoder.graph.outputs}
+        assert "logits" in output_names
+        assert "present.0.key" in output_names
+        assert "present.0.value" in output_names
+
+    def test_registry_lookup(self):
+        """Verify fun_asr is registered with fun-asr-speech-language task."""
+        model_cls = registry.get("fun_asr")
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+
+        assert model_cls is FunASRForConditionalGeneration
+        assert _default_task_for_model("fun_asr") == "fun-asr-speech-language"
+
+    def test_3model_pipeline_runs_with_ort(self):
+        """Run audio_encoder → embedding → decoder with ORT."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.fun_asr import FunASRForConditionalGeneration
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import FunASRSpeechLanguageTask
+
+        config = self._fun_asr_config()
+        module = FunASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=FunASRSpeechLanguageTask())
+
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        # Step 1: Audio encoder — random fbank input
+        # Sequence length must be even (temporal pooling halves it)
+        input_dim = config.audio.input_size
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        fbank = np.random.randn(1, 100, input_dim).astype(np.float32)
+        enc_out = enc_sess.run({"input_features": fbank})
+        audio_features = enc_out["audio_features"]
+        num_audio_tokens = audio_features.shape[1]
+        audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
+        enc_sess.close()
+
+        # Step 2: Embedding — mix text + audio tokens
+        audio_token_id = config.audio.audio_token_id
+        prefix = [1, 2, 3]
+        suffix = [4, 5]
+        input_ids = np.array(
+            [prefix + [audio_token_id] * num_audio_tokens + suffix],
+            dtype=np.int64,
+        )
+
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        embed_out = embed_sess.run(
+            {
+                "input_ids": input_ids,
+                "audio_features": audio_features_2d,
+            }
+        )
+        inputs_embeds = embed_out["inputs_embeds"]
+        embed_sess.close()
+
+        seq_len = inputs_embeds.shape[1]
+        assert seq_len == input_ids.shape[1]
+        assert inputs_embeds.shape[2] == config.hidden_size
+
+        # Step 3: Decoder — single forward pass
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        past_kv = {}
+        for i in range(config.num_hidden_layers):
+            past_kv[f"past_key_values.{i}.key"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+            past_kv[f"past_key_values.{i}.value"] = np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim),
+                dtype=np.float32,
+            )
+
+        pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": pos,
                 **past_kv,
             }
         )
@@ -3855,6 +4262,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "wav2vec2-conformer",
     "wavlm",
     # Audio/TTS dedicated tests
+    "fun_asr",
     "qwen3_asr",
     "qwen3_forced_aligner",
     "qwen3_tts",

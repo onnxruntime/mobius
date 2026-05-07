@@ -12,6 +12,7 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -52,39 +53,43 @@ class MultiModalTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph()
+        op = builder.op
+
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
 
         image_size = config.vision.image_size or 224 if config.vision else 224
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, 3, image_size, image_size]),
-            type=ir.TensorType(config.dtype),
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, 3, image_size, image_size],
         )
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
 
         audio_input_size = (config.audio.input_size if config.audio else None) or 80
-        audio_features = ir.Value(
-            name="audio_features",
-            shape=ir.Shape([batch, "audio_seq_len", audio_input_size]),
-            type=ir.TensorType(config.dtype),
+        audio_features = builder.input(
+            "audio_features",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, "audio_seq_len", audio_input_size],
         )
+        audio_features = _cast_encoder_input(op, audio_features, config)
 
-        graph_inputs = [input_ids, attention_mask, position_ids, pixel_values, audio_features]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             config.num_hidden_layers,
             config.num_key_value_heads,
             config.head_dim,
@@ -92,10 +97,6 @@ class MultiModalTask(ModelTask):
             batch,
             past_seq_len,
         )
-        graph_inputs.extend(kv_inputs)
-
-        graph, builder = _make_graph(graph_inputs)
-        op = builder.op
 
         logits, present_key_values = module(
             op,
@@ -107,8 +108,7 @@ class MultiModalTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
-        _register_kv_cache_outputs(graph, present_key_values)
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(builder, present_key_values)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

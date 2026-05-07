@@ -1,4 +1,5 @@
 model_id: "google-bert/bert-base-uncased"
+model_type: "bert"
 revision: "86b5e0934494bd15c9632b12f734a8a67f723594"
 task_type: "feature-extraction"
 dtype: "float32"

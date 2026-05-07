@@ -1,4 +1,5 @@
 model_id: "microsoft/beit-base-patch16-224"
+model_type: "beit"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

@@ -109,30 +109,24 @@ def linear_attention(
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
 
-    # --- Define function inputs (conditional on update_rule) ---
-    # TODO: Investigate relaxing onnx-shape-inference's strict arity check
-    # to allow trailing optional inputs, enabling a single 6-input signature.
-    # The function is specialized per-model: only inputs actually used
-    # by this update_rule variant are declared.  Call sites (e.g.
-    # Mamba2Block with "gated") pass exactly the declared number of args.
+    # --- Define function inputs ---
+    # Always declare the full 6-input signature:
+    # (query, key, value, past_state, decay, beta).
+    # Update-rule-specific paths inside the function body ignore unused
+    # trailing inputs so every variant exposes the same ir.Function
+    # interface.  Call sites that don't need trailing inputs (decay, beta)
+    # simply omit them — onnx-shape-inference >=0.1.9 accepts trailing
+    # optional inputs (matching ONNX C++ behavior).
     inputs: list[ir.Value] = [
         ir.Value(name="query"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="key"),  # (B, T, q_num_heads * d_k)
         ir.Value(name="value"),  # (B, T, kv_num_heads * d_v)
         ir.Value(name="past_state"),
+        ir.Value(name="decay"),
+        ir.Value(name="beta"),
     ]
-    if uses_decay:
-        inputs.append(ir.Value(name="decay"))
-    if uses_beta:
-        inputs.append(ir.Value(name="beta"))
 
-    def body(op, *args):
-        query_v, key_v, value_v, past_state_v = args[:4]
-        idx = 4
-        decay_v = args[idx] if uses_decay else None
-        if uses_decay:
-            idx += 1
-        beta_v = args[idx] if uses_beta else None
+    def body(op, query_v, key_v, value_v, past_state_v, decay_v, beta_v):
 
         # --- Reshape 3D → 4D using head counts ---
         b_dim = op.Shape(query_v, start=0, end=1)

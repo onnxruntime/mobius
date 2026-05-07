@@ -34,6 +34,7 @@ __all__ = [
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
     "FluxTransformer2DModel",
+    "FunASRForConditionalGeneration",
     "GPT2CausalLMModel",
     "GPTJCausalLMModel",
     "GPTNeoXCausalLMModel",
@@ -98,6 +99,7 @@ __all__ = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
+    "SenseVoiceSmallModel",
     "Qwen3TTSCodePredictorModel",
     "Qwen3TTSCodecDecoderModel",
     "Qwen3TTSCodecEncoderModel",
@@ -152,6 +154,7 @@ from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
+from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.models.gemma3_text import Gemma3CausalLMModel
@@ -243,6 +246,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
+from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration

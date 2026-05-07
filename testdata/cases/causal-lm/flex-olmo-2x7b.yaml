@@ -1,4 +1,5 @@
 model_id: "allenai/Flex-reddit-2x7B-1T"
+model_type: "flex_olmo"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

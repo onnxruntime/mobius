@@ -42,8 +42,6 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_attention_bias,
-    create_padding_mask,
-    create_sliding_window_mask,
     initialize_rope,
 )
 from mobius.components._activations import get_activation
@@ -54,6 +52,39 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
+
+
+# ---------------------------------------------------------------------------
+# Shared weight preprocessing helpers
+# ---------------------------------------------------------------------------
+
+
+def _remap_moe_expert_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> None:
+    """Rename HF MoE expert weights and fold router scale in-place.
+
+    Shared by ``Gemma4CausalLMModel`` and ``Gemma4Model`` to avoid
+    duplicating the rename/fold logic.
+    """
+    # experts.gate_up_proj → fc1_experts_weights
+    # experts.down_proj    → fc2_experts_weights
+    for key in list(state_dict.keys()):
+        if ".experts.gate_up_proj" in key:
+            new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+        elif ".experts.down_proj" in key:
+            new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
+            state_dict[new_key] = state_dict.pop(key)
+
+    # Fold hidden_size^-0.5 into router.scale
+    if config.enable_moe_block:
+        scale_factor = float(config.hidden_size**-0.5)
+        for key in list(state_dict.keys()):
+            if ".router.scale" in key and ".per_expert_scale" not in key:
+                state_dict[key] = state_dict[key] * scale_factor
+
 
 # ---------------------------------------------------------------------------
 # Scale-free RMSNorm (Gemma4RMSNorm with with_scale=False)
@@ -67,27 +98,29 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
     Used for V norms in the vision encoder, the vision projector pre-norm,
     and the audio pre-projection norm.
 
-    Implemented as manual ``x / sqrt(mean(x²) + ε)`` rather than
-    ``op.RMSNormalization`` to prevent ORT's graph optimizer from fusing
-    an upstream ``Add(bias)`` into ``SkipSimplifiedLayerNormalization``,
-    which requires the skip tensor to have the same shape as the input
-    (failing when the bias is 1D or has mismatched temporal dimension).
+    Uses ``op.RMSNormalization`` with ``stash_type=1`` (float32 accumulation)
+    to handle FP16 overflow: values > 256 squared exceed the FP16 max (65504).
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
         self.eps = eps
+        # Constant all-ones scale (not a learnable parameter from HF).
+        self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        # Manual RMSNorm: x / sqrt(mean(x²) + ε), scale = 1.0 (scale-free).
-        # Using primitive ops avoids ORT's SkipLayerNorm fusion pattern which
-        # would corrupt the skip shape when an upstream Add uses a 1D bias.
-        square = op.Mul(hidden_states, hidden_states)
-        mean_sq = op.ReduceMean(square, op.Constant(value_ints=[-1]), keepdims=1)
-        eps = op.CastLike(op.Constant(value_float=self.eps), mean_sq)
-        rms = op.Sqrt(op.Add(mean_sq, eps))
-        return op.Div(hidden_states, rms)
+        # stash_type=1 means accumulate variance in float32, avoiding
+        # FP16 overflow when squaring large values.
+        # CastLike ensures the weight matches the input dtype.
+        scale = op.CastLike(self.weight, hidden_states)
+        return op.RMSNormalization(
+            hidden_states,
+            scale,
+            axis=-1,
+            epsilon=self.eps,
+            stash_type=1,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +150,16 @@ class Gemma4VisionSelfAttention(nn.Module):
         norm_eps: float = 1e-6,
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.q_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.o_proj = ClippableLinear(num_heads * self.head_dim, hidden_size, bias=False)
+        linear_class = ClippableLinear if use_clipped_linears else Linear
+        self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
+        self.o_proj = linear_class(num_heads * self.head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.v_norm = _Gemma4ScaleFreeRMSNorm(self.head_dim, eps=norm_eps)
@@ -283,10 +318,16 @@ class Gemma4VisionEncoderLayer(nn.Module):
         hidden_act: str = "gelu_pytorch_tanh",
         rope_theta: float = 100.0,
         max_position: int = 128,
+        use_clipped_linears: bool = True,
     ):
         super().__init__()
         self.self_attn = Gemma4VisionSelfAttention(
-            hidden_size, num_heads, norm_eps, rope_theta=rope_theta, max_position=max_position
+            hidden_size,
+            num_heads,
+            norm_eps,
+            rope_theta=rope_theta,
+            max_position=max_position,
+            use_clipped_linears=use_clipped_linears,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -294,7 +335,8 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
-        # Vision encoder uses ClippableLinear for all projections.
+        # Use ClippableLinear only when the checkpoint has clipping weights.
+        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -302,7 +344,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
                 hidden_act=hidden_act,
                 rms_norm_eps=norm_eps,
             ),
-            linear_class=ClippableLinear,
+            linear_class=linear_class,
         )
 
     def forward(
@@ -412,9 +454,12 @@ class Gemma4VisionPooler(nn.Module):
         # --- 5. One-hot weight matrix ----------------------------------------
         # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
         # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
+        # Keep values as float32 — OneHot doesn't support bfloat16.
         on_val = 1.0 / float(k2)
-        one_hot_vals = op.CastLike(op.Constant(value_floats=[0.0, on_val]), vision_features)
-        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth]
+        one_hot_vals = op.Constant(value_floats=[0.0, on_val])
+        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth] f32
+        # Cast to model dtype for the subsequent MatMul
+        weights = op.CastLike(weights, vision_features)
 
         # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
         weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, valid_depth, T]
@@ -517,6 +562,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     hidden_act=vc.hidden_act or "gelu_pytorch_tanh",
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
+                    use_clipped_linears=vc.use_clipped_linears,
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -591,7 +637,6 @@ class Gemma4TextAttention(nn.Module):
     ):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = head_dim
         self.scaling = 1.0
         # attn_logit_softcapping maps directly to the ONNX Attention op's
@@ -601,6 +646,19 @@ class Gemma4TextAttention(nn.Module):
         self.rotary_embedding_dim = rotary_embedding_dim
         self._rope_interleave = config.rope_interleave
         self.layer_idx = layer_idx
+
+        # Alternative attention: full_attention layers with k_eq_v share V=K
+        # (no separate v_proj). Uses fewer KV heads (num_global_key_value_heads).
+        is_sliding = layer_types[layer_idx] == "sliding_attention"
+        self._use_alternative_attention = (
+            getattr(config, "attention_k_eq_v", False) and not is_sliding
+        )
+        # Full-attention layers use num_global_key_value_heads when set,
+        # independent of the k_eq_v flag.
+        if not is_sliding and config.num_global_key_value_heads is not None:
+            self.num_key_value_heads = config.num_global_key_value_heads
+        else:
+            self.num_key_value_heads = config.num_key_value_heads
 
         # KV sharing: layers >= first_kv_shared_layer_idx borrow K,V from source
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
@@ -633,11 +691,13 @@ class Gemma4TextAttention(nn.Module):
         # KV-shared layers borrow K,V — no projections needed
         if not self.is_kv_shared_layer:
             self.k_proj = Linear(
-                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
+                config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
-            self.v_proj = Linear(
-                config.hidden_size, config.num_key_value_heads * head_dim, bias=False
-            )
+            # Alternative attention (k_eq_v): V = K, no separate v_proj
+            if not self._use_alternative_attention:
+                self.v_proj = Linear(
+                    config.hidden_size, self.num_key_value_heads * head_dim, bias=False
+                )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -675,37 +735,79 @@ class Gemma4TextAttention(nn.Module):
             )
 
         if self.is_kv_shared_layer:
-            # KV-shared layers always use standard Attention path because
-            # they borrow K,V from a source layer (no own KV cache).
-            if use_gqa:
-                raise ValueError("KV-shared layers should not receive GQAContext")
-            # Borrow full-history K,V from source layer.
-            # present_key/value from the ONNX Attention op is 4D:
-            #   [batch, kv_heads, total_seq, head_dim]
-            # The Attention op expects key/value as 3D:
-            #   [batch, total_seq, kv_heads * head_dim]
-            # Transpose and reshape to match.
+            # KV-shared layers borrow K,V from a source layer (no own KV cache).
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
 
-            # [B, kv_heads, total_seq, head_dim] → [B, total_seq, kv_heads*head_dim]
-            src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-            src_key = op.Reshape(src_key, [0, 0, -1])
-            src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-            src_value = op.Reshape(src_value, [0, 0, -1])
+            if use_gqa:
+                # GQA path for shared KV: pass empty K/V tensors and wire the
+                # source layer's present_key/value as past_key/past_value.
+                # The shared buffer is already in BNSH format, so GQA reads it
+                # directly — no Transpose/Reshape needed.
+                gqa_ctx = attention_bias
 
-            attn_output, present_key, present_value = _apply_attention(
-                op,
-                query_states,
-                src_key,
-                src_value,
-                attention_bias,
-                past_key=None,
-                past_value=None,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                scale=self.scaling,
-                softcap=self.softcap,
-            )
+                # Create empty K/V tensors with kv_sequence_length=0.
+                # Shape: [batch, 0, kv_heads * head_dim]
+                batch_dim = op.Shape(query_states, start=0, end=1)
+                kv_hidden = self.num_key_value_heads * self.head_dim
+                empty_shape = op.Concat(
+                    batch_dim,
+                    op.Constant(value_ints=[0, kv_hidden]),
+                    axis=0,
+                )
+                empty_kv = op.CastLike(op.ConstantOfShape(empty_shape), query_states)
+
+                gqa_attrs: dict = {
+                    "num_heads": self.num_attention_heads,
+                    "kv_num_heads": self.num_key_value_heads,
+                    "scale": self.scaling,
+                    "do_rotary": 1,
+                    "rotary_interleaved": int(self._rope_interleave),
+                }
+                if self.softcap:
+                    gqa_attrs["softcap"] = self.softcap
+                if self.rotary_embedding_dim:
+                    gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+                if gqa_ctx.local_window_size > 0:
+                    gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
+
+                attn_output, present_key, present_value = op.GroupQueryAttention(
+                    query_states,
+                    empty_kv,  # key: empty (kv_sequence_length=0)
+                    empty_kv,  # value: empty (kv_sequence_length=0)
+                    src_key,  # past_key: shared KV in BNSH
+                    src_value,  # past_value: shared KV in BNSH
+                    gqa_ctx.seqlens_k,
+                    gqa_ctx.total_seq_len,
+                    gqa_ctx.cos_cache,
+                    gqa_ctx.sin_cache,
+                    _domain="com.microsoft",
+                    _outputs=3,
+                    **gqa_attrs,
+                )
+            else:
+                # Fallback Attention path: transpose shared KV from BNSH to 3D.
+                # present_key/value from the ONNX Attention op is 4D:
+                #   [batch, kv_heads, total_seq, head_dim]
+                # The Attention op expects key/value as 3D:
+                #   [batch, total_seq, kv_heads * head_dim]
+                src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
+                src_key = op.Reshape(src_key, [0, 0, -1])
+                src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
+                src_value = op.Reshape(src_value, [0, 0, -1])
+
+                attn_output, present_key, present_value = _apply_attention(
+                    op,
+                    query_states,
+                    src_key,
+                    src_value,
+                    attention_bias,
+                    past_key=None,
+                    past_value=None,
+                    num_attention_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    scale=self.scaling,
+                    softcap=self.softcap,
+                )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
             # The op fuses RoPE + attention + KV cache into a single op,
@@ -713,22 +815,28 @@ class Gemma4TextAttention(nn.Module):
             gqa_ctx = attention_bias
 
             # K projection + per-head K norm (no manual RoPE — GQA does it)
-            key_states = self.k_proj(op, hidden_states)
-            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_raw = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_raw, [0, 0, -1, self.head_dim])
             key_states = self.k_norm(op, key_states)
             key_states = op.Reshape(key_states, [0, 0, -1])
 
-            # V projection + parameterless per-head V normalisation
-            value_states = self.v_proj(op, hidden_states)
+            # V: separate projection, or V=K (alternative attention)
+            if self._use_alternative_attention:
+                value_raw = key_raw
+            else:
+                value_raw = self.v_proj(op, hidden_states)
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
-                value_states,
+                value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             # Build GQA attributes
@@ -772,8 +880,8 @@ class Gemma4TextAttention(nn.Module):
                 )
         else:
             # K projection + per-head K norm + optional RoPE
-            key_states = self.k_proj(op, hidden_states)
-            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            key_raw = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(key_raw, [0, 0, -1, self.head_dim])
             key_states = self.k_norm(op, key_states)
             key_states = op.Reshape(key_states, [0, 0, -1])
 
@@ -787,20 +895,26 @@ class Gemma4TextAttention(nn.Module):
                     interleaved=self._rope_interleave,
                 )
 
-            # V projection + parameterless per-head V normalisation
-            value_states = self.v_proj(op, hidden_states)
+            # V: separate projection, or V=K (alternative attention)
+            if self._use_alternative_attention:
+                value_raw = key_raw
+            else:
+                value_raw = self.v_proj(op, hidden_states)
+            # Parameterless per-head V normalisation (FP32 accumulation to
+            # prevent FP16 overflow when squaring values > 256).
             value_states = op.Reshape(
-                value_states,
+                value_raw,
                 op.Constant(value_ints=[0, 0, self.num_key_value_heads, self.head_dim]),
             )
-            sq = op.Mul(value_states, value_states)
+            v_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            sq = op.Mul(v_f32, v_f32)
             mean_sq = op.ReduceMean(sq, [-1], keepdims=1)
             # Use op.Constant to create a 1D tensor node (not a scalar initializer).
             # Scalar Python floats use a type-keyed cache that can fail when upstream
             # type information is missing (e.g., after custom ops like com.microsoft.MoE).
             eps = op.Constant(value_floats=[self._v_norm_eps])
-            rms = op.Sqrt(op.Add(mean_sq, op.CastLike(eps, mean_sq)))
-            value_states = op.Div(value_states, rms)
+            rms = op.Sqrt(op.Add(mean_sq, eps))
+            value_states = op.CastLike(op.Div(v_f32, rms), value_states)
             value_states = op.Reshape(value_states, [0, 0, -1])
 
             attn_output, present_key, present_value = _apply_attention(
@@ -917,6 +1031,11 @@ class Gemma4DecoderLayer(nn.Module):
     def __init__(self, config: Gemma4Config, layer_idx: int):
         super().__init__()
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                f"Gemma4Config.layer_types length ({len(layer_types)}) "
+                f"must match num_hidden_layers ({config.num_hidden_layers})"
+            )
         first_kv_shared = config.num_hidden_layers - config.num_kv_shared_layers
         layer_type = layer_types[layer_idx]
         is_full = layer_type == "full_attention"
@@ -1395,11 +1514,12 @@ class Gemma4TextModel(nn.Module):
         )
 
         if use_gqa:
-            # Realize cos/sin caches as ONNX graph initializers.
-            # The returned gathered embeddings are saved for potential reuse
-            # by KV-shared layers that fall back to standard Attention.
-            local_pos_emb = self.rotary_emb_local(op, position_ids)
-            global_pos_emb = self.rotary_emb_global(op, position_ids)
+            # Calling forward() on the RoPE modules materializes their
+            # cos_cache / sin_cache nn.Parameters as ONNX graph initializers.
+            # GQA references these caches directly; without the call the
+            # parameters are never emitted into the graph.
+            _ = self.rotary_emb_local(op, position_ids)
+            _ = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
@@ -1443,60 +1563,27 @@ class Gemma4TextModel(nn.Module):
                 "full_attention": self.rotary_emb_global(op, position_ids),
             }
 
-        # Fallback attention bias for non-GQA layers (KV-shared layers always
-        # use this, plus all layers when use_gqa is False).
+        # Fallback attention bias for non-GQA layers (used when use_gqa is False).
         query_input = input_ids if input_ids is not None else hidden_states
         fallback_bias_dict: dict[str, ir.Value | None] = {}
-        need_fallback = not use_gqa or any(
-            layer.self_attn.is_kv_shared_layer for layer in self.layers
-        )
+        need_fallback = not use_gqa
         if need_fallback:
-            if use_gqa:
-                # GQA is active for non-shared layers. KV-shared layers use
-                # the standard Attention op with is_causal=1, so we only need
-                # bool masks (not additive float bias). This avoids the
-                # CumSum/GreaterOrEqual chain used by create_attention_bias.
-                # Full-attention: simple padding mask (causality handled by op)
-                # Sliding-window: still needs CumSum for window constraint
-                fallback_bias_dict = {
-                    "sliding_attention": create_sliding_window_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        window_size=self.sliding_window or 512,
-                    ),
-                    "full_attention": create_padding_mask(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                    ),
-                }
-            else:
-                fallback_bias_dict = {
-                    "sliding_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        sliding_window=self.sliding_window,
-                        dtype=self._dtype,
-                    ),
-                    "full_attention": create_attention_bias(
-                        op,
-                        input_ids=query_input,
-                        attention_mask=attention_mask,
-                        dtype=self._dtype,
-                    ),
-                }
-            # KV-shared layers also need position embeddings for the
-            # standard Attention path (manual RoPE). Reuse the embeddings
-            # already gathered when realizing cos/sin caches above.
-            if use_gqa:
-                fallback_pos_dict = {
-                    "sliding_attention": local_pos_emb,
-                    "full_attention": global_pos_emb,
-                }
-            else:
-                fallback_pos_dict = position_embeddings_dict
+            fallback_bias_dict = {
+                "sliding_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                    dtype=self._dtype,
+                ),
+                "full_attention": create_attention_bias(
+                    op,
+                    input_ids=query_input,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                ),
+            }
+            fallback_pos_dict = position_embeddings_dict
         else:
             fallback_pos_dict = {}
 
@@ -1522,12 +1609,9 @@ class Gemma4TextModel(nn.Module):
         ):
             per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
 
-            # Per-layer decision: use GQA for non-shared layers when
-            # available, fall back to standard Attention for KV-shared layers
-            # and layers where head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
-            is_shared = layer.self_attn.is_kv_shared_layer
-            gqa_head_dim_ok = layer.self_attn.head_dim <= 256
-            if use_gqa and not is_shared and gqa_head_dim_ok:
+            # Per-layer decision: use GQA when available. KV-shared layers
+            # also use GQA (with empty K/V and shared past buffer).
+            if use_gqa:
                 attn_bias = gqa_ctx_dict[layer_type]
                 pos_emb = None
             else:
@@ -1628,27 +1712,8 @@ class Gemma4CausalLMModel(CausalLMModel):
                 for i in range(num_layers):
                     shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
                     state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = shard
-        # Map HF expert weight names to our 3D stacked parameter names.
-        # HF stores: layers.N.experts.gate_up_proj [E, 2*inter, H]
-        #             layers.N.experts.down_proj     [E, H, inter]
-        # We store:  layers.N.fc1_experts_weights   [E, 2*inter, H]
-        #             layers.N.fc2_experts_weights   [E, H, inter]
-        for key in list(state_dict.keys()):
-            if ".experts.gate_up_proj" in key:
-                new_key = key.replace(".experts.gate_up_proj", ".fc1_experts_weights")
-                state_dict[new_key] = state_dict.pop(key)
-            elif ".experts.down_proj" in key:
-                new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
-                state_dict[new_key] = state_dict.pop(key)
-        # Fold hidden_size^-0.5 into router.scale.
-        # The router computes: x_normed * scale * hidden_size^-0.5.
-        # We pre-multiply scale by hidden_size^-0.5 here so the forward only needs
-        # x_normed * self.scale, avoiding float-constant name collisions across layers.
-        if self.config.enable_moe_block:
-            scale_factor = float(self.config.hidden_size**-0.5)
-            for key in list(state_dict.keys()):
-                if ".router.scale" in key:
-                    state_dict[key] = state_dict[key] * scale_factor
+        # Map HF expert weight names and fold router scale
+        _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
 
 
@@ -1934,7 +1999,10 @@ class _Gemma4AudioEncoderModel(nn.Module):
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
-        self.pre_projection_norm = _Gemma4ScaleFreeRMSNorm(output_proj_dims, eps=rms_norm_eps)
+        # NOTE: We inline the RMSNorm in forward() using manual ops to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNormalization into
+        # SkipSimplifiedLayerNormalization (CUDA rejects 1D skip).
+        self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
         self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
@@ -1949,8 +2017,17 @@ class _Gemma4AudioEncoderModel(nn.Module):
         audio_features, downsampled_mask = self.encoder(
             op, input_features, input_features_mask=input_features_mask
         )
-        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm)
-        audio_features = self.pre_projection_norm(op, audio_features)
+        # Scale-free RMSNorm before projection (HF embed_audio.embedding_pre_projection_norm).
+        # Use manual primitive ops instead of op.RMSNormalization to prevent
+        # ORT from fusing Add(output_proj.bias) + RMSNorm into
+        # SkipSimplifiedLayerNormalization with a 1D bias as skip input
+        # (CUDA kernel rejects 1D skip, CPU kernel accepts it).
+        x_f32 = op.Cast(audio_features, to=ir.DataType.FLOAT)
+        sq = op.Mul(x_f32, x_f32)
+        mean_sq = op.ReduceMean(sq, op.Constant(value_ints=[-1]), keepdims=1)
+        eps = op.Constant(value_float=self._rms_norm_eps)
+        rms = op.Sqrt(op.Add(mean_sq, eps))
+        audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features), downsampled_mask
 
@@ -2124,5 +2201,8 @@ class Gemma4Model(nn.Module):
 
             else:
                 renamed[key] = value
+
+        # Map HF expert weight names and fold router scale
+        _remap_moe_expert_weights(renamed, self.config)
 
         return renamed

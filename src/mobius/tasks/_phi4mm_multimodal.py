@@ -29,6 +29,7 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
+    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -84,22 +85,24 @@ class Phi4MMMultiModalTask(ModelTask):
         num_images = ir.SymbolicDim("num_images")
         image_size = (config.vision.image_size if config.vision else None) or 448
 
-        pixel_values = ir.Value(
-            name="pixel_values",
-            shape=ir.Shape([batch, 3, image_size, image_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, 3, image_size, image_size],
         )
-        image_sizes = ir.Value(
-            name="image_sizes",
-            shape=ir.Shape([num_images, 2]),
-            type=ir.TensorType(ir.DataType.INT64),
+        pixel_values = _cast_encoder_input(op, pixel_values, config)
+        image_sizes = builder.input(
+            "image_sizes",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 2],
         )
 
-        graph, builder = _make_graph([pixel_values, image_sizes], name="vision_encoder")
-        image_features = vision(builder.op, pixel_values, image_sizes=image_sizes)
+        image_features = vision(op, pixel_values, image_sizes=image_sizes)
 
-        image_features.name = "image_features"
-        graph.outputs.append(image_features)
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
     def _build_speech(
@@ -117,35 +120,34 @@ class Phi4MMMultiModalTask(ModelTask):
         num_audio_clips = ir.SymbolicDim("num_audio_clips")
         input_size = (config.audio.input_size if config.audio else None) or 80
 
-        audio_embeds = ir.Value(
-            name="audio_embeds",
-            shape=ir.Shape([batch, audio_seq_len, input_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
+
+        audio_embeds = builder.input(
+            "audio_embeds",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, audio_seq_len, input_size],
         )
-        audio_sizes = ir.Value(
-            name="audio_sizes",
-            shape=ir.Shape([num_audio_clips]),
-            type=ir.TensorType(ir.DataType.INT64),
+        audio_embeds = _cast_encoder_input(op, audio_embeds, config)
+        audio_sizes = builder.input(
+            "audio_sizes",
+            dtype=ir.DataType.INT64,
+            shape=[num_audio_clips],
         )
-        audio_projection_mode = ir.Value(
-            name="audio_projection_mode",
-            shape=ir.Shape([]),
-            type=ir.TensorType(ir.DataType.INT64),
+        audio_projection_mode = builder.input(
+            "audio_projection_mode",
+            dtype=ir.DataType.INT64,
+            shape=[],
         )
 
-        graph, builder = _make_graph(
-            [audio_embeds, audio_sizes, audio_projection_mode],
-            name="audio_encoder",
-        )
         speech_out = speech(
-            builder.op,
+            op,
             audio_embeds,
             audio_sizes=audio_sizes,
             audio_projection_mode=audio_projection_mode,
         )
 
-        speech_out.name = "audio_features"
-        graph.outputs.append(speech_out)
+        builder.add_output(speech_out, "audio_features")
         return _make_model(graph)
 
     def _build_embedding(
@@ -159,26 +161,24 @@ class Phi4MMMultiModalTask(ModelTask):
         num_image_tokens = ir.SymbolicDim("num_image_tokens")
         num_speech_tokens = ir.SymbolicDim("num_speech_tokens")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph(name="embedding")
+
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-        image_features = ir.Value(
-            name="image_features",
-            shape=ir.Shape([num_image_tokens, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        image_features = builder.input(
+            "image_features",
+            dtype=config.dtype,
+            shape=[num_image_tokens, config.hidden_size],
         )
-        audio_features = ir.Value(
-            name="audio_features",
-            shape=ir.Shape([num_speech_tokens, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        audio_features = builder.input(
+            "audio_features",
+            dtype=config.dtype,
+            shape=[num_speech_tokens, config.hidden_size],
         )
 
-        graph, builder = _make_graph(
-            [input_ids, image_features, audio_features],
-            name="embedding",
-        )
         inputs_embeds = embedding(
             builder.op,
             input_ids=input_ids,
@@ -186,6 +186,5 @@ class Phi4MMMultiModalTask(ModelTask):
             audio_features=audio_features,
         )
 
-        inputs_embeds.name = "inputs_embeds"
-        graph.outputs.append(inputs_embeds)
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)

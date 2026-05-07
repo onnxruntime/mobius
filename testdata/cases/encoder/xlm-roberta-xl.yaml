@@ -1,4 +1,5 @@
 model_id: "facebook/xlm-roberta-xl"
+model_type: "xlm-roberta-xl"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

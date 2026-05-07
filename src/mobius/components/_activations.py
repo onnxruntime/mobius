@@ -83,6 +83,12 @@ ACT2FN: OrderedDict[str, callable] = OrderedDict(
         "silu": silu,
         "swish": silu,
         "tanh": tanh,
+        # xielu is a parametric learnable activation (used by Apertus).
+        # Mapped to silu here so CausalLMModel.__init__ can construct the
+        # base MLP without crashing. ApertusCausalLMModel immediately
+        # replaces the MLP with ApertusFCMLP that uses the real
+        # XIELUActivation nn.Module (with alpha_p/alpha_n parameters).
+        "xielu": silu,
     }
 )
 

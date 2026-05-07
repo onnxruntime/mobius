@@ -1,4 +1,5 @@
 model_id: "bigcode/gpt_bigcode-santacoder"
+model_type: "gpt_bigcode"
 revision: "291931872cae83498cf984b16319f47f5e9e7a07"
 task_type: "text-generation"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "nghuyong/ernie-3.0-base-zh"
+model_type: "ernie"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

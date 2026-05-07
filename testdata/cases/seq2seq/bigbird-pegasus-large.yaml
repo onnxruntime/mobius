@@ -1,4 +1,5 @@
 model_id: "google/bigbird-pegasus-large-bigpatent"
+model_type: "bigbird_pegasus"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

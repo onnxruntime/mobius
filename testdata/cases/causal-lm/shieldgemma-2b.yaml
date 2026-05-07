@@ -1,4 +1,5 @@
 model_id: "google/shieldgemma-2b"
+model_type: "shieldgemma2"
 revision: "d1dffc9c8c92"
 task_type: "text-generation"
 dtype: "float32"

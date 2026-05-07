@@ -15,8 +15,11 @@ import pytest
 from mobius.integrations.ort_genai.auto_export import (
     _copy_tokenizer_files,
     _copy_tokenizer_files_from_local,
+    _fix_chat_template,
+    _fix_tokenizer_config,
     _graph_input_names,
     _resolve_ort_genai_model_type,
+    _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
     write_ort_genai_config,
@@ -67,6 +70,11 @@ class TestResolveOrtGenaiModelType:
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 
+    def test_mistral3_model_type(self):
+        assert _resolve_ort_genai_model_type("mistral3") == "mistral3"
+        # Text-only mistral is a separate mapping
+        assert _resolve_ort_genai_model_type("mistral") == "mistral"
+
     def test_phi4mm_model_types(self):
         assert _resolve_ort_genai_model_type("phi4mm") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
@@ -79,19 +87,221 @@ class TestWriteProcessorConfig:
         del config.vision  # ensure no vision attribute
         assert _write_vision_processor_config(config, str(tmp_path)) is None
 
-    def test_writes_vision_config(self, tmp_path):
+    def test_writes_transform_pipeline(self, tmp_path):
+        """Generates full transform pipeline for generic VLMs."""
         vision = mock.MagicMock()
-        vision.image_size = 224
-        vision.patch_size = 16
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
         config = mock.MagicMock()
         config.vision = vision
+        config.spatial_merge_size = 2
 
         path = _write_vision_processor_config(config, str(tmp_path))
         assert path is not None
         with open(path) as f:
             data = json.load(f)
-        assert data["image_size"] == 224
-        assert data["patch_size"] == 16
+
+        proc = data["processor"]
+        assert proc["name"] == "image_processor"
+        transforms = proc["transforms"]
+        assert len(transforms) == 5
+        assert transforms[0]["operation"]["type"] == "DecodeImage"
+        assert transforms[1]["operation"]["type"] == "ConvertRGB"
+        assert transforms[2]["operation"]["type"] == "Resize"
+        assert transforms[3]["operation"]["type"] == "Rescale"
+        assert transforms[4]["operation"]["type"] == "Normalize"
+
+        # Check resize attrs
+        resize_attrs = transforms[2]["operation"]["attrs"]
+        assert resize_attrs["patch_size"] == 14
+        assert resize_attrs["merge_size"] == 2
+
+        # Check normalization defaults (CLIP-standard)
+        norm_attrs = transforms[4]["operation"]["attrs"]
+        assert len(norm_attrs["mean"]) == 3
+        assert len(norm_attrs["std"]) == 3
+
+    def test_pixtral_vision_config(self, tmp_path):
+        """Generates pixtral-specific processor config with 7 transforms."""
+        vision = mock.MagicMock()
+        vision.image_size = 1540
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = "pixtral"
+        config = mock.MagicMock()
+        config.vision = vision
+        config.spatial_merge_size = 2
+        config.model_type = "mistral3"
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("processor_config.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "pixtral_image_processor"
+        transforms = proc["transforms"]
+        assert len(transforms) == 7
+
+        # Verify all 7 transform types in order
+        types = [t["operation"]["type"] for t in transforms]
+        assert types == [
+            "DecodeImage",
+            "ConvertRGB",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "Permute3D",
+            "PixtralImageSizes",
+        ]
+
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["height"] == 1540
+        assert resize["width"] == 1540
+
+        # Permute3D has correct dims
+        permute = transforms[5]["operation"]["attrs"]
+        assert permute["dims"] == [2, 0, 1]
+
+    def test_hf_processor_fallback_to_clip_defaults(self, tmp_path):
+        """Falls back to CLIP-standard defaults when HF processor can't be loaded."""
+        vision = mock.MagicMock()
+        vision.image_size = 448
+        vision.patch_size = 14
+        vision.spatial_merge_size = 2
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.spatial_merge_size = 2
+        config.model_type = "qwen2"
+
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            side_effect=OSError("model not found"),
+        ):
+            path = _write_vision_processor_config(
+                config, str(tmp_path), hf_model_id="nonexistent/model"
+            )
+
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        # Should use CLIP-standard normalization defaults
+        normalize = proc["transforms"][4]["operation"]["attrs"]
+        assert normalize["mean"] == pytest.approx([0.48145466, 0.4578275, 0.40821073])
+        assert normalize["std"] == pytest.approx([0.26862954, 0.26130258, 0.27577711])
+
+
+class TestFixTokenizerConfig:
+    def test_remaps_tokenizers_backend(self, tmp_path):
+        tc = {"tokenizer_class": "TokenizersBackend"}
+        tc_path = tmp_path / "tokenizer_config.json"
+        tc_path.write_text(json.dumps(tc))
+
+        assert _fix_tokenizer_config(str(tmp_path)) is True
+
+        fixed = json.loads(tc_path.read_text())
+        assert fixed["tokenizer_class"] == "LlamaTokenizer"
+
+    def test_no_fix_needed(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+    def test_no_tokenizer_config(self, tmp_path):
+        assert _fix_tokenizer_config(str(tmp_path)) is False
+
+
+class TestFixChatTemplate:
+    def test_adds_chat_template(self, tmp_path):
+        """Adds chat_template from HF tokenizer when missing."""
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+
+        fake_tokenizer = mock.MagicMock()
+        fake_tokenizer.chat_template = "{{ bos_token }}"
+
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=fake_tokenizer,
+        ):
+            result = _fix_chat_template(str(tmp_path), "fake/model")
+
+        assert result is True
+        fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert fixed["chat_template"] == "{{ bos_token }}"
+
+    def test_skips_when_template_exists(self, tmp_path):
+        tc = {
+            "tokenizer_class": "LlamaTokenizer",
+            "chat_template": "existing",
+        }
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
+
+    def test_skips_without_model_id(self, tmp_path):
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+        assert _fix_chat_template(str(tmp_path), None) is False
+
+    def test_skips_without_file(self, tmp_path):
+        assert _fix_chat_template(str(tmp_path), "fake/model") is False
+
+    def test_audio_no_audio_returns_none(self, tmp_path):
+        config = mock.MagicMock(spec=[])
+        del config.audio
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_non_gemma4_returns_none(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "whisper"
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "gemma4"
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("audio_feature_extraction.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        # Must use feature_extraction.sequence, not processor.transforms
+        assert "feature_extraction" in data
+        seq = data["feature_extraction"]["sequence"]
+        assert len(seq) == 2
+        assert seq[0]["operation"]["type"] == "AudioDecoder"
+        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
+        attrs = seq[1]["operation"]["attrs"]
+        assert attrs["feature_size"] == 128
+        assert attrs["sampling_rate"] == 16000
+        assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
+        assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
+        assert attrs["mel_floor"] == 0.001  # noqa: RUF069
+
+    def test_handles_tokenizer_load_error(self, tmp_path):
+        """Gracefully handles AutoTokenizer.from_pretrained raising."""
+        tc = {"tokenizer_class": "LlamaTokenizer"}
+        (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+
+        with mock.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=RuntimeError("model not available"),
+        ):
+            result = _fix_chat_template(str(tmp_path), "fake/model")
+
+        assert result is False
+        # Original config is unchanged
+        fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
+        assert "chat_template" not in fixed
 
 
 class TestCopyTokenizerFiles:
@@ -279,6 +489,8 @@ class TestExportForOrtGenai:
         class FakeVision:
             image_size: int = 448
             patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str | None = None
 
         @dataclasses.dataclass
         class FakeConfig:
@@ -289,6 +501,7 @@ class TestExportForOrtGenai:
             num_attention_heads: int = 4
             num_key_value_heads: int = 2
             head_dim: int = 16
+            spatial_merge_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
         pkg = ModelPackage(
@@ -305,7 +518,13 @@ class TestExportForOrtGenai:
         assert os.path.isfile(result["processor_config"])
         with open(result["processor_config"]) as f:
             data = json.load(f)
-        assert data["image_size"] == 448
+        # New format: transform pipeline under "processor"
+        assert "processor" in data
+        transforms = data["processor"]["transforms"]
+        assert len(transforms) >= 4
+        # Verify resize uses config values
+        resize = transforms[2]["operation"]["attrs"]
+        assert resize["patch_size"] == 14
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -380,6 +599,139 @@ class TestExportForOrtGenai:
         assert op1["attrs"]["max_soft_tokens"] == 260
         assert op1["attrs"]["pooling_kernel_size"] == 3
 
+    def test_gemma4_audio_processor_json_written(self, tmp_path):
+        """Gemma4 writes audio_feature_extraction.json with feature_extraction.sequence schema."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            feature_size: int = 128
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "audio_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        # Should write audio_feature_extraction.json
+        assert "audio_processor" in result
+        audio_path = result["audio_processor"]
+        assert audio_path.endswith("audio_feature_extraction.json")
+        assert os.path.isfile(audio_path)
+
+        with open(audio_path) as f:
+            data = json.load(f)
+
+        # Verify feature_extraction.sequence schema (not processor.transforms)
+        assert "feature_extraction" in data
+        assert "processor" not in data
+        seq = data["feature_extraction"]["sequence"]
+        assert len(seq) == 2
+
+        # First op: AudioDecoder
+        op0 = seq[0]["operation"]
+        assert op0["type"] == "AudioDecoder"
+
+        # Second op: Gemma4LogMel with expected attrs
+        op1 = seq[1]["operation"]
+        assert op1["type"] == "Gemma4LogMel"
+        assert op1["attrs"]["feature_size"] == 128
+        assert op1["attrs"]["sampling_rate"] == 16000
+        assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
+
+    def test_gemma4_audio_processor_not_written_without_audio(self, tmp_path):
+        """No audio_feature_extraction.json when config has no audio attr."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=FakeConfig())
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        assert "audio_processor" not in result
+        assert not os.path.exists(os.path.join(str(tmp_path), "audio_feature_extraction.json"))
+
+    def test_gemma4_genai_config_speech_section(self, tmp_path):
+        """Gemma4 with audio_encoder writes speech section with correct config_filename and input mapping."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeAudio:
+            feature_size: int = 128
+            audio_token_id: int = 255999
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "gemma4"
+            vocab_size: int = 262144
+            hidden_size: int = 1536
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 8
+            num_key_value_heads: int = 1
+            head_dim: int = 256
+            boa_token_id: int = 255998
+            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
+
+        pkg = ModelPackage(
+            {
+                "model": mock.MagicMock(),
+                "audio_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        # Speech section must exist
+        assert "speech" in data["model"], (
+            "genai_config.json should have a speech section for Gemma4 with audio_encoder"
+        )
+        speech = data["model"]["speech"]
+
+        # config_filename must point to the onnxruntime-extensions audio config
+        assert speech["config_filename"] == "audio_feature_extraction.json"
+
+        # filename must point to the audio encoder ONNX model
+        assert speech["filename"] == "audio_encoder/model.onnx"
+
+        # input_names mapping: genai internal name -> ONNX model input name
+        assert speech["inputs"]["audio_embeds"] == "input_features"
+        assert speech["inputs"]["attention_mask"] == "input_features_mask"
+
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -444,7 +796,7 @@ class TestExportForOrtGenai:
             data = json.load(f)
         provider_opts = data["model"]["decoder"]["session_options"]["provider_options"]
         assert len(provider_opts) == 1
-        assert "CUDAExecutionProvider" in provider_opts[0]
+        assert "cuda" in provider_opts[0]
 
     def test_raises_when_pkg_config_is_none(self, tmp_path):
         """ValueError is raised when pkg.config is None."""
@@ -689,6 +1041,76 @@ class TestGemma4GenaiConfig:
         emb_inputs = data["model"]["embedding"]["inputs"]
         assert "input_ids" in emb_inputs
         assert "image_features" in emb_inputs
+
+
+class TestPixtralGenaiConfig:
+    """Tests for Pixtral/Ministral-3-specific genai_config generation."""
+
+    @staticmethod
+    def _make_pixtral_pkg():
+        """Build a mock Pixtral VLM package with graph inputs."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 1540
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str = "pixtral"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "mistral3"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 128
+            image_token_id: int = 10
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        decoder = _mock_model_with_inputs(
+            ["input_ids", "attention_mask", "past_key_values.0.key"]
+        )
+        vision = _mock_model_with_inputs(["pixel_values"])
+        embedding = _mock_model_with_inputs(["input_ids", "image_features"])
+
+        return ModelPackage(
+            {
+                "model": decoder,
+                "vision_encoder": vision,
+                "embedding": embedding,
+            },
+            config=FakeConfig(),
+        )
+
+    def test_pixtral_config_filename_is_processor_config(self, tmp_path):
+        """Pixtral genai_config.json references processor_config.json, not image_processor.json."""
+        pkg = self._make_pixtral_pkg()
+        path = _write_genai_config(
+            pkg.config,
+            str(tmp_path),
+            pkg=pkg,
+            ort_model_type="mistral3",
+            ep="cpu",
+            context_length=4096,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            is_vlm=True,
+            has_speech=False,
+        )
+        with open(path) as f:
+            data = json.load(f)
+        vision = data["model"]["vision"]
+        assert vision["config_filename"] == "processor_config.json"
+        assert vision["spatial_merge_size"] == 2
+        assert data["model"]["image_token_id"] == 10
 
 
 class TestGraphInputNames:

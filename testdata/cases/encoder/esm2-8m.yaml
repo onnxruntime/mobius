@@ -1,4 +1,5 @@
 model_id: "facebook/esm2_t6_8M_UR50D"
+model_type: "esm"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

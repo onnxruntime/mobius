@@ -1,4 +1,5 @@
 model_id: "facebook/vit-mae-base"
+model_type: "vit_mae"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

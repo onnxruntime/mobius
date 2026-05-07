@@ -1,4 +1,5 @@
 model_id: "facebook/data2vec-vision-base-ft1k"
+model_type: "data2vec-vision"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

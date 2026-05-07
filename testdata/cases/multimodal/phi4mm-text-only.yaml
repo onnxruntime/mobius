@@ -1,4 +1,5 @@
 model_id: "microsoft/Phi-4-multimodal-instruct"
+model_type: "phi4mm"
 revision: "main"
 task_type: "phi4mm-multimodal"
 dtype: "float32"
