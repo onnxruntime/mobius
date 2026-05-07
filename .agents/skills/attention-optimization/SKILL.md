@@ -167,7 +167,7 @@ entirely.**
 |--------|---------------------|
 | XQA | SM≥8.0, `seq==1`, `past_present_share_buffer`, `softcap==0`, `local_window==-1`, `head_size ∈ {64, 128, 256}` |
 | Flash | fp16/bf16, SM≥8.0. FastDecode: `seq==1`, `past_present_share_buffer`, no KV quant |
-| MEA | No bias (rejected upstream), head_size check |
+| MEA | No bias (rejected upstream), `head_size ≤ 256` (shared memory guard), fp16/bf16 |
 | Unfused | Fallback |
 
 ### ONNX Attention — MHA (`q_num_heads == kv_num_heads`)
@@ -187,13 +187,13 @@ Same cascade as MHA with extra MEA constraints:
 | Kernel | Required conditions |
 |--------|---------------------|
 | Flash | Same as MHA |
-| MEA | MHA conditions + `head_size == v_head_size` + not float32 |
+| MEA | MHA conditions + `head_size == v_head_size` + not float32. With `nonpad_kv_seqlen`: `head_size ≤ 256` |
 | Unfused | Always available, handles GQA via in-kernel reshape |
 
-### GQA + float additive bias dispatch
+### GQA + float additive bias dispatch (ONNX Attention)
 
-When using float bias with GQA, Flash is disabled (`attn_mask !=
-nullptr`). The effective dispatch:
+When using float bias with GQA via ONNX Attention, Flash is disabled
+(`attn_mask != nullptr`). The effective dispatch:
 
 | Condition | Kernel |
 |-----------|--------|
@@ -202,6 +202,12 @@ nullptr`). The effective dispatch:
 | fp16/bf16, `head_size != v_head_size` (asymmetric V) | Unfused |
 | fp32 (GQA) | Unfused (explicitly excluded) |
 | `qk_matmul_output_mode != kNone` | Unfused (or error) |
+
+**Note:** Contrib GQA rejects `attention_bias` entirely — this table
+applies to ONNX Attention in GQA mode only. Also, Contrib GQA has a
+stricter MEA guard (`head_size ≤ 256`) than the ONNX Attention path
+(which allows up to 1024 for the standard path, ≤ 256 only with
+`nonpad_kv_seqlen`).
 
 This explains why Gemma4's KV-shared layers fall to unfused: they
 borrow K/V from a layer with different `head_size`, creating
@@ -232,6 +238,10 @@ borrow K/V from a layer with different `head_size`, creating
 4. **SM≥8.0** (Ampere+) required for Flash on all paths.
 5. **Float bias is safer** than bool mask for complex attention patterns.
 6. **MEA requires alignment** — `total_kv % 4 == 0` for bias tensors.
+7. **Contrib GQA limits MEA to `head_size ≤ 256`** — shared memory
+   guard; the kernel itself supports 1024 but GQA's eligibility check
+   blocks it. ONNX Attention is less restrictive (≤ 1024 standard,
+   ≤ 256 only with `nonpad_kv_seqlen`).
 
 ## Cross-references
 
