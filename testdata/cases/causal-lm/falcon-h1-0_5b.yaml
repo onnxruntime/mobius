@@ -1,4 +1,5 @@
 model_id: "tiiuae/Falcon-H1-0.5B-Base"
+model_type: "falcon_h1"
 revision: "59fb76e8c5d3"
 task_type: "text-generation"
 dtype: "float32"

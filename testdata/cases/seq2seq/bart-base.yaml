@@ -1,4 +1,5 @@
 model_id: "facebook/bart-base"
+model_type: "bart"
 revision: "aadd2ab0ae0c8268c7c9693540e9904811f36177"
 task_type: "seq2seq"
 dtype: "float32"

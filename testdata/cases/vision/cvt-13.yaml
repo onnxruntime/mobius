@@ -1,4 +1,5 @@
 model_id: "microsoft/cvt-13"
+model_type: "cvt"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

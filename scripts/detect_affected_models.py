@@ -35,18 +35,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ROOT = _PROJECT_ROOT / "src" / "mobius"
 
 # ----------------------------------------------------------------
-# Shared infrastructure paths — any change triggers run_all
+# Shared infrastructure paths — any change triggers run_all.
+# Currently empty: core infra files (e.g. _configs.py, _registry.py)
+# are NOT under _TRACEABLE_PREFIXES and therefore classify as "other",
+# triggering no model tests. Add entries here to re-enable run_all for
+# specific paths when broader regression coverage is needed.
 # ----------------------------------------------------------------
-_SHARED_INFRA_PATTERNS = (
-    "src/mobius/_configs.py",
-    "src/mobius/_registry.py",
-    "src/mobius/_builder.py",
-    "src/mobius/_weight_loading.py",
-    "src/mobius/_model_package.py",
-    "src/mobius/_exporter.py",
-    # Re-export hub for all model classes — any change here affects all models
-    "src/mobius/models/__init__.py",
-)
+_SHARED_INFRA_PATTERNS: tuple[str, ...] = ()
 
 _SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
 

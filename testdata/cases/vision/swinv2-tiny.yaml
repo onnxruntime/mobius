@@ -1,4 +1,5 @@
 model_id: "microsoft/swinv2-tiny-patch4-window16-256"
+model_type: "swinv2"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

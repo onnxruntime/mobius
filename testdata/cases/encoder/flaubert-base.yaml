@@ -1,4 +1,5 @@
 model_id: "flaubert/flaubert_base_cased"
+model_type: "flaubert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

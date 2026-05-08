@@ -1,4 +1,5 @@
 model_id: "mistralai/Mixtral-8x7B-v0.1"
+model_type: "mixtral"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

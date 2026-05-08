@@ -1,4 +1,5 @@
 model_id: "nvidia/segformer-b0-finetuned-ade-512-512"
+model_type: "segformer"
 revision: "main"
 task_type: "image-segmentation"
 dtype: "float32"

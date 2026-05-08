@@ -81,14 +81,9 @@ class _Flags:
            deduplication pass.
        * - ``ort_lower_opset_for_ep``
          - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
-         - ``True``
-         - Lower the ONNX opset declaration to 23 for non-CPU EPs
-           (ORT ≤1.24.x workaround).
-       * - ``use_gqa_for_kv_shared``
-         - ``MOBIUS_USE_GQA_FOR_KV_SHARED``
          - ``False``
-         - Use GQA for KV-shared layers on CUDA EP. Requires ORT GQA
-           new_kv_length=0 support.
+         - Lower the ONNX opset declaration to 23 for non-CPU EPs
+           (ORT ≤1.24.x workaround). Disabled by default.
        * - ``prune_lm_head``
          - ``MOBIUS_PRUNE_LM_HEAD``
          - ``False``
@@ -115,33 +110,17 @@ class _Flags:
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
     """
 
-    use_gqa_for_kv_shared: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_USE_GQA_FOR_KV_SHARED", False)
-    )
-    """Use GroupQueryAttention for KV-shared layers on CUDA EP.
-
-    When ``False`` (default), KV-shared layers that borrow K/V from a
-    source layer use standard ONNX Attention (which falls back to unfused
-    attention on CUDA EP).  This avoids a CUTLASS MEA crash with the
-    aligned kernel for certain sequence lengths when ``past_key`` is
-    ``nullptr``.
-
-    Set ``MOBIUS_USE_GQA_FOR_KV_SHARED=1`` when the ORT GQA kernel
-    supports ``new_kv_length=0`` (KV-shared pattern), which will enable
-    fused attention for these layers.
-    """
-
     ort_lower_opset_for_ep: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_ORT_LOWER_OPSET_FOR_EP", True)
+        default_factory=lambda: _env_bool("MOBIUS_ORT_LOWER_OPSET_FOR_EP", False)
     )
     """Lower the ONNX default-domain opset declaration to 23 when creating
     ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
 
-    ORT ≤1.24.x EPs don't register kernels for opset 24 standard ops
+    ORT ≤1.24.x EPs didn't register kernels for opset 24 standard ops
     (Squeeze, Reshape, etc.) even though the semantics are unchanged.
     Lowering the import declaration lets the EP find its existing kernels.
-    Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
-    opset 24 kernel support.
+    Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
+    an older ORT build without opset 24 kernel registration.
     """
 
     prune_lm_head: bool = dataclasses.field(

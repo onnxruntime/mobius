@@ -1,4 +1,5 @@
 model_id: "arcee-ai/AFM-4.5B-Base"
+model_type: "arcee"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

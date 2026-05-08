@@ -1,4 +1,5 @@
 model_id: "facebook/wav2vec2-base"
+model_type: "wav2vec2"
 revision: "0b5b8e868dd84f03fd87d01f9c4ff0f080fecfe8"
 task_type: "audio-feature-extraction"
 dtype: "float32"

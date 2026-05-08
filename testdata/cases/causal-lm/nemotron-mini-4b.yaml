@@ -1,4 +1,5 @@
 model_id: "nvidia/Nemotron-Mini-4B-Instruct"
+model_type: "nemotron"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

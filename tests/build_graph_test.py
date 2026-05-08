@@ -2223,9 +2223,43 @@ class TestBuildGraphQwen3ASR:
 
         input_names = {inp.name for inp in encoder.graph.inputs}
         assert "input_features" in input_names
+        # feature_attention_mask is required so the encoder can ignore
+        # padded mel frames; without it the LLM emits degenerate loops
+        # on any input padded by the standard HF processor.
+        assert "feature_attention_mask" in input_names
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "audio_features" in output_names
+        # audio_feature_lengths exposes the valid token count after
+        # the encoder's 8x time downsampling so downstream callers can
+        # crop padding-derived rows out of audio_features before the
+        # embedding gather.
+        assert "audio_feature_lengths" in output_names
+
+    def test_audio_encoder_attention_uses_mask(self):
+        """The encoder's Attention ops must receive the mask input.
+
+        Guards against accidentally dropping the mask wiring inside
+        the encoder forward — the graph builds without it but the
+        encoder behaves the same as the pre-fix version.
+        """
+        from mobius.models.qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        from mobius.tasks import SpeechLanguageTask
+
+        config = self._asr_config()
+        module = Qwen3ASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=SpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        attention_nodes = [n for n in encoder.graph if n.op_type == "Attention"]
+        assert attention_nodes, "audio encoder must contain Attention ops"
+        for node in attention_nodes:
+            # 4th positional input on op.Attention is attn_mask; must
+            # be a wired value, not None / empty.
+            assert len(node.inputs) >= 4
+            assert node.inputs[3] is not None
 
     def test_embedding_io(self):
         """Verify embedding model inputs/outputs."""
@@ -2318,9 +2352,26 @@ class TestBuildGraphQwen3ASR:
 
         # Step 1: Audio encoder — random mel input
         enc_sess = OnnxModelSession(pkg["audio_encoder"])
-        mel = np.random.randn(1, config.audio.num_mel_bins, 100).astype(np.float32)
-        enc_out = enc_sess.run({"input_features": mel})
+        mel_seq = 100
+        mel = np.random.randn(1, config.audio.num_mel_bins, mel_seq).astype(np.float32)
+        # Mark the last 20 mel frames as padding to exercise the mask
+        # path. The encoder must crop the corresponding audio rows so
+        # they don't leak into the embedding's Gather.
+        feature_attention_mask = np.ones((1, mel_seq), dtype=np.int64)
+        feature_attention_mask[:, -20:] = 0
+        enc_out = enc_sess.run(
+            {
+                "input_features": mel,
+                "feature_attention_mask": feature_attention_mask,
+            }
+        )
         audio_features = enc_out["audio_features"]
+        audio_feature_lengths = enc_out["audio_feature_lengths"]
+        # Crop padding-derived rows before passing to the embedding —
+        # this mirrors what production callers must do.
+        valid_len = int(audio_feature_lengths[0])
+        assert 0 < valid_len <= audio_features.shape[1]
+        audio_features = audio_features[:, :valid_len, :]
         num_audio_tokens = audio_features.shape[1]
         # Flatten to 2D: (num_audio_tokens, output_dim)
         audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
