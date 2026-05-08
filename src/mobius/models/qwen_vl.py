@@ -9,13 +9,13 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     InputMixer,
     Qwen2VLVisionModel,
     Qwen3VLVisionModel,
     Qwen25VLVisionModel,
 )
-from mobius._weight_utils import tie_word_embeddings
 from mobius.components._common import (
     Embedding,
     Linear,
