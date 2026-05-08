@@ -1,0 +1,24 @@
+model_id: "OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B"
+model_type: "videochat_flash_qwen"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+skip_reason: "7B model requires cv2/decord/imageio; too large for CI golden generation."
+notes: >
+  VideoChat-Flash-Qwen2.5-7B with InternVideo2-1B vision encoder.
+  Custom InternVideo2 ViT with LayerScale and QK norms.
+  Uses Qwen2.5 decoder with standard GQA attention.

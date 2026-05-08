@@ -508,7 +508,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_vl_text": ModelRegistration(Qwen3VLTextModel),
     "smolvlm": ModelRegistration(LLaVAModel, task="vision-language"),
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
-    "videochat_flash_qwen": ModelRegistration(VideoChatFlashModel, task="vision-language"),
+    "videochat_flash_qwen": ModelRegistration(
+        VideoChatFlashModel,
+        task="vision-language",
+        test_model_id="OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B",
+    ),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
     # Fun-ASR uses config.yaml (not config.json). build() auto-detection
