@@ -142,7 +142,7 @@ class TestRopeVariants:
         expected_theta = config.rope_theta * (4.0 ** (dim / (dim - 2)))
         expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         expected_cos1 = np.cos(expected_inv)
-        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
         np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
 
     def test_dynamic_ntk_rope_with_alpha(self):
@@ -158,11 +158,13 @@ class TestRopeVariants:
         expected_theta = config.rope_theta * (1000.0 ** (dim / (dim - 2)))
         expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         expected_cos1 = np.cos(expected_inv)
-        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
         np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
 
         # Verify it differs from factor=1.0 (no scaling)
-        default_inv = 1.0 / (config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        default_inv = 1.0 / (
+            config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim)
+        )
         default_cos1 = np.cos(default_inv)
         assert not np.allclose(actual_cos1, default_cos1, atol=1e-3), (
             "alpha=1000 should produce different frequencies than default"
@@ -194,7 +196,7 @@ class TestRopeVariants:
 
         # Compare cos at position 1 (cos(1 * inv_freq))
         hf_cos1 = np.cos(hf_inv_freq)
-        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
         np.testing.assert_allclose(actual_cos1, hf_cos1, atol=1e-5)
 
     def test_dynamic_ntk_rope_factor_only_backward_compatible(self):
@@ -209,7 +211,7 @@ class TestRopeVariants:
         expected_theta = config.rope_theta * (2.0 ** (dim / (dim - 2)))
         expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         expected_cos1 = np.cos(expected_inv)
-        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, : dim // 2]
         np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
 
 
