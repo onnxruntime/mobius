@@ -1,0 +1,28 @@
+model_id: "tencent/HY-Embodied-0.5-X"
+model_type: "hunyuan_vl_mot"
+revision: "79f8301d8a80dd03ba778c58d6429e414e9ef5d3"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+trust_remote_code: true
+
+skip_reason: "HF repo auto_map references configuration_hunyuan_vl_mot.py / modeling_hunyuan_vl_mot.py but those files do not exist in the repo. AutoModelForImageTextToText cannot load the model. Model type not yet in transformers. L5 verified manually via mobius ONNX build + ORT inference."
+
+# The VLM 3-model pipeline (vision encoder → embedding → decoder) with MoT
+# dual-pathway routing accumulates float32 rounding differences vs HuggingFace
+# PyTorch over autoregressive decode steps.
+min_token_match_ratio: 0.25
+
+notes: "HunYuan VL-MoT (HY-Embodied-0.5-X). ViT vision encoder + spatial merger + Mixture-of-Tokens dual-pathway decoder. 0.5B params. MoT routes vision/text tokens through separate projection weights per layer."
