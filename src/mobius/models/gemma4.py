@@ -1430,12 +1430,14 @@ class Gemma4TextModel(nn.Module):
         if self._image_token_id:
             masked_ids = op.Where(
                 op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
-                pad, masked_ids,
+                pad,
+                masked_ids,
             )
         if self._audio_token_id is not None:
             masked_ids = op.Where(
                 op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
-                pad, masked_ids,
+                pad,
+                masked_ids,
             )
 
         fused_emb = self.embed_tokens_per_layer(op, masked_ids)
@@ -2176,7 +2178,7 @@ class Gemma4Model(nn.Module):
 
         renamed: dict[str, torch.Tensor] = {}
         # Per-layer weight prefixes that should route to the embedding model
-        _PER_LAYER_PREFIXES = (
+        per_layer_prefixes = (
             "embed_tokens_per_layer.",
             "per_layer_model_projection.",
             "per_layer_projection_norm.",
@@ -2187,7 +2189,7 @@ class Gemma4Model(nn.Module):
                 if suffix.startswith("lm_head"):
                     # lm_head lives directly under decoder (not decoder.model)
                     renamed["decoder." + suffix] = value
-                elif any(suffix.startswith(p) for p in _PER_LAYER_PREFIXES):
+                elif any(suffix.startswith(p) for p in per_layer_prefixes):
                     # Per-layer embedding weights → embedding sub-model
                     renamed["embedding." + suffix] = value
                 else:
