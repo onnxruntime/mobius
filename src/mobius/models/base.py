@@ -20,6 +20,7 @@ from onnxscript._internal import builder
 
 from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._flags import flags
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -223,6 +224,18 @@ class CausalLMModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if flags.prune_lm_head:
+            # Select only the last token's hidden state before the LM head.
+            # Hidden shape goes [B, S, H] → [B, H] → [B, 1, H], turning the
+            # downstream MatMul output from [B, S, vocab] into [B, 1, vocab].
+            # Saves the [B, (S-1), vocab] portion of work during prefill.
+            #
+            # Mirrors onnxruntime-genai Model Builder's `prune_lm_head` flag
+            # (see make_lm_head() in builders/base.py).  Breaks workflows that
+            # need per-token logits — see flag docstring.
+            indices = op.Constant(value_ints=[-1])
+            last_hidden = op.Gather(hidden_states, indices, axis=1)
+            hidden_states = op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

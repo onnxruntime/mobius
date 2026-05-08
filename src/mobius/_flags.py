@@ -89,6 +89,13 @@ class _Flags:
          - ``False``
          - Use GQA for KV-shared layers on CUDA EP. Requires ORT GQA
            new_kv_length=0 support.
+       * - ``prune_lm_head``
+         - ``MOBIUS_PRUNE_LM_HEAD``
+         - ``False``
+         - Insert ``Gather(axis=1, indices=[-1])`` before the LM head MatMul
+           so logits are only computed for the last token. Speeds up prefill
+           for chat-only workloads but breaks logprob scoring and
+           speculative decoding.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -135,6 +142,38 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=0`` to disable once ORT adds
     opset 24 kernel support.
+    """
+
+    prune_lm_head: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_PRUNE_LM_HEAD", False)
+    )
+    """Insert ``Gather(axis=1, indices=[-1])`` before the LM head MatMul to
+    select only the last token's hidden state.
+
+    When ``False`` (default), the LM head computes logits for every token
+    in the sequence (output shape ``[B, S, vocab]``). This preserves all
+    use cases including logprob scoring, perplexity evaluation,
+    speculative-decoding verification, and multi-token-at-a-time generation.
+
+    When ``True``, only the last token's logits are computed (output shape
+    ``[B, 1, vocab]``), avoiding the full ``[B, S, vocab]`` MatMul during
+    prefill.  This is a meaningful prefill speedup for chat / single-token
+    generation workloads on models with large vocabularies (e.g. Qwen at
+    151936 tokens), but **breaks** any workflow that needs per-token logits.
+
+    Mirrors the ``prune_lm_head`` extra option in onnxruntime-genai's
+    Model Builder.  Set ``MOBIUS_PRUNE_LM_HEAD=1`` to enable for chat-only
+    deployments.
+
+    .. note::
+        **Compatibility:** This flag only takes effect for models that use
+        the base :class:`~mobius.models.base.CausalLMModel.forward`
+        implementation — Llama, Mistral, Qwen2 / 2.5 / 3, and other
+        standard decoder-only architectures.  Models that override
+        ``forward()`` (GPT-J, CodeGen, Phi, NanoChat, DOGE, Gemma3n,
+        Apertus, GPT-2 family, Mamba, InternLM2, Qwen3.5, etc.) **silently
+        ignore this flag** because they assemble logits via their own code
+        paths.  Coverage will be extended in follow-up work as needed.
     """
 
 

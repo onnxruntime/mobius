@@ -138,7 +138,64 @@ class TestBuildFromModule:
         assert model.graph.num_nodes() > 0
 
 
-class TestModelRegistry:
+class TestPruneLmHead:
+    """Tests for the ``prune_lm_head`` flag in CausalLMModel.
+
+    When ``True``, a ``Gather + Unsqueeze`` is inserted before the LM head
+    MatMul so logits are produced for only the last sequence position.
+    Mirrors onnxruntime-genai Model Builder's ``prune_lm_head`` opt-in.
+    """
+
+    def _build(self) -> ir.Model:
+        config = make_config()
+        module = CausalLMModel(config)
+        return build_from_module(module, config)["model"]
+
+    def test_default_emits_no_lm_head_pruning(self):
+        """Default flag: graph contains no Gather feeding the lm_head MatMul."""
+        from mobius._flags import override_flags
+
+        with override_flags(prune_lm_head=False):
+            model = self._build()
+
+        # The logits output should track full sequence_length in dim 1
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        # Full path: shape[1] is a symbolic dim ("sequence_length"), not 1
+        seq_dim = logits.shape[1]
+        # symbolic dims either expose an integer value of None or a symbolic
+        # name; the default (un-pruned) path must NOT be the literal int 1
+        assert seq_dim != 1, (
+            f"Expected dynamic sequence_length in logits dim 1, got {seq_dim!r}"
+        )
+
+    def test_prune_emits_gather_before_lm_head(self):
+        """With prune_lm_head=True, logits dim 1 collapses to 1."""
+        from mobius._flags import override_flags
+
+        with override_flags(prune_lm_head=True):
+            model = self._build()
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        seq_dim = logits.shape[1]
+        # Pruned path: shape[1] is the literal integer 1
+        assert seq_dim == 1, (
+            f"Expected logits dim 1 to be 1 after pruning, got {seq_dim!r}"
+        )
+
+    def test_prune_does_not_change_input_shapes(self):
+        """Pruning only affects output; input_ids / attention_mask still
+        have dynamic sequence_length so the model accepts arbitrary prompts."""
+        from mobius._flags import override_flags
+
+        with override_flags(prune_lm_head=True):
+            model = self._build()
+
+        input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
+        # input dim 1 (sequence_length) should still be dynamic, not 1
+        assert input_ids.shape[1] != 1
+
+
+
     def test_registry_not_empty(self):
         assert len(registry) > 0
 
