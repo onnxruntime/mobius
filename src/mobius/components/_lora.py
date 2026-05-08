@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import numpy
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 
@@ -61,7 +60,7 @@ class LoRALinear(Linear):
                 setattr(self, f"_lora_scale_{name}", scale_param)
                 self._adapters.append((name, scale_param))
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         result = super().forward(op, x)
         for name, scale_param in self._adapters:
             lora_a = getattr(self, f"_lora_A_{name}")

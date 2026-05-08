@@ -8,8 +8,7 @@ from __future__ import annotations
 import math
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 # MatMulNBits packs weights into uint8 blobs.  The packed shape depends
 # on bits and block_size:
@@ -85,7 +84,7 @@ class QuantizedLinear(nn.Module):
         )
         self.bias = nn.Parameter([out_features]) if bias else None
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         """Compute quantized matmul: y = x @ dequant(W).
 
         Args:

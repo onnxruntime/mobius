@@ -18,8 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Embedding, LayerNorm, Linear
 
@@ -27,7 +26,7 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def _swish(op: builder.OpBuilder, x):
+def _swish(op: OpBuilder, x):
     """Swish activation: x * sigmoid(x)."""
     return op.Mul(x, op.Sigmoid(x))
 
@@ -40,21 +39,21 @@ def _swish(op: builder.OpBuilder, x):
 class _SwishModule(nn.Module):
     """Swish activation as an nn.Module (no parameters)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Mul(x, op.Sigmoid(x))
 
 
 class _ReLUModule(nn.Module):
     """ReLU activation as an nn.Module (no parameters)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Relu(x)
 
 
 class _IdentityModule(nn.Module):
     """Identity (no-op) module, placeholder for dropout layers."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return x
 
 
@@ -80,7 +79,7 @@ class _Conv2d(nn.Module):
         self._pads = [padding, padding, padding, padding]
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -112,7 +111,7 @@ class _ConvWeight(nn.Module):
         self._pads = pads or [0, 0]
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -131,7 +130,7 @@ class _GLULinear(nn.Module):
         super().__init__()
         self.linear = Linear(input_dim, output_dim * 2)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.linear(op, x)  # [B, T, output_dim * 2]
         first, second = op.Split(x, axis=-1, num_outputs=2, _outputs=2)
         return op.Mul(first, _swish(op, second))
@@ -150,7 +149,7 @@ class _GLUPointWiseConv(nn.Module):
         self.b1 = nn.Parameter([1, channels, 1])
         self.b2 = nn.Parameter([1, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # [B, C, T] → [B, 2C, T] → split → GLU gate
         glu_out = self.ext_pw_conv_1d(op, x)  # [B, 2C, T]
         first, second = op.Split(glu_out, axis=1, num_outputs=2, _outputs=2)
@@ -178,7 +177,7 @@ class _DepthwiseSepConv(nn.Module):
         )
         self.pw_conv = _ConvWeight([channels, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.dw_conv(op, x)
         return self.pw_conv(op, x)
 
@@ -228,7 +227,7 @@ class NeMoConvSubsampling(nn.Module):
         )
         self.out = Linear(conv_channels * freq, feat_out)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: [B, T, input_size]
         x = op.Unsqueeze(x, [1])  # [B, 1, T, F]
 
@@ -254,7 +253,7 @@ class MeanVarianceNorm(nn.Module):
         self.global_mean = nn.Parameter([input_size])
         self.global_invstd = nn.Parameter([input_size])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = op.Sub(x, self.global_mean)
         return op.Mul(x, self.global_invstd)
 
@@ -274,7 +273,7 @@ class T5RelativeAttentionBias(nn.Module):
         self._max_distance = max_distance
         self._num_buckets = num_buckets
 
-    def forward(self, op: builder.OpBuilder, seq_length: ir.Value):
+    def forward(self, op: OpBuilder, seq_length: ir.Value):
         # seq_length: scalar tensor (int64)
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
@@ -321,7 +320,7 @@ class ConformerFeedForward(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.layer_norm(op, x)
         for layer in self.net:
             x = layer(op, x)
@@ -344,7 +343,7 @@ class ConformerConvModule(nn.Module):
         self.dw_sep_conv_1d = _DepthwiseSepConv(channels, kernel_size)
         self.ext_pw_conv_1d = _ConvWeight([channels, channels, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: [B, T, C]
         x = self.layer_norm(op, x)
         x = op.Transpose(x, perm=[0, 2, 1])  # [B, C, T]
@@ -382,7 +381,7 @@ class ConformerAttention(nn.Module):
         self.linear_v = Linear(d_model, d_model)
         self.linear_out = Linear(d_model, d_model)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
         # x: [B, T, D], relative_attention_bias: [1, H, T, T]
         q = self.linear_q(op, x)  # [B, T, H*D_h]
         k = self.linear_k(op, x)
@@ -430,7 +429,7 @@ class ConformerEncoderLayer(nn.Module):
         self.layer_norm_att = LayerNorm(d_model)
         self.layer_norm = LayerNorm(d_model)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value, relative_attention_bias: ir.Value):
         # Macaron feed-forward in
         x = op.Add(x, op.Mul(self.feed_forward_in(op, x), 0.5))
 
@@ -491,7 +490,7 @@ class ConformerEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, audio_features: ir.Value):
+    def forward(self, op: OpBuilder, audio_features: ir.Value):
         # audio_features: [B, T, input_size]
         x = self.encoder_embedding(op, audio_features)
         x = self.embed(op, x)  # [B, T', attention_dim]

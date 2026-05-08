@@ -16,8 +16,7 @@ import re
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, YolosConfig
 from mobius.components import (
@@ -59,7 +58,7 @@ class _YolosEmbeddings(nn.Module):
             data=ir.tensor(np.zeros((1, num_positions, hidden_size), dtype=np.float32)),
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_embeds = self.patch_embeddings(op, pixel_values)
         batch_size = op.Shape(patch_embeds, start=0, end=1)
 
@@ -90,7 +89,7 @@ class _Conv2dPatchEmbed(nn.Module):
         super().__init__()
         self.projection = _Conv2d(in_channels, hidden_size, patch_size, patch_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         x = self.projection(op, pixel_values)
         batch = op.Shape(x, start=0, end=1)
         hidden = op.Shape(x, start=1, end=2)
@@ -118,7 +117,7 @@ class _YolosEncoderLayer(nn.Module):
             bias=True,
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.layernorm_before(op, hidden_states)
         hidden_states = self.self_attn(op, hidden_states)
@@ -142,7 +141,7 @@ class _MLPPredictionHead(nn.Module):
         )
         self.num_layers = num_layers
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         for i, layer in enumerate(self.layers):
             x = layer(op, x)
             if i < self.num_layers - 1:
@@ -196,7 +195,7 @@ class YolosForObjectDetection(nn.Module):
             config.hidden_size, config.hidden_size, 4, num_layers=3
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
 
         for i, layer in enumerate(self.encoder):

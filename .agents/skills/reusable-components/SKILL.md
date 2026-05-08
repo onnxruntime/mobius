@@ -60,7 +60,7 @@ Model-specific compound blocks (e.g. `_TimestepEmbedding`, `_DiTBlock`,
 
 ```python
 from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder
 
 
 class MyComponent(nn.Module):
@@ -68,7 +68,7 @@ class MyComponent(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states):
+    def forward(self, op: OpBuilder, hidden_states):
         return op.Mul(hidden_states, self.weight)
 ```
 

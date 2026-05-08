@@ -29,8 +29,7 @@ HuggingFace reference: ``MambaMixer`` (SSM portion).
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 
@@ -60,7 +59,7 @@ class SelectiveScan(nn.Module):
         # D: (d_inner,) — skip connection / feedthrough
         self.D = nn.Parameter([d_inner])
 
-    def _project_ssm_params(self, op: builder.OpBuilder, x_db):
+    def _project_ssm_params(self, op: OpBuilder, x_db):
         """Split x_proj output into dt_raw, B, C.
 
         Subclasses can override to apply extra transformations (e.g.
@@ -83,7 +82,7 @@ class SelectiveScan(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         x: ir.Value,
         ssm_state: ir.Value,
     ):
@@ -230,7 +229,7 @@ class Mamba2Scan(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         dt_input: ir.Value,
         b_mat: ir.Value,
@@ -327,7 +326,7 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter([size])
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Upcast to fp32 for variance computation (matching HF RMSNorm).
         x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
         variance = op.ReduceMean(op.Mul(x_f32, x_f32), [-1], keepdims=True)

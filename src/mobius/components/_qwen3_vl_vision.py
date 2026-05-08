@@ -23,8 +23,7 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius.components._common import LayerNorm, Linear
@@ -64,7 +63,7 @@ class Qwen3VLPatchEmbed(nn.Module):
         )
         self.bias = nn.Parameter([hidden_size], name="proj.bias")
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (total_patches, C * T_p * P * P)
         # Reshape to (total_patches, C, T_p, P, P) for Conv3d
         x = op.Reshape(
@@ -112,7 +111,7 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
             data=ir.tensor(sin_table),
         )
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         """Look up cos/sin for 2D position IDs.
 
         Args:
@@ -160,7 +159,7 @@ class Qwen3VLVisionAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         position_embeddings: tuple,
@@ -336,7 +335,7 @@ class Qwen3VLVisionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         position_embeddings: tuple,
@@ -377,7 +376,7 @@ class Qwen3VLPatchMerger(nn.Module):
         self.linear_fc1 = Linear(self.merged_size, self.merged_size, bias=True)
         self.linear_fc2 = Linear(self.merged_size, out_hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         if self.use_postshuffle_norm:
             # Reshape to merged dim, then normalise
             x = op.Reshape(hidden_states, [-1, self.merged_size])
@@ -834,7 +833,7 @@ class Qwen3VLVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         grid_thw: ir.Value,
     ):

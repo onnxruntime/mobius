@@ -4,8 +4,7 @@
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._flags import flags
 
@@ -18,7 +17,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
 
 
@@ -36,7 +35,7 @@ class OffsetRMSNorm(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         effective_weight = op.Add(self.weight, 1.0)
         return op.RMSNormalization(
             hidden_states,
@@ -73,7 +72,7 @@ class GatedRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.group_size = group_size
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # SiLU gating in fp32 for precision, matching HF.
         h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
@@ -160,7 +159,7 @@ class PostGatedRMSNorm(nn.Module):
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
         # RMSNorm uses stash_type=1 internally for fp32 variance.
         normed = op.RMSNormalization(
             hidden_states,
@@ -177,7 +176,7 @@ class PostGatedRMSNorm(nn.Module):
         return op.CastLike(result, hidden_states)
 
 
-def apply_rms_norm(op: builder.OpBuilder, x, weight, eps):
+def apply_rms_norm(op: OpBuilder, x, weight, eps):
     """Apply RMS normalization using the ONNX RMSNormalization op.
 
     Args:

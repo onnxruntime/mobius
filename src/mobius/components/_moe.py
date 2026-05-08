@@ -8,8 +8,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._mlp import MLP
@@ -31,7 +30,7 @@ class TopKGate(nn.Module):
         self.top_k = top_k
         self.weight = nn.Parameter([num_experts, hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         k = op.Constant(value_ints=[self.top_k])
@@ -56,7 +55,7 @@ class SoftmaxTopKGate(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.weight = nn.Parameter([num_experts, hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         # Softmax over all experts first
@@ -95,7 +94,7 @@ class SigmoidTopKGate(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter([num_experts, hidden_size])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
         # Sigmoid instead of softmax: each expert scored independently
@@ -154,7 +153,7 @@ class SparseMixerGate(nn.Module):
         expert_weight = op.GatherElements(weights, expert_idx, axis=-1)
         return expert_weight, expert_idx
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
@@ -209,7 +208,7 @@ class MoELayer(nn.Module):
         )
         self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         result = None

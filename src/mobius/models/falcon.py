@@ -38,7 +38,7 @@ from mobius.components._common import Embedding, LayerNorm, Linear
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-    from onnxscript._internal import builder
+    from onnxscript import OpBuilder
 
 
 class _ALiBiAttention(nn.Module):
@@ -72,7 +72,7 @@ class _ALiBiAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -130,7 +130,7 @@ class _ALiBiDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         past_key_value: tuple | None = None,
@@ -195,7 +195,7 @@ class _FalconDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -333,7 +333,7 @@ class _FalconTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -401,7 +401,7 @@ class _BloomTextModel(_FalconTextModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -521,7 +521,7 @@ class FalconCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
