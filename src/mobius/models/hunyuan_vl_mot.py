@@ -291,45 +291,106 @@ class HunYuanVLMoTModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         # Top-level HF prefix: "model." wraps everything.
-        # Strip it so sub-models can find their weights:
-        # - model.language_model.* → language_model.*
-        # - model.visual.* → visual.*
+        # Strip it first: model.language_model.* → language_model.*
+        #                  model.visual.*        → visual.*
         stripped: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             new_key = key[len("model.") :] if key.startswith("model.") else key
             stripped[new_key] = value
 
-        # Route visual.* weights to vision_encoder sub-model
-        # Route language_model.* weights to decoder and embedding sub-models
         result: dict[str, torch.Tensor] = {}
+
         for key, value in stripped.items():
             if key.startswith("visual."):
-                # visual.vision_tower.* → vision_encoder.vision_tower.*
-                # visual.merger.* → vision_encoder.multi_modal_projector.*
-                suffix = key[len("visual.") :]
-                if suffix.startswith("merger."):
-                    # Map merger.proj1 → multi_modal_projector.linear_1
-                    # Map merger.proj2 → multi_modal_projector.linear_2
-                    merger_key = suffix[len("merger.") :]
-                    merger_key = merger_key.replace("proj1.", "linear_1.")
-                    merger_key = merger_key.replace("proj2.", "linear_2.")
-                    # pooler.predictor is extra — skip for now (not in standard MLP projector)
-                    if "pooler." in merger_key:
-                        continue
-                    result[f"vision_encoder.multi_modal_projector.{merger_key}"] = value
-                else:
-                    result[f"vision_encoder.{suffix}"] = value
+                self._route_vision_weight(key, value, result)
             elif key.startswith("language_model."):
-                # Duplicate embed_tokens to both decoder and embedding sub-models
-                if "embed_tokens" in key:
-                    suffix = key[len("language_model.model.") :]
-                    result[f"embedding.{suffix}"] = value
-                # All language_model weights go to decoder (it strips prefix internally)
-                result[f"decoder.{key}"] = value
+                self._route_decoder_weight(key, value, result)
 
-                # Handle weight tying: embed_tokens → lm_head
-                if self.config.tie_word_embeddings and "embed_tokens.weight" in key:
-                    result["decoder.lm_head.weight"] = value
-            else:
-                result[key] = value
         return result
+
+    def _route_vision_weight(
+        self,
+        key: str,
+        value: torch.Tensor,
+        result: dict[str, torch.Tensor],
+    ) -> None:
+        """Route visual.* weights to vision_encoder sub-model."""
+        suffix = key[len("visual.") :]
+
+        if suffix.startswith("merger."):
+            # merger.proj1 → multi_modal_projector.linear_1
+            # merger.proj2 → multi_modal_projector.linear_2
+            merger_key = suffix[len("merger.") :]
+            merger_key = merger_key.replace("proj1.", "linear_1.")
+            merger_key = merger_key.replace("proj2.", "linear_2.")
+            # Skip pooler weights (not in standard MLP projector)
+            if "pooler." in merger_key:
+                return
+            result[f"vision_encoder.multi_modal_projector.{merger_key}"] = value
+            return
+
+        # Vision tower weight renames:
+        # vision_tower.blocks.N → vision_tower.vision_model.encoder.layers.N
+        new_key = suffix.replace(
+            "vision_tower.blocks.",
+            "vision_tower.vision_model.encoder.layers.",
+        )
+        # attn.proj → self_attn.out_proj
+        new_key = new_key.replace(".attn.proj.", ".self_attn.out_proj.")
+        # norm1/norm2 → layer_norm1/layer_norm2
+        new_key = new_key.replace(".norm1.", ".layer_norm1.")
+        new_key = new_key.replace(".norm2.", ".layer_norm2.")
+        # mlp.fc1/fc2 → mlp.up_proj/down_proj
+        new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
+        new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
+        # patch_embed.proj → embeddings.patch_embedding
+        new_key = new_key.replace(
+            "vision_tower.patch_embed.proj.",
+            "vision_tower.vision_model.embeddings.patch_embedding.",
+        )
+        # pos_embed → embeddings.position_embedding.weight
+        new_key = new_key.replace(
+            "vision_tower.pos_embed",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
+        )
+
+        # Split fused QKV into separate Q, K, V
+        if ".attn.qkv." in suffix:
+            layer_prefix = new_key.split(".attn.qkv.")[0]
+            param = "weight" if "weight" in key else "bias"
+            chunks = torch.chunk(value, 3, dim=0)
+            result[f"vision_encoder.{layer_prefix}.self_attn.q_proj.{param}"] = chunks[0]
+            result[f"vision_encoder.{layer_prefix}.self_attn.k_proj.{param}"] = chunks[1]
+            result[f"vision_encoder.{layer_prefix}.self_attn.v_proj.{param}"] = chunks[2]
+            return
+
+        result[f"vision_encoder.{new_key}"] = value
+
+    def _route_decoder_weight(
+        self,
+        key: str,
+        value: torch.Tensor,
+        result: dict[str, torch.Tensor],
+    ) -> None:
+        """Route language_model.* weights to decoder and embedding."""
+        # Strip language_model. prefix → model.layers.0.*, lm_head.*, etc.
+        suffix = key[len("language_model.") :]
+
+        # Skip MoT _v pathway weights
+        if "_v." in suffix or suffix.endswith("_v"):
+            return
+
+        # Duplicate embed_tokens to embedding sub-model
+        if "embed_tokens" in suffix:
+            embed_key = suffix[len("model.") :] if suffix.startswith("model.") else suffix
+            result[f"embedding.{embed_key}"] = value
+
+        # QK-norm rename: query_layernorm → q_norm, key_layernorm → k_norm
+        renamed = suffix.replace(".query_layernorm.", ".q_norm.").replace(
+            ".key_layernorm.", ".k_norm."
+        )
+        result[f"decoder.{renamed}"] = value
+
+        # Weight tying: embed_tokens → lm_head
+        if self.config.tie_word_embeddings and "embed_tokens.weight" in key:
+            result["decoder.lm_head.weight"] = value
