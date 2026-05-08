@@ -12,6 +12,7 @@ from mobius._testing import create_test_builder, create_test_input, make_config
 from mobius.components._rotary_embedding import (
     ChunkedMRope,
     DefaultRope,
+    DynamicNTKRope,
     InterleavedMRope,
     LinearRope,
     Llama3Rope,
@@ -127,6 +128,90 @@ class TestRopeVariants:
         assert rope.has_long_cache
         assert next(iter(rope.cos_cache.shape)) == 96
 
+    def test_dynamic_ntk_rope_with_factor(self):
+        """DynamicNTKRope with factor (standard, no alpha) applies NTK scaling."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 4.0},
+        )
+        rope = DynamicNTKRope(config)
+        assert next(iter(rope.cos_cache.shape)) == config.max_position_embeddings
+
+        # Verify NTK scaling: new_theta = theta * factor^(dim/(dim-2))
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (4.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
+    def test_dynamic_ntk_rope_with_alpha(self):
+        """DynamicNTKRope with alpha (HunyuanV1) uses alpha instead of factor."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 1.0, "alpha": 1000.0},
+        )
+        rope = DynamicNTKRope(config)
+
+        # With alpha=1000, scaling should use 1000 not factor=1.0
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (1000.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
+        # Verify it differs from factor=1.0 (no scaling)
+        default_inv = 1.0 / (config.rope_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        default_cos1 = np.cos(default_inv)
+        assert not np.allclose(actual_cos1, default_cos1, atol=1e-3), (
+            "alpha=1000 should produce different frequencies than default"
+        )
+
+    def test_dynamic_ntk_rope_alpha_matches_hunyuan_hf(self):
+        """DynamicNTKRope with HunyuanV1 config matches HF inv_freq exactly."""
+        # HunyuanV1 HF formula: base = theta * alpha^(dim/(dim-2))
+        # inv_freq = 1.0 / (base ** (arange(0, dim, 2) / dim))
+        config = make_config(
+            rope_theta=10000.0,
+            head_dim=128,
+            rope_type="dynamic",
+            rope_scaling={
+                "factor": 1.0,
+                "alpha": 1000.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+            },
+        )
+        rope = DynamicNTKRope(config)
+
+        # Reference: HF HunYuanDenseV1RotaryEmbedding
+        dim = 128
+        base = 10000.0 * 1000.0 ** (dim / (dim - 2))
+        hf_inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+
+        # Compare cos at position 1 (cos(1 * inv_freq))
+        hf_cos1 = np.cos(hf_inv_freq)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        np.testing.assert_allclose(actual_cos1, hf_cos1, atol=1e-5)
+
+    def test_dynamic_ntk_rope_factor_only_backward_compatible(self):
+        """DynamicNTKRope without alpha still works with factor alone."""
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 2.0},
+        )
+        rope = DynamicNTKRope(config)
+
+        dim = config.head_dim
+        expected_theta = config.rope_theta * (2.0 ** (dim / (dim - 2)))
+        expected_inv = 1.0 / (expected_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        expected_cos1 = np.cos(expected_inv)
+        actual_cos1 = rope.cos_cache.const_value.numpy()[1, :dim // 2]
+        np.testing.assert_allclose(actual_cos1, expected_cos1, atol=1e-5)
+
 
 class TestInitializeRope:
     def test_default(self):
@@ -155,6 +240,19 @@ class TestInitializeRope:
         )
         rope = initialize_rope(config)
         assert isinstance(rope, LongRope)
+
+    def test_dynamic(self):
+        config = make_config(rope_type="dynamic", rope_scaling={"factor": 2.0})
+        rope = initialize_rope(config)
+        assert isinstance(rope, DynamicNTKRope)
+
+    def test_dynamic_with_alpha(self):
+        config = make_config(
+            rope_type="dynamic",
+            rope_scaling={"factor": 1.0, "alpha": 1000.0},
+        )
+        rope = initialize_rope(config)
+        assert isinstance(rope, DynamicNTKRope)
 
     def test_unsupported_raises(self):
         config = make_config(rope_type="unknown")
