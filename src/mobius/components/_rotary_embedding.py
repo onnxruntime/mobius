@@ -218,13 +218,19 @@ class DynamicNTKRope(BaseRope):
     This spreads frequencies more evenly across the extended context,
     preserving the model's positional inductive bias better than linear
     scaling for long-context extrapolation.
+
+    HunyuanV1 uses ``alpha`` instead of ``factor`` for the scaling
+    exponent (same formula, different config key). When ``alpha`` is
+    present in ``rope_scaling``, it takes precedence over ``factor``.
     """
 
     def __init__(self, config: ArchitectureConfig):
         dim = int(config.head_dim * config.partial_rotary_factor)
-        factor = config.rope_scaling["factor"]
+        # HunyuanV1 uses "alpha" as the scaling factor; standard
+        # dynamic NTK uses "factor". Prefer alpha when present.
+        scaling = config.rope_scaling.get("alpha") or config.rope_scaling["factor"]
         # NTK-aware base scaling
-        new_theta = config.rope_theta * (factor ** (dim / (dim - 2)))
+        new_theta = config.rope_theta * (scaling ** (dim / (dim - 2)))
         inv_freq = 1.0 / (new_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
         super().__init__(cos_cache, sin_cache, dtype=config.dtype)
