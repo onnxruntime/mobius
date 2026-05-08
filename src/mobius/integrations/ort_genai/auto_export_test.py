@@ -910,6 +910,118 @@ class TestExportForOrtGenai:
         assert data["model"]["eos_token_id"] == [1, 106]
 
 
+class TestExportPackage:
+    """Tests for export_package() — the save+config integration helper."""
+
+    @staticmethod
+    def _make_pkg():
+        return _make_fake_llm_pkg("qwen2")
+
+    def test_writes_both_onnx_and_genai_config(self, tmp_path, monkeypatch):
+        """export_package calls pkg.save AND writes genai_config.json."""
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        save_calls = []
+
+        def fake_save(self, directory, **kwargs):
+            save_calls.append((directory, kwargs))
+
+        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+
+        result = export_package(pkg, str(tmp_path))
+
+        # pkg.save called exactly once with the output dir
+        assert len(save_calls) == 1
+        assert save_calls[0][0] == str(tmp_path)
+        # genai_config artifact is in the manifest
+        assert "genai_config" in result
+        assert os.path.isfile(result["genai_config"])
+        # ONNX path is in the manifest (single-component package)
+        assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
+
+    def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
+        """external_data and progress_bar are forwarded to pkg.save."""
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        save_calls = []
+
+        def fake_save(self, directory, **kwargs):
+            save_calls.append(kwargs)
+
+        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+
+        export_package(
+            pkg,
+            str(tmp_path),
+            external_data="safetensors",
+            progress_bar=False,
+        )
+
+        assert save_calls[0]["external_data"] == "safetensors"
+        assert save_calls[0]["progress_bar"] is False
+
+    def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
+        """The ep and context_length kwargs reach the generated genai_config.json."""
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
+
+        result = export_package(
+            pkg,
+            str(tmp_path),
+            ep="cuda",
+            context_length=8192,
+        )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        # ep="cuda" should produce CUDA provider_options
+        provider_opts = data["model"]["decoder"]["session_options"]["provider_options"]
+        assert any("cuda" in po for po in provider_opts)
+        # context_length should bump max_length
+        assert data["search"]["max_length"] == 8192
+
+    def test_preflights_missing_config(self, tmp_path, monkeypatch):
+        """Raises ValueError BEFORE writing any ONNX when pkg.config is None.
+
+        This avoids leaving a half-exported directory with model.onnx but
+        no genai_config.json.
+        """
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
+        save_called = []
+
+        def fake_save(self, *a, **kw):
+            save_called.append(True)
+
+        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+
+        with pytest.raises(ValueError, match="config"):
+            export_package(pkg, str(tmp_path))
+
+        # save was NOT called — preflight failed before any I/O
+        assert save_called == []
+
+    def test_returns_manifest_with_all_artifacts(self, tmp_path, monkeypatch):
+        """Returned manifest contains ONNX paths AND config artifacts."""
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
+
+        result = export_package(pkg, str(tmp_path))
+
+        # Manifest is non-empty and includes both kinds of artifacts
+        assert isinstance(result, dict)
+        assert "model" in result
+        assert "genai_config" in result
+
+
 class TestGemma4GenaiConfig:
     """Tests for Gemma4-specific genai_config generation via graph introspection."""
 
