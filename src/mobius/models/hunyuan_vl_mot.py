@@ -8,7 +8,20 @@ Replicates ``tencent/HY-Embodied-0.5-X`` (HunYuanVLMoTForConditionalGeneration).
 Architecture:
 - **Vision encoder**: 27-block ViT (fused QKV, LayerNorm) with spatial merger
 - **Embedding**: Token lookup + image feature scatter at placeholder positions
-- **Decoder**: 32-layer GQA (16Q/4KV heads, head_dim=128) with QK-norm
+- **Decoder**: 32-layer GQA (16Q/4KV heads, head_dim=128) with QK-norm and
+  Mixture-of-Tokens (MoT) dual-pathway routing
+
+MoT dual pathway:
+    Every decoder layer has two sets of projections — standard (text) and
+    ``_v`` (vision).  During prefill, vision token positions are routed
+    through ``_v`` weights while text tokens use standard weights.  Q/K/V
+    are merged per-token **before** the attention operation so that all
+    tokens attend to all tokens in a shared KV space.  The KV cache
+    contains mixed text/vision K/V so that subsequent decode steps
+    correctly attend to image context.
+
+    QK norms (``query_layernorm`` / ``key_layernorm``) are shared between
+    both pathways.
 
 HuggingFace weight layout::
 
@@ -21,26 +34,19 @@ HuggingFace weight layout::
     model.visual.merger.proj1/proj2.{weight,bias}
     model.visual.merger.pooler.predictor.{0,2}.{weight,bias}
     model.language_model.model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+    model.language_model.model.layers.{i}.self_attn.{q,k,v,o}_proj_v.weight
     model.language_model.model.layers.{i}.self_attn.query_layernorm.weight
     model.language_model.model.layers.{i}.self_attn.key_layernorm.weight
     model.language_model.model.layers.{i}.{input,post_attention}_layernorm.weight
+    model.language_model.model.layers.{i}.{input,post_attention}_layernorm_v.weight
     model.language_model.model.layers.{i}.mlp.{gate,up,down}_proj.weight
+    model.language_model.model.layers.{i}.mlp_v.{gate,up,down}_proj.weight
     model.language_model.model.embed_tokens.weight
     model.language_model.model.norm.weight
-
-.. note::
-
-   The HF model also contains ``_v``-suffixed weights for a Mixture-of-Tokens
-   (MoT) visual pathway (``q_proj_v``, ``mlp_v``, ``input_layernorm_v``, etc.)
-   that routes vision tokens through separate projections per layer.  This
-   pathway is not yet implemented — the ONNX decoder uses the standard text
-   pathway only.  This is correct for text-only decode steps; full MoT prefill
-   support is tracked as future work.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -53,7 +59,13 @@ from mobius.components import (
     MLPMultiModalProjector,
     VisionModel,
 )
-from mobius.models.base import TextModel
+from mobius.components._attention import _apply_attention
+from mobius.components._mlp import MLP
+from mobius.components._rms_norm import RMSNorm
+from mobius.components._rotary_embedding import (
+    apply_rotary_pos_emb,
+    initialize_rope,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -147,28 +159,265 @@ class _HunYuanVLMoTEmbeddingModel(nn.Module):
         return op.Where(image_mask_3d, gathered, text_embeds)
 
 
+# ── MoT Attention ───────────────────────────────────────────────────────
+
+
+class _MoTAttention(nn.Module):
+    """Mixture-of-Tokens attention with dual Q/K/V/O projections.
+
+    Text tokens use standard projections; vision tokens use ``_v``
+    projections.  Q/K/V are merged per-token **before** the single
+    attention operation so that all tokens attend to all tokens in a
+    shared KV space.  The QK norms (``q_norm`` / ``k_norm``) are shared
+    between both pathways.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        h = config.hidden_size
+        hd = config.head_dim
+        nq = config.num_attention_heads
+        nkv = config.num_key_value_heads
+
+        self.num_attention_heads = nq
+        self.num_key_value_heads = nkv
+        self.head_dim = hd
+        self.scaling = hd**-0.5
+
+        bias = config.attn_qkv_bias
+        o_bias = config.attn_o_bias
+
+        # Text pathway projections
+        self.q_proj = Linear(h, nq * hd, bias=bias)
+        self.k_proj = Linear(h, nkv * hd, bias=bias)
+        self.v_proj = Linear(h, nkv * hd, bias=bias)
+        self.o_proj = Linear(nq * hd, h, bias=o_bias)
+
+        # Vision pathway projections (_v)
+        self.q_proj_v = Linear(h, nq * hd, bias=bias)
+        self.k_proj_v = Linear(h, nkv * hd, bias=bias)
+        self.v_proj_v = Linear(h, nkv * hd, bias=bias)
+        self.o_proj_v = Linear(nq * hd, h, bias=o_bias)
+
+        # Shared QK norms (applied to both pathways)
+        self.q_norm = RMSNorm(hd, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(hd, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states_text: ir.Value,
+        hidden_states_vision: ir.Value,
+        modality_mask_3d: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None,
+        past_key_value: tuple | None,
+    ):
+        # Compute Q/K/V for both pathways
+        q_text = self.q_proj(op, hidden_states_text)
+        k_text = self.k_proj(op, hidden_states_text)
+        v_text = self.v_proj(op, hidden_states_text)
+
+        q_vision = self.q_proj_v(op, hidden_states_vision)
+        k_vision = self.k_proj_v(op, hidden_states_vision)
+        v_vision = self.v_proj_v(op, hidden_states_vision)
+
+        # Merge Q/K/V per-token: vision tokens get _v projection output
+        q = op.Where(modality_mask_3d, q_vision, q_text)
+        k = op.Where(modality_mask_3d, k_vision, k_text)
+        v = op.Where(modality_mask_3d, v_vision, v_text)
+
+        # Apply shared QK norms (per-head: reshape to 4D, norm, reshape back)
+        q = op.Reshape(q, [0, 0, -1, self.head_dim])
+        k = op.Reshape(k, [0, 0, -1, self.head_dim])
+        q = self.q_norm(op, q)
+        k = self.k_norm(op, k)
+        q = op.Reshape(q, [0, 0, -1])
+        k = op.Reshape(k, [0, 0, -1])
+
+        # Apply rotary position embeddings
+        if position_embeddings is not None:
+            q = apply_rotary_pos_emb(
+                op,
+                x=q,
+                position_embeddings=position_embeddings,
+                num_heads=self.num_attention_heads,
+                rotary_embedding_dim=0,
+            )
+            k = apply_rotary_pos_emb(
+                op,
+                x=k,
+                position_embeddings=position_embeddings,
+                num_heads=self.num_key_value_heads,
+                rotary_embedding_dim=0,
+            )
+
+        # Single attention over merged Q/K/V
+        past_k = past_key_value[0] if past_key_value else None
+        past_v = past_key_value[1] if past_key_value else None
+        attn_output, present_k, present_v = _apply_attention(
+            op,
+            q,
+            k,
+            v,
+            attention_bias,
+            past_k,
+            past_v,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            scale=self.scaling,
+        )
+
+        # Route output through text or vision o_proj
+        o_text = self.o_proj(op, attn_output)
+        o_vision = self.o_proj_v(op, attn_output)
+        output = op.Where(modality_mask_3d, o_vision, o_text)
+
+        return output, (present_k, present_v)
+
+
+# ── MoT Decoder Layer ──────────────────────────────────────────────────
+
+
+class _MoTDecoderLayer(nn.Module):
+    """Decoder layer with MoT dual-pathway routing.
+
+    Each sub-layer (attention, MLP) has text and vision variants.
+    Routing is controlled by ``modality_mask_3d`` (BOOL [B, S, 1]).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        h = config.hidden_size
+        eps = config.rms_norm_eps
+
+        # Dual input layernorms
+        self.input_layernorm = RMSNorm(h, eps=eps)
+        self.input_layernorm_v = RMSNorm(h, eps=eps)
+
+        # MoT attention (dual projections, shared QK norms)
+        self.self_attn = _MoTAttention(config)
+
+        # Dual post-attention layernorms
+        self.post_attention_layernorm = RMSNorm(h, eps=eps)
+        self.post_attention_layernorm_v = RMSNorm(h, eps=eps)
+
+        # Dual MLPs
+        self.mlp = MLP(config)
+        self.mlp_v = MLP(config)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        modality_mask_3d: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None,
+        past_key_value: tuple | None,
+    ):
+        residual = hidden_states
+
+        # Dual input norms, merge for attention input
+        normed_text = self.input_layernorm(op, hidden_states)
+        normed_vision = self.input_layernorm_v(op, hidden_states)
+
+        # MoT attention: merges Q/K/V internally, single attention call
+        attn_output, present_kv = self.self_attn(
+            op,
+            hidden_states_text=normed_text,
+            hidden_states_vision=normed_vision,
+            modality_mask_3d=modality_mask_3d,
+            attention_bias=attention_bias,
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+        )
+        hidden_states = op.Add(residual, attn_output)
+
+        # Dual post-attention norms → dual MLPs → merge
+        residual = hidden_states
+        normed_text = self.post_attention_layernorm(op, hidden_states)
+        normed_vision = self.post_attention_layernorm_v(op, hidden_states)
+        mlp_text = self.mlp(op, normed_text)
+        mlp_vision = self.mlp_v(op, normed_vision)
+        mlp_output = op.Where(modality_mask_3d, mlp_vision, mlp_text)
+        hidden_states = op.Add(residual, mlp_output)
+
+        return hidden_states, present_kv
+
+
+# ── MoT Text Model ────────────────────────────────────────────────────
+
+
+class _MoTTextModel(nn.Module):
+    """Text model backbone with MoT decoder layers.
+
+    Threads ``modality_mask`` through all layers for per-token routing.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self.layers = nn.ModuleList(
+            [_MoTDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = initialize_rope(config)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        modality_mask_3d: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(op, position_ids)
+        # Pass attention_mask as a bool padding mask — _apply_attention
+        # uses is_causal=1 so only padding information is needed.
+        if attention_mask is not None:
+            attention_bias = op.Cast(attention_mask, to=9)  # BOOL
+        else:
+            attention_bias = None
+
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer, past_kv in zip(self.layers, past_kvs):
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                modality_mask_3d=modality_mask_3d,
+                attention_bias=attention_bias,
+                position_embeddings=position_embeddings,
+                past_key_value=past_kv,
+            )
+            present_key_values.append(present_kv)
+
+        hidden_states = self.norm(op, hidden_states)
+        return hidden_states, present_key_values
+
+
 # ── Decoder ─────────────────────────────────────────────────────────────
 
 
 class _HunYuanVLMoTDecoderModel(nn.Module):
-    """Text decoder (standard pathway only).
+    """MoT decoder with dual-pathway routing.
 
-    Uses the text-pathway weights (no ``_v`` suffix).  QK-norm is enabled
-    unconditionally to match HuggingFace's ``query_layernorm`` /
-    ``key_layernorm``.
+    Takes ``inputs_embeds`` and ``input_ids`` — the latter is used to
+    derive the modality mask (vision tokens identified by image_token_id).
 
-    .. note::
-
-       Weight renaming is handled entirely by
-       :meth:`HunYuanVLMoTModel.preprocess_weights`.
+    Weight renaming is handled by
+    :meth:`HunYuanVLMoTModel.preprocess_weights`.
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        # Force QK-norm on (HF always has query_layernorm / key_layernorm)
-        config = dataclasses.replace(config, attn_qk_norm=True)
-        self.model = TextModel(config)
+        self.image_token_id = (config.vision.image_token_id if config.vision else 0) or 0
+        self.model = _MoTTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
@@ -177,15 +426,20 @@ class _HunYuanVLMoTDecoderModel(nn.Module):
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
+        input_ids: ir.Value,
         past_key_values: list | None = None,
     ):
+        # Derive modality mask from input_ids: True where vision tokens
+        modality_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
+        modality_mask_3d = op.Unsqueeze(modality_mask, [-1])  # [B, S, 1]
+
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=None,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            modality_mask_3d=modality_mask_3d,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -204,7 +458,7 @@ class HunYuanVLMoTModel(nn.Module):
     - **embedding**: token embedding + image feature fusion
     """
 
-    default_task: str = "vision-language"
+    default_task: str = "hunyuan-vl-mot"
     category: str = "Multimodal"
 
     def __init__(self, config: ArchitectureConfig):
@@ -311,14 +565,13 @@ class HunYuanVLMoTModel(nn.Module):
         # Strip language_model. prefix → model.layers.0.*, lm_head.*, etc.
         suffix = key[len("language_model.") :]
 
-        # Skip MoT _v pathway weights
-        if "_v." in suffix or suffix.endswith("_v"):
-            return
-
         # Duplicate embed_tokens to embedding sub-model
         if "embed_tokens" in suffix:
             embed_key = suffix[len("model.") :] if suffix.startswith("model.") else suffix
             result[f"embedding.{embed_key}"] = value
+
+        # MoT _v pathway: HF names match our module names directly
+        # e.g. self_attn.q_proj_v, mlp_v.gate_proj, input_layernorm_v
 
         # QK-norm rename: query_layernorm → q_norm, key_layernorm → k_norm
         renamed = suffix.replace(".query_layernorm.", ".q_norm.").replace(

@@ -474,7 +474,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
-    "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="vision-language"),
+    "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
