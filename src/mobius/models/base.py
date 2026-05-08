@@ -237,9 +237,7 @@ class CausalLMModel(nn.Module):
             # need per-token logits — see flag docstring.
             last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
             last_hidden = op.Gather(hidden_states, last_idx, axis=1)  # [B, H]
-            hidden_states = op.Unsqueeze(
-                last_hidden, op.Constant(value_ints=[1])
-            )  # [B, 1, H]
+            hidden_states = op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))  # [B, 1, H]
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

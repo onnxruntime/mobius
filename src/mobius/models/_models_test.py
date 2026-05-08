@@ -188,16 +188,15 @@ class TestPruneLmHead:
         )
         # Pruned: dim 1 must be the literal integer 1
         seq_dim = logits.shape[1]
-        assert seq_dim == 1, (
-            f"Expected logits dim 1 to be 1 after pruning, got {seq_dim!r}"
-        )
+        assert seq_dim == 1, f"Expected logits dim 1 to be 1 after pruning, got {seq_dim!r}"
         # Last dim is still the vocabulary size
         config = make_config()
         assert logits.shape[2] == config.vocab_size
 
     def test_prune_does_not_change_input_shapes(self):
         """Pruning only affects output; input_ids / attention_mask still
-        have dynamic sequence_length so the model accepts arbitrary prompts."""
+        have dynamic sequence_length so the model accepts arbitrary prompts.
+        """
         from mobius._flags import override_flags
 
         with override_flags(prune_lm_head=True):
