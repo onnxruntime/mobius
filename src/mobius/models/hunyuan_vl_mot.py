@@ -501,6 +501,15 @@ class HunYuanVLMoTModel(nn.Module):
             elif key.startswith("language_model."):
                 self._route_decoder_weight(key, value, result)
 
+        # The generic VisionModel always creates a post_layernorm but the
+        # HF model doesn't have one.  Provide identity LayerNorm weights
+        # (weight=1, bias=0) so the layer is a no-op.
+        pln_prefix = "vision_encoder.vision_tower.vision_model.post_layernorm"
+        if f"{pln_prefix}.weight" not in result:
+            hidden = self.config.vision.hidden_size or self.config.hidden_size
+            result[f"{pln_prefix}.weight"] = torch.ones(hidden)
+            result[f"{pln_prefix}.bias"] = torch.zeros(hidden)
+
         return result
 
     def _route_vision_weight(
