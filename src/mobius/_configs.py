@@ -1176,6 +1176,7 @@ class ArchitectureConfig(BaseModelConfig):
                     "qwen3_vl_text",
                 )
                 or getattr(config, "use_qk_norm", False)
+                or getattr(config, "qk_norm", False)
             ),
             attn_qk_norm_full=(model_type in ("flex_olmo", "olmoe", "olmo2", "olmo3")),
             mlp_bias=(
@@ -1246,11 +1247,23 @@ class ArchitectureConfig(BaseModelConfig):
             post_feedforward_norm=(model_type in ("flex_olmo",)),
             n_group=getattr(config, "n_group", 1),
             topk_group=getattr(config, "topk_group", 1),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            scoring_func=getattr(config, "scoring_func", "softmax"),
+            routed_scaling_factor=getattr(
+                config,
+                "routed_scaling_factor",
+                getattr(config, "router_scaling_factor", 1.0),
+            ),
+            scoring_func=(
+                "sigmoid"
+                if getattr(config, "moe_router_use_sigmoid", False)
+                else getattr(config, "scoring_func", "softmax")
+            ),
             topk_method=getattr(config, "topk_method", "greedy"),
             first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
-            n_shared_experts=getattr(config, "n_shared_experts", None),
+            n_shared_experts=getattr(
+                config,
+                "n_shared_experts",
+                getattr(config, "num_shared_experts", None),
+            ),
             # Multi-head Latent Attention (MLA)
             q_lora_rank=getattr(config, "q_lora_rank", None),
             kv_lora_rank=getattr(config, "kv_lora_rank", None),
@@ -1582,6 +1595,7 @@ def _shared_expert_size(config) -> int | None:
     n_shared = _first(
         getattr(config, "moe_num_shared_experts", None)
         or getattr(config, "n_shared_experts", None)
+        or getattr(config, "num_shared_experts", None)
         or getattr(config, "num_shared_expert", None)
     )
     if moe_dim is not None and n_shared is not None:
