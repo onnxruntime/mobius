@@ -15,6 +15,7 @@ from mobius.components import (
     Qwen3VLVisionModel,
     Qwen25VLVisionModel,
 )
+from mobius._weight_utils import tie_word_embeddings
 from mobius.components._common import (
     Embedding,
     Linear,
@@ -120,13 +121,17 @@ class Qwen25VLCausalLMModel(nn.Module):
                 renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
                 renamed[f"embedding.{stripped}"] = value
-                if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
-                    renamed["decoder.lm_head.weight"] = value
             elif key.startswith("model."):
                 renamed[f"decoder.{key}"] = value
             elif key.startswith("lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{key}"] = value
+        if self.config.tie_word_embeddings:
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -183,10 +188,9 @@ class Qwen25VLDecoderModel(nn.Module):
                 continue
             renamed[key] = value
 
-        # Handle weight tying: provide embed_tokens weight for lm_head
+        # Handle weight tying
         if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            tie_word_embeddings(renamed)
         return renamed
 
 
@@ -781,8 +785,6 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                if self.config.tie_word_embeddings and stripped == "language_model.embed_tokens.weight":
-                    renamed["decoder.lm_head.weight"] = value
             elif stripped.startswith("language_model.lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
@@ -790,6 +792,12 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
+        if self.config.tie_word_embeddings:
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -844,10 +852,7 @@ class Qwen3VLDecoderModel(nn.Module):
             renamed[stripped] = value
 
         if self.config.tie_word_embeddings:
-            # Provide embed_tokens weight for lm_head (they share the same
-            # tensor in the graph, but the weight loader needs data for both).
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+            tie_word_embeddings(renamed)
         return renamed
 
 
