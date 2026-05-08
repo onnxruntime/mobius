@@ -1048,5 +1048,4 @@ def auto_export(
         progress_bar=progress_bar,
     )
 
-
     return result

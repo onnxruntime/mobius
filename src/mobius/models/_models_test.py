@@ -152,35 +152,48 @@ class TestPruneLmHead:
         return build_from_module(module, config)["model"]
 
     def test_default_emits_no_lm_head_pruning(self):
-        """Default flag: graph contains no Gather feeding the lm_head MatMul."""
+        """Default flag: graph emits full [B, S, vocab] logits."""
         from mobius._flags import override_flags
 
         with override_flags(prune_lm_head=False):
             model = self._build()
 
-        # The logits output should track full sequence_length in dim 1
         logits = next(v for v in model.graph.outputs if v.name == "logits")
-        # Full path: shape[1] is a symbolic dim ("sequence_length"), not 1
+        # Logits must remain rank-3 [B, S, vocab]
+        assert len(logits.shape) == 3, (
+            f"Expected rank-3 logits [B, S, V], got rank {len(logits.shape)}: "
+            f"shape={list(logits.shape)!r}"
+        )
+        # The full path: shape[1] is a symbolic dim ("sequence_length"), not 1
         seq_dim = logits.shape[1]
-        # symbolic dims either expose an integer value of None or a symbolic
-        # name; the default (un-pruned) path must NOT be the literal int 1
         assert seq_dim != 1, (
             f"Expected dynamic sequence_length in logits dim 1, got {seq_dim!r}"
         )
+        # Last dim is the vocabulary size
+        config = make_config()
+        assert logits.shape[2] == config.vocab_size
 
     def test_prune_emits_gather_before_lm_head(self):
-        """With prune_lm_head=True, logits dim 1 collapses to 1."""
+        """With prune_lm_head=True, logits dim 1 collapses to 1 (still rank-3)."""
         from mobius._flags import override_flags
 
         with override_flags(prune_lm_head=True):
             model = self._build()
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
+        # Logits must still be rank-3 [B, 1, vocab] (NOT rank-4 [B, 1, 1, V])
+        assert len(logits.shape) == 3, (
+            f"Expected rank-3 logits [B, 1, V] after pruning, got rank "
+            f"{len(logits.shape)}: shape={list(logits.shape)!r}"
+        )
+        # Pruned: dim 1 must be the literal integer 1
         seq_dim = logits.shape[1]
-        # Pruned path: shape[1] is the literal integer 1
         assert seq_dim == 1, (
             f"Expected logits dim 1 to be 1 after pruning, got {seq_dim!r}"
         )
+        # Last dim is still the vocabulary size
+        config = make_config()
+        assert logits.shape[2] == config.vocab_size
 
     def test_prune_does_not_change_input_shapes(self):
         """Pruning only affects output; input_ids / attention_mask still
@@ -195,7 +208,7 @@ class TestPruneLmHead:
         assert input_ids.shape[1] != 1
 
 
-
+class TestModelRegistry:
     def test_registry_not_empty(self):
         assert len(registry) > 0
 

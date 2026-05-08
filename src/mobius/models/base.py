@@ -226,16 +226,20 @@ class CausalLMModel(nn.Module):
         )
         if flags.prune_lm_head:
             # Select only the last token's hidden state before the LM head.
-            # Hidden shape goes [B, S, H] → [B, H] → [B, 1, H], turning the
-            # downstream MatMul output from [B, S, vocab] into [B, 1, vocab].
-            # Saves the [B, (S-1), vocab] portion of work during prefill.
+            # Use a scalar (rank-0) index so Gather collapses dim 1:
+            #   [B, S, H] --Gather(axis=1, idx=-1, scalar)--> [B, H]
+            #   --Unsqueeze(axis=1)--> [B, 1, H]
+            # The downstream MatMul then produces [B, 1, vocab] instead of
+            # [B, S, vocab], saving the [B, S-1, vocab] of work during prefill.
             #
             # Mirrors onnxruntime-genai Model Builder's `prune_lm_head` flag
             # (see make_lm_head() in builders/base.py).  Breaks workflows that
             # need per-token logits — see flag docstring.
-            indices = op.Constant(value_ints=[-1])
-            last_hidden = op.Gather(hidden_states, indices, axis=1)
-            hidden_states = op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))
+            last_idx = op.Constant(value_int=-1)  # scalar (rank-0) INT64
+            last_hidden = op.Gather(hidden_states, last_idx, axis=1)  # [B, H]
+            hidden_states = op.Unsqueeze(
+                last_hidden, op.Constant(value_ints=[1])
+            )  # [B, 1, H]
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
