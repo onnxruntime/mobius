@@ -295,9 +295,7 @@ class TestDetectAffectedModels:
             "src/mobius/models/__init__.py",
         ]:
             result = detect_affected_models([path])
-            assert result["run_all"] is False, (
-                f"{path} should NOT trigger run_all"
-            )
+            assert result["run_all"] is False, f"{path} should NOT trigger run_all"
 
     def test_traceable_and_model_combined(self):
         """A component + model file change returns union of affected types."""
