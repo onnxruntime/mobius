@@ -59,6 +59,7 @@ __all__ = [
     "IPAdapterModel",
     "InternLM2CausalLMModel",
     "InternVL2Model",
+    "VideoChatFlashModel",
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
@@ -253,6 +254,7 @@ from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.unet import UNet2DConditionModel
 from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel
+from mobius.models.videochat_flash import VideoChatFlashModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.whisper import WhisperForConditionalGeneration

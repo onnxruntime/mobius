@@ -122,6 +122,7 @@ from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.videochat_flash import VideoChatFlashModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.xlm import XLMCausalLMModel
@@ -507,6 +508,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_vl_text": ModelRegistration(Qwen3VLTextModel),
     "smolvlm": ModelRegistration(LLaVAModel, task="vision-language"),
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "videochat_flash_qwen": ModelRegistration(VideoChatFlashModel, task="vision-language"),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
     # Fun-ASR uses config.yaml (not config.json). build() auto-detection

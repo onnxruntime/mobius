@@ -2021,6 +2021,11 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("pixtral", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("smolvlm", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("video_llava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "videochat_flash_qwen",
+        {"vision": _TINY_VISION, "image_token_id": 32000},
+        True,
+    ),
     ("vipllava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     # --- InternVL family ---
     ("internvl_chat", {"vision": _TINY_VISION, "image_token_id": 32000}, True),

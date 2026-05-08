@@ -1126,6 +1126,7 @@ class ArchitectureConfig(BaseModelConfig):
                                         "qwen2_5_vl_text",
                                         "qwen2_moe",
                                         "qwen2_vl_text",
+                                        "videochat_flash_qwen",
                                     ),
                                 ),
                             ),
