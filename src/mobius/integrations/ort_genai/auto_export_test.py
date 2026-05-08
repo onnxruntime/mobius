@@ -1056,7 +1056,6 @@ class TestGemma4GenaiConfig:
             [
                 "inputs_embeds",
                 "per_layer_inputs",
-                "input_ids",
                 "attention_mask",
                 "position_ids",
                 "past_key_values.0.key",
@@ -1130,6 +1129,7 @@ class TestGemma4GenaiConfig:
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
         assert "per_layer_inputs" in decoder_inputs
+        assert "input_ids" not in decoder_inputs
         # KV cache templates are present
         assert decoder_inputs["past_key_names"] == "past_key_values.%d.key"
 
@@ -1343,6 +1343,7 @@ class TestGemma4RealModel:
         # Decoder inputs introspected from graph
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
+        assert "input_ids" not in decoder_inputs
         assert "attention_mask" in decoder_inputs
         assert "position_ids" in decoder_inputs
         assert decoder_inputs["past_key_names"] == ("past_key_values.%d.key")

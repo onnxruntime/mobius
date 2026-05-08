@@ -1396,6 +1396,8 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
+            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
+            # Gather int64 index support (onnxruntime#28107).
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
