@@ -131,6 +131,7 @@ class Hy3TextModel(nn.Module):
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            dtype=self._dtype,
         )
 
         present_key_values = []
