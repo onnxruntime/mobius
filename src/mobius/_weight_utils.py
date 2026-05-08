@@ -396,11 +396,10 @@ def tie_word_embeddings(
     elif embed_key not in state_dict and head_key in state_dict:
         state_dict[embed_key] = state_dict[head_key]
     elif embed_key not in state_dict and head_key not in state_dict:
-        logger.warning(
-            "tie_word_embeddings: neither '%s' nor '%s' found in state_dict; "
-            "tying has no effect.",
-            embed_key,
-            head_key,
+        raise ValueError(
+            f"tie_word_embeddings: neither '{embed_key}' nor '{head_key}' "
+            f"found in state_dict. Check that the key names match the "
+            f"weight dictionary after any prefix stripping."
         )
 
 
