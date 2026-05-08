@@ -349,6 +349,15 @@ class HunYuanVLMoTModel(nn.Module):
             "vision_tower.vision_model.embeddings.patch_embedding.",
         )
         # pos_embed → embeddings.position_embedding.weight
+        # HF pos_embed is [1, num_patches, hidden] — squeeze batch dim
+        if "vision_tower.pos_embed" in suffix:
+            new_key = new_key.replace(
+                "vision_tower.pos_embed",
+                "vision_tower.vision_model.embeddings.position_embedding.weight",
+            )
+            result[f"vision_encoder.{new_key}"] = value.squeeze(0)
+            return
+
         new_key = new_key.replace(
             "vision_tower.pos_embed",
             "vision_tower.vision_model.embeddings.position_embedding.weight",
