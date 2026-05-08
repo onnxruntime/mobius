@@ -42,8 +42,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Zamba2Config
 from mobius._weight_utils import tie_word_embeddings
@@ -97,7 +96,7 @@ class Zamba2MambaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -135,7 +134,7 @@ class _Adapter(nn.Module):
         self.down = Linear(in_features, rank, bias=False)
         self.up = Linear(rank, out_features, bias=False)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         return self.up(op, self.down(op, x))
 
 
@@ -157,7 +156,7 @@ class _Zamba2QKVAdapters(nn.Module):
         self.k_adapter = _Adapter(attn_hidden, config.num_key_value_heads * head_dim, rank)
         self.v_adapter = _Adapter(attn_hidden, config.num_key_value_heads * head_dim, rank)
 
-    def forward(self, op: builder.OpBuilder, attn_input: ir.Value) -> tuple:
+    def forward(self, op: OpBuilder, attn_input: ir.Value) -> tuple:
         """Compute Q/K/V adapter outputs from layer-normed concat hidden."""
         return (
             self.q_adapter(op, attn_input),
@@ -178,7 +177,7 @@ class _Zamba2MLPAdapter(nn.Module):
         rank = config.adapter_rank
         self.mlp_adapter = _Adapter(config.hidden_size, 2 * config.intermediate_size, rank)
 
-    def forward(self, op: builder.OpBuilder, mlp_input: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, mlp_input: ir.Value) -> ir.Value:
         """Compute MLP adapter output from pre-FFN hidden states."""
         return self.mlp_adapter(op, mlp_input)
 
@@ -203,7 +202,7 @@ class _Zamba2AttentionProjections(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attn_output: ir.Value | None = None,
     ):
@@ -254,7 +253,7 @@ class Zamba2SharedTransformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         concat_hidden: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple | None,
@@ -377,7 +376,7 @@ class Zamba2InjectedMambaLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         transformer_hidden_states: ir.Value,
         past_key_value: tuple | None,
@@ -494,7 +493,7 @@ class _Zamba2TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -618,7 +617,7 @@ class Zamba2CausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

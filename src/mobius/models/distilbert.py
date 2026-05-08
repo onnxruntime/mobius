@@ -8,8 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
@@ -31,7 +30,7 @@ class _DistilBertEmbeddings(nn.Module):
         )
         self.LayerNorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
         word_embeds = self.word_embeddings(op, input_ids)
 
         seq_len = op.Shape(input_ids, start=1, end=2)
@@ -62,7 +61,7 @@ class _DistilBertEncoderLayer(nn.Module):
         )
         self.output_layer_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Self-attention with post-norm
         attn_output = self.attention(op, hidden_states)
         hidden_states = self.sa_layer_norm(op, op.Add(hidden_states, attn_output))
@@ -93,7 +92,7 @@ class DistilBertModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None = None,
         token_type_ids: ir.Value | None = None,
@@ -122,7 +121,7 @@ class _DistilBertEncoder(nn.Module):
             [_DistilBertEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for layer in self.layer:
             hidden_states = layer(op, hidden_states)
         return hidden_states

@@ -1,4 +1,5 @@
 model_id: "OpenGVLab/pvt_v2_b0"
+model_type: "pvt_v2"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

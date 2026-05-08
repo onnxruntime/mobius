@@ -24,8 +24,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import (
@@ -130,7 +129,7 @@ class FunASRAudioEncoder(nn.Module):
         # Adaptor: projects encoder hidden_dim (512) → LLM hidden_size (1024)
         self.adaptor = FunASRAudioAdaptor(config)
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
         """Encode LFR-processed fbank features to LLM-dimension audio embeddings.
 
         Args:
@@ -202,7 +201,7 @@ class AdaptorAttention(nn.Module):
         self._n_heads = n_heads
         self._head_dim = hidden_size // n_heads
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         """Multi-head self-attention.
 
         Args:
@@ -251,7 +250,7 @@ class FunASRAdaptorBlock(nn.Module):
         self.norm2 = LayerNorm(hidden_size)
         self.feed_forward = SANMFFN(hidden_size, ffn_dim)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # Pre-norm attention with residual
         residual = hidden_states
         hidden_states = self.norm1(op, hidden_states)
@@ -301,7 +300,7 @@ class FunASRAudioAdaptor(nn.Module):
             [FunASRAdaptorBlock(llm_hidden, ffn_dim, n_heads) for _ in range(num_blocks)]
         )
 
-    def forward(self, op: builder.OpBuilder, audio_features: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, audio_features: ir.Value) -> ir.Value:
         """Project audio features from encoder dim to LLM hidden dim.
 
         Args:
@@ -366,7 +365,7 @@ class FunASREmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         audio_features: ir.Value,
     ) -> ir.Value:
@@ -438,7 +437,7 @@ class FunASRDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -514,7 +513,7 @@ class FunASRForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

@@ -1,4 +1,5 @@
 model_id: "microsoft/deberta-v3-base"
+model_type: "deberta-v2"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

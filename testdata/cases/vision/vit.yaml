@@ -1,4 +1,5 @@
 model_id: "google/vit-base-patch16-224"
+model_type: "vit"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

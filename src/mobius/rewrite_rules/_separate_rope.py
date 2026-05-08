@@ -133,12 +133,14 @@ class GQASeparateRoPE(RewriteRuleClassBase):
         # past_key, past_value, seqlens_k, total_sequence_length.
         remaining = list(gqa_node.inputs[3:7])
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[q_rot, k_rot, v, *remaining],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q_rot,
+            k_rot,
+            v,
+            *remaining,
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
         return outputs[0], outputs[1], outputs[2]
 

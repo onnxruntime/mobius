@@ -1,4 +1,5 @@
 model_id: "google/rembert"
+model_type: "rembert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

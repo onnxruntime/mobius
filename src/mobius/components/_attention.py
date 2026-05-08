@@ -7,8 +7,7 @@ import math
 from typing import NamedTuple
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
@@ -76,7 +75,7 @@ class StaticCacheState(NamedTuple):
 
 
 def _apply_attention(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     query: ir.Value,
     key: ir.Value,
     value: ir.Value,
@@ -281,7 +280,7 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | GQAContext | None,
         position_embeddings: tuple | None = None,
@@ -367,7 +366,7 @@ class Attention(nn.Module):
 
     def _forward_gqa(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         query_states: ir.Value,
         key_states: ir.Value,
         value_states: ir.Value,
@@ -478,7 +477,7 @@ class Qwen35Attention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,

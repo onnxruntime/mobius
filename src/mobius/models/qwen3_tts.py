@@ -28,8 +28,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -74,7 +73,7 @@ class Qwen3TTSTalkerDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -214,7 +213,7 @@ class Qwen3TTSCodePredictorModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         step_index: ir.Value,
         attention_mask: ir.Value,
@@ -330,7 +329,7 @@ class Qwen3TTSEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         text_ids: ir.Value,
         codec_ids: ir.Value,
     ):
@@ -386,7 +385,7 @@ class Qwen3TTSSpeakerEncoderModel(nn.Module):
             enc_se_channels=se.enc_se_channels if se else 128,
         )
 
-    def forward(self, op: builder.OpBuilder, mel_input: ir.Value):
+    def forward(self, op: OpBuilder, mel_input: ir.Value):
         """Extract speaker embedding from mel spectrogram.
 
         Args:
@@ -434,7 +433,7 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

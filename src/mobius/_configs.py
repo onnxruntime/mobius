@@ -281,6 +281,16 @@ class AudioConfig:
     audio_start_token_id: int | None = None
     audio_end_token_id: int | None = None
     classify_num: int | None = None
+    # Qwen3-ASR chunked conv parameters. ``n_window`` is half the
+    # number of mel frames per conv chunk (so chunk_size = 2 *
+    # n_window). ``n_window_infer`` is the attention window in mel
+    # frames; encoder self-attention is block-diagonal with windows
+    # of n_window_infer / (2 * n_window) post-conv chunks (~=
+    # n_window_infer * tokens_per_chunk / chunk_size_mel post-conv
+    # tokens). HF reference: QwenLM/Qwen3-ASR
+    # qwen_asr/core/transformers_backend/modeling_qwen3_asr.py
+    n_window: int | None = None
+    n_window_infer: int | None = None
     # Fun-ASR / SenseVoice encoder config
     tp_num_blocks: int | None = None
     adaptor_proj_dim: int | None = None
@@ -712,6 +722,8 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
                 downsample_hidden_size=getattr(ac, "downsample_hidden_size", None),
                 output_dim=getattr(ac, "output_dim", None),
                 activation_function=getattr(ac, "activation_function", "gelu"),
+                n_window=getattr(ac, "n_window", None),
+                n_window_infer=getattr(ac, "n_window_infer", None),
             )
         # Special tokens from thinker config
         audio_fields["audio_token_id"] = getattr(tc, "audio_token_id", None)

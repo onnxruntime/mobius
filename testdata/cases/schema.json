@@ -6,6 +6,7 @@
   "type": "object",
   "required": [
     "model_id",
+    "model_type",
     "revision",
     "task_type",
     "dtype",
@@ -21,6 +22,11 @@
         "Qwen/Qwen2.5-0.5B",
         "google-bert/bert-base-uncased"
       ]
+    },
+    "model_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Registry model_type key (e.g. 'llama', 'qwen2'). Must match a key in mobius._registry."
     },
     "revision": {
       "type": "string",

@@ -244,22 +244,19 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         }
         if softcap:
             gqa_attrs["softcap"] = softcap
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                q_pre,
-                k_pre,
-                v,
-                past_key,
-                past_value,
-                self._seqlens_k,
-                self._total_seq_len,
-                self._cos_cache,
-                self._sin_cache,
-            ],
-            domain="com.microsoft",
-            attributes=gqa_attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q_pre,
+            k_pre,
+            v,
+            past_key,
+            past_value,
+            self._seqlens_k,
+            self._total_seq_len,
+            self._cos_cache,
+            self._sin_cache,
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -377,17 +374,14 @@ class PackQKVForGQA(RewriteRuleClassBase):
         gqa_node = gqa_out.producer()
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                packed_qkv,
-                None,
-                None,
-                *gqa_node.inputs[3:],
-            ],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            packed_qkv,
+            None,
+            None,
+            *gqa_node.inputs[3:],
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -507,17 +501,14 @@ class PackQKVWithBiasForGQA(RewriteRuleClassBase):
         gqa_node = gqa_out.producer()
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[
-                packed_qkv,
-                None,
-                None,
-                *gqa_node.inputs[3:],
-            ],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            packed_qkv,
+            None,
+            None,
+            *gqa_node.inputs[3:],
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
 
         return outputs[0], outputs[1], outputs[2]
@@ -655,12 +646,17 @@ class AttentionToGQA(RewriteRuleClassBase):
         if softcap:
             gqa_attrs["softcap"] = softcap
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[q, k, v, past_key, past_value, self._seqlens_k, self._total_seq_len],
-            domain="com.microsoft",
-            attributes=gqa_attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q,
+            k,
+            v,
+            past_key,
+            past_value,
+            self._seqlens_k,
+            self._total_seq_len,
+            _domain="com.microsoft",
+            _outputs=3,
+            **gqa_attrs,
         )
         return outputs[0], outputs[1], outputs[2]
 

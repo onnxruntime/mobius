@@ -16,8 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._mlp import FCMLP
@@ -56,7 +55,7 @@ class PatchEmbedding(nn.Module):
             name="position_embedding.weight",
         )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: [batch, channels, height, width]
         # Conv2d: extract patches
         patches = op.Conv(
@@ -103,7 +102,7 @@ class VisionAttention(nn.Module):
         self.v_proj = _VisionLinear(hidden_size, hidden_size)
         self.out_proj = _VisionLinear(hidden_size, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: [batch, seq_len, hidden_size]
         q = self.q_proj(op, hidden_states)
         k = self.k_proj(op, hidden_states)
@@ -136,7 +135,7 @@ class _VisionLinear(nn.Module):
         self.weight = nn.Parameter([out_features, in_features])
         self.bias = nn.Parameter([out_features])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, weight_t)
         return op.Add(result, self.bias)
@@ -151,7 +150,7 @@ class VisionLayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.LayerNormalization(
             hidden_states,
             self.weight,
@@ -190,7 +189,7 @@ class VisionEncoderLayer(nn.Module):
             linear_class=_VisionLinear,
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
         hidden_states = self.self_attn(op, hidden_states)
@@ -222,7 +221,7 @@ class VisionEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for layer in self.layers:
             hidden_states = layer(op, hidden_states)
         return hidden_states
@@ -261,7 +260,7 @@ class _VisionModelInner(nn.Module):
         )
         self.post_layernorm = VisionLayerNorm(vc.hidden_size, eps=vc.norm_eps)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         hidden_states = self.encoder(op, hidden_states)
         hidden_states = self.post_layernorm(op, hidden_states)
@@ -282,5 +281,5 @@ class VisionModel(nn.Module):
         super().__init__()
         self.vision_model = _VisionModelInner(config)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         return self.vision_model(op, pixel_values)

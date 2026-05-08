@@ -1,4 +1,5 @@
 model_id: "jetmoe/jetmoe-8b"
+model_type: "jetmoe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -56,7 +56,7 @@ def _get_cached_rms_norm_session(
         ``"weight"`` (shape ``[hidden_size]``), both float32.
     """
     import onnx_ir as ir
-    from onnxscript._internal.builder import GraphBuilder
+    from onnxscript import GraphBuilder
 
     from mobius.components._rms_norm import apply_rms_norm
 

@@ -14,8 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 
@@ -39,11 +38,20 @@ class Qwen3ASRAudioAttention(nn.Module):
         self._num_heads = num_heads
         self._head_dim = d_model // num_heads
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         """Bidirectional self-attention.
 
         Args:
             hidden_states: (batch, seq_len, d_model)
+            attention_mask: optional bool mask of shape ``(batch, seq_len, seq_len)``
+                (True = attend, False = mask out). Used to ignore padded
+                mel positions that were added by the HF processor when
+                padding to a fixed 30s window.
 
         Returns:
             output: (batch, seq_len, d_model)
@@ -57,6 +65,7 @@ class Qwen3ASRAudioAttention(nn.Module):
             q,
             k,
             v,
+            attention_mask,
             q_num_heads=self._num_heads,
             kv_num_heads=self._num_heads,
             scale=float(self._head_dim**-0.5),
@@ -88,11 +97,17 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         self.fc2 = Linear(ffn_dim, d_model, bias=True)
         self.final_layer_norm = LayerNorm(d_model, eps=eps)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         """Pre-norm encoder layer with bidirectional attention.
 
         Args:
             hidden_states: (batch, seq_len, d_model)
+            attention_mask: optional bool mask, see ``Qwen3ASRAudioAttention``.
 
         Returns:
             hidden_states: (batch, seq_len, d_model)
@@ -100,7 +115,7 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
         # Self-attention with pre-norm and residual
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(op, hidden_states)
-        hidden_states = self.self_attn(op, hidden_states)
+        hidden_states = self.self_attn(op, hidden_states, attention_mask)
         hidden_states = op.Add(residual, hidden_states)
 
         # FFN with pre-norm, GELU, and residual

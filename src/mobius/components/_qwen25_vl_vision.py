@@ -24,8 +24,7 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius.components._common import LayerNorm, Linear
@@ -66,7 +65,7 @@ class Qwen25VLPatchEmbed(nn.Module):
             name="proj.weight",
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         x = op.Reshape(
             hidden_states,
             [-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size],
@@ -103,7 +102,7 @@ class Qwen25VLVisionRotaryEmbedding(nn.Module):
             data=ir.tensor(freqs),
         )
 
-    def forward(self, op: builder.OpBuilder, rotary_pos_ids: ir.Value):
+    def forward(self, op: OpBuilder, rotary_pos_ids: ir.Value):
         """Compute cos/sin position embeddings.
 
         Args:
@@ -145,7 +144,7 @@ class Qwen25VLVisionAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -362,7 +361,7 @@ class Qwen25VLVisionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -403,7 +402,7 @@ class Qwen2VLVisionBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
         cos: ir.Value,
@@ -449,7 +448,7 @@ class Qwen25VLPatchMerger(nn.Module):
         self.mlp_0 = Linear(merged_dim, merged_dim, bias=True)
         self.mlp_2 = Linear(merged_dim, out_hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: (N, hidden_size) where N = total_patches after blocks
         # Apply RMSNorm per-token
         hidden_states = self.ln_q(op, hidden_states)
@@ -1020,7 +1019,7 @@ class Qwen25VLVisionModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
@@ -1176,7 +1175,7 @@ class Qwen2VLVisionModel(Qwen25VLVisionModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ) -> ir.Value:

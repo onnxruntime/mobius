@@ -117,7 +117,7 @@ def test_patch_merger_matches_hf_unfold_ordering():
     ordering so the learned ``merging_layer`` projection is correct.
     """
     import torch
-    from onnxscript._internal.builder import GraphBuilder
+    from onnxscript import GraphBuilder
 
     hidden_size = 8
     ms = 2

@@ -3796,7 +3796,7 @@ def test_qwen35_deltanet_single_layer_parity():
     - recurrent_state carry matches HF
     """
     import onnx_ir as ir
-    from onnxscript._internal import builder as onnx_builder
+    from onnxscript import GraphBuilder
 
     try:
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -3858,7 +3858,7 @@ def test_qwen35_deltanet_single_layer_parity():
         name="deltanet_test",
         opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
     )
-    graph_builder = onnx_builder.GraphBuilder(graph)
+    graph_builder = GraphBuilder(graph)
     op = graph_builder.op
 
     output, new_conv, new_rec = onnx_dn(

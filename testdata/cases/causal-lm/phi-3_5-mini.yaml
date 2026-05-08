@@ -1,4 +1,5 @@
 model_id: "microsoft/Phi-3.5-mini-instruct"
+model_type: "phi3"
 revision: "2fe192450127e6a83f7441aef6e3ca586c338b77"
 task_type: "text-generation"
 dtype: "float32"

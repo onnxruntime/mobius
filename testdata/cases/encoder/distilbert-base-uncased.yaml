@@ -1,4 +1,5 @@
 model_id: "distilbert/distilbert-base-uncased"
+model_type: "distilbert"
 revision: "12040accade4e8a0f71eabdb258fecc2e7e948be"
 task_type: "feature-extraction"
 dtype: "float32"

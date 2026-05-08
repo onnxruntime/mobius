@@ -285,12 +285,14 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         attrs = {key: gqa_node.attributes[key].value for key in gqa_node.attributes}
         remaining = list(gqa_node.inputs[3:])  # everything after the packed slot
 
-        outputs = op.op_multi_out(
-            "GroupQueryAttention",
-            inputs=[q, k, v, *remaining],
-            domain="com.microsoft",
-            attributes=attrs,
-            num_outputs=3,
+        outputs = op.GroupQueryAttention(
+            q,
+            k,
+            v,
+            *remaining,
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
         )
         return outputs[0], outputs[1], outputs[2]
 

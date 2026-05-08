@@ -156,9 +156,18 @@ def run_alignment(
     alignment_text += "<timestamp><timestamp>"
 
     # Step 2: Compute mel spectrogram and run audio encoder
-    mel = compute_mel_spectrogram(audio)
-    audio_out = sessions["audio_encoder"].run({"input_features": mel})
+    mel, feature_attention_mask = compute_mel_spectrogram(audio)
+    audio_out = sessions["audio_encoder"].run(
+        {
+            "input_features": mel,
+            "feature_attention_mask": feature_attention_mask,
+        }
+    )
     audio_features = audio_out["audio_features"]
+    audio_feature_lengths = audio_out["audio_feature_lengths"]
+    # Crop padding-derived audio tokens
+    valid_audio_tokens = int(audio_feature_lengths[0])
+    audio_features = audio_features[:, :valid_audio_tokens, :]
     num_audio_tokens = audio_features.shape[1]
     audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])
 

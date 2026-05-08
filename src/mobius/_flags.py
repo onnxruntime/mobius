@@ -84,11 +84,6 @@ class _Flags:
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT ≤1.24.x workaround). Disabled by default.
-       * - ``use_gqa_for_kv_shared``
-         - ``MOBIUS_USE_GQA_FOR_KV_SHARED``
-         - ``False``
-         - Use GQA for KV-shared layers on CUDA EP. Requires ORT GQA
-           new_kv_length=0 support.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -106,22 +101,6 @@ class _Flags:
     """Decompose grouped RMSNormalization into basic ops to work around an
     ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
-    """
-
-    use_gqa_for_kv_shared: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_USE_GQA_FOR_KV_SHARED", False)
-    )
-    """Use GroupQueryAttention for KV-shared layers on CUDA EP.
-
-    When ``False`` (default), KV-shared layers that borrow K/V from a
-    source layer use standard ONNX Attention (which falls back to unfused
-    attention on CUDA EP).  This avoids a CUTLASS MEA crash with the
-    aligned kernel for certain sequence lengths when ``past_key`` is
-    ``nullptr``.
-
-    Set ``MOBIUS_USE_GQA_FOR_KV_SHARED=1`` when the ORT GQA kernel
-    supports ``new_kv_length=0`` (KV-shared pattern), which will enable
-    fused attention for these layers.
     """
 
     ort_lower_opset_for_ep: bool = dataclasses.field(

@@ -1,4 +1,5 @@
 model_id: "facebook/xmod-base"
+model_type: "xmod"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

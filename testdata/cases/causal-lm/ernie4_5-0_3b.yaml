@@ -1,4 +1,5 @@
 model_id: "baidu/ERNIE-4.5-0.3B-PT"
+model_type: "ernie4_5"
 revision: "b565cf6caebd"
 task_type: "text-generation"
 dtype: "float32"
