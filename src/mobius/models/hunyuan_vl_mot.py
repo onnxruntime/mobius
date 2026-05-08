@@ -47,7 +47,6 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     Embedding,
     Linear,
@@ -72,6 +71,12 @@ class _HunYuanVLMoTVisionEncoderModel(nn.Module):
     MLP (proj1 → GELU → proj2).
 
     HF weight prefix: ``model.visual.*``
+
+    .. note::
+
+       Weight renaming is handled entirely by
+       :meth:`HunYuanVLMoTModel.preprocess_weights` — the sub-model's
+       ``preprocess_weights`` is not called in the standard build flow.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -89,55 +94,6 @@ class _HunYuanVLMoTVisionEncoderModel(nn.Module):
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.vision_tower(op, pixel_values)
         return self.multi_modal_projector(op, vision_features)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if not key.startswith("vision_tower.") and not key.startswith(
-                "multi_modal_projector."
-            ):
-                continue
-            new_key = key
-            # ── Vision tower weight renames ──
-            # HF: vision_tower.blocks.N.* → our: vision_tower.vision_model.encoder.layers.N.*
-            new_key = new_key.replace(
-                "vision_tower.blocks.", "vision_tower.vision_model.encoder.layers."
-            )
-            # HF: attn.qkv → separate q_proj/k_proj/v_proj (handled below)
-            # HF: attn.proj → our: attention.out_proj
-            new_key = new_key.replace(".attn.proj.", ".attention.out_proj.")
-            # HF: norm1 → our: layer_norm1; norm2 → our: layer_norm2
-            new_key = new_key.replace(".norm1.", ".layer_norm1.")
-            new_key = new_key.replace(".norm2.", ".layer_norm2.")
-            # HF: mlp.fc1 → our: mlp.up_proj; mlp.fc2 → our: mlp.down_proj
-            new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            new_key = new_key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            # HF: patch_embed.proj → our: embeddings.patch_embedding
-            new_key = new_key.replace(
-                "vision_tower.patch_embed.proj.",
-                "vision_tower.vision_model.embeddings.patch_embedding.",
-            )
-            # HF: pos_embed → our: embeddings.position_embedding
-            new_key = new_key.replace(
-                "vision_tower.pos_embed",
-                "vision_tower.vision_model.embeddings.position_embedding",
-            )
-
-            # Split fused QKV into separate Q, K, V
-            if ".attn.qkv." in key:
-                layer_prefix = new_key.split(".attn.qkv.")[0]
-                suffix = "weight" if "weight" in key else "bias"
-                # Fused QKV: [3 * hidden, ...] → split into 3 equal parts
-                chunks = torch.chunk(value, 3, dim=0)
-                renamed[f"{layer_prefix}.attention.q_proj.{suffix}"] = chunks[0]
-                renamed[f"{layer_prefix}.attention.k_proj.{suffix}"] = chunks[1]
-                renamed[f"{layer_prefix}.attention.v_proj.{suffix}"] = chunks[2]
-                continue
-
-            renamed[new_key] = value
-        return renamed
 
 
 # ── Embedding ───────────────────────────────────────────────────────────
@@ -190,11 +146,6 @@ class _HunYuanVLMoTEmbeddingModel(nn.Module):
         gathered = op.Gather(padded_features, indices, axis=0)
         return op.Where(image_mask_3d, gathered, text_embeds)
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return vlm_embedding_weights(state_dict)
-
 
 # ── Decoder ─────────────────────────────────────────────────────────────
 
@@ -205,6 +156,11 @@ class _HunYuanVLMoTDecoderModel(nn.Module):
     Uses the text-pathway weights (no ``_v`` suffix).  QK-norm is enabled
     unconditionally to match HuggingFace's ``query_layernorm`` /
     ``key_layernorm``.
+
+    .. note::
+
+       Weight renaming is handled entirely by
+       :meth:`HunYuanVLMoTModel.preprocess_weights`.
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -233,29 +189,6 @@ class _HunYuanVLMoTDecoderModel(nn.Module):
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        # Extract decoder weights, stripping "language_model." prefix
-        state_dict = vlm_decoder_weights(
-            state_dict,
-            prefix="language_model.",
-            tie=self.config.tie_word_embeddings,
-        )
-        # Rename HF QK-norm keys to match Attention component naming
-        # HF: .query_layernorm. → ours: .q_norm.
-        # HF: .key_layernorm. → ours: .k_norm.
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            # Skip MoT _v pathway weights — not used in text-only decoder
-            if "_v." in key or key.endswith("_v"):
-                continue
-            new_key = key.replace(".query_layernorm.", ".q_norm.").replace(
-                ".key_layernorm.", ".k_norm."
-            )
-            renamed[new_key] = value
-        return renamed
 
 
 # ── Top-level model ─────────────────────────────────────────────────────
@@ -351,17 +284,10 @@ class HunYuanVLMoTModel(nn.Module):
         # pos_embed → embeddings.position_embedding.weight
         # HF pos_embed is [1, num_patches, hidden] — squeeze batch dim
         if "vision_tower.pos_embed" in suffix:
-            new_key = new_key.replace(
-                "vision_tower.pos_embed",
-                "vision_tower.vision_model.embeddings.position_embedding.weight",
-            )
-            result[f"vision_encoder.{new_key}"] = value.squeeze(0)
+            result[
+                "vision_encoder.vision_tower.vision_model.embeddings.position_embedding.weight"
+            ] = value.squeeze(0)
             return
-
-        new_key = new_key.replace(
-            "vision_tower.pos_embed",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
-        )
 
         # Split fused QKV into separate Q, K, V
         if ".attn.qkv." in suffix:
