@@ -34,14 +34,13 @@ pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
 
 ```python
 # Good
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import nn, OpBuilder
 
 class MyLayer(nn.Module):
     def __init__(self):
         self.param = nn.Parameter([64], name="weight")
 
-    def forward(self, op: builder.OpBuilder, x):
+    def forward(self, op: OpBuilder, x):
         ...
 
 # Bad

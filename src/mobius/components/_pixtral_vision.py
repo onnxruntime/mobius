@@ -21,8 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
@@ -94,7 +93,7 @@ class PixtralRoPE2D(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         position_ids: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
         """Look up 2D RoPE cos/sin by flattened grid position IDs.
@@ -147,7 +146,7 @@ class PixtralAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple[ir.Value, ir.Value],
     ) -> ir.Value:
@@ -232,7 +231,7 @@ class PixtralTransformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple[ir.Value, ir.Value],
     ) -> ir.Value:
@@ -284,7 +283,7 @@ class PixtralTransformerEncoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple[ir.Value, ir.Value],
     ) -> ir.Value:
@@ -326,7 +325,7 @@ class Mistral3PatchMerger(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         grid_h: ir.Value,
         grid_w: ir.Value,
@@ -425,7 +424,7 @@ class Mistral3MultiModalProjector(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         vision_features: ir.Value,
         grid_h: ir.Value,
         grid_w: ir.Value,
@@ -505,7 +504,7 @@ class PixtralVisionTower(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
     ) -> tuple[ir.Value, ir.Value, ir.Value]:
         """Encode pixel values to patch features.

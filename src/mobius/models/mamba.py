@@ -30,8 +30,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Mamba2Config, MambaConfig
 from mobius.components import (
@@ -74,7 +73,7 @@ class MambaBackbone(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -130,7 +129,7 @@ class _MambaResidualBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         past_state: tuple | None = None,
     ):
@@ -189,7 +188,7 @@ class MambaCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -295,7 +294,7 @@ class _Mamba2ResidualBlock(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         past_state: tuple | None = None,
     ):
@@ -358,7 +357,7 @@ class Mamba2Backbone(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):
@@ -413,7 +412,7 @@ class Mamba2CausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         past_states: list[tuple] | None = None,
     ):

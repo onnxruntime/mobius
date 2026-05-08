@@ -16,7 +16,7 @@ from mobius.models.gpt2 import GPT2CausalLMModel, _GPT2TextModel
 
 if TYPE_CHECKING:
     import onnx_ir as ir
-    from onnxscript._internal import builder
+    from onnxscript import OpBuilder
 
 
 class OPTCausalLMModel(GPT2CausalLMModel):
@@ -37,7 +37,7 @@ class OPTCausalLMModel(GPT2CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

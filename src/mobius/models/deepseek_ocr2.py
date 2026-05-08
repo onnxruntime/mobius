@@ -21,8 +21,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -79,7 +78,7 @@ class _Qwen2EncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -173,7 +172,7 @@ class _Qwen2DecoderAsEncoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sam_features: ir.Value,
     ):
         # sam_features: (B, 896, H_sam, W_sam) — e.g., (B, 896, 16, 16)
@@ -313,7 +312,7 @@ class DeepSeekOCR2VisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
     ):
         # SAM: (B, 3, 1024, 1024) → (B, 896, 16, 16)
@@ -384,7 +383,7 @@ class DeepSeekOCR2EmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
     ):
@@ -456,7 +455,7 @@ class DeepSeekOCR2DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

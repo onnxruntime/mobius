@@ -6,8 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -93,7 +92,7 @@ class Qwen25VLCausalLMModel(nn.Module):
         self.vision_encoder = Qwen25VLVisionEncoderModel(config)
         self.embedding = Qwen25VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen25VLCausalLMModel uses Qwen25VL3ModelTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."
@@ -150,7 +149,7 @@ class Qwen25VLDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -226,7 +225,7 @@ class Qwen25VLVisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
@@ -275,7 +274,7 @@ class Qwen25VLEmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
     ):
@@ -399,7 +398,7 @@ class Qwen2VLCausalLMModel(nn.Module):
         self.vision_encoder = Qwen2VLVisionEncoderModel(config)
         self.embedding = Qwen25VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen2VLCausalLMModel uses Qwen25VL3ModelTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) "
@@ -460,7 +459,7 @@ class _Qwen3VLTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -566,7 +565,7 @@ class _Qwen3VLForMultimodalLM(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -634,7 +633,7 @@ class Qwen3VLCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -748,7 +747,7 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen3VL3ModelCausalLMModel uses QwenVLTask "
             "which calls each sub-module separately."
@@ -808,7 +807,7 @@ class Qwen3VLDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -882,7 +881,7 @@ class Qwen3VLVisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):

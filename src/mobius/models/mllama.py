@@ -20,8 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, MllamaConfig
 from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
@@ -81,7 +80,7 @@ class MllamaCrossAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cross_attention_states: ir.Value,
         past_key_value: tuple | None = None,
@@ -158,7 +157,7 @@ class MllamaCrossAttentionDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cross_attention_states: ir.Value,
         past_key_value: tuple | None = None,
@@ -221,7 +220,7 @@ class MllamaTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -280,7 +279,7 @@ class _MllamaDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -312,7 +311,7 @@ class _MllamaVisionEncoderModel(nn.Module):
         super().__init__()
         self.vision_model = VisionModel(config)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         return self.vision_model(op, pixel_values)
 
     def preprocess_weights(
@@ -338,7 +337,7 @@ class _MllamaEmbeddingModel(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value, image_features: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
         text_embeds = self.embed_tokens(op, input_ids)
         # For Mllama, vision features are injected via cross-attention
         # (not concatenated). The embedding model just returns text embeds.
@@ -371,7 +370,7 @@ class MllamaCausalLMModel(nn.Module):
         self.vision_encoder = _MllamaVisionEncoderModel(config)
         self.embedding = _MllamaEmbeddingModel(config)
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "MllamaCausalLMModel uses VisionLanguageTask which calls "
             "each sub-module (decoder, vision_encoder, embedding) separately."
