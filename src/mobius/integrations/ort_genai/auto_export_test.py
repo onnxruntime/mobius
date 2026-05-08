@@ -1055,6 +1055,7 @@ class TestGemma4GenaiConfig:
         decoder = _mock_model_with_inputs(
             [
                 "inputs_embeds",
+                "per_layer_inputs",
                 "input_ids",
                 "attention_mask",
                 "position_ids",
@@ -1108,8 +1109,8 @@ class TestGemma4GenaiConfig:
         assert "image_grid_thw" not in vision_inputs
         assert data["model"]["vision"]["spatial_merge_size"] == 2
 
-    def test_gemma4_decoder_has_input_ids_and_inputs_embeds(self, tmp_path):
-        """Gemma4 decoder has both inputs_embeds and input_ids."""
+    def test_gemma4_decoder_has_per_layer_inputs_and_inputs_embeds(self, tmp_path):
+        """Gemma4 decoder has inputs_embeds and per_layer_inputs."""
         pkg = self._make_gemma4_pkg()
         path = _write_genai_config(
             pkg.config,
@@ -1128,7 +1129,7 @@ class TestGemma4GenaiConfig:
             data = json.load(f)
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
-        assert "input_ids" in decoder_inputs
+        assert "per_layer_inputs" in decoder_inputs
         # KV cache templates are present
         assert decoder_inputs["past_key_names"] == "past_key_values.%d.key"
 
@@ -1342,7 +1343,6 @@ class TestGemma4RealModel:
         # Decoder inputs introspected from graph
         decoder_inputs = data["model"]["decoder"]["inputs"]
         assert "inputs_embeds" in decoder_inputs
-        assert "input_ids" in decoder_inputs
         assert "attention_mask" in decoder_inputs
         assert "position_ids" in decoder_inputs
         assert decoder_inputs["past_key_names"] == ("past_key_values.%d.key")
