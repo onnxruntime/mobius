@@ -138,16 +138,94 @@ class ModelPackage(UserDict[str, ir.Model]):
                 os.makedirs(model_dir, exist_ok=True)
             else:
                 model_dir = directory
-            path = os.path.join(model_dir, "model.onnx")
-            if external_data == "safetensors":
-                ir.save_safetensors(
-                    model,
-                    path,
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
-                )
-            else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+            _write_one_model(
+                model,
+                model_dir,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+                callback=callback,
+            )
+
+    def save_package_layout(
+        self,
+        directory: str,
+        *,
+        component_map: dict[str, str] | None = None,
+        variant_name: str = "base",
+        external_data: str = "onnx",
+        max_shard_size_bytes: int | None = None,
+        components: Callable[[str], bool] | None = None,
+        progress_bar: bool = True,
+        check_weights: bool = True,
+    ) -> dict[str, str]:
+        """Save component models in the ORT Model Package layout.
+
+        Each component is written to
+        ``<directory>/<component>/<variant_name>/model.onnx`` regardless
+        of whether the package has one or many components — the
+        single-component flat-directory shortcut from :meth:`save` does
+        *not* apply here.
+
+        Args:
+            directory: Package root directory (created if needed).
+            component_map: Optional mapping from this package's
+                ``dict`` keys to package component names. When a key is
+                missing from the map, the dict key is used directly.
+                Useful for renaming the legacy LLM key ``"model"`` to
+                the GenAI role ``"decoder"`` in the on-disk layout.
+            variant_name: Variant directory name. Defaults to
+                ``"base"``, which is mobius's single-variant
+                EP-agnostic output.
+            external_data: External data format (``"onnx"`` or
+                ``"safetensors"``). Same semantics as :meth:`save`.
+            max_shard_size_bytes: Safetensors shard size cap. Same
+                semantics as :meth:`save`.
+            components: Optional predicate selecting which components
+                to write. Same semantics as :meth:`save`.
+            progress_bar: Whether to display a tqdm progress bar.
+            check_weights: Whether to verify that all initializers have
+                weight data before saving.
+
+        Returns:
+            Mapping ``{component_name: absolute_path_to_model_onnx}``
+            for every component written.
+
+        Raises:
+            ValueError: If *external_data* is not ``"onnx"`` or
+                ``"safetensors"``, or if *check_weights* is ``True`` and
+                any initializer is missing its ``const_value``.
+        """
+        if external_data not in {"onnx", "safetensors"}:
+            raise ValueError(
+                f"Unknown external_data format {external_data!r}. "
+                "Expected 'onnx' or 'safetensors'."
+            )
+        os.makedirs(directory, exist_ok=True)
+        callback = _make_progress_callback() if progress_bar else None
+        component_map = component_map or {}
+
+        selected = {
+            name: model
+            for name, model in self.data.items()
+            if components is None or components(name)
+        }
+
+        written: dict[str, str] = {}
+        for name, model in selected.items():
+            if check_weights:
+                _check_weights(name, model)
+            component_name = component_map.get(name, name)
+            variant_dir = os.path.join(directory, component_name, variant_name)
+            os.makedirs(variant_dir, exist_ok=True)
+            _write_one_model(
+                model,
+                variant_dir,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+                callback=callback,
+            )
+            written[component_name] = os.path.join(variant_dir, "model.onnx")
+        return written
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
@@ -254,6 +332,33 @@ class ModelPackage(UserDict[str, ir.Model]):
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
+
+
+def _write_one_model(
+    model: ir.Model,
+    output_dir: str,
+    *,
+    external_data: str,
+    max_shard_size_bytes: int | None,
+    callback: Callable[..., None] | None,
+) -> None:
+    """Save a single :class:`ir.Model` as ``model.onnx`` in *output_dir*.
+
+    Encapsulates the choice between ``ir.save`` (default) and
+    :func:`ir.save_safetensors` so that both
+    :meth:`ModelPackage.save` and :meth:`ModelPackage.save_package_layout`
+    share the same I/O logic.
+    """
+    path = os.path.join(output_dir, "model.onnx")
+    if external_data == "safetensors":
+        ir.save_safetensors(
+            model,
+            path,
+            max_shard_size_bytes=max_shard_size_bytes,
+            callback=callback,
+        )
+    else:
+        ir.save(model, path, external_data="model.onnx.data", callback=callback)
 
 
 def _make_progress_callback():

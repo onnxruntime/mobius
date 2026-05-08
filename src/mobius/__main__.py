@@ -206,7 +206,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
 def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
-    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+    """Save a ModelPackage to disk, applying optimizations and runtime configs.
+
+    When ``--runtime ort-genai`` is set, writes the ORT Model Package
+    layout (per-component ``base/model.onnx`` plus manifest, metadata,
+    variant.json, configs/genai_config.json, tokenizer files). Otherwise
+    writes the legacy flat-directory layout via
+    :meth:`ModelPackage.save`.
+    """
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
@@ -221,6 +228,38 @@ def _save_package(
             "alignment, which can cause CUBLAS misaligned address errors on "
             "CUDA. Consider using --external-data onnx for CUDA builds."
         )
+
+    runtime = getattr(args, "runtime", None)
+
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai import write_ort_genai_config
+        from mobius.integrations.ort_genai.auto_export import _resolve_component_map
+
+        component_map = _resolve_component_map(pkg)
+        saved = pkg.save_package_layout(
+            output_dir,
+            component_map=component_map,
+            external_data=args.external_data,
+            max_shard_size_bytes=max_shard_size_bytes,
+            components=components,
+            check_weights=not args.no_weights,
+        )
+        for component_name, model_path in saved.items():
+            print(f"Saved {component_name} to {model_path}")
+
+        hf_model_id = getattr(args, "model", None)
+        # When --config (local dir) is used instead of --model, copy tokenizer
+        # files from the local directory rather than downloading from HF.
+        local_config_dir = getattr(args, "config", None)
+        artifacts = write_ort_genai_config(
+            pkg,
+            output_dir,
+            hf_model_id=hf_model_id,
+            local_config_dir=local_config_dir,
+        )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
+        return
 
     pkg.save(
         output_dir,
@@ -237,25 +276,6 @@ def _save_package(
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
-
-    runtime = getattr(args, "runtime", None)
-    if runtime == "ort-genai":
-        from mobius.integrations.ort_genai import write_ort_genai_config
-
-        hf_model_id = getattr(args, "model", None)
-        ep = getattr(args, "execution_provider", "cpu")
-        # When --config (local dir) is used instead of --model, copy tokenizer
-        # files from the local directory rather than downloading from HF.
-        local_config_dir = getattr(args, "config", None)
-        artifacts = write_ort_genai_config(
-            pkg,
-            output_dir,
-            hf_model_id=hf_model_id,
-            ep=ep,
-            local_config_dir=local_config_dir,
-        )
-        for name, path in artifacts.items():
-            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:

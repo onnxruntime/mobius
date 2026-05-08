@@ -76,25 +76,38 @@ done
 
 ### Multi-model outputs
 
-For multimodal models (VLMs, audio-language), `mobius build` produces
-multiple sub-models:
+For all `mobius build --runtime ort-genai` exports, the output is a
+**Model Package** (single-model and multi-model use the same layout):
 
 ```
 output/
-├── decoder/           # Text decoder
-│   ├── model.onnx
-│   └── model.onnx.data.safetensors
-├── embedding/         # Embedding model
-│   ├── model.onnx
-│   └── model.onnx.data.safetensors
-├── vision_encoder/    # Vision encoder (VLMs)
-│   ├── model.onnx
-│   └── model.onnx.data.safetensors
-├── audio_encoder/     # Audio encoder (ALMs)
-│   ├── model.onnx
-│   └── model.onnx.data.safetensors
-└── genai_config.json
+├── manifest.json
+├── configs/
+│   ├── genai_config.json
+│   ├── tokenizer.json + tokenizer_config.json + special_tokens_map.json
+│   ├── chat_template.jinja          # if present
+│   ├── image_processor.json         # VLMs
+│   └── audio_processor.json         # audio models
+├── decoder/                          # always present
+│   ├── metadata.json
+│   └── base/
+│       ├── variant.json
+│       ├── model.onnx
+│       └── model.onnx.data.safetensors
+├── embedding/                        # multimodal only
+│   └── base/{variant.json, model.onnx, model.onnx.data.safetensors}
+├── vision_encoder/                   # VLMs only
+│   └── base/{variant.json, model.onnx, model.onnx.data.safetensors}
+└── audio_encoder/                    # speech-capable models only
+    └── base/{variant.json, model.onnx, model.onnx.data.safetensors}
 ```
+
+Mobius emits exactly one variant, named `base`, declared as compatible
+with major ORT EPs. Downstream packagers can replace `base` with
+EP-specialized variants (e.g. `cuda-fp16`, `dml-int4`).
+
+Plain `mobius build` (no `--runtime`) still uses the legacy flat layout
+(`model.onnx` + optional `<component>/model.onnx` subdirs).
 
 ## Quantization with Olive
 
@@ -126,7 +139,7 @@ k-quant quantization:
 
 ```json
 {
-  "input_model": { "type": "OnnxModel", "model_path": "decoder/model.onnx" },
+  "input_model": { "type": "OnnxModel", "model_path": "decoder/base/model.onnx" },
   "passes": {
     "kquant": {
       "type": "OnnxKQuantQuantization",
@@ -134,7 +147,7 @@ k-quant quantization:
       "block_size": 32
     }
   },
-  "output_dir": "output/Q4_K_M/default/decoder"
+  "output_dir": "output/Q4_K_M/default/decoder/base"
 }
 ```
 
@@ -149,14 +162,14 @@ implementation — no GPU needed.
 
 ```json
 {
-  "input_model": { "type": "OnnxModel", "model_path": "decoder/model.onnx" },
+  "input_model": { "type": "OnnxModel", "model_path": "decoder/base/model.onnx" },
   "passes": {
     "nf4": {
       "type": "OnnxBnb4Quantization",
       "precision": "nf4"
     }
   },
-  "output_dir": "output/NF4/default/decoder"
+  "output_dir": "output/NF4/default/decoder/base"
 }
 ```
 
@@ -187,18 +200,17 @@ quantized (it has the most parameters). Copy all other files needed
 for a complete ORT GenAI package:
 
 ```bash
-# Quantize decoder only (largest model)
+# Quantize decoder only (largest model) — under <component>/<variant>/
 olive run --config kquant_decoder.json
 
 # Copy other sub-models as-is (already small)
-cp -r output/f16/default/embedding/ output/Q4_K_M/default/embedding/
-cp -r output/f16/default/vision_encoder/ output/Q4_K_M/default/vision_encoder/
+cp -r output/f16/default/embedding output/Q4_K_M/default/
+cp -r output/f16/default/vision_encoder output/Q4_K_M/default/
 
-# IMPORTANT: Copy config, tokenizer, and processor files too
-cp output/f16/default/genai_config.json output/Q4_K_M/default/
-cp output/f16/default/tokenizer* output/Q4_K_M/default/
-cp output/f16/default/image_processor.json output/Q4_K_M/default/ 2>/dev/null
-cp output/f16/default/audio_processor.json output/Q4_K_M/default/ 2>/dev/null
+# IMPORTANT: Copy package metadata, configs, tokenizer, and processor files
+cp output/f16/default/manifest.json output/Q4_K_M/default/
+cp -r output/f16/default/configs output/Q4_K_M/default/
+# Also copy any per-component metadata.json the quantized component needs.
 ```
 
 Without the tokenizer and processor config files, ORT GenAI will fail

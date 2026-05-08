@@ -82,7 +82,7 @@ def build_and_export(
     print(f"Package components: {list(pkg.keys())}")
 
     print(f"Exporting to {output_dir!r} ...")
-    export_package(pkg, output_dir, hf_model_id=model_id, ep=ep)
+    export_package(pkg, output_dir, hf_model_id=model_id)
     print(f"Export complete -> {output_dir}")
 
 

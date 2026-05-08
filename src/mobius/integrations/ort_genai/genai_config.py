@@ -1,12 +1,29 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Generate genai_config.json for onnxruntime-genai.
+"""Generate genai_config.json for onnxruntime-genai (Model Package format).
 
 This module takes an ``ArchitectureConfig`` (or ``BaseModelConfig``) and a
-model type string and produces the config dict that onnxruntime-genai
-expects. It does NOT import from core model/task/component layers — it
-only reads config dataclass fields.
+model type string and produces the ``genai_config.json`` *base* document
+that onnxruntime-genai expects in the Model Package layout.
+
+The generated document is **EP-agnostic**: it carries no
+``session_options``, ``provider_options``, ``filename``, or
+EP-derived search defaults (``past_present_share_buffer``, KV-buffer
+``max_length`` cap). All EP-specific concerns live in each variant's
+``variant.json`` (written by a downstream packager); per-variant
+GenAI overrides land via the variant's
+``consumer_metadata.genai_config_overlay``.
+
+What stays here is GenAI architecture identity (``model.type``,
+hidden/head sizes, layer counts, vocab size, token IDs, context
+length), per-component I/O name maps, and EP-agnostic ``search``
+defaults. Each component block now carries a ``"component"`` field
+naming the package component the role binds to (e.g.
+``"component": "decoder"``, ``"component": "vision_encoder"``).
+
+This module does NOT import from core model/task/component layers —
+it only reads config dataclass fields.
 """
 
 from __future__ import annotations
@@ -44,42 +61,20 @@ def _default_decoder_outputs() -> dict[str, str]:
     }
 
 
-_SHARE_BUFFER_MAX_LENGTH_CAP = 4096
+def _default_search_params(*, context_length: int) -> dict[str, Any]:
+    """Return EP-agnostic default search parameters.
 
-
-def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
-    """Return sensible default search parameters.
-
-    Args:
-        ep: Execution provider (``"cpu"``, ``"cuda"``, ``"dml"``,
-            ``"webgpu"``, ``"trt-rtx"``).  Capability flags are read from
-            :data:`~mobius._execution_providers.ep_registry`.
-        context_length: Model context window; used as the default
-            ``max_length`` for generation so the limit matches the model.
+    EP-specific knobs (``past_present_share_buffer``, KV-buffer
+    ``max_length`` caps) are omitted — they belong in the variant's
+    overlay or runtime config, not in the package-shipped base.
     """
-    from mobius._execution_providers import ep_registry
-
-    caps = ep_registry.get(ep)
-    share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
-    cap_length = caps.cap_kv_buffer_max_length if caps is not None else False
-    if share_buffer and cap_length:
-        # Memory-constrained EPs (e.g. WebGPU on consumer GPUs) pre-allocate
-        # KV-cache for the full max_length at load time.  Cap the default to
-        # avoid pre-allocating huge buffers (~8 GB for 128K-token models).
-        # Users can raise the limit in genai_config.json for their device.
-        # The cap only applies when buffer sharing is also active — without
-        # sharing, the runtime grows the cache on demand and no cap is needed.
-        max_length = min(context_length, _SHARE_BUFFER_MAX_LENGTH_CAP)
-    else:
-        max_length = context_length
     return {
         "do_sample": True,
         "early_stopping": True,
-        "max_length": max_length,
+        "max_length": context_length,
         "min_length": 0,
         "num_beams": 1,
         "num_return_sequences": 1,
-        "past_present_share_buffer": share_buffer,
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_k": 1,
@@ -87,26 +82,13 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
     }
 
 
-def _make_session_options(ep: str) -> dict[str, Any]:
-    """Return session options with EP-specific provider_options.
-
-    Args:
-        ep: Execution provider name (e.g. ``"cpu"``, ``"cuda"``,
-            ``"dml"``, ``"trt-rtx"``).
-    """
-    from mobius.integrations.ort_genai.ep_config import make_provider_options
-
-    return {
-        "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(ep),
-    }
-
-
 class GenaiConfigGenerator:
-    """Generates genai_config.json dicts for onnxruntime-genai.
+    """Generates the EP-agnostic ``genai_config.json`` base document.
 
-    This class takes config fields as plain values (not model internals)
-    and assembles the nested dict structure that ORT-GenAI expects.
+    The output document is the *base* in the Model Package world:
+    every variant in the package merges its overlay onto this document
+    at runtime. The document declares only architecture identity and
+    role↔component bindings, never EP-specific settings.
 
     Args:
         model_type: The ORT-GenAI model type string (e.g. ``"qwen2"``,
@@ -121,8 +103,6 @@ class GenaiConfigGenerator:
             ``genai_config.json``. Overridden upward by
             ``max_position_embeddings`` from the model config when that
             value is larger. Defaults to 4096.
-        ep: Execution provider for ``session_options`` (e.g. ``"cpu"``,
-            ``"cuda"``, ``"dml"``, ``"trt-rtx"``). Defaults to ``"cpu"``.
         bos_token_id: Beginning-of-sequence token ID.
         eos_token_id: End-of-sequence token ID(s).
         pad_token_id: Padding token ID.
@@ -132,6 +112,9 @@ class GenaiConfigGenerator:
             :func:`_default_decoder_inputs`. Must already include KV
             cache template entries (``past_key_names``,
             ``past_value_names``).
+        decoder_component: Name of the package component the
+            ``decoder`` role binds to. Defaults to ``"decoder"``.
+            Emitted as ``model.decoder.component``.
     """
 
     def __init__(
@@ -145,12 +128,11 @@ class GenaiConfigGenerator:
         num_key_value_heads: int,
         head_dim: int,
         context_length: int = 4096,
-        ep: str = "cpu",
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
-        decoder_filename: str | None = None,
+        decoder_component: str = "decoder",
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -160,15 +142,14 @@ class GenaiConfigGenerator:
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.context_length = context_length
-        self.ep = ep
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
         # Explicit decoder inputs (from graph introspection); None → use defaults
         self._decoder_inputs = decoder_inputs
-        # Explicit decoder filename; None → use "model.onnx"
-        self._decoder_filename = decoder_filename
+        # Package component name for the decoder role
+        self._decoder_component = decoder_component
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -188,12 +169,11 @@ class GenaiConfigGenerator:
         model_type: str,
         *,
         context_length: int = 4096,
-        ep: str = "cpu",
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
-        decoder_filename: str | None = None,
+        decoder_component: str = "decoder",
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -221,20 +201,17 @@ class GenaiConfigGenerator:
             num_key_value_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             context_length=context_length,
-            ep=ep,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad,
             decoder_inputs=decoder_inputs,
-            decoder_filename=decoder_filename,
+            decoder_component=decoder_component,
         )
 
     def with_vision(
         self,
         *,
         image_token_id: int,
-        filename: str = "vision_encoder/model.onnx",
-        embedding_filename: str = "embedding/model.onnx",
         spatial_merge_size: int | None = 2,
         config_filename: str = "image_processor.json",
         input_names: dict[str, str] | None = None,
@@ -242,28 +219,36 @@ class GenaiConfigGenerator:
         embedding_input_names: dict[str, str] | None = None,
         vision_start_token_id: int | None = None,
         video_token_id: int | None = None,
+        vision_component: str = "vision_encoder",
+        embedding_component: str = "embedding",
     ) -> GenaiConfigGenerator:
         """Add VLM vision + embedding sections.
 
         Args:
             image_token_id: Token ID for image placeholders. Required —
                 ORT-GenAI crashes without it.
-            filename: Vision ONNX model filename.
-            embedding_filename: Embedding ONNX model filename.
             spatial_merge_size: Spatial merge size for position ID
                 computation. Set to ``None`` to omit (e.g. for Phi4MM
                 which doesn't use spatial merge).
-            config_filename: Vision processor config filename.
+            config_filename: Vision processor config filename (relative
+                to the package's ``configs/`` directory). Defaults to
+                ``"image_processor.json"``.
             input_names: Override vision model input name mapping.
                 Defaults to pixel_values + image_grid_thw.
             output_names: Override vision model output name mapping.
                 Defaults to image_features.
             embedding_input_names: Override embedding model input name
-                mapping.  When provided (e.g. from ONNX graph
-                introspection), used directly.  Defaults to
+                mapping. When provided (e.g. from ONNX graph
+                introspection), used directly. Defaults to
                 input_ids + image_features.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
+            vision_component: Package component name for the vision
+                role. Defaults to ``"vision_encoder"``. Emitted as
+                ``model.vision.component``.
+            embedding_component: Package component name for the
+                embedding role. Defaults to ``"embedding"``. Emitted
+                as ``model.embedding.component``.
 
         Returns self for chaining.
         """
@@ -283,22 +268,20 @@ class GenaiConfigGenerator:
             }
 
         self._vision = {
-            "filename": filename,
+            "component": vision_component,
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
 
         self._embedding = {
-            "filename": embedding_filename,
+            "component": embedding_component,
             "inputs": embedding_input_names,
             "outputs": {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _make_session_options(self.ep),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -312,23 +295,27 @@ class GenaiConfigGenerator:
         *,
         audio_token_id: int | None = None,
         boa_token_id: int | None = None,
-        filename: str = "audio_encoder/model.onnx",
         config_filename: str = "audio_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
+        audio_component: str = "audio_encoder",
     ) -> GenaiConfigGenerator:
         """Add audio model section for multimodal models.
 
         Args:
             audio_token_id: Token ID for audio placeholders.
             boa_token_id: Beginning-of-audio token ID.
-            filename: Audio ONNX model filename.
-            config_filename: Audio processor config filename.
+            config_filename: Audio processor config filename (relative
+                to the package's ``configs/`` directory). Defaults to
+                ``"audio_processor.json"``.
             input_names: Override audio model input name mapping.
                 Defaults to audio_embeds + audio_sizes +
                 audio_projection_mode.
             output_names: Override audio model output name mapping.
                 Defaults to audio_features.
+            audio_component: Package component name for the audio
+                role. Defaults to ``"audio_encoder"``. Emitted as
+                ``model.speech.component``.
 
         Returns self for chaining.
         """
@@ -344,11 +331,10 @@ class GenaiConfigGenerator:
             }
 
         self._audio = {
-            "filename": filename,
+            "component": audio_component,
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep),
         }
 
         if audio_token_id is not None:
@@ -359,7 +345,7 @@ class GenaiConfigGenerator:
         return self
 
     def generate(self) -> dict[str, Any]:
-        """Generate the full genai_config.json dict."""
+        """Generate the full genai_config.json dict (package-world shape)."""
         is_multimodal = self._vision is not None or self._audio is not None
 
         # Decoder section — use explicit inputs when available (from
@@ -368,10 +354,8 @@ class GenaiConfigGenerator:
             decoder_inputs = dict(self._decoder_inputs)
         else:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
-        decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
-            "session_options": _make_session_options(self.ep),
-            "filename": self._decoder_filename or decoder_filename,
+            "component": self._decoder_component,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
@@ -410,7 +394,7 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
-        search = _default_search_params(ep=self.ep, context_length=self.context_length)
+        search = _default_search_params(context_length=self.context_length)
         search.update(self._search_overrides)
 
         return {
@@ -421,9 +405,13 @@ class GenaiConfigGenerator:
     def write(self, output_dir: str) -> str:
         """Write genai_config.json to the output directory.
 
-        Returns the path to the written file.
+        Returns the path to the written file. The output directory is
+        the package's ``configs/`` directory in the new layout (callers
+        in :mod:`mobius.integrations.ort_genai.auto_export` ensure
+        that). Creates *output_dir* if it does not yet exist.
         """
         config = self.generate()
+        os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, "genai_config.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)

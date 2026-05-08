@@ -60,15 +60,16 @@ def export_models(
     pkg = build(model_path, dtype=dtype, load_weights=True)
     print(f"  Components: {list(pkg.keys())}")
 
-    print(f"\n=== Saving to {output_dir} ===")
-    pkg.save(output_dir)
+    print(f"\n=== Saving to {output_dir} in Model Package layout ===")
+    from mobius.integrations.ort_genai.auto_export import _resolve_component_map
 
-    print("\n=== Generating ORT GenAI config ===")
+    pkg.save_package_layout(output_dir, component_map=_resolve_component_map(pkg))
+
+    print("\n=== Generating ORT GenAI Model Package config ===")
     write_ort_genai_config(
         pkg,
         output_dir,
         hf_model_id=model_path,
-        ep=ep,
     )
 
     print("  Export complete")

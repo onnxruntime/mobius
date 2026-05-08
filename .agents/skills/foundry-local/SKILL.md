@@ -53,11 +53,16 @@ Use this skill when:
      output/
    ```
 
-   The output directory must contain `genai_config.json` and tokenizer
-   files. For single-model exports (text-only LLMs), model files
-   (`model.onnx` + external data) are in the output root. For
-   multi-model exports (VLMs, ALMs), sub-directories like `decoder/`,
-   `embedding/`, `vision_encoder/` contain each model.
+   The output is a Model Package directory containing
+   `manifest.json`, a `configs/` subdirectory (genai_config + tokenizer +
+   processor configs), and one `<component>/base/{variant.json,
+   model.onnx, model.onnx.data.safetensors}` per component
+   (`decoder` always, plus `embedding` / `vision_encoder` /
+   `audio_encoder` for multimodal exports).
+
+   > **Foundry Local consumes a flat layout today.** The Model Package
+   > emitted by mobius needs to be flattened (or the Foundry packager
+   > extended). The Step 3 commands below do the flattening.
 
 ## Custom model registration
 
@@ -82,37 +87,35 @@ MODEL_NAME="my-custom-model"
 mkdir -p "${CACHE_DIR}/models/Custom/${MODEL_NAME}"
 ```
 
-### Step 3: Copy model files
-
-Copy the entire mobius export output into the model directory. The
-simplest approach copies everything:
+### Step 3: Copy model files (flatten Model Package → Foundry layout)
 
 ```bash
-cp -r output/* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
+DST="${CACHE_DIR}/models/Custom/${MODEL_NAME}"
+
+# Configs (genai_config.json, tokenizer*, processor configs) live under configs/
+cp output/configs/* "${DST}/"
+
+# Per-component model files: <component>/base/{model.onnx,*.safetensors}
+# Foundry expects them at the top level (single-component) or in
+# <component>/ subdirectories (multi-component).
+for comp in decoder embedding vision_encoder audio_encoder; do
+  if [ -d "output/${comp}/base" ]; then
+    if [ "$(ls -A output)" = "decoder" ] || [ ! -d "output/embedding" ]; then
+      # Single-component LLM: flatten model files into the model root
+      cp output/${comp}/base/* "${DST}/"
+    else
+      # Multi-component: keep one subdir per component
+      mkdir -p "${DST}/${comp}"
+      cp output/${comp}/base/* "${DST}/${comp}/"
+    fi
+  fi
+done
 ```
 
-Or copy selectively (handles both single-model and multi-model layouts):
-
-```bash
-# Model files — single-model (root-level) and multi-model (sub-dirs)
-cp output/model.onnx* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp -r output/decoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp -r output/embedding/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp -r output/vision_encoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp -r output/audio_encoder/ "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-
-# Config and tokenizer files (required)
-cp output/genai_config.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
-cp output/tokenizer* "${CACHE_DIR}/models/Custom/${MODEL_NAME}/"
-
-# Processor configs for VLMs (copy whichever exist)
-cp output/image_processor.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp output/processor_config.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-cp output/audio_processor.json "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-
-# External data shards (single-model layout)
-cp output/*.safetensors "${CACHE_DIR}/models/Custom/${MODEL_NAME}/" 2>/dev/null
-```
+> Most users will simplify the above with their own packaging script.
+> The key invariant is: Foundry Local needs `genai_config.json`,
+> tokenizer files, and `model.onnx` (+ external data) reachable from
+> the model directory using the legacy flat layout.
 
 ### Step 4: Create `inference_model.json`
 

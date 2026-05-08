@@ -398,7 +398,7 @@ class TestWriteOrtGenaiConfigLocalDir:
         return _make_fake_llm_pkg("llama")
 
     def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
-        """When local_config_dir is set, tokenizer files are copied from it."""
+        """When local_config_dir is set, tokenizer files are copied into configs/."""
         src = tmp_path / "local_model"
         src.mkdir()
         (src / "tokenizer.json").write_text('{"local": true}')
@@ -414,8 +414,10 @@ class TestWriteOrtGenaiConfigLocalDir:
             local_config_dir=str(src),
         )
 
+        # Tokenizer files now land under <output>/configs/ (Model Package layout)
+        configs = out / "configs"
         assert "tokenizer.json" in result
-        assert (out / "tokenizer.json").read_text() == '{"local": true}'
+        assert (configs / "tokenizer.json").read_text() == '{"local": true}'
         assert "tokenizer_config.json" in result
 
     def test_hf_model_id_takes_precedence_over_local_dir(self, tmp_path):
@@ -725,8 +727,8 @@ class TestExportForOrtGenai:
         # config_filename must point to the onnxruntime-extensions audio config
         assert speech["config_filename"] == "audio_feature_extraction.json"
 
-        # filename must point to the audio encoder ONNX model
-        assert speech["filename"] == "audio_encoder/model.onnx"
+        # component must point to the audio encoder package component
+        assert speech["component"] == "audio_encoder"
 
         # input_names mapping: genai internal name -> ONNX model input name
         assert speech["inputs"]["audio_embeds"] == "input_features"
@@ -744,7 +746,7 @@ class TestExportForOrtGenai:
         mock_copy.assert_not_called()
 
     def test_tokenizer_copied_when_model_id_provided(self, tmp_path):
-        """Tokenizer files are copied when hf_model_id is provided."""
+        """Tokenizer files are copied (into configs/) when hf_model_id is provided."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
@@ -760,43 +762,25 @@ class TestExportForOrtGenai:
             )
             result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id="fake/model")
 
-        mock_copy.assert_called_once_with("fake/model", str(tmp_path))
+        # Tokenizer files now go into <output>/configs/ in the package layout
+        mock_copy.assert_called_once_with("fake/model", os.path.join(str(tmp_path), "configs"))
         assert "tokenizer.json" in result
 
-    def test_ep_default_normalizes_to_cpu(self, tmp_path):
-        """ep='default' is normalized to cpu (provider_options=[])."""
+    def test_genai_config_omits_session_options(self, tmp_path):
+        """Package-level base genai_config must not carry session_options."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = self._make_pkg()
-        result = write_ort_genai_config(pkg, str(tmp_path), ep="default")
+        result = write_ort_genai_config(pkg, str(tmp_path))
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        assert data["model"]["decoder"]["session_options"]["provider_options"] == []
-
-    def test_ep_onnx_standard_normalizes_to_cpu(self, tmp_path):
-        """ep='onnx-standard' is normalized to cpu (provider_options=[])."""
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
-        pkg = self._make_pkg()
-        result = write_ort_genai_config(pkg, str(tmp_path), ep="onnx-standard")
-
-        with open(result["genai_config"]) as f:
-            data = json.load(f)
-        assert data["model"]["decoder"]["session_options"]["provider_options"] == []
-
-    def test_ep_cuda_passes_through(self, tmp_path):
-        """ep='cuda' passes through to session_options with CUDA provider."""
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
-        pkg = self._make_pkg()
-        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
-
-        with open(result["genai_config"]) as f:
-            data = json.load(f)
-        provider_opts = data["model"]["decoder"]["session_options"]["provider_options"]
-        assert len(provider_opts) == 1
-        assert "cuda" in provider_opts[0]
+        decoder = data["model"]["decoder"]
+        assert "session_options" not in decoder
+        assert "provider_options" not in decoder
+        assert "filename" not in decoder
+        # 'component' replaces 'filename' in the package-world schema
+        assert decoder["component"] == "decoder"
 
     def test_raises_when_pkg_config_is_none(self, tmp_path):
         """ValueError is raised when pkg.config is None."""
@@ -918,39 +902,52 @@ class TestExportPackage:
         return _make_fake_llm_pkg("qwen2")
 
     def test_writes_both_onnx_and_genai_config(self, tmp_path, monkeypatch):
-        """export_package calls pkg.save AND writes genai_config.json."""
+        """export_package calls save_package_layout AND writes genai_config.json."""
         from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = self._make_pkg()
         save_calls = []
 
-        def fake_save(self, directory, **kwargs):
+        def fake_save_package_layout(self, directory, **kwargs):
             save_calls.append((directory, kwargs))
+            # Return what save_package_layout would: {component_name: path}
+            component_map = kwargs.get("component_map") or {}
+            written = {}
+            for key in self:
+                comp = component_map.get(key, key)
+                written[comp] = os.path.join(directory, comp, "base", "model.onnx")
+            return written
 
-        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+        monkeypatch.setattr(pkg.__class__, "save_package_layout", fake_save_package_layout)
 
         result = export_package(pkg, str(tmp_path))
 
-        # pkg.save called exactly once with the output dir
+        # save_package_layout called exactly once with the output dir
         assert len(save_calls) == 1
         assert save_calls[0][0] == str(tmp_path)
-        # genai_config artifact is in the manifest
+        # genai_config artifact is in the manifest (under configs/)
         assert "genai_config" in result
         assert os.path.isfile(result["genai_config"])
-        # ONNX path is in the manifest (single-component package)
-        assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
+        # Per-component ONNX path is in the manifest (LLM key "model" -> "decoder")
+        assert result["decoder:model"] == os.path.join(
+            str(tmp_path), "decoder", "base", "model.onnx"
+        )
+        # Top-level manifest.json was written
+        assert "manifest" in result
+        assert os.path.isfile(result["manifest"])
 
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
-        """external_data and progress_bar are forwarded to pkg.save."""
+        """external_data and progress_bar are forwarded to save_package_layout."""
         from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = self._make_pkg()
         save_calls = []
 
-        def fake_save(self, directory, **kwargs):
+        def fake_save_package_layout(self, directory, **kwargs):
             save_calls.append(kwargs)
+            return {}
 
-        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+        monkeypatch.setattr(pkg.__class__, "save_package_layout", fake_save_package_layout)
 
         export_package(
             pkg,
@@ -963,26 +960,27 @@ class TestExportPackage:
         assert save_calls[0]["progress_bar"] is False
 
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
-        """The ep and context_length kwargs reach the generated genai_config.json."""
+        """The context_length kwarg reaches the generated genai_config.json."""
         from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = self._make_pkg()
-        monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
+        monkeypatch.setattr(
+            pkg.__class__, "save_package_layout", lambda self, d, **kw: {}
+        )
 
         result = export_package(
             pkg,
             str(tmp_path),
-            ep="cuda",
             context_length=8192,
         )
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        # ep="cuda" should produce CUDA provider_options
-        provider_opts = data["model"]["decoder"]["session_options"]["provider_options"]
-        assert any("cuda" in po for po in provider_opts)
-        # context_length should bump max_length
+        # context_length should set max_length (no EP-specific cap is applied
+        # in the v4 EP-agnostic base config).
         assert data["search"]["max_length"] == 8192
+        # The base genai_config has no session_options (EP-agnostic).
+        assert "session_options" not in data["model"]["decoder"]
 
     def test_preflights_missing_config(self, tmp_path, monkeypatch):
         """Raises ValueError BEFORE writing any ONNX when pkg.config is None.
@@ -996,10 +994,11 @@ class TestExportPackage:
         pkg = ModelPackage({"model": mock.MagicMock()}, config=None)
         save_called = []
 
-        def fake_save(self, *a, **kw):
+        def fake_save_package_layout(self, *a, **kw):
             save_called.append(True)
+            return {}
 
-        monkeypatch.setattr(pkg.__class__, "save", fake_save)
+        monkeypatch.setattr(pkg.__class__, "save_package_layout", fake_save_package_layout)
 
         with pytest.raises(ValueError, match="config"):
             export_package(pkg, str(tmp_path))
@@ -1008,18 +1007,27 @@ class TestExportPackage:
         assert save_called == []
 
     def test_returns_manifest_with_all_artifacts(self, tmp_path, monkeypatch):
-        """Returned manifest contains ONNX paths AND config artifacts."""
+        """Returned manifest contains per-component ONNX paths AND config artifacts."""
         from mobius.integrations.ort_genai.auto_export import export_package
 
         pkg = self._make_pkg()
-        monkeypatch.setattr(pkg.__class__, "save", lambda self, d, **kw: None)
+        monkeypatch.setattr(
+            pkg.__class__,
+            "save_package_layout",
+            lambda self, d, **kw: {
+                "decoder": os.path.join(d, "decoder", "base", "model.onnx"),
+            },
+        )
 
         result = export_package(pkg, str(tmp_path))
 
         # Manifest is non-empty and includes both kinds of artifacts
         assert isinstance(result, dict)
-        assert "model" in result
+        assert "decoder:model" in result
+        assert "decoder:metadata" in result
+        assert "decoder:variant" in result
         assert "genai_config" in result
+        assert "manifest" in result
 
 
 class TestGemma4GenaiConfig:
@@ -1092,13 +1100,17 @@ class TestGemma4GenaiConfig:
             str(tmp_path),
             pkg=pkg,
             ort_model_type="gemma4",
-            ep="cpu",
             context_length=4096,
             bos_token_id=2,
             eos_token_id=1,
             pad_token_id=0,
             is_vlm=True,
             has_speech=False,
+            component_map={
+                "model": "decoder",
+                "vision_encoder": "vision_encoder",
+                "embedding": "embedding",
+            },
         )
         with open(path) as f:
             data = json.load(f)
@@ -1116,13 +1128,17 @@ class TestGemma4GenaiConfig:
             str(tmp_path),
             pkg=pkg,
             ort_model_type="gemma4",
-            ep="cpu",
             context_length=4096,
             bos_token_id=2,
             eos_token_id=1,
             pad_token_id=0,
             is_vlm=True,
             has_speech=False,
+            component_map={
+                "model": "decoder",
+                "vision_encoder": "vision_encoder",
+                "embedding": "embedding",
+            },
         )
         with open(path) as f:
             data = json.load(f)
@@ -1140,13 +1156,17 @@ class TestGemma4GenaiConfig:
             str(tmp_path),
             pkg=pkg,
             ort_model_type="gemma4",
-            ep="cpu",
             context_length=4096,
             bos_token_id=2,
             eos_token_id=1,
             pad_token_id=0,
             is_vlm=True,
             has_speech=False,
+            component_map={
+                "model": "decoder",
+                "vision_encoder": "vision_encoder",
+                "embedding": "embedding",
+            },
         )
         with open(path) as f:
             data = json.load(f)
@@ -1209,13 +1229,17 @@ class TestPixtralGenaiConfig:
             str(tmp_path),
             pkg=pkg,
             ort_model_type="mistral3",
-            ep="cpu",
             context_length=4096,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=0,
             is_vlm=True,
             has_speech=False,
+            component_map={
+                "model": "decoder",
+                "vision_encoder": "vision_encoder",
+                "embedding": "embedding",
+            },
         )
         with open(path) as f:
             data = json.load(f)

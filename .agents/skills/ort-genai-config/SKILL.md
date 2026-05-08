@@ -42,25 +42,43 @@ Read these companion documents for exhaustive field-by-field details:
 
 ## Overview
 
-onnxruntime-genai loads models from a directory containing:
+Mobius produces ORT-GenAI artifacts in **Model Package** layout:
+EP-agnostic ONNX components plus an EP-agnostic `genai_config.json`.
+Variant choices (which EP, which session/provider options to use)
+belong to a downstream packager, not mobius.
 
 ```
-model_dir/
-├── genai_config.json          # Required — model config + search params
-├── model.onnx                 # Decoder model (single-model) OR:
-├── decoder/model.onnx         # Decoder model (multimodal)
-├── vision_encoder/model.onnx   # Vision encoder (multimodal only)
-├── audio_encoder/model.onnx   # Audio encoder (multimodal only)
-├── embedding/model.onnx       # Embedding model (multimodal only)
-├── tokenizer.json             # Tokenizer (HuggingFace format)
-├── tokenizer_config.json      # Tokenizer config
-├── chat_template.jinja        # Chat template (optional)
-├── image_processor.json       # Image processor (ort-extensions, all VLMs)
-└── audio_processor.json       # Audio processor (multimodal only)
+model_pkg/
+├── manifest.json              # Top-level: schema_version, components
+├── configs/                   # EP-agnostic, model-level shared assets
+│   ├── genai_config.json      # No filename / session_options here
+│   ├── tokenizer.json         # HuggingFace tokenizer
+│   ├── tokenizer_config.json
+│   ├── chat_template.jinja    # if present
+│   ├── image_processor.json   # for VLMs
+│   └── audio_processor.json   # for audio models
+├── decoder/                   # one subdir per ModelPackage component key
+│   ├── metadata.json          # declares variants for this component
+│   └── base/                  # variant directory ("base" is mobius default)
+│       ├── variant.json       # files, session_options, provider_options
+│       ├── model.onnx
+│       └── model.onnx.data    # external weights, when present
+├── vision_encoder/            # multimodal only
+│   └── base/{variant.json, model.onnx, model.onnx.data}
+├── audio_encoder/             # speech-capable models only
+│   └── base/{...}
+└── embedding/                 # multimodal only
+    └── base/{...}
 ```
 
-**Processor config filenames**: `image_processor.json` for all VLMs,
-`audio_processor.json` for audio models.
+**Processor config filenames** (under `configs/`): `image_processor.json`
+for VLMs, `audio_processor.json` for audio models.
+
+**`base` variant compatibility.** Mobius declares `base` as compatible
+with the major ORT EPs (CPU + CUDA + DML + WebGPU + NvTensorRTRTX).
+Downstream packagers can split `base` into EP-specialized variants
+(e.g. `cuda-fp16`, `dml-int4`) by populating `session_options` /
+`provider_options` per variant.
 
 ## genai_config.json — Structure
 
@@ -83,9 +101,15 @@ Key model-level fields: `type` (required), `vocab_size`, `context_length`
 (required), `eos_token_id`, `pad_token_id`. VLMs also need `image_token_id`
 and `vision_start_token_id`.
 
-Key decoder fields: `filename`, `hidden_size`, `head_size`,
-`num_attention_heads`, `num_key_value_heads`, `num_hidden_layers`, plus
-`inputs`/`outputs` name mappings.
+Key decoder fields: `component` (the package component name, e.g.
+`"decoder"`), `hidden_size`, `head_size`, `num_attention_heads`,
+`num_key_value_heads`, `num_hidden_layers`, plus `inputs`/`outputs`
+name mappings.
+
+**Mobius-emitted `genai_config.json` is EP-agnostic.** It does NOT
+contain `filename`, `session_options`, `provider_options`, or
+`past_present_share_buffer`. Those are populated per-variant by a
+downstream packager into the relevant `variant.json`.
 
 > For the complete field-by-field tables, see
 > [`references/genai-config-fields.md`](references/genai-config-fields.md).
@@ -147,7 +171,7 @@ phi3small_pipeline, qwen2_5_vl_pipeline
     "eos_token_id": 2,
     "pad_token_id": 0,
     "decoder": {
-      "filename": "model.onnx",
+      "component": "decoder",
       "hidden_size": 4096,
       "head_size": 128,
       "num_attention_heads": 32,
@@ -170,11 +194,14 @@ phi3small_pipeline, qwen2_5_vl_pipeline
   "search": {
     "do_sample": false,
     "max_length": 4096,
-    "num_beams": 1,
-    "past_present_share_buffer": false
+    "num_beams": 1
   }
 }
 ```
+
+`"component": "decoder"` references the matching subdirectory in the
+package layout; the actual ONNX file (`model.onnx`) lives under
+`<component>/<variant>/` and is named in `variant.json`.
 
 VLM models additionally require `model.vision`, `model.embedding`,
 `image_token_id`, and `vision_start_token_id`. See

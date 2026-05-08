@@ -42,7 +42,7 @@ class TestGenaiConfigGeneratorLLM:
         assert decoder["num_attention_heads"] == 32
         assert decoder["num_key_value_heads"] == 8
         assert decoder["head_size"] == 128
-        assert decoder["filename"] == "model.onnx"
+        assert decoder["component"] == "decoder"
 
     def test_llm_decoder_inputs_have_input_ids(self):
         """LLM decoders receive input_ids, not inputs_embeds."""
@@ -115,7 +115,7 @@ class TestGenaiConfigGeneratorLLM:
         assert "pad_token_id" not in config["model"]
 
     def test_search_params_defaults(self):
-        """Search section has sensible defaults for CPU EP."""
+        """Search section has EP-agnostic defaults."""
         gen = GenaiConfigGenerator(
             "llama",
             vocab_size=32000,
@@ -134,13 +134,16 @@ class TestGenaiConfigGeneratorLLM:
         assert search["temperature"] == pytest.approx(1.0)
         assert search["top_k"] == 1
         assert search["top_p"] == pytest.approx(1.0)
-        # max_length tracks the model's context window
+        # max_length tracks the model's context window — not capped at any
+        # EP-specific KV-buffer ceiling. EP-specific overrides land via the
+        # variant's consumer_metadata.genai_config_overlay.
         assert search["max_length"] == 8192
-        # CPU shares past/present KV buffers (all GQA-capable EPs do)
-        assert search["past_present_share_buffer"] is True
+        # past_present_share_buffer is an EP-specific knob and must NOT
+        # appear in the package-level base genai_config.
+        assert "past_present_share_buffer" not in search
 
-    def test_search_params_webgpu_sets_past_present_share_buffer(self):
-        """WebGPU EP sets supports_past_present_share_buffer=True via EpCapabilities and caps max_length."""
+    def test_search_params_no_ep_cap_for_large_context(self):
+        """Large context_length is not capped — base config is EP-agnostic."""
         gen = GenaiConfigGenerator(
             "qwen2",
             vocab_size=151936,
@@ -149,120 +152,15 @@ class TestGenaiConfigGeneratorLLM:
             num_attention_heads=14,
             num_key_value_heads=2,
             head_dim=64,
-            ep="webgpu",
-            context_length=32768,
-        )
-        config = gen.generate()
-        assert config["search"]["past_present_share_buffer"] is True
-        # 32768 > 4096 cap, so max_length is capped to avoid pre-allocating huge KV cache
-        assert config["search"]["max_length"] == 4096
-
-    def test_search_params_webgpu_small_context_not_capped(self):
-        """WebGPU max_length is not capped when context_length <= 4096."""
-        gen = GenaiConfigGenerator(
-            "phi3",
-            vocab_size=32064,
-            hidden_size=3072,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=32,
-            head_dim=96,
-            ep="webgpu",
-            context_length=2048,
-        )
-        config = gen.generate()
-        assert config["search"]["past_present_share_buffer"] is True
-        assert config["search"]["max_length"] == 2048
-
-    def test_search_params_cuda_shares_buffer(self):
-        """CUDA EP sets past_present_share_buffer=True (all GQA-capable EPs do).
-
-        CUDA does NOT cap max_length — only memory-constrained EPs (WebGPU)
-        set ``cap_kv_buffer_max_length=True``.  Server-class GPUs handle
-        large pre-allocations.
-        """
-        gen = GenaiConfigGenerator(
-            "llama",
-            vocab_size=32000,
-            hidden_size=4096,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            head_dim=128,
-            ep="cuda",
             context_length=131072,
         )
         config = gen.generate()
-        assert config["search"]["past_present_share_buffer"] is True
-        # CUDA: full context_length, NOT capped at 4096
+        # No WebGPU-style 4096 cap — packagers add EP-specific limits via
+        # variant overlays.
         assert config["search"]["max_length"] == 131072
 
-    def test_search_params_custom_ep_with_share_buffer(self):
-        """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
-
-        This proves the value comes from EpCapabilities, not from a hardcoded
-        'ep == webgpu' check.  The custom EP does NOT set
-        ``cap_kv_buffer_max_length``, so max_length is the full context.
-        """
-        from mobius._execution_providers import EpCapabilities, ep_registry
-
-        ep_registry.register(
-            EpCapabilities(name="test-custom-ep", supports_past_present_share_buffer=True),
-            overwrite=True,
-        )
-        try:
-            gen = GenaiConfigGenerator(
-                "llama",
-                vocab_size=32000,
-                hidden_size=4096,
-                num_hidden_layers=32,
-                num_attention_heads=32,
-                num_key_value_heads=8,
-                head_dim=128,
-                ep="test-custom-ep",
-                context_length=8192,
-            )
-            config = gen.generate()
-            assert config["search"]["past_present_share_buffer"] is True
-            # No cap_kv_buffer_max_length: max_length = full context_length
-            assert config["search"]["max_length"] == 8192
-        finally:
-            # Clean up the test EP so it doesn't bleed into other tests
-            ep_registry._entries.pop("test-custom-ep", None)
-
-    def test_search_params_custom_ep_with_max_length_cap(self):
-        """A custom EP with cap_kv_buffer_max_length=True caps max_length at 4096."""
-        from mobius._execution_providers import EpCapabilities, ep_registry
-
-        ep_registry.register(
-            EpCapabilities(
-                name="test-capped-ep",
-                supports_past_present_share_buffer=True,
-                cap_kv_buffer_max_length=True,
-            ),
-            overwrite=True,
-        )
-        try:
-            gen = GenaiConfigGenerator(
-                "llama",
-                vocab_size=32000,
-                hidden_size=4096,
-                num_hidden_layers=32,
-                num_attention_heads=32,
-                num_key_value_heads=8,
-                head_dim=128,
-                ep="test-capped-ep",
-                context_length=131072,
-            )
-            config = gen.generate()
-            assert config["search"]["past_present_share_buffer"] is True
-            # cap_kv_buffer_max_length=True: max_length capped at 4096
-            assert config["search"]["max_length"] == 4096
-        finally:
-            ep_registry._entries.pop("test-capped-ep", None)
-
-    def test_session_options_present(self):
-        """Decoder has session_options with log_id."""
+    def test_decoder_component_default(self):
+        """Decoder block carries a 'component' field, default 'decoder'."""
         gen = GenaiConfigGenerator(
             "llama",
             vocab_size=32000,
@@ -273,8 +171,38 @@ class TestGenaiConfigGeneratorLLM:
             head_dim=128,
         )
         config = gen.generate()
-        opts = config["model"]["decoder"]["session_options"]
-        assert opts["log_id"] == "onnxruntime-genai"
+        assert config["model"]["decoder"]["component"] == "decoder"
+
+    def test_decoder_component_custom(self):
+        """Custom decoder component name is emitted unchanged."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            decoder_component="text_decoder",
+        )
+        config = gen.generate()
+        assert config["model"]["decoder"]["component"] == "text_decoder"
+
+    def test_decoder_block_has_no_filename_or_session_options(self):
+        """Package-level base genai_config must not carry EP-coupled keys."""
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
+        decoder = gen.generate()["model"]["decoder"]
+        assert "filename" not in decoder
+        assert "session_options" not in decoder
+        assert "provider_options" not in decoder
 
 
 class TestGenaiConfigGeneratorVLM:
@@ -302,7 +230,7 @@ class TestGenaiConfigGeneratorVLM:
         """VLM config includes vision model section."""
         config = self._make_vlm_gen().generate()
         vision = config["model"]["vision"]
-        assert vision["filename"] == "vision_encoder/model.onnx"
+        assert vision["component"] == "vision_encoder"
         assert vision["spatial_merge_size"] == 2
         assert vision["inputs"]["pixel_values"] == "pixel_values"
         assert vision["outputs"]["image_features"] == "image_features"
@@ -311,7 +239,7 @@ class TestGenaiConfigGeneratorVLM:
         """VLM config includes embedding model section."""
         config = self._make_vlm_gen().generate()
         emb = config["model"]["embedding"]
-        assert emb["filename"] == "embedding/model.onnx"
+        assert emb["component"] == "embedding"
         assert emb["inputs"]["input_ids"] == "input_ids"
         assert emb["inputs"]["image_features"] == "image_features"
         assert emb["outputs"]["inputs_embeds"] == "inputs_embeds"
@@ -323,11 +251,20 @@ class TestGenaiConfigGeneratorVLM:
         assert "inputs_embeds" in inputs
         assert "input_ids" not in inputs
 
-    def test_vlm_decoder_filename_uses_subdirectory(self):
-        """VLM decoder filename includes the decoder/ subdirectory."""
+    def test_vlm_decoder_has_decoder_component(self):
+        """VLM decoder block carries component='decoder'."""
         config = self._make_vlm_gen().generate()
         decoder = config["model"]["decoder"]
-        assert decoder["filename"] == "decoder/model.onnx"
+        assert decoder["component"] == "decoder"
+
+    def test_vlm_blocks_have_no_filename_or_session_options(self):
+        """VLM vision/embedding blocks must not carry EP-coupled keys."""
+        config = self._make_vlm_gen().generate()
+        for role in ("vision", "embedding"):
+            block = config["model"][role]
+            assert "filename" not in block
+            assert "session_options" not in block
+            assert "provider_options" not in block
 
     def test_vlm_token_ids_at_model_level(self):
         """VLM-specific token IDs are at the model level."""
@@ -607,12 +544,20 @@ class TestGenaiConfigGeneratorMultimodal:
         """Audio section has audio_embeds, audio_sizes, mode."""
         config = self._make_phi4mm_gen().generate()
         audio = config["model"]["speech"]
-        assert audio["filename"] == "audio_encoder/model.onnx"
+        assert audio["component"] == "audio_encoder"
         assert audio["config_filename"] == "audio_processor.json"
         assert audio["inputs"]["audio_embeds"] == "audio_embeds"
         assert audio["inputs"]["audio_sizes"] == "audio_sizes"
         assert audio["inputs"]["audio_projection_mode"] == "audio_projection_mode"
         assert audio["outputs"]["audio_features"] == "audio_features"
+
+    def test_audio_block_has_no_filename_or_session_options(self):
+        """Audio block must not carry EP-coupled keys."""
+        config = self._make_phi4mm_gen().generate()
+        speech = config["model"]["speech"]
+        assert "filename" not in speech
+        assert "session_options" not in speech
+        assert "provider_options" not in speech
 
     def test_boa_token_id_in_audio_config(self):
         """boa_token_id is included when passed to with_audio()."""
@@ -718,87 +663,3 @@ class TestGenaiConfigGeneratorMultimodal:
         )
         result = gen.with_vision(image_token_id=200010).with_audio()
         assert result is gen
-
-
-class TestMakeSessionOptions:
-    """Tests for the _make_session_options() helper."""
-
-    def test_cpu_has_empty_provider_options(self):
-        """CPU EP produces empty provider_options (no special session config)."""
-        from mobius.integrations.ort_genai.genai_config import _make_session_options
-
-        opts = _make_session_options("cpu")
-        assert opts["log_id"] == "onnxruntime-genai"
-        assert opts["provider_options"] == []
-
-    def test_cuda_has_cuda_provider_options(self):
-        """CUDA EP produces a provider_options entry for cuda."""
-        from mobius.integrations.ort_genai.genai_config import _make_session_options
-
-        opts = _make_session_options("cuda")
-        assert opts["log_id"] == "onnxruntime-genai"
-        assert len(opts["provider_options"]) == 1
-        assert "cuda" in opts["provider_options"][0]
-
-    def test_dml_has_dml_provider_options(self):
-        """DML EP produces a provider_options entry for dml."""
-        from mobius.integrations.ort_genai.genai_config import _make_session_options
-
-        opts = _make_session_options("dml")
-        assert opts["log_id"] == "onnxruntime-genai"
-        assert len(opts["provider_options"]) == 1
-        assert "dml" in opts["provider_options"][0]
-
-
-class TestGenaiConfigGeneratorEp:
-    """Tests for EP threading through all session_options blocks."""
-
-    def _gen(self, ep: str) -> GenaiConfigGenerator:
-        return GenaiConfigGenerator(
-            "llama",
-            vocab_size=32000,
-            hidden_size=4096,
-            num_hidden_layers=32,
-            num_attention_heads=32,
-            num_key_value_heads=8,
-            head_dim=128,
-            ep=ep,
-        )
-
-    def test_cpu_ep_decoder_has_empty_provider_options(self):
-        """CPU EP: decoder session_options.provider_options is empty."""
-        config = self._gen("cpu").generate()
-        assert config["model"]["decoder"]["session_options"]["provider_options"] == []
-
-    def test_cuda_ep_decoder_has_cuda_provider_options(self):
-        """CUDA EP: decoder session_options.provider_options has CUDA entry."""
-        config = self._gen("cuda").generate()
-        opts = config["model"]["decoder"]["session_options"]["provider_options"]
-        assert len(opts) == 1
-        assert "cuda" in opts[0]
-
-    def test_cuda_ep_all_blocks_have_cuda_session_options(self):
-        """CUDA EP applied to all 4 session blocks (decoder, vision, embedding, audio)."""
-        gen = (
-            GenaiConfigGenerator(
-                "phi4mm",
-                vocab_size=200064,
-                hidden_size=3072,
-                num_hidden_layers=32,
-                num_attention_heads=24,
-                num_key_value_heads=8,
-                head_dim=128,
-                ep="cuda",
-            )
-            .with_vision(image_token_id=200010)
-            .with_audio()
-        )
-        config = gen.generate()
-
-        for block in ("decoder", "vision", "embedding", "speech"):
-            if block not in config["model"]:
-                continue
-            session_opts = config["model"][block]["session_options"]
-            provider_options = session_opts["provider_options"]
-            assert len(provider_options) == 1, f"{block} missing CUDA provider options"
-            assert "cuda" in provider_options[0], f"{block} has wrong EP in provider_options"
