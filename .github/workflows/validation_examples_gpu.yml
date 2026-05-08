@@ -83,7 +83,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers]'
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
-          pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai --no-deps
+          pip install --pre --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda --no-deps
 
       - name: Run ${{ matrix.name }}
         env:
