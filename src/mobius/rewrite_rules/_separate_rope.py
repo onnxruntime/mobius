@@ -134,7 +134,10 @@ class GQASeparateRoPE(RewriteRuleClassBase):
         remaining = list(gqa_node.inputs[3:7])
 
         outputs = op.GroupQueryAttention(
-            q_rot, k_rot, v, *remaining,
+            q_rot,
+            k_rot,
+            v,
+            *remaining,
             _domain="com.microsoft",
             _outputs=3,
             **attrs,

@@ -286,7 +286,10 @@ class GQAUnpackQKV(RewriteRuleClassBase):
         remaining = list(gqa_node.inputs[3:])  # everything after the packed slot
 
         outputs = op.GroupQueryAttention(
-            q, k, v, *remaining,
+            q,
+            k,
+            v,
+            *remaining,
             _domain="com.microsoft",
             _outputs=3,
             **attrs,

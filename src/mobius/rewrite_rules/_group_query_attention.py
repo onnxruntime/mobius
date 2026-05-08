@@ -647,7 +647,13 @@ class AttentionToGQA(RewriteRuleClassBase):
             gqa_attrs["softcap"] = softcap
 
         outputs = op.GroupQueryAttention(
-            q, k, v, past_key, past_value, self._seqlens_k, self._total_seq_len,
+            q,
+            k,
+            v,
+            past_key,
+            past_value,
+            self._seqlens_k,
+            self._total_seq_len,
             _domain="com.microsoft",
             _outputs=3,
             **gqa_attrs,
