@@ -124,7 +124,11 @@ class _HunYuanVLMoTEmbeddingModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.image_token_id = (config.vision.image_token_id if config.vision else 0) or 0
+        self.image_token_id = (
+            config.image_token_id
+            or (config.vision.image_token_id if config.vision else None)
+            or 0
+        )
 
     def forward(
         self,
@@ -416,7 +420,11 @@ class _HunYuanVLMoTDecoderModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.image_token_id = (config.vision.image_token_id if config.vision else 0) or 0
+        self.image_token_id = (
+            config.image_token_id
+            or (config.vision.image_token_id if config.vision else None)
+            or 0
+        )
         self.model = _MoTTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
