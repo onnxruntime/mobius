@@ -266,7 +266,7 @@ jobs:
           restore-keys: |
             hf-integration-fast-
       - name: Install PyTorch CUDA
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu130
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
