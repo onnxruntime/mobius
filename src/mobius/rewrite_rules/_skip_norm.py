@@ -91,6 +91,17 @@ class AddRMSNormToSkipNorm(RewriteRuleClassBase):
         if rmsnorm.attributes.get_float("epsilon", None) is None:
             return result.fail("Missing epsilon attribute on RMSNormalization")
 
+        # SkipSimplifiedLayerNormalization does not expose a stash_type
+        # attribute — its ORT kernel always uses float32 accumulation,
+        # matching the ONNX default stash_type=1.  Refuse fusion if the
+        # source RMSNorm requests a different stash_type so we don't
+        # silently change precision semantics.
+        stash = rmsnorm.attributes.get_int("stash_type", 1)
+        if stash != 1:
+            return result.fail(
+                f"RMSNorm has stash_type={stash}; fused op always uses fp32 accumulation"
+            )
+
         return result
 
     def rewrite(self, op, add_out, weight, norm_out, **_):

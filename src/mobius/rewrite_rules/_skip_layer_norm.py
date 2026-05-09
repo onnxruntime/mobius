@@ -103,6 +103,16 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
                 f"LayerNorm axis={axis}, expected -1 for SkipLayerNormalization compatibility"
             )
 
+        # SkipLayerNormalization does not expose a stash_type attribute
+        # — its ORT kernel always uses float32 accumulation, matching
+        # the ONNX default stash_type=1.  Refuse fusion if the source
+        # LayerNorm requests a different stash_type.
+        stash = ln.attributes.get_int("stash_type", 1)
+        if stash != 1:
+            return result.fail(
+                f"LayerNorm has stash_type={stash}; fused op always uses fp32 accumulation"
+            )
+
         return result
 
     def rewrite(self, op, add_out, weight, bias, norm_out, **_):
@@ -185,6 +195,13 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         if axis != -1:
             return result.fail(
                 f"LayerNorm axis={axis}, expected -1 for SkipLayerNormalization compatibility"
+            )
+
+        # SkipLayerNormalization does not expose a stash_type attribute.
+        stash = ln.attributes.get_int("stash_type", 1)
+        if stash != 1:
+            return result.fail(
+                f"LayerNorm has stash_type={stash}; fused op always uses fp32 accumulation"
             )
 
         # Ensure this is truly bias-free (2 inputs, not 3)

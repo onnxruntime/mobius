@@ -41,6 +41,7 @@ class OffsetRMSNorm(nn.Module):
             hidden_states,
             effective_weight,
             epsilon=self.variance_epsilon,
+            stash_type=1,
             axis=-1,
         )
 
@@ -123,6 +124,7 @@ class GatedRMSNorm(nn.Module):
                     grouped,
                     weight_grouped,
                     epsilon=self.variance_epsilon,
+                    stash_type=1,
                     axis=-1,
                 )
                 normed = op.Reshape(normed, orig_shape)
@@ -134,6 +136,7 @@ class GatedRMSNorm(nn.Module):
                 gated,
                 self.weight,
                 epsilon=self.variance_epsilon,
+                stash_type=1,
                 axis=-1,
             )
         return op.CastLike(normed, hidden_states)
@@ -188,4 +191,7 @@ def apply_rms_norm(op: OpBuilder, x, weight, eps):
     Returns:
         Normalized tensor with the same shape as input.
     """
-    return op.RMSNormalization(x, weight, epsilon=eps, axis=-1)
+    # stash_type=1 forces internal variance computation in float32,
+    # preventing overflow/underflow in f16/bf16.  This is the ONNX
+    # default but is stated explicitly for clarity.
+    return op.RMSNormalization(x, weight, epsilon=eps, stash_type=1, axis=-1)
