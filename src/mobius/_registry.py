@@ -837,6 +837,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "glm4v_moe_text": "THUDM/glm-4v-9b",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
+    "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
