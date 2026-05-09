@@ -1,4 +1,5 @@
 model_id: "facebook/mbart-large-cc25"
+model_type: "mbart"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

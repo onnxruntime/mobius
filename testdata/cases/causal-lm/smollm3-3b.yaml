@@ -1,4 +1,5 @@
 model_id: "HuggingFaceTB/SmolLM3-3B"
+model_type: "smollm3"
 revision: "a07cc9a04f16"
 task_type: "text-generation"
 dtype: "float32"

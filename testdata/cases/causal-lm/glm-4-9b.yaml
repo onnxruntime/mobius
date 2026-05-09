@@ -1,4 +1,5 @@
 model_id: "THUDM/glm-4-9b-chat-hf"
+model_type: "glm"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

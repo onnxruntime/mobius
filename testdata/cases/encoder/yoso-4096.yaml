@@ -1,4 +1,5 @@
 model_id: "uw-madison/yoso-4096"
+model_type: "yoso"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

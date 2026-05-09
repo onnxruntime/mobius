@@ -1,4 +1,5 @@
 model_id: "ibm-fms/Bamba-9B"
+model_type: "bamba"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

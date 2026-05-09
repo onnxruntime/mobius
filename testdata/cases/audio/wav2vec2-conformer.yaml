@@ -1,4 +1,5 @@
 model_id: "facebook/wav2vec2-conformer-rope-large-960h-ft"
+model_type: "wav2vec2-conformer"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

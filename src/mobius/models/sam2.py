@@ -18,8 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Sam2Config
 from mobius.components._activations import ACT2FN
@@ -65,7 +64,7 @@ class _Sam2HieraBlock(nn.Module):
         if self._has_dim_proj:
             self.proj = Linear(dim_in, dim_out)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # hidden_states: [B, S, dim_in]
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
@@ -186,7 +185,7 @@ class Sam2VisionModel(nn.Module):
                 Conv2dNoBias(dim, fpn_hidden_size, kernel_size=1, stride=1, padding=0)
             )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # Patch embedding: [B, 3, H, W] → [B, C, H', W']
         x = self.patch_embed(op, pixel_values)
         # Flatten spatial dims: [B, C, H', W'] → [B, H'*W', C]

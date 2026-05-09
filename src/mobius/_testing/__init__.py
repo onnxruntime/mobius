@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal.builder import GraphBuilder
+from onnxscript import GraphBuilder
 
 from mobius._configs import ArchitectureConfig
 from mobius._constants import OPSET_VERSION

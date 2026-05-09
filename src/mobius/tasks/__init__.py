@@ -82,6 +82,7 @@ from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
 )
+from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -130,6 +131,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
+    "hunyuan-vl-mot": HunYuanVLMoTTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,

@@ -1,4 +1,5 @@
 model_id: "stas/tiny-wmt19-en-de"
+model_type: "fsmt"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

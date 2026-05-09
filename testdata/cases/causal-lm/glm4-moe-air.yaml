@@ -1,4 +1,5 @@
 model_id: "zai-org/GLM-4.5-Air"
+model_type: "glm4_moe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

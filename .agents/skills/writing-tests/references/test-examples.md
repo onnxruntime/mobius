@@ -111,10 +111,11 @@ Guidelines for choosing models:
 Categories match task types: `causal-lm`, `encoder`, `seq2seq`, `audio`,
 `vision`, `vision-language`, `diffusion`.
 
-**Required fields:**
+**Required fields** (enforced by `testdata/cases/schema.json`; `tests/yaml_schema_test.py` validates every YAML on every PR):
 
 ```yaml
 model_id: "Qwen/Qwen2.5-1.5B-Instruct"   # HuggingFace model ID
+model_type: "qwen2"                       # HF config.model_type — must match a key in mobius._registry
 revision: "main"                            # Git revision / commit SHA
 task_type: "text-generation"               # Task type string
 dtype: "float32"                           # "float32", "float16", or "bfloat16"
@@ -124,6 +125,8 @@ inputs:
   prompts:
     - "Here is my poem:"                   # Text prompt(s); use this default
 ```
+
+`model_type` is the value the registry lookup uses (see `_create_default_registry()` in `src/mobius/_registry.py`). It is **also** what `tests/model_coverage_test.py` keys on — every registered `model_type` must either appear in some YAML's `model_type` field or be added to `_COVERAGE_SKIP` with a reason. Omit it and the schema test fails; provide a value the registry doesn't know and the coverage test still flags it.
 
 For image models, use `images:` instead of (or alongside) `prompts:`:
 
@@ -209,8 +212,11 @@ Golden files must be committed alongside new test case YAML files.
 
 **L2 — Config compatible:**
 1. Create `testdata/cases/<category>/my-model.yaml`.
-2. Set `test_model_id: "org/my-model-id"`.
+2. Fill in all required fields, including `model_type` (must match the
+   key registered in `src/mobius/_registry.py`) and `test_model_id`.
 3. Run schema validation: `python -m pytest tests/yaml_schema_test.py`.
+4. Run coverage check: `python -m pytest tests/model_coverage_test.py` —
+   fails if any registered `model_type` lacks a YAML or `_COVERAGE_SKIP` entry.
 
 **L3 — Synthetic parity:**
 1. Add `pytest.param("org/my-model", False, id="my-model")` to the

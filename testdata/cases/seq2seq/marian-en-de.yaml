@@ -1,4 +1,5 @@
 model_id: "Helsinki-NLP/opus-mt-en-de"
+model_type: "marian"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

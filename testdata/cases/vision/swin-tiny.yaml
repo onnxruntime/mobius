@@ -1,4 +1,5 @@
 model_id: "microsoft/swin-tiny-patch4-window7-224"
+model_type: "swin"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

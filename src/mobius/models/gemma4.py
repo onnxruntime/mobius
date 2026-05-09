@@ -30,8 +30,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
@@ -109,7 +108,7 @@ class _Gemma4ScaleFreeRMSNorm(nn.Module):
         # Constant all-ones scale (not a learnable parameter from HF).
         self.weight = nn.Parameter([dim], data=ir.Tensor(np.ones(dim, dtype=np.float32)))
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # stash_type=1 means accumulate variance in float32, avoiding
         # FP16 overflow when squaring large values.
         # CastLike ensures the weight matches the input dtype.
@@ -194,7 +193,7 @@ class Gemma4VisionSelfAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
         pixel_position_ids: ir.Value | None = None,
@@ -349,7 +348,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
         pixel_position_ids: ir.Value | None = None,
@@ -395,7 +394,7 @@ class Gemma4VisionPooler(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         vision_features: ir.Value,
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
@@ -493,7 +492,7 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         pixel_position_ids: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
@@ -573,7 +572,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
@@ -702,7 +701,7 @@ class Gemma4TextAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | GQAContext,
         position_embeddings: tuple | None = None,
@@ -978,7 +977,7 @@ class _Gemma4MoeRouter(nn.Module):
         self.proj = Linear(hidden_size, num_experts, bias=False)
         self.per_expert_scale = nn.Parameter([num_experts])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         """Compute router probabilities over all experts.
 
         Args:
@@ -1128,7 +1127,7 @@ class Gemma4DecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | GQAContext,
         position_embeddings: tuple | None,
@@ -1225,7 +1224,7 @@ class Gemma4DecoderLayer(nn.Module):
 
     def _dispatch_moe_fallback(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         normed_flat: ir.Value,
         router_probs: ir.Value,
     ) -> ir.Value:
@@ -1424,7 +1423,7 @@ class Gemma4TextModel(nn.Module):
 
     def _compute_per_layer_inputs(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value | None,
         inputs_embeds: ir.Value,
     ) -> list[ir.Value] | None:
@@ -1483,7 +1482,7 @@ class Gemma4TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -1666,7 +1665,7 @@ class Gemma4CausalLMModel(CausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -1741,7 +1740,7 @@ class _Gemma4DecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -1801,7 +1800,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         pixel_values: ir.Value,
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
@@ -1886,7 +1885,7 @@ class Gemma4EmbeddingModel(nn.Module):
 
     def _scatter_features(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden: ir.Value,
         input_ids: ir.Value,
         token_id: int,
@@ -1922,7 +1921,7 @@ class Gemma4EmbeddingModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value | None = None,
@@ -2009,7 +2008,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_features: ir.Value,
         input_features_mask: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value | None]:
@@ -2071,7 +2070,7 @@ class Gemma4Model(nn.Module):
             _Gemma4AudioEncoderModel(config) if config.audio is not None else None
         )
 
-    def forward(self, op: builder.OpBuilder, **kwargs):
+    def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Gemma4Model is a multi-model split; Gemma4Task builds each sub-module "
             "(decoder, vision_encoder, embedding, and optionally audio_encoder) separately."

@@ -1,4 +1,5 @@
 model_id: "google/pegasus-xsum"
+model_type: "pegasus"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

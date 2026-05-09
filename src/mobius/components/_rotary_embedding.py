@@ -7,8 +7,7 @@ import math
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import INT64_MAX
@@ -35,7 +34,7 @@ def _get_cos_sin_cache(
     )
 
 
-def get_rotary_pos_emb(op: builder.OpBuilder, position_ids, cos_cache, sin_cache):
+def get_rotary_pos_emb(op: OpBuilder, position_ids, cos_cache, sin_cache):
     """Retrieve cos/sin positional embeddings based on position IDs.
 
     Uses Gather to look up the embeddings for the given position IDs.
@@ -55,7 +54,7 @@ def get_rotary_pos_emb(op: builder.OpBuilder, position_ids, cos_cache, sin_cache
 
 
 def apply_rotary_pos_emb(
-    op: builder.OpBuilder,
+    op: OpBuilder,
     x,
     position_embeddings: tuple,
     num_heads: int,
@@ -134,7 +133,7 @@ class BaseRope(nn.Module):
 
     def _cast_embeddings(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         cos: ir.Value,
         sin: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
@@ -149,7 +148,7 @@ class BaseRope(nn.Module):
             sin = op.Cast(sin, to=self._dtype)
         return cos, sin
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
         return self._cast_embeddings(op, cos, sin)
 
@@ -219,13 +218,19 @@ class DynamicNTKRope(BaseRope):
     This spreads frequencies more evenly across the extended context,
     preserving the model's positional inductive bias better than linear
     scaling for long-context extrapolation.
+
+    HunyuanV1 uses ``alpha`` instead of ``factor`` for the scaling
+    exponent (same formula, different config key). When ``alpha`` is
+    present in ``rope_scaling``, it takes precedence over ``factor``.
     """
 
     def __init__(self, config: ArchitectureConfig):
         dim = int(config.head_dim * config.partial_rotary_factor)
-        factor = config.rope_scaling["factor"]
+        # HunyuanV1 uses "alpha" as the scaling factor; standard
+        # dynamic NTK uses "factor". Prefer alpha when present.
+        scaling = config.rope_scaling.get("alpha") or config.rope_scaling["factor"]
         # NTK-aware base scaling
-        new_theta = config.rope_theta * (factor ** (dim / (dim - 2)))
+        new_theta = config.rope_theta * (scaling ** (dim / (dim - 2)))
         inv_freq = 1.0 / (new_theta ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         cos_cache, sin_cache = _get_cos_sin_cache(config.max_position_embeddings, inv_freq)
         super().__init__(cos_cache, sin_cache, dtype=config.dtype)
@@ -295,7 +300,7 @@ class LongRope(BaseRope):
         sin_cache = np.concatenate([short_sin, long_sin], axis=0)
         super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         if self.has_long_cache:
             max_pos = op.ReduceMax(position_ids, keepdims=False)
             use_long = op.Cast(
@@ -389,7 +394,7 @@ class YarnRope(BaseRope):
         self._llama4_beta = rope_scaling.get("llama_4_scaling_beta")
         self._llama4_original_max_pos = float(original_max_pos)
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         cos, sin = get_rotary_pos_emb(op, position_ids, self.cos_cache, self.sin_cache)
         cos, sin = self._cast_embeddings(op, cos, sin)
         if self._llama4_beta is None:
@@ -444,7 +449,7 @@ class _MRopeBase(BaseRope):
             data=ir.tensor(w_mask),
         )
 
-    def forward(self, op: builder.OpBuilder, position_ids: ir.Value):
+    def forward(self, op: OpBuilder, position_ids: ir.Value):
         """Compute MRoPE cos/sin embeddings.
 
         Args:

@@ -1,4 +1,5 @@
 model_id: "naver-clova-ocr/bros-base-uncased"
+model_type: "bros"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

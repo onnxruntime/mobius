@@ -17,8 +17,7 @@ import math
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import WhisperConfig
 from mobius.components import (
@@ -88,7 +87,7 @@ class WhisperEncoderModel(nn.Module):
         )
         self.layer_norm = LayerNorm(d_model, eps=eps)
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value):
+    def forward(self, op: OpBuilder, input_features: ir.Value):
         # input_features: [batch, num_mel_bins, audio_seq_len]
         hidden_states = op.Gelu(self.conv1(op, input_features))
         hidden_states = op.Gelu(self.conv2(op, hidden_states))
@@ -143,7 +142,7 @@ class WhisperDecoderModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         decoder_input_ids: ir.Value,
         encoder_hidden_states: ir.Value,
         position_ids: ir.Value,

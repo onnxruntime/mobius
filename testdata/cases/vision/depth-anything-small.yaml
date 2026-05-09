@@ -1,4 +1,5 @@
 model_id: "LiheYoung/depth-anything-small-hf"
+model_type: "depth_anything"
 revision: "main"
 task_type: "depth-estimation"
 dtype: "float32"

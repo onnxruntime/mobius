@@ -602,6 +602,21 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
             image_token_id=getattr(config, "special_image_token_id", 200010),
         )
 
+    # HunYuan VL-MoT has a flat config.json with no vision_config sub-object.
+    # The vision encoder params are hardcoded (InternViT-style ViT).
+    if model_type == "hunyuan_vl_mot" and not vision_fields.get("hidden_size"):
+        vision_fields.update(
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_hidden_layers=27,
+            num_attention_heads=16,
+            image_size=2048,
+            patch_size=16,
+            norm_eps=1e-6,
+            spatial_merge_size=2,
+            image_token_id=getattr(vision_source, "mask_init_id", 12),
+        )
+
     # InternVL2 doesn't expose image_token_id in its config — default to
     # the Qwen2 <IMG_CONTEXT> token id used by InternVL2-* models.
     parent_model_type = getattr(vision_source, "model_type", None)

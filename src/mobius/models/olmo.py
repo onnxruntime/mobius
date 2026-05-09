@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -38,7 +37,7 @@ class _WeightFreeLayerNorm(nn.Module):
         )
         self.eps = eps
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return op.LayerNormalization(
             hidden_states, self.scale, self.bias, epsilon=self.eps, axis=-1
         )
@@ -56,7 +55,7 @@ class _OlmoDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -99,7 +98,7 @@ class _OlmoTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -167,7 +166,7 @@ class _PostNormTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

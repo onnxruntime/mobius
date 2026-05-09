@@ -1,4 +1,5 @@
 model_id: "almanach/camembert-base"
+model_type: "camembert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

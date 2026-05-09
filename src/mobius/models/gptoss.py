@@ -22,8 +22,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -54,7 +53,7 @@ class _GptOssGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         self.bias = nn.Parameter([num_experts])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # router_logits: [B, S, N_exp] = [B, S, H] @ [H, N_exp] + [N_exp]
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
@@ -92,7 +91,7 @@ class _GptOssExpertMLP(nn.Module):
         self.up_proj = Linear(hidden_size, intermediate_size, bias=True)
         self.down_proj = Linear(intermediate_size, hidden_size, bias=True)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate = self.gate_proj(op, hidden_states)  # [B, S, inter]
         up = self.up_proj(op, hidden_states)  # [B, S, inter]
 
@@ -126,7 +125,7 @@ class _GptOssMoELayer(nn.Module):
             ]
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         # Loop over experts: mask-and-accumulate dispatch
@@ -204,7 +203,7 @@ class _GptOssAttention(nn.Module):
 
     def _expand_kv_for_gqa(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         kv: ir.Value,
         batch_1d: ir.Value,
         kv_len_1d: ir.Value,
@@ -237,7 +236,7 @@ class _GptOssAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
@@ -363,7 +362,7 @@ class _GptOssDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -405,7 +404,7 @@ class _GptOssTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,

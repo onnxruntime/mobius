@@ -1,4 +1,5 @@
 model_id: "microsoft/trocr-small-handwritten"
+model_type: "trocr"
 revision: "main"
 task_type: "image-to-text"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "optimum-intel-internal-testing/tiny-random-unispeech"
+model_type: "unispeech"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

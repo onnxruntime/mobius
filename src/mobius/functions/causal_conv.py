@@ -13,7 +13,7 @@ Op spec: https://github.com/onnx/onnx/issues/7689
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
@@ -142,7 +142,7 @@ def causal_conv_nd_with_state(
     # NOTE: Do not set ``overload`` here — call sites (op.CausalConvWithState)
     # do not set an overload, so setting one on the function would prevent the
     # serializer from matching nodes to this function definition.
-    return builder.build_function(
+    return build_function(
         body,
         [
             ir.Value(name="input"),

@@ -1,4 +1,5 @@
 model_id: "allenai/led-base-16384"
+model_type: "led"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

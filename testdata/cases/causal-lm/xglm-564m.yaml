@@ -1,4 +1,5 @@
 model_id: "facebook/xglm-564M"
+model_type: "xglm"
 revision: "f3059f01b98ccc877c673149e0178c0e957660f9"
 task_type: "text-generation"
 dtype: "float32"

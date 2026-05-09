@@ -1,4 +1,5 @@
 model_id: "EleutherAI/gpt-neo-125m"
+model_type: "gpt_neo"
 revision: "21def0189f5705e2521767faed922f1f15e7d7db"
 task_type: "text-generation"
 dtype: "float32"

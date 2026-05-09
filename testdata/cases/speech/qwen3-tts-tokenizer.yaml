@@ -1,4 +1,5 @@
 model_id: "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+model_type: "qwen3_tts_tokenizer_12hz"
 revision: "main"
 task_type: "codec"
 dtype: "float32"

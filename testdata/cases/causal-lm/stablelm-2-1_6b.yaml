@@ -1,4 +1,5 @@
 model_id: "stabilityai/stablelm-2-1_6b"
+model_type: "stablelm"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

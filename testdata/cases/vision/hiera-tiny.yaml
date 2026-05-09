@@ -1,4 +1,5 @@
 model_id: "facebook/hiera-tiny-224-mae-hf"
+model_type: "hiera"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

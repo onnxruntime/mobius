@@ -11,8 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import VAEConfig
 from mobius.components import Conv2d as _Conv2d
@@ -50,7 +49,7 @@ class _ResNetBlock2D(nn.Module):
         else:
             self.conv_shortcut = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
 
         hidden_states = self.norm1(op, hidden_states)
@@ -85,7 +84,7 @@ class _AttentionBlock(nn.Module):
         self._channels = channels
         self._num_heads = max(1, channels // num_head_channels) if num_head_channels > 0 else 1
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         batch = op.Shape(hidden_states, start=0, end=1)
         channels = op.Shape(hidden_states, start=1, end=2)
@@ -148,7 +147,7 @@ class _DownEncoderBlock2D(nn.Module):
         else:
             self.downsamplers = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
 
@@ -166,7 +165,7 @@ class _Downsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         return self.conv(op, hidden_states)
 
 
@@ -197,7 +196,7 @@ class _UpDecoderBlock2D(nn.Module):
         else:
             self.upsamplers = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         for resnet in self.resnets:
             hidden_states = resnet(op, hidden_states)
 
@@ -215,7 +214,7 @@ class _Upsample2D(nn.Module):
         super().__init__()
         self.conv = _Conv2d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = op.Resize(
             hidden_states,
             None,
@@ -249,7 +248,7 @@ class _MidBlock2D(nn.Module):
         else:
             self.attentions = None
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         hidden_states = self.resnets[0](op, hidden_states)
 
         if self.attentions is not None:
@@ -302,7 +301,7 @@ class _VAEEncoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         hidden_states = self.conv_in(op, sample)
 
         for down_block in self.down_blocks:
@@ -356,7 +355,7 @@ class _VAEDecoder(nn.Module):
         )
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, latent_sample: ir.Value):
+    def forward(self, op: OpBuilder, latent_sample: ir.Value):
         hidden_states = self.conv_in(op, latent_sample)
 
         hidden_states = self.mid_block(op, hidden_states)
