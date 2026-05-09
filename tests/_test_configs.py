@@ -2007,6 +2007,16 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("glm4v", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("glm4v_moe", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("got_ocr2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "hunyuan_vl_mot",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "attn_qk_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
     ("idefics2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("idefics3", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("instructblip", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
