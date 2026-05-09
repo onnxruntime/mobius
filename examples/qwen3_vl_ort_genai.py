@@ -18,9 +18,8 @@ Supported dtype/EP combinations::
     - CPU:  f32
     - CUDA: f32, f16, bf16
 
-    For f16 on CUDA, the decoder runs on CPU to avoid ORT CUDA EP
-    Memcpy-induced NaN with half-precision RMSNorm at opset 24.
-    For bf16, torch IOBinding is used (numpy lacks bfloat16 support).
+    For bf16, torch IOBinding is used because numpy lacks bfloat16.
+    Requires onnxruntime-gpu >= 1.27 for f16/bf16 CUDA support.
 
 Usage::
 
@@ -92,6 +91,10 @@ def build_and_export(
 # ---------------------------------------------------------------------------
 
 
+_CUDA_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+_CPU_PROVIDERS = ["CPUExecutionProvider"]
+
+
 def _make_session(
     model_dir: str,
     subdir: str,
@@ -100,9 +103,9 @@ def _make_session(
     """Load an ONNX model as an ORT InferenceSession."""
     path = os.path.join(model_dir, subdir, "model.onnx")
     opts = ort.SessionOptions()
-    # ORT 1.26 EXTENDED graph optimizations crash for f16/bf16 CUDA
-    # models (vector bounds assertion). BASIC is safe and still runs
-    # constant folding + redundant-node elimination.
+    # ORT 1.26 EXTENDED/ALL graph optimizations crash for f16/bf16 on
+    # CUDA (vector bounds assertion in transformer_memcpy).  BASIC is
+    # safe and still runs constant folding + redundant-node elimination.
     if any("CUDA" in p for p in providers):
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     return ort.InferenceSession(
@@ -181,12 +184,11 @@ def _generate_numpy(
     image_path: str,
     max_new_tokens: int,
     ep: str,
+    dtype: str,
 ) -> str:
     """Generate text using numpy-based session.run().
 
-    Works for f32 and f16.  For f16 on CUDA, the decoder runs on CPU
-    to avoid Memcpy-induced NaN (the vision encoder stays on CUDA for
-    PackedMultiHeadAttention which is CUDA-only).
+    Works for f32 and f16.  All sessions run on the requested EP.
     """
     from PIL import Image
     from transformers import AutoConfig, AutoProcessor
@@ -221,18 +223,14 @@ def _generate_numpy(
     if isinstance(eos, list):
         eos = eos[0]
 
-    cuda_provs = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    cpu_provs = ["CPUExecutionProvider"]
-
-    # Vision encoder always on CUDA (PackedMHA is CUDA-only)
-    vision_provs = cuda_provs if ep == "cuda" else cpu_provs
-    # Decoder/embedding on CPU — CUDA causes NaN from Memcpy at opset 24
-    decoder_provs = cpu_provs
+    # Vision encoder: CUDA if available (PackedMHA is CUDA-only)
+    vision_provs = _CUDA_PROVIDERS if ep == "cuda" else _CPU_PROVIDERS
+    decode_provs = _CUDA_PROVIDERS if ep == "cuda" else _CPU_PROVIDERS
 
     print(f"Loading model from {model_dir!r} (ep={ep}) ...")
     vsess = _make_session(model_dir, "vision_encoder", vision_provs)
-    esess = _make_session(model_dir, "embedding", decoder_provs)
-    dsess = _make_session(model_dir, "decoder", decoder_provs)
+    esess = _make_session(model_dir, "embedding", decode_provs)
+    dsess = _make_session(model_dir, "decoder", decode_provs)
 
     # Detect model dtype from decoder inputs
     model_dt = np.float32
@@ -403,16 +401,12 @@ def _generate_bf16(
     if isinstance(eos, list):
         eos = eos[0]
 
-    cuda_provs = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     print(f"Loading model from {model_dir!r} (ep=cuda, bf16) ...")
-    vsess = _make_session(model_dir, "vision_encoder", cuda_provs)
-    esess = _make_session(model_dir, "embedding", cuda_provs)
-    dsess = _make_session(model_dir, "decoder", cuda_provs)
+    vsess = _make_session(model_dir, "vision_encoder", _CUDA_PROVIDERS)
+    esess = _make_session(model_dir, "embedding", _CUDA_PROVIDERS)
+    dsess = _make_session(model_dir, "decoder", _CUDA_PROVIDERS)
 
     bf = torch.bfloat16
-
-    def _ov(tensor: torch.Tensor) -> ort.OrtValue:
-        return ort.OrtValue.from_dlpack(tensor)
 
     def _run_io(
         sess: ort.InferenceSession,
@@ -420,7 +414,7 @@ def _generate_bf16(
     ) -> list[torch.Tensor]:
         io = sess.io_binding()
         for name, t in feed.items():
-            io.bind_ortvalue_input(name, _ov(t))
+            io.bind_ortvalue_input(name, ort.OrtValue.from_dlpack(t))
         for out in sess.get_outputs():
             io.bind_output(out.name)
         sess.run_with_iobinding(io)
@@ -431,10 +425,13 @@ def _generate_bf16(
         vsess,
         {
             "pixel_values": torch.tensor(pixel_values),
-            "image_grid_thw": torch.tensor(image_grid_thw, dtype=torch.int64),
+            "image_grid_thw": torch.tensor(
+                image_grid_thw,
+                dtype=torch.int64,
+            ),
         },
     )
-    img_feat = v_outs[0]  # bf16
+    img_feat = v_outs[0]
 
     # Embedding
     e_outs = _run_io(
@@ -444,7 +441,7 @@ def _generate_bf16(
             "image_features": img_feat,
         },
     )
-    embeds = e_outs[0]  # bf16
+    embeds = e_outs[0]
 
     # MRoPE position IDs
     position_ids = _compute_mrope_position_ids(
@@ -459,7 +456,10 @@ def _generate_bf16(
     d_feed: dict[str, torch.Tensor] = {
         "inputs_embeds": embeds,
         "attention_mask": torch.ones(1, seq_len, dtype=torch.int64),
-        "position_ids": torch.tensor(position_ids, dtype=torch.int64),
+        "position_ids": torch.tensor(
+            position_ids,
+            dtype=torch.int64,
+        ),
     }
     for i in range(tc.num_hidden_layers):
         empty = torch.zeros(
@@ -482,7 +482,6 @@ def _generate_bf16(
     token = int(np.argmax(logits[0, -1]))
     generated: list[int] = [token]
 
-    # Store KV cache as torch tensors
     kv: dict[str, torch.Tensor] = {}
     for i in range(tc.num_hidden_layers):
         kv[f"past_key_values.{i}.key"] = d_outs[1 + 2 * i]
@@ -573,6 +572,7 @@ def generate_with_image(
         image_path,
         max_new_tokens,
         ep,
+        dtype,
     )
 
 
