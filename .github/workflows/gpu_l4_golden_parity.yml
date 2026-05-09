@@ -52,7 +52,7 @@ jobs:
             hf-gpu-
 
       - name: Install PyTorch (CUDA)
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
       - name: Install dependencies
         run: |
