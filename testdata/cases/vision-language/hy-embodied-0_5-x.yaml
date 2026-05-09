@@ -16,7 +16,7 @@ generation:
   max_new_tokens: 30
   do_sample: false
 
-skip_reason: "HF repo config.json auto_map references configuration_hunyuan_vl_mot.py / modeling_hunyuan_vl_mot.py but those files do not exist in the repo. With trust_remote_code=True transformers raises OSError (missing files); with False it raises ValueError (requires custom code). Model type hunyuan_vl_mot not in transformers 5.7.0. Cannot load HF reference model for golden generation. L5 verified manually via mobius ONNX build + ORT inference."
+skip_reason: "HF repo auto_map references missing .py files; model type not in transformers. Cannot load HF reference model."
 
 # The VLM 3-model pipeline (vision encoder → embedding → decoder) with MoT
 # dual-pathway routing accumulates float32 rounding differences vs HuggingFace
