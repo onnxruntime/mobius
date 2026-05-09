@@ -9,6 +9,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     InputMixer,
     Qwen2VLVisionModel,
@@ -120,12 +121,21 @@ class Qwen25VLCausalLMModel(nn.Module):
                 renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
                 renamed[f"embedding.{stripped}"] = value
-                # lm_head.weight is tied at graph level; no separate entry needed.
             elif key.startswith("model."):
                 renamed[f"decoder.{key}"] = value
             elif key.startswith("lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{key}"] = value
+        if self.config.tie_word_embeddings:
+            # onnxscript qualifies params by module path, so the in-tree
+            # alias set in __init__ does not cross composite module
+            # boundaries.  Establish tensor identity here so apply_weights
+            # sees a single data_ptr() across both initializers.
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -182,9 +192,10 @@ class Qwen25VLDecoderModel(nn.Module):
                 continue
             renamed[key] = value
 
-        # Handle weight tying: lm_head.weight is tied at graph level.
+        # Establish tensor identity for tied weights so apply_weights
+        # detects shared data_ptr() and emits a single ONNX initializer.
         if self.config.tie_word_embeddings:
-            renamed.pop("lm_head.weight", None)
+            tie_word_embeddings(renamed)
         return renamed
 
 
@@ -709,7 +720,9 @@ class Qwen3VLCausalLMModel(nn.Module):
                 new_key = new_key.replace("language_model.", "language_model.model.", 1)
             renamed[new_key] = value
 
-        # lm_head.weight is tied at graph level; discard any separate checkpoint entry.
+        # Single-model composite: lm_head shares the embed_tokens initializer
+        # at graph level (onnxscript ties them in __init__). Discard the
+        # checkpoint's separate lm_head entry to avoid a duplicate.
         config = self.config
         if config.tie_word_embeddings:
             renamed.pop("language_model.lm_head.weight", None)
@@ -779,7 +792,6 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
                 renamed[f"embedding.{suffix}"] = value
-                # lm_head.weight is tied at graph level; no separate entry needed.
             elif stripped.startswith("language_model.lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
@@ -787,6 +799,16 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
+        if self.config.tie_word_embeddings:
+            # onnxscript qualifies params by module path, so the in-tree
+            # alias set in __init__ does not cross composite module
+            # boundaries.  Establish tensor identity here so apply_weights
+            # sees a single data_ptr() across both initializers.
+            tie_word_embeddings(
+                renamed,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
         return renamed
 
 
@@ -841,8 +863,13 @@ class Qwen3VLDecoderModel(nn.Module):
             renamed[stripped] = value
 
         if self.config.tie_word_embeddings:
-            # lm_head.weight is tied at graph level; discard any separate key.
-            renamed.pop("lm_head.weight", None)
+            # After stripping language_model., keys are embed_tokens.weight
+            # and lm_head.weight (no model. prefix).
+            tie_word_embeddings(
+                renamed,
+                embed_key="embed_tokens.weight",
+                head_key="lm_head.weight",
+            )
         return renamed
 
 
