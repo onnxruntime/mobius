@@ -180,6 +180,9 @@ class Qwen3VLVisionAttention(nn.Module):
         k = op.Reshape(k, [0, self.num_heads, self.head_dim])
 
         # Apply rotary embedding (vision uses full rotation, no partial)
+        # Cast cos/sin to match query dtype (tables are float32, model may be f16/bf16)
+        cos = op.CastLike(cos, q)
+        sin = op.CastLike(sin, q)
         cos = op.Unsqueeze(cos, [1])  # (total_seq, 1, rotary_dim)
         sin = op.Unsqueeze(sin, [1])
 
@@ -216,6 +219,7 @@ class Qwen3VLVisionAttention(nn.Module):
         """Emit com.microsoft.PackedMultiHeadAttention.
 
         Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+        PackedMHA supports float32/float16 only; bf16 inputs are cast to f16.
 
         Args:
             query, key: (total_seq, hidden_size) after rotary embedding
@@ -226,9 +230,7 @@ class Qwen3VLVisionAttention(nn.Module):
         total_seq = op.Shape(hidden_states, start=0, end=1)
         total_seq_scalar = op.Squeeze(total_seq)
 
-        # value from Split is (total_seq, hidden_size)
         # token_offset: identity mapping for packed (no-padding) input.
-        # Shape: (1, total_seq) — single batch, positions [0..N-1].
         token_offset = op.Unsqueeze(
             op.Range(
                 op.Constant(value_int=0),
@@ -241,10 +243,16 @@ class Qwen3VLVisionAttention(nn.Module):
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
+        # PackedMHA doesn't support bfloat16; cast to float16 if needed
+        query_mha = op.Cast(query, to=10)  # FLOAT16
+        key_mha = op.Cast(key, to=10)
+        value_mha = op.Cast(value, to=10)
+
         attn_output = op.PackedMultiHeadAttention(
-            query,
-            key,
-            value,
+            query_mha,
+            key_mha,
+            value_mha,
+            None,  # bias (optional, not used)
             token_offset,
             cu_seqlens_int32,
             num_heads=self.num_heads,
@@ -252,6 +260,9 @@ class Qwen3VLVisionAttention(nn.Module):
             _domain="com.microsoft",
             _outputs=["packed_attn_out"],
         )  # (total_seq, hidden_size)
+
+        # Cast back to original dtype
+        attn_output = op.CastLike(attn_output, query)
 
         return attn_output
 
@@ -659,11 +670,12 @@ class Qwen3VLVisionModel(nn.Module):
         w_10 = body_op.Reshape(body_op.Mul(dh2, omdw2), [-1, 1])
         w_11 = body_op.Reshape(body_op.Mul(dh2, dw2), [-1, 1])
 
-        # Gather from learned pos_embed (implicit input from parent graph)
-        e_00 = body_op.Mul(body_op.Gather(self.pos_embed, idx_00), w_00)
-        e_01 = body_op.Mul(body_op.Gather(self.pos_embed, idx_01), w_01)
-        e_10 = body_op.Mul(body_op.Gather(self.pos_embed, idx_10), w_10)
-        e_11 = body_op.Mul(body_op.Gather(self.pos_embed, idx_11), w_11)
+        # Gather from learned pos_embed (implicit input from parent graph).
+        # Cast to float32 for bilinear interpolation (pos_embed may be bf16/f16).
+        e_00 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_00), to=1), w_00)
+        e_01 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_01), to=1), w_01)
+        e_10 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_10), to=1), w_10)
+        e_11 = body_op.Mul(body_op.Cast(body_op.Gather(self.pos_embed, idx_11), to=1), w_11)
         pos_embeds = body_op.Add(
             body_op.Add(e_00, e_01),
             body_op.Add(e_10, e_11),
@@ -852,8 +864,10 @@ class Qwen3VLVisionModel(nn.Module):
         # Patch embedding
         hidden_states = self.patch_embed(op, hidden_states)
 
-        # Bilinear-interpolated position embeddings from learned grid
+        # Bilinear-interpolated position embeddings from learned grid.
+        # Cast to match hidden_states dtype (Scan body computes in float32).
         pos_embeds = self._interpolate_pos_embed(op, grid_thw)
+        pos_embeds = op.CastLike(pos_embeds, hidden_states)
         hidden_states = op.Add(hidden_states, pos_embeds)
 
         # Compute rotary position IDs and embeddings from grid_thw

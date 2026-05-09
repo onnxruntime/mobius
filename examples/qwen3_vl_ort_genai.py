@@ -2,344 +2,199 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Qwen3-VL generation with onnxruntime-genai.
+r"""Qwen3-VL multimodal generation with ONNX Runtime.
 
-Builds the 3-model ONNX package (decoder, vision encoder, embedding),
-saves it in the flat layout expected by onnxruntime-genai, and runs
-text generation — with or without an image.
-
-Qwen3-VL uses the same 3-model I/O contract as Qwen2.5-VL, so it can
-be loaded by onnxruntime-genai with ``model.type = "qwen2_5_vl"``.
+Builds the 3-model ONNX package (decoder, vision encoder, embedding)
+using the mobius ORT GenAI integration, then runs multimodal inference
+using raw ONNX Runtime sessions with HuggingFace preprocessing.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-ai[ort-genai] onnxruntime-gpu  # for CUDA
+    pip install mobius-ai[ort-genai] onnxruntime       # for CPU only
+
+Supported dtype/EP combinations::
+
+    - CPU:  f32
+    - CUDA: f32, f16, bf16
+
+    For bf16, torch IOBinding is used because numpy lacks bfloat16.
+    Requires onnxruntime-gpu >= 1.27 for f16/bf16 CUDA support.
 
 Usage::
 
-    # Text-only generation:
-    python examples/qwen3_vl_ort_genai.py
+    # CPU f32 (default):
+    python examples/qwen3_vl_ort_genai.py \
+        --image testdata/pipeline-cat-chonk.jpeg
 
-    # With an image:
-    python examples/qwen3_vl_ort_genai.py --image testdata/pipeline-cat-chonk.jpeg
+    # CUDA f16:
+    python examples/qwen3_vl_ort_genai.py \
+        --image testdata/pipeline-cat-chonk.jpeg --dtype f16 --ep cuda
 
-    # Compare ORT GenAI output with HuggingFace transformers:
-    python examples/qwen3_vl_ort_genai.py --image testdata/pipeline-cat-chonk.jpeg --compare-hf
-
-    # Use a pre-built model directory:
-    python examples/qwen3_vl_ort_genai.py --model-dir output/qwen3vl/
+    # CUDA bf16:
+    python examples/qwen3_vl_ort_genai.py \
+        --image testdata/pipeline-cat-chonk.jpeg --dtype bf16 --ep cuda
 
     # Build and save (skip inference):
-    python examples/qwen3_vl_ort_genai.py --save-to output/qwen3vl/
+    python examples/qwen3_vl_ort_genai.py \
+        --save-to output/qwen3_vl/ --dtype f16 --ep cuda
+
+    # Compare ORT output with HuggingFace transformers:
+    python examples/qwen3_vl_ort_genai.py --image <path> --compare-hf
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
-import onnxruntime_genai as og
-
-# ---------------------------------------------------------------------------
-# Model export helpers
-# ---------------------------------------------------------------------------
+import numpy as np
+import onnxruntime as ort
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
-DEFAULT_PROMPT = "The capital of France is"
+DEFAULT_PROMPT = "Describe this image in detail."
 MAX_NEW_TOKENS = 50
 
 
-def _write_genai_config(config, output_dir: str) -> None:
-    """Write genai_config.json for the Qwen3-VL 3-model split.
-
-    Uses ``qwen2_5_vl`` model type since onnxruntime-genai does not
-    yet have a native ``qwen3_vl`` handler — the I/O contract is
-    identical for the 3-model pipeline.
-    """
-    genai_config = {
-        "model": {
-            "bos_token_id": 151643,
-            "context_length": 4096,
-            "decoder": {
-                "session_options": {
-                    "log_id": "onnxruntime-genai",
-                    "provider_options": [],
-                },
-                "filename": "decoder/model.onnx",
-                "head_size": config.head_dim,
-                "hidden_size": config.hidden_size,
-                "inputs": {
-                    "inputs_embeds": "inputs_embeds",
-                    "attention_mask": "attention_mask",
-                    "position_ids": "position_ids",
-                    "past_key_names": "past_key_values.%d.key",
-                    "past_value_names": "past_key_values.%d.value",
-                },
-                "outputs": {
-                    "logits": "logits",
-                    "present_key_names": "present.%d.key",
-                    "present_value_names": "present.%d.value",
-                },
-                "num_attention_heads": config.num_attention_heads,
-                "num_hidden_layers": config.num_hidden_layers,
-                "num_key_value_heads": config.num_key_value_heads,
-            },
-            "embedding": {
-                "filename": "embedding/model.onnx",
-                "inputs": {
-                    "input_ids": "input_ids",
-                    "image_features": "image_features",
-                },
-                "outputs": {
-                    "inputs_embeds": "inputs_embeds",
-                },
-            },
-            "vision": {
-                "filename": "vision_encoder/model.onnx",
-                "spatial_merge_size": 2,
-                "inputs": {
-                    "pixel_values": "pixel_values",
-                    "image_grid_thw": "image_grid_thw",
-                },
-                "outputs": {
-                    "image_features": "image_features",
-                },
-            },
-            "eos_token_id": [151645, 151643],
-            "pad_token_id": 151643,
-            "image_token_id": 151655,
-            "vision_start_token_id": 151652,
-            "type": "qwen2_5_vl",
-            "vocab_size": config.vocab_size,
-        },
-        "search": {
-            "diversity_penalty": 0.0,
-            "do_sample": False,
-            "early_stopping": True,
-            "length_penalty": 1.0,
-            "max_length": 4096,
-            "min_length": 0,
-            "no_repeat_ngram_size": 0,
-            "num_beams": 1,
-            "num_return_sequences": 1,
-            "past_present_share_buffer": False,
-            "repetition_penalty": 1.0,
-            "temperature": 1.0,
-            "top_k": 1,
-            "top_p": 1.0,
-        },
-    }
-    with open(os.path.join(output_dir, "genai_config.json"), "w") as f:
-        json.dump(genai_config, f, indent=4)
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
 
 
-def _copy_tokenizer(model_id: str, output_dir: str) -> None:
-    """Copy tokenizer files and processor config from the HuggingFace cache."""
-    from transformers import AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(model_id)
-    processor.save_pretrained(output_dir)
-
-    # ORT GenAI expects ort-extensions processor_config.json format
-    _write_processor_config(processor, output_dir)
-
-
-def _write_processor_config(processor, output_dir: str) -> None:
-    """Write processor_config.json in the ort-extensions format.
-
-    NOTE: The ``width`` / ``height`` in the Resize step are default hints.
-    Call ``_update_resize_for_image`` before running multimodal inference
-    so that the ORT GenAI processor resizes the image to the same
-    dimensions that HuggingFace would compute.
-    """
-    ip = processor.image_processor
-    processor_config = {
-        "processor": {
-            "name": "qwen2_5_image_processor",
-            "transforms": [
-                {
-                    "operation": {
-                        "name": "decode_image",
-                        "type": "DecodeImage",
-                        "attrs": {"color_space": "RGB"},
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "convert_to_rgb",
-                        "type": "ConvertRGB",
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "resize",
-                        "type": "Resize",
-                        "attrs": {
-                            "width": 960,
-                            "height": 672,
-                            "smart_resize": 1,
-                            "min_pixels": ip.size.get("shortest_edge", 3136),
-                            "max_pixels": ip.size.get("longest_edge", 12845056),
-                            "patch_size": ip.patch_size,
-                            "merge_size": ip.merge_size,
-                        },
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "rescale",
-                        "type": "Rescale",
-                        "attrs": {"rescale_factor": ip.rescale_factor},
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "normalize",
-                        "type": "Normalize",
-                        "attrs": {
-                            "mean": list(ip.image_mean),
-                            "std": list(ip.image_std),
-                            "qwen2_5_vl": 1,
-                        },
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "patch_image",
-                        "type": "PatchImage",
-                        "attrs": {
-                            "patch_size": ip.patch_size,
-                            "temporal_patch_size": ip.temporal_patch_size,
-                            "merge_size": ip.merge_size,
-                        },
-                    }
-                },
-            ],
-        }
-    }
-    with open(os.path.join(output_dir, "processor_config.json"), "w") as f:
-        json.dump(processor_config, f, indent=2)
-
-
-def _update_resize_for_image(
-    model_dir: str, image_path: str, patch_size: int = 14, merge_size: int = 2
+def build_and_export(
+    model_id: str,
+    output_dir: str,
+    dtype: str = "f32",
+    ep: str = "cpu",
 ) -> None:
-    """Update processor_config.json resize dims to match HF smart_resize.
-
-    The ORT GenAI processor uses the configured width/height as the
-    target resize.  HuggingFace instead computes target dimensions from
-    the original image size and pixel constraints.  This helper bridges
-    that gap by computing the HF-equivalent dimensions for the given
-    image and writing them into the processor config.
-    """
-    from PIL import Image
-
-    img = Image.open(image_path)
-    w, h = img.size
-    factor = patch_size * merge_size  # 28
-
-    new_h = max(factor, round(h / factor) * factor)
-    new_w = max(factor, round(w / factor) * factor)
-
-    config_path = os.path.join(model_dir, "processor_config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-
-    resize = config["processor"]["transforms"][2]["operation"]["attrs"]
-    min_pix = resize.get("min_pixels", 3136)
-    max_pix = resize.get("max_pixels", 12845056)
-
-    pixels = new_h * new_w
-    if pixels > max_pix:
-        scale = (max_pix / pixels) ** 0.5
-        new_h = max(factor, round(h * scale / factor) * factor)
-        new_w = max(factor, round(w * scale / factor) * factor)
-    elif pixels < min_pix:
-        scale = (min_pix / pixels) ** 0.5
-        new_h = max(factor, round(h * scale / factor) * factor)
-        new_w = max(factor, round(w * scale / factor) * factor)
-
-    resize["width"] = new_w
-    resize["height"] = new_h
-
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-
-def build_and_export(model_id: str, output_dir: str) -> None:
-    """Build the 3-model ONNX package and save for onnxruntime-genai."""
+    """Build the 3-model ONNX package via the mobius ORT GenAI integration."""
     from mobius import build
+    from mobius.integrations.ort_genai import export_package
 
-    print(f"Building {model_id!r} ...")
-    pkg = build(model_id, dtype="f32", load_weights=True)
+    print(f"Building {model_id!r} (dtype={dtype}, ep={ep}) ...")
+    pkg = build(
+        model_id,
+        dtype=dtype,
+        execution_provider=ep,
+        load_weights=True,
+    )
     print(f"Package components: {list(pkg.keys())}")
 
-    print(f"Saving to {output_dir} ...")
-    pkg.save(output_dir)
-    _write_genai_config(pkg.config, output_dir)
-    _copy_tokenizer(model_id, output_dir)
-    print("Export complete.")
+    print(f"Exporting to {output_dir!r} ...")
+    export_package(pkg, output_dir, hf_model_id=model_id, ep=ep)
+    print(f"Export complete -> {output_dir}")
 
 
 # ---------------------------------------------------------------------------
-# Generation
+# ORT session helpers
 # ---------------------------------------------------------------------------
 
 
-def generate(model_dir: str, prompt: str, max_new_tokens: int) -> str:
-    """Run text generation with onnxruntime-genai."""
-    print(f"Loading model from {model_dir} ...")
-    model = og.Model(model_dir)
-    tokenizer = og.Tokenizer(model)
-
-    input_ids = tokenizer.encode(prompt)
-    params = og.GeneratorParams(model)
-    params.set_search_options(max_length=len(input_ids) + max_new_tokens)
-
-    generator = og.Generator(model, params)
-    generator.append_tokens(input_ids)
-
-    print(f"\nPrompt: {prompt}")
-    print("-" * 40)
-
-    generated = list(input_ids)
-    tokenizer_stream = tokenizer.create_stream()
-    for _ in range(max_new_tokens):
-        if generator.is_done():
-            break
-        generator.generate_next_token()
-        token = generator.get_next_tokens()[0]
-        generated.append(token)
-        print(tokenizer_stream.decode(token), end="", flush=True)
-
-    print()
-    print("-" * 40)
-
-    output = tokenizer.decode(generated)
-    del generator
-    return output
+_CUDA_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+_CPU_PROVIDERS = ["CPUExecutionProvider"]
 
 
-def generate_with_image(
+def _make_session(
     model_dir: str,
+    subdir: str,
+    providers: list[str],
+) -> ort.InferenceSession:
+    """Load an ONNX model as an ORT InferenceSession."""
+    path = os.path.join(model_dir, subdir, "model.onnx")
+    opts = ort.SessionOptions()
+    # ORT 1.26 EXTENDED/ALL graph optimizations crash for f16/bf16 on
+    # CUDA (vector bounds assertion in transformer_memcpy).  BASIC is
+    # safe and still runs constant folding + redundant-node elimination.
+    if any("CUDA" in p for p in providers):
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    return ort.InferenceSession(
+        path,
+        sess_options=opts,
+        providers=providers,
+    )
+
+
+def _run(
+    sess: ort.InferenceSession,
+    feeds: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Run an ORT session and return outputs as a dict."""
+    names = [o.name for o in sess.get_outputs()]
+    return dict(zip(names, sess.run(names, feeds)))
+
+
+# ---------------------------------------------------------------------------
+# MRoPE position IDs
+# ---------------------------------------------------------------------------
+
+
+def _compute_mrope_position_ids(
+    input_ids: np.ndarray,
+    image_grid_thw: np.ndarray | None,
+    image_token_id: int,
+    spatial_merge_size: int = 2,
+) -> np.ndarray:
+    """Compute 3D MRoPE position IDs for the Qwen-VL decoder.
+
+    Returns shape ``(3, batch, seq_len)`` — (temporal, height, width).
+    """
+    batch_size, seq_len = input_ids.shape
+    pos = np.zeros((3, batch_size, seq_len), dtype=np.int64)
+
+    for b in range(batch_size):
+        text_pos = 0
+        img_idx = 0
+        i = 0
+        while i < seq_len:
+            if image_grid_thw is not None and input_ids[b, i] == image_token_id:
+                start = i
+                while i < seq_len and input_ids[b, i] == image_token_id:
+                    i += 1
+                t, h, w = image_grid_thw[img_idx]
+                img_idx += 1
+                mh = h // spatial_merge_size
+                mw = w // spatial_merge_size
+                idx = start
+                for ti in range(t):
+                    for hi in range(mh):
+                        for wi in range(mw):
+                            if idx < i:
+                                pos[0, b, idx] = text_pos + ti
+                                pos[1, b, idx] = text_pos + hi
+                                pos[2, b, idx] = text_pos + wi
+                                idx += 1
+                text_pos += max(t, mh, mw)
+            else:
+                pos[:, b, i] = text_pos
+                text_pos += 1
+                i += 1
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# Generation: f32 / f16 path (numpy session.run)
+# ---------------------------------------------------------------------------
+
+
+def _generate_numpy(
+    model_dir: str,
+    model_id: str,
     prompt: str,
     image_path: str,
     max_new_tokens: int,
+    ep: str,
+    dtype: str,
 ) -> str:
-    """Run multimodal generation with onnxruntime-genai.
+    """Generate text using numpy-based session.run().
 
-    Uses the ORT GenAI multimodal processor to encode the image
-    into pixel_values + image_grid_thw alongside the tokenized prompt.
+    Works for f32 and f16.  All sessions run on the requested EP.
     """
-    # Compute HF-equivalent resize dimensions for this image
-    _update_resize_for_image(model_dir, image_path)
+    from PIL import Image
+    from transformers import AutoConfig, AutoProcessor
 
-    from transformers import AutoProcessor
-
-    # The chat template encodes <|image_pad|> tokens for the image
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor = AutoProcessor.from_pretrained(model_id)
+    image = Image.open(image_path).convert("RGB")
     messages = [
         {
             "role": "user",
@@ -354,83 +209,376 @@ def generate_with_image(
         tokenize=False,
         add_generation_prompt=True,
     )
+    inputs = processor(text=[text], images=[image], return_tensors="pt")
 
-    print(f"Loading model from {model_dir} ...")
-    model = og.Model(model_dir)
-    tokenizer = og.Tokenizer(model)
-    ort_processor = model.create_multimodal_processor()
+    input_ids = inputs["input_ids"].numpy().astype(np.int64)
+    pixel_values = inputs["pixel_values"].numpy().astype(np.float32)
+    image_grid_thw = inputs["image_grid_thw"].numpy().astype(np.int64)
 
-    # Load the image via ORT GenAI's image processor
-    images = og.Images.open(image_path)
-    inputs = ort_processor(text, images=images)
+    config = AutoConfig.from_pretrained(model_id)
+    tc = getattr(config, "text_config", config)
+    image_token_id = config.image_token_id
+    sms = config.vision_config.spatial_merge_size
+    eos = tc.eos_token_id
+    if isinstance(eos, list):
+        eos = eos[0]
 
-    params = og.GeneratorParams(model)
-    params.set_search_options(max_length=max_new_tokens + 512)
+    # Vision encoder: CUDA if available (PackedMHA is CUDA-only)
+    vision_provs = _CUDA_PROVIDERS if ep == "cuda" else _CPU_PROVIDERS
+    decode_provs = _CUDA_PROVIDERS if ep == "cuda" else _CPU_PROVIDERS
 
-    generator = og.Generator(model, params)
-    generator.set_inputs(inputs)
+    print(f"Loading model from {model_dir!r} (ep={ep}) ...")
+    vsess = _make_session(model_dir, "vision_encoder", vision_provs)
+    esess = _make_session(model_dir, "embedding", decode_provs)
+    dsess = _make_session(model_dir, "decoder", decode_provs)
+
+    # Detect model dtype from decoder inputs
+    model_dt = np.float32
+    for inp in dsess.get_inputs():
+        if inp.name == "inputs_embeds":
+            if inp.type == "tensor(float16)":
+                model_dt = np.float16
+            break
+
+    # Vision encoder
+    vout = _run(
+        vsess,
+        {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+        },
+    )
+    img_feat = vout["image_features"].astype(model_dt)
+
+    # Embedding
+    eout = _run(
+        esess,
+        {
+            "input_ids": input_ids,
+            "image_features": img_feat,
+        },
+    )
+    embeds = eout["inputs_embeds"]
+
+    # MRoPE position IDs
+    position_ids = _compute_mrope_position_ids(
+        input_ids,
+        image_grid_thw,
+        image_token_id,
+        sms,
+    )
+
+    # Decoder prefill
+    seq_len = embeds.shape[1]
+    feeds: dict[str, np.ndarray] = {
+        "inputs_embeds": embeds,
+        "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+        "position_ids": position_ids,
+    }
+    for i in range(tc.num_hidden_layers):
+        feeds[f"past_key_values.{i}.key"] = np.zeros(
+            (1, tc.num_key_value_heads, 0, tc.head_dim),
+            dtype=model_dt,
+        )
+        feeds[f"past_key_values.{i}.value"] = np.zeros(
+            (1, tc.num_key_value_heads, 0, tc.head_dim),
+            dtype=model_dt,
+        )
+    outputs = _run(dsess, feeds)
 
     print(f"\nPrompt: {prompt}")
     print(f"Image:  {image_path}")
     print("-" * 40)
 
-    tokenizer_stream = tokenizer.create_stream()
-    generated_tokens: list[int] = []
-    while not generator.is_done():
-        generator.generate_next_token()
-        token = generator.get_next_tokens()[0]
-        generated_tokens.append(token)
-        print(tokenizer_stream.decode(token), end="", flush=True)
-        if len(generated_tokens) >= max_new_tokens:
+    # Greedy decode
+    logits = outputs["logits"].astype(np.float32)
+    token = int(np.argmax(logits[0, -1]))
+    generated: list[int] = [token]
+    kv = {
+        f"past_key_values.{i}.{t}": outputs[f"present.{i}.{t}"]
+        for i in range(tc.num_hidden_layers)
+        for t in ("key", "value")
+    }
+    past_len = seq_len
+    max_pos = int(position_ids.max())
+
+    for _ in range(max_new_tokens - 1):
+        if token == eos:
             break
+        eout = _run(
+            esess,
+            {
+                "input_ids": np.array([[token]], dtype=np.int64),
+                "image_features": np.zeros(
+                    (0, tc.hidden_size),
+                    dtype=model_dt,
+                ),
+            },
+        )
+        max_pos += 1
+        feeds = {
+            "inputs_embeds": eout["inputs_embeds"],
+            "attention_mask": np.ones(
+                (1, past_len + 1),
+                dtype=np.int64,
+            ),
+            "position_ids": np.full(
+                (3, 1, 1),
+                max_pos,
+                dtype=np.int64,
+            ),
+            **kv,
+        }
+        outputs = _run(dsess, feeds)
+        kv = {
+            f"past_key_values.{i}.{t}": outputs[f"present.{i}.{t}"]
+            for i in range(tc.num_hidden_layers)
+            for t in ("key", "value")
+        }
+        past_len += 1
+        logits = outputs["logits"].astype(np.float32)
+        token = int(np.argmax(logits[0, -1]))
+        generated.append(token)
 
-    print()
+    output = processor.tokenizer.decode(
+        generated,
+        skip_special_tokens=True,
+    )
+    print(output)
     print("-" * 40)
-
-    output = tokenizer.decode(generated_tokens)
-    del generator
     return output
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace transformers generation (for comparison)
+# Generation: bf16 path (torch IOBinding)
 # ---------------------------------------------------------------------------
 
 
-def generate_text_hf(model_id: str, prompt: str, max_new_tokens: int) -> str:
-    """Run text-only generation with HuggingFace transformers."""
+def _generate_bf16(
+    model_dir: str,
+    model_id: str,
+    prompt: str,
+    image_path: str,
+    max_new_tokens: int,
+) -> str:
+    """Generate text for bf16 models using torch IOBinding.
+
+    ORT's Python API cannot handle bfloat16 numpy arrays, so we use
+    torch tensors + ``OrtValue.from_dlpack`` to feed bf16 data via
+    IOBinding.
+    """
     import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from PIL import Image
+    from transformers import AutoConfig, AutoProcessor
 
-    print(f"[HF] Loading {model_id} ...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        torch_dtype=torch.float32,
-        device_map="cpu",
-    )
     processor = AutoProcessor.from_pretrained(model_id)
-
-    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    image = Image.open(image_path).convert("RGB")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image_path},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
-    inputs = processor(text=[text], return_tensors="pt").to("cpu")
+    inputs = processor(text=[text], images=[image], return_tensors="pt")
 
-    print(f"\n[HF] Prompt: {prompt}")
-    print("-" * 40)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
+    input_ids = inputs["input_ids"].numpy().astype(np.int64)
+    pixel_values = inputs["pixel_values"].numpy().astype(np.float32)
+    image_grid_thw = inputs["image_grid_thw"].numpy().astype(np.int64)
+
+    config = AutoConfig.from_pretrained(model_id)
+    tc = getattr(config, "text_config", config)
+    image_token_id = config.image_token_id
+    sms = config.vision_config.spatial_merge_size
+    eos = tc.eos_token_id
+    if isinstance(eos, list):
+        eos = eos[0]
+
+    print(f"Loading model from {model_dir!r} (ep=cuda, bf16) ...")
+    vsess = _make_session(model_dir, "vision_encoder", _CUDA_PROVIDERS)
+    esess = _make_session(model_dir, "embedding", _CUDA_PROVIDERS)
+    dsess = _make_session(model_dir, "decoder", _CUDA_PROVIDERS)
+
+    bf = torch.bfloat16
+
+    def _run_io(
+        sess: ort.InferenceSession,
+        feed: dict[str, torch.Tensor],
+    ) -> list[torch.Tensor]:
+        io = sess.io_binding()
+        for name, t in feed.items():
+            io.bind_ortvalue_input(name, ort.OrtValue.from_dlpack(t))
+        for out in sess.get_outputs():
+            io.bind_output(out.name)
+        sess.run_with_iobinding(io)
+        return [torch.from_dlpack(o).clone() for o in io.get_outputs()]
+
+    # Vision encoder
+    v_outs = _run_io(
+        vsess,
+        {
+            "pixel_values": torch.tensor(pixel_values),
+            "image_grid_thw": torch.tensor(
+                image_grid_thw,
+                dtype=torch.int64,
+            ),
+        },
+    )
+    img_feat = v_outs[0]
+
+    # Embedding
+    e_outs = _run_io(
+        esess,
+        {
+            "input_ids": torch.tensor(input_ids, dtype=torch.int64),
+            "image_features": img_feat,
+        },
+    )
+    embeds = e_outs[0]
+
+    # MRoPE position IDs
+    position_ids = _compute_mrope_position_ids(
+        input_ids,
+        image_grid_thw,
+        image_token_id,
+        sms,
+    )
+    seq_len = embeds.shape[1]
+
+    # Decoder prefill
+    d_feed: dict[str, torch.Tensor] = {
+        "inputs_embeds": embeds,
+        "attention_mask": torch.ones(1, seq_len, dtype=torch.int64),
+        "position_ids": torch.tensor(
+            position_ids,
+            dtype=torch.int64,
+        ),
+    }
+    for i in range(tc.num_hidden_layers):
+        empty = torch.zeros(
+            1,
+            tc.num_key_value_heads,
+            0,
+            tc.head_dim,
+            dtype=bf,
         )
-    gen_ids = output_ids[:, inputs.input_ids.shape[1] :]
-    output = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
+        d_feed[f"past_key_values.{i}.key"] = empty
+        d_feed[f"past_key_values.{i}.value"] = empty
+
+    d_outs = _run_io(dsess, d_feed)
+
+    print(f"\nPrompt: {prompt}")
+    print(f"Image:  {image_path}")
+    print("-" * 40)
+
+    logits = d_outs[0].float().cpu().numpy()
+    token = int(np.argmax(logits[0, -1]))
+    generated: list[int] = [token]
+
+    kv: dict[str, torch.Tensor] = {}
+    for i in range(tc.num_hidden_layers):
+        kv[f"past_key_values.{i}.key"] = d_outs[1 + 2 * i]
+        kv[f"past_key_values.{i}.value"] = d_outs[2 + 2 * i]
+
+    past_len = seq_len
+    max_pos = int(position_ids.max())
+
+    for _ in range(max_new_tokens - 1):
+        if token == eos:
+            break
+
+        e_outs = _run_io(
+            esess,
+            {
+                "input_ids": torch.tensor(
+                    [[token]],
+                    dtype=torch.int64,
+                ),
+                "image_features": torch.zeros(
+                    0,
+                    tc.hidden_size,
+                    dtype=bf,
+                ),
+            },
+        )
+        max_pos += 1
+        d_feed = {
+            "inputs_embeds": e_outs[0],
+            "attention_mask": torch.ones(
+                1,
+                past_len + 1,
+                dtype=torch.int64,
+            ),
+            "position_ids": torch.full(
+                (3, 1, 1),
+                max_pos,
+                dtype=torch.int64,
+            ),
+            **kv,
+        }
+        d_outs = _run_io(dsess, d_feed)
+        for i in range(tc.num_hidden_layers):
+            kv[f"past_key_values.{i}.key"] = d_outs[1 + 2 * i]
+            kv[f"past_key_values.{i}.value"] = d_outs[2 + 2 * i]
+        past_len += 1
+
+        logits = d_outs[0].float().cpu().numpy()
+        token = int(np.argmax(logits[0, -1]))
+        generated.append(token)
+
+    output = processor.tokenizer.decode(
+        generated,
+        skip_special_tokens=True,
+    )
     print(output)
     print("-" * 40)
     return output
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+def generate_with_image(
+    model_dir: str,
+    model_id: str,
+    prompt: str,
+    image_path: str,
+    max_new_tokens: int,
+    ep: str = "cpu",
+    dtype: str = "f32",
+) -> str:
+    """Run multimodal generation, dispatching by dtype."""
+    if dtype == "bf16":
+        return _generate_bf16(
+            model_dir,
+            model_id,
+            prompt,
+            image_path,
+            max_new_tokens,
+        )
+    return _generate_numpy(
+        model_dir,
+        model_id,
+        prompt,
+        image_path,
+        max_new_tokens,
+        ep,
+        dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace comparison
+# ---------------------------------------------------------------------------
 
 
 def generate_with_image_hf(
@@ -494,9 +642,9 @@ def generate_with_image_hf(
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Qwen3-VL text generation with onnxruntime-genai.",
+        description="Qwen3-VL multimodal generation with ONNX Runtime.",
     )
     parser.add_argument(
         "--model-id",
@@ -515,14 +663,14 @@ def main():
         help="Export the model to DIR and exit (no inference).",
     )
     parser.add_argument(
-        "--prompt",
-        default=None,
-        help="Text prompt (default depends on whether --image is used).",
-    )
-    parser.add_argument(
         "--image",
         default=None,
-        help="Path to image file for multimodal generation.",
+        help="Path to image file (required for inference).",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Text prompt (default: %(default)s).",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -533,76 +681,84 @@ def main():
     parser.add_argument(
         "--compare-hf",
         action="store_true",
-        help="Also run with HuggingFace transformers and compare outputs.",
+        help="Also run HuggingFace transformers and compare.",
     )
     parser.add_argument(
         "--ci",
         action="store_true",
-        help="Exit with non-zero code on failure (for CI pipelines).",
+        help="Exit with non-zero code on failure.",
+    )
+    parser.add_argument(
+        "--ep",
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Execution provider (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="f32",
+        help="Data type for ONNX model (default: %(default)s).",
     )
     args = parser.parse_args()
 
     if args.save_to:
-        build_and_export(args.model_id, args.save_to)
+        build_and_export(
+            args.model_id,
+            args.save_to,
+            dtype=args.dtype,
+            ep=args.ep,
+        )
         return
+
+    if not args.image:
+        parser.error("--image is required for inference. Use --save-to for export-only.")
 
     if args.model_dir:
         model_dir = args.model_dir
     else:
         model_dir = os.path.join("output", "qwen3_vl")
         if not os.path.isfile(os.path.join(model_dir, "genai_config.json")):
-            build_and_export(args.model_id, model_dir)
-
-    if args.image:
-        prompt = args.prompt or "Describe this image in detail."
-        print("=" * 60)
-        print("ORT GenAI")
-        print("=" * 60)
-        onnx_output = generate_with_image(model_dir, prompt, args.image, args.max_new_tokens)
-        if args.compare_hf:
-            print("\n" + "=" * 60)
-            print("HuggingFace Transformers")
-            print("=" * 60)
-            hf_output = generate_with_image_hf(
+            build_and_export(
                 args.model_id,
-                prompt,
-                args.image,
-                args.max_new_tokens,
+                model_dir,
+                dtype=args.dtype,
+                ep=args.ep,
             )
-            if onnx_output.strip() == hf_output.strip():
-                print("\n\u2713 Outputs match exactly!")
-            else:
-                print("\n\u2717 Outputs differ!")
-                print(f"  ONNX: {onnx_output!r}")
-                print(f"  HF:   {hf_output!r}")
-                if args.ci:
-                    sys.exit(1)
-    else:
-        prompt = args.prompt or DEFAULT_PROMPT
+
+    prompt = args.prompt or DEFAULT_PROMPT
+
+    print("=" * 60)
+    print("ONNX Runtime")
+    print("=" * 60)
+    onnx_output = generate_with_image(
+        model_dir,
+        args.model_id,
+        prompt,
+        args.image,
+        args.max_new_tokens,
+        ep=args.ep,
+        dtype=args.dtype,
+    )
+
+    if args.compare_hf:
+        print("\n" + "=" * 60)
+        print("HuggingFace Transformers")
         print("=" * 60)
-        print("ORT GenAI")
-        print("=" * 60)
-        onnx_output = generate(model_dir, prompt, args.max_new_tokens)
-        if args.compare_hf:
-            print("\n" + "=" * 60)
-            print("HuggingFace Transformers")
-            print("=" * 60)
-            hf_output = generate_text_hf(args.model_id, prompt, args.max_new_tokens)
-            if onnx_output.strip() == hf_output.strip():
-                print("\n\u2713 Outputs match exactly!")
-            else:
-                print("\n\u2717 Outputs differ!")
-                print(f"  ONNX: {onnx_output!r}")
-                print(f"  HF:   {hf_output!r}")
-                if args.ci:
-                    sys.exit(1)
+        hf_output = generate_with_image_hf(
+            args.model_id,
+            prompt,
+            args.image,
+            args.max_new_tokens,
+        )
+        if onnx_output.strip() == hf_output.strip():
+            print("\n✓ Outputs match exactly!")
+        else:
+            print("\n✗ Outputs differ!")
+            print(f"  ONNX: {onnx_output!r}")
+            print(f"  HF:   {hf_output!r}")
+            if args.ci:
+                sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        if "--ci" in sys.argv:
-            print(f"FAILED: {e}", file=sys.stderr)
-            sys.exit(1)
-        raise
+    main()

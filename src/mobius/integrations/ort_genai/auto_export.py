@@ -77,10 +77,28 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
+    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
+    "qwen2_vl": "qwen2_5_vl",
+    "qwen3_vl": "qwen2_5_vl",
+    "qwen3_vl_text": "qwen2_5_vl",
+    "qwen3_5": "qwen2_5_vl",
+    "qwen3_5_vl": "qwen2_5_vl",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
+_QWEN_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_text",
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_moe",
+        "videochat_flash_qwen",
+    }
+)
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -483,8 +501,37 @@ def _write_vision_processor_config(
                     }
                 }
             )
+        elif model_type in _QWEN_VL_MODEL_TYPES:
+            # Qwen-VL models need the PatchImage transform to extract
+            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
+            # on Normalize for correct interleaving.
+            temporal_patch_size = config.temporal_patch_size
+            # Add qwen3_vl flag to the Normalize step
+            for t in transforms:
+                op = t.get("operation", {})
+                if op.get("type") == "Normalize":
+                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "patch_image",
+                        "type": "PatchImage",
+                        "attrs": {
+                            "patch_size": patch_size,
+                            "temporal_patch_size": temporal_patch_size,
+                            "merge_size": merge_size,
+                        },
+                    }
+                }
+            )
 
-        processor_name = "pixtral_image_processor" if is_pixtral else "image_processor"
+        processor_name = (
+            "pixtral_image_processor"
+            if is_pixtral
+            else "qwen2_5_image_processor"
+            if model_type in _QWEN_VL_MODEL_TYPES
+            else "image_processor"
+        )
         processor_config = {
             "processor": {
                 "name": processor_name,
@@ -629,6 +676,16 @@ def _write_genai_config(
                     config, "spatial_merge_size", 2
                 )
                 vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
+            else:
+                # All other VLMs (Qwen-VL, LLaVA, InternVL, etc.) use
+                # processor_config.json written by _write_vision_processor_config.
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", None
+                )
+                if sms is not None:
+                    vision_kwargs["spatial_merge_size"] = sms
                 vision_kwargs["config_filename"] = "processor_config.json"
 
             if vision_input_mapping is not None:
