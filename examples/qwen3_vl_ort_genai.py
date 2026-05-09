@@ -11,6 +11,18 @@ Requirements::
 
     pip install mobius-ai[ort-genai]
 
+    # Requires onnxruntime-genai >= 0.13 (dev build) with set_inputs
+    # support for VLM model types. The pip release 0.12.2 does not
+    # support this feature.
+
+Supported dtype/EP combinations:
+
+    - CPU:  f32
+    - CUDA: f32, f16
+
+    NOTE: bf16 is NOT supported — ORT CUDA EP lacks bf16 kernels for
+    enough operators, causing 230+ MemcpyFromHost nodes and garbled output.
+
 Usage::
 
     # Build and run with an image:
