@@ -120,7 +120,7 @@ def generate_with_image(
     inputs = processor(text, images=images)
 
     params = og.GeneratorParams(model)
-    params.set_search_options(max_length=max_new_tokens + 512)
+    params.set_search_options(max_length=max_new_tokens + 4096)
     generator = og.Generator(model, params)
     generator.set_inputs(inputs)
 
