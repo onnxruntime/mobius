@@ -11,10 +11,10 @@ import torch
 
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius.models.qwen_vl import (
-    Qwen25VLCausalLMModel,
-    Qwen25VLDecoderModel,
     Qwen3VL3ModelCausalLMModel,
     Qwen3VLDecoderModel,
+    Qwen25VLCausalLMModel,
+    Qwen25VLDecoderModel,
 )
 
 # Tiny config for weight preprocessing tests (no graph build needed)
@@ -122,7 +122,8 @@ class TestQwen3VL3ModelCausalLMModelTiedWeights:
 
     def test_lm_head_present_when_tied(self):
         config = dataclasses.replace(
-            _BASE_CONFIG, model_type="qwen3_vl",
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
         )
         model = Qwen3VL3ModelCausalLMModel(config)
         sd = _fake_state_dict_qwen3vl()
@@ -132,7 +133,8 @@ class TestQwen3VL3ModelCausalLMModelTiedWeights:
 
     def test_lm_head_shares_data_ptr_with_embed(self):
         config = dataclasses.replace(
-            _BASE_CONFIG, model_type="qwen3_vl",
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
         )
         model = Qwen3VL3ModelCausalLMModel(config)
         sd = _fake_state_dict_qwen3vl()
@@ -148,7 +150,8 @@ class TestQwen3VLDecoderModelTiedWeights:
 
     def test_lm_head_present_when_tied(self):
         config = dataclasses.replace(
-            _BASE_CONFIG, model_type="qwen3_vl",
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
         )
         model = Qwen3VLDecoderModel(config)
         sd = _fake_state_dict_qwen3vl()
@@ -158,7 +161,8 @@ class TestQwen3VLDecoderModelTiedWeights:
 
     def test_lm_head_shares_data_ptr_with_embed(self):
         config = dataclasses.replace(
-            _BASE_CONFIG, model_type="qwen3_vl",
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
         )
         model = Qwen3VLDecoderModel(config)
         sd = _fake_state_dict_qwen3vl()
