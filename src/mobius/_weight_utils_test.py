@@ -227,11 +227,13 @@ class TestTieWordEmbeddings:
         assert sd["model.embed_tokens.weight"].data_ptr() == t1.data_ptr()
         assert sd["lm_head.weight"].data_ptr() == t2.data_ptr()
 
-    def test_neither_present_no_change(self):
-        """If neither present, no change."""
+    def test_neither_present_raises(self):
+        """Raise ValueError if neither key is found (catches key mismatches)."""
+        import pytest
+
         sd = {"other.weight": torch.randn(4)}
-        tie_word_embeddings(sd)
-        assert list(sd.keys()) == ["other.weight"]
+        with pytest.raises(ValueError, match=r"neither.*found"):
+            tie_word_embeddings(sd)
 
     def test_custom_keys(self):
         """Custom embed/head keys."""
