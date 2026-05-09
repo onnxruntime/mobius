@@ -97,12 +97,14 @@ def _make_session(
     subdir: str,
     providers: list[str],
 ) -> ort.InferenceSession:
-    """Load an ONNX model with graph optimizations disabled for CUDA."""
+    """Load an ONNX model as an ORT InferenceSession."""
     path = os.path.join(model_dir, subdir, "model.onnx")
     opts = ort.SessionOptions()
     # ORT 1.26 EXTENDED graph optimizations crash for f16/bf16 CUDA
+    # models (vector bounds assertion). BASIC is safe and still runs
+    # constant folding + redundant-node elimination.
     if any("CUDA" in p for p in providers):
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     return ort.InferenceSession(
         path,
         sess_options=opts,
