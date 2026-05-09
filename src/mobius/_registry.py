@@ -819,6 +819,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
     "gemma4": "google/gemma-4-E2B-it",
     "internvl2": "OpenGVLab/InternVL2-1B",
+    "videochat_flash_qwen": "OpenGVLab/VideoChat-Flash-Qwen2_5-7B_InternVideo2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
     "blip-2": "Salesforce/blip2-opt-2.7b",

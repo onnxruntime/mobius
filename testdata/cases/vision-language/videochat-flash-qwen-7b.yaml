@@ -17,7 +17,9 @@ generation:
   do_sample: false
 
 trust_remote_code: true
-skip_reason: "7B model requires cv2/decord/imageio; too large for CI golden generation."
+skip_reason: >
+  Custom HF modeling code missing rope_theta in config;
+  incompatible with transformers 5.x forward pass.
 notes: >
   VideoChat-Flash-Qwen2.5-7B with InternVideo2-1B vision encoder.
   Custom InternVideo2 ViT with LayerScale and QK norms.

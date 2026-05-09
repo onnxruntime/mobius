@@ -385,11 +385,49 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     from PIL import Image
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
-    from mobius._testing.torch_reference import (
-        load_torch_multimodal_model,
-    )
 
-    model, _tokenizer, processor = load_torch_multimodal_model(case.model_id, device=device)
+    config = None
+    try:
+        import transformers
+
+        config = transformers.AutoConfig.from_pretrained(
+            case.model_id, trust_remote_code=getattr(case, "trust_remote_code", False)
+        )
+    except Exception:
+        pass
+
+    model_type = getattr(config, "model_type", "") if config else ""
+
+    if model_type == "videochat_flash_qwen":
+        # VideoChat-Flash uses AutoModel with trust_remote_code
+        import transformers
+
+        if device == "auto":
+            model = transformers.AutoModel.from_pretrained(
+                case.model_id,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                device_map=device,
+            )
+        else:
+            model = transformers.AutoModel.from_pretrained(
+                case.model_id,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+            )
+            model = model.to(device)
+        model.eval()
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+    else:
+        from mobius._testing.torch_reference import (
+            load_torch_multimodal_model,
+        )
+
+        model, _tokenizer, processor = load_torch_multimodal_model(
+            case.model_id, device=device
+        )
 
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
@@ -670,6 +708,28 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
         )
         # Qwen3-ASR wraps a thinker; the thinker produces logits.
         forward_model = model.thinker
+    elif model_type == "videochat_flash_qwen":
+        # VideoChat-Flash uses AutoModel (not AutoModelForImageTextToText)
+        # with trust_remote_code for custom modeling code.
+        if device == "auto":
+            model = transformers.AutoModel.from_pretrained(
+                case.model_id,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                device_map=device,
+            )
+        else:
+            model = transformers.AutoModel.from_pretrained(
+                case.model_id,
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+            )
+            model = model.to(device)
+        model.eval()
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id, trust_remote_code=True
+        )
+        forward_model = model
     else:
         # Gemma4-style: AutoModelForImageTextToText
         from mobius._testing.torch_reference import (
