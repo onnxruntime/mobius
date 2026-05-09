@@ -89,8 +89,7 @@ def generate_with_image(
 ) -> str:
     """Run multimodal generation with onnxruntime-genai.
 
-    Uses the ORT GenAI multimodal processor to encode the image
-    alongside the tokenized prompt (with chat template).
+    Uses the ORT GenAI multimodal processor + HF chat template.
     """
     from transformers import AutoProcessor
 

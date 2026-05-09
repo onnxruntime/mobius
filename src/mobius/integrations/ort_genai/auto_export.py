@@ -630,6 +630,16 @@ def _write_genai_config(
                 )
                 vision_kwargs["spatial_merge_size"] = sms
                 vision_kwargs["config_filename"] = "processor_config.json"
+            else:
+                # All other VLMs (Qwen-VL, LLaVA, InternVL, etc.) use
+                # processor_config.json written by _write_vision_processor_config.
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", None
+                )
+                if sms is not None:
+                    vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping

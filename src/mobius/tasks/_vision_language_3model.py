@@ -138,11 +138,15 @@ class QwenVLTask(VisionLanguageTask):
 
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
+        # Rank-3 [batch, total_patches, pixel_dim] to match GenAI's processor
+        # output format (same as Gemma4). Squeeze batch for the vision model.
+        batch = ir.SymbolicDim("batch")
         pixel_values = builder.input(
             "pixel_values",
             dtype=ir.DataType.FLOAT,
-            shape=[total_patches, pixel_dim],
+            shape=[batch, total_patches, pixel_dim],
         )
+        pixel_values = op.Reshape(pixel_values, op.Constant(value_ints=[-1, pixel_dim]))
         pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_grid_thw = builder.input(
             "image_grid_thw",
