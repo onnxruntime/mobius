@@ -226,8 +226,8 @@ def _generate_numpy(
 
     # Vision encoder always on CUDA (PackedMHA is CUDA-only)
     vision_provs = cuda_provs if ep == "cuda" else cpu_provs
-    # For f16 CUDA: decoder on CPU to avoid Memcpy NaN
-    decoder_provs = cpu_provs if ep == "cuda" else cpu_provs
+    # Decoder/embedding on CPU — CUDA causes NaN from Memcpy at opset 24
+    decoder_provs = cpu_provs
 
     print(f"Loading model from {model_dir!r} (ep={ep}) ...")
     vsess = _make_session(model_dir, "vision_encoder", vision_provs)
