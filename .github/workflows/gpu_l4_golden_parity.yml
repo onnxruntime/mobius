@@ -43,14 +43,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache pip packages
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-gpu-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
-          restore-keys: |
-            pip-gpu-
-
       - name: Cache HuggingFace models
         uses: actions/cache@v5
         with:
@@ -60,13 +52,14 @@ jobs:
             hf-gpu-
 
       - name: Install PyTorch (CUDA)
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
-          pip install onnxruntime-gpu
+          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing,transformers]'
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
 
       - name: Check for golden test data
         id: check_golden

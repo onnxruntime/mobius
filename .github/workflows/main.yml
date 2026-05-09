@@ -277,12 +277,13 @@ jobs:
           restore-keys: |
             hf-integration-fast-
       - name: Install PyTorch CUDA
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
+        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
-          pip install onnxruntime-gpu
+          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing]'
+          pip install --pre --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/ onnxruntime-gpu onnxruntime-genai-cuda
       - name: Run fast integration tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
