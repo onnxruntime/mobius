@@ -16,8 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._codec_conv import LayerScale
 from mobius.components._common import (
@@ -83,7 +82,7 @@ class CodecDecoderTransformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -149,7 +148,7 @@ class _CodecDecoderAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -259,7 +258,7 @@ class CodecDecoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,
@@ -332,7 +331,7 @@ class CodecEncoderTransformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_embeddings: tuple,
         attention_mask: ir.Value | None = None,
@@ -416,7 +415,7 @@ class CodecEncoderTransformerModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         position_ids: ir.Value,
         attention_mask: ir.Value | None = None,

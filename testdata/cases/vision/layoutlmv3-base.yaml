@@ -1,4 +1,5 @@
 model_id: "microsoft/layoutlmv3-base"
+model_type: "layoutlmv3"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

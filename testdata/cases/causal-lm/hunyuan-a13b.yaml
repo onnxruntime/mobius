@@ -1,4 +1,5 @@
 model_id: "tencent/Hunyuan-A13B-Instruct"
+model_type: "hunyuan_v1_moe"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -12,8 +12,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -64,7 +63,7 @@ class DeepSeekMoEGate(nn.Module):
         if self.scoring_func == "sigmoid":
             self.e_score_correction_bias = nn.Parameter([self.num_experts])
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Compute routing logits: hidden @ weight^T
         weight_t = op.Transpose(self.weight, perm=[1, 0])
         router_logits = op.MatMul(
@@ -164,7 +163,7 @@ class DeepSeekMLADecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -211,7 +210,7 @@ class _DeepSeekStandardDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -255,7 +254,7 @@ class _DeepSeekMoEFFN(nn.Module):
         shared_intermediate = config.moe_intermediate_size * n_shared
         self.shared_experts = _SharedExpertMLP(config, shared_intermediate)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         moe_output = self.moe(op, hidden_states)
         shared_output = self.shared_experts(op, hidden_states)
         return op.Add(moe_output, shared_output)
@@ -270,7 +269,7 @@ class _SharedExpertMLP(nn.Module):
         self.up_proj = Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = Linear(intermediate_size, config.hidden_size, bias=False)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate_out = self.gate_proj(op, hidden_states)
         # SiLU = x * sigmoid(x)
         gate = op.Mul(gate_out, op.Sigmoid(gate_out))
@@ -322,7 +321,7 @@ class DeepSeekV3TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

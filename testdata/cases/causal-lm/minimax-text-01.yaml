@@ -1,4 +1,5 @@
 model_id: "MiniMaxAI/MiniMax-Text-01"
+model_type: "minimax"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

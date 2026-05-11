@@ -16,8 +16,7 @@ import re
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, DepthAnythingConfig
 from mobius.components import (
@@ -61,7 +60,7 @@ class _ViTBackbone(nn.Module):
         # 1-indexed out_indices (layer 1 = after first layer)
         self.out_indices = config.backbone_out_indices or []
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_embeds = self.patch_embeddings(op, pixel_values)
         batch_size = op.Shape(patch_embeds, start=0, end=1)
 
@@ -90,7 +89,7 @@ class _Conv2dPatchEmbed(nn.Module):
         super().__init__()
         self.projection = Conv2d(in_channels, hidden_size, patch_size, patch_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         x = self.projection(op, pixel_values)
         batch = op.Shape(x, start=0, end=1)
         hidden = op.Shape(x, start=1, end=2)
@@ -117,7 +116,7 @@ class _ViTEncoderLayer(nn.Module):
             activation=config.hidden_act,
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.layernorm_before(op, hidden_states)
         hidden_states = self.self_attn(op, hidden_states)
@@ -153,7 +152,7 @@ class _ReassembleLayer(nn.Module):
         else:
             self.resize = None  # Identity
 
-    def forward(self, op: builder.OpBuilder, hidden_state: ir.Value):
+    def forward(self, op: OpBuilder, hidden_state: ir.Value):
         hidden_state = self.projection(op, hidden_state)
         if self.resize is not None:
             hidden_state = self.resize(op, hidden_state)
@@ -168,7 +167,7 @@ class _PreActResidualLayer(nn.Module):
         self.convolution1 = Conv2d(channels, channels, kernel_size=3, padding=1)
         self.convolution2 = Conv2d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, op: builder.OpBuilder, hidden_state: ir.Value):
+    def forward(self, op: OpBuilder, hidden_state: ir.Value):
         residual = hidden_state
         hidden_state = op.Relu(hidden_state)
         hidden_state = self.convolution1(op, hidden_state)
@@ -188,7 +187,7 @@ class _FeatureFusionLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_state: ir.Value,
         residual: ir.Value | None = None,
         scale_factor: int = 2,
@@ -247,7 +246,7 @@ class _DepthAnythingNeck(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         patch_height: ir.Value,
         patch_width: ir.Value,
@@ -303,7 +302,7 @@ class _DepthEstimationHead(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         patch_height: ir.Value,
         patch_width: ir.Value,
@@ -360,7 +359,7 @@ class DepthAnythingForDepthEstimation(nn.Module):
         self.neck = _DepthAnythingNeck(config)
         self.head = _DepthEstimationHead(config)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         feature_maps = self.backbone(op, pixel_values)
 
         patch_height = op.Constant(value_int=self.config.image_size // self._patch_size)

@@ -1,4 +1,5 @@
 model_id: "openai/whisper-tiny"
+model_type: "whisper"
 revision: "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"
 task_type: "speech-to-text"
 dtype: "float32"

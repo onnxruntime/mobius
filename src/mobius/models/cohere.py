@@ -22,8 +22,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import MLP, Attention, LayerNorm, LayerNormNoBias, StaticCacheState
@@ -49,7 +48,7 @@ class _CohereDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -114,7 +113,7 @@ class CohereCausalLMModel(LayerNormCausalLMModel):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,

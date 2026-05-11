@@ -20,7 +20,7 @@ Naming convention:
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
@@ -68,7 +68,7 @@ def skip_layer_normalization() -> ir.Function:
         add_out.name = "add_out"
         return norm_out, mean_out, inv_std_out, add_out
 
-    return builder.build_function(
+    return build_function(
         body,
         [
             ir.Value(name="input"),
@@ -114,7 +114,7 @@ def skip_simplified_layer_normalization() -> ir.Function:
         add_out.name = "add_out"
         return norm_out, add_out
 
-    return builder.build_function(
+    return build_function(
         body,
         [
             ir.Value(name="input"),

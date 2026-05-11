@@ -368,11 +368,21 @@ def tie_word_embeddings(
     embed_key: str = "model.embed_tokens.weight",
     head_key: str = "lm_head.weight",
 ) -> None:
-    """Ensure both embedding and LM head weights are present (tied).
+    """Ensure both embedding and LM head weights are present and tied.
 
-    If one of the two keys is missing, copies the other. This handles
-    the common HuggingFace ``tie_word_embeddings=True`` pattern where
-    only one of the two weights is stored in the checkpoint.
+    When HuggingFace saves a model with ``tie_word_embeddings=True``, only
+    one of the two weights (embedding or LM head) is stored in the
+    checkpoint.  This function fills in the missing key by assigning it
+    to **the same Python tensor object** as the existing key.
+
+    This identity relationship is what enables true ONNX weight sharing
+    downstream: :func:`~mobius._weight_loading.apply_weights` detects
+    that two state-dict entries share the same underlying storage (via
+    ``data_ptr()``), creates a **single** ONNX initializer for the first
+    occurrence, and redirects all graph uses of the second initializer to
+    point at the first one.  The result is one copy of the embedding
+    table in the ONNX file, used by both the Gather (embedding lookup)
+    and MatMul (LM head projection) nodes.
 
     Mutates *state_dict* in place.
 
@@ -385,6 +395,12 @@ def tie_word_embeddings(
         state_dict[head_key] = state_dict[embed_key]
     elif embed_key not in state_dict and head_key in state_dict:
         state_dict[embed_key] = state_dict[head_key]
+    elif embed_key not in state_dict and head_key not in state_dict:
+        raise ValueError(
+            f"tie_word_embeddings: neither '{embed_key}' nor '{head_key}' "
+            f"found in state_dict. Check that the key names match the "
+            f"weight dictionary after any prefix stripping."
+        )
 
 
 def vlm_decoder_weights(

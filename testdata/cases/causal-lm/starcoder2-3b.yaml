@@ -1,4 +1,5 @@
 model_id: "bigcode/starcoder2-3b"
+model_type: "starcoder2"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

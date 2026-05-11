@@ -1,4 +1,5 @@
 model_id: "FacebookAI/xlm-roberta-base"
+model_type: "xlm-roberta"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

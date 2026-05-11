@@ -1,4 +1,5 @@
 model_id: "asapp/sew-d-tiny-100k"
+model_type: "sew-d"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

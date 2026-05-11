@@ -88,6 +88,12 @@ def pytest_collection_modifyitems(
             if not hasattr(item, "callspec"):
                 continue
             if "model_type" not in item.callspec.params:
+                # Golden tests use a "case" param with a model_type field
+                if "case" in item.callspec.params:
+                    case = item.callspec.params["case"]
+                    mt = getattr(case, "model_type", None)
+                    if mt and mt not in selected_models:
+                        item.add_marker(skip_model)
                 continue
             model_type = item.callspec.params["model_type"]
             if model_type not in selected_models:

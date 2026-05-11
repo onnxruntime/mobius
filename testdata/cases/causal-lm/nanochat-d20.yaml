@@ -1,4 +1,5 @@
 model_id: "nanochat-students/nanochat-d20"
+model_type: "nanochat"
 revision: "2c8093277a59"
 task_type: "text-generation"
 dtype: "float32"

@@ -8,8 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 if TYPE_CHECKING:
     pass
@@ -41,7 +40,7 @@ class Conv2d(nn.Module):
         self._padding = padding
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -114,7 +113,7 @@ class Conv2dNoBias(nn.Module):
         self._padding = padding
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -141,7 +140,7 @@ class BatchNorm2d(nn.Module):
         self.running_var = nn.Parameter((num_features,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.BatchNormalization(
             x,
             self.weight,
@@ -170,7 +169,7 @@ class ConvTranspose2d(nn.Module):
         self._stride = stride
         self._padding = padding
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.ConvTranspose(
             x,
@@ -203,7 +202,7 @@ class CausalDepthwiseConv1d(nn.Module):
         self._channels = channels
         self._kernel_size = kernel_size
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # x: [B, C, T]
         left_pad = self._kernel_size - 1
         return op.Conv(

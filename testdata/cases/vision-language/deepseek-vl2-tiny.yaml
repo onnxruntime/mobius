@@ -1,4 +1,5 @@
 model_id: "deepseek-ai/deepseek-vl2-tiny"
+model_type: "deepseek_vl_v2"
 revision: "main"
 task_type: "image-text-to-text"
 dtype: "float32"

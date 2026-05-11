@@ -16,8 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Embedding
 
@@ -43,7 +42,7 @@ class EuclideanCodebook(nn.Module):
         # After precomputation this holds the actual embeddings
         self.embedding = Embedding(codebook_size, dim)
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Lookup codebook entries.
 
         Args:
@@ -69,7 +68,7 @@ class VectorQuantization(nn.Module):
         super().__init__()
         self._codebook = EuclideanCodebook(codebook_size, dim)
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Decode codes through one VQ layer.
 
         Args:
@@ -101,7 +100,7 @@ class ResidualVectorQuantization(nn.Module):
             [VectorQuantization(codebook_size, dim) for _ in range(num_layers)]
         )
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Decode and sum across quantizer layers.
 
         Args:
@@ -154,7 +153,7 @@ class ResidualVectorQuantizer(nn.Module):
         self.output_proj = _Conv1dProjParams(dim, output_dim)
         self.vq = ResidualVectorQuantization(num_quantizers, codebook_size, dim)
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Decode codes through projected RVQ.
 
         Args:
@@ -181,7 +180,7 @@ class _Conv1dProjParams(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([out_dim, in_dim, 1])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
             x,
             self.weight,
@@ -229,7 +228,7 @@ class SplitResidualVectorQuantizer(nn.Module):
             output_dim=codebook_dim,
         )
 
-    def forward(self, op: builder.OpBuilder, codes: ir.Value):
+    def forward(self, op: OpBuilder, codes: ir.Value):
         """Decode all code groups and sum.
 
         Args:

@@ -53,6 +53,7 @@ from mobius.models import (
     GraniteMoECausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
+    HunYuanVLMoTModel,
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
     Llama4CausalLMModel,
@@ -94,6 +95,7 @@ from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -118,6 +120,7 @@ from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
@@ -472,6 +475,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
+    "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -508,10 +512,17 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "video_llava": ModelRegistration(LLaVAModel, task="vision-language"),
     "vipllava": ModelRegistration(LLaVAModel, task="vision-language"),
     # --- Speech ---
+    # Fun-ASR uses config.yaml (not config.json). build() auto-detection
+    # won't work — use build_from_module() with manual config construction.
+    # See examples/fun_asr.py for the full pipeline.
+    "fun_asr": ModelRegistration(
+        FunASRForConditionalGeneration, task="fun-asr-speech-language"
+    ),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
     ),
+    "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
     "whisper": ModelRegistration(
@@ -833,6 +844,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "glm4v_moe_text": "THUDM/glm-4v-9b",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
+    "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
@@ -852,6 +864,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Speech ---
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
+    "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -1017,6 +1031,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
+    "fun_asr": "qwen",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",

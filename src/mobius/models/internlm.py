@@ -20,8 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -48,7 +47,7 @@ class _InternLMMLP(nn.Module):
         self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
         self._act_fn = get_activation(config.hidden_act)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate = self._act_fn(op, self.w1(op, hidden_states))
         up = self.w3(op, hidden_states)
         return self.w2(op, op.Mul(gate, up))
@@ -70,7 +69,7 @@ class _InternLMDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -116,7 +115,7 @@ class _InternLMTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -171,7 +170,7 @@ class InternLM2CausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

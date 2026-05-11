@@ -28,18 +28,15 @@ class AudioFeatureExtractionTask(ModelTask):
         module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
-        input_values = ir.Value(
-            name="input_values",
-            type=ir.TensorType(ir.DataType.FLOAT),
-            shape=ir.Shape(("batch", "time")),
-        )
-
-        graph, builder = _make_graph([input_values])
+        graph, builder = _make_graph()
         op = builder.op
+
+        input_values = builder.input(
+            "input_values", dtype=ir.DataType.FLOAT, shape=["batch", "time"]
+        )
 
         last_hidden_state = module(op, input_values=input_values)
 
-        last_hidden_state.name = "last_hidden_state"
-        graph.outputs.append(last_hidden_state)
+        builder.add_output(last_hidden_state, "last_hidden_state")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

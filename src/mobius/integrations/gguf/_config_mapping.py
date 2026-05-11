@@ -22,10 +22,13 @@ from __future__ import annotations
 
 __all__ = ["gguf_to_config"]
 
+import dataclasses
 import logging
 from typing import Any
 
-from mobius._configs import ArchitectureConfig
+import numpy as np
+
+from mobius._configs import ArchitectureConfig, Gemma4Config
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,7 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "gemma3": "gemma3_text",
     # Gemma 4 GGUF contains the text backbone only — no vision or audio encoder.
     # Vision and audio encoders are exported separately from the HuggingFace checkpoint.
-    "gemma4": "gemma4",
+    "gemma4": "gemma4_text",
     "phi3": "phi3",
     "falcon": "falcon",
     "gpt2": "gpt2",
@@ -209,8 +212,14 @@ def gguf_to_config(
     elif head_dim is None:
         head_dim = hidden_size // num_attention_heads
 
-    # Handle num_key_value_heads defaulting to num_attention_heads
+    # Handle num_key_value_heads defaulting to num_attention_heads.
+    # Gemma4 GGUF stores per-layer KV head counts as an array; use the
+    # most common (mode) value as the scalar config value.
     num_kv_heads = hf_fields.get("num_key_value_heads", num_attention_heads)
+    if isinstance(num_kv_heads, (list, np.ndarray)):
+        # Per-layer array → pick the majority value (sliding layers dominate)
+        values = list(num_kv_heads)
+        num_kv_heads = max(set(values), key=values.count)
 
     # Map activation function
     hidden_act = hf_fields.get("hidden_act")
@@ -287,6 +296,14 @@ def gguf_to_config(
     config._gguf_model_type = model_type
     config.model_type = model_type
 
+    # Apply architecture-specific postprocessing to produce the correct
+    # config subclass (e.g. Gemma4Config instead of plain ArchitectureConfig).
+    postprocessor = _CONFIG_POSTPROCESSORS.get(model_type)
+    if postprocessor is not None:
+        config = postprocessor(config, metadata)
+        config._gguf_model_type = model_type
+        config.model_type = model_type
+
     logger.info(
         "Extracted config from GGUF: arch=%s, model_type=%s, "
         "hidden=%d, layers=%d, heads=%d, vocab=%d",
@@ -299,6 +316,179 @@ def gguf_to_config(
     )
 
     return config
+
+
+def _gemma4_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+) -> Gemma4Config:
+    """Convert a base config to Gemma4Config with architecture-specific fields.
+
+    Gemma4 GGUF metadata uses dual-regime keys (global/full-attention vs
+    SWA/sliding-window) for head_dim, RoPE theta, and RoPE rotary count.
+    The base extractor picks up the global values; this postprocessor
+    corrects them for the sliding-window default and stores the global
+    values in Gemma4Config's dedicated fields.
+
+    GGUF key mapping (``gemma4.`` prefix omitted for readability):
+
+    =================================== ======================================
+    GGUF key                            Gemma4Config / ArchitectureConfig field
+    =================================== ======================================
+    attention.key_length                global_head_dim
+    attention.key_length_swa            head_dim (sliding-window, default)
+    rope.freq_base                      global_rope_theta
+    rope.freq_base_swa                  rope_theta (sliding-window, default)
+    rope.dimension_count                (global rotary dim → partial_rotary_factor)
+    rope.dimension_count_swa            (local rotary dim — full rotation)
+    attention.sliding_window            sliding_window
+    attention.sliding_window_pattern    layer_types (bool[] → str[])
+    final_logit_softcapping             final_logit_softcapping
+    attention.shared_kv_layers          num_kv_shared_layers
+    embedding_length_per_layer_input    hidden_size_per_layer_input
+    =================================== ======================================
+    """
+    arch = "gemma4"
+
+    # --- Dual head_dim ---
+    # Base extractor sets head_dim from attention.key_length (global, 512).
+    # Override with sliding-window head_dim (256) as the default.
+    swa_head_dim = metadata.get(f"{arch}.attention.key_length_swa")
+    global_head_dim = metadata.get(f"{arch}.attention.key_length")
+    if swa_head_dim is not None:
+        config = dataclasses.replace(config, head_dim=int(swa_head_dim))
+    elif global_head_dim is not None:
+        logger.warning(
+            "GGUF file missing non-standard key '%s.attention.key_length_swa'. "
+            "Using global head_dim (%d) for sliding-window layers — "
+            "this may be incorrect for Gemma4.",
+            arch,
+            int(global_head_dim),
+        )
+
+    # --- Dual RoPE theta ---
+    # Base extractor sets rope_theta from rope.freq_base (global, 1M).
+    # Override with sliding-window theta (10K) as the default.
+    swa_rope_theta = metadata.get(f"{arch}.rope.freq_base_swa")
+    global_rope_theta = metadata.get(f"{arch}.rope.freq_base")
+    if swa_rope_theta is not None:
+        config = dataclasses.replace(config, rope_theta=float(swa_rope_theta))
+    elif global_rope_theta is not None:
+        logger.warning(
+            "GGUF file missing non-standard key '%s.rope.freq_base_swa'. "
+            "Using global rope_theta (%.1f) for sliding-window layers — "
+            "this may be incorrect for Gemma4.",
+            arch,
+            float(global_rope_theta),
+        )
+
+    # --- Partial rotary factor ---
+    # Global layers use partial rotation: rotary_dim / global_head_dim.
+    # GGUF provides rope.dimension_count (global rotary dim, e.g. 512)
+    # but the actual HF partial_rotary_factor is 0.25, meaning only 128
+    # of 512 dims are rotated.  This isn't directly in GGUF metadata,
+    # so use the known Gemma4 default.
+    # Source: HF Gemma4Config.global_partial_rotary_factor default value
+    # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/configuration_gemma4.py
+    global_partial_rotary_factor = 0.25
+
+    # SWA layers use full rotation (partial_rotary_factor = 1.0), which
+    # is already the base config default.  Reset the base partial_rotary_factor
+    # to 1.0 since the base extractor may have derived it incorrectly.
+    config = dataclasses.replace(config, partial_rotary_factor=1.0)
+
+    # --- Layer types from sliding_window_pattern ---
+    # GGUF stores a bool array: True = sliding, False = full_attention
+    sliding_pattern = metadata.get(f"{arch}.attention.sliding_window_pattern")
+    layer_types: list[str] | None = None
+    if sliding_pattern is not None:
+        if len(sliding_pattern) != config.num_hidden_layers:
+            raise ValueError(
+                f"GGUF metadata length mismatch: "
+                f"attention.sliding_window_pattern has "
+                f"{len(sliding_pattern)} entries but "
+                f"num_hidden_layers is {config.num_hidden_layers}."
+            )
+        layer_types = [
+            "sliding_attention" if is_sliding else "full_attention"
+            for is_sliding in sliding_pattern
+        ]
+    config = dataclasses.replace(config, layer_types=layer_types)
+
+    # --- Sliding window size ---
+    sliding_window = metadata.get(f"{arch}.attention.sliding_window")
+    if sliding_window is not None:
+        config = dataclasses.replace(config, sliding_window=int(sliding_window))
+
+    # --- Softcapping ---
+    final_logit_softcapping = metadata.get(f"{arch}.final_logit_softcapping")
+    attn_logit_softcapping = metadata.get(f"{arch}.attention.logit_softcapping")
+
+    # --- KV sharing ---
+    num_kv_shared_layers = metadata.get(f"{arch}.attention.shared_kv_layers")
+
+    # --- Per-layer input gating ---
+    hidden_size_per_layer_input = metadata.get(f"{arch}.embedding_length_per_layer_input")
+
+    # --- Per-layer KV heads (num_global_key_value_heads) ---
+    # GGUF stores per-layer KV head counts as an array.  When full-attention
+    # layers use fewer KV heads than sliding layers, extract the minority
+    # value as num_global_key_value_heads.
+    num_global_key_value_heads: int | None = None
+    raw_kv_heads = metadata.get(f"{arch}.attention.head_count_kv")
+    if isinstance(raw_kv_heads, (list, np.ndarray)) and sliding_pattern is not None:
+        if len(raw_kv_heads) != len(sliding_pattern):
+            raise ValueError(
+                f"GGUF metadata length mismatch: "
+                f"attention.head_count_kv has {len(raw_kv_heads)} entries "
+                f"but attention.sliding_window_pattern has "
+                f"{len(sliding_pattern)} entries. "
+                f"Both must equal num_hidden_layers."
+            )
+        full_kv_heads = {
+            int(raw_kv_heads[i])
+            for i, is_sliding in enumerate(sliding_pattern)
+            if not is_sliding
+        }
+        if len(full_kv_heads) == 1:
+            global_kv = full_kv_heads.pop()
+            if global_kv != config.num_key_value_heads:
+                num_global_key_value_heads = global_kv
+
+    return Gemma4Config(
+        # Inherit all base ArchitectureConfig fields
+        **{f.name: getattr(config, f.name) for f in dataclasses.fields(ArchitectureConfig)},
+        # Gemma4-specific fields
+        global_head_dim=int(global_head_dim) if global_head_dim is not None else None,
+        global_rope_theta=float(global_rope_theta)
+        if global_rope_theta is not None
+        else 1_000_000.0,
+        global_partial_rotary_factor=global_partial_rotary_factor,
+        num_global_key_value_heads=num_global_key_value_heads,
+        # attention_k_eq_v: derive from per-layer KV head counts. When
+        # full-attention layers use fewer KV heads, V = K (no v_proj).
+        attention_k_eq_v=num_global_key_value_heads is not None,
+        final_logit_softcapping=float(final_logit_softcapping or 0.0),
+        attn_logit_softcapping=float(attn_logit_softcapping or 0.0),
+        num_kv_shared_layers=int(num_kv_shared_layers)
+        if num_kv_shared_layers is not None
+        else 0,
+        hidden_size_per_layer_input=int(hidden_size_per_layer_input)
+        if hidden_size_per_layer_input is not None
+        else 0,
+        # Fields without GGUF metadata — use Gemma4Config defaults
+        vocab_size_per_layer_input=config.vocab_size
+        if (hidden_size_per_layer_input or 0) > 0
+        else 0,
+    )
+
+
+# Architecture-specific config postprocessors.
+# Each takes a base ArchitectureConfig + raw metadata and returns
+# an architecture-specific config subclass.
+_CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "gemma4_text": _gemma4_postprocess,
+}
 
 
 def _default_activation(model_type: str) -> str:

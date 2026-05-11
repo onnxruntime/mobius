@@ -5,8 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
@@ -48,7 +47,7 @@ class SmolLM3TextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -78,14 +77,17 @@ class SmolLM3TextModel(nn.Module):
             attn_bias = (
                 sliding_attn_bias if layer_type == "sliding_attention" else full_attn_bias
             )
-            # SmolLM3 uses no_rope_layers to gate RoPE per layer:
-            # no_rope_layers[i] == 1 → skip RoPE, 0 → apply RoPE
-            skip_rope = (
-                self.no_rope_layers is not None
-                and i < len(self.no_rope_layers)
-                and self.no_rope_layers[i] == 1
+            # SmolLM3 uses no_rope_layers to gate RoPE per layer.
+            # Despite the name, the HF convention is:
+            #   no_rope_layers[i] == 1 → USE RoPE
+            #   no_rope_layers[i] == 0 → skip RoPE
+            # (HF assigns self.use_rope = config.no_rope_layers[layer_idx])
+            use_rope = (
+                self.no_rope_layers is None
+                or i >= len(self.no_rope_layers)
+                or self.no_rope_layers[i] == 1
             )
-            rope = None if skip_rope else position_embeddings
+            rope = position_embeddings if use_rope else None
 
             hidden_states, present_kv = layer(
                 op,

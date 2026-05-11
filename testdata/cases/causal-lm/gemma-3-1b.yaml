@@ -1,4 +1,5 @@
 model_id: "google/gemma-3-1b-pt"
+model_type: "gemma3"
 revision: "fcf18a2a879aab110ca39f8bffbccd5d49d8eb29"
 task_type: "text-generation"
 dtype: "float32"

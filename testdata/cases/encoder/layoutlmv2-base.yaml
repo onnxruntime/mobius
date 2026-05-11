@@ -1,4 +1,5 @@
 model_id: "microsoft/layoutlmv2-base-uncased"
+model_type: "layoutlmv2"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

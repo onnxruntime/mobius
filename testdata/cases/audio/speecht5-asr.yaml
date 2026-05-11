@@ -1,4 +1,5 @@
 model_id: "microsoft/speecht5_asr"
+model_type: "speecht5"
 revision: "main"
 task_type: "speech-to-text"
 dtype: "float32"

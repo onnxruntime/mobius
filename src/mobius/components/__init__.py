@@ -84,6 +84,9 @@ __all__ = [
     "Qwen3VLVisionBlock",
     "Qwen3VLVisionModel",
     "Qwen3VLVisionRotaryEmbedding",
+    "SANMAttention",
+    "SANMEncoderLayer",
+    "SANMFFN",
     "RMSNorm",
     "SelectiveScan",
     "SiLU",
@@ -241,6 +244,11 @@ from mobius.components._rms_norm import (
     apply_rms_norm,
 )
 from mobius.components._rotary_embedding import initialize_rope
+from mobius.components._sanm_attention import (
+    SANMFFN,
+    SANMAttention,
+    SANMEncoderLayer,
+)
 from mobius.components._ssm import (
     JambaSelectiveScan,
     SelectiveScan,

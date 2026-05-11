@@ -20,26 +20,26 @@ class TestMakeProviderOptions:
     def test_cuda_default(self):
         result = make_provider_options("cuda")
         assert len(result) == 1
-        assert "CUDAExecutionProvider" in result[0]
-        assert result[0]["CUDAExecutionProvider"]["enable_cuda_graph"] == "0"
+        assert "cuda" in result[0]
+        assert result[0]["cuda"]["enable_cuda_graph"] == "0"
 
     def test_cuda_with_graph(self):
         result = make_provider_options("cuda", enable_cuda_graph=True)
-        assert result[0]["CUDAExecutionProvider"]["enable_cuda_graph"] == "1"
+        assert result[0]["cuda"]["enable_cuda_graph"] == "1"
 
     def test_dml(self):
         result = make_provider_options("dml")
         assert len(result) == 1
-        assert "DmlExecutionProvider" in result[0]
+        assert "dml" in result[0]
 
     def test_webgpu_default(self):
         result = make_provider_options("webgpu")
-        assert result[0]["WebGpuExecutionProvider"]["enableGraphCapture"] == "0"
-        assert result[0]["WebGpuExecutionProvider"]["validationMode"] == "basic"
+        assert result[0]["webgpu"]["enableGraphCapture"] == "0"
+        assert result[0]["webgpu"]["validationMode"] == "basic"
 
     def test_webgpu_with_graph(self):
         result = make_provider_options("webgpu", enable_webgpu_graph=True)
-        opts = result[0]["WebGpuExecutionProvider"]
+        opts = result[0]["webgpu"]
         assert opts["enableGraphCapture"] == "1"
         assert opts["validationMode"] == "disabled"
 

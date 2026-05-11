@@ -86,6 +86,8 @@ _TEXT_MODELS = [
     # CausalLMModel (base: llama/mistral/qwen2 architecture)
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
     pytest.param("HuggingFaceTB/SmolLM-135M", False, id="smollm-135m"),
+    # SmolLM3 (per-layer RoPE gating via no_rope_layers)
+    pytest.param("HuggingFaceTB/SmolLM3-3B", False, id="smollm3-3b"),
     # Gemma
     pytest.param("google/gemma-3-1b-pt", False, id="gemma3-1b"),
     # Granite
@@ -2213,7 +2215,7 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
     arch_config = ArchitectureConfig.from_transformers(config)
     arch_config.dtype = ir.DataType.FLOAT
     onnx_module = onnx_module_cls(arch_config)
-    pkg = build_from_module(onnx_module, arch_config, task="text-generation")
+    pkg = build_from_module(onnx_module, arch_config, task="hybrid-text-generation")
     onnx_model = pkg["model"]
 
     # Apply HF random weights
@@ -2257,11 +2259,12 @@ def _build_and_compare_qwen3_next(hf_model, config, onnx_module_cls):
             feeds[name] = np.zeros(kv_shape, dtype=np.float32)
         elif name.endswith((".conv_state", ".recurrent_state")):
             # Hybrid cache: use shape from the graph input.
-            # Batch dim (dim 0) must match actual batch size — see
-            # _build_and_compare_qwen35 for the full explanation.
+            # Batch dim (dim 0) must match actual batch size.
+            # Conv state has shape (B, D, K-1) where K-1 is concrete.
+            # Recurrent state may have symbolic dims that default to 0.
             batch_size = input_ids.shape[0]
             shape = tuple(
-                d if isinstance(d, int) else batch_size if i == 0 else 0
+                d if isinstance(d, int) else batch_size if i == 0 else 1
                 for i, d in enumerate(inp.shape)
             )
             feeds[name] = np.zeros(shape, dtype=np.float32)
@@ -3793,7 +3796,7 @@ def test_qwen35_deltanet_single_layer_parity():
     - recurrent_state carry matches HF
     """
     import onnx_ir as ir
-    from onnxscript._internal import builder as onnx_builder
+    from onnxscript import GraphBuilder
 
     try:
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -3855,7 +3858,7 @@ def test_qwen35_deltanet_single_layer_parity():
         name="deltanet_test",
         opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
     )
-    graph_builder = onnx_builder.GraphBuilder(graph)
+    graph_builder = GraphBuilder(graph)
     op = graph_builder.op
 
     output, new_conv, new_rec = onnx_dn(
@@ -3928,19 +3931,20 @@ def test_qwen35_deltanet_single_layer_parity():
 
     # HF forward (single-token decode with pre-filled cache)
     cache = DynamicCache(config=tc)
+    # Use the cache API to pre-fill states so that dtype/device/initialized flags
+    # are all set correctly.  Direct attribute assignment bypasses lazy_initialization
+    # and leaves 'dtype' unset, causing AttributeError on the first update call.
     # HF conv_state shape is (batch, conv_dim, conv_kernel_size) —
-    # pad with one extra left position vs ONNX (kernel_size - 1)
-    cache.layers[0].conv_states = torch.from_numpy(
-        np.pad(conv_np, ((0, 0), (0, 0), (1, 0))),
-    ).float()
-    cache.layers[0].recurrent_states = torch.from_numpy(rec_np).float()
-    # has_previous_state is True once conv_states[0] is set
+    # pad with one extra left position vs ONNX (kernel_size - 1).
+    # update_conv_state also sets has_previous_state = True (decode-mode trigger).
+    padded_conv = torch.from_numpy(np.pad(conv_np, ((0, 0), (0, 0), (1, 0)))).float()
+    cache.update_conv_state(padded_conv, layer_idx=0)
+    cache.update_recurrent_state(torch.from_numpy(rec_np).float(), layer_idx=0)
 
     with torch.no_grad():
         hf_output = hf_dn(
             hidden_states=torch.from_numpy(hidden_np).float(),
             cache_params=cache,
-            cache_position=torch.tensor([conv_kernel - 1]),
         ).numpy()
     hf_rec = cache.layers[0].recurrent_states.numpy()
 

@@ -3,34 +3,47 @@
 
 """Auto-export pipeline for onnxruntime-genai.
 
-Two entry points:
+Three entry points, in order of increasing convenience:
 
-- :func:`write_ort_genai_config` — programmatic API. Takes an already-built
-  :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
-  ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
-  ``image_processor.json``) alongside the ONNX models.
+- :func:`write_ort_genai_config` — config-only API.  Generates the ORT-GenAI
+  config artifacts (``genai_config.json``, tokenizer files,
+  ``processor_config.json`` / ``image_processor.json``) for an already-built
+  :class:`~mobius._model_package.ModelPackage`.  Does **not** write any ONNX
+  files — call :meth:`ModelPackage.save` separately if the ONNX models are
+  not already on disk.  The package only needs ``pkg.config`` and the model
+  graph metadata; weights need not have been written yet.
 
-- :func:`auto_export` — end-to-end convenience function. Builds the model
-  from a HuggingFace ID, saves the ONNX files, then calls
-  :func:`write_ort_genai_config` to write the config artifacts.
+- :func:`export_package` — save+config API. Takes an already-built
+  ``ModelPackage`` and writes both the ONNX models AND the ORT-GenAI config
+  artifacts in one call.  Use this when you built the package manually
+  (e.g. with custom dtype / quantization).
 
-Both functions produce a directory that ``onnxruntime-genai`` can load
-directly.
+- :func:`auto_export` — end-to-end API. Builds the model from a HuggingFace
+  ID and calls :func:`export_package`. Use this for the common
+  HF-model-id → ORT-GenAI-directory case.
+
+All three produce a directory that ``onnxruntime-genai`` can load directly.
 
 Example::
 
-    # Programmatic API — build first, then export configs
+    # Config-only — assumes you've already saved the ONNX files yourself
     from mobius import build
     from mobius.integrations.ort_genai import write_ort_genai_config
 
     pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
-    pkg.save("/output/qwen3")
+    pkg.save("/output/qwen3")  # write ONNX + weights first
     write_ort_genai_config(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B")
 
-    # End-to-end convenience
+    # Save + config — single call, when you have a built package in memory
+    from mobius.integrations.ort_genai import export_package
+
+    pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
+    export_package(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B", ep="cuda")
+
+    # End-to-end — when you only have an HF model id
     from mobius.integrations.ort_genai.auto_export import auto_export
 
-    auto_export("Qwen/Qwen3-0.6B", "/output/qwen3")
+    auto_export("Qwen/Qwen3-0.6B", "/output/qwen3", ep="cuda")
 """
 
 from __future__ import annotations
@@ -63,9 +76,29 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
+    "mistral3": "mistral3",
+    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
+    "qwen2_vl": "qwen2_5_vl",
+    "qwen3_vl": "qwen2_5_vl",
+    "qwen3_vl_text": "qwen2_5_vl",
+    "qwen3_5": "qwen2_5_vl",
+    "qwen3_5_vl": "qwen2_5_vl",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
+_QWEN_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_text",
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_moe",
+        "videochat_flash_qwen",
+    }
+)
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -163,20 +196,185 @@ def _copy_tokenizer_files_from_local(
     return copied
 
 
+# Tokenizer class remapping: HF tokenizer classes that ORT GenAI
+# (ort-extensions) does not support, mapped to compatible alternatives.
+_TOKENIZER_CLASS_REMAP: dict[str, str] = {
+    "TokenizersBackend": "LlamaTokenizer",
+}
+
+
+def _fix_tokenizer_config(output_dir: str) -> bool:
+    """Remap unsupported tokenizer classes for ORT GenAI compatibility.
+
+    Some HuggingFace models use tokenizer classes (e.g.
+    ``TokenizersBackend``) that ORT GenAI's ort-extensions
+    tokenizer doesn't support. This fixes tokenizer_config.json
+    to use a compatible class.
+
+    Returns True if a fix was applied, False otherwise.
+    """
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.exists(tc_path):
+        return False
+
+    with open(tc_path, encoding="utf-8") as f:
+        tc = json.load(f)
+
+    original_class = tc.get("tokenizer_class", "")
+    replacement = _TOKENIZER_CLASS_REMAP.get(original_class)
+    if replacement is None:
+        return False
+
+    tc["tokenizer_class"] = replacement
+    with open(tc_path, "w", encoding="utf-8") as f:
+        json.dump(tc, f, indent=2, ensure_ascii=False)
+    logger.info(
+        "Fixed tokenizer_class: %s -> %s",
+        original_class,
+        replacement,
+    )
+    return True
+
+
+def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+    """Ensure chat_template is present in tokenizer_config.json.
+
+    Some HuggingFace models don't store ``chat_template`` in the
+    raw ``tokenizer_config.json`` file — transformers injects it
+    dynamically from the model class at runtime. ORT GenAI reads
+    the file directly and needs it to be present.
+
+    This function loads the tokenizer via transformers (which
+    applies the dynamic template) and writes it back.
+
+    Returns True if the template was added, False otherwise.
+    """
+    tc_path = os.path.join(output_dir, "tokenizer_config.json")
+    if not os.path.exists(tc_path):
+        return False
+
+    with open(tc_path, encoding="utf-8") as f:
+        tc = json.load(f)
+
+    if tc.get("chat_template"):
+        return False
+
+    if hf_model_id is None:
+        return False
+
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            tc["chat_template"] = template
+            with open(tc_path, "w", encoding="utf-8") as f:
+                json.dump(tc, f, indent=2, ensure_ascii=False)
+            logger.info(
+                "Added chat_template to tokenizer_config.json from %s",
+                hf_model_id,
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "Could not load tokenizer for %s to extract chat_template",
+            hf_model_id,
+            exc_info=True,
+        )
+    return False
+
+
+def _build_vision_transform_pipeline(
+    *,
+    image_size: int,
+    patch_size: int,
+    merge_size: int,
+    rescale_factor: float,
+    image_mean: list[float],
+    image_std: list[float],
+    min_pixels: int = 784,
+    max_pixels: int = 2371600,
+) -> list[dict[str, Any]]:
+    """Build the common 5-step vision transform pipeline.
+
+    Returns the base transforms: DecodeImage → ConvertRGB → Resize →
+    Rescale → Normalize.  Callers may append model-specific steps
+    (e.g. Permute3D, PixtralImageSizes) after this.
+    """
+    return [
+        {
+            "operation": {
+                "name": "decode_image",
+                "type": "DecodeImage",
+                "attrs": {"color_space": "RGB"},
+            }
+        },
+        {
+            "operation": {
+                "name": "convert_to_rgb",
+                "type": "ConvertRGB",
+            }
+        },
+        {
+            "operation": {
+                "name": "resize",
+                "type": "Resize",
+                "attrs": {
+                    "height": image_size,
+                    "width": image_size,
+                    "smart_resize": 1,
+                    "min_pixels": min_pixels,
+                    "max_pixels": max_pixels,
+                    "patch_size": patch_size,
+                    "merge_size": merge_size,
+                },
+            }
+        },
+        {
+            "operation": {
+                "name": "rescale",
+                "type": "Rescale",
+                "attrs": {
+                    "rescale_factor": rescale_factor,
+                },
+            }
+        },
+        {
+            "operation": {
+                "name": "normalize",
+                "type": "Normalize",
+                "attrs": {
+                    "mean": image_mean,
+                    "std": image_std,
+                },
+            }
+        },
+    ]
+
+
 def _write_vision_processor_config(
     config: Any,
     output_dir: str,
+    *,
+    hf_model_id: str | None = None,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
+
+    Generates the ORT-extensions image transform pipeline derived from the
+    HuggingFace image processor config. When ``hf_model_id`` is provided,
+    loads the HF processor to extract normalization values and resize
+    parameters. Otherwise falls back to CLIP-standard defaults.
 
     The output format depends on the model type:
 
     - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
-      in the onnxruntime-extensions transforms pipeline format required by
-      ``OrtxCreateProcessor``.  The pipeline is
-      ``DecodeImage → Gemma4ImageTransform``.
-    - **Other models**: Writes ``processor_config.json`` with a minimal
-      HuggingFace-style schema (``image_size``, ``patch_size``).
+      with a ``DecodeImage → Gemma4ImageTransform`` pipeline.
+    - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
+      pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
+      Permute3D → PixtralImageSizes).
+    - **Other VLMs**: Writes ``processor_config.json`` with a 5-step pipeline
+      (DecodeImage → ConvertRGB → Resize → Rescale → Normalize).
 
     Returns the written file path, or None if the config has no vision section.
     """
@@ -185,15 +383,12 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
+    vision_model_type = getattr(vision, "model_type", None)
+    is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
 
     if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs an onnxruntime-extensions format processor config
         # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
-        # The OrtxCreateProcessor API requires this format.
-        #
-        # max_soft_tokens: maps from HF's mm_tokens_per_image (the number of
-        # vision tokens per image after pooling) into the Gemma4ImageTransform's
-        # max_soft_tokens attribute, which controls the padded patch budget.
         max_soft_tokens = (
             getattr(vision, "mm_tokens_per_image", None)
             or getattr(config, "mm_tokens_per_image", None)
@@ -201,7 +396,7 @@ def _write_vision_processor_config(
         )
         patch_size = getattr(vision, "patch_size", None) or 16
         pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
-        processor = {
+        processor_config: dict[str, Any] = {
             "processor": {
                 "name": "gemma_4_image_processing",
                 "transforms": [
@@ -226,15 +421,127 @@ def _write_vision_processor_config(
                 ],
             }
         }
+        path = os.path.join(output_dir, "image_processor.json")
     else:
-        processor = {
-            "image_size": getattr(vision, "image_size", None) or 448,
-            "patch_size": getattr(vision, "patch_size", None) or 14,
-        }
+        # Pixtral and generic VLMs share the same base pipeline;
+        # Pixtral adds Permute3D + PixtralImageSizes at the end.
+        patch_size = getattr(vision, "patch_size", 14) or 14
+        merge_size = (
+            getattr(vision, "spatial_merge_size", None)
+            or getattr(config, "spatial_merge_size", 2)
+            or 2
+        )
 
-    path = os.path.join(output_dir, "image_processor.json")
+        # CLIP-standard normalization defaults
+        image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.26862954, 0.26130258, 0.27577711]
+        rescale_factor = 1.0 / 255.0
+        min_pixels = 784
+        max_pixels = 2371600
+        image_size = getattr(vision, "image_size", None)
+
+        if hf_model_id is not None:
+            try:
+                from transformers import AutoProcessor
+
+                hf_proc = AutoProcessor.from_pretrained(hf_model_id)
+                ip = getattr(hf_proc, "image_processor", None)
+                if ip is not None:
+                    image_mean = list(getattr(ip, "image_mean", image_mean))
+                    image_std = list(getattr(ip, "image_std", image_std))
+                    rescale_factor = getattr(ip, "rescale_factor", rescale_factor)
+                    if hasattr(ip, "size"):
+                        size = ip.size
+                        if isinstance(size, dict):
+                            if "longest_edge" in size:
+                                image_size = size["longest_edge"]
+                            min_pixels = size.get("shortest_edge", min_pixels)
+                            max_pixels = size.get("longest_edge", max_pixels)
+                        elif isinstance(size, int):
+                            image_size = size
+            except Exception:
+                logger.warning(
+                    "Could not load HF processor for %s; "
+                    "using CLIP-standard normalization defaults",
+                    hf_model_id,
+                    exc_info=True,
+                )
+
+        if image_size is None:
+            image_size = 1540 if is_pixtral else 448
+
+        transforms = _build_vision_transform_pipeline(
+            image_size=image_size,
+            patch_size=patch_size,
+            merge_size=merge_size,
+            rescale_factor=rescale_factor,
+            image_mean=image_mean,
+            image_std=image_std,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+
+        if is_pixtral:
+            # Pixtral requires Permute3D (HWC→CHW) and PixtralImageSizes
+            # for the per-image slicing loop in PixtralVisionState.
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "permute",
+                        "type": "Permute3D",
+                        "attrs": {"dims": [2, 0, 1]},
+                    }
+                }
+            )
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "pixtral_image_sizes",
+                        "type": "PixtralImageSizes",
+                    }
+                }
+            )
+        elif model_type in _QWEN_VL_MODEL_TYPES:
+            # Qwen-VL models need the PatchImage transform to extract
+            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
+            # on Normalize for correct interleaving.
+            temporal_patch_size = config.temporal_patch_size
+            # Add qwen3_vl flag to the Normalize step
+            for t in transforms:
+                op = t.get("operation", {})
+                if op.get("type") == "Normalize":
+                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "patch_image",
+                        "type": "PatchImage",
+                        "attrs": {
+                            "patch_size": patch_size,
+                            "temporal_patch_size": temporal_patch_size,
+                            "merge_size": merge_size,
+                        },
+                    }
+                }
+            )
+
+        processor_name = (
+            "pixtral_image_processor"
+            if is_pixtral
+            else "qwen2_5_image_processor"
+            if model_type in _QWEN_VL_MODEL_TYPES
+            else "image_processor"
+        )
+        processor_config = {
+            "processor": {
+                "name": processor_name,
+                "transforms": transforms,
+            }
+        }
+        path = os.path.join(output_dir, "processor_config.json")
+
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(processor, f, indent=4)
+        json.dump(processor_config, f, indent=4)
     return path
 
 
@@ -355,12 +662,31 @@ def _write_genai_config(
             model_type = getattr(config, "model_type", "")
             if model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
-                sms = getattr(vision_cfg, "spatial_merge_size", 2)
-                vision_kwargs["spatial_merge_size"] = sms
-                vision_kwargs["config_filename"] = "image_processor.json"
+                vision_kwargs["spatial_merge_size"] = getattr(
+                    vision_cfg, "spatial_merge_size", 2
+                )
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
-                vision_kwargs["config_filename"] = "image_processor.json"
+            elif (
+                model_type in _PIXTRAL_MODEL_TYPES
+                or getattr(getattr(config, "vision", None), "model_type", None) == "pixtral"
+            ):
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", 2
+                )
+                vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
+            else:
+                # All other VLMs (Qwen-VL, LLaVA, InternVL, etc.) use
+                # processor_config.json written by _write_vision_processor_config.
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", None
+                )
+                if sms is not None:
+                    vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
@@ -569,7 +895,7 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     # Write processor config for VLMs
-    processor_path = _write_vision_processor_config(config, directory)
+    processor_path = _write_vision_processor_config(config, directory, hf_model_id=hf_model_id)
     if processor_path:
         result["processor_config"] = processor_path
 
@@ -578,7 +904,126 @@ def write_ort_genai_config(
     if audio_proc_path:
         result["audio_processor"] = audio_proc_path
 
+    # Fix unsupported tokenizer classes
+    _fix_tokenizer_config(directory)
+
+    # Ensure chat_template is in tokenizer_config.json
+    _fix_chat_template(directory, hf_model_id)
+
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
+    return result
+
+
+def export_package(
+    pkg: ModelPackage,
+    output_dir: str,
+    *,
+    hf_model_id: str | None = None,
+    ep: str = "cpu",
+    context_length: int = 4096,
+    local_config_dir: str | None = None,
+    external_data: str = "onnx",
+    progress_bar: bool = True,
+) -> dict[str, str]:
+    """Save an already-built ModelPackage as a complete ORT-GenAI directory.
+
+    This is the convenience function for users who built a ``ModelPackage``
+    themselves (e.g. with custom dtype / quantization / weight overrides) and
+    want a single call that produces an ``onnxruntime-genai``-loadable
+    directory.  It calls :meth:`ModelPackage.save` followed by
+    :func:`write_ort_genai_config`.
+
+    For the end-to-end case where you start from a HuggingFace model id, use
+    :func:`auto_export` instead — it builds the package for you.
+
+    Args:
+        pkg: Already-built :class:`~mobius._model_package.ModelPackage` with
+            weights applied and ``config`` set.  All components in *pkg* are
+            saved; selective export via :meth:`ModelPackage.save`'s
+            ``components`` filter is intentionally not exposed here, because
+            the ORT-GenAI runtime expects the on-disk file layout to match
+            what ``model.type`` in :file:`genai_config.json` declares (e.g. a
+            multimodal ``model.type`` implies a vision encoder file is
+            present).  If you need a partial export, build a separate
+            filtered ``ModelPackage`` first.
+        output_dir: Output directory (created if needed).
+        hf_model_id: HuggingFace model ID for tokenizer download / token-id
+            resolution.  When ``None``, token IDs are read from ``pkg.config``
+            and tokenizer files are not copied (unless ``local_config_dir``
+            is provided).
+        ep: Execution provider written to ``session_options`` in
+            ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``).
+        context_length: Minimum context length written to ``genai_config.json``.
+            Overridden upward by ``pkg.config.max_position_embeddings`` when
+            larger.
+        local_config_dir: Local model directory to copy tokenizer files from
+            when ``hf_model_id`` is ``None``.
+        external_data: External-data format passed to :meth:`ModelPackage.save`
+            (``"onnx"`` or ``"safetensors"``).
+        progress_bar: Whether to show the save progress bar.
+
+    Returns:
+        Manifest dict mapping artifact names to paths::
+
+            {
+                "model": "/output/model.onnx",          # or per-component paths
+                "genai_config": "/output/genai_config.json",
+                "tokenizer.json": "/output/tokenizer.json",
+                ...
+            }
+
+    Raises:
+        ValueError: If ``pkg.config`` is ``None`` (required for genai_config
+            generation; e.g. diffusion models have no config and are not
+            supported).
+
+    Example::
+
+        from mobius import build
+        from mobius.integrations.ort_genai import export_package
+
+        pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
+        export_package(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B", ep="cuda")
+    """
+    # Preflight: fail fast before writing ONNX so the user doesn't end up
+    # with a half-exported directory containing only the model file.
+    if getattr(pkg, "config", None) is None:
+        raise ValueError(
+            "export_package requires ModelPackage.config to be set. "
+            "This is set automatically when building with mobius.build(). "
+            "Diffusion models (which have no config) are not supported — "
+            "use ModelPackage.save() directly for those."
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Save ONNX models + weights
+    logger.info("Saving ONNX models to %s", output_dir)
+    pkg.save(
+        output_dir,
+        external_data=external_data,
+        progress_bar=progress_bar,
+    )
+
+    # 2. Write ORT-GenAI config artifacts
+    result = write_ort_genai_config(
+        pkg,
+        output_dir,
+        hf_model_id=hf_model_id,
+        ep=ep,
+        context_length=context_length,
+        local_config_dir=local_config_dir,
+    )
+
+    # 3. Add ONNX paths to the manifest
+    if len(pkg) == 1:
+        result["model"] = os.path.join(output_dir, "model.onnx")
+    else:
+        for name in pkg:
+            result[name] = os.path.join(output_dir, name, "model.onnx")
+
+    logger.info("Export complete: %d artifacts", len(result))
     return result
 
 
@@ -648,28 +1093,16 @@ def auto_export(
             "Diffusion models are not yet supported."
         )
 
-    # Save ONNX models
-    logger.info("Saving ONNX models to %s", output_dir)
-    pkg.save(
-        output_dir,
-        external_data=external_data,
-        progress_bar=progress_bar,
-    )
-
-    # Write ORT-GenAI config artifacts (genai_config.json, tokenizer, processor)
-    result = write_ort_genai_config(
+    # Delegate save + config generation to the integration helper.
+    # `export_package` already logs "Export complete" so we don't repeat it here.
+    result = export_package(
         pkg,
         output_dir,
         hf_model_id=model_id,
         ep=ep,
         context_length=context_length,
+        external_data=external_data,
+        progress_bar=progress_bar,
     )
 
-    # Add ONNX model paths to manifest
-    if len(pkg) == 1:
-        result["model"] = os.path.join(output_dir, "model.onnx")
-    else:
-        for name in pkg:
-            result[name] = os.path.join(output_dir, name, "model.onnx")
-
-    logger.info("Export complete: %d artifacts", len(result))
+    return result

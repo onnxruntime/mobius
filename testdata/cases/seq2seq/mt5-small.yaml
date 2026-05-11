@@ -1,4 +1,5 @@
 model_id: "google/mt5-small"
+model_type: "mt5"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

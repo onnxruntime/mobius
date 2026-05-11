@@ -7,8 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Embedding, Linear
@@ -68,7 +67,7 @@ class EncoderDecoderAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         key_value_states: ir.Value | None = None,
         attention_bias: ir.Value | None = None,

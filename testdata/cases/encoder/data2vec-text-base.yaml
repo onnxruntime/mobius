@@ -1,4 +1,5 @@
 model_id: "facebook/data2vec-text-base"
+model_type: "data2vec-text"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

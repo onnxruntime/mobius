@@ -15,8 +15,7 @@ from __future__ import annotations
 import itertools
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import QwenImageVAEConfig
 from mobius.components import Conv2d as _Conv2d
@@ -78,7 +77,7 @@ class _CausalConv3d(nn.Module):
         ]
         self._needs_pad = any(p > 0 for p in self._onnx_pads)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         if self._needs_pad:
             x = op.Pad(
                 x,
@@ -109,7 +108,7 @@ class _RMSNorm3d(nn.Module):
         self.gamma = nn.Parameter((dim, 1, 1, 1))
         self._scale = dim**0.5
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # F.normalize(x, dim=1) * scale * gamma
         # L2 normalize along channel dimension
         norm = op.ReduceL2(x, [1], keepdims=True)
@@ -135,7 +134,7 @@ class _ResidualBlock(nn.Module):
         self.conv_shortcut = _CausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else None
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         h = x if self.conv_shortcut is None else self.conv_shortcut(op, x)
         x = self.norm1(op, x)
         x = self._silu(op, x)
@@ -161,7 +160,7 @@ class _AttentionBlock(nn.Module):
         self.proj = _Conv2d(dim, dim, kernel_size=1)
         self._dim = dim
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         identity = x
         # x: (B, C, T, H, W)
         b_shape = op.Shape(x, start=0, end=1)
@@ -225,7 +224,7 @@ class _MidBlock(nn.Module):
             self.attentions.append(_AttentionBlock(dim))
             self.resnets.append(_ResidualBlock(dim, dim))
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.resnets[0](op, x)
         for i in range(len(self.attentions)):
             x = self.attentions[i](op, x)
@@ -252,7 +251,7 @@ class _SequentialConv2d(nn.Module):
         setattr(self, "1", conv)
         self._asymmetric_pad = asymmetric_pad
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         if self._asymmetric_pad:
             # Asymmetric pad (0,1,0,1) on H,W — equivalent to ZeroPad2d
             x = op.Pad(
@@ -297,7 +296,7 @@ class _Resample(nn.Module):
             )
             self.time_conv = _CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, C, T, H, W)
         b_shape = op.Shape(x, start=0, end=1)
         c_shape = op.Shape(x, start=1, end=2)
@@ -405,7 +404,7 @@ class _Encoder3d(nn.Module):
         self.conv_out = _CausalConv3d(dims[-1], z_dim * 2, 3, padding=1)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.conv_in(op, x)
         x = self.down_blocks(op, x)
         x = self.mid_block(op, x)
@@ -435,7 +434,7 @@ class _UpBlock(nn.Module):
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList([_Resample(out_dim, mode=upsample_mode)])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.resnets(op, x)
         if self.upsamplers is not None:
             x = self.upsamplers[0](op, x)
@@ -475,7 +474,7 @@ class _Decoder3d(nn.Module):
         self.conv_out = _CausalConv3d(dims[-1], 3, 3, padding=1)
         self._silu = _SiLU()
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         x = self.conv_in(op, x)
         x = self.mid_block(op, x)
         x = self.up_blocks(op, x)

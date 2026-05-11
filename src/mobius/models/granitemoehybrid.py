@@ -27,8 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import GraniteMoeHybridConfig
 from mobius.components import (
@@ -62,7 +61,7 @@ class _Linear3D(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([n_experts, out_features, in_features])
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value, expert_index: int) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value, expert_index: int) -> ir.Value:
         """Select expert *expert_index* and compute ``x @ W[expert_index].T``."""
         # W[e]: [out_features, in_features]
         w_e = op.Squeeze(op.Gather(self.weight, [expert_index], axis=0), [0])
@@ -113,7 +112,7 @@ class _FusedMoEBlock(nn.Module):
             config.intermediate_size,
         )
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         """Route tokens to experts and accumulate weighted outputs."""
         # routing_weights: [batch*seq, top_k], selected_experts: [batch*seq, top_k]
         routing_weights, selected_experts = self.gate(op, hidden_states)
@@ -173,7 +172,7 @@ class _FusedSharedMLP(nn.Module):
         )
         self.act_fn = get_activation(config.hidden_act)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         gate_up = self.input_linear(op, x)  # [*, 2*shared_intermediate]
         gate, up = op.Split(gate_up, axis=-1, num_outputs=2, _outputs=2)
         return self.output_linear(op, op.Mul(self.act_fn(op, gate), up))
@@ -223,7 +222,7 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -289,7 +288,7 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -357,7 +356,7 @@ class _GraniteMoeHybridTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -417,7 +416,7 @@ class GraniteMoeHybridCausalLMModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,

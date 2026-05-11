@@ -61,11 +61,14 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
 
     caps = ep_registry.get(ep)
     share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
-    if share_buffer:
-        # EPs that pre-allocate KV-cache for the full max_length at load time
-        # (e.g. WebGPU) need a capped default to avoid pre-allocating huge
-        # buffers (~8 GB for 128K-token models) on consumer hardware.  Users
-        # can raise the limit in genai_config.json for their target device.
+    cap_length = caps.cap_kv_buffer_max_length if caps is not None else False
+    if share_buffer and cap_length:
+        # Memory-constrained EPs (e.g. WebGPU on consumer GPUs) pre-allocate
+        # KV-cache for the full max_length at load time.  Cap the default to
+        # avoid pre-allocating huge buffers (~8 GB for 128K-token models).
+        # Users can raise the limit in genai_config.json for their device.
+        # The cap only applies when buffer sharing is also active — without
+        # sharing, the runtime grows the cache on demand and no cap is needed.
         max_length = min(context_length, _SHARE_BUFFER_MAX_LENGTH_CAP)
     else:
         max_length = context_length
@@ -174,6 +177,9 @@ class GenaiConfigGenerator:
 
         # Optional audio fields (set via with_audio())
         self._audio: dict[str, Any] | None = None
+
+        # Search config overrides applied in generate()
+        self._search_overrides: dict[str, Any] = {}
 
     @classmethod
     def from_config(
@@ -404,9 +410,12 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
+        search = _default_search_params(ep=self.ep, context_length=self.context_length)
+        search.update(self._search_overrides)
+
         return {
             "model": model,
-            "search": _default_search_params(ep=self.ep, context_length=self.context_length),
+            "search": search,
         }
 
     def write(self, output_dir: str) -> str:

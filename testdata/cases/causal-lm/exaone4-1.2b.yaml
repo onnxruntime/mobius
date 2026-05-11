@@ -1,4 +1,5 @@
 model_id: "LGAI-EXAONE/EXAONE-4.0-1.2B"
+model_type: "exaone4"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

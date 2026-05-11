@@ -73,11 +73,26 @@ class ModelPackage(UserDict[str, ir.Model]):
         ``model.onnx`` in *directory*.  When multiple models are present,
         each is saved in its own subfolder as ``{name}/model.onnx``.
 
+        .. note::
+            This method writes ONNX files only.  If you need a directory that
+            ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
+            tokenizer files), use
+            :func:`mobius.integrations.ort_genai.export_package` instead — it
+            wraps :meth:`save` with the ORT-GenAI config-generation step.
+
         Args:
             directory: Path to the output directory (created if needed).
             external_data: External data format. ``"onnx"`` (default) saves
                 weights to ``model.onnx.data``. ``"safetensors"`` saves
                 weights in safetensors format.
+
+                .. warning::
+                    The safetensors format does not guarantee 256-byte offset
+                    alignment for tensor data within the file.  This can cause
+                    ``CUBLAS_STATUS_INVALID_VALUE`` ("misaligned address")
+                    errors on some CUDA/cuBLAS versions when loading weights
+                    via memory-mapped I/O.  Use ``"onnx"`` (the default) for
+                    models targeting CUDA execution.
             max_shard_size_bytes: Maximum shard size in bytes for safetensors
                 format.  Only used when *external_data* is ``"safetensors"``.
             components: Optional predicate ``(name) -> bool`` that selects

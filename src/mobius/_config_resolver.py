@@ -115,9 +115,14 @@ def _dict_to_pretrained_config(d: dict):
     """
     import transformers
 
-    config = transformers.PretrainedConfig(**d)
-    # Recursively convert known nested config keys
-    nested_keys = (
+    # Composite configs (e.g. configs with text_config/thinker_config) may
+    # duplicate rope_scaling at the top level.  PretrainedConfig's rope
+    # standardization (__post_init__ → standardize_rope_params) can crash
+    # with AttributeError when self.max_position_embeddings is not yet set.
+    # Strip top-level rope fields ONLY for composite configs — the nested
+    # text_config will carry its own rope_scaling with correct context.
+    # Non-composite (flat) configs must keep rope fields intact.
+    nested_config_keys = (
         "thinker_config",
         "talker_config",
         "text_config",
@@ -127,7 +132,36 @@ def _dict_to_pretrained_config(d: dict):
         "code_predictor_config",
         "speaker_encoder_config",
     )
-    for key in nested_keys:
+    is_composite = any(isinstance(d.get(k), dict) for k in nested_config_keys)
+    rope_keys = ("rope_scaling", "rope_parameters")
+    if is_composite and any(k in d for k in rope_keys):
+        logger.debug(
+            "Stripping top-level rope fields from composite %s config",
+            d.get("model_type", "unknown"),
+        )
+        d = {k: v for k, v in d.items() if k not in rope_keys}
+
+    try:
+        config = transformers.PretrainedConfig(**d)
+    except (AttributeError, KeyError, TypeError) as e:
+        # Newer transformers may crash during rope standardization
+        # (e.g. Phi4-MM longrope format where PretrainedConfig doesn't
+        # set max_position_embeddings before accessing it).  Strip rope
+        # fields, construct the config, then restore them as attributes
+        # so _extract_rope_config can still read them.
+        logger.warning(
+            "Retrying %s config without rope fields after PretrainedConfig init failure: %s",
+            d.get("model_type", "unknown"),
+            e,
+        )
+        saved_rope = {k: d[k] for k in rope_keys if k in d}
+        d_clean = {k: v for k, v in d.items() if k not in rope_keys}
+        config = transformers.PretrainedConfig(**d_clean)
+        for k, v in saved_rope.items():
+            setattr(config, k, v)
+
+    # Recursively convert known nested config keys
+    for key in nested_config_keys:
         val = getattr(config, key, None)
         if isinstance(val, dict):
             setattr(config, key, _dict_to_pretrained_config(val))

@@ -1,4 +1,5 @@
 model_id: "andreasmadsen/efficient_mlm_m0.40"
+model_type: "roberta-prelayernorm"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

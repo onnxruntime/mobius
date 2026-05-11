@@ -1,4 +1,5 @@
 model_id: "optimum-intel-internal-testing/tiny-random-NystromformerModel"
+model_type: "nystromformer"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

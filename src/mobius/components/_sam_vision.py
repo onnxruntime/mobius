@@ -21,8 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import Linear
 from mobius.components._mlp import FCMLP
@@ -51,7 +50,7 @@ class _SAMPatchEmbed(nn.Module):
         self.bias = nn.Parameter((embed_dim,), name="proj.bias")
         self._kernel_size = kernel_size
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # (B, 3, H, W) → (B, embed_dim, H/16, W/16)
         x = op.Conv(
             x,
@@ -79,7 +78,7 @@ class _SAMLayerNorm2d(nn.Module):
         self._eps = eps
         self._num_channels = num_channels
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, C, H, W) — normalize over C dimension
         # Reshape to (B, C, H*W), normalize, reshape back
         # Or use InstanceNormalization which normalizes per-channel
@@ -139,7 +138,7 @@ class _SAMAttention(nn.Module):
         relative_coords = q_coords - k_coords + (k_size - 1)
         return relative_coords.astype(np.int64)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, H, W, C)
         # Flatten spatial dims for attention
         B = op.Shape(x, start=0, end=1)  # noqa: N806
@@ -289,7 +288,7 @@ class _SAMBlock(nn.Module):
             self._Hp = H + self._pad_h
             self._Wp = W + self._pad_w
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, H, W, C)
         shortcut = x
         x = self.norm1(op, x)
@@ -366,7 +365,7 @@ class _SAMLayerNorm(nn.Module):
         self.bias = nn.Parameter([hidden_size])
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.LayerNormalization(x, self.weight, self.bias, epsilon=self._eps, axis=-1)
 
 
@@ -387,7 +386,7 @@ class _SAMConv2dNoBias(nn.Module):
         self._stride = stride
         self._padding = padding
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
@@ -487,7 +486,7 @@ class SAMVisionEncoder(nn.Module):
                 padding=1,
             )
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: (B, 3, 1024, 1024)
         # → (B, 64, 64, 768)
         x = self.patch_embed(op, pixel_values)

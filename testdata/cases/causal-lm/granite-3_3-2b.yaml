@@ -1,4 +1,5 @@
 model_id: "ibm-granite/granite-3.3-2b-instruct"
+model_type: "granite"
 revision: "707f574c62054322f6b5b04b6d075f0a8f05e0f0"
 task_type: "text-generation"
 dtype: "float32"

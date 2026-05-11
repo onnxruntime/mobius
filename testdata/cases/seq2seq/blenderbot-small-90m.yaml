@@ -1,4 +1,5 @@
 model_id: "facebook/blenderbot_small-90M"
+model_type: "blenderbot-small"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

@@ -8,8 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
@@ -40,7 +39,7 @@ class _CLIPVisionEmbeddings(nn.Module):
         num_patches = (image_size // patch_size) ** 2
         self.position_embedding = Embedding(num_patches + 1, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_embeds = self.patch_embedding(op, pixel_values)
         batch_size = op.Shape(pixel_values, start=0, end=1)
 
@@ -71,7 +70,7 @@ class _Conv2dPatchEmbed(nn.Module):
         super().__init__()
         self.projection = Conv2d(in_channels, out_channels, kernel_size, stride)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Conv2d: [batch, channels, H, W] -> [batch, out_channels, H', W']
         conv_out = self.projection(op, x)
         # Reshape [batch, out_channels, H', W'] -> [batch, num_patches, out_channels]
@@ -98,7 +97,7 @@ class _CLIPVisionEncoderLayer(nn.Module):
         )
         self.layer_norm2 = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
         hidden_states = self.self_attn(op, hidden_states)
@@ -129,7 +128,7 @@ class CLIPVisionModel(nn.Module):
         self.pre_layrnorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
         hidden_states = self.pre_layrnorm(op, hidden_states)
 
@@ -230,7 +229,7 @@ class _SigLIPVisionEmbeddings(nn.Module):
         num_patches = (image_size // patch_size) ** 2
         self.position_embedding = Embedding(num_patches, hidden_size)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_embeds = self.patch_embedding(op, pixel_values)
         # Position IDs: [0, 1, ..., num_patches-1]
         seq_len = op.Shape(patch_embeds, start=1, end=2)
@@ -260,7 +259,7 @@ class SigLIPVisionModel(nn.Module):
         )
         self.post_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: builder.OpBuilder, pixel_values: ir.Value):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value):
         hidden_states = self.embeddings(op, pixel_values)
 
         for layer in self.encoder:
@@ -344,7 +343,7 @@ class _CLIPTextEmbeddings(nn.Module):
         self.word_embeddings = Embedding(config.vocab_size, config.hidden_size)
         self.position_embedding = Embedding(config.max_position_embeddings, config.hidden_size)
 
-    def forward(self, op: builder.OpBuilder, input_ids: ir.Value):
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
         token_embeds = self.word_embeddings(op, input_ids)
         seq_len = op.Shape(input_ids, start=1, end=2)
         position_ids = op.Range(
@@ -374,7 +373,7 @@ class _CLIPTextEncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
     ):
@@ -410,7 +409,7 @@ class CLIPTextModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         attention_mask: ir.Value,
         token_type_ids: ir.Value,  # Unused but required by FeatureExtractionTask interface

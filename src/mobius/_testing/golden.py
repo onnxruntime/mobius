@@ -70,6 +70,9 @@ class GoldenTestCase:
     model_id: str
     """HuggingFace model ID (e.g. ``Qwen/Qwen2.5-0.5B``)."""
 
+    model_type: str
+    """Registry model_type key (e.g. ``qwen2``, ``llama``)."""
+
     revision: str
     """HF model revision / commit SHA."""
 
@@ -204,7 +207,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         raise TypeError(f"Expected a YAML mapping in {yaml_path}, got {type(data)}")
 
     # Validate required top-level fields
-    _required = ("model_id", "revision", "task_type", "dtype", "level")
+    _required = ("model_id", "model_type", "revision", "task_type", "dtype", "level")
     missing = [k for k in _required if k not in data]
     if missing:
         raise ValueError(f"Missing required fields in {yaml_path}: {missing}")
@@ -220,6 +223,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         case_id=case_id,
         task_type=data["task_type"],
         model_id=data["model_id"],
+        model_type=data["model_type"],
         revision=data["revision"],
         dtype=data["dtype"],
         level=data["level"],

@@ -1,4 +1,5 @@
 model_id: "google/gemma-4-E4B-it"
+model_type: "gemma4_text"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
