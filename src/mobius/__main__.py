@@ -222,7 +222,7 @@ def _save_package(
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
-    if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
+    if args.external_data == "safetensors" and args.execution_provider == "cuda":
         logging.getLogger(__name__).warning(
             "Safetensors external data does not guarantee 256-byte offset "
             "alignment, which can cause CUBLAS misaligned address errors on "
@@ -232,6 +232,7 @@ def _save_package(
     runtime = getattr(args, "runtime", None)
 
     if runtime == "ort-genai":
+        from mobius._model_package import ModelPackage
         from mobius.integrations.ort_genai import write_ort_genai_config
         from mobius.integrations.ort_genai.auto_export import _resolve_component_map
 
@@ -247,12 +248,23 @@ def _save_package(
         for component_name, model_path in saved.items():
             print(f"Saved {component_name} to {model_path}")
 
+        # Restrict config generation to exactly the components that were saved
+        # so manifest.json / metadata.json don't reference components whose
+        # ONNX files were excluded by --component.
+        if components is not None:
+            config_pkg = ModelPackage(
+                {name: model for name, model in pkg.items() if components(name)},
+                config=pkg.config,
+            )
+        else:
+            config_pkg = pkg
+
         hf_model_id = getattr(args, "model", None)
         # When --config (local dir) is used instead of --model, copy tokenizer
         # files from the local directory rather than downloading from HF.
         local_config_dir = getattr(args, "config", None)
         artifacts = write_ort_genai_config(
-            pkg,
+            config_pkg,
             output_dir,
             hf_model_id=hf_model_id,
             local_config_dir=local_config_dir,

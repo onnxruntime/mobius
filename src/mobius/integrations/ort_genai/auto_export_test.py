@@ -480,6 +480,29 @@ class TestExportForOrtGenai:
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
 
+    def test_duplicate_component_names_rejected(self, tmp_path, monkeypatch):
+        """Two package keys mapping to the same on-disk component is rejected.
+
+        Prevents manifest.json from listing duplicates and per-component
+        metadata.json / variant.json files from clobbering each other.
+        """
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai import auto_export as ae
+
+        pkg = ModelPackage(
+            {"model": mock.MagicMock(), "decoder": mock.MagicMock()},
+            config=self._make_pkg().config,
+        )
+        # Force the duplicate: both "model" and "decoder" -> "decoder".
+        monkeypatch.setattr(
+            ae,
+            "_resolve_component_map",
+            lambda p: {key: "decoder" for key in p},
+        )
+
+        with pytest.raises(ValueError, match="Duplicate component names"):
+            write_ort_genai_config(pkg, str(tmp_path))
+
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
         import dataclasses

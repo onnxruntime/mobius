@@ -227,3 +227,40 @@ class TestCLIBuildRuntime:
                     "tensorrt",  # not a supported value
                 ]
             )
+
+    def test_component_filter_restricts_genai_config_components(self):
+        """--component restricts write_ort_genai_config to the selected component.
+
+        Regression test: previously the CLI passed the full ``pkg`` to
+        ``write_ort_genai_config`` even when ``--component`` had filtered
+        ``save_package_layout`` down to a subset, producing a manifest
+        that referenced components whose ONNX files were not on disk.
+        """
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_export,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--runtime",
+                    "ort-genai",
+                    "--component",
+                    "model",
+                ]
+            )
+
+        mock_export.assert_called_once()
+        # The package passed to write_ort_genai_config must contain only the
+        # filtered component (here: "model"). For an LLM build this is a
+        # no-op (the package already has one component), but the call site
+        # must always pass a filtered package — never the unfiltered one.
+        config_pkg = mock_export.call_args.args[0]
+        assert set(config_pkg.keys()) == {"model"}

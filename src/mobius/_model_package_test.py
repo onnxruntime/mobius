@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -117,6 +118,94 @@ class TestModelPackageSaveLoad:
         pkg = ModelPackage({"m": _make_simple_model()})
         pkg.save(str(outdir))
         assert (outdir / "model.onnx").exists()
+
+
+class TestModelPackageSavePackageLayout:
+    """Tests for ``ModelPackage.save_package_layout`` (ORT Model Package v4)."""
+
+    def test_layout_single_component(self, tmp_path):
+        """Single-component packages still use the <component>/<variant> layout."""
+        pkg = ModelPackage({"model": _make_simple_model("decoder")})
+        written = pkg.save_package_layout(str(tmp_path))
+
+        # No flat-directory shortcut: even one component lives under its subdir.
+        assert (tmp_path / "model" / "base" / "model.onnx").exists()
+        assert not (tmp_path / "model.onnx").exists()
+        # Returned path mapping points at the written file.
+        assert written == {"model": str(tmp_path / "model" / "base" / "model.onnx")}
+
+    def test_layout_multi_component(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "vision_encoder": _make_simple_model("vision_encoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+        written = pkg.save_package_layout(str(tmp_path))
+
+        for name in ("decoder", "vision_encoder", "embedding"):
+            assert (tmp_path / name / "base" / "model.onnx").exists()
+            assert written[name] == str(tmp_path / name / "base" / "model.onnx")
+
+    def test_component_map_renames_keys(self, tmp_path):
+        """`component_map` renames the on-disk component dir (e.g. model -> decoder)."""
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("decoder"),
+                "vision_encoder": _make_simple_model("vision_encoder"),
+            }
+        )
+        written = pkg.save_package_layout(
+            str(tmp_path),
+            component_map={"model": "decoder"},
+        )
+
+        # "model" key gets remapped to "decoder" on disk.
+        assert (tmp_path / "decoder" / "base" / "model.onnx").exists()
+        assert not (tmp_path / "model").exists()
+        # Unmapped keys pass through unchanged.
+        assert (tmp_path / "vision_encoder" / "base" / "model.onnx").exists()
+        # Returned dict is keyed by on-disk component name (post-rename).
+        assert written["decoder"] == str(tmp_path / "decoder" / "base" / "model.onnx")
+        assert written["vision_encoder"] == str(
+            tmp_path / "vision_encoder" / "base" / "model.onnx"
+        )
+
+    def test_variant_name(self, tmp_path):
+        pkg = ModelPackage({"decoder": _make_simple_model("decoder")})
+        written = pkg.save_package_layout(str(tmp_path), variant_name="cuda")
+
+        assert (tmp_path / "decoder" / "cuda" / "model.onnx").exists()
+        assert written["decoder"] == str(tmp_path / "decoder" / "cuda" / "model.onnx")
+
+    def test_components_filter(self, tmp_path):
+        """The ``components`` predicate filters which sub-models are written."""
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "vision_encoder": _make_simple_model("vision_encoder"),
+            }
+        )
+        written = pkg.save_package_layout(
+            str(tmp_path),
+            components=lambda name: name == "decoder",
+        )
+
+        assert (tmp_path / "decoder" / "base" / "model.onnx").exists()
+        assert not (tmp_path / "vision_encoder").exists()
+        assert list(written.keys()) == ["decoder"]
+
+    def test_invalid_external_data_raises(self, tmp_path):
+        pkg = ModelPackage({"decoder": _make_simple_model("decoder")})
+        with pytest.raises(ValueError, match="Unknown external_data format"):
+            pkg.save_package_layout(str(tmp_path), external_data="parquet")
+
+    def test_creates_nested_directory(self, tmp_path):
+        outdir = tmp_path / "nested" / "pkg"
+        pkg = ModelPackage({"decoder": _make_simple_model("decoder")})
+        pkg.save_package_layout(str(outdir))
+        assert (outdir / "decoder" / "base" / "model.onnx").exists()
 
 
 class TestModelPackageApplyWeights:

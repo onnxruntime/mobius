@@ -912,6 +912,17 @@ def write_ort_genai_config(
     component_map = _resolve_component_map(pkg)
     component_names = list(component_map.values())
 
+    # Defensive check: component names must be unique so per-component
+    # metadata.json / variant.json don't clobber each other and the manifest
+    # doesn't list duplicates.
+    if len(component_names) != len(set(component_names)):
+        duplicates = sorted({n for n in component_names if component_names.count(n) > 1})
+        raise ValueError(
+            "Duplicate component names in ModelPackage after component_map "
+            f"resolution: {duplicates}. Each package key must map to a "
+            "distinct on-disk component directory."
+        )
+
     # --- Write package manifest (top-level) -----------------------------
     manifest_path = write_manifest(directory, component_names)
 

@@ -100,8 +100,13 @@ cp output/configs/* "${DST}/"
 # <component>/ subdirectories (multi-component).
 for comp in decoder embedding vision_encoder audio_encoder; do
   if [ -d "output/${comp}/base" ]; then
-    if [ "$(ls -A output)" = "decoder" ] || [ ! -d "output/embedding" ]; then
-      # Single-component LLM: flatten model files into the model root
+    if [ "${comp}" = "decoder" ] \
+      && [ ! -d "output/embedding" ] \
+      && [ ! -d "output/vision_encoder" ] \
+      && [ ! -d "output/audio_encoder" ]; then
+      # Single-component LLM: flatten decoder files into the model root.
+      # Check sibling component dirs explicitly because a real Model
+      # Package also contains configs/ and manifest.json at the top level.
       cp output/${comp}/base/* "${DST}/"
     else
       # Multi-component: keep one subdir per component
