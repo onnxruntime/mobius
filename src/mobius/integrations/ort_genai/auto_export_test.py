@@ -497,7 +497,7 @@ class TestExportForOrtGenai:
         monkeypatch.setattr(
             ae,
             "_resolve_component_map",
-            lambda p: {key: "decoder" for key in p},
+            lambda p: dict.fromkeys(p, "decoder"),
         )
 
         with pytest.raises(ValueError, match="Duplicate component names"):
