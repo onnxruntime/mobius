@@ -221,13 +221,12 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds + input_ids -> logits + per-layer KV cache.
+        """Build text decoder: inputs_embeds [+ per_layer_inputs] -> logits + KV cache.
 
-        ``input_ids`` is included alongside ``inputs_embeds`` because models with
-        ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B) need the original token
-        IDs to compute per-layer token embeddings that condition each decoder layer.
-        When ``hidden_size_per_layer_input == 0`` the tensor is passed through but has
-        no effect (``_compute_per_layer_inputs`` short-circuits to ``None``).
+        When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), the decoder
+        accepts precomputed ``per_layer_inputs`` from the embedding model instead
+        of ``input_ids``.  This moves the per-layer embedding computation to the
+        embedding model, simplifying the decoder graph.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -251,11 +250,16 @@ class Gemma4Task(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        input_ids = builder.input(
-            "input_ids",
-            dtype=ir.DataType.INT64,
-            shape=[batch, seq_len],
-        )
+
+        per_layer_inputs_val: ir.Value | None = None
+        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        if per_layer_dim:
+            total_per_layer = config.num_hidden_layers * per_layer_dim
+            per_layer_inputs_val = builder.input(
+                "per_layer_inputs",
+                dtype=config.dtype,
+                shape=[batch, seq_len, total_per_layer],
+            )
 
         past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
 
@@ -264,7 +268,7 @@ class Gemma4Task(ModelTask):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            input_ids=input_ids,
+            per_layer_inputs=per_layer_inputs_val,
             past_key_values=past_key_values,
         )
 
@@ -410,11 +414,20 @@ class Gemma4Task(ModelTask):
                 shape=[num_audio_tokens, config.hidden_size],
             )
 
-        inputs_embeds = embedding(
+        result = embedding(
             op,
             input_ids=input_ids,
             image_features=image_features,
             audio_features=audio_features_val,
         )
-        builder.add_output(inputs_embeds, "inputs_embeds")
+
+        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        if per_layer_dim:
+            # Embedding model returns (inputs_embeds, per_layer_inputs) when
+            # per-layer input gating is enabled.
+            inputs_embeds, per_layer_inputs = result
+            builder.add_output(inputs_embeds, "inputs_embeds")
+            builder.add_output(per_layer_inputs, "per_layer_inputs")
+        else:
+            builder.add_output(result, "inputs_embeds")
         return _make_model(graph)
