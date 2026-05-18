@@ -31,16 +31,24 @@ paired with integer zero-point ``3``. ORT's ``MatMulNBits`` then
 computes ``scale · (B − 3)`` which equals ``{-3·s, -1·s, +1·s, +3·s}``,
 i.e. exactly Tencent's dequantization.
 
-Two implementation details forced by current ORT CPU kernel limits:
+Two implementation details forced by current ORT CPU kernel limits
+(both expected to be fixed upstream — see TODOs below):
 
-* We use 4-bit MatMulNBits (not 2-bit) because the CPU kernel does not
-  yet support float-valued zero-points at ``bits=2``, which is what
-  the half-integer SEQ offset ``1.5`` would otherwise require.
+* We use 4-bit MatMulNBits (not 2-bit) because the ORT CPU kernel
+  rejects ``bits=2`` on its **unpacked (float) zero-point** path:
+  ``Only 4b quantization is supported for unpacked compute using
+  non-MLAS de-quantization for now``
+  (``contrib_ops/cpu/quantization/matmul_nbits.cc``). The integer-zp
+  path at ``bits=2`` works, but integer zp can only encode integer
+  offsets {0..3}, whereas SEQ's half-integer offset ``1.5`` requires
+  the float-zp path. TODO: drop the inflation once that path is
+  generalised to all ``bits`` values.
 * The output ``block_size`` is ``128``, not Tencent's native ``512``,
   because the CPU kernel silently produces zeros for
   ``bits=4, block_size=512``. Each Tencent 512-element scale is
   replicated across 4 consecutive ORT blocks of 128 elements; the
-  dequantized values are identical.
+  dequantized values are identical. TODO: drop the replication once
+  the kernel handles ``block_size > 256``.
 """
 
 from __future__ import annotations

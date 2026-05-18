@@ -279,8 +279,9 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
     # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
     # 512-elt blocks) is inflated to 4-bit MatMulNBits with zp=3 — see
-    # parse_tencent_q1_0_tensor — because ORT CPU does not yet support
-    # the half-integer zero-point that 2-bit SEQ would otherwise need.
+    # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
+    # path is currently only implemented for bits=4, and the half-integer
+    # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
     type_params: dict = {
         GGMLQuantizationType.Q4_0: (4, 32, True),
         GGMLQuantizationType.Q4_1: (4, 32, False),
