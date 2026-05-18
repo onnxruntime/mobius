@@ -106,8 +106,11 @@ def build_from_gguf(
     # 3. Quantized path: detect dominant type and set config
     if keep_quantized:
         from mobius._configs import QuantizationConfig
+        from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
 
         bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+        # Tencent Q1_0 needs a float zero-point (1.5) — see _tencent_q1_0.
+        float_zp = is_tencent_q1_0_layout(gguf_model)
         config = dataclasses.replace(
             config,
             quantization=QuantizationConfig(
@@ -115,13 +118,15 @@ def build_from_gguf(
                 group_size=block_size,
                 quant_method="gguf",
                 sym=is_sym,
+                float_zero_point=float_zp,
             ),
         )
         logger.info(
-            "Quantized mode: bits=%d, block_size=%d, symmetric=%s",
+            "Quantized mode: bits=%d, block_size=%d, symmetric=%s, float_zp=%s",
             bits,
             block_size,
             is_sym,
+            float_zp,
         )
 
     # 4. Look up module class and resolve task
@@ -312,7 +317,9 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     # Override the mainline defaults so the resulting QuantizedLinear
     # matches what parse_tencent_q1_0_tensor produces (4-bit packed).
     if dominant == GGMLQuantizationType.Q1_0 and is_tencent_q1_0_layout(gguf_model):
-        bits, block_size, is_sym = 4, 128, False
+        # See _tencent_q1_0.py: we emit native 2-bit with float zp=1.5
+        # and replicate scales across 128-elt sub-blocks.
+        bits, block_size, is_sym = 2, 128, False
 
     logger.info(
         "Dominant GGUF quant type: %s (%d tensors, bits=%d, block_size=%d)",

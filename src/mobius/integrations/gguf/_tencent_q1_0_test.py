@@ -85,70 +85,80 @@ class TestTencentQ10:
         codes = np.zeros((ne1, ne0), dtype=np.uint8)
         scales = np.full((ne1, 1), 0.5, dtype=np.float16)
         result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, scales)
-        # bits=4, block_size=128 → blob_size = 128*4/8 = 64 bytes per sub-block
+        # bits=2, block_size=128 → blob_size = 128*2/8 = 32 bytes per sub-block
         # 512 native = 4 sub-blocks
-        assert result.bits == 4
+        assert result.bits == 2
         assert result.block_size == 128
-        assert result.weight.shape == (1, 4, 64)
-        # Scales replicated 4× across sub-blocks
+        assert result.weight.shape == (1, 4, 32)
+        # Effective scale exposed to ORT = 2 * stored_scale
         assert result.scales.shape == (1, 4)
-        np.testing.assert_array_equal(result.scales, 0.5)
-        # zero_points packed 0x33 per byte. 4 sub-blocks → 2 bytes
-        assert result.zero_points.shape == (1, 2)
-        np.testing.assert_array_equal(result.zero_points, 0x33)
+        np.testing.assert_allclose(result.scales.astype(np.float32), 1.0, rtol=0, atol=1e-3)
+        # Float zero_points: one per sub-block, all = 1.5
+        assert result.zero_points.shape == (1, 4)
+        assert result.zero_points.dtype == np.float32
+        np.testing.assert_array_equal(result.zero_points, 1.5)
 
     def test_all_code_0_packs_as_zeros(self, tmp_path: Path):
-        """Code 0 → 4-bit slot 0; dequant scale·(0-3) = -3·scale."""
+        """Code 0 in every slot → byte 0x00."""
         ne0, ne1 = 512, 1
         codes = np.zeros((ne1, ne0), dtype=np.uint8)
         scales = np.ones((ne1, 1), dtype=np.float16)
         result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, scales)
         np.testing.assert_array_equal(result.weight, 0x00)
 
-    def test_all_code_3_packs_as_0x66(self, tmp_path: Path):
-        """Code 3 → 4-bit slot 6; byte = (6<<4) | 6 = 0x66."""
+    def test_all_code_3_packs_as_0xff(self, tmp_path: Path):
+        """Code 3 in every slot → byte (3<<6)|(3<<4)|(3<<2)|3 = 0xFF."""
         ne0, ne1 = 512, 1
         codes = np.full((ne1, ne0), 3, dtype=np.uint8)
         scales = np.ones((ne1, 1), dtype=np.float16)
         result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, scales)
-        np.testing.assert_array_equal(result.weight, 0x66)
+        np.testing.assert_array_equal(result.weight, 0xFF)
 
     def test_dequant_round_trip_matches_seq_codebook(self, tmp_path: Path):
-        """End-to-end: dequant via MatMulNBits formula gives ±{1,3}·scale."""
+        """End-to-end: MatMulNBits dequant via the emitted tensors gives
+        ``stored_scale · {-3,-1,+1,+3}[code]``."""
         ne0, ne1 = 512, 2
         rng = np.random.default_rng(123)
         codes = rng.integers(0, 4, size=(ne1, ne0)).astype(np.uint8)
-        scales = np.array(
+        stored_scales = np.array(
             [[0.25], [0.0625]], dtype=np.float16
-        )  # one scale per row (only 1 native block)
-        result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, scales)
+        )  # one stored_scale per row (only 1 native block)
+        result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, stored_scales)
 
-        # Manually dequantize MatMulNBits-style: nibble - 3, then * scale
-        N, n_blocks, blob = result.weight.shape  # (2, 4, 64)
-        nibbles = np.empty((N, n_blocks, blob * 2), dtype=np.uint8)
-        nibbles[:, :, 0::2] = result.weight & 0xF
-        nibbles[:, :, 1::2] = (result.weight >> 4) & 0xF
+        # Unpack 2-bit codes from result.weight (LSB-first, 4 per byte)
+        N, n_blocks, blob = result.weight.shape  # (2, 4, 32)
+        codes_unpacked = np.empty((N, n_blocks, blob * 4), dtype=np.uint8)
+        for slot in range(4):
+            codes_unpacked[:, :, slot::4] = (result.weight >> (2 * slot)) & np.uint8(0x3)
+
+        # MatMulNBits dequant: (B - zp) * scale, zp = 1.5, scale = 2*stored
         sc = result.scales.astype(np.float32)
-        deq = (nibbles.astype(np.float32) - 3) * sc[:, :, None]
-        deq = deq.reshape(N, n_blocks * blob * 2)
+        zp = result.zero_points.astype(np.float32)
+        deq = (codes_unpacked.astype(np.float32) - zp[:, :, None]) * sc[:, :, None]
+        deq = deq.reshape(N, n_blocks * blob * 4)
 
-        # Reference dequant: scale * {-3,-1,+1,+3}[code]
+        # Reference: stored_scale * {-3,-1,+1,+3}[code]
         codebook = np.array([-3, -1, 1, 3], dtype=np.float32)
-        ref = scales.astype(np.float32) * codebook[codes]
+        ref = stored_scales.astype(np.float32) * codebook[codes]
 
         np.testing.assert_allclose(deq, ref, rtol=0, atol=1e-3)
 
     def test_multi_native_block_replicates_scales(self, tmp_path: Path):
-        """Each native scale should appear 4× consecutively in result.scales."""
+        """Each native scale should appear 4× consecutively in result.scales
+        (with the 2× SEQ factor folded in)."""
         ne0, ne1 = 1024, 3  # 2 native blocks per row
         codes = np.zeros((ne1, ne0), dtype=np.uint8)
-        scales = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=np.float16)
-        result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, scales)
+        stored = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=np.float16)
+        result = _round_trip(tmp_path / "t.bin", ne0, ne1, codes, stored)
         # 2 native blocks × 4 sub-blocks = 8 ORT blocks
         assert result.scales.shape == (3, 8)
-        # Row 0: [0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2]
-        expected = np.repeat(scales, 4, axis=1)
-        np.testing.assert_array_equal(result.scales, expected)
+        # Row 0: [0.2, 0.2, 0.2, 0.2, 0.4, 0.4, 0.4, 0.4] (2 × stored)
+        expected = np.repeat(
+            (stored.astype(np.float32) * 2.0).astype(np.float16), 4, axis=1
+        )
+        np.testing.assert_allclose(
+            result.scales.astype(np.float32), expected.astype(np.float32), rtol=0, atol=1e-3
+        )
 
     def test_rejects_unaligned_k(self, tmp_path: Path):
         """K not divisible by 512 raises."""

@@ -37,6 +37,13 @@ class QuantizedLinear(nn.Module):
         bits: Quantization bit-width (2, 4, or 8).
         block_size: Number of elements per quantization group.
         has_zero_point: Whether asymmetric zero-point is used.
+        zero_point_dtype: Dtype for the zero_points parameter when
+            ``has_zero_point`` is true. ``UINT8`` (default) uses ORT's
+            bit-packed integer zero-points (same bit width as the
+            weights). Float dtypes (``FLOAT``/``FLOAT16``/``BFLOAT16``)
+            produce one un-packed float per block — required for
+            codebooks whose offset is not an integer (e.g. Tencent SEQ
+            uses ``1.5``).
         bias: Whether to include a bias term.
     """
 
@@ -47,6 +54,7 @@ class QuantizedLinear(nn.Module):
         bits: int = 4,
         block_size: int = 32,
         has_zero_point: bool = False,
+        zero_point_dtype: ir.DataType = ir.DataType.UINT8,
         bias: bool = False,
     ):
         super().__init__()
@@ -71,20 +79,26 @@ class QuantizedLinear(nn.Module):
         # Per-block scale factors
         self.scales = nn.Parameter([out_features, n_blocks])
         # Optional per-block zero points (asymmetric quantization).
-        # Zero points use the same bit-packing as the weights, so the
-        # packed last dimension is ceil(n_blocks * bits / 8):
+        # UINT8 zero_points use the same bit-packing as the weights, so
+        # the packed last dimension is ceil(n_blocks * bits / 8):
         #   bits=2 → 4 zero-points per byte
         #   bits=4 → 2 zero-points per byte
         #   bits=8 → 1 zero-point per byte (no packing)
-        zp_dim = math.ceil(n_blocks * bits / 8)
-        self.zero_points = (
-            nn.Parameter(
-                [out_features, zp_dim],
-                dtype=ir.DataType.UINT8,
-            )
-            if has_zero_point
-            else None
-        )
+        # Float zero_points are one value per block, dtype as specified.
+        if has_zero_point:
+            if zero_point_dtype == ir.DataType.UINT8:
+                zp_dim = math.ceil(n_blocks * bits / 8)
+                self.zero_points = nn.Parameter(
+                    [out_features, zp_dim],
+                    dtype=ir.DataType.UINT8,
+                )
+            else:
+                self.zero_points = nn.Parameter(
+                    [out_features, n_blocks],
+                    dtype=zero_point_dtype,
+                )
+        else:
+            self.zero_points = None
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
@@ -118,6 +132,7 @@ def make_quantized_linear_factory(
     bits: int = 4,
     block_size: int = 32,
     has_zero_point: bool = False,
+    zero_point_dtype: ir.DataType = ir.DataType.UINT8,
 ) -> type:
     """Create a QuantizedLinear factory compatible with the linear_class pattern.
 
@@ -129,6 +144,8 @@ def make_quantized_linear_factory(
         bits: Quantization bit-width (typically 4).
         block_size: Number of elements per quantization group.
         has_zero_point: Whether to include zero-point parameters.
+        zero_point_dtype: Dtype for the zero_points parameter (see
+            :class:`QuantizedLinear`).
 
     Returns:
         A class that constructs QuantizedLinear instances.
@@ -148,6 +165,7 @@ def make_quantized_linear_factory(
                 bits=bits,
                 block_size=block_size,
                 has_zero_point=has_zero_point,
+                zero_point_dtype=zero_point_dtype,
             )
 
     _Factory.__name__ = "QuantizedLinear"

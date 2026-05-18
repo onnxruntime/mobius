@@ -51,10 +51,16 @@ class TextModel(nn.Module):
         linear_class = None
         qc = getattr(config, "quantization", None)
         if qc is not None and qc.quant_method != "none":
+            zp_dtype = (
+                config.dtype
+                if getattr(qc, "float_zero_point", False)
+                else ir.DataType.UINT8
+            )
             linear_class = make_quantized_linear_factory(
                 bits=qc.bits,
                 block_size=qc.group_size,
                 has_zero_point=not qc.sym,
+                zero_point_dtype=zp_dtype,
             )
 
         self.embed_tokens = Embedding(
@@ -265,10 +271,16 @@ class LayerNormTextModel(TextModel):
         qc = getattr(config, "quantization", None)
         linear_class = None
         if qc is not None and qc.quant_method != "none":
+            zp_dtype = (
+                config.dtype
+                if getattr(qc, "float_zero_point", False)
+                else ir.DataType.UINT8
+            )
             linear_class = make_quantized_linear_factory(
                 bits=qc.bits,
                 block_size=qc.group_size,
                 has_zero_point=not qc.sym,
+                zero_point_dtype=zp_dtype,
             )
         self.layers = nn.ModuleList(
             [
