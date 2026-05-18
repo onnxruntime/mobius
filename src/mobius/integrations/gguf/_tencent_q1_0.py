@@ -88,7 +88,7 @@ def is_tencent_q1_0_layout(gguf_model) -> bool:
     reader = gguf_model._reader
     tensors = sorted(
         reader.tensors,
-        key=lambda t: _tensor_data_offset(t),
+        key=_tensor_data_offset,
     )
     for i, t in enumerate(tensors):
         if t.tensor_type != GGMLQuantizationType.Q1_0:
