@@ -107,17 +107,22 @@ def build_from_gguf(
     if keep_quantized:
         from mobius._configs import QuantizationConfig
 
-        bits, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+        bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
         config = dataclasses.replace(
             config,
             quantization=QuantizationConfig(
                 bits=bits,
-                group_size=32,
+                group_size=block_size,
                 quant_method="gguf",
                 sym=is_sym,
             ),
         )
-        logger.info("Quantized mode: bits=%d, symmetric=%s", bits, is_sym)
+        logger.info(
+            "Quantized mode: bits=%d, block_size=%d, symmetric=%s",
+            bits,
+            block_size,
+            is_sym,
+        )
 
     # 4. Look up module class and resolve task
     module_class = registry.get(model_type)
@@ -249,14 +254,14 @@ def _normalize_gguf_weights(
     return result
 
 
-def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
-    """Detect bits and symmetry from dominant GGUF quant type.
+def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
+    """Detect bits, block size, and symmetry from dominant GGUF quant type.
 
-    Scans block-level (projection) tensors and returns the
-    bit-width and symmetry flag of the most common repackable type.
+    Scans block-level (projection) tensors and returns the bit-width,
+    block size, and symmetry flag of the most common repackable type.
 
     Returns:
-        ``(bits, is_symmetric)`` tuple.
+        ``(bits, block_size, is_symmetric)`` tuple.
 
     Raises:
         ValueError: If no repackable quantized tensors are found.
@@ -264,17 +269,24 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
     from gguf import GGMLQuantizationType
 
     from mobius.integrations.gguf._repacker import can_repack
+    from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
 
-    q4_types = {
-        GGMLQuantizationType.Q4_0,
-        GGMLQuantizationType.Q4_1,
-    }
-    symmetric_types = {
-        GGMLQuantizationType.Q4_0,
-        GGMLQuantizationType.Q8_0,
+    # Per-type parameters: (bits, block_size, is_symmetric).
+    #
+    # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
+    # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
+    # 512-elt blocks) is inflated to 4-bit MatMulNBits with zp=3 — see
+    # parse_tencent_q1_0_tensor — because ORT CPU does not yet support
+    # the half-integer zero-point that 2-bit SEQ would otherwise need.
+    type_params: dict = {
+        GGMLQuantizationType.Q4_0: (4, 32, True),
+        GGMLQuantizationType.Q4_1: (4, 32, False),
+        GGMLQuantizationType.Q4_K: (4, 32, False),
+        GGMLQuantizationType.Q8_0: (8, 32, True),
+        GGMLQuantizationType.Q1_0: (2, 128, False),
     }
 
     counts: Counter = Counter()
@@ -292,15 +304,23 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
         )
 
     dominant = counts.most_common(1)[0][0]
-    bits = 4 if dominant in q4_types else 8
-    is_sym = dominant in symmetric_types
+    bits, block_size, is_sym = type_params[dominant]
+
+    # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
+    # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
+    # Override the mainline defaults so the resulting QuantizedLinear
+    # matches what parse_tencent_q1_0_tensor produces (4-bit packed).
+    if dominant == GGMLQuantizationType.Q1_0 and is_tencent_q1_0_layout(gguf_model):
+        bits, block_size, is_sym = 4, 128, False
+
     logger.info(
-        "Dominant GGUF quant type: %s (%d tensors, bits=%d)",
+        "Dominant GGUF quant type: %s (%d tensors, bits=%d, block_size=%d)",
         dominant,
         counts[dominant],
         bits,
+        block_size,
     )
-    return bits, is_sym
+    return bits, block_size, is_sym
 
 
 def _load_dequantized_state_dict(
@@ -358,6 +378,10 @@ def _load_quantized_state_dict(
         can_repack,
         repack_gguf_tensor,
     )
+    from mobius.integrations.gguf._tencent_q1_0 import (
+        is_tencent_q1_0_layout,
+        parse_tencent_q1_0_tensor,
+    )
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
@@ -374,6 +398,19 @@ def _load_quantized_state_dict(
 
     num_heads = getattr(config, "num_attention_heads", None)
     num_kv_heads = getattr(config, "num_key_value_heads", None)
+
+    # Detect Tencent's non-mainline Q1_0 layout once per file. Reading
+    # such tensors requires a custom parser keyed on the explicit
+    # per-tensor file offset (mainline byte sizes are wrong).
+    tencent_q1_0 = is_tencent_q1_0_layout(gguf_model)
+    if tencent_q1_0:
+        gguf_path = str(gguf_model._path)
+        data_section_offset = gguf_model._reader.data_offset
+        tensors_by_name = {t.name: t for t in gguf_model._reader.tensors}
+        logger.info(
+            "Detected Tencent Q1_0 layout (block_size=512, 2-bit SEQ); "
+            "using custom per-tensor parser"
+        )
 
     state_dict: dict[str, torch.Tensor] = {}
     n_repacked = 0
@@ -394,15 +431,27 @@ def _load_quantized_state_dict(
         # Repack if the tensor is repackable AND its target ONNX
         # parameter is from a QuantizedLinear module.
         stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
-        should_repack = stem is not None and stem in quantized_stems and can_repack(qtype_val)
+        is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
+        should_repack = (
+            stem is not None
+            and stem in quantized_stems
+            and (can_repack(qtype_val) or is_tencent_q1_0_tensor)
+        )
 
         if should_repack:
-            shape_2d = (int(np_shape[0]), int(np_shape[1]))
-            repacked = repack_gguf_tensor(
-                raw.ravel().view(np.uint8),
-                qtype_val,
-                shape_2d,
-            )
+            if is_tencent_q1_0_tensor:
+                repacked = parse_tencent_q1_0_tensor(
+                    gguf_path,
+                    data_section_offset,
+                    tensors_by_name[gguf_name],
+                )
+            else:
+                shape_2d = (int(np_shape[0]), int(np_shape[1]))
+                repacked = repack_gguf_tensor(
+                    raw.ravel().view(np.uint8),
+                    qtype_val,
+                    shape_2d,
+                )
             w = torch.from_numpy(repacked.weight)
             s = torch.from_numpy(repacked.scales)
 

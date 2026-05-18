@@ -212,6 +212,16 @@ _LLAMA_FAMILY = frozenset(
 
 _GEMMA_FAMILY = frozenset({"gemma", "gemma2", "gemma3"})
 
+# HunYuan-v1 dense uses the Llama base but adds per-head Q/K layer-norms
+# (HF: ``query_layernorm`` / ``key_layernorm``), which mobius renames to
+# ``q_norm`` / ``k_norm`` inside the Attention component.
+_HUNYUAN_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
+_HUNYUAN_FAMILY = frozenset({"hunyuan-dense", "hunyuan_v1_dense"})
+
 _MOE_FAMILY = frozenset(
     {
         "qwen2moe",
@@ -267,6 +277,9 @@ def _build_mapping(
         result = dict(_GPT2_MAPPING)
     elif arch == "mamba":
         result = dict(_MAMBA_MAPPING)
+    elif arch in _HUNYUAN_FAMILY:
+        result = dict(_LLAMA_MAPPING)
+        result.update(_HUNYUAN_EXTRAS)
     elif arch in _MOE_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_MOE_EXTRAS)
@@ -277,6 +290,7 @@ def _build_mapping(
             _LLAMA_FAMILY
             | _GEMMA_FAMILY
             | _MOE_FAMILY
+            | _HUNYUAN_FAMILY
             | {"gemma4", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(

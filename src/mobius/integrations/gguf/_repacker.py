@@ -3,19 +3,22 @@
 
 """Repack GGUF quantized blocks into ORT MatMulNBits format.
 
-Converts raw GGUF block data for Q4_0, Q4_1, and Q8_0 quantization
-types into the (weight, scales, zero_points) tensors expected by the
-``com.microsoft.MatMulNBits`` operator.
+Converts raw GGUF block data for Q4_0, Q4_1, Q8_0, Q4_K, and Q1_0
+quantization types into the (weight, scales, zero_points) tensors
+expected by the ``com.microsoft.MatMulNBits`` operator.
 
-GGUF block layouts (32 elements per block):
-    Q4_0 (18 bytes): [fp16 scale][16B packed nibbles]
-    Q4_1 (20 bytes): [fp16 scale][fp16 min][16B packed nibbles]
-    Q8_0 (34 bytes): [fp16 scale][32B int8 values]
+GGUF block layouts:
+    Q4_0 (18 bytes, 32 elt):  [fp16 scale][16B packed nibbles]
+    Q4_1 (20 bytes, 32 elt):  [fp16 scale][fp16 min][16B packed nibbles]
+    Q8_0 (34 bytes, 32 elt):  [fp16 scale][32B int8 values]
+    Q4_K (144 bytes, 256 elt): [fp16 d][fp16 dmin][12B sub-scales][128B nibbles]
+    Q1_0 (18 bytes, 128 elt): [fp16 scale][16B packed bits, LSB-first]
+        Dequant: ``bit ? +d : -d`` (1-bit binary).
 
 MatMulNBits expects:
     weight:      [N, n_blocks, blob_size] uint8
     scales:      [N, n_blocks]            float16
-    zero_points: [N, zp_dim]             uint8 (nibble-packed for 4-bit)
+    zero_points: [N, ceil(n_blocks*bits/8)] uint8 (bit-packed)
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ _GGUF_Q4_0 = 2
 _GGUF_Q4_1 = 3
 _GGUF_Q8_0 = 8
 _GGUF_Q4_K = 12
+_GGUF_Q1_0 = 41
 
 # Block byte sizes per GGUF type
 _BLOCK_BYTES = {
@@ -42,15 +46,18 @@ _BLOCK_BYTES = {
     _GGUF_Q4_1: 20,  # 2B scale + 2B min + 16B quants
     _GGUF_Q8_0: 34,  # 2B scale + 32B int8 values
     _GGUF_Q4_K: 144,  # 2B d + 2B dmin + 12B scales + 128B quants
+    _GGUF_Q1_0: 18,  # 2B scale + 16B packed bits (128 elements)
 }
 
 # Elements per GGUF block. Q4_K uses 256-element "super-blocks"
-# that decompose into 8 sub-blocks of 32 for MatMulNBits.
+# that decompose into 8 sub-blocks of 32 for MatMulNBits. Q1_0 uses
+# 128-element blocks (QK1_0 from llama.cpp).
 _GGUF_BLOCK_ELEMENTS = {
     _GGUF_Q4_0: 32,
     _GGUF_Q4_1: 32,
     _GGUF_Q8_0: 32,
     _GGUF_Q4_K: 256,
+    _GGUF_Q1_0: 128,
 }
 
 _SUPPORTED_TYPES = frozenset(_BLOCK_BYTES.keys())
@@ -133,6 +140,8 @@ def repack_gguf_tensor(
         return _repack_q4_1(blocks, n_out, n_blocks_per_row)
     elif gguf_type == _GGUF_Q4_K:
         return _repack_q4_k(blocks, n_out, n_blocks_per_row)
+    elif gguf_type == _GGUF_Q1_0:
+        return _repack_q1_0(blocks, n_out, n_blocks_per_row)
     else:
         return _repack_q8_0(blocks, n_out, n_blocks_per_row)
 
@@ -441,4 +450,85 @@ def _repack_q4_k(
         zero_points=zero_points,
         block_size=_BLOCK_SIZE,
         bits=4,
+    )
+
+
+# Lookup table: 4-bit nibble (LSB-first) → 8-bit ORT 2-bit packed byte.
+# Each Q1_0 bit b ∈ {0, 1} maps to MatMulNBits 2-bit code 2*b ∈ {0, 2}
+# (which under zp=1 dequantizes to {-1, +1}).
+#
+# Q1_0 bit packing: bit `j % 8` of `qs[j // 8]` holds element j.
+# MatMulNBits 2-bit packing: code k of byte i = (byte >> (2*k)) & 0x3.
+#
+# nibble layout (LSB-first):    bit0 bit1 bit2 bit3
+# packed 2-bit byte (LSB-first): c0   c1   c2   c3
+#   where c_k = 2 * bit_k, giving byte = (bit3<<7)|(bit2<<5)|(bit1<<3)|(bit0<<1).
+def _build_q1_0_expand_table() -> "np.ndarray":
+    table = np.zeros(16, dtype=np.uint8)
+    for nibble in range(16):
+        byte = 0
+        for k in range(4):
+            bit = (nibble >> k) & 1
+            byte |= (bit * 2) << (2 * k)
+        table[nibble] = byte
+    return table
+
+
+_Q1_0_EXPAND = _build_q1_0_expand_table()
+
+
+def _repack_q1_0(
+    blocks: np.ndarray,
+    n_out: int,
+    n_blocks_per_row: int,
+) -> RepackedTensor:
+    """Repack Q1_0 (1-bit binary) blocks into MatMulNBits 2-bit format.
+
+    Q1_0 block (18 bytes, 128 elements):
+        ``[fp16 scale (2B)][16B packed bits, LSB-first within each byte]``
+    Dequant per llama.cpp: ``bit ? +scale : -scale``.
+
+    MatMulNBits has no native 1-bit format, so we inflate each Q1_0 bit
+    ``b ∈ {0, 1}`` to a 2-bit code ``B ∈ {0, 2}``. With zero-point=1 and
+    scale=d, the op then dequantizes to ``(B - 1) * d = {-d, +d}`` — an
+    exact equivalent of Q1_0 at 2× the on-disk weight bytes but bit-exact
+    in values.
+
+    Each 8-bit Q1_0 byte encodes 8 elements, producing 2 MatMulNBits 2-bit
+    bytes (4 codes per byte).
+    """
+    raw_scales = blocks[:, :2].copy()
+    raw_bits = blocks[:, 2:]  # (total_blocks, 16)
+
+    scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
+
+    # Expand each Q1_0 byte (8 bits) into 2 MatMulNBits 2-bit bytes
+    # via the precomputed 4-bit nibble → 8-bit lookup table.
+    low_nibbles = raw_bits & 0x0F  # bits 0..3 of each Q1_0 byte
+    high_nibbles = (raw_bits >> 4) & 0x0F  # bits 4..7
+
+    ort_low = _Q1_0_EXPAND[low_nibbles]  # (total_blocks, 16) — even ORT bytes
+    ort_high = _Q1_0_EXPAND[high_nibbles]  # (total_blocks, 16) — odd ORT bytes
+
+    # Interleave: ORT bytes for elements 0..7 are (ort_low[0], ort_high[0]),
+    # for elements 8..15 are (ort_low[1], ort_high[1]), etc.
+    blob_size = 32  # 128 elements * 2 bits / 8 = 32 bytes per block
+    interleaved = np.empty((raw_bits.shape[0], blob_size), dtype=np.uint8)
+    interleaved[:, 0::2] = ort_low
+    interleaved[:, 1::2] = ort_high
+    weight = interleaved.reshape(n_out, n_blocks_per_row, blob_size)
+
+    # Zero points: all blocks share zp=1 (so dequant maps {0,2} → {-1,+1}).
+    # Packed as 4 ZPs per byte (bits=2): byte = (1<<6) | (1<<4) | (1<<2) | 1 = 0x55.
+    # Tail of the last byte (when n_blocks_per_row % 4 != 0) is unused by ORT;
+    # we still fill it with 0x55 for cleanliness.
+    zp_cols = math.ceil(n_blocks_per_row / 4)
+    zero_points = np.full((n_out, zp_cols), 0x55, dtype=np.uint8)
+
+    return RepackedTensor(
+        weight=weight,
+        scales=scales,
+        zero_points=zero_points,
+        block_size=128,
+        bits=2,
     )

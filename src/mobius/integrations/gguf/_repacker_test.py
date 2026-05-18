@@ -17,7 +17,24 @@ _Q4_0 = 2
 _Q4_1 = 3
 _Q8_0 = 8
 _Q4_K = 12
+_Q1_0 = 41
 _BLOCK_SIZE = 32
+
+
+def _make_q1_0_block(scale: float, bits: list[int]) -> np.ndarray:
+    """Build a single Q1_0 block (18 bytes) from scale + 128 binary signs.
+
+    GGUF packing per llama.cpp ``quantize_row_q1_0_ref``:
+        bit ``j % 8`` of ``qs[j // 8]`` holds element j (LSB-first).
+    Dequant: ``bit ? +scale : -scale``.
+    """
+    assert len(bits) == 128
+    scale_bytes = np.array([scale], dtype=np.float16).view(np.uint8)
+    packed = np.zeros(16, dtype=np.uint8)
+    for j in range(128):
+        if bits[j]:
+            packed[j // 8] |= 1 << (j % 8)
+    return np.concatenate([scale_bytes, packed])
 
 
 def _make_q4_0_block(scale: float, nibbles: list[int]) -> np.ndarray:
@@ -628,3 +645,134 @@ class TestRepackQ4K:
     def test_q4_k_in_can_repack(self):
         """Q4_K (type 12) is recognized as repackable."""
         assert can_repack(12) is True
+
+
+# ---- Q1_0 tests ----
+
+
+class TestRepackQ10:
+    """Tests for Q1_0 (1-bit binary) → MatMulNBits 2-bit repacking."""
+
+    def test_in_can_repack(self):
+        """Q1_0 (type 41) is recognized as repackable."""
+        assert can_repack(_Q1_0) is True
+
+    def test_single_block_shape(self):
+        """One Q1_0 block (128 elt) → one 32-byte MatMulNBits block, bits=2."""
+        bits = [1] * 128
+        block = _make_q1_0_block(scale=0.5, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        assert isinstance(result, RepackedTensor)
+        assert result.bits == 2
+        assert result.block_size == 128
+        # 1 row, 1 block, 128*2/8 = 32 bytes blob
+        assert result.weight.shape == (1, 1, 32)
+        assert result.scales.shape == (1, 1)
+        # zero_points: ceil(1 * 2 / 8) = 1 byte
+        assert result.zero_points.shape == (1, 1)
+
+    def test_zero_points_are_0x55(self):
+        """All zero-points = 1 (packed as 0x55 = 01_01_01_01)."""
+        bits = [0] * 128
+        block = _make_q1_0_block(scale=1.0, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        assert result.zero_points is not None
+        np.testing.assert_array_equal(result.zero_points, 0x55)
+
+    def test_all_positive_bits_pack_to_code_2(self):
+        """All bits = 1 → every 2-bit code = 2; byte = 0xAA (10_10_10_10)."""
+        bits = [1] * 128
+        block = _make_q1_0_block(scale=1.0, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        # Each byte = (2<<6) | (2<<4) | (2<<2) | 2 = 0xAA
+        np.testing.assert_array_equal(result.weight, 0xAA)
+
+    def test_all_negative_bits_pack_to_code_0(self):
+        """All bits = 0 → every 2-bit code = 0; all bytes zero."""
+        bits = [0] * 128
+        block = _make_q1_0_block(scale=1.0, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        np.testing.assert_array_equal(result.weight, 0x00)
+
+    def test_round_trip_dequantize(self):
+        """Repacked W (with zp=1, scale=d) reproduces Q1_0 dequant exactly.
+
+        Q1_0 dequant per llama.cpp: ``bit ? +d : -d``.
+        MatMulNBits dequant: ``(B - zp) * scale``.
+        With zp=1, scale=d, B = 2*bit: result = (2*bit - 1) * d = ±d. ✓
+        """
+        rng = np.random.default_rng(0)
+        bits = rng.integers(0, 2, size=128).tolist()
+        scale = 0.25
+        block = _make_q1_0_block(scale=scale, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+
+        # Unpack each ORT 2-bit code from the 32-byte blob
+        blob = result.weight[0, 0]  # (32,) uint8
+        codes = np.empty(128, dtype=np.uint8)
+        for byte_i in range(32):
+            for slot in range(4):
+                codes[byte_i * 4 + slot] = (blob[byte_i] >> (2 * slot)) & 0x3
+
+        # Each code should be 2 * original_bit
+        expected_codes = 2 * np.array(bits, dtype=np.uint8)
+        np.testing.assert_array_equal(codes, expected_codes)
+
+        # Dequantize via MatMulNBits formula and compare to llama.cpp Q1_0
+        scale_v = result.scales[0, 0].astype(np.float32)
+        zp = 1  # encoded as 0x55 across the byte
+        deq_ort = (codes.astype(np.float32) - zp) * scale_v
+        expected_deq = np.where(np.array(bits) == 1, scale, -scale).astype(np.float32)
+        np.testing.assert_allclose(deq_ort, expected_deq, rtol=1e-3)
+
+    def test_multi_block_multi_row(self):
+        """Multiple rows × multiple blocks pack into the expected shape."""
+        n, k = 4, 256  # 4 rows, 2 blocks per row
+        rng = np.random.default_rng(1)
+        blocks = [
+            _make_q1_0_block(
+                scale=float(rng.uniform(0.1, 1.0)),
+                bits=rng.integers(0, 2, size=128).tolist(),
+            )
+            for _ in range(n * 2)
+        ]
+        raw = np.concatenate(blocks)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(n, k))
+        # 4 rows × 2 blocks × 32 bytes
+        assert result.weight.shape == (n, 2, 32)
+        assert result.scales.shape == (n, 2)
+        # zero_points: ceil(2*2/8) = 1 byte per row
+        assert result.zero_points.shape == (n, 1)
+
+    def test_bit_order_lsb_first(self):
+        """Bit j of Q1_0 byte j//8 → code in slot j%4 of ORT byte (j//4)%(blob/4).
+
+        Sets only element 0 = +1 (bit 0 of Q1_0 byte 0) and verifies that
+        ORT byte 0 has its low 2 bits = 2 and all other bits = 0.
+        """
+        bits = [0] * 128
+        bits[0] = 1
+        block = _make_q1_0_block(scale=1.0, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        blob = result.weight[0, 0]
+        # Code 0 (low 2 bits of byte 0) should be 2; everything else = 0
+        assert blob[0] == 0b00000010
+        np.testing.assert_array_equal(blob[1:], 0)
+
+        # Set element 7 (bit 7 of Q1_0 byte 0): this is slot 3 of ORT byte 1.
+        bits = [0] * 128
+        bits[7] = 1
+        block = _make_q1_0_block(scale=1.0, bits=bits)
+        raw = block.reshape(-1)
+        result = repack_gguf_tensor(raw, _Q1_0, shape=(1, 128))
+        blob = result.weight[0, 0]
+        # ORT byte 1 covers codes 4..7; code 3 of that byte sits in bits 6..7
+        assert blob[0] == 0
+        assert blob[1] == 0b10000000  # code 3 = 2 (binary 10) in slot 3
+        np.testing.assert_array_equal(blob[2:], 0)

@@ -16,7 +16,7 @@ from onnxscript import OpBuilder, nn
 #     where n_blocks = ceil(K / block_size)
 #           blob_size = block_size * bits / 8
 #   scales:         [N, n_blocks]             (float16/float32)
-#   zero_points:    [N, ceil(n_blocks/2)]    (uint8, optional, 4-bit packed)
+#   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
 _MICROSOFT_DOMAIN = "com.microsoft"
 
@@ -34,7 +34,7 @@ class QuantizedLinear(nn.Module):
     Args:
         in_features: Input dimension (K).
         out_features: Output dimension (N).
-        bits: Quantization bit-width (4 or 8).
+        bits: Quantization bit-width (2, 4, or 8).
         block_size: Number of elements per quantization group.
         has_zero_point: Whether asymmetric zero-point is used.
         bias: Whether to include a bias term.
@@ -50,8 +50,8 @@ class QuantizedLinear(nn.Module):
         bias: bool = False,
     ):
         super().__init__()
-        if bits not in (4, 8):
-            raise ValueError(f"bits must be 4 or 8, got {bits}")
+        if bits not in (2, 4, 8):
+            raise ValueError(f"bits must be 2, 4, or 8, got {bits}")
         if block_size < 16 or (block_size & (block_size - 1)):
             raise ValueError(f"block_size must be a power of 2 >= 16, got {block_size}")
 
@@ -71,9 +71,12 @@ class QuantizedLinear(nn.Module):
         # Per-block scale factors
         self.scales = nn.Parameter([out_features, n_blocks])
         # Optional per-block zero points (asymmetric quantization).
-        # For 4-bit, two zero-point values are packed per byte →
-        # the last dimension is ceil(n_blocks / 2).
-        zp_dim = math.ceil(n_blocks / 2) if bits == 4 else n_blocks
+        # Zero points use the same bit-packing as the weights, so the
+        # packed last dimension is ceil(n_blocks * bits / 8):
+        #   bits=2 → 4 zero-points per byte
+        #   bits=4 → 2 zero-points per byte
+        #   bits=8 → 1 zero-point per byte (no packing)
+        zp_dim = math.ceil(n_blocks * bits / 8)
         self.zero_points = (
             nn.Parameter(
                 [out_features, zp_dim],
