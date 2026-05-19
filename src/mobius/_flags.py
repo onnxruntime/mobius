@@ -83,12 +83,12 @@ class _Flags:
          - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
-           (ORT ≤1.24.x workaround). Disabled by default.
+           (ORT <=1.24.x workaround). Disabled by default.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
          - Use native ``MatMulNBits bits=2`` for Tencent SEQ Q1_0
-           (smaller, semantically faithful, but ~20× slower on CPU EP
+           (smaller, semantically faithful, but ~20x slower on CPU EP
            pending an MLAS fast path).
     """
 
@@ -105,7 +105,7 @@ class _Flags:
         default_factory=lambda: _env_bool("MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND", False)
     )
     """Decompose grouped RMSNormalization into basic ops to work around an
-    ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
+    ORT <=1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
     """
 
@@ -115,7 +115,7 @@ class _Flags:
     """Lower the ONNX default-domain opset declaration to 23 when creating
     ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
 
-    ORT ≤1.24.x EPs didn't register kernels for opset 24 standard ops
+    ORT <=1.24.x EPs didn't register kernels for opset 24 standard ops
     (Squeeze, Reshape, etc.) even though the semantics are unchanged.
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
@@ -135,16 +135,16 @@ class _Flags:
 
     Cons (default ``False``):
         ORT's CPU ``bits=2`` + float-zp dequant path is currently a
-        naive scalar fallback (~20× slower than the ``bits=4`` packed
+        naive scalar fallback (~20x slower than the ``bits=4`` packed
         path on the same weights). See
         `microsoft/onnxruntime#28552
         <https://github.com/microsoft/onnxruntime/issues/28552>`_.
-        Also requires ORT ≥1.27 (the float-zp path was added in
+        Also requires ORT >=1.27 (the float-zp path was added in
         `microsoft/onnxruntime#28354
         <https://github.com/microsoft/onnxruntime/pull/28354>`_).
 
-    The ``bits=4`` default inflates each 2-bit code ``c ∈ {0..3}`` to
-    a 4-bit slot ``2c ∈ {0,2,4,6}`` paired with integer ``zero_point=3``;
+    The ``bits=4`` default inflates each 2-bit code ``c in {0..3}`` to
+    a 4-bit slot ``2c in {0,2,4,6}`` paired with integer ``zero_point=3``;
     dequant gives the same SEQ codebook values, just at twice the
     weight storage. Set ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT=1`` to
     opt in to the smaller native form once kernel performance lands.

@@ -52,9 +52,7 @@ class TextModel(nn.Module):
         qc = getattr(config, "quantization", None)
         if qc is not None and qc.quant_method != "none":
             zp_dtype = (
-                config.dtype
-                if getattr(qc, "float_zero_point", False)
-                else ir.DataType.UINT8
+                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
             )
             linear_class = make_quantized_linear_factory(
                 bits=qc.bits,
@@ -272,9 +270,7 @@ class LayerNormTextModel(TextModel):
         linear_class = None
         if qc is not None and qc.quant_method != "none":
             zp_dtype = (
-                config.dtype
-                if getattr(qc, "float_zero_point", False)
-                else ir.DataType.UINT8
+                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
             )
             linear_class = make_quantized_linear_factory(
                 bits=qc.bits,

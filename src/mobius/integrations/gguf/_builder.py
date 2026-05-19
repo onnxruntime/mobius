@@ -111,10 +111,7 @@ def build_from_gguf(
 
         bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
         # Float zero-point only when actually using Tencent's native 2-bit form.
-        float_zp = (
-            is_tencent_q1_0_layout(gguf_model)
-            and flags.tencent_q1_0_use_native_2bit
-        )
+        float_zp = is_tencent_q1_0_layout(gguf_model) and flags.tencent_q1_0_use_native_2bit
         config = dataclasses.replace(
             config,
             quantization=QuantizationConfig(

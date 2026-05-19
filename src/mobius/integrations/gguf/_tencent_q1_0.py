@@ -12,12 +12,12 @@ The HuggingFace repo ``AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF`` reuses
 
 * Tencent Q1_0 block (130 bytes, 512 elements):
     ``[fp16 scale][128B packed 2-bit codes, LSB-first slots]``
-    Codes ``c ∈ {0,1,2,3}`` dequantize via the SEQ codebook
-    ``{-1.5, -0.5, 0.5, 1.5}`` scaled by ``2·scale`` (equivalently
-    ``{-3, -1, +1, +3}·scale``). Each output row of ``K`` elements
+    Codes ``c in {0,1,2,3}`` dequantize via the SEQ codebook
+    ``{-1.5, -0.5, 0.5, 1.5}`` scaled by ``2*scale`` (equivalently
+    ``{-3, -1, +1, +3}*scale``). Each output row of ``K`` elements
     splits into ``K/512`` blocks, each with its own scale.
 
-Because the on-disk row stride differs (~4× larger than mainline),
+Because the on-disk row stride differs (~4x larger than mainline),
 mainline llama.cpp refuses to load these files — every tensor after
 the first Q1_0 entry lands at the wrong offset. gguf-py likewise
 under-reads tensor data. We bypass the size calculation entirely by
@@ -28,17 +28,17 @@ Two MatMulNBits representations are available, selected by the
 ``flags.tencent_q1_0_use_native_2bit`` flag:
 
 * **Inflated bits=4** (default; ``flag=False``): each 2-bit code
-  ``c ∈ {0..3}`` is doubled to a 4-bit slot ``2c ∈ {0,2,4,6}`` and
-  paired with integer ``zero_point = 3``. Dequant: ``scale·(B − 3) =
-  scale · {−3, −1, +1, +3}[c]``. Doubles on-disk weight bytes (4 bpw
+  ``c in {0..3}`` is doubled to a 4-bit slot ``2c in {0,2,4,6}`` and
+  paired with integer ``zero_point = 3``. Dequant: ``scale*(B - 3) =
+  scale * {-3, -1, +1, +3}[c]``. Doubles on-disk weight bytes (4 bpw
   packed) but uses ORT's well-optimised bits=4 packed-uint8 kernel,
-  giving ~20× higher CPU throughput than the native form.
+  giving ~20x higher CPU throughput than the native form.
 
 * **Native bits=2** (``flag=True``): the 2-bit codes are copied
   through unchanged and paired with float ``zero_point = 1.5`` and
-  ``effective_scale = 2·stored_scale``. Dequant:
-  ``effective_scale·(B − 1.5) = stored_scale · {−3,−1,+1,+3}[c]``.
-  Requires ORT ≥ 1.27 (`microsoft/onnxruntime#28354
+  ``effective_scale = 2*stored_scale``. Dequant:
+  ``effective_scale*(B - 1.5) = stored_scale * {-3,-1,+1,+3}[c]``.
+  Requires ORT >= 1.27 (`microsoft/onnxruntime#28354
   <https://github.com/microsoft/onnxruntime/pull/28354>`_), and the
   CPU path is currently a naive scalar fallback (`#28552
   <https://github.com/microsoft/onnxruntime/issues/28552>`_).
@@ -82,15 +82,13 @@ TENCENT_Q1_0_ORT_BLOCK_SIZE = 128
 
 # Float zero point that produces the SEQ codebook centred between
 # integer codes 0..3 in the native bits=2 representation:
-#   stored_scale · {-3, -1, +1, +3}[c] = (2 · stored_scale) · (c - 1.5)
+#   stored_scale * {-3, -1, +1, +3}[c] = (2 * stored_scale) * (c - 1.5)
 TENCENT_Q1_0_NATIVE_ZERO_POINT = 1.5
 
-# Per native block on-disk: 2 bytes (fp16 scale) + 512·2/8 = 128 bytes codes.
+# Per native block on-disk: 2 bytes (fp16 scale) + 512*2/8 = 128 bytes codes.
 _TENCENT_Q1_0_BLOCK_BYTES = 2 + TENCENT_Q1_0_NATIVE_BLOCK_SIZE // 4  # 130
 
-_SUBBLOCKS_PER_NATIVE = (
-    TENCENT_Q1_0_NATIVE_BLOCK_SIZE // TENCENT_Q1_0_ORT_BLOCK_SIZE
-)  # 4
+_SUBBLOCKS_PER_NATIVE = TENCENT_Q1_0_NATIVE_BLOCK_SIZE // TENCENT_Q1_0_ORT_BLOCK_SIZE  # 4
 
 
 def is_tencent_q1_0_layout(gguf_model) -> bool:
@@ -142,7 +140,7 @@ def parse_tencent_q1_0_tensor(
     :attr:`flags.tencent_q1_0_use_native_2bit`:
 
     * ``False`` (default): :func:`_pack_inflated_4bit` — codes inflated
-      to 4-bit slots, integer ``zp=3``. Fast on CPU EP but 2× the
+      to 4-bit slots, integer ``zp=3``. Fast on CPU EP but 2x the
       on-disk weight bytes.
     * ``True``: :func:`_pack_native_2bit` — codes passed through,
       float ``zp=1.5``. Native 2 bpw but slow on CPU EP today.
@@ -197,7 +195,7 @@ def _read_tencent_blocks(
         f.seek(abs_offset)
         blob = f.read(total_bytes)
     if len(blob) != total_bytes:
-        raise IOError(
+        raise OSError(
             f"Short read for {tensor.name!r}: got {len(blob)} bytes, expected {total_bytes}"
         )
 
@@ -222,9 +220,9 @@ def _pack_native_2bit(
 
     The on-disk 2-bit codes match ORT's bit-packing exactly, so the
     bytes are copied through unchanged. We expose
-    ``effective_scale = 2 · stored_scale`` so that the
-    ``effective_scale · (B − 1.5)`` dequant formula produces
-    ``stored_scale · {−3, −1, +1, +3}[B]``.
+    ``effective_scale = 2 * stored_scale`` so that the
+    ``effective_scale * (B - 1.5)`` dequant formula produces
+    ``stored_scale * {-3, -1, +1, +3}[B]``.
 
     Requires onnxruntime that includes the ``bits=2`` float zero-point
     CPU path (PR #28354, expected in 1.27+). See
@@ -241,7 +239,7 @@ def _pack_native_2bit(
     # 4 consecutive 128-elt sub-blocks of 32 bytes each.
     weight = codes_2bit.reshape(ne1, n_ort_blocks_per_row, blob_size).copy()
 
-    # effective_scale = 2 · stored_scale, replicated across the 4 sub-blocks.
+    # effective_scale = 2 * stored_scale, replicated across the 4 sub-blocks.
     effective_scales = (native_scales.astype(np.float32) * 2.0).astype(np.float16)
     scales = np.repeat(effective_scales, _SUBBLOCKS_PER_NATIVE, axis=1)
 
@@ -269,12 +267,12 @@ def _pack_inflated_4bit(
 ) -> RepackedTensor:
     """Pack Tencent codes as ``MatMulNBits bits=4`` + integer zp=3.
 
-    Inflates each 2-bit code ``c ∈ {0..3}`` to a 4-bit slot ``2c ∈
+    Inflates each 2-bit code ``c in {0..3}`` to a 4-bit slot ``2c in
     {0,2,4,6}``. With integer ``zp=3``, the dequant formula
-    ``scale·(B − 3)`` produces ``scale · {−3, −1, +1, +3}[c]`` — the
+    ``scale*(B - 3)`` produces ``scale * {-3, -1, +1, +3}[c]`` — the
     same SEQ codebook as the native form. ``scales`` carry the
     unmodified ``stored_scale`` (no factor-of-2 fold-in: the codebook
-    offset of ``3`` between slots already encodes the SEQ ``2×`` step).
+    offset of ``3`` between slots already encodes the SEQ ``2x`` step).
 
     Doubles on-disk weight bytes vs the native form but exercises
     ORT's well-optimised bits=4 packed-uint8 path. This is the default
@@ -285,7 +283,7 @@ def _pack_inflated_4bit(
     bits = 4
     n_ort_blocks_per_row = n_native * _SUBBLOCKS_PER_NATIVE
 
-    # Unpack 2-bit codes → 4 codes per byte, LSB-first slot k holds code k.
+    # Unpack 2-bit codes -> 4 codes per byte, LSB-first slot k holds code k.
     codes = np.empty(
         (ne1, n_native, TENCENT_Q1_0_NATIVE_BLOCK_SIZE),
         dtype=np.uint8,
@@ -293,7 +291,7 @@ def _pack_inflated_4bit(
     for slot in range(4):
         codes[:, :, slot::4] = (codes_2bit >> (2 * slot)) & np.uint8(0x3)
 
-    # Inflate c → 2c so dequant scale·(2c − 3) = scale·{−3,−1,+1,+3}[c].
+    # Inflate c -> 2c so dequant scale*(2c - 3) = scale*{-3,-1,+1,+3}[c].
     codes_inflated = (codes * 2).astype(np.uint8)
 
     # Split each native 512-elt block into 4 sub-blocks of 128 elements,
@@ -307,7 +305,9 @@ def _pack_inflated_4bit(
     # Integer zp=3 packed 2 per byte: (3 << 4) | 3 = 0x33.
     zp_cols = math.ceil(n_ort_blocks_per_row * bits / 8)
     zero_points = np.full((ne1, zp_cols), 0x33, dtype=np.uint8)
-    if n_ort_blocks_per_row % 2 == 1:  # pragma: no cover — n_ort_blocks always even (4·n_native)
+    if (
+        n_ort_blocks_per_row % 2 == 1
+    ):  # pragma: no cover — n_ort_blocks always even (4*n_native)
         zero_points[:, -1] = 0x03
 
     return RepackedTensor(

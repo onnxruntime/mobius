@@ -185,7 +185,7 @@ def _repack_q4_0(
     """Repack Q4_0 blocks.
 
     Q4_0 block (18 bytes): [fp16 scale (2B)][16B packed 4-bit quants]
-    Dequant: (nibble - 8) * scale  →  symmetric with zero_point = 8.
+    Dequant: (nibble - 8) * scale  ->  symmetric with zero_point = 8.
 
     GGUF nibble ordering differs from MatMulNBits — we reorder during
     repacking.  See ``_reorder_nibbles_gguf_to_ort`` for details.
@@ -194,7 +194,7 @@ def _repack_q4_0(
     raw_scales = blocks[:, :2].copy()
     raw_quants = blocks[:, 2:]  # (total_blocks, 16)
 
-    # Scales: view as fp16 → (total_blocks,) → reshape to (N, n_blocks)
+    # Scales: view as fp16 -> (total_blocks,) -> reshape to (N, n_blocks)
     scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
 
     # Reorder nibbles from GGUF order to MatMulNBits order
@@ -228,7 +228,7 @@ def _repack_q4_1(
     """Repack Q4_1 blocks.
 
     Q4_1 block (20 bytes): [fp16 scale (2B)][fp16 min (2B)][16B quants]
-    Dequant: nibble * scale + min  →  asymmetric.
+    Dequant: nibble * scale + min  ->  asymmetric.
 
     MatMulNBits dequant: (nibble - zp) * scale
     So: zp = round(-min / scale), clamped to [0, 15].
@@ -283,7 +283,7 @@ def _repack_q8_0(
     """Repack Q8_0 blocks.
 
     Q8_0 block (34 bytes): [fp16 scale (2B)][32 x int8 values (32B)]
-    Dequant: int8_val * scale  →  symmetric around 0.
+    Dequant: int8_val * scale  ->  symmetric around 0.
 
     MatMulNBits dequant: (uint8_val - zp) * scale
     Convert: uint8_val = int8_val + 128, zp = 128.
@@ -293,7 +293,7 @@ def _repack_q8_0(
 
     scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
 
-    # Convert signed int8 → unsigned uint8 by adding 128
+    # Convert signed int8 -> unsigned uint8 by adding 128
     quants_int8 = raw_quants.view(np.int8).astype(np.int16)
     quants_uint8 = (quants_int8 + 128).astype(np.uint8)
     weight = quants_uint8.reshape(n_out, n_blocks_per_row, 32)
@@ -319,12 +319,12 @@ def _unpack_q4_k_scales(
     packed into 12 bytes using 6-bit encoding.  The packing layout (from
     llama.cpp) uses three 4-byte groups::
 
-        Bytes 0-3 (d):   low 6 bits → sub_scale[0..3],
-                         high 2 bits → sub_scale[4..7] bits 4-5
-        Bytes 4-7 (m):   low 6 bits → sub_min[0..3],
-                         high 2 bits → sub_min[4..7] bits 4-5
-        Bytes 8-11 (md): low 4 bits → sub_scale[4..7] bits 0-3,
-                         high 4 bits → sub_min[4..7] bits 0-3
+        Bytes 0-3 (d):   low 6 bits -> sub_scale[0..3],
+                         high 2 bits -> sub_scale[4..7] bits 4-5
+        Bytes 4-7 (m):   low 6 bits -> sub_min[0..3],
+                         high 2 bits -> sub_min[4..7] bits 4-5
+        Bytes 8-11 (md): low 4 bits -> sub_scale[4..7] bits 0-3,
+                         high 4 bits -> sub_min[4..7] bits 0-3
 
     Args:
         scales_raw: uint8 array, shape ``(n_super_blocks, 12)``.
@@ -396,7 +396,7 @@ def _repack_q4_k(
     # Effective zero-point: zp = round(dmin * sub_min / eff_scale)
     # GGUF dequant: d * sub_scale * nibble - dmin * sub_min
     # MatMulNBits: (nibble - zp) * eff_scale = eff_scale * nibble - eff_scale * zp
-    # So eff_scale * zp = dmin * sub_min → zp = dmin * sub_min / eff_scale
+    # So eff_scale * zp = dmin * sub_min -> zp = dmin * sub_min / eff_scale
     numerator = dmin[:, None] * sub_mins_f  # (total, 8)
     with np.errstate(divide="ignore", invalid="ignore"):
         zp_float = np.where(
@@ -416,14 +416,14 @@ def _repack_q4_k(
 
     # Unpack 4-bit quants from Q4_K layout.
     # 128 bytes = 4 groups of 32 bytes. Each group encodes two sub-blocks:
-    #   byte[j] low nibble  → even sub-block element j
-    #   byte[j] high nibble → odd sub-block element j
+    #   byte[j] low nibble  -> even sub-block element j
+    #   byte[j] high nibble -> odd sub-block element j
     qs = qs_raw.reshape(total, 4, 1, 32)
     shifts = np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)
     qs = (qs >> shifts) & np.uint8(0x0F)  # (total, 4, 2, 32)
     qs = qs.reshape(total, 8, 32)  # (total, 8, 32) — 8 sub-blocks
 
-    # Repack each sub-block's 32 nibbles → 16 MatMulNBits bytes.
+    # Repack each sub-block's 32 nibbles -> 16 MatMulNBits bytes.
     # ORT format: byte[j] = (element[2j+1] << 4) | element[2j]
     pairs = qs.reshape(total, 8, 16, 2)
     ort_packed = (pairs[..., 1] << 4) | pairs[..., 0]  # (total, 8, 16)
@@ -453,8 +453,8 @@ def _repack_q4_k(
     )
 
 
-# Lookup table: 4-bit nibble (LSB-first) → 8-bit ORT 2-bit packed byte.
-# Each Q1_0 bit b ∈ {0, 1} maps to MatMulNBits 2-bit code 2*b ∈ {0, 2}
+# Lookup table: 4-bit nibble (LSB-first) -> 8-bit ORT 2-bit packed byte.
+# Each Q1_0 bit b in {0, 1} maps to MatMulNBits 2-bit code 2*b in {0, 2}
 # (which under zp=1 dequantizes to {-1, +1}).
 #
 # Q1_0 bit packing: bit `j % 8` of `qs[j // 8]` holds element j.
@@ -463,7 +463,7 @@ def _repack_q4_k(
 # nibble layout (LSB-first):    bit0 bit1 bit2 bit3
 # packed 2-bit byte (LSB-first): c0   c1   c2   c3
 #   where c_k = 2 * bit_k, giving byte = (bit3<<7)|(bit2<<5)|(bit1<<3)|(bit0<<1).
-def _build_q1_0_expand_table() -> "np.ndarray":
+def _build_q1_0_expand_table() -> np.ndarray:
     table = np.zeros(16, dtype=np.uint8)
     for nibble in range(16):
         byte = 0
@@ -489,9 +489,9 @@ def _repack_q1_0(
     Dequant per llama.cpp: ``bit ? +scale : -scale``.
 
     MatMulNBits has no native 1-bit format, so we inflate each Q1_0 bit
-    ``b ∈ {0, 1}`` to a 2-bit code ``B ∈ {0, 2}``. With zero-point=1 and
+    ``b in {0, 1}`` to a 2-bit code ``B in {0, 2}``. With zero-point=1 and
     scale=d, the op then dequantizes to ``(B - 1) * d = {-d, +d}`` — an
-    exact equivalent of Q1_0 at 2× the on-disk weight bytes but bit-exact
+    exact equivalent of Q1_0 at 2x the on-disk weight bytes but bit-exact
     in values.
 
     Each 8-bit Q1_0 byte encodes 8 elements, producing 2 MatMulNBits 2-bit
@@ -503,7 +503,7 @@ def _repack_q1_0(
     scales = raw_scales.view(np.float16).reshape(n_out, n_blocks_per_row)
 
     # Expand each Q1_0 byte (8 bits) into 2 MatMulNBits 2-bit bytes
-    # via the precomputed 4-bit nibble → 8-bit lookup table.
+    # via the precomputed 4-bit nibble -> 8-bit lookup table.
     low_nibbles = raw_bits & 0x0F  # bits 0..3 of each Q1_0 byte
     high_nibbles = (raw_bits >> 4) & 0x0F  # bits 4..7
 
@@ -518,7 +518,7 @@ def _repack_q1_0(
     interleaved[:, 1::2] = ort_high
     weight = interleaved.reshape(n_out, n_blocks_per_row, blob_size)
 
-    # Zero points: all blocks share zp=1 (so dequant maps {0,2} → {-1,+1}).
+    # Zero points: all blocks share zp=1 (so dequant maps {0,2} -> {-1,+1}).
     # Packed as 4 ZPs per byte (bits=2): byte = (1<<6) | (1<<4) | (1<<2) | 1 = 0x55.
     # Tail of the last byte (when n_blocks_per_row % 4 != 0) is unused by ORT;
     # we still fill it with 0x55 for cleanliness.
