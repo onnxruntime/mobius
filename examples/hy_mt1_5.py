@@ -72,7 +72,6 @@ def _build_bf16(output_dir: Path) -> None:
     pkg = mobius.build(HF_MODEL_ID, dtype="bf16", load_weights=True)
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
-    _patch_genai_config(output_dir)
     print("  genai_config.json + tokenizer files written")
 
 
@@ -82,28 +81,17 @@ def _build_q1_0(gguf_path: Path, output_dir: Path) -> None:
     from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
     print(f"Building Q1_0 -> {output_dir}")
-    pkg = build_from_gguf(str(gguf_path), keep_quantized=True, dtype="f32")
+    # ep='cpu' applies the GroupQueryAttention rewrite. With standard
+    # opset 23 Attention (ep='default'), ORT GenAI's
+    # past_present_share_buffer mode cannot be used; mobius's
+    # write_ort_genai_config inspects the resulting graph and turns
+    # share_buffer off automatically when GQA is absent.
+    pkg = build_from_gguf(
+        str(gguf_path), keep_quantized=True, dtype="f32", execution_provider="cpu"
+    )
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
-    _patch_genai_config(output_dir)
     print("  genai_config.json + tokenizer files written")
-
-
-def _patch_genai_config(output_dir: Path) -> None:
-    """Disable ``past_present_share_buffer`` for the dynamic-cache export.
-
-    mobius emits a dynamic-shape KV cache (no pre-allocated buffer);
-    ORT GenAI's default of ``past_present_share_buffer = True`` would
-    feed the attention op a mask whose ``total_sequence_length`` doesn't
-    match the dynamic past_key/past_value shapes, producing
-    ``inconsistent total_sequence_length`` at runtime.
-    """
-    import json
-
-    cfg_path = output_dir / "genai_config.json"
-    cfg = json.loads(cfg_path.read_text())
-    cfg.setdefault("search", {})["past_present_share_buffer"] = False
-    cfg_path.write_text(json.dumps(cfg, indent=4))
 
 
 def _ensure_built(args: argparse.Namespace) -> Path:

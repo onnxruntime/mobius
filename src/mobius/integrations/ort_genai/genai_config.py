@@ -47,7 +47,12 @@ def _default_decoder_outputs() -> dict[str, str]:
 _SHARE_BUFFER_MAX_LENGTH_CAP = 4096
 
 
-def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
+def _default_search_params(
+    *,
+    ep: str,
+    context_length: int,
+    supports_in_place_kv_cache: bool | None = None,
+) -> dict[str, Any]:
     """Return sensible default search parameters.
 
     Args:
@@ -56,11 +61,23 @@ def _default_search_params(*, ep: str, context_length: int) -> dict[str, Any]:
             :data:`~mobius._execution_providers.ep_registry`.
         context_length: Model context window; used as the default
             ``max_length`` for generation so the limit matches the model.
+        supports_in_place_kv_cache: When ``True`` / ``False``, forces
+            ``past_present_share_buffer`` regardless of the EP flag.
+            ORT GenAI's shared-buffer mode requires the decoder graph to
+            update the KV cache *in place* — only the
+            ``com.microsoft.GroupQueryAttention`` op does that.  The
+            standard ONNX ``Attention`` op concatenates past/new K,V into
+            a dynamically-sized tensor, which is incompatible with the
+            pre-allocated buffer mode. When ``None`` (legacy callers),
+            falls back to the EP capability flag.
     """
     from mobius._execution_providers import ep_registry
 
     caps = ep_registry.get(ep)
-    share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
+    if supports_in_place_kv_cache is None:
+        share_buffer = caps.supports_past_present_share_buffer if caps is not None else False
+    else:
+        share_buffer = supports_in_place_kv_cache
     cap_length = caps.cap_kv_buffer_max_length if caps is not None else False
     if share_buffer and cap_length:
         # Memory-constrained EPs (e.g. WebGPU on consumer GPUs) pre-allocate
@@ -151,6 +168,7 @@ class GenaiConfigGenerator:
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
+        supports_in_place_kv_cache: bool | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -165,10 +183,16 @@ class GenaiConfigGenerator:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
-        # Explicit decoder inputs (from graph introspection); None → use defaults
+        # Explicit decoder inputs (from graph introspection); None -> use defaults
         self._decoder_inputs = decoder_inputs
-        # Explicit decoder filename; None → use "model.onnx"
+        # Explicit decoder filename; None -> use "model.onnx"
         self._decoder_filename = decoder_filename
+        # Whether the exported decoder ONNX graph supports in-place KV-cache
+        # updates (i.e. uses ``com.microsoft.GroupQueryAttention`` rather than
+        # the standard ``Attention`` op that concatenates). ``None`` falls back
+        # to the EP capability flag, preserving existing behaviour for callers
+        # that don't introspect the graph.
+        self._supports_in_place_kv_cache = supports_in_place_kv_cache
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -194,6 +218,7 @@ class GenaiConfigGenerator:
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
+        supports_in_place_kv_cache: bool | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -227,6 +252,7 @@ class GenaiConfigGenerator:
             pad_token_id=pad,
             decoder_inputs=decoder_inputs,
             decoder_filename=decoder_filename,
+            supports_in_place_kv_cache=supports_in_place_kv_cache,
         )
 
     def with_vision(
@@ -410,7 +436,11 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
-        search = _default_search_params(ep=self.ep, context_length=self.context_length)
+        search = _default_search_params(
+            ep=self.ep,
+            context_length=self.context_length,
+            supports_in_place_kv_cache=self._supports_in_place_kv_cache,
+        )
         search.update(self._search_overrides)
 
         return {

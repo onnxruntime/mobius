@@ -35,6 +35,7 @@ def build_from_gguf(
     task: str | None = None,
     dtype: str | None = None,
     keep_quantized: bool = False,
+    execution_provider: str = "default",
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -59,6 +60,10 @@ def build_from_gguf(
         keep_quantized: When ``True``, preserve quantization for
             supported GGUF types (Q4_0, Q4_1, Q8_0) by repacking
             linear-layer weights into MatMulNBits format.
+        execution_provider: Target execution provider for EP-aware
+            optimisations (e.g. ``"cpu"`` to apply the
+            GroupQueryAttention rewrite). Defaults to ``"default"``
+            (portable, no vendor fusions).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -137,7 +142,7 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
-    pkg = build_from_module(module, config, task)
+    pkg = build_from_module(module, config, task, execution_provider=execution_provider)
     logger.info(
         "Built ONNX graph for %s (%d components)",
         model_type,
