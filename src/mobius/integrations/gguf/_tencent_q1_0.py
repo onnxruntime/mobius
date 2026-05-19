@@ -283,7 +283,6 @@ def _pack_inflated_4bit(
     <https://github.com/microsoft/onnxruntime/issues/28552>`_).
     """
     bits = 4
-    blob_size = TENCENT_Q1_0_ORT_BLOCK_SIZE * bits // 8  # 64
     n_ort_blocks_per_row = n_native * _SUBBLOCKS_PER_NATIVE
 
     # Unpack 2-bit codes → 4 codes per byte, LSB-first slot k holds code k.
