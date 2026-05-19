@@ -1,3 +1,4 @@
+# ruff: noqa: RUF002
 r"""End-to-end translation example for Hy-MT1.5-1.8B via ORT GenAI.
 
 Demonstrates loading a mobius-built Hy-MT1.5 export with
@@ -5,7 +6,7 @@ Demonstrates loading a mobius-built Hy-MT1.5 export with
 ``hunyuan_v1_dense`` is mapped to ORT GenAI's generic ``decoder`` LLM
 type (see ``onnxruntime-genai/src/models/model_type.h``); this script
 verifies that the resulting ``genai_config.json`` loads and that
-``Generator.generate_next_token()`` produces output end-to-end.
+``Generator`` produces real translations end-to-end.
 
 Two model variants are supported, selected by ``--variant``:
 
@@ -16,12 +17,28 @@ Two model variants are supported, selected by ``--variant``:
   SEQ codebook; default mobius packing is ``MatMulNBits bits=4``
   inflated form for fast CPU decode).
 
-Known caveat: the upstream Hy-MT1.5 BPE vocab uses placeholder special
-tokens and Chinese characters that ort-extensions' tokenizer does not
-fully round-trip today — for example ``"你好"`` tokenizes to an empty
-sequence. The chat template path renders correctly, but tokenization
-of CJK content in the message body is lossy. This is independent of
-the ``model_type=decoder`` fix and tracked downstream.
+Tokenizer caveat: the Hy-MT1.5 BPE vocab uses a custom regex
+pre-tokenizer that ort-extensions does not currently round-trip
+(``"Hello, world!"`` tokenizes to a single space token, ``"你好"``
+tokenizes to an empty sequence). By default this example tokenizes
+and detokenizes with the HuggingFace tokenizer and feeds raw token
+IDs to ``og.Generator``, which still exercises the full ORT GenAI
+inference path. Pass ``--use-ort-tokenizer`` to force the broken
+``og.Tokenizer`` path for reproduction / debugging.
+
+Expected output (Q1_0 on CPU EP)::
+
+    $ python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx \\
+          --prompt 'Translate to Spanish: The cat is sleeping on the chair.'
+    El gato está durmiendo en la silla.
+
+    $ python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx \\
+          --prompt 'Translate to French: Knowledge is power.'
+    La connaissance est puissance.
+
+    $ python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx
+    # default prompt: Translate the following Chinese text to English: 你好，世界！
+    Hello, world!
 
 Usage::
 
@@ -107,16 +124,19 @@ def _ensure_built(args: argparse.Namespace) -> Path:
     return out
 
 
-def run_translation(model_dir: Path, prompt: str, max_new_tokens: int) -> str:
+def run_translation(
+    model_dir: Path,
+    prompt: str,
+    max_new_tokens: int,
+    use_hf_tokenizer: bool,
+) -> str:
     """Run a single greedy generation through ORT GenAI."""
     import onnxruntime_genai as og
 
     print(f"\nLoading ORT GenAI model from {model_dir}")
     model = og.Model(str(model_dir))
-    tokenizer = og.Tokenizer(model)
-    tokenizer_stream = tokenizer.create_stream()
 
-    # Apply the chat template from the model dir if present.
+    # Apply the chat template from the model dir (works either way).
     chat_template_path = model_dir / "chat_template.jinja"
     if chat_template_path.exists():
         from jinja2 import Environment
@@ -130,6 +150,40 @@ def run_translation(model_dir: Path, prompt: str, max_new_tokens: int) -> str:
         full_prompt = prompt
 
     print(f"\nPrompt:\n  {prompt!r}")
+
+    if use_hf_tokenizer:
+        # Tokenize and detokenize via HuggingFace. ORT-extensions' BPE
+        # tokenizer does not currently round-trip the Hy-MT1.5 vocab's
+        # custom regex pre-tokenizer, so we bypass og.Tokenizer here
+        # while still exercising the ORT GenAI inference path.
+        import transformers
+
+        hf_tok = transformers.AutoTokenizer.from_pretrained(HF_MODEL_ID)
+        input_tokens = hf_tok.encode(full_prompt, add_special_tokens=False)
+
+        params = og.GeneratorParams(model)
+        params.set_search_options(
+            max_length=len(input_tokens) + max_new_tokens, do_sample=False
+        )
+        generator = og.Generator(model, params)
+        generator.append_tokens(input_tokens)
+
+        print("Generating: ", end="", flush=True)
+        generated_ids: list[int] = []
+        while not generator.is_done() and len(generated_ids) < max_new_tokens:
+            generator.generate_next_token()
+            new_token = int(generator.get_next_tokens()[0])
+            generated_ids.append(new_token)
+            # Decode incrementally; some tokens are multi-byte and only
+            # render when combined with neighbours, so we re-decode the
+            # accumulated tail and print the delta.
+            text_so_far = hf_tok.decode(generated_ids, skip_special_tokens=False)
+            print(text_so_far, end="\r", flush=True)
+        print()
+        return hf_tok.decode(generated_ids, skip_special_tokens=False)
+
+    tokenizer = og.Tokenizer(model)
+    tokenizer_stream = tokenizer.create_stream()
     input_tokens = tokenizer.encode(full_prompt)
 
     params = og.GeneratorParams(model)
@@ -138,17 +192,15 @@ def run_translation(model_dir: Path, prompt: str, max_new_tokens: int) -> str:
     generator.append_tokens(input_tokens)
 
     print("Generating: ", end="", flush=True)
-    response_chunks = []
+    chunks: list[str] = []
     while not generator.is_done():
         generator.generate_next_token()
         new_token = generator.get_next_tokens()[0]
         chunk = tokenizer_stream.decode(new_token)
-        response_chunks.append(chunk)
+        chunks.append(chunk)
         print(chunk, end="", flush=True)
     print()
-
-    text = "".join(response_chunks)
-    return text
+    return "".join(chunks)
 
 
 def main() -> None:
@@ -167,13 +219,29 @@ def main() -> None:
     )
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--use-ort-tokenizer",
+        action="store_true",
+        help=(
+            "Use ort-extensions' tokenizer (og.Tokenizer) instead of the "
+            "HuggingFace one. The Hy-MT1.5 vocab's custom regex pre-tokenizer "
+            "is not currently round-tripped by ort-extensions, so by default "
+            "we tokenize with HF and feed raw token IDs to og.Generator. "
+            "Enable this flag to exercise the full og.Tokenizer path."
+        ),
+    )
     args = parser.parse_args()
 
     if args.out is None:
         args.out = f"./hy-mt-{args.variant.lower()}-onnx"
 
     out = _ensure_built(args)
-    text = run_translation(out, args.prompt, args.max_new_tokens)
+    text = run_translation(
+        out,
+        args.prompt,
+        args.max_new_tokens,
+        use_hf_tokenizer=not args.use_ort_tokenizer,
+    )
 
     print("\n--- Full response ---")
     print(text)
