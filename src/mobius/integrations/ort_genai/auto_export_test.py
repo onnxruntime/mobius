@@ -67,6 +67,11 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("gemma2") == "gemma"
         assert _resolve_ort_genai_model_type("llama") == "llama"
 
+    def test_hunyuan_v1_dense_maps_to_decoder(self):
+        # ORT GenAI accepts "decoder" as a generic LLM type for any
+        # decoder-only causal LM not in its built-in registry.
+        assert _resolve_ort_genai_model_type("hunyuan_v1_dense") == "decoder"
+
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 

@@ -77,6 +77,9 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
+    # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
+    # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
+    "hunyuan_v1_dense": "decoder",
     # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen2_5_vl",
