@@ -79,14 +79,14 @@ class TestWriteComponentMetadata:
     def test_default_uses_spec_field_names(self, tmp_path):
         # The ORT-GenAI loader uses streaming JSON and rejects unknown
         # keys: ep_compatibility entries must use 'ep' / 'device' /
-        # 'compatibility' (not legacy aliases like 'ep_name' or
+        # 'compatibility_string' (not legacy aliases like 'ep_name' or
         # 'compatibility_strings').
         component_dir = tmp_path / "decoder"
         path = write_component_metadata(str(component_dir))
         with open(path, encoding="utf-8") as f:
             metadata = json.load(f)
         for entry in metadata["variants"][BASE_VARIANT_NAME]["ep_compatibility"]:
-            assert set(entry.keys()) <= {"ep", "device", "compatibility"}
+            assert set(entry.keys()) <= {"ep", "device", "compatibility_string"}
             assert "ep" in entry
 
     def test_custom_variants_override_default(self, tmp_path):
@@ -94,7 +94,7 @@ class TestWriteComponentMetadata:
         custom = {
             "cuda-ada-fp16": {
                 "ep_compatibility": [
-                    {"ep": "CUDAExecutionProvider", "compatibility": ["sm_89"]},
+                    {"ep": "CUDAExecutionProvider", "compatibility_string": "sm_89"},
                 ],
             },
         }
@@ -102,6 +102,24 @@ class TestWriteComponentMetadata:
         with open(path, encoding="utf-8") as f:
             metadata = json.load(f)
         assert metadata["variants"] == custom
+
+    def test_converts_legacy_compatibility_list(self, tmp_path):
+        component_dir = tmp_path / "decoder"
+        path = write_component_metadata(
+            str(component_dir),
+            variants={
+                "cuda": {
+                    "ep_compatibility": [
+                        {"ep": "CUDAExecutionProvider", "compatibility": ["sm_89", "sm_90"]},
+                    ],
+                },
+            },
+        )
+
+        with open(path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        ep_compat = metadata["variants"]["cuda"]["ep_compatibility"]
+        assert ep_compat == [{"ep": "CUDAExecutionProvider", "compatibility_string": "sm_89,sm_90"}]
 
 
 class TestWriteVariantJson:

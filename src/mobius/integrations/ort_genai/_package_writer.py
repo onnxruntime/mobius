@@ -4,15 +4,15 @@
 """Writers for ORT Model Package metadata files.
 
 This module produces the three package metadata files that the
-ORT-GenAI Model Package format expects (per the v4 proposal):
+current ORT Model Package parser expects:
 
 - ``<package>/manifest.json`` — top-level package descriptor
   (``schema_version`` + ``components`` array of component names).
-- ``<package>/<component>/metadata.json`` — component descriptor
+- ``<package>/models/<component>/metadata.json`` — component descriptor
   whose ``variants`` is a *map* keyed by variant name; each entry
   carries an ``ep_compatibility`` array of
-  ``{"ep", "device"?, "compatibility"}`` objects.
-- ``<package>/<component>/<variant>/variant.json`` — per-variant
+  ``{"ep", "device"?, "compatibility_string"?}`` objects.
+- ``<package>/models/<component>/<variant>/variant.json`` — per-variant
   manifest listing files, optional per-file session/provider options
   (objects, not arrays), optional ``shared_files`` map, and the
   ``consumer_metadata.genai_config_overlay`` blob.
@@ -34,9 +34,8 @@ import json
 import os
 from typing import Any
 
-# Mobius commits to schema version 1.0 for now. Bump on breaking
-# layout changes; the v4 proposal does not yet pin a number.
-SCHEMA_VERSION = "1.0"
+# Keep in sync with ORT's model-package descriptor parser.
+SCHEMA_VERSION = 1
 
 # The single variant name produced by mobius. Downstream packagers
 # add more variants alongside this one (e.g. "cuda", "qnn-htp-v75").
@@ -49,18 +48,18 @@ BASE_VARIANT_NAME = "base"
 # UX intact. Producers who know their build is e.g. CUDA-only can
 # narrow this list afterwards.
 #
-# Each entry follows the ORT-GenAI Model Package schema:
+# Each entry follows the ORT Model Package schema:
 #   { "ep": <canonical ORT EP name>,
 #     "device"?: <optional device class hint>,
-#     "compatibility": [<opaque match strings>] }
-# Empty ``compatibility`` means "matches any device the EP claims to
-# support" — the right default for an EP-agnostic graph.
+#     "compatibility_string"?: <opaque EP match string> }
+# Omitting ``compatibility_string`` means "matches any device the EP
+# claims to support" — the right default for an EP-agnostic graph.
 DEFAULT_BASE_EP_COMPATIBILITY: list[dict[str, Any]] = [
-    {"ep": "CPUExecutionProvider", "compatibility": []},
-    {"ep": "CUDAExecutionProvider", "compatibility": []},
-    {"ep": "DmlExecutionProvider", "compatibility": []},
-    {"ep": "WebGpuExecutionProvider", "compatibility": []},
-    {"ep": "NvTensorRTRTXExecutionProvider", "compatibility": []},
+    {"ep": "CPUExecutionProvider"},
+    {"ep": "CUDAExecutionProvider"},
+    {"ep": "DmlExecutionProvider"},
+    {"ep": "WebGpuExecutionProvider"},
+    {"ep": "NvTensorRTRTXExecutionProvider"},
 ]
 
 
@@ -99,14 +98,14 @@ def write_component_metadata(
           "variants": {
             "<name>": {
               "ep_compatibility": [
-                {"ep": "...", "device"?: "...", "compatibility": [...]}
+                {"ep": "...", "device"?: "...", "compatibility_string"?: "..."}
               ]
             }
           }
         }
 
     Args:
-        component_dir: Path to ``<package>/<component>/`` (created if
+        component_dir: Path to ``<package>/models/<component>/`` (created if
             missing).
         variants: Mapping from variant name to its descriptor dict.
             Each descriptor must contain ``"ep_compatibility"`` (a
@@ -121,6 +120,8 @@ def write_component_metadata(
         variants = {
             BASE_VARIANT_NAME: {"ep_compatibility": DEFAULT_BASE_EP_COMPATIBILITY},
         }
+    else:
+        variants = _normalize_variants(variants)
     metadata = {"variants": variants}
     path = os.path.join(component_dir, "metadata.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -157,7 +158,7 @@ def write_variant_json(
     cleanest representation for mobius's EP-agnostic ``base`` variant.
 
     Args:
-        variant_dir: Path to ``<package>/<component>/<variant>/``
+        variant_dir: Path to ``<package>/models/<component>/<variant>/``
             (created if missing).
         files: List of file entries. Each entry has at minimum
             ``"filename"`` (relative to *variant_dir*); optional
@@ -199,6 +200,52 @@ def _make_default_file_entry(filename: str) -> dict[str, Any]:
     optional fields are omitted entirely.
     """
     return {"filename": filename}
+
+
+def _normalize_variants(variants: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return a copy of variant descriptors using ORT's current field names."""
+    normalized: dict[str, dict[str, Any]] = {}
+    for variant_name, descriptor in variants.items():
+        ep_entries = descriptor.get("ep_compatibility")
+        if not isinstance(ep_entries, list) or not ep_entries:
+            raise ValueError("metadata.json variant entry must contain a non-empty ep_compatibility list")
+
+        out = dict(descriptor)
+        out["ep_compatibility"] = [_normalize_ep_compatibility_entry(entry) for entry in ep_entries]
+        normalized[variant_name] = out
+    return normalized
+
+
+def _normalize_ep_compatibility_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        raise TypeError("metadata.json ep_compatibility entries must be objects")
+
+    ep = entry.get("ep")
+    if not isinstance(ep, str) or not ep:
+        raise ValueError("metadata.json ep_compatibility entries require a non-empty string 'ep'")
+
+    out: dict[str, Any] = {"ep": ep}
+
+    device = entry.get("device")
+    if device is not None:
+        if not isinstance(device, str):
+            raise ValueError("metadata.json ep_compatibility 'device' must be a string")
+        out["device"] = device
+
+    compatibility_string = entry.get("compatibility_string")
+    if compatibility_string is None and "compatibility" in entry:
+        compatibility = entry["compatibility"]
+        if not isinstance(compatibility, list) or not all(isinstance(item, str) for item in compatibility):
+            raise ValueError("metadata.json ep_compatibility 'compatibility' must be a list of strings")
+        compatibility_string = ",".join(compatibility)
+
+    if compatibility_string is not None:
+        if not isinstance(compatibility_string, str):
+            raise ValueError("metadata.json ep_compatibility 'compatibility_string' must be a string")
+        if compatibility_string:
+            out["compatibility_string"] = compatibility_string
+
+    return out
 
 
 def _normalize_file_entry(entry: dict[str, Any]) -> dict[str, Any]:

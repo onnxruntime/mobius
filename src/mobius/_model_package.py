@@ -161,7 +161,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         """Save component models in the ORT Model Package layout.
 
         Each component is written to
-        ``<directory>/<component>/<variant_name>/model.onnx`` regardless
+        ``<directory>/models/<component>/<variant_name>/model.onnx`` regardless
         of whether the package has one or many components — the
         single-component flat-directory shortcut from :meth:`save` does
         *not* apply here.
@@ -211,11 +211,12 @@ class ModelPackage(UserDict[str, ir.Model]):
         }
 
         written: dict[str, str] = {}
+        models_dir = os.path.join(directory, "models")
         for name, model in selected.items():
             if check_weights:
                 _check_weights(name, model)
             component_name = component_map.get(name, name)
-            variant_dir = os.path.join(directory, component_name, variant_name)
+            variant_dir = os.path.join(models_dir, component_name, variant_name)
             os.makedirs(variant_dir, exist_ok=True)
             _write_one_model(
                 model,

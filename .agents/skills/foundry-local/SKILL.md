@@ -55,7 +55,7 @@ Use this skill when:
 
    The output is a Model Package directory containing
    `manifest.json`, a `configs/` subdirectory (genai_config + tokenizer +
-   processor configs), and one `<component>/base/{variant.json,
+   processor configs), and one `models/<component>/base/{variant.json,
    model.onnx, model.onnx.data.safetensors}` per component
    (`decoder` always, plus `embedding` / `vision_encoder` /
    `audio_encoder` for multimodal exports).
@@ -95,23 +95,23 @@ DST="${CACHE_DIR}/models/Custom/${MODEL_NAME}"
 # Configs (genai_config.json, tokenizer*, processor configs) live under configs/
 cp output/configs/* "${DST}/"
 
-# Per-component model files: <component>/base/{model.onnx,*.safetensors}
+# Per-component model files: models/<component>/base/{model.onnx,*.safetensors}
 # Foundry expects them at the top level (single-component) or in
 # <component>/ subdirectories (multi-component).
 for comp in decoder embedding vision_encoder audio_encoder; do
-  if [ -d "output/${comp}/base" ]; then
+  if [ -d "output/models/${comp}/base" ]; then
     if [ "${comp}" = "decoder" ] \
-      && [ ! -d "output/embedding" ] \
-      && [ ! -d "output/vision_encoder" ] \
-      && [ ! -d "output/audio_encoder" ]; then
+      && [ ! -d "output/models/embedding" ] \
+      && [ ! -d "output/models/vision_encoder" ] \
+      && [ ! -d "output/models/audio_encoder" ]; then
       # Single-component LLM: flatten decoder files into the model root.
       # Check sibling component dirs explicitly because a real Model
       # Package also contains configs/ and manifest.json at the top level.
-      cp output/${comp}/base/* "${DST}/"
+      cp output/models/${comp}/base/* "${DST}/"
     else
       # Multi-component: keep one subdir per component
       mkdir -p "${DST}/${comp}"
-      cp output/${comp}/base/* "${DST}/${comp}/"
+      cp output/models/${comp}/base/* "${DST}/${comp}/"
     fi
   fi
 done

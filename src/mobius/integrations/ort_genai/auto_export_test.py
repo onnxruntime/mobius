@@ -479,6 +479,9 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert "model" in data
         assert data["model"]["type"] == "qwen2"
+        assert os.path.isfile(tmp_path / "models" / "decoder" / "metadata.json")
+        assert os.path.isfile(tmp_path / "models" / "decoder" / "base" / "variant.json")
+        assert not os.path.exists(tmp_path / "decoder")
 
     def test_duplicate_component_names_rejected(self, tmp_path, monkeypatch):
         """Two package keys mapping to the same on-disk component is rejected.
@@ -938,7 +941,7 @@ class TestExportPackage:
             written = {}
             for key in self:
                 comp = component_map.get(key, key)
-                written[comp] = os.path.join(directory, comp, "base", "model.onnx")
+                written[comp] = os.path.join(directory, "models", comp, "base", "model.onnx")
             return written
 
         monkeypatch.setattr(pkg.__class__, "save_package_layout", fake_save_package_layout)
@@ -953,7 +956,7 @@ class TestExportPackage:
         assert os.path.isfile(result["genai_config"])
         # Per-component ONNX path is in the manifest (LLM key "model" -> "decoder")
         assert result["decoder:model"] == os.path.join(
-            str(tmp_path), "decoder", "base", "model.onnx"
+            str(tmp_path), "models", "decoder", "base", "model.onnx"
         )
         # Top-level manifest.json was written
         assert "manifest" in result
@@ -1038,7 +1041,7 @@ class TestExportPackage:
             pkg.__class__,
             "save_package_layout",
             lambda self, d, **kw: {
-                "decoder": os.path.join(d, "decoder", "base", "model.onnx"),
+                "decoder": os.path.join(d, "models", "decoder", "base", "model.onnx"),
             },
         )
 

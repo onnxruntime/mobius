@@ -106,7 +106,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
 )
 
 # Mapping from ``ModelPackage`` dict keys to package component names
-# (the on-disk subfolder under ``<package>/<component>/``). The legacy
+# (the on-disk subfolder under ``<package>/models/<component>/``). The legacy
 # LLM key ``"model"`` is renamed to the GenAI role ``"decoder"``;
 # everything else is identity.
 _PKG_KEY_TO_COMPONENT: dict[str, str] = {
@@ -795,12 +795,12 @@ def write_ort_genai_config(
     - ``configs/`` — tokenizer files and (for VLMs/speech) processor
       configs (``image_processor.json`` /  ``processor_config.json`` /
       ``audio_processor.json`` / ``audio_feature_extraction.json``).
-    - ``<component>/metadata.json`` — per-component variant list.
-    - ``<component>/base/variant.json`` — per-variant manifest.
+    - ``models/<component>/metadata.json`` — per-component variant list.
+    - ``models/<component>/base/variant.json`` — per-variant manifest.
 
     This function does NOT write ONNX model files — call
     :meth:`~mobius._model_package.ModelPackage.save_package_layout`
-    separately to populate the per-component ``base/model.onnx``
+    separately to populate the per-component ``models/<component>/base/model.onnx``
     files.
 
     Args:
@@ -984,8 +984,9 @@ def write_ort_genai_config(
     _fix_chat_template(configs_dir, hf_model_id)
 
     # --- Write per-component metadata + base/variant.json ---------------
+    models_dir = os.path.join(directory, "models")
     for component_name in component_names:
-        component_dir = os.path.join(directory, component_name)
+        component_dir = os.path.join(models_dir, component_name)
         metadata_path = write_component_metadata(component_dir)
         variant_dir = os.path.join(component_dir, "base")
         variant_path = write_variant_json(variant_dir)
@@ -1075,7 +1076,7 @@ def export_package(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Save ONNX models in package layout: <output>/<component>/base/model.onnx
+    # 1. Save ONNX models in package layout: <output>/models/<component>/base/model.onnx
     logger.info("Saving ONNX models to %s in Model Package layout", output_dir)
     component_map = _resolve_component_map(pkg)
     saved = pkg.save_package_layout(
@@ -1120,7 +1121,7 @@ def auto_export(
 
     1. Builds the ONNX graph(s) via :func:`~mobius._builder.build`
     2. Downloads and applies HuggingFace weights
-    3. Saves ONNX model(s) into ``<component>/base/model.onnx`` via
+    3. Saves ONNX model(s) into ``models/<component>/base/model.onnx`` via
        :meth:`~mobius._model_package.ModelPackage.save_package_layout`
     4. Calls :func:`write_ort_genai_config` to write the package
        metadata files (``manifest.json``, per-component

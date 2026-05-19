@@ -209,9 +209,9 @@ def _save_package(
     """Save a ModelPackage to disk, applying optimizations and runtime configs.
 
     When ``--runtime ort-genai`` is set, writes the ORT Model Package
-    layout (per-component ``base/model.onnx`` plus manifest, metadata,
-    variant.json, configs/genai_config.json, tokenizer files). Otherwise
-    writes the legacy flat-directory layout via
+    layout (per-component ``models/<component>/base/model.onnx`` plus
+    manifest, metadata, variant.json, configs/genai_config.json, tokenizer
+    files). Otherwise writes the legacy flat-directory layout via
     :meth:`ModelPackage.save`.
     """
     components = (lambda name: name == component_filter) if component_filter else None
