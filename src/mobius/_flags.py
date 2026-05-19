@@ -84,6 +84,12 @@ class _Flags:
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT ≤1.24.x workaround). Disabled by default.
+       * - ``tencent_q1_0_use_native_2bit``
+         - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
+         - ``False``
+         - Use native ``MatMulNBits bits=2`` for Tencent SEQ Q1_0
+           (smaller, semantically faithful, but ~20× slower on CPU EP
+           pending an MLAS fast path).
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -114,6 +120,34 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
     an older ORT build without opset 24 kernel registration.
+    """
+
+    tencent_q1_0_use_native_2bit: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT", False)
+    )
+    """Emit Tencent custom Q1_0 (2-bit SEQ) tensors using native
+    ``MatMulNBits bits=2`` + float ``zero_point = 1.5`` instead of the
+    ``bits=4`` inflation that defaults today.
+
+    Pros (when set to ``True``):
+        Halves the on-disk weight bytes (2 bpw vs 4 bpw inflated).
+        Semantically faithful to the source quantization layout.
+
+    Cons (default ``False``):
+        ORT's CPU ``bits=2`` + float-zp dequant path is currently a
+        naive scalar fallback (~20× slower than the ``bits=4`` packed
+        path on the same weights). See
+        `microsoft/onnxruntime#28552
+        <https://github.com/microsoft/onnxruntime/issues/28552>`_.
+        Also requires ORT ≥1.27 (the float-zp path was added in
+        `microsoft/onnxruntime#28354
+        <https://github.com/microsoft/onnxruntime/pull/28354>`_).
+
+    The ``bits=4`` default inflates each 2-bit code ``c ∈ {0..3}`` to
+    a 4-bit slot ``2c ∈ {0,2,4,6}`` paired with integer ``zero_point=3``;
+    dequant gives the same SEQ codebook values, just at twice the
+    weight storage. Set ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT=1`` to
+    opt in to the smaller native form once kernel performance lands.
     """
 
 
