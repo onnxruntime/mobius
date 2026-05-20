@@ -774,6 +774,25 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
                 )
             }
 
+    # SenseVoice / FunASR-style: encoder config lives under "encoder_conf"
+    # and the mel-spec frontend under "frontend_conf". Top-level holds
+    # input_size + vocab_size. model_type is "sensevoice".
+    if model_type == "sensevoice":
+        encoder_conf = getattr(config, "encoder_conf", None) or {}
+        frontend_conf = getattr(config, "frontend_conf", None) or {}
+        if isinstance(encoder_conf, dict) and encoder_conf:
+            audio_fields.update(
+                attention_dim=encoder_conf.get("output_size"),
+                attention_heads=encoder_conf.get("attention_heads"),
+                num_blocks=encoder_conf.get("num_blocks"),
+                tp_num_blocks=encoder_conf.get("tp_blocks"),
+                linear_units=encoder_conf.get("linear_units"),
+                kernel_size=encoder_conf.get("kernel_size"),
+                input_size=getattr(config, "input_size", None),
+            )
+            if isinstance(frontend_conf, dict):
+                audio_fields["num_mel_bins"] = frontend_conf.get("n_mels")
+
     # Build AudioConfig sub-config if any audio fields are set
     has_audio = any(v is not None for v in audio_fields.values())
 
