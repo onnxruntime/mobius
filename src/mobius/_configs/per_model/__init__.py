@@ -14,7 +14,11 @@ from __future__ import annotations
 from mobius._configs.per_model import (  # noqa: F401
     _audio_default,
     _gemma4_audio,
+    _hunyuan_vl_mot_vision,
+    _internvl_vision,
     _phi4mm_audio,
+    _phi4mm_vision,
     _qwen3_asr_audio,
     _sensevoice_audio,
+    _vision_default,
 )

@@ -130,13 +130,42 @@ def extract_audio_config(config, parent_config, model_type: str) -> dict:
 def extract_vision_config(config, parent_config, model_type: str) -> dict:
     """Run every registered vision hook and assemble the result.
 
-    Vision hooks differ from audio hooks: there is no default
-    :class:`VisionConfig` autoinstantiation — vision sub-configs are
-    constructed by an always-applied "default" hook so that other hooks
-    can override its output.
+    Hooks may either contribute to ``fields`` (which become kwargs for
+    :class:`VisionConfig`) or return a fully-formed dict to short-circuit.
+    The dispatcher also lifts a fixed set of "shared" vision fields
+    (``image_token_id``, ``spatial_merge_size``, ...) up to the top-level
+    of the returned dict so callers can access them as
+    ``config.image_token_id`` directly.
     """
+    from mobius._configs._sub_configs import VisionConfig
+
     fields: dict = {}
     short_circuit = _run(_VISION_HOOKS, config, parent_config, model_type, fields)
     if short_circuit is not None:
         return short_circuit
-    return fields
+    # A "vision present" signal: at least one field beyond the always-defaulted
+    # geometric knobs (norm_eps / in_channels / spatial_merge_size /
+    # temporal_patch_size) must be populated.
+    has_vision = any(
+        v is not None
+        for k, v in fields.items()
+        if k not in ("norm_eps", "in_channels", "spatial_merge_size", "temporal_patch_size")
+    )
+    if not has_vision:
+        return {}
+    out: dict = {"vision": VisionConfig(**fields)}
+    for shared in (
+        "mm_tokens_per_image",
+        "image_token_id",
+        "spatial_merge_size",
+        "temporal_patch_size",
+        "deepstack_visual_indexes",
+        "fullatt_block_indexes",
+        "window_size",
+        "mrope_section",
+        "image_crop_size",
+    ):
+        val = fields.get(shared)
+        if val is not None:
+            out[shared] = val
+    return out
