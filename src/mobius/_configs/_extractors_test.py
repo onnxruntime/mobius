@@ -208,3 +208,46 @@ def test_sensevoice_filter_only_fires_for_sensevoice(loaded_hooks):
     assert out == {}, (
         f"sensevoice hook fired for model_type='llama' (cross-contamination): {out}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Vision hooks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def loaded_vision_hooks():
+    _import_per_model()
+    return list(_extractors._VISION_HOOKS)
+
+
+def test_vision_hooks_do_not_contribute_for_unrelated_models(loaded_vision_hooks):
+    """Plain text model_types must not trigger any vision hook."""
+    for plain_model_type in ("llama", "qwen2", "gpt2", "bloom", "mamba"):
+        result = _extractors.extract_vision_config(_FakeHFConfig(), None, plain_model_type)
+        assert result == {}, (
+            f"unrelated model_type {plain_model_type!r} produced vision output: {result}"
+        )
+
+
+def test_phi4mm_vision_filter_only_fires_for_phi4mm(loaded_vision_hooks):
+    # Bare config without vision_config: phi4mm hook should still fire (its
+    # body hard-codes the SigLIP dims) for "phi4mm", but NOT for "llama".
+    cfg = _FakeHFConfig(special_image_token_id=200010)
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    assert "vision" in out and out["vision"].hidden_size == 1152
+
+    out = _extractors.extract_vision_config(cfg, None, "llama")
+    assert out == {}, (
+        f"phi4mm vision hook fired for model_type='llama' (cross-contamination): {out}"
+    )
+
+
+def test_hunyuan_vl_mot_filter_only_fires_for_that_model(loaded_vision_hooks):
+    cfg = _FakeHFConfig(mask_init_id=12)
+    out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
+    assert out["vision"].hidden_size == 1152
+
+    # llama: no vision_config + no hardcoded path → empty
+    out = _extractors.extract_vision_config(cfg, None, "llama")
+    assert out == {}
