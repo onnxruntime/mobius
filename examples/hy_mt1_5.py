@@ -42,16 +42,14 @@ Expected output (Q1_0 on CPU EP)::
 
 Usage::
 
-    # One-step demo: downloads the GGUF from AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF
-    # on first use, builds the ONNX model into --out, and runs translation.
+    # One-shot demo: downloads the GGUF from AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF
+    # (cached by huggingface_hub), builds the ONNX model into --out, and runs
+    # translation. Re-running rebuilds the ONNX (the network download is cached).
     python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx \\
         --prompt 'Translate to Spanish: The cat is sleeping on the chair.'
 
-    # Subsequent runs reuse the build (no download, no rebuild)
-    python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx
-
     # Build from a local GGUF instead of letting mobius download it
-    python examples/hy_mt1_5.py --variant Q1_0 --build \\
+    python examples/hy_mt1_5.py --variant Q1_0 \\
         --gguf ./gguf/Hy-MT1.5-1.8B-2bit.gguf --out ./hy-mt-q1_0-onnx
 """
 
@@ -70,9 +68,6 @@ GGUF_HF_REF = "AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF"
 _DEFAULT_PROMPT = "Translate the following Chinese text to English: 你好，世界！"  # noqa: RUF001
 
 
-_VARIANT_MARKER = ".mobius-variant"
-
-
 def _build_bf16(output_dir: Path) -> None:
     """Build the BF16 ONNX model + ORT-GenAI config in-process."""
     import mobius
@@ -82,7 +77,6 @@ def _build_bf16(output_dir: Path) -> None:
     pkg = mobius.build(HF_MODEL_ID, dtype="bf16", load_weights=True)
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
-    (output_dir / _VARIANT_MARKER).write_text("bf16\n")
     print("  genai_config.json + tokenizer files written")
 
 
@@ -105,46 +99,27 @@ def _build_q1_0(gguf_ref: str, output_dir: Path) -> None:
     pkg = build_from_gguf(gguf_ref, keep_quantized=True, dtype="f32", execution_provider="cpu")
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
-    (output_dir / _VARIANT_MARKER).write_text(f"Q1_0\t{gguf_ref}\n")
     print("  genai_config.json + tokenizer files written")
 
 
-def _existing_variant(output_dir: Path) -> str | None:
-    """Return the variant string recorded for an existing build, or None."""
-    marker = output_dir / _VARIANT_MARKER
-    if not marker.exists():
-        return None
-    return marker.read_text().split("\t", 1)[0].strip() or None
+def _build(args: argparse.Namespace) -> Path:
+    """Always (re)build the model into ``--out``.
 
-
-def _ensure_built(args: argparse.Namespace) -> Path:
+    HuggingFace Hub caches the source (safetensors for bf16, GGUF for Q1_0),
+    so re-runs are cheap on the network side; the in-process ONNX construction
+    runs every time. This keeps the example dead-simple: no marker files, no
+    reuse logic, no chance of silently running a stale or wrong-variant build.
+    """
     out = Path(args.out).resolve()
-    existing_variant = _existing_variant(out)
-    has_model = (out / "genai_config.json").exists()
-
-    # Refuse to silently reuse a directory built for a different variant.
-    if has_model and existing_variant is not None and existing_variant != args.variant:
-        sys.exit(
-            f"{out} already contains a {existing_variant!r} build but "
-            f"--variant is {args.variant!r}. Pick a different --out, "
-            f"or remove the directory and re-run."
-        )
-
-    # Default to building from the published HF GGUF so a fresh demo only
-    # needs one ``python examples/hy_mt1_5.py ...`` invocation.
-    need_build = args.build or not has_model
-    if need_build:
-        out.mkdir(parents=True, exist_ok=True)
-        if args.variant == "bf16":
-            _build_bf16(out)
-        elif args.variant == "Q1_0":
-            gguf_ref = args.gguf or GGUF_HF_REF
-            _build_q1_0(gguf_ref, out)
+    out.mkdir(parents=True, exist_ok=True)
+    if args.variant == "bf16":
+        _build_bf16(out)
+    elif args.variant == "Q1_0":
+        _build_q1_0(args.gguf or GGUF_HF_REF, out)
     if not (out / "genai_config.json").exists():
         sys.exit(
-            f"Build did not produce {out / 'genai_config.json'}. The build step above "
-            f"failed; check the preceding output. To force a rebuild from a clean state, "
-            f"remove {out} and re-run with --build."
+            f"Build did not produce {out / 'genai_config.json'}; check the "
+            f"preceding output for the underlying failure."
         )
     return out
 
@@ -237,16 +212,10 @@ def main() -> None:
         "--out",
         default=None,
         help=(
-            "ONNX model directory. If it doesn't contain a built model yet, "
-            "one is created automatically (downloading the GGUF for --variant Q1_0 "
-            "when --gguf isn't given). Subsequent runs with the same --out reuse "
-            "the build. Defaults to ./hy-mt-<variant>-onnx."
+            "Directory to write the ONNX model + ORT GenAI config into. "
+            "Always overwritten on each run (HuggingFace cache handles "
+            "the underlying source download). Defaults to ./hy-mt-<variant>-onnx."
         ),
-    )
-    parser.add_argument(
-        "--build",
-        action="store_true",
-        help="Force rebuild even when --out already has a model",
     )
     parser.add_argument(
         "--gguf",
@@ -254,7 +223,7 @@ def main() -> None:
         help=(
             "Path to a local Tencent SEQ GGUF for --variant Q1_0. When omitted, "
             "mobius downloads the GGUF from AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF "
-            "on first use."
+            "(cached locally by huggingface_hub)."
         ),
     )
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
@@ -275,7 +244,7 @@ def main() -> None:
     if args.out is None:
         args.out = f"./hy-mt-{args.variant.lower()}-onnx"
 
-    out = _ensure_built(args)
+    out = _build(args)
     text = run_translation(
         out,
         args.prompt,
