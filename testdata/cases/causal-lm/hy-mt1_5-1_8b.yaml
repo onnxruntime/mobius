@@ -1,0 +1,27 @@
+model_id: "tencent/Hy-MT1.5-1.8B-2bit"
+model_type: "hunyuan_v1_dense"
+revision: "f89fcdc2b27e5a3c742789b909371971de8c042c"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "<｜hy_begin▁of▁sentence｜><｜hy_User｜>Translate the following Chinese text to English: 黄河之水天上来<｜hy_Assistant｜>"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 16
+  do_sample: false
+
+notes: |
+  Tencent Hy-MT1.5 1.8B translation model. Same architecture as the
+  existing tiny-random hunyuan-v1-dense case, but with real weights so
+  L4 prefill logits and L5 generation are meaningful. The repo name is
+  "*-2bit" but it ships a full BF16 safetensors checkpoint alongside
+  the 2-bit GGUF variant.
+
+  The prompt is pre-formatted with the Hy-MT chat template
+  (<｜hy_User｜>...<｜hy_Assistant｜>) because generate_golden.py does
+  not apply chat templates for causal-lm cases — feeding the raw
+  instruction directly causes the model to hallucinate.

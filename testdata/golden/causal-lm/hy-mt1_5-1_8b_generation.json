@@ -1,0 +1,19 @@
+{
+  "model_id": "tencent/Hy-MT1.5-1.8B-2bit",
+  "prompt": "<\uff5chy_begin\u2581of\u2581sentence\uff5c><\uff5chy_User\uff5c>Translate the following Chinese text to English: \u9ec4\u6cb3\u4e4b\u6c34\u5929\u4e0a\u6765<\uff5chy_Assistant\uff5c>",
+  "generated_tokens": [
+    628,
+    16284,
+    279,
+    252,
+    32075,
+    10630,
+    3899,
+    562,
+    252,
+    63562,
+    13,
+    120020
+  ],
+  "generated_text": "The waters of the Yellow River come from the heavens."
+}
