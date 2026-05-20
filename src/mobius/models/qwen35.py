@@ -320,17 +320,24 @@ class Qwen35MoETextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        # Embed tokens unless caller already provided fused inputs_embeds
+        # (e.g. the VL decoder, which interleaves vision features before
+        # entering the text backbone).
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
 
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=hidden_states if input_ids is None else input_ids,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
@@ -568,4 +575,160 @@ class Qwen35VLDecoderModel(nn.Module):
         if self.config.tie_word_embeddings:
             if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
                 renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+        return renamed
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.5-MoE-VL (Qwen3.6-35B-A3B and friends)
+# ---------------------------------------------------------------------------
+
+
+class Qwen35MoEVLDecoderModel(nn.Module):
+    """Qwen3.5-MoE-VL text decoder taking ``inputs_embeds`` (3-model split).
+
+    Same wiring as :class:`Qwen35VLDecoderModel` but the text backbone is the
+    MoE variant :class:`Qwen35MoETextModel` (hybrid linear/full attention +
+    sparse Mixture-of-Experts FFN with a sigmoid-gated shared expert).
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.model = Qwen35MoETextModel(config)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+        )
+        logits = self.lm_head(op, hidden_states)
+        return logits, present_key_values
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route language_model weights for standalone decoder build."""
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith(("mtp_", "mtp.")):
+                continue
+            stripped = key
+            if stripped.startswith("model."):
+                stripped = stripped[len("model.") :]
+            if stripped.startswith("visual."):
+                continue
+            if stripped.startswith("language_model."):
+                stripped = stripped[len("language_model.") :]
+            renamed[stripped] = value
+        if self.config.tie_word_embeddings:
+            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
+                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
+        return renamed
+
+
+class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
+    """Qwen3.5-MoE-VL vision-language model (3-model split for ORT GenAI).
+
+    Builds three separate ONNX models:
+
+    - ``decoder``: text decoder over hybrid linear/full attention with MoE
+      FFN; consumes ``inputs_embeds`` so the embedding model can splice in
+      vision features.
+    - ``vision_encoder``: shared Qwen3-VL ViT (identical to the dense
+      Qwen3.5-VL counterpart).
+    - ``embedding``: token embedding + image-feature fusion.
+
+    HuggingFace class: ``Qwen3_5MoeForConditionalGeneration``. The HF
+    model_type string is ``qwen3_5_moe`` for both the text-only checkpoints
+    and these VL checkpoints; the registry dispatches to this class when the
+    HF config carries a ``vision_config`` sub-object and to
+    :class:`Qwen35MoECausalLMModel` otherwise.
+    """
+
+    default_task: str = "hybrid-qwen-vl"
+    category: str = "Multimodal"
+    config_class: type = ArchitectureConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = Qwen35MoEVLDecoderModel(config)
+        self.vision_encoder = Qwen3VLVisionEncoderModel(config)
+        self.embedding = Qwen3VLEmbeddingModel(config)
+
+    def forward(self, op, **kwargs):
+        raise NotImplementedError(
+            "Qwen35MoEVL3ModelCausalLMModel uses HybridQwenVLTask which "
+            "drives each sub-module independently."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route HF weights to the three sub-model ONNX initializer names.
+
+        HF key prefixes: ``model.visual.*`` (vision encoder),
+        ``model.language_model.*`` (MoE text backbone + embeddings),
+        ``lm_head.*`` (final projection — tied or untied to embeddings).
+        Mirrors :meth:`Qwen35VL3ModelCausalLMModel.preprocess_weights` but
+        the decoder uses the MoE-flavoured text model and HF stores experts
+        as fused tensors that must be unpacked.
+        """
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith(("mtp_", "mtp.")):
+                continue
+            stripped = key
+            if stripped.startswith("model."):
+                stripped = stripped[len("model.") :]
+
+            if stripped.startswith("visual."):
+                stripped = stripped.replace(".mlp.linear_fc1.", ".mlp.up_proj.")
+                stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
+                renamed[f"vision_encoder.{stripped}"] = value
+            elif stripped.startswith("language_model.embed_tokens."):
+                suffix = stripped[len("language_model.") :]
+                renamed[f"decoder.model.{suffix}"] = value
+                renamed[f"embedding.{suffix}"] = value
+                if (
+                    self.config.tie_word_embeddings
+                    and stripped == "language_model.embed_tokens.weight"
+                ):
+                    renamed["decoder.lm_head.weight"] = value
+            elif stripped.startswith("language_model.lm_head."):
+                renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
+            elif stripped.startswith("lm_head."):
+                renamed[f"decoder.{stripped}"] = value
+            elif stripped.startswith("language_model."):
+                suffix = stripped[len("language_model.") :]
+                target = f"decoder.model.{suffix}"
+                # Unpack fused expert tensors into per-expert ONNX initializer
+                # names. HF stores ``experts.gate_up_proj`` as
+                # ``[num_experts, 2*inter, hidden]`` (gate + up concatenated
+                # along dim 1) and ``experts.down_proj`` as
+                # ``[num_experts, hidden, inter]``.
+                if suffix.endswith(".mlp.experts.gate_up_proj"):
+                    prefix = target[: -len("experts.gate_up_proj")]
+                    half = value.shape[1] // 2
+                    for i in range(value.shape[0]):
+                        renamed[f"{prefix}experts.{i}.gate_proj.weight"] = value[i, :half]
+                        renamed[f"{prefix}experts.{i}.up_proj.weight"] = value[i, half:]
+                elif suffix.endswith(".mlp.experts.down_proj"):
+                    prefix = target[: -len("experts.down_proj")]
+                    for i in range(value.shape[0]):
+                        renamed[f"{prefix}experts.{i}.down_proj.weight"] = value[i]
+                else:
+                    renamed[target] = value
         return renamed

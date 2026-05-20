@@ -1,0 +1,25 @@
+model_id: "Qwen/Qwen3.6-35B-A3B"
+model_type: "qwen3_5_moe_vl"
+revision: "main"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Describe this image in one short sentence."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+  eos_token_id: 248044
+
+ci_skip_reason: "35B-total MoE — too large for CI without GPU"
+notes: |
+  Qwen3.6-35B-A3B vision-language model. model_type=qwen3_5_moe (composite)
+  with text_config (hybrid linear/full attention + MoE) and vision_config
+  (Qwen3-VL ViT). Dispatched to Qwen35MoEVL3ModelCausalLMModel because
+  the composite carries a vision_config sub-object.

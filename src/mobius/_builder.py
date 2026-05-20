@@ -357,6 +357,17 @@ def build(
             dc.model_type = model_type
         hf_config = dc
     elif hasattr(hf_config, "text_config"):
+        # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B etc.) ships ``model_type=qwen3_5_moe``
+        # for *both* text-only and VL checkpoints. When the composite carries
+        # a ``vision_config`` sub-object, override model_type so the registry
+        # picks the 3-model VL class. The text backbone's per-layer fields
+        # still live under ``text_config``, so we always unwrap; the original
+        # composite stays available via ``parent_config`` for vision extraction.
+        if (
+            model_type == "qwen3_5_moe"
+            and getattr(hf_config, "vision_config", None) is not None
+        ):
+            model_type = "qwen3_5_moe_vl"
         hf_config = hf_config.text_config
 
     if module_class is None:
