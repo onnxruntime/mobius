@@ -70,6 +70,9 @@ GGUF_HF_REF = "AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF"
 _DEFAULT_PROMPT = "Translate the following Chinese text to English: 你好，世界！"  # noqa: RUF001
 
 
+_VARIANT_MARKER = ".mobius-variant"
+
+
 def _build_bf16(output_dir: Path) -> None:
     """Build the BF16 ONNX model + ORT-GenAI config in-process."""
     import mobius
@@ -79,6 +82,7 @@ def _build_bf16(output_dir: Path) -> None:
     pkg = mobius.build(HF_MODEL_ID, dtype="bf16", load_weights=True)
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
+    (output_dir / _VARIANT_MARKER).write_text("bf16\n")
     print("  genai_config.json + tokenizer files written")
 
 
@@ -101,14 +105,34 @@ def _build_q1_0(gguf_ref: str, output_dir: Path) -> None:
     pkg = build_from_gguf(gguf_ref, keep_quantized=True, dtype="f32", execution_provider="cpu")
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
+    (output_dir / _VARIANT_MARKER).write_text(f"Q1_0\t{gguf_ref}\n")
     print("  genai_config.json + tokenizer files written")
+
+
+def _existing_variant(output_dir: Path) -> str | None:
+    """Return the variant string recorded for an existing build, or None."""
+    marker = output_dir / _VARIANT_MARKER
+    if not marker.exists():
+        return None
+    return marker.read_text().split("\t", 1)[0].strip() or None
 
 
 def _ensure_built(args: argparse.Namespace) -> Path:
     out = Path(args.out).resolve()
+    existing_variant = _existing_variant(out)
+    has_model = (out / "genai_config.json").exists()
+
+    # Refuse to silently reuse a directory built for a different variant.
+    if has_model and existing_variant is not None and existing_variant != args.variant:
+        sys.exit(
+            f"{out} already contains a {existing_variant!r} build but "
+            f"--variant is {args.variant!r}. Pick a different --out, "
+            f"or remove the directory and re-run."
+        )
+
     # Default to building from the published HF GGUF so a fresh demo only
     # needs one ``python examples/hy_mt1_5.py ...`` invocation.
-    need_build = args.build or not (out / "genai_config.json").exists()
+    need_build = args.build or not has_model
     if need_build:
         out.mkdir(parents=True, exist_ok=True)
         if args.variant == "bf16":
@@ -117,7 +141,11 @@ def _ensure_built(args: argparse.Namespace) -> Path:
             gguf_ref = args.gguf or GGUF_HF_REF
             _build_q1_0(gguf_ref, out)
     if not (out / "genai_config.json").exists():
-        sys.exit(f"{out}/genai_config.json missing after build. Check earlier output.")
+        sys.exit(
+            f"Build did not produce {out / 'genai_config.json'}. The build step above "
+            f"failed; check the preceding output. To force a rebuild from a clean state, "
+            f"remove {out} and re-run with --build."
+        )
     return out
 
 
@@ -206,7 +234,14 @@ def main() -> None:
     )
     parser.add_argument("--variant", choices=("bf16", "Q1_0"), default="bf16")
     parser.add_argument(
-        "--out", default=None, help="ONNX model directory (will be created with --build)"
+        "--out",
+        default=None,
+        help=(
+            "ONNX model directory. If it doesn't contain a built model yet, "
+            "one is created automatically (downloading the GGUF for --variant Q1_0 "
+            "when --gguf isn't given). Subsequent runs with the same --out reuse "
+            "the build. Defaults to ./hy-mt-<variant>-onnx."
+        ),
     )
     parser.add_argument(
         "--build",

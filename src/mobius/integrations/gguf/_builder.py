@@ -29,6 +29,14 @@ from mobius._model_package import ModelPackage
 logger = logging.getLogger(__name__)
 
 
+def _looks_like_hf_repo_id(value: str) -> bool:
+    """Heuristic: ``value`` matches ``owner/repo`` (no path separators, no .gguf suffix)."""
+    if value.startswith((".", "/", "~")):
+        return False
+    parts = value.split("/")
+    return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
+
+
 def _resolve_gguf_path(gguf_path: str | Path) -> str:
     """Resolve a GGUF reference to a local file path.
 
@@ -44,27 +52,32 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
     if candidate.exists():
         return str(candidate)
 
-    # Anything that doesn't look like a HF reference falls through to
-    # GGUFModel which will surface a FileNotFoundError with the original path.
-    if "/" not in raw or raw.startswith((".", "/", "~")) or raw.endswith(".gguf"):
-        # Treat as a path that just doesn't exist yet (let downstream error).
+    # Split the optional ":filename" suffix before classifying, so HF refs like
+    # "owner/repo:weights.gguf" are not mistaken for a local path that ends in .gguf.
+    repo_id, sep, filename = raw.partition(":")
+    if sep and _looks_like_hf_repo_id(repo_id):
+        from huggingface_hub import hf_hub_download
+
+        logger.info("Downloading %s from %s", filename, repo_id)
+        return hf_hub_download(repo_id=repo_id, filename=filename)
+
+    if not _looks_like_hf_repo_id(raw):
+        # Looks like a local path that doesn't exist; let GGUFModel raise a
+        # FileNotFoundError with the original path.
         return raw
 
     from huggingface_hub import HfApi, hf_hub_download
 
-    repo_id, _, filename = raw.partition(":")
-    if not filename:
-        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".gguf")]
-        if len(files) == 0:
-            raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
-        if len(files) > 1:
-            raise ValueError(
-                f"HF repo {repo_id!r} contains multiple .gguf files: {files}. "
-                f"Specify one via '{repo_id}:<filename.gguf>'."
-            )
-        filename = files[0]
-    logger.info("Downloading %s from %s", filename, repo_id)
-    return hf_hub_download(repo_id=repo_id, filename=filename)
+    files = [f for f in HfApi().list_repo_files(raw) if f.endswith(".gguf")]
+    if len(files) == 0:
+        raise FileNotFoundError(f"No *.gguf files found in HF repo {raw!r}")
+    if len(files) > 1:
+        raise ValueError(
+            f"HF repo {raw!r} contains multiple .gguf files: {files}. "
+            f"Specify one via '{raw}:<filename.gguf>'."
+        )
+    logger.info("Downloading %s from %s", files[0], raw)
+    return hf_hub_download(repo_id=raw, filename=files[0])
 
 
 def build_from_gguf(
