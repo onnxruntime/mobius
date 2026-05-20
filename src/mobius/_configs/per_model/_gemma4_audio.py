@@ -11,8 +11,9 @@ from mobius._configs._sub_configs import Gemma4AudioConfig
 
 @register_audio_hook
 def _gemma4_audio(config, parent_config, model_type: str, fields: dict):
-    # model_type may be "gemma4_text" when build() resolves to the text
-    # sub-config; check parent_config to catch that case.
+    # No decorator filter: this hook also needs to fire when the *parent* is
+    # gemma4 (e.g. build() has resolved to a text sub-config whose model_type
+    # is no longer "gemma4*"). The body's predicate covers both cases.
     parent_model_type = getattr(parent_config, "model_type", "") if parent_config else ""
     if model_type not in ("gemma4", "gemma4_text") and parent_model_type != "gemma4":
         return None
