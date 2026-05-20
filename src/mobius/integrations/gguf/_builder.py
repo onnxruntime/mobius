@@ -23,10 +23,56 @@ from collections import Counter
 from pathlib import Path
 
 import tqdm
+from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    """Heuristic: ``value`` matches ``owner/repo`` (no path separators, no .gguf suffix)."""
+    if value.startswith((".", "/", "~")):
+        return False
+    parts = value.split("/")
+    return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
+
+
+def _resolve_gguf_path(gguf_path: str | Path) -> str:
+    """Resolve a GGUF reference to a local file path.
+
+    Accepts:
+    - An existing local filesystem path (returned unchanged).
+    - A HuggingFace Hub reference ``"owner/repo"`` — the repo must contain
+      exactly one ``*.gguf`` file, which is downloaded.
+    - A HuggingFace Hub reference ``"owner/repo:filename.gguf"`` to pick a
+      specific file from a multi-file repo.
+    """
+    raw = str(gguf_path)
+    if Path(raw).exists():
+        return raw
+
+    # Split the optional ":filename" suffix before classifying so HF refs like
+    # "owner/repo:weights.gguf" are not mistaken for a local path ending in .gguf.
+    repo_id, _, filename = raw.partition(":")
+    if not _looks_like_hf_repo_id(repo_id):
+        # Looks like a local path that doesn't exist; let GGUFModel raise
+        # FileNotFoundError with the original path.
+        return raw
+
+    if not filename:
+        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".gguf")]
+        if not files:
+            raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
+        if len(files) > 1:
+            raise ValueError(
+                f"HF repo {repo_id!r} contains multiple .gguf files: {files}. "
+                f"Specify one via '{repo_id}:<filename.gguf>'."
+            )
+        filename = files[0]
+
+    logger.info("Downloading %s from %s", filename, repo_id)
+    return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
 def build_from_gguf(
@@ -51,7 +97,12 @@ def build_from_gguf(
     repacked into MatMulNBits format instead of dequantized.
 
     Args:
-        gguf_path: Path to the ``.gguf`` file.
+        gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
+            reference of the form ``"owner/repo"`` (the repo must
+            contain exactly one ``*.gguf`` file) or
+            ``"owner/repo:filename.gguf"`` to pick a specific file. HF
+            references are downloaded via ``huggingface_hub`` into the
+            standard local cache.
         task: Override the model task (e.g. ``"text-generation"``).
             When ``None``, the task is auto-detected from the
             model type.
@@ -92,7 +143,8 @@ def build_from_gguf(
         process_tensors,
     )
 
-    # 1. Parse GGUF file
+    # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
+    gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = GGUFModel(gguf_path)
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)

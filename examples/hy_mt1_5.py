@@ -42,14 +42,15 @@ Expected output (Q1_0 on CPU EP)::
 
 Usage::
 
-    # Build + run the Q1_0 quantized variant on CPU
-    huggingface-cli download AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF \\
-        Hy-MT1.5-1.8B-2bit.gguf --local-dir ./gguf
-    python examples/hy_mt1_5.py --variant Q1_0 --build \\
-        --gguf ./gguf/Hy-MT1.5-1.8B-2bit.gguf --out ./hy-mt-q1_0-onnx
+    # One-shot demo: downloads the GGUF from AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF
+    # (cached by huggingface_hub), builds the ONNX model into --out, and runs
+    # translation. Re-running rebuilds the ONNX (the network download is cached).
+    python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx \\
+        --prompt 'Translate to Spanish: The cat is sleeping on the chair.'
 
-    # Reuse an existing build (no --build)
-    python examples/hy_mt1_5.py --variant Q1_0 --out ./hy-mt-q1_0-onnx
+    # Build from a local GGUF instead of letting mobius download it
+    python examples/hy_mt1_5.py --variant Q1_0 \\
+        --gguf ./gguf/Hy-MT1.5-1.8B-2bit.gguf --out ./hy-mt-q1_0-onnx
 """
 
 from __future__ import annotations
@@ -59,6 +60,10 @@ import sys
 from pathlib import Path
 
 HF_MODEL_ID = "tencent/Hy-MT1.5-1.8B-2bit"
+
+# Source of the 2-bit GGUF. mobius's build_from_gguf accepts this directly and
+# downloads via huggingface_hub on first use.
+GGUF_HF_REF = "AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF"
 
 _DEFAULT_PROMPT = "Translate the following Chinese text to English: 你好，世界！"  # noqa: RUF001
 
@@ -75,39 +80,46 @@ def _build_bf16(output_dir: Path) -> None:
     print("  genai_config.json + tokenizer files written")
 
 
-def _build_q1_0(gguf_path: Path, output_dir: Path) -> None:
-    """Build the 2-bit Q1_0 ONNX model + ORT-GenAI config in-process."""
+def _build_q1_0(gguf_ref: str, output_dir: Path) -> None:
+    """Build the 2-bit Q1_0 ONNX model + ORT-GenAI config in-process.
+
+    ``gguf_ref`` may be a local ``.gguf`` path or a HuggingFace reference
+    like ``"AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF"`` (mobius downloads it via
+    huggingface_hub on first use).
+    """
     from mobius.integrations.gguf._builder import build_from_gguf
     from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
-    print(f"Building Q1_0 -> {output_dir}")
+    print(f"Building Q1_0 from {gguf_ref} -> {output_dir}")
     # ep='cpu' applies the GroupQueryAttention rewrite. With standard
     # opset 23 Attention (ep='default'), ORT GenAI's
     # past_present_share_buffer mode cannot be used; mobius's
     # write_ort_genai_config inspects the resulting graph and turns
     # share_buffer off automatically when GQA is absent.
-    pkg = build_from_gguf(
-        str(gguf_path), keep_quantized=True, dtype="f32", execution_provider="cpu"
-    )
+    pkg = build_from_gguf(gguf_ref, keep_quantized=True, dtype="f32", execution_provider="cpu")
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
     print("  genai_config.json + tokenizer files written")
 
 
-def _ensure_built(args: argparse.Namespace) -> Path:
+def _build(args: argparse.Namespace) -> Path:
+    """Always (re)build the model into ``--out``.
+
+    HuggingFace Hub caches the source (safetensors for bf16, GGUF for Q1_0),
+    so re-runs are cheap on the network side; the in-process ONNX construction
+    runs every time. This keeps the example dead-simple: no marker files, no
+    reuse logic, no chance of silently running a stale or wrong-variant build.
+    """
     out = Path(args.out).resolve()
-    if args.build:
-        out.mkdir(parents=True, exist_ok=True)
-        if args.variant == "bf16":
-            _build_bf16(out)
-        elif args.variant == "Q1_0":
-            if not args.gguf:
-                sys.exit("--gguf is required for --variant Q1_0 --build")
-            _build_q1_0(Path(args.gguf), out)
+    out.mkdir(parents=True, exist_ok=True)
+    if args.variant == "bf16":
+        _build_bf16(out)
+    elif args.variant == "Q1_0":
+        _build_q1_0(args.gguf or GGUF_HF_REF, out)
     if not (out / "genai_config.json").exists():
         sys.exit(
-            f"{out}/genai_config.json missing. Re-run with --build or point --out "
-            "at a directory produced by `mobius build --runtime ort-genai`."
+            f"Build did not produce {out / 'genai_config.json'}; check the "
+            f"preceding output for the underlying failure."
         )
     return out
 
@@ -197,13 +209,22 @@ def main() -> None:
     )
     parser.add_argument("--variant", choices=("bf16", "Q1_0"), default="bf16")
     parser.add_argument(
-        "--out", default=None, help="ONNX model directory (will be created with --build)"
+        "--out",
+        default=None,
+        help=(
+            "Directory to write the ONNX model + ORT GenAI config into. "
+            "Always overwritten on each run (HuggingFace cache handles "
+            "the underlying source download). Defaults to ./hy-mt-<variant>-onnx."
+        ),
     )
-    parser.add_argument("--build", action="store_true", help="Build the model before running")
     parser.add_argument(
         "--gguf",
         default=None,
-        help="Path to the Tencent SEQ GGUF (required with --variant Q1_0 --build)",
+        help=(
+            "Path to a local Tencent SEQ GGUF for --variant Q1_0. When omitted, "
+            "mobius downloads the GGUF from AngelSlim/Hy-MT1.5-1.8B-2bit-GGUF "
+            "(cached locally by huggingface_hub)."
+        ),
     )
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -223,7 +244,7 @@ def main() -> None:
     if args.out is None:
         args.out = f"./hy-mt-{args.variant.lower()}-onnx"
 
-    out = _ensure_built(args)
+    out = _build(args)
     text = run_translation(
         out,
         args.prompt,
