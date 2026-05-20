@@ -57,6 +57,7 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "stablelm": "stablelm",
     "nemotron": "nemotron",
     "t5": "t5",
+    "hunyuan-dense": "hunyuan_v1_dense",
     "deci": "llama",  # DeciLM uses Llama architecture
 }
 
@@ -259,6 +260,62 @@ def gguf_to_config(
     rope_sections = metadata.get(f"{gguf_arch}.rope.dimension_sections")
     rope_interleave = rope_sections is not None and any(s > 0 for s in rope_sections)
 
+    # Derive rope_type from rope.scaling.type. GGUF stores the scaling
+    # variant under ``<arch>.rope.scaling.type`` (or omits the key for the
+    # plain non-scaled case). ``ArchitectureConfig.rope_type`` defaults to
+    # ``None``, which would disable RoPE entirely — but every GGUF whose
+    # metadata contains ``rope.freq_base`` is a RoPE model, so we promote
+    # the absence/``"none"`` case to the default RoPE variant.
+    rope_scaling_type = metadata.get(f"{gguf_arch}.rope.scaling.type")
+    rope_freq_base = metadata.get(f"{gguf_arch}.rope.freq_base")
+    rope_type: str | None = None
+    rope_scaling: dict | None = None
+    if rope_freq_base is not None or rope_scaling_type is not None:
+        if rope_scaling_type in (None, "none", ""):
+            rope_type = "default"
+        elif rope_scaling_type in ("linear", "yarn", "longrope"):
+            rope_type = rope_scaling_type
+        elif rope_scaling_type == "dynamic":
+            rope_type = "dynamic"
+        else:
+            # Unknown scaling type — fall back to default rather than disabling
+            # RoPE so the model at least runs.
+            logger.warning(
+                "Unrecognized GGUF rope.scaling.type=%r; using rope_type='default'",
+                rope_scaling_type,
+            )
+            rope_type = "default"
+
+    # HunYuan-V1-Dense: HF runs dynamic-NTK RoPE with rope_theta=10000 and
+    # alpha=1000. The Tencent quantization pipeline bakes those into a
+    # static rope.freq_base (~1.1e7) and sets rope.scaling.type='none' in
+    # the GGUF. That works for short contexts but diverges for long
+    # prompts (the dynamic exponent changes with position). Restore the
+    # HF dynamic-NTK config so the ONNX model behaves correctly on
+    # long-context inputs.
+    if (
+        gguf_arch == "hunyuan-dense"
+        and rope_type == "default"
+        and rope_freq_base is not None
+        and float(rope_freq_base) > 1e6
+    ):
+        logger.info(
+            "hunyuan-dense GGUF freq_base=%s exceeds 1e6 — restoring HF "
+            "dynamic-NTK RoPE (rope_theta=10000, alpha=1000)",
+            rope_freq_base,
+        )
+        rope_type = "dynamic"
+        rope_scaling = {
+            "alpha": 1000.0,
+            "factor": 1.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "type": "dynamic",
+        }
+        hf_fields["rope_theta"] = 10000.0
+
     # Build config — required fields validated above, optional fields
     # use safe defaults
     config = ArchitectureConfig(
@@ -271,6 +328,8 @@ def gguf_to_config(
         vocab_size=hf_fields.get("vocab_size", 32000),
         max_position_embeddings=hf_fields.get("max_position_embeddings", 2048),
         rope_theta=hf_fields.get("rope_theta", 10000.0),
+        rope_type=rope_type,
+        rope_scaling=rope_scaling,
         rms_norm_eps=hf_fields.get("rms_norm_eps", 1e-5),
         hidden_act=hidden_act,
         tie_word_embeddings=_infer_tie_embeddings(model),

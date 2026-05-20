@@ -798,6 +798,10 @@ class QuantizationConfig:
     group_size: int = 128
     quant_method: str = "none"
     sym: bool = True
+    # When True, zero_points is a per-block float tensor rather than a
+    # bit-packed uint8. Required for codebooks with non-integer offsets
+    # (e.g. Tencent SEQ uses 1.5).
+    float_zero_point: bool = False
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:

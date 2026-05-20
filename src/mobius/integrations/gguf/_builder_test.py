@@ -170,8 +170,9 @@ class TestBuildQuantizedGguf:
         from mobius.integrations.gguf._reader import GGUFModel
 
         gguf_model = GGUFModel(q4_0_gguf)
-        bits, is_sym = _detect_quant_params(gguf_model, gguf_model.architecture)
+        bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_model.architecture)
         assert bits == 4
+        assert block_size == 32
         assert is_sym is True
 
 
