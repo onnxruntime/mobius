@@ -75,9 +75,7 @@ def _build_arch_params(extra_xfails: dict[str, str]):
         if registration.test_model_id is None:
             continue
         reason = _PARSE_AND_GRAPH_XFAILS.get(model_type) or extra_xfails.get(model_type)
-        marks = (
-            [pytest.mark.xfail(reason=reason, strict=True)] if reason is not None else []
-        )
+        marks = [pytest.mark.xfail(reason=reason, strict=True)] if reason is not None else []
         params.append(
             pytest.param(
                 model_type,
