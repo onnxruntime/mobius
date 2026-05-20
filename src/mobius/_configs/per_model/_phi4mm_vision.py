@@ -15,10 +15,8 @@ from __future__ import annotations
 from mobius._configs._extractors import register_vision_hook
 
 
-@register_vision_hook
+@register_vision_hook("phi4mm")
 def _phi4mm_vision(config, parent_config, model_type: str, fields: dict):
-    if model_type != "phi4mm":
-        return None
     fields.update(
         hidden_size=1152,
         intermediate_size=4304,

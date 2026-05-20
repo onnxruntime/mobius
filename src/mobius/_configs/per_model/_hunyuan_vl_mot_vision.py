@@ -12,10 +12,8 @@ from __future__ import annotations
 from mobius._configs._extractors import register_vision_hook
 
 
-@register_vision_hook
+@register_vision_hook("hunyuan_vl_mot")
 def _hunyuan_vl_mot_vision(config, parent_config, model_type: str, fields: dict):
-    if model_type != "hunyuan_vl_mot":
-        return None
     if fields.get("hidden_size"):
         return None
     vision_source = parent_config or config
