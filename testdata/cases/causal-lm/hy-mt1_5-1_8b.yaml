@@ -13,6 +13,7 @@ level: "L4+L5"
 generation:
   max_new_tokens: 16
   do_sample: false
+  eos_token_id: 120020  # <｜hy_place▁holder▁no▁2｜>, the HF generation_config EOS
 
 notes: |
   Tencent Hy-MT1.5 1.8B translation model. Same architecture as the
