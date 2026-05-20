@@ -23,6 +23,7 @@ from collections import Counter
 from pathlib import Path
 
 import tqdm
+from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
 
@@ -56,8 +57,6 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
     # "owner/repo:weights.gguf" are not mistaken for a local path that ends in .gguf.
     repo_id, sep, filename = raw.partition(":")
     if sep and _looks_like_hf_repo_id(repo_id):
-        from huggingface_hub import hf_hub_download
-
         logger.info("Downloading %s from %s", filename, repo_id)
         return hf_hub_download(repo_id=repo_id, filename=filename)
 
@@ -65,8 +64,6 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
         # Looks like a local path that doesn't exist; let GGUFModel raise a
         # FileNotFoundError with the original path.
         return raw
-
-    from huggingface_hub import HfApi, hf_hub_download
 
     files = [f for f in HfApi().list_repo_files(raw) if f.endswith(".gguf")]
     if len(files) == 0:
