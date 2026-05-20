@@ -569,10 +569,17 @@ def _run_session(
     session: ort.InferenceSession,
     feeds: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """Run an ORT session and return outputs as a dict."""
+    """Run an ORT session and return outputs as a dict.
+
+    Olive's OnnxKQuantQuantization pass renames the ``logits`` output to
+    ``logits_Q4``; we alias it back so the generation loop is unchanged.
+    """
     output_names = [o.name for o in session.get_outputs()]
     results = session.run(output_names, feeds)
-    return dict(zip(output_names, results))
+    outputs = dict(zip(output_names, results))
+    if "logits" not in outputs and "logits_Q4" in outputs:
+        outputs["logits"] = outputs["logits_Q4"]
+    return outputs
 
 
 # ---------------------------------------------------------------------------
