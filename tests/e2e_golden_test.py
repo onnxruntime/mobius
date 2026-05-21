@@ -110,12 +110,12 @@ def _make_empty_kv_cache(
                         static.append(0)  # seq dim
                     else:
                         static.append(default_kv_heads if i == 1 else default_head_dim)
-            feeds[name] = np.zeros(static, dtype=np.float32)
+            feeds[name] = np.zeros(static, dtype=session.get_input_dtype(name) or np.float32)
         else:
             # Fallback: standard shape
             feeds[name] = np.zeros(
                 (1, default_kv_heads, 0, default_head_dim),
-                dtype=np.float32,
+                dtype=session.get_input_dtype(name) or np.float32,
             )
     return feeds
 
@@ -637,6 +637,9 @@ def _run_vision_language_prefill(
     try:
         seq_len = inputs_embeds.shape[1]
         kv_cache = _make_empty_kv_cache(dec_session, config)
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+        if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+            inputs_embeds = inputs_embeds.astype(embeds_dtype)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             **kv_cache,
@@ -824,6 +827,9 @@ def _run_vl_generation(
 
         # --- Step 4: prefill decoder ---
         past_cache = _make_empty_kv_cache(dec_session, config)
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+        if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+            inputs_embeds = inputs_embeds.astype(embeds_dtype)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
@@ -868,7 +874,12 @@ def _run_vl_generation(
 
         # --- Step 5: decode loop ---
         # Embed each new token through the embedding model with no image features.
-        empty_image = np.zeros((0, hidden_size), dtype=np.float32)
+        image_feat_dtype = (
+            emb_session.get_input_dtype(image_feat_input)
+            if image_feat_input is not None
+            else None
+        ) or np.float32
+        empty_image = np.zeros((0, hidden_size), dtype=image_feat_dtype)
         for _ in range(max_new_tokens - 1):
             if eos_token_id is not None and np.all(next_token == eos_token_id):
                 break
@@ -885,6 +896,8 @@ def _run_vl_generation(
                     step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
+            if embeds_dtype is not None and step_embeds.dtype != embeds_dtype:
+                step_embeds = step_embeds.astype(embeds_dtype)
 
             total_len = past_seq_len + 1
             step_feeds: dict[str, np.ndarray] = {
