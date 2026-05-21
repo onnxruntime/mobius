@@ -87,8 +87,14 @@ def _vision_default(config, parent_config, model_type: str, fields: dict):
             use_clipped_linears=getattr(vc, "use_clipped_linears", False),
             position_embedding_size=getattr(vc, "position_embedding_size", None),
         )
-    fields["mm_tokens_per_image"] = getattr(vision_source, "mm_tokens_per_image", None)
-    fields["image_token_id"] = getattr(vision_source, "image_token_id", None)
+    # Only fill in shared fields when not already populated. Per-model hooks
+    # may run before this one (e.g. via direct registration order) — when
+    # they do, their values must survive. Use setdefault semantics so
+    # the default only supplies a value when nothing better is available.
+    fields.setdefault(
+        "mm_tokens_per_image", getattr(vision_source, "mm_tokens_per_image", None)
+    )
+    fields.setdefault("image_token_id", getattr(vision_source, "image_token_id", None))
 
     # MRoPE section — only for composite VL models (parent_config != config).
     if parent_config is not None and parent_config is not config:

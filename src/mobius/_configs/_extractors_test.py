@@ -251,3 +251,25 @@ def test_hunyuan_vl_mot_filter_only_fires_for_that_model(loaded_vision_hooks):
     # llama: no vision_config + no hardcoded path → empty
     out = _extractors.extract_vision_config(cfg, None, "llama")
     assert out == {}
+
+
+def test_phi4mm_image_token_id_survives_default_hook(loaded_vision_hooks):
+    """Per-model image_token_id must not be clobbered by _vision_default.
+
+    Regression guard for hook ordering: _vision_default runs the same field
+    assignment as per-model hooks, and earlier versions overwrote any value
+    set by an earlier per-model hook (or by a later one whose registration
+    order put _vision_default after it).
+    """
+    cfg = _FakeHFConfig(special_image_token_id=200010)
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    assert out["vision"].image_token_id == 200010
+    assert out.get("image_token_id") == 200010
+
+
+def test_hunyuan_vl_mot_image_token_id_survives_default_hook(loaded_vision_hooks):
+    """Same regression guard as phi4mm but for hunyuan_vl_mot."""
+    cfg = _FakeHFConfig(mask_init_id=12)
+    out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
+    assert out["vision"].image_token_id == 12
+    assert out.get("image_token_id") == 12
