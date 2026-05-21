@@ -16,7 +16,6 @@ from mobius._configs._sub_configs import (
     CodecDecoderConfig,
     CodecEncoderConfig,
     CodePredictorConfig,
-    Gemma4AudioConfig,
     RoPEConfig,
     SpeakerEncoderConfig,
     TTSConfig,
@@ -453,138 +452,14 @@ def _extract_vision_config(config, parent_config, model_type: str) -> dict:
 def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     """Extract audio sub-config from a HuggingFace config.
 
-    Builds an :class:`AudioConfig` (if audio fields are found) and
-    returns a dict of options to merge into :class:`ArchitectureConfig`
-    kwargs.
+    Thin shim that delegates to the per-model registry. The actual
+    hooks live under :mod:`mobius._configs.per_model` and are
+    registered with :mod:`mobius._configs._extractors` at import time.
     """
-    audio_fields: dict = {}
-    audio_processor = getattr(config, "audio_processor", None)
-    if isinstance(audio_processor, dict) and "config" in audio_processor:
-        ac = audio_processor["config"]
-        nemo = ac.get("nemo_conv_settings", {})
-        rel_bias = ac.get("relative_attention_bias_args", {})
-        audio_fields.update(
-            attention_dim=ac.get("attention_dim"),
-            attention_heads=ac.get("attention_heads"),
-            num_blocks=ac.get("num_blocks"),
-            linear_units=ac.get("linear_units"),
-            kernel_size=ac.get("kernel_size"),
-            input_size=ac.get("input_size"),
-            conv_channels=nemo.get("conv_channels", ac.get("attention_dim")),
-            t5_bias_max_distance=rel_bias.get("t5_bias_max_distance"),
-        )
+    from mobius._configs import per_model  # noqa: F401  - side-effect import
+    from mobius._configs._extractors import extract_audio_config as _dispatch
 
-    embd_layer = getattr(config, "embd_layer", None)
-    if isinstance(embd_layer, dict):
-        audio_fields["projection_hidden_size"] = config.hidden_size
-
-    # Phi4MM audio token ID
-    if model_type == "phi4mm":
-        audio_config_dict = getattr(config, "audio_config", None)
-        if audio_config_dict is not None:
-            ac_dict = (
-                audio_config_dict
-                if isinstance(audio_config_dict, dict)
-                else vars(audio_config_dict)
-            )
-            audio_fields["token_id"] = ac_dict.get("audio_token_id")
-
-    speech_lora = getattr(config, "speech_lora", None)
-    if speech_lora is not None:
-        audio_fields["lora"] = (
-            speech_lora if isinstance(speech_lora, dict) else vars(speech_lora)
-        )
-
-    # Qwen3-ASR audio config (from thinker_config)
-    thinker_config_source = parent_config or config
-    hf_thinker_config = getattr(thinker_config_source, "thinker_config", None)
-    if hf_thinker_config is not None:
-        tc = (
-            hf_thinker_config
-            if not isinstance(hf_thinker_config, dict)
-            else type("TC", (), hf_thinker_config)()
-        )
-        hf_audio_config = getattr(tc, "audio_config", None)
-        if hf_audio_config is not None:
-            ac = (
-                hf_audio_config
-                if not isinstance(hf_audio_config, dict)
-                else type("AC", (), hf_audio_config)()
-            )
-            audio_fields.update(
-                d_model=getattr(ac, "d_model", None),
-                encoder_layers=getattr(ac, "encoder_layers", None),
-                encoder_attention_heads=getattr(ac, "encoder_attention_heads", None),
-                encoder_ffn_dim=getattr(ac, "encoder_ffn_dim", None),
-                num_mel_bins=getattr(ac, "num_mel_bins", None),
-                max_source_positions=getattr(ac, "max_source_positions", None),
-                downsample_hidden_size=getattr(ac, "downsample_hidden_size", None),
-                output_dim=getattr(ac, "output_dim", None),
-                activation_function=getattr(ac, "activation_function", "gelu"),
-                n_window=getattr(ac, "n_window", None),
-                n_window_infer=getattr(ac, "n_window_infer", None),
-            )
-        # Special tokens from thinker config
-        audio_fields["audio_token_id"] = getattr(tc, "audio_token_id", None)
-        audio_fields["audio_start_token_id"] = getattr(tc, "audio_start_token_id", None)
-        audio_fields["audio_end_token_id"] = getattr(tc, "audio_end_token_id", None)
-        audio_fields["classify_num"] = getattr(tc, "classify_num", None)
-
-    # Gemma4 audio config (from composite audio_config sub-config).
-    # model_type may be "gemma4_text" when build() resolves to the text sub-config;
-    # check parent_config to catch that case.
-    parent_model_type = getattr(parent_config, "model_type", "") if parent_config else ""
-    if model_type in ("gemma4", "gemma4_text") or parent_model_type == "gemma4":
-        composite = parent_config or config
-        hf_audio_config = getattr(composite, "audio_config", None)
-        if hf_audio_config is not None:
-            ac = (
-                hf_audio_config
-                if not isinstance(hf_audio_config, dict)
-                else type("AC", (), hf_audio_config)()
-            )
-            subsampling = getattr(ac, "subsampling_conv_channels", None)
-            return {
-                "audio": Gemma4AudioConfig(
-                    num_layers=getattr(ac, "num_hidden_layers", 12),
-                    hidden_size=getattr(ac, "hidden_size", 1024),
-                    subsampling_conv_channels=(
-                        list(subsampling) if subsampling is not None else None
-                    ),
-                    use_causal_chunked_attn=getattr(ac, "use_causal_chunked_attn", False),
-                    output_dim=getattr(ac, "output_dim", None),
-                    output_proj_dims=getattr(ac, "output_proj_dims", None),
-                    audio_token_id=getattr(composite, "audio_token_id", None),
-                )
-            }
-
-    # SenseVoice / FunASR-style: encoder config lives under "encoder_conf"
-    # and the mel-spec frontend under "frontend_conf". Top-level holds
-    # input_size + vocab_size. model_type is "sensevoice".
-    if model_type == "sensevoice":
-        encoder_conf = getattr(config, "encoder_conf", None) or {}
-        frontend_conf = getattr(config, "frontend_conf", None) or {}
-        if isinstance(encoder_conf, dict) and encoder_conf:
-            audio_fields.update(
-                attention_dim=encoder_conf.get("output_size"),
-                attention_heads=encoder_conf.get("attention_heads"),
-                num_blocks=encoder_conf.get("num_blocks"),
-                tp_num_blocks=encoder_conf.get("tp_blocks"),
-                linear_units=encoder_conf.get("linear_units"),
-                kernel_size=encoder_conf.get("kernel_size"),
-                input_size=getattr(config, "input_size", None),
-            )
-            if isinstance(frontend_conf, dict):
-                audio_fields["num_mel_bins"] = frontend_conf.get("n_mels")
-
-    # Build AudioConfig sub-config if any audio fields are set
-    has_audio = any(v is not None for v in audio_fields.values())
-
-    result: dict = {}
-    if has_audio:
-        result["audio"] = AudioConfig(**audio_fields)
-
-    return result
+    return _dispatch(config, parent_config, model_type)
 
 
 @dataclasses.dataclass
