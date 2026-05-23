@@ -1966,8 +1966,8 @@ class Gemma4EmbeddingModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
-        # 2. Mask multimodal token IDs → pad_token_id (0) before per-layer lookup
-        pad = op.Constant(value_int=0)
+        # 2. Mask multimodal token IDs → configured pad_token_id before per-layer lookup
+        pad = op.Constant(value_int=self.config.pad_token_id)
         masked_ids = input_ids
         if self.image_token_id:
             masked_ids = op.Where(
