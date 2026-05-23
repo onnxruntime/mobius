@@ -1891,10 +1891,6 @@ class Gemma4EmbeddingModel(nn.Module):
             self.per_layer_projection_norm = RMSNorm(
                 self._per_layer_dim, eps=config.rms_norm_eps
             )
-            self._image_token_id_mask: int = config.image_token_id or 0
-            self._audio_token_id_mask: int | None = (
-                config.audio.audio_token_id if config.audio is not None else None
-            )
 
     def _scatter_features(
         self,
@@ -1970,18 +1966,18 @@ class Gemma4EmbeddingModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
-        # 2. Mask multimodal token IDs → pad_token_id (0) before per-layer lookup
-        pad = op.Constant(value_int=0)
+        # 2. Mask multimodal token IDs → configured pad_token_id before per-layer lookup
+        pad = op.Constant(value_int=self.config.pad_token_id)
         masked_ids = input_ids
-        if self._image_token_id_mask:
+        if self.image_token_id:
             masked_ids = op.Where(
-                op.Equal(masked_ids, op.Constant(value_int=self._image_token_id_mask)),
+                op.Equal(masked_ids, op.Constant(value_int=self.image_token_id)),
                 pad,
                 masked_ids,
             )
-        if self._audio_token_id_mask is not None:
+        if self.audio_token_id is not None:
             masked_ids = op.Where(
-                op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id_mask)),
+                op.Equal(masked_ids, op.Constant(value_int=self.audio_token_id)),
                 pad,
                 masked_ids,
             )
