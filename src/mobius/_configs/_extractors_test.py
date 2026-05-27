@@ -56,6 +56,12 @@ def _isolated_registry(monkeypatch):
 
 
 def test_bare_decorator_runs_for_every_model_type(monkeypatch):
+    """Bare ``@register_audio_hook`` registers a hook that runs for every model_type.
+
+    Reserved for hooks that need to inspect ``parent_config`` to decide
+    whether to fire (e.g. ``_gemma4_audio`` fires when the parent is
+    gemma4 even when model_type points at a sub-config).
+    """
     _audio, _ = _isolated_registry(monkeypatch)
     seen: list[str] = []
 
@@ -64,7 +70,7 @@ def test_bare_decorator_runs_for_every_model_type(monkeypatch):
         seen.append(model_type)
         return None
 
-    assert [(None, _hook)] == _extractors._AUDIO_HOOKS
+    assert _extractors._AUDIO_HOOKS == [(None, _hook)]  # noqa: SIM300
     _extractors.extract_audio_config(_FakeHFConfig(), None, "anything")
     _extractors.extract_audio_config(_FakeHFConfig(), None, "another")
     assert seen == ["anything", "another"]
@@ -122,6 +128,31 @@ def test_no_contributions_returns_empty_dict(monkeypatch):
     assert _extractors.extract_audio_config(_FakeHFConfig(), None, "x") == {}
 
 
+def test_defaults_run_before_per_model_hooks(monkeypatch):
+    """The explicit ``apply_*_defaults`` first pass runs before any hook.
+
+    Regression guard for the order-of-execution invariant. Per-model
+    hooks can observe and override fields set by the defaults.
+    """
+    _isolated_registry(monkeypatch)
+    default_observed: list[bool] = []
+
+    @_extractors.register_vision_hook("phi4mm")
+    def _override(config, parent, model_type, fields):
+        # apply_vision_defaults wrote hidden_size first (from the
+        # vision_config sub-dict); the hook can see it then override.
+        default_observed.append("hidden_size" in fields)
+        fields["image_token_id"] = 999
+        return None
+
+    cfg = _FakeHFConfig(vision_config={"hidden_size": 768})
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    # Default ran first and populated hidden_size from vision_config.
+    assert default_observed == [True]
+    # Per-model override took precedence on the shared field.
+    assert out.get("image_token_id") == 999
+
+
 # ---------------------------------------------------------------------------
 # Per-model cross-contamination guard
 # ---------------------------------------------------------------------------
@@ -139,15 +170,16 @@ def loaded_hooks():
 
 
 def test_filtered_hooks_have_concrete_model_type_filters(loaded_hooks):
-    r"""At least one ``@register_audio_hook("x", ...)`` registration must exist.
+    """At least one ``@register_audio_hook("x", ...)`` registration must exist.
 
-    Sanity check that the parameterised decorator form is actually in use —
-    every model-specific hook should prefer it over bare ``@register_audio_hook``
-    + an internal ``if model_type != "x":`` guard.
+    Sanity check that the parameterised decorator form is in use — every
+    per-model audio hook that can be filtered by model_type alone should
+    prefer it over bare ``@register_audio_hook`` + an internal
+    ``if model_type != "x":`` guard. (Bare form is reserved for hooks
+    whose firing condition depends on ``parent_config`` etc.)
     """
-    seen_filter_sets = [filter_set for filter_set, _ in loaded_hooks if filter_set is not None]
-    # At least one parameterised registration (sanity check the mechanism is in use).
-    assert any(seen_filter_sets), (
+    has_filter = any(filter_set is not None for filter_set, _ in loaded_hooks)
+    assert has_filter, (
         'No filtered audio hooks registered — register_audio_hook("type") '
         "should be preferred over bare @register_audio_hook for model-specific hooks."
     )
@@ -208,3 +240,68 @@ def test_sensevoice_filter_only_fires_for_sensevoice(loaded_hooks):
     assert out == {}, (
         f"sensevoice hook fired for model_type='llama' (cross-contamination): {out}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Vision hooks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def loaded_vision_hooks():
+    _import_per_model()
+    return list(_extractors._VISION_HOOKS)
+
+
+def test_vision_hooks_do_not_contribute_for_unrelated_models(loaded_vision_hooks):
+    """Plain text model_types must not trigger any vision hook."""
+    for plain_model_type in ("llama", "qwen2", "gpt2", "bloom", "mamba"):
+        result = _extractors.extract_vision_config(_FakeHFConfig(), None, plain_model_type)
+        assert result == {}, (
+            f"unrelated model_type {plain_model_type!r} produced vision output: {result}"
+        )
+
+
+def test_phi4mm_vision_filter_only_fires_for_phi4mm(loaded_vision_hooks):
+    # Bare config without vision_config: phi4mm hook should still fire (its
+    # body hard-codes the SigLIP dims) for "phi4mm", but NOT for "llama".
+    cfg = _FakeHFConfig(special_image_token_id=200010)
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    assert "vision" in out and out["vision"].hidden_size == 1152
+
+    out = _extractors.extract_vision_config(cfg, None, "llama")
+    assert out == {}, (
+        f"phi4mm vision hook fired for model_type='llama' (cross-contamination): {out}"
+    )
+
+
+def test_hunyuan_vl_mot_filter_only_fires_for_that_model(loaded_vision_hooks):
+    cfg = _FakeHFConfig(mask_init_id=12)
+    out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
+    assert out["vision"].hidden_size == 1152
+
+    # llama: no vision_config + no hardcoded path → empty
+    out = _extractors.extract_vision_config(cfg, None, "llama")
+    assert out == {}
+
+
+def test_phi4mm_image_token_id_survives_default_hook(loaded_vision_hooks):
+    """Per-model image_token_id must not be clobbered by _vision_default.
+
+    Regression guard for hook ordering: _vision_default runs the same field
+    assignment as per-model hooks, and earlier versions overwrote any value
+    set by an earlier per-model hook (or by a later one whose registration
+    order put _vision_default after it).
+    """
+    cfg = _FakeHFConfig(special_image_token_id=200010)
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    assert out["vision"].image_token_id == 200010
+    assert out.get("image_token_id") == 200010
+
+
+def test_hunyuan_vl_mot_image_token_id_survives_default_hook(loaded_vision_hooks):
+    """Same regression guard as phi4mm but for hunyuan_vl_mot."""
+    cfg = _FakeHFConfig(mask_init_id=12)
+    out = _extractors.extract_vision_config(cfg, None, "hunyuan_vl_mot")
+    assert out["vision"].image_token_id == 12
+    assert out.get("image_token_id") == 12

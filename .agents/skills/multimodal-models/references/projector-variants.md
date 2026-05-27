@@ -96,7 +96,8 @@ If `fullatt_block_indexes` is missing, ALL blocks use windowed attention,
 causing massive feature divergence (cos ≈ 0.25). The first few blocks may
 appear correct since they happen to be windowed blocks.
 
-**Config extraction** — these must be in `_configs.py` VisionConfig:
+**Config extraction** — these must be in the `VisionConfig` dataclass at
+`src/mobius/_configs/_sub_configs.py`:
 
 ```python
 @dataclasses.dataclass

@@ -190,9 +190,28 @@ Also export from `src/mobius/models/__init__.py`.
 
 ### 6. Update `ArchitectureConfig.from_transformers` if needed
 
-If the model has unusual config fields, update `from_transformers()` in
-`_configs.py`.  Use safe defaults (1.0 for multipliers, None for optional
-features) so existing models are unaffected.
+If the model has unusual top-level config fields (vocab size, head counts,
+RoPE knobs, etc.), update `from_transformers()` in `src/mobius/_configs/_base.py`.
+Use safe defaults (1.0 for multipliers, None for optional features) so
+existing models are unaffected.
+
+**For audio- or vision-capable models** (i.e. models whose HF config has an
+`audio_config` or `vision_config` sub-object), prefer adding a per-model hook
+under `src/mobius/_configs/per_model/` rather than editing the central file:
+
+```python
+# src/mobius/_configs/per_model/_my_model_vision.py
+from mobius._configs._extractors import register_vision_hook
+
+@register_vision_hook("my_model_type")
+def _my_model_vision(config, parent_config, model_type, fields):
+    fields.update(hidden_size=..., num_attention_heads=..., ...)
+    return None  # contribute fields, defer VisionConfig instantiation
+```
+
+Then add the new module to `src/mobius/_configs/per_model/__init__.py` so its
+side-effect registration runs at import time. The dispatcher filters hooks by
+the declared model_type strings, so unrelated models never see your hook.
 
 ### 7. Write tests
 
@@ -343,9 +362,10 @@ config fields (`embedding_multiplier`, `attention_multiplier`,
 
 ### 4. Config fields not extracted
 
-**Symptom:** Model builds but multipliers default to 1.0.  Add extraction
-to `ArchitectureConfig.from_transformers()` in `_configs.py` with safe
-defaults.
+**Symptom:** Model builds but multipliers default to 1.0. Add extraction
+to `ArchitectureConfig.from_transformers()` in `src/mobius/_configs/_base.py`
+with safe defaults. For audio/vision-specific fields, register a per-model
+hook under `src/mobius/_configs/per_model/` instead — see step 6 above.
 
 ### 5. Debugging workflow for logit mismatches
 
