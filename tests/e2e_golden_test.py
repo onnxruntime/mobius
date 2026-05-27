@@ -110,12 +110,12 @@ def _make_empty_kv_cache(
                         static.append(0)  # seq dim
                     else:
                         static.append(default_kv_heads if i == 1 else default_head_dim)
-            feeds[name] = np.zeros(static, dtype=np.float32)
+            feeds[name] = np.zeros(static, dtype=session.get_input_dtype(name) or np.float32)
         else:
             # Fallback: standard shape
             feeds[name] = np.zeros(
                 (1, default_kv_heads, 0, default_head_dim),
-                dtype=np.float32,
+                dtype=session.get_input_dtype(name) or np.float32,
             )
     return feeds
 
@@ -637,6 +637,9 @@ def _run_vision_language_prefill(
     try:
         seq_len = inputs_embeds.shape[1]
         kv_cache = _make_empty_kv_cache(dec_session, config)
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+        if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+            inputs_embeds = inputs_embeds.astype(embeds_dtype)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             **kv_cache,
@@ -663,6 +666,10 @@ def _run_vision_language_prefill(
                     )
                 else:
                     dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+            elif name in emb_out:
+                # Gemma4 (when hidden_size_per_layer_input > 0) emits a second
+                # embedding output ``per_layer_inputs`` that the decoder needs.
+                dec_feeds[name] = emb_out[name]
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
@@ -824,6 +831,9 @@ def _run_vl_generation(
 
         # --- Step 4: prefill decoder ---
         past_cache = _make_empty_kv_cache(dec_session, config)
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+        if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+            inputs_embeds = inputs_embeds.astype(embeds_dtype)
         dec_feeds: dict[str, np.ndarray] = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": np.ones((batch_size, prompt_seq_len), dtype=np.int64),
@@ -856,6 +866,12 @@ def _run_vl_generation(
         else:
             next_decode_pos = prompt_seq_len
 
+        # Wire extra embedding outputs the decoder expects by name
+        # (e.g. Gemma4 ``per_layer_inputs``).
+        for name in dec_session.input_names:
+            if name not in dec_feeds and name in emb_out:
+                dec_feeds[name] = emb_out[name]
+
         prefill_out = dec_session.run(dec_feeds)
         logits = prefill_out["logits"]
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
@@ -868,7 +884,12 @@ def _run_vl_generation(
 
         # --- Step 5: decode loop ---
         # Embed each new token through the embedding model with no image features.
-        empty_image = np.zeros((0, hidden_size), dtype=np.float32)
+        image_feat_dtype = (
+            emb_session.get_input_dtype(image_feat_input)
+            if image_feat_input is not None
+            else None
+        ) or np.float32
+        empty_image = np.zeros((0, hidden_size), dtype=image_feat_dtype)
         for _ in range(max_new_tokens - 1):
             if eos_token_id is not None and np.all(next_token == eos_token_id):
                 break
@@ -885,6 +906,8 @@ def _run_vl_generation(
                     step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
+            if embeds_dtype is not None and step_embeds.dtype != embeds_dtype:
+                step_embeds = step_embeds.astype(embeds_dtype)
 
             total_len = past_seq_len + 1
             step_feeds: dict[str, np.ndarray] = {
@@ -904,6 +927,12 @@ def _run_vl_generation(
                     )
                 else:
                     step_feeds["position_ids"] = np.array([[next_decode_pos]], dtype=np.int64)
+
+            # Wire extra embedding outputs the decoder expects by name
+            # (e.g. Gemma4 ``per_layer_inputs``).
+            for name in dec_session.input_names:
+                if name not in step_feeds and name in step_emb_out:
+                    step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
             logits = step_out["logits"]
@@ -1056,6 +1085,11 @@ def _run_text_only_multimodel_prefill(
                 dec_feeds[name] = np.ones((1, seq_len), dtype=np.int64)
             elif name == "position_ids":
                 dec_feeds[name] = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+            elif name in emb_out:
+                # Gemma4 (when hidden_size_per_layer_input > 0) emits a second
+                # embedding output ``per_layer_inputs`` that the decoder needs.
+                # Wire any extra embedding outputs through by name.
+                dec_feeds[name] = emb_out[name]
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
@@ -1187,6 +1221,11 @@ def _run_phi4mm_multimodal_prefill(
             "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
             **kv_cache,
         }
+        # Wire any extra embedding outputs the decoder expects by name
+        # (e.g. Gemma4 ``per_layer_inputs``).
+        for name in dec_session.input_names:
+            if name not in dec_feeds and name in emb_out:
+                dec_feeds[name] = emb_out[name]
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
@@ -1239,7 +1278,11 @@ def _run_speech_language_prefill(
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
             if name in audio_processed:
-                audio_feeds[name] = audio_processed[name].astype(np.float32)
+                # Cast to the session's declared dtype (e.g. input_features_mask
+                # is BOOL on Gemma4 audio encoder; the HF feature extractor may
+                # emit it as float or int).
+                target_dtype = audio_session.get_input_dtype(name) or np.float32
+                audio_feeds[name] = audio_processed[name].astype(target_dtype)
             elif name == "input_features" and "input_features" in audio_processed:
                 audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
         # Provide all-True mask for single-clip inference when the model
@@ -1251,7 +1294,8 @@ def _run_speech_language_prefill(
             and "input_features" in audio_feeds
         ):
             feats = audio_feeds["input_features"]
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=np.bool_)
+            mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
+            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1339,6 +1383,10 @@ def _run_speech_language_prefill(
                     ndims = pos_shape[0] if isinstance(pos_shape[0], int) else 3
                     pos = np.tile(pos, (ndims, 1, 1))
                 dec_feeds[name] = pos
+            elif name in emb_out:
+                # Extra embedding outputs the decoder expects by name
+                # (e.g. Gemma4 ``per_layer_inputs``).
+                dec_feeds[name] = emb_out[name]
         outputs = dec_session.run(dec_feeds)
     finally:
         dec_session.close()
@@ -1688,7 +1736,8 @@ def _run_speech_language_generation(
         audio_feeds: dict[str, np.ndarray] = {}
         for name in audio_session.input_names:
             if name in audio_processed:
-                audio_feeds[name] = audio_processed[name].astype(np.float32)
+                target_dtype = audio_session.get_input_dtype(name) or np.float32
+                audio_feeds[name] = audio_processed[name].astype(target_dtype)
             elif name == "input_features" and "input_features" in audio_processed:
                 audio_feeds[name] = audio_processed["input_features"].astype(np.float32)
         # Provide all-True mask for single-clip inference when the model
@@ -1700,7 +1749,8 @@ def _run_speech_language_generation(
             and "input_features" in audio_feeds
         ):
             feats = audio_feeds["input_features"]
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=np.bool_)
+            mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
+            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1785,6 +1835,12 @@ def _run_speech_language_generation(
                 pos = np.tile(pos, (ndims_pos, 1, 1))
             dec_feeds["position_ids"] = pos
 
+        # Wire extra embedding outputs the decoder expects by name
+        # (e.g. Gemma4 ``per_layer_inputs``).
+        for name in dec_session.input_names:
+            if name not in dec_feeds and name in emb_out:
+                dec_feeds[name] = emb_out[name]
+
         prefill_out = dec_session.run(dec_feeds)
         logits = prefill_out["logits"]
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
@@ -1827,6 +1883,12 @@ def _run_speech_language_generation(
                     )
                 else:
                     step_feeds["position_ids"] = np.array([[past_seq_len]], dtype=np.int64)
+
+            # Wire extra embedding outputs the decoder expects by name
+            # (e.g. Gemma4 ``per_layer_inputs``).
+            for name in dec_session.input_names:
+                if name not in step_feeds and name in step_emb_out:
+                    step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
             logits = step_out["logits"]
