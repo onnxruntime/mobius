@@ -45,7 +45,7 @@ testing = [
     "librosa",
     "jsonschema>=4.0",
 ]
-ort-genai = ["onnxruntime-genai"]
+ort-genai = ["onnxruntime-genai", "Pillow"]
 docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
 
 [tool.setuptools.packages.find]

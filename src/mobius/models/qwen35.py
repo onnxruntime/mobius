@@ -616,26 +616,13 @@ class Qwen35MoEVLDecoderModel(nn.Module):
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Route language_model weights for standalone decoder build."""
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith(("mtp_", "mtp.")):
-                continue
-            stripped = key
-            if stripped.startswith("model."):
-                stripped = stripped[len("model.") :]
-            if stripped.startswith("visual."):
-                continue
-            if stripped.startswith("language_model."):
-                stripped = stripped[len("language_model.") :]
-            renamed[stripped] = value
-        if self.config.tie_word_embeddings:
-            if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
-                renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
-        return renamed
+    # No preprocess_weights here: this class is an internal sub-module of
+    # Qwen35MoEVL3ModelCausalLMModel (constructed at line ~667 below) and is
+    # never registered standalone. The wrapper's preprocess_weights handles
+    # all HF weight routing for the 3-model package, including the fused
+    # MoE expert unpack and the tied lm_head/embeddings hookup. Adding a
+    # standalone preprocess_weights here would be dead code at best and
+    # confusingly out-of-sync with the wrapper at worst.
 
 
 class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
