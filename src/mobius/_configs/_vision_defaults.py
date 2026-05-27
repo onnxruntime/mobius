@@ -12,12 +12,22 @@ override or extend these defaults for specific architectures.
 from __future__ import annotations
 
 from mobius._configs._base import _first, _first_not_none
-from mobius._configs._extractors import DEFAULT_PRIORITY, register_vision_hook
 
 
-@register_vision_hook(priority=DEFAULT_PRIORITY)
-def _vision_default(config, parent_config, model_type: str, fields: dict):
-    """Pull the canonical HF ``vision_config`` fields into ``fields``."""
+def apply_vision_defaults(config, parent_config, model_type: str, fields: dict) -> None:
+    """Pull the canonical HF ``vision_config`` fields into ``fields``.
+
+    This is the "first pass" of the vision-extraction pipeline: it always
+    runs before any per-model hook registered via
+    :func:`register_vision_hook`. Per-model hooks may freely overwrite
+    fields produced here with ``fields.update(...)`` or
+    ``fields[key] = ...``.
+
+    Called explicitly by :func:`extract_vision_config` rather than being
+    registered as a hook — this keeps the architecture self-evident
+    (defaults are a builtin first pass, hooks are overrides) and removes
+    any dependence on hook-registration order.
+    """
     vision_source = parent_config or config
     hf_vision_config = getattr(vision_source, "vision_config", None)
     if hf_vision_config is None:
@@ -87,14 +97,10 @@ def _vision_default(config, parent_config, model_type: str, fields: dict):
             use_clipped_linears=getattr(vc, "use_clipped_linears", False),
             position_embedding_size=getattr(vc, "position_embedding_size", None),
         )
-    # Only fill in shared fields when not already populated. Per-model hooks
-    # may run before this one (e.g. via direct registration order) — when
-    # they do, their values must survive. Use setdefault semantics so
-    # the default only supplies a value when nothing better is available.
-    fields.setdefault(
-        "mm_tokens_per_image", getattr(vision_source, "mm_tokens_per_image", None)
-    )
-    fields.setdefault("image_token_id", getattr(vision_source, "image_token_id", None))
+    # This runs before per-model hooks, so plain assignment is safe — any
+    # per-model hook may overwrite later via fields.update(...).
+    fields["mm_tokens_per_image"] = getattr(vision_source, "mm_tokens_per_image", None)
+    fields["image_token_id"] = getattr(vision_source, "image_token_id", None)
 
     # MRoPE section — only for composite VL models (parent_config != config).
     if parent_config is not None and parent_config is not config:

@@ -56,6 +56,12 @@ def _isolated_registry(monkeypatch):
 
 
 def test_bare_decorator_runs_for_every_model_type(monkeypatch):
+    """Bare ``@register_audio_hook`` registers a hook that runs for every model_type.
+
+    Reserved for hooks that need to inspect ``parent_config`` to decide
+    whether to fire (e.g. ``_gemma4_audio`` fires when the parent is
+    gemma4 even when model_type points at a sub-config).
+    """
     _audio, _ = _isolated_registry(monkeypatch)
     seen: list[str] = []
 
@@ -64,7 +70,7 @@ def test_bare_decorator_runs_for_every_model_type(monkeypatch):
         seen.append(model_type)
         return None
 
-    assert [(_extractors.PER_MODEL_PRIORITY, 0, None, _hook)] == _extractors._AUDIO_HOOKS
+    assert _extractors._AUDIO_HOOKS == [(None, _hook)]  # noqa: SIM300
     _extractors.extract_audio_config(_FakeHFConfig(), None, "anything")
     _extractors.extract_audio_config(_FakeHFConfig(), None, "another")
     assert seen == ["anything", "another"]
@@ -122,55 +128,29 @@ def test_no_contributions_returns_empty_dict(monkeypatch):
     assert _extractors.extract_audio_config(_FakeHFConfig(), None, "x") == {}
 
 
-def test_priority_overrides_registration_order(monkeypatch):
-    """Hooks must run in priority order regardless of registration order.
+def test_defaults_run_before_per_model_hooks(monkeypatch):
+    """The explicit ``apply_*_defaults`` first pass runs before any hook.
 
-    This is the regression guard that motivates the priority mechanism:
-    if you registered a high-priority (later-running) hook BEFORE a
-    low-priority (earlier-running) hook, the earlier one must still
-    execute first.
+    Regression guard for the order-of-execution invariant. Per-model
+    hooks can observe and override fields set by the defaults.
     """
     _isolated_registry(monkeypatch)
-    order: list[str] = []
+    default_observed: list[bool] = []
 
-    # Register the late-running hook FIRST in source order.
-    @_extractors.register_audio_hook(priority=200)
-    def _later(config, parent, model_type, fields):
-        order.append("later")
+    @_extractors.register_vision_hook("phi4mm")
+    def _override(config, parent, model_type, fields):
+        # apply_vision_defaults wrote hidden_size first (from the
+        # vision_config sub-dict); the hook can see it then override.
+        default_observed.append("hidden_size" in fields)
+        fields["image_token_id"] = 999
         return None
 
-    # Register the early-running hook SECOND in source order.
-    @_extractors.register_audio_hook(priority=_extractors.DEFAULT_PRIORITY)
-    def _default(config, parent, model_type, fields):
-        order.append("default")
-        return None
-
-    _extractors.extract_audio_config(_FakeHFConfig(), None, "x")
-    assert order == ["default", "later"], (
-        f"priority did not override registration order: got {order}"
-    )
-
-
-def test_equal_priority_preserves_registration_order(monkeypatch):
-    """Within a single priority level, registration order is preserved.
-
-    Stable sort by ``insertion_index`` guarantees this.
-    """
-    _isolated_registry(monkeypatch)
-    order: list[str] = []
-
-    @_extractors.register_audio_hook
-    def _first(config, parent, model_type, fields):
-        order.append("first")
-        return None
-
-    @_extractors.register_audio_hook
-    def _second(config, parent, model_type, fields):
-        order.append("second")
-        return None
-
-    _extractors.extract_audio_config(_FakeHFConfig(), None, "x")
-    assert order == ["first", "second"]
+    cfg = _FakeHFConfig(vision_config={"hidden_size": 768})
+    out = _extractors.extract_vision_config(cfg, None, "phi4mm")
+    # Default ran first and populated hidden_size from vision_config.
+    assert default_observed == [True]
+    # Per-model override took precedence on the shared field.
+    assert out.get("image_token_id") == 999
 
 
 # ---------------------------------------------------------------------------
@@ -190,15 +170,16 @@ def loaded_hooks():
 
 
 def test_filtered_hooks_have_concrete_model_type_filters(loaded_hooks):
-    r"""At least one ``@register_audio_hook("x", ...)`` registration must exist.
+    """At least one ``@register_audio_hook("x", ...)`` registration must exist.
 
-    Sanity check that the parameterised decorator form is actually in use —
-    every model-specific hook should prefer it over bare ``@register_audio_hook``
-    + an internal ``if model_type != "x":`` guard.
+    Sanity check that the parameterised decorator form is in use — every
+    per-model audio hook that can be filtered by model_type alone should
+    prefer it over bare ``@register_audio_hook`` + an internal
+    ``if model_type != "x":`` guard. (Bare form is reserved for hooks
+    whose firing condition depends on ``parent_config`` etc.)
     """
-    seen_filter_sets = [entry[2] for entry in loaded_hooks if entry[2] is not None]
-    # At least one parameterised registration (sanity check the mechanism is in use).
-    assert any(seen_filter_sets), (
+    has_filter = any(filter_set is not None for filter_set, _ in loaded_hooks)
+    assert has_filter, (
         'No filtered audio hooks registered — register_audio_hook("type") '
         "should be preferred over bare @register_audio_hook for model-specific hooks."
     )

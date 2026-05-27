@@ -34,79 +34,71 @@ from typing import Any
 
 Hook = Callable[[Any, Any, str, dict], dict | None]
 
-# Hook execution priority constants. Lower values run first; equal values
-# preserve registration order (stable sort). The two extremes are exposed
-# so call-sites read self-documenting.
-DEFAULT_PRIORITY = 0  # "always-runs" hooks that fill in HF defaults
-PER_MODEL_PRIORITY = 100  # per-model overrides that may stomp on defaults
-
-# Each registry entry is ``(priority, insertion_index, model_type_filter, hook)``
-# where the filter is either ``None`` (always run) or a frozenset of
-# model_type strings. ``insertion_index`` makes the sort total-ordered and
-# stable across equal priorities so import order is irrelevant.
-_AUDIO_HOOKS: list[tuple[int, int, frozenset[str] | None, Hook]] = []
-_VISION_HOOKS: list[tuple[int, int, frozenset[str] | None, Hook]] = []
+# Each registry entry is ``(model_type_filter, hook)``. ``filter`` is
+# either a frozenset of model_type strings (only fire for those types) or
+# ``None`` (fire for every model_type — hook body does its own
+# conditional based on parent_config etc.).
+#
+# Note: model-agnostic "default" first-pass logic lives in
+# apply_audio_defaults / apply_vision_defaults (called explicitly by
+# extract_audio_config / extract_vision_config), not in this registry.
+# Keeping defaults out of the registry makes the run order self-evident
+# at the call site and removes any dependence on import order.
+_AUDIO_HOOKS: list[tuple[frozenset[str] | None, Hook]] = []
+_VISION_HOOKS: list[tuple[frozenset[str] | None, Hook]] = []
 
 
 def _make_register(registry: list) -> Callable:
-    """Build a decorator that supports both bare and parameterised usage."""
+    """Build a decorator that registers a per-model hook.
 
-    def register(*model_types, priority: int = PER_MODEL_PRIORITY):
-        """Register a hook in *registry* with an explicit priority.
+    Two usages are supported:
 
-        Two usages are supported:
+    * Parameterised — runs only when ``model_type`` matches one of the
+      supplied strings; the dispatcher filters before invocation::
 
-        * Bare decorator — runs for every model_type. Use this for default
-          hooks that pull a generic HuggingFace field common to many models.
-          Defaults are typically registered with
-          ``priority=DEFAULT_PRIORITY`` so they run before any per-model
-          overrides regardless of import order:
+          @register_audio_hook("phi4mm")
+          def _phi4mm(config, parent, mt, fields): ...
 
-          .. code-block:: python
+          @register_audio_hook("gemma4", "gemma4_text")
+          def _gemma4(config, parent, mt, fields): ...
 
-              @register_audio_hook(priority=DEFAULT_PRIORITY)
-              def _default(config, parent, mt, fields): ...
+    * Bare — runs for every model_type. Reserve this for hooks that need
+      to look at ``parent_config`` to decide whether to fire (e.g.
+      ``_gemma4_audio`` fires when *parent* is gemma4 even when
+      model_type points at a sub-config). Hooks bodies do their own
+      conditional and return ``None`` to skip::
 
-          A bare ``@register_audio_hook`` form (no parentheses) is also
-          supported and defaults to ``priority=PER_MODEL_PRIORITY``.
+          @register_audio_hook
+          def _hook(config, parent, mt, fields):
+              if parent is None or parent.model_type != "gemma4":
+                  return None
+              ...
 
-        * Parameterised decorator — runs only when ``model_type`` matches
-          one of the supplied strings. The dispatcher filters before
-          invocation so hook bodies don't need to repeat the
-          ``if model_type != ...`` guard. Hooks that *also* need to inspect
-          ``parent_config`` (e.g. Gemma4's text-config short-circuit) can
-          still do that check inside.
+    There is intentionally NO bare-decorator form for "always-runs
+    defaults". Defaults live in :func:`apply_audio_defaults` /
+    :func:`apply_vision_defaults` and are called explicitly as the first
+    pipeline step by :func:`extract_audio_config` /
+    :func:`extract_vision_config`. That keeps the run order self-evident
+    at the call site and removes any dependence on import order.
 
-          .. code-block:: python
+    Hooks fire in registration order.
+    """
 
-              @register_audio_hook("phi4mm")
-              def _phi4mm(config, parent, mt, fields): ...
-
-              @register_audio_hook("gemma4", "gemma4_text")
-              def _gemma4(config, parent, mt, fields): ...
-
-        Notes on ordering:
-            Hooks are sorted by ``(priority, insertion_index)`` before the
-            dispatcher iterates. Within the same priority, the relative
-            order of registration is preserved (stable sort). Crucially,
-            this means a per-model hook's ``fields.update(...)`` will
-            always run *after* a ``DEFAULT_PRIORITY`` hook's
-            ``fields.setdefault(...)`` regardless of import order.
-        """
-        # Bare decorator: ``@register`` with a single callable arg
+    def register(*model_types):
+        # Bare decorator: @register_*_hook
         if (
             len(model_types) == 1
             and callable(model_types[0])
             and not isinstance(model_types[0], str)
         ):
             fn = model_types[0]
-            registry.append((priority, len(registry), None, fn))
+            registry.append((None, fn))
             return fn
 
         types_set = frozenset(model_types) if model_types else None
 
         def deco(fn: Hook) -> Hook:
-            registry.append((priority, len(registry), types_set, fn))
+            registry.append((types_set, fn))
             return fn
 
         return deco
@@ -119,14 +111,13 @@ register_vision_hook = _make_register(_VISION_HOOKS)
 
 
 def _run(hooks: list, config, parent_config, model_type: str, fields: dict):
-    """Apply each hook whose filter matches ``model_type``, in priority order.
+    """Apply each hook whose filter matches ``model_type``, in registration order.
 
-    Sort by ``(priority, insertion_index)`` so defaults always run before
-    per-model overrides, independent of the order in which hook modules
-    were imported. Short-circuits on the first hook that returns a non-None
-    dict.
+    Filter ``None`` means the hook runs for every model_type (the hook
+    body does its own conditional). Short-circuits on the first hook
+    that returns a non-None dict.
     """
-    for _priority, _index, filter_set, hook in sorted(hooks):
+    for filter_set, hook in hooks:
         if filter_set is not None and model_type not in filter_set:
             continue
         result = hook(config, parent_config, model_type, fields)
@@ -136,15 +127,19 @@ def _run(hooks: list, config, parent_config, model_type: str, fields: dict):
 
 
 def extract_audio_config(config, parent_config, model_type: str) -> dict:
-    """Run every applicable audio hook and assemble the result.
+    """Run the audio extraction pipeline and assemble the result.
 
-    Each hook either contributes to ``fields`` (which become kwargs for
-    :class:`AudioConfig` at the end) or returns a dict that short-circuits
-    the dispatcher.
+    Pipeline: ``apply_audio_defaults`` (always runs, first) →
+    per-model hooks (run if their model_type filter matches).
+    Either step can populate ``fields`` (which become kwargs for
+    :class:`AudioConfig` at the end), or a per-model hook can return a
+    dict that short-circuits the rest of the pipeline.
     """
+    from mobius._configs._audio_defaults import apply_audio_defaults
     from mobius._configs._sub_configs import AudioConfig
 
     fields: dict = {}
+    apply_audio_defaults(config, parent_config, model_type, fields)
     short_circuit = _run(_AUDIO_HOOKS, config, parent_config, model_type, fields)
     if short_circuit is not None:
         return short_circuit
@@ -154,18 +149,22 @@ def extract_audio_config(config, parent_config, model_type: str) -> dict:
 
 
 def extract_vision_config(config, parent_config, model_type: str) -> dict:
-    """Run every registered vision hook and assemble the result.
+    """Run the vision extraction pipeline and assemble the result.
 
-    Hooks may either contribute to ``fields`` (which become kwargs for
-    :class:`VisionConfig`) or return a fully-formed dict to short-circuit.
-    The dispatcher also lifts a fixed set of "shared" vision fields
-    (``image_token_id``, ``spatial_merge_size``, ...) up to the top-level
-    of the returned dict so callers can access them as
-    ``config.image_token_id`` directly.
+    Pipeline: ``apply_vision_defaults`` (always runs, first) →
+    per-model hooks (run if their model_type filter matches).
+    Either step can populate ``fields`` (which become kwargs for
+    :class:`VisionConfig`), or a per-model hook can return a fully-formed
+    dict to short-circuit. The dispatcher also lifts a fixed set of
+    "shared" vision fields (``image_token_id``, ``spatial_merge_size``,
+    ...) up to the top-level of the returned dict so callers can access
+    them as ``config.image_token_id`` directly.
     """
     from mobius._configs._sub_configs import VisionConfig
+    from mobius._configs._vision_defaults import apply_vision_defaults
 
     fields: dict = {}
+    apply_vision_defaults(config, parent_config, model_type, fields)
     short_circuit = _run(_VISION_HOOKS, config, parent_config, model_type, fields)
     if short_circuit is not None:
         return short_circuit
