@@ -11,14 +11,12 @@ here instead of editing a shared switch.
 from __future__ import annotations
 
 # Import for side effects: each module registers its hooks at import time.
-# Default hooks are imported first so they register first and run first;
-# per-model hooks then execute after and can override default fields
-# (e.g. ``image_token_id``) without being clobbered.
-# fmt: off
-# ruff: noqa: I001
-from mobius._configs.per_model import _audio_default  # noqa: F401
-from mobius._configs.per_model import _vision_default  # noqa: F401
+# Run order is controlled explicitly via the ``priority=`` argument on each
+# ``@register_*_hook`` decorator (see _extractors.DEFAULT_PRIORITY /
+# PER_MODEL_PRIORITY), so import order here is intentionally irrelevant —
+# alphabetical is fine and `ruff` / `isort` may freely re-sort this block.
 from mobius._configs.per_model import (  # noqa: F401
+    _audio_default,
     _gemma4_audio,
     _hunyuan_vl_mot_vision,
     _internvl_vision,
@@ -26,5 +24,5 @@ from mobius._configs.per_model import (  # noqa: F401
     _phi4mm_vision,
     _qwen3_asr_audio,
     _sensevoice_audio,
+    _vision_default,
 )
-# fmt: on

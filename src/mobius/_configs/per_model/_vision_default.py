@@ -12,10 +12,10 @@ override or extend these defaults for specific architectures.
 from __future__ import annotations
 
 from mobius._configs._base import _first, _first_not_none
-from mobius._configs._extractors import register_vision_hook
+from mobius._configs._extractors import DEFAULT_PRIORITY, register_vision_hook
 
 
-@register_vision_hook
+@register_vision_hook(priority=DEFAULT_PRIORITY)
 def _vision_default(config, parent_config, model_type: str, fields: dict):
     """Pull the canonical HF ``vision_config`` fields into ``fields``."""
     vision_source = parent_config or config

@@ -34,33 +34,48 @@ from typing import Any
 
 Hook = Callable[[Any, Any, str, dict], dict | None]
 
-# Each registry entry is ``(model_type_filter, hook)`` where the filter is
-# either ``None`` (always run) or a frozenset of model_type strings.
-_AUDIO_HOOKS: list[tuple[frozenset[str] | None, Hook]] = []
-_VISION_HOOKS: list[tuple[frozenset[str] | None, Hook]] = []
+# Hook execution priority constants. Lower values run first; equal values
+# preserve registration order (stable sort). The two extremes are exposed
+# so call-sites read self-documenting.
+DEFAULT_PRIORITY = 0  # "always-runs" hooks that fill in HF defaults
+PER_MODEL_PRIORITY = 100  # per-model overrides that may stomp on defaults
+
+# Each registry entry is ``(priority, insertion_index, model_type_filter, hook)``
+# where the filter is either ``None`` (always run) or a frozenset of
+# model_type strings. ``insertion_index`` makes the sort total-ordered and
+# stable across equal priorities so import order is irrelevant.
+_AUDIO_HOOKS: list[tuple[int, int, frozenset[str] | None, Hook]] = []
+_VISION_HOOKS: list[tuple[int, int, frozenset[str] | None, Hook]] = []
 
 
 def _make_register(registry: list) -> Callable:
     """Build a decorator that supports both bare and parameterised usage."""
 
-    def register(*model_types):
-        """Register a hook in *registry*.
+    def register(*model_types, priority: int = PER_MODEL_PRIORITY):
+        """Register a hook in *registry* with an explicit priority.
 
         Two usages are supported:
 
         * Bare decorator — runs for every model_type. Use this for default
           hooks that pull a generic HuggingFace field common to many models.
+          Defaults are typically registered with
+          ``priority=DEFAULT_PRIORITY`` so they run before any per-model
+          overrides regardless of import order:
 
           .. code-block:: python
 
-              @register_audio_hook
+              @register_audio_hook(priority=DEFAULT_PRIORITY)
               def _default(config, parent, mt, fields): ...
 
-        * Parameterised decorator — runs only when ``model_type`` matches one
-          of the supplied strings. The dispatcher filters before invocation
-          so hook bodies don't need to repeat the ``if model_type != ...``
-          guard. Hooks that *also* need to inspect ``parent_config`` (e.g.
-          Gemma4's text-config short-circuit) can still do that check inside.
+          A bare ``@register_audio_hook`` form (no parentheses) is also
+          supported and defaults to ``priority=PER_MODEL_PRIORITY``.
+
+        * Parameterised decorator — runs only when ``model_type`` matches
+          one of the supplied strings. The dispatcher filters before
+          invocation so hook bodies don't need to repeat the
+          ``if model_type != ...`` guard. Hooks that *also* need to inspect
+          ``parent_config`` (e.g. Gemma4's text-config short-circuit) can
+          still do that check inside.
 
           .. code-block:: python
 
@@ -69,6 +84,14 @@ def _make_register(registry: list) -> Callable:
 
               @register_audio_hook("gemma4", "gemma4_text")
               def _gemma4(config, parent, mt, fields): ...
+
+        Notes on ordering:
+            Hooks are sorted by ``(priority, insertion_index)`` before the
+            dispatcher iterates. Within the same priority, the relative
+            order of registration is preserved (stable sort). Crucially,
+            this means a per-model hook's ``fields.update(...)`` will
+            always run *after* a ``DEFAULT_PRIORITY`` hook's
+            ``fields.setdefault(...)`` regardless of import order.
         """
         # Bare decorator: ``@register`` with a single callable arg
         if (
@@ -77,13 +100,13 @@ def _make_register(registry: list) -> Callable:
             and not isinstance(model_types[0], str)
         ):
             fn = model_types[0]
-            registry.append((None, fn))
+            registry.append((priority, len(registry), None, fn))
             return fn
 
         types_set = frozenset(model_types) if model_types else None
 
         def deco(fn: Hook) -> Hook:
-            registry.append((types_set, fn))
+            registry.append((priority, len(registry), types_set, fn))
             return fn
 
         return deco
@@ -96,11 +119,14 @@ register_vision_hook = _make_register(_VISION_HOOKS)
 
 
 def _run(hooks: list, config, parent_config, model_type: str, fields: dict):
-    """Apply each hook whose filter matches ``model_type``.
+    """Apply each hook whose filter matches ``model_type``, in priority order.
 
-    Short-circuits on the first hook that returns a non-None dict.
+    Sort by ``(priority, insertion_index)`` so defaults always run before
+    per-model overrides, independent of the order in which hook modules
+    were imported. Short-circuits on the first hook that returns a non-None
+    dict.
     """
-    for filter_set, hook in hooks:
+    for _priority, _index, filter_set, hook in sorted(hooks):
         if filter_set is not None and model_type not in filter_set:
             continue
         result = hook(config, parent_config, model_type, fields)

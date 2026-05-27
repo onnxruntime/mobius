@@ -64,7 +64,7 @@ def test_bare_decorator_runs_for_every_model_type(monkeypatch):
         seen.append(model_type)
         return None
 
-    assert [(None, _hook)] == _extractors._AUDIO_HOOKS
+    assert [(_extractors.PER_MODEL_PRIORITY, 0, None, _hook)] == _extractors._AUDIO_HOOKS
     _extractors.extract_audio_config(_FakeHFConfig(), None, "anything")
     _extractors.extract_audio_config(_FakeHFConfig(), None, "another")
     assert seen == ["anything", "another"]
@@ -122,6 +122,57 @@ def test_no_contributions_returns_empty_dict(monkeypatch):
     assert _extractors.extract_audio_config(_FakeHFConfig(), None, "x") == {}
 
 
+def test_priority_overrides_registration_order(monkeypatch):
+    """Hooks must run in priority order regardless of registration order.
+
+    This is the regression guard that motivates the priority mechanism:
+    if you registered a high-priority (later-running) hook BEFORE a
+    low-priority (earlier-running) hook, the earlier one must still
+    execute first.
+    """
+    _isolated_registry(monkeypatch)
+    order: list[str] = []
+
+    # Register the late-running hook FIRST in source order.
+    @_extractors.register_audio_hook(priority=200)
+    def _later(config, parent, model_type, fields):
+        order.append("later")
+        return None
+
+    # Register the early-running hook SECOND in source order.
+    @_extractors.register_audio_hook(priority=_extractors.DEFAULT_PRIORITY)
+    def _default(config, parent, model_type, fields):
+        order.append("default")
+        return None
+
+    _extractors.extract_audio_config(_FakeHFConfig(), None, "x")
+    assert order == ["default", "later"], (
+        f"priority did not override registration order: got {order}"
+    )
+
+
+def test_equal_priority_preserves_registration_order(monkeypatch):
+    """Within a single priority level, registration order is preserved.
+
+    Stable sort by ``insertion_index`` guarantees this.
+    """
+    _isolated_registry(monkeypatch)
+    order: list[str] = []
+
+    @_extractors.register_audio_hook
+    def _first(config, parent, model_type, fields):
+        order.append("first")
+        return None
+
+    @_extractors.register_audio_hook
+    def _second(config, parent, model_type, fields):
+        order.append("second")
+        return None
+
+    _extractors.extract_audio_config(_FakeHFConfig(), None, "x")
+    assert order == ["first", "second"]
+
+
 # ---------------------------------------------------------------------------
 # Per-model cross-contamination guard
 # ---------------------------------------------------------------------------
@@ -145,7 +196,7 @@ def test_filtered_hooks_have_concrete_model_type_filters(loaded_hooks):
     every model-specific hook should prefer it over bare ``@register_audio_hook``
     + an internal ``if model_type != "x":`` guard.
     """
-    seen_filter_sets = [filter_set for filter_set, _ in loaded_hooks if filter_set is not None]
+    seen_filter_sets = [entry[2] for entry in loaded_hooks if entry[2] is not None]
     # At least one parameterised registration (sanity check the mechanism is in use).
     assert any(seen_filter_sets), (
         'No filtered audio hooks registered — register_audio_hook("type") '

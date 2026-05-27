@@ -10,10 +10,10 @@ regardless of model_type.
 
 from __future__ import annotations
 
-from mobius._configs._extractors import register_audio_hook
+from mobius._configs._extractors import DEFAULT_PRIORITY, register_audio_hook
 
 
-@register_audio_hook
+@register_audio_hook(priority=DEFAULT_PRIORITY)
 def _audio_processor(config, parent_config, model_type: str, fields: dict):
     """Pull encoder dims from an ``audio_processor`` dict if present."""
     ap = getattr(config, "audio_processor", None)
@@ -35,7 +35,7 @@ def _audio_processor(config, parent_config, model_type: str, fields: dict):
     return None
 
 
-@register_audio_hook
+@register_audio_hook(priority=DEFAULT_PRIORITY)
 def _projection_hidden_size(config, parent_config, model_type: str, fields: dict):
     """Pull projection_hidden_size from an ``embd_layer`` dict if present."""
     embd_layer = getattr(config, "embd_layer", None)
@@ -44,7 +44,7 @@ def _projection_hidden_size(config, parent_config, model_type: str, fields: dict
     return None
 
 
-@register_audio_hook
+@register_audio_hook(priority=DEFAULT_PRIORITY)
 def _speech_lora(config, parent_config, model_type: str, fields: dict):
     """Pull a ``speech_lora`` adapter dict if present."""
     speech_lora = getattr(config, "speech_lora", None)
