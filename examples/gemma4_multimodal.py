@@ -227,6 +227,7 @@ def prepare_decoder_feeds(
     past_seq_len: int,
     past_kv: dict[str, np.ndarray],
     input_ids: np.ndarray,
+    per_layer_inputs: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **decoder** session.
 
@@ -239,8 +240,14 @@ def prepare_decoder_feeds(
         past_seq_len: Number of tokens already stored in the KV cache.
         past_kv: Mapping of ``"past_key_values.{i}.key/value"`` arrays
             from the previous decoder step.
-        input_ids: ``int64[1, cur_seq_len]`` — original token ids (needed for
-            per-layer token embeddings when ``hidden_size_per_layer_input > 0``).
+        input_ids: ``int64[1, cur_seq_len]`` — original token ids (legacy
+            decoder input, retained for backward compat). On builds where
+            the embedding model emits ``per_layer_inputs`` the decoder
+            does not consume ``input_ids``.
+        per_layer_inputs: Optional ``float32[1, cur_seq_len, num_layers *
+            per_layer_dim]`` emitted by the embedding model when
+            ``hidden_size_per_layer_input > 0``. The decoder requires
+            this input on every step (prefill + decode).
 
     Returns:
         Complete feeds dict for the decoder ONNX model.
@@ -248,7 +255,7 @@ def prepare_decoder_feeds(
     batch_size, cur_seq_len, _ = inputs_embeds.shape
     total_seq_len = past_seq_len + cur_seq_len
 
-    return {
+    feeds: dict[str, np.ndarray] = {
         "inputs_embeds": inputs_embeds,
         # Attend to all tokens (past + current)
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
@@ -256,6 +263,9 @@ def prepare_decoder_feeds(
         "input_ids": input_ids,
         **past_kv,
     }
+    if per_layer_inputs is not None:
+        feeds["per_layer_inputs"] = per_layer_inputs
+    return feeds
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +489,16 @@ def generate(
             )
         )
         inputs_embeds: np.ndarray = embed_out["inputs_embeds"]
+        # Gemma4 builds with hidden_size_per_layer_input > 0 also emit a
+        # second embedding output (``per_layer_inputs``) that the decoder
+        # consumes on every step. Pass it through transparently when present.
+        per_layer_inputs = embed_out.get("per_layer_inputs")
 
         # ---- Decoder session ----
         decoder_out = decoder_session.run(
-            prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv, cur_ids)
+            prepare_decoder_feeds(
+                inputs_embeds, past_seq_len, past_kv, cur_ids, per_layer_inputs
+            )
         )
 
         # Greedy: pick the token with the highest logit at the last position
