@@ -389,7 +389,15 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         load_torch_multimodal_model,
     )
 
-    model, _tokenizer, processor = load_torch_multimodal_model(case.model_id, device=device)
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+    model, _tokenizer, processor = load_torch_multimodal_model(
+        case.model_id, dtype=torch_dtype, device=device
+    )
 
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]

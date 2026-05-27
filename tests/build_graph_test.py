@@ -89,6 +89,7 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "qwen3_vl",
     "qwen3_vl_single",
     "qwen3_5_vl",
+    "qwen3_5_moe_vl",
     "qwen3_tts_tokenizer_12hz",
 }
 
