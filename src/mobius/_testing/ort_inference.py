@@ -66,14 +66,18 @@ def _ort_value_to_numpy(value: ort.OrtValue) -> np.ndarray:
 
 
 def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
-    """Convert a NumPy array to an OrtValue, supporting ml_dtypes (bf16, etc).
+    """Convert a NumPy array to an OrtValue, supporting ml_dtypes and bool.
 
     ``onnxruntime_easy.ort_value`` prefers the DLPack path, which is broken
-    for ml_dtypes scalars (NumPy's __dlpack__ rejects non-standard dtypes).
-    Route ml_dtypes arrays through ``ortvalue_from_numpy_with_onnx_type``
-    instead.
+    for ml_dtypes scalars (NumPy's __dlpack__ rejects non-standard dtypes)
+    and for bool (DLPack has no native bool type code). Route those arrays
+    through the explicit numpy-to-OrtValue APIs instead.
     """
     if isinstance(value, np.ndarray):
+        if value.dtype == np.bool_:
+            # ORT supports tensor(bool) natively but DLPack does not, so
+            # bypass ort_easy's DLPack-first path.
+            return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(value))
         try:
             import ml_dtypes
         except ImportError:  # pragma: no cover
