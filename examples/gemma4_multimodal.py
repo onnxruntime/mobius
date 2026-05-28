@@ -244,8 +244,10 @@ def prepare_decoder_feeds(
             decoder input, retained for backward compat). On builds where
             the embedding model emits ``per_layer_inputs`` the decoder
             does not consume ``input_ids``.
-        per_layer_inputs: Optional ``float32[1, cur_seq_len, num_layers *
-            per_layer_dim]`` emitted by the embedding model when
+        per_layer_inputs: Optional ``[1, cur_seq_len, num_layers *
+            per_layer_dim]`` tensor with the same dtype as
+            ``inputs_embeds`` (that is, the model/config dtype), emitted
+            by the embedding model when
             ``hidden_size_per_layer_input > 0``. The decoder requires
             this input on every step (prefill + decode).
 
