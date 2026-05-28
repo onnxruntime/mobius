@@ -389,18 +389,14 @@ than requiring exact numerical matches.
 
 ## Inference speed: Q4_K_M vs NF4
 
-Benchmark with Gemma4 E2B-IT on GenAI (text-only, 50+ token decode):
-
-| Dtype | CUDA tok/s | CPU tok/s | Notes |
-|-------|-----------|----------|-------|
-| F16 | 104 | 6.8 | Baseline |
-| Q4_K_M | 111 (+8%) | 16.2 (+138%) | **Recommended** |
-| NF4 | 93 (-10%) | 4.0 (-41%) | Slower than F16 |
+For the benchmark table, use the canonical reference in
+`.agents/skills/profiling-onnx-models/SKILL.md` ("Quantization benchmark
+reference (Gemma4 E2B-IT)").
 
 **Q4_K_M is recommended over NF4** for both speed and quality:
-- Faster on both CPU (+138% vs F16) and CUDA (+8% vs F16)
-- NF4 is paradoxically *slower* than F16 on both EPs
-- Quality is comparable between Q4_K_M and NF4
+- Faster on both CPU and CUDA than F16 in the referenced measurement
+- NF4 is slower than F16 in the same measurement
+- Quality is comparable between Q4_K_M and NF4 in spot checks
 - Q4_K_M uses less memory than F16 (~4x compression)
 
 ## Cross-references
