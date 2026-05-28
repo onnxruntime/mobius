@@ -322,7 +322,9 @@ class GenaiConfigGenerator:
         self._embedding = {
             "filename": embedding_filename,
             "inputs": embedding_input_names,
-            "outputs": embedding_output_names if embedding_output_names is not None else {
+            "outputs": embedding_output_names
+            if embedding_output_names is not None
+            else {
                 "inputs_embeds": "inputs_embeds",
             },
             "session_options": _make_session_options(self.ep),

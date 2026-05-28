@@ -156,11 +156,7 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     model = pkg.get(key)
     if model is None:
         return None
-    return {
-        out.name: out.name
-        for out in model.graph.outputs
-        if out.name is not None
-    }
+    return {out.name: out.name for out in model.graph.outputs if out.name is not None}
 
 
 def _copy_tokenizer_files(
