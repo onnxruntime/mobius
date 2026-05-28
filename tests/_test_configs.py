@@ -2007,6 +2007,16 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     ("glm4v", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("glm4v_moe", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("got_ocr2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "hunyuan_vl_mot",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "attn_qk_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
     ("idefics2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("idefics3", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
     ("instructblip", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
@@ -2185,6 +2195,32 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
             "attn_qk_norm": True,
         },
         False,
+    ),
+    # qwen3_5_moe_vl: Qwen3.6-35B-A3B family. Hybrid linear/full attention
+    # MoE text backbone + Qwen3VL ViT, exported as a 3-model split.
+    (
+        "qwen3_5_moe_vl",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+        },
+        True,
     ),
     # mistral3: Pixtral-VL model (same task as pixtral)
     (

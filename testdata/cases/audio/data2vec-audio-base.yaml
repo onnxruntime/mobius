@@ -1,4 +1,5 @@
 model_id: "facebook/data2vec-audio-base-960h"
+model_type: "data2vec-audio"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

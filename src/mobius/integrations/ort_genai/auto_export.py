@@ -3,34 +3,47 @@
 
 """Auto-export pipeline for onnxruntime-genai.
 
-Two entry points:
+Three entry points, in order of increasing convenience:
 
-- :func:`write_ort_genai_config` — programmatic API. Takes an already-built
-  :class:`~mobius._model_package.ModelPackage` (with weights) and writes the
-  ORT-GenAI config artifacts (``genai_config.json``, tokenizer files,
-  ``processor_config.json`` / ``image_processor.json``) alongside the ONNX models.
+- :func:`write_ort_genai_config` — config-only API.  Generates the ORT-GenAI
+  config artifacts (``genai_config.json``, tokenizer files,
+  ``processor_config.json`` / ``image_processor.json``) for an already-built
+  :class:`~mobius._model_package.ModelPackage`.  Does **not** write any ONNX
+  files — call :meth:`ModelPackage.save` separately if the ONNX models are
+  not already on disk.  The package only needs ``pkg.config`` and the model
+  graph metadata; weights need not have been written yet.
 
-- :func:`auto_export` — end-to-end convenience function. Builds the model
-  from a HuggingFace ID, saves the ONNX files, then calls
-  :func:`write_ort_genai_config` to write the config artifacts.
+- :func:`export_package` — save+config API. Takes an already-built
+  ``ModelPackage`` and writes both the ONNX models AND the ORT-GenAI config
+  artifacts in one call.  Use this when you built the package manually
+  (e.g. with custom dtype / quantization).
 
-Both functions produce a directory that ``onnxruntime-genai`` can load
-directly.
+- :func:`auto_export` — end-to-end API. Builds the model from a HuggingFace
+  ID and calls :func:`export_package`. Use this for the common
+  HF-model-id → ORT-GenAI-directory case.
+
+All three produce a directory that ``onnxruntime-genai`` can load directly.
 
 Example::
 
-    # Programmatic API — build first, then export configs
+    # Config-only — assumes you've already saved the ONNX files yourself
     from mobius import build
     from mobius.integrations.ort_genai import write_ort_genai_config
 
     pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
-    pkg.save("/output/qwen3")
+    pkg.save("/output/qwen3")  # write ONNX + weights first
     write_ort_genai_config(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B")
 
-    # End-to-end convenience
+    # Save + config — single call, when you have a built package in memory
+    from mobius.integrations.ort_genai import export_package
+
+    pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
+    export_package(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B", ep="cuda")
+
+    # End-to-end — when you only have an HF model id
     from mobius.integrations.ort_genai.auto_export import auto_export
 
-    auto_export("Qwen/Qwen3-0.6B", "/output/qwen3")
+    auto_export("Qwen/Qwen3-0.6B", "/output/qwen3", ep="cuda")
 """
 
 from __future__ import annotations
@@ -64,10 +77,31 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
+    # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
+    # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
+    "hunyuan_v1_dense": "decoder",
+    # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
+    "qwen2_vl": "qwen2_5_vl",
+    "qwen3_vl": "qwen2_5_vl",
+    "qwen3_vl_text": "qwen2_5_vl",
+    "qwen3_5": "qwen2_5_vl",
+    "qwen3_5_vl": "qwen2_5_vl",
 }
 
 _GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
+_QWEN_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_text",
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_moe",
+        "videochat_flash_qwen",
+    }
+)
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
@@ -470,8 +504,37 @@ def _write_vision_processor_config(
                     }
                 }
             )
+        elif model_type in _QWEN_VL_MODEL_TYPES:
+            # Qwen-VL models need the PatchImage transform to extract
+            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
+            # on Normalize for correct interleaving.
+            temporal_patch_size = config.temporal_patch_size
+            # Add qwen3_vl flag to the Normalize step
+            for t in transforms:
+                op = t.get("operation", {})
+                if op.get("type") == "Normalize":
+                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
+            transforms.append(
+                {
+                    "operation": {
+                        "name": "patch_image",
+                        "type": "PatchImage",
+                        "attrs": {
+                            "patch_size": patch_size,
+                            "temporal_patch_size": temporal_patch_size,
+                            "merge_size": merge_size,
+                        },
+                    }
+                }
+            )
 
-        processor_name = "pixtral_image_processor" if is_pixtral else "image_processor"
+        processor_name = (
+            "pixtral_image_processor"
+            if is_pixtral
+            else "qwen2_5_image_processor"
+            if model_type in _QWEN_VL_MODEL_TYPES
+            else "image_processor"
+        )
         processor_config = {
             "processor": {
                 "name": processor_name,
@@ -578,6 +641,22 @@ def _write_genai_config(
     # Derive decoder filename from the actual package key
     decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
 
+    # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
+    # graph to write the KV cache in place. Only ``com.microsoft.
+    # GroupQueryAttention`` does that; the standard ONNX ``Attention`` op
+    # concatenates ``past_key`` with the new ``K`` and returns a dynamic-
+    # shape ``present_key``, which is incompatible with the pre-allocated
+    # shared buffer. Introspect the graph: if there is at least one GQA
+    # node, the model supports shared-buffer mode; otherwise force it off
+    # regardless of the EP capability flag.
+    decoder_model = pkg.get(decoder_key)
+    supports_in_place_kv_cache: bool | None = None
+    if decoder_model is not None:
+        supports_in_place_kv_cache = any(
+            node.op_type == "GroupQueryAttention" and node.domain == "com.microsoft"
+            for node in decoder_model.graph
+        )
+
     generator = GenaiConfigGenerator.from_config(
         config,
         ort_model_type,
@@ -588,6 +667,7 @@ def _write_genai_config(
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
         decoder_filename=decoder_filename,
+        supports_in_place_kv_cache=supports_in_place_kv_cache,
     )
 
     if is_vlm:
@@ -616,6 +696,16 @@ def _write_genai_config(
                     config, "spatial_merge_size", 2
                 )
                 vision_kwargs["spatial_merge_size"] = sms
+                vision_kwargs["config_filename"] = "processor_config.json"
+            else:
+                # All other VLMs (Qwen-VL, LLaVA, InternVL, etc.) use
+                # processor_config.json written by _write_vision_processor_config.
+                vision_cfg = getattr(config, "vision", None)
+                sms = getattr(vision_cfg, "spatial_merge_size", None) or getattr(
+                    config, "spatial_merge_size", None
+                )
+                if sms is not None:
+                    vision_kwargs["spatial_merge_size"] = sms
                 vision_kwargs["config_filename"] = "processor_config.json"
 
             if vision_input_mapping is not None:
@@ -654,14 +744,6 @@ def _write_genai_config(
             boa_token_id=boa_token_id,
             **audio_kwargs,
         )
-
-    # Disable past_present_share_buffer for models with dual head_dim
-    # (e.g., different head_dim for sliding vs full-attention layers).
-    # Shared buffers require uniform head_dim across all KV cache layers.
-    global_head_dim = getattr(config, "global_head_dim", None)
-    head_dim = getattr(config, "head_dim", None)
-    if global_head_dim and head_dim and global_head_dim != head_dim:
-        generator._search_overrides["past_present_share_buffer"] = False
 
     return generator.write(output_dir)
 
@@ -852,6 +934,119 @@ def write_ort_genai_config(
     return result
 
 
+def export_package(
+    pkg: ModelPackage,
+    output_dir: str,
+    *,
+    hf_model_id: str | None = None,
+    ep: str = "cpu",
+    context_length: int = 4096,
+    local_config_dir: str | None = None,
+    external_data: str = "onnx",
+    progress_bar: bool = True,
+) -> dict[str, str]:
+    """Save an already-built ModelPackage as a complete ORT-GenAI directory.
+
+    This is the convenience function for users who built a ``ModelPackage``
+    themselves (e.g. with custom dtype / quantization / weight overrides) and
+    want a single call that produces an ``onnxruntime-genai``-loadable
+    directory.  It calls :meth:`ModelPackage.save` followed by
+    :func:`write_ort_genai_config`.
+
+    For the end-to-end case where you start from a HuggingFace model id, use
+    :func:`auto_export` instead — it builds the package for you.
+
+    Args:
+        pkg: Already-built :class:`~mobius._model_package.ModelPackage` with
+            weights applied and ``config`` set.  All components in *pkg* are
+            saved; selective export via :meth:`ModelPackage.save`'s
+            ``components`` filter is intentionally not exposed here, because
+            the ORT-GenAI runtime expects the on-disk file layout to match
+            what ``model.type`` in :file:`genai_config.json` declares (e.g. a
+            multimodal ``model.type`` implies a vision encoder file is
+            present).  If you need a partial export, build a separate
+            filtered ``ModelPackage`` first.
+        output_dir: Output directory (created if needed).
+        hf_model_id: HuggingFace model ID for tokenizer download / token-id
+            resolution.  When ``None``, token IDs are read from ``pkg.config``
+            and tokenizer files are not copied (unless ``local_config_dir``
+            is provided).
+        ep: Execution provider written to ``session_options`` in
+            ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
+            ``"webgpu"``, ``"trt-rtx"``).
+        context_length: Minimum context length written to ``genai_config.json``.
+            Overridden upward by ``pkg.config.max_position_embeddings`` when
+            larger.
+        local_config_dir: Local model directory to copy tokenizer files from
+            when ``hf_model_id`` is ``None``.
+        external_data: External-data format passed to :meth:`ModelPackage.save`
+            (``"onnx"`` or ``"safetensors"``).
+        progress_bar: Whether to show the save progress bar.
+
+    Returns:
+        Manifest dict mapping artifact names to paths::
+
+            {
+                "model": "/output/model.onnx",          # or per-component paths
+                "genai_config": "/output/genai_config.json",
+                "tokenizer.json": "/output/tokenizer.json",
+                ...
+            }
+
+    Raises:
+        ValueError: If ``pkg.config`` is ``None`` (required for genai_config
+            generation; e.g. diffusion models have no config and are not
+            supported).
+
+    Example::
+
+        from mobius import build
+        from mobius.integrations.ort_genai import export_package
+
+        pkg = build("Qwen/Qwen3-0.6B", load_weights=True)
+        export_package(pkg, "/output/qwen3", hf_model_id="Qwen/Qwen3-0.6B", ep="cuda")
+    """
+    # Preflight: fail fast before writing ONNX so the user doesn't end up
+    # with a half-exported directory containing only the model file.
+    if getattr(pkg, "config", None) is None:
+        raise ValueError(
+            "export_package requires ModelPackage.config to be set. "
+            "This is set automatically when building with mobius.build(). "
+            "Diffusion models (which have no config) are not supported — "
+            "use ModelPackage.save() directly for those."
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Save ONNX models + weights
+    logger.info("Saving ONNX models to %s", output_dir)
+    pkg.save(
+        output_dir,
+        external_data=external_data,
+        progress_bar=progress_bar,
+    )
+
+    # 2. Write ORT-GenAI config artifacts
+    result = write_ort_genai_config(
+        pkg,
+        output_dir,
+        hf_model_id=hf_model_id,
+        ep=ep,
+        context_length=context_length,
+        local_config_dir=local_config_dir,
+    )
+
+    # 3. Add ONNX paths to the manifest
+    if len(pkg) == 1:
+        result["model"] = os.path.join(output_dir, "model.onnx")
+    else:
+        for name in pkg:
+            result[name] = os.path.join(output_dir, name, "model.onnx")
+
+    logger.info("Export complete: %d artifacts", len(result))
+    return result
+
+
 def auto_export(
     model_id: str,
     output_dir: str,
@@ -918,28 +1113,16 @@ def auto_export(
             "Diffusion models are not yet supported."
         )
 
-    # Save ONNX models
-    logger.info("Saving ONNX models to %s", output_dir)
-    pkg.save(
-        output_dir,
-        external_data=external_data,
-        progress_bar=progress_bar,
-    )
-
-    # Write ORT-GenAI config artifacts (genai_config.json, tokenizer, processor)
-    result = write_ort_genai_config(
+    # Delegate save + config generation to the integration helper.
+    # `export_package` already logs "Export complete" so we don't repeat it here.
+    result = export_package(
         pkg,
         output_dir,
         hf_model_id=model_id,
         ep=ep,
         context_length=context_length,
+        external_data=external_data,
+        progress_bar=progress_bar,
     )
 
-    # Add ONNX model paths to manifest
-    if len(pkg) == 1:
-        result["model"] = os.path.join(output_dir, "model.onnx")
-    else:
-        for name in pkg:
-            result[name] = os.path.join(output_dir, name, "model.onnx")
-
-    logger.info("Export complete: %d artifacts", len(result))
+    return result

@@ -89,6 +89,7 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "qwen3_vl",
     "qwen3_vl_single",
     "qwen3_5_vl",
+    "qwen3_5_moe_vl",
     "qwen3_tts_tokenizer_12hz",
 }
 
@@ -1861,13 +1862,13 @@ class TestBuildGraphDtype:
         "dtype_str",
         ["f16", "bf16"],
     )
-    def test_multimodal_encoder_inputs_are_float32(self, dtype_str):
-        """Vision/audio encoder graph inputs stay f32 with Cast at entry.
+    def test_multimodal_encoder_inputs_match_model_dtype(self, dtype_str):
+        """Vision/audio encoder graph inputs use the model's compute dtype.
 
-        When building multimodal models with f16/bf16, encoder graph inputs
-        (pixel_values, input_features) must remain FLOAT because ORT GenAI's
-        image/audio processors output f32. A Cast node at graph entry converts
-        to the target dtype for the encoder's internal computation.
+        ORT GenAI's image/audio processor output doesn't have to be f32 —
+        the runtime can deliver inputs at the model's compute dtype
+        directly. Declaring the graph input as ``config.dtype`` removes
+        an extra Cast node at graph entry.
         """
         # Use a VL model with 3-model split (vision_encoder is separate)
         config = _base_config(
@@ -1888,27 +1889,28 @@ class TestBuildGraphDtype:
         task = get_task("vision-language")
         pkg = task.build(module, config)
 
-        # Vision encoder pixel_values input must be FLOAT
+        # Vision encoder pixel_values input must match config.dtype
         vision_model = pkg["vision_encoder"]
         pixel_values_input = vision_model.graph.inputs[0]
         assert pixel_values_input.name == "pixel_values"
-        assert pixel_values_input.dtype == ir.DataType.FLOAT, (
+        assert pixel_values_input.dtype == config.dtype, (
             f"Vision encoder input dtype is {pixel_values_input.dtype}, "
-            f"expected FLOAT (Cast should handle conversion to {dtype_str})"
+            f"expected {config.dtype} (no Cast at graph entry)"
         )
 
-        # First non-input node should be Cast to target dtype
+        # No Cast as the first node — inputs already arrive at the right dtype
         first_node = next(iter(vision_model.graph))
-        assert first_node.op_type == "Cast", (
-            f"Expected Cast as first node, got {first_node.op_type}"
+        assert first_node.op_type != "Cast" or first_node.inputs[0].name != "pixel_values", (
+            f"Unexpected Cast on pixel_values: graph input dtype {pixel_values_input.dtype} "
+            f"should already match the encoder's compute dtype."
         )
 
     @pytest.mark.parametrize(
         "dtype_str",
         ["f16", "bf16"],
     )
-    def test_gemma4_encoder_inputs_are_float32(self, dtype_str):
-        """Gemma4 vision and audio encoder inputs stay f32 in bf16/f16 builds."""
+    def test_gemma4_encoder_inputs_match_model_dtype(self, dtype_str):
+        """Gemma4 vision/audio encoder inputs match the model's compute dtype."""
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
 
         config = Gemma4Config(
@@ -1956,17 +1958,17 @@ class TestBuildGraphDtype:
         task = get_task("gemma4")
         pkg = task.build(module, config)
 
-        # Vision encoder pixel_values must be FLOAT
+        # Vision encoder pixel_values must match config.dtype
         vision_model = pkg["vision_encoder"]
         pv_input = vision_model.graph.inputs[0]
         assert pv_input.name == "pixel_values"
-        assert pv_input.dtype == ir.DataType.FLOAT
+        assert pv_input.dtype == config.dtype
 
-        # Audio encoder input_features must be FLOAT
+        # Audio encoder input_features must match config.dtype
         audio_model = pkg["audio_encoder"]
         af_input = audio_model.graph.inputs[0]
         assert af_input.name == "input_features"
-        assert af_input.dtype == ir.DataType.FLOAT
+        assert af_input.dtype == config.dtype
 
 
 class TestBuildGraphMultiModal:
@@ -2223,9 +2225,43 @@ class TestBuildGraphQwen3ASR:
 
         input_names = {inp.name for inp in encoder.graph.inputs}
         assert "input_features" in input_names
+        # feature_attention_mask is required so the encoder can ignore
+        # padded mel frames; without it the LLM emits degenerate loops
+        # on any input padded by the standard HF processor.
+        assert "feature_attention_mask" in input_names
 
         output_names = {out.name for out in encoder.graph.outputs}
         assert "audio_features" in output_names
+        # audio_feature_lengths exposes the valid token count after
+        # the encoder's 8x time downsampling so downstream callers can
+        # crop padding-derived rows out of audio_features before the
+        # embedding gather.
+        assert "audio_feature_lengths" in output_names
+
+    def test_audio_encoder_attention_uses_mask(self):
+        """The encoder's Attention ops must receive the mask input.
+
+        Guards against accidentally dropping the mask wiring inside
+        the encoder forward — the graph builds without it but the
+        encoder behaves the same as the pre-fix version.
+        """
+        from mobius.models.qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        from mobius.tasks import SpeechLanguageTask
+
+        config = self._asr_config()
+        module = Qwen3ASRForConditionalGeneration(config)
+        pkg = build_from_module(module, config, task=SpeechLanguageTask())
+        encoder = pkg["audio_encoder"]
+
+        attention_nodes = [n for n in encoder.graph if n.op_type == "Attention"]
+        assert attention_nodes, "audio encoder must contain Attention ops"
+        for node in attention_nodes:
+            # 4th positional input on op.Attention is attn_mask; must
+            # be a wired value, not None / empty.
+            assert len(node.inputs) >= 4
+            assert node.inputs[3] is not None
 
     def test_embedding_io(self):
         """Verify embedding model inputs/outputs."""
@@ -2318,9 +2354,26 @@ class TestBuildGraphQwen3ASR:
 
         # Step 1: Audio encoder — random mel input
         enc_sess = OnnxModelSession(pkg["audio_encoder"])
-        mel = np.random.randn(1, config.audio.num_mel_bins, 100).astype(np.float32)
-        enc_out = enc_sess.run({"input_features": mel})
+        mel_seq = 100
+        mel = np.random.randn(1, config.audio.num_mel_bins, mel_seq).astype(np.float32)
+        # Mark the last 20 mel frames as padding to exercise the mask
+        # path. The encoder must crop the corresponding audio rows so
+        # they don't leak into the embedding's Gather.
+        feature_attention_mask = np.ones((1, mel_seq), dtype=np.int64)
+        feature_attention_mask[:, -20:] = 0
+        enc_out = enc_sess.run(
+            {
+                "input_features": mel,
+                "feature_attention_mask": feature_attention_mask,
+            }
+        )
         audio_features = enc_out["audio_features"]
+        audio_feature_lengths = enc_out["audio_feature_lengths"]
+        # Crop padding-derived rows before passing to the embedding —
+        # this mirrors what production callers must do.
+        valid_len = int(audio_feature_lengths[0])
+        assert 0 < valid_len <= audio_features.shape[1]
+        audio_features = audio_features[:, :valid_len, :]
         num_audio_tokens = audio_features.shape[1]
         # Flatten to 2D: (num_audio_tokens, output_dim)
         audio_features_2d = audio_features.reshape(-1, audio_features.shape[-1])

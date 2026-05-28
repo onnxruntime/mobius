@@ -1,4 +1,5 @@
 model_id: "tau/splinter-base"
+model_type: "splinter"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

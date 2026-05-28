@@ -17,8 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import QwenImageConfig
 from mobius.components import (
@@ -50,7 +49,7 @@ class _TimestepMLP(nn.Module):
         self.linear_1 = _Linear(in_channels, time_embed_dim)
         self.linear_2 = _Linear(time_embed_dim, time_embed_dim)
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         sample = self.linear_1(op, sample)
         sample = op.Mul(sample, op.Sigmoid(sample))  # SiLU
         sample = self.linear_2(op, sample)
@@ -67,7 +66,7 @@ class _TimestepEmbedding(nn.Module):
         super().__init__()
         self.timestep_embedder = _TimestepMLP(in_channels, time_embed_dim)
 
-    def forward(self, op: builder.OpBuilder, sample: ir.Value):
+    def forward(self, op: OpBuilder, sample: ir.Value):
         return self.timestep_embedder(op, sample)
 
 
@@ -82,7 +81,7 @@ class _AdaLayerNormOutput(nn.Module):
         self.norm = _LayerNormNoAffine(hidden_size, eps=eps)
         self.linear = _Linear(hidden_size, hidden_size * 2)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, timestep_emb: ir.Value):
         emb = op.Mul(timestep_emb, op.Sigmoid(timestep_emb))  # SiLU
         emb = self.linear(op, emb)
         shift, scale = op.Split(emb, num_outputs=2, axis=-1, _outputs=2)
@@ -101,7 +100,7 @@ class _RMSNormQK(nn.Module):
         self.weight = nn.Parameter((dim,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.RMSNormalization(x, self.weight, axis=-1, epsilon=self._eps, stash_type=1)
 
 
@@ -113,7 +112,7 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter((dim,))
         self._eps = eps
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.RMSNormalization(x, self.weight, axis=-1, epsilon=self._eps, stash_type=1)
 
 
@@ -124,14 +123,14 @@ class _GELUGate(nn.Module):
         super().__init__()
         self.proj = _Linear(in_features, out_features)
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return op.Gelu(self.proj(op, x), approximate="tanh")
 
 
 class _NoOpModule(nn.Module):
     """Placeholder for HF nn.Dropout (no parameters, identity at inference)."""
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         return x
 
 
@@ -154,7 +153,7 @@ class _GeluApproxFFN(nn.Module):
             _Linear(inner_dim, dim_out),
         )
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         # Sequential chains: GELUGate → NoOp → Linear
         return self.net(op, x)
 
@@ -190,7 +189,7 @@ class _QwenImageJointAttention(nn.Module):
         self.norm_added_q = _RMSNormQK(head_dim, eps=eps)
         self.norm_added_k = _RMSNormQK(head_dim, eps=eps)
 
-    def forward(self, op: builder.OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value):
+    def forward(self, op: OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value):
         batch = op.Shape(img_hidden, start=0, end=1)
 
         # Image stream QKV
@@ -301,7 +300,7 @@ class _QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = _GeluApproxFFN(dim)
 
     def forward(
-        self, op: builder.OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value, temb: ir.Value
+        self, op: OpBuilder, img_hidden: ir.Value, txt_hidden: ir.Value, temb: ir.Value
     ):
         one = 1.0
 
@@ -411,7 +410,7 @@ class QwenImageTransformer2DModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
@@ -440,7 +439,7 @@ class QwenImageTransformer2DModel(nn.Module):
 
         return output
 
-    def _get_timestep_embedding(self, op: builder.OpBuilder, timestep, dim):
+    def _get_timestep_embedding(self, op: OpBuilder, timestep, dim):
         """Compute sinusoidal timestep embedding."""
         half_dim = 256 // 2
         exponent = -math.log(10000.0) / half_dim

@@ -8,8 +8,8 @@ from __future__ import annotations
 import onnx_ir as ir
 import torch
 
-from mobius._configs import Gemma4Config
-from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4Model
+from mobius._configs import AudioConfig, Gemma4Config
+from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
 def _tiny_gemma4_config(**overrides) -> Gemma4Config:
@@ -118,6 +118,20 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.per_expert_scale"
         assert key in result
         assert torch.allclose(result[key], torch.ones(4))
+
+
+class TestGemma4EmbeddingModel:
+    def test_reuses_token_id_fields_for_masking(self):
+        config = _tiny_gemma4_config(
+            image_token_id=200010,
+            audio=AudioConfig(audio_token_id=200011),
+        )
+        model = Gemma4EmbeddingModel(config)
+
+        assert model.image_token_id == 200010
+        assert model.audio_token_id == 200011
+        assert not hasattr(model, "_image_token_id_mask")
+        assert not hasattr(model, "_audio_token_id_mask")
 
 
 class TestScaleFreeRMSNormOverflow:

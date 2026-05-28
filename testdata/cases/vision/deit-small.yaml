@@ -1,4 +1,5 @@
 model_id: "facebook/deit-small-patch16-224"
+model_type: "deit"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

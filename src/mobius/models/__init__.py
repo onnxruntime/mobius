@@ -55,6 +55,7 @@ __all__ = [
     "GraniteMoeHybridCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
+    "HunYuanVLMoTModel",
     "HunyuanDiT2DModel",
     "IPAdapterModel",
     "InternLM2CausalLMModel",
@@ -93,6 +94,7 @@ __all__ = [
     "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
+    "Qwen35MoEVL3ModelCausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
     "Qwen35VLDecoderModel",
     "Qwen35VLTextModel",
@@ -172,6 +174,7 @@ from mobius.models.granite import GraniteCausalLMModel, GraniteMoECausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.hunyuan_v1 import HunYuanV1DenseCausalLMModel
+from mobius.models.hunyuan_vl_mot import HunYuanVLMoTModel
 from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
@@ -225,6 +228,7 @@ from mobius.models.qwen3_tts_tokenizer import (
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
+    Qwen35MoEVL3ModelCausalLMModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLDecoderModel,
     Qwen35VLTextModel,

@@ -1,4 +1,5 @@
 model_id: "justinchuby/Fun-ASR-Nano-2512"
+model_type: "fun_asr"
 revision: "main"
 task_type: "fun-asr-speech-language"
 dtype: "float32"

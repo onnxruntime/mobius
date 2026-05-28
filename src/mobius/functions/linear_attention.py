@@ -32,7 +32,7 @@ Op spec: https://github.com/onnx/onnx/issues/7689
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript._internal import builder
+from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 from mobius.components._scan_utils import (
@@ -224,7 +224,7 @@ def linear_attention(
         return output, present_state_v
 
     # --- Build the ir.Function ---
-    return builder.build_function(
+    return build_function(
         body,
         inputs,
         domain=DOMAIN,

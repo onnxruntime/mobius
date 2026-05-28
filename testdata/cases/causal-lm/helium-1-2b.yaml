@@ -1,4 +1,5 @@
 model_id: "kyutai/helium-1-preview-2b"
+model_type: "helium"
 revision: "645c94758493"
 task_type: "text-generation"
 dtype: "float32"

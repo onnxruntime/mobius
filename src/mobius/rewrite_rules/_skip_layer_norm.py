@@ -114,12 +114,14 @@ class AddLayerNormToSkipLayerNorm(RewriteRuleClassBase):
         input_a = add_node.inputs[0]
         input_b = add_node.inputs[1]
 
-        outputs = op.op_multi_out(
-            "SkipLayerNormalization",
-            inputs=[input_a, input_b, weight, bias],
-            domain="com.microsoft",
-            attributes={"epsilon": epsilon},
-            num_outputs=4,
+        outputs = op.SkipLayerNormalization(
+            input_a,
+            input_b,
+            weight,
+            bias,
+            _domain="com.microsoft",
+            epsilon=epsilon,
+            _outputs=4,
         )
         new_norm_out = outputs[0]
         skip_out = outputs[3]
@@ -200,12 +202,13 @@ class AddLayerNormNoBiasToSkipLayerNorm(RewriteRuleClassBase):
         input_b = add_node.inputs[1]
 
         # SkipLayerNormalization with gamma only (no beta)
-        outputs = op.op_multi_out(
-            "SkipLayerNormalization",
-            inputs=[input_a, input_b, weight],
-            domain="com.microsoft",
-            attributes={"epsilon": epsilon},
-            num_outputs=4,
+        outputs = op.SkipLayerNormalization(
+            input_a,
+            input_b,
+            weight,
+            _domain="com.microsoft",
+            epsilon=epsilon,
+            _outputs=4,
         )
         new_norm_out = outputs[0]
         skip_out = outputs[3]

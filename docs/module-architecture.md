@@ -137,7 +137,7 @@ same `forward()` signature as `DecoderLayer`:
 ```python
 # In models/my_arch.py
 from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder
 from mobius._configs import ArchitectureConfig
 from mobius.components import Attention, MLP, RMSNorm
 
@@ -156,7 +156,7 @@ class MyDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states,
         attention_bias,
         position_embeddings: tuple,
@@ -220,7 +220,7 @@ All decoder layers **must** use the explicit typed signature:
 ```python
 def forward(
     self,
-    op: builder.OpBuilder,
+    op: OpBuilder,
     hidden_states,           # [batch, seq_len, hidden_size]
     attention_bias,          # attention mask/bias tensor
     position_embeddings: tuple,  # (cos, sin) from RoPE

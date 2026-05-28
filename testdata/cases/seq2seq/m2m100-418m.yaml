@@ -1,4 +1,5 @@
 model_id: "facebook/m2m100_418M"
+model_type: "m2m_100"
 revision: "main"
 task_type: "seq2seq"
 dtype: "float32"

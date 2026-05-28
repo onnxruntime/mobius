@@ -83,12 +83,13 @@ class _Flags:
          - ``MOBIUS_ORT_LOWER_OPSET_FOR_EP``
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
-           (ORT ≤1.24.x workaround). Disabled by default.
-       * - ``use_gqa_for_kv_shared``
-         - ``MOBIUS_USE_GQA_FOR_KV_SHARED``
+           (ORT <=1.24.x workaround). Disabled by default.
+       * - ``tencent_q1_0_use_native_2bit``
+         - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
-         - Use GQA for KV-shared layers on CUDA EP. Requires ORT GQA
-           new_kv_length=0 support.
+         - Use native ``MatMulNBits bits=2`` for Tencent SEQ Q1_0
+           (smaller, semantically faithful, but ~20x slower on CPU EP
+           pending an MLAS fast path).
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -104,24 +105,8 @@ class _Flags:
         default_factory=lambda: _env_bool("MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND", False)
     )
     """Decompose grouped RMSNormalization into basic ops to work around an
-    ORT ≤1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
+    ORT <=1.24.4 CUDA kernel bug that produces wrong results when scale is 2D.
     Set ``MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND=1`` when targeting CUDA.
-    """
-
-    use_gqa_for_kv_shared: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_USE_GQA_FOR_KV_SHARED", False)
-    )
-    """Use GroupQueryAttention for KV-shared layers on CUDA EP.
-
-    When ``False`` (default), KV-shared layers that borrow K/V from a
-    source layer use standard ONNX Attention (which falls back to unfused
-    attention on CUDA EP).  This avoids a CUTLASS MEA crash with the
-    aligned kernel for certain sequence lengths when ``past_key`` is
-    ``nullptr``.
-
-    Set ``MOBIUS_USE_GQA_FOR_KV_SHARED=1`` when the ORT GQA kernel
-    supports ``new_kv_length=0`` (KV-shared pattern), which will enable
-    fused attention for these layers.
     """
 
     ort_lower_opset_for_ep: bool = dataclasses.field(
@@ -130,11 +115,39 @@ class _Flags:
     """Lower the ONNX default-domain opset declaration to 23 when creating
     ORT sessions on non-CPU execution providers (CUDA, TRT, etc.).
 
-    ORT ≤1.24.x EPs didn't register kernels for opset 24 standard ops
+    ORT <=1.24.x EPs didn't register kernels for opset 24 standard ops
     (Squeeze, Reshape, etc.) even though the semantics are unchanged.
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
     an older ORT build without opset 24 kernel registration.
+    """
+
+    tencent_q1_0_use_native_2bit: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT", False)
+    )
+    """Emit Tencent custom Q1_0 (2-bit SEQ) tensors using native
+    ``MatMulNBits bits=2`` + float ``zero_point = 1.5`` instead of the
+    ``bits=4`` inflation that defaults today.
+
+    Pros (when set to ``True``):
+        Halves the on-disk weight bytes (2 bpw vs 4 bpw inflated).
+        Semantically faithful to the source quantization layout.
+
+    Cons (default ``False``):
+        ORT's CPU ``bits=2`` + float-zp dequant path is currently a
+        naive scalar fallback (~20x slower than the ``bits=4`` packed
+        path on the same weights). See
+        `microsoft/onnxruntime#28552
+        <https://github.com/microsoft/onnxruntime/issues/28552>`_.
+        Also requires ORT >=1.27 (the float-zp path was added in
+        `microsoft/onnxruntime#28354
+        <https://github.com/microsoft/onnxruntime/pull/28354>`_).
+
+    The ``bits=4`` default inflates each 2-bit code ``c in {0..3}`` to
+    a 4-bit slot ``2c in {0,2,4,6}`` paired with integer ``zero_point=3``;
+    dequant gives the same SEQ codebook values, just at twice the
+    weight storage. Set ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT=1`` to
+    opt in to the smaller native form once kernel performance lands.
     """
 
 

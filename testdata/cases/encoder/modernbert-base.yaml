@@ -1,4 +1,5 @@
 model_id: "answerdotai/ModernBERT-base"
+model_type: "modernbert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

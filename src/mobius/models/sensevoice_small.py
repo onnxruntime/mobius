@@ -23,8 +23,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import (
@@ -131,7 +130,7 @@ class SenseVoiceSmallModel(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_features: ir.Value,
         language_id: ir.Value,
     ) -> ir.Value:
@@ -288,7 +287,7 @@ class _SenseVoiceEncoder(nn.Module):
         )
         self.tp_norm = LayerNorm(hidden_size)
 
-    def forward(self, op: builder.OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         """Encode through all 3 stacks.
 
         Args:

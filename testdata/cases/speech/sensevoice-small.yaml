@@ -1,4 +1,5 @@
 model_id: "mlx-community/SenseVoiceSmall"
+model_type: "sensevoice_small"
 revision: "main"
 task_type: "audio-ctc"
 dtype: "float32"

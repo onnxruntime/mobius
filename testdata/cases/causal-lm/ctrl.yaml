@@ -1,4 +1,5 @@
 model_id: "Salesforce/ctrl"
+model_type: "ctrl"
 revision: "3ff4f697e86bb0b95f7a70e39822af96671727d9"
 task_type: "text-generation"
 dtype: "float32"

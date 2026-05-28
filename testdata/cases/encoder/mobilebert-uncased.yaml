@@ -1,4 +1,5 @@
 model_id: "google/mobilebert-uncased"
+model_type: "mobilebert"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

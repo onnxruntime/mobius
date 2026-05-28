@@ -1,4 +1,5 @@
 model_id: "sijunhe/nezha-cn-base"
+model_type: "nezha"
 revision: "main"
 task_type: "feature-extraction"
 dtype: "float32"

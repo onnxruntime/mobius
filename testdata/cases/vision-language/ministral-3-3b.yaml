@@ -1,4 +1,5 @@
 model_id: "mistralai/Ministral-3-3B-Instruct-2512"
+model_type: "mistral3"
 revision: "main"
 task_type: "image-text-to-text"
 dtype: "float32"

@@ -1,4 +1,5 @@
 model_id: "apple/mobilevitv2-1.0-imagenet1k-256"
+model_type: "mobilevitv2"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

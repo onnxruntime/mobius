@@ -1,4 +1,5 @@
 model_id: "apple/mobilevit-small"
+model_type: "mobilevit"
 revision: "main"
 task_type: "image-classification"
 dtype: "float32"

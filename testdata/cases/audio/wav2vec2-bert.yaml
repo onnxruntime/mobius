@@ -1,4 +1,5 @@
 model_id: "facebook/w2v-bert-2.0"
+model_type: "wav2vec2-bert"
 revision: "main"
 task_type: "audio-feature-extraction"
 dtype: "float32"

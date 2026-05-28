@@ -1,4 +1,5 @@
 model_id: "HuggingFaceTB/SmolVLM-256M-Instruct"
+model_type: "smolvlm"
 revision: "7e3e67edbbed"
 task_type: "image-text-to-text"
 dtype: "float32"
