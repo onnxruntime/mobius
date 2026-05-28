@@ -140,11 +140,12 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
       opt-in via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`)
 - [ ] Dead graph inputs removed after EP-aware optimization
       (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
-- [ ] `past_present_share_buffer` must be `false` in `genai_config.json`
-      for models with dual head_dim (e.g. Gemma4: 256 for sliding, 512
-      for full attention) — GenAI allocates uniform KV cache shapes
-- [ ] Encoder inputs (vision/audio) use `_cast_encoder_input()` to cast
-      to float32 at sub-model entry, preventing FP16 overflow
+- [ ] `search.past_present_share_buffer` must be `false` in
+      `genai_config.json` for models with dual head_dim (e.g. Gemma4:
+      256 for sliding, 512 for full attention) — GenAI allocates uniform
+      KV cache shapes
+- [ ] Encoder inputs (vision/audio) are declared with `dtype=config.dtype`
+      at sub-model entry (no stale float32-only cast guidance)
 
 ### 9. ORT GenAI runtime
 

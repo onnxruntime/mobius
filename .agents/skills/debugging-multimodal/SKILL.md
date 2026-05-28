@@ -259,21 +259,23 @@ This has been fixed in newer ORT versions.  The `ort_lower_opset_for_ep`
 feature flag is available as a workaround (disabled by default, opt-in
 via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).  See `src/mobius/_flags.py`.
 
-### f32 Cast-at-entry for encoder inputs
+### Encoder input dtype alignment
 
-Vision and audio encoder inputs should be cast to float32 at the entry
-of the encoder sub-model to prevent FP16 overflow in encoder operations.
-Use the `_cast_encoder_input()` helper from `src/mobius/tasks/_base.py`
-in all encoder task builders.  This is now standard for all multimodal
-tasks.
+Encoder task inputs should be declared with `dtype=config.dtype` so
+entry tensors match the model compute dtype (float32/float16/bfloat16).
+In the current codebase, multimodal encoder task builders set encoder
+inputs directly to `config.dtype` (there is no `_cast_encoder_input()`
+helper in `src/mobius/tasks/_base.py`).
 
 ### GQA for KV-shared layers
 
-Models with KV-shared attention (e.g. Gemma4) can use
-`GroupQueryAttention` for KV-shared layers by setting
-`kv_sequence_length=0` to signal that the layer has no independent KV
-cache.  This eliminates Transpose/Reshape ops for cache handling.
-See ORT PR microsoft/onnxruntime#28242.
+Gemma4 KV-shared layers now emit `GroupQueryAttention` with empty K/V
+inputs (`kv_sequence_length=0`) and borrowed source-layer KV wired via
+`past_key`/`past_value`, avoiding extra Transpose/Reshape cache ops.
+
+Runtime support depends on ORT having KV-shared GQA support (tracked in
+microsoft/onnxruntime#28242; still upstreaming as of this writing). On
+ORT builds without that support, this path can fail at runtime.
 
 ### NaN for large head_dim (> 256)
 
