@@ -187,7 +187,7 @@ Same cascade as MHA with extra MEA constraints:
 | Kernel | Required conditions |
 |--------|---------------------|
 | Flash | Same as MHA |
-| MEA | MHA conditions + `head_size == v_head_size` + not float32. With `nonpad_kv_seqlen`: `head_size ≤ 256` |
+| MEA | MHA conditions + `head_size == v_head_size` + not float32. With `nonpad_kv_seqlens`: `head_size ≤ 256` |
 | Unfused | Always available, handles GQA via in-kernel reshape |
 
 ### GQA + float additive bias dispatch (ONNX Attention)
@@ -207,7 +207,7 @@ When using float bias with GQA via ONNX Attention, Flash is disabled
 applies to ONNX Attention in GQA mode only. Also, Contrib GQA has a
 stricter MEA guard (`head_size ≤ 256`) than the ONNX Attention path
 (which allows up to 1024 for the standard path, ≤ 256 only with
-`nonpad_kv_seqlen`).
+`nonpad_kv_seqlens`).
 
 This explains why Gemma4's KV-shared layers fall to unfused: they
 borrow K/V from a layer with different `head_size`, creating
@@ -238,10 +238,10 @@ borrow K/V from a layer with different `head_size`, creating
 4. **SM≥8.0** (Ampere+) required for Flash on all paths.
 5. **Float bias is safer** than bool mask for complex attention patterns.
 6. **MEA requires alignment** — `total_kv % 4 == 0` for bias tensors.
-7. **Contrib GQA limits MEA to `head_size ≤ 256`** — shared memory
-   guard; the kernel itself supports 1024 but GQA's eligibility check
-   blocks it. ONNX Attention is less restrictive (≤ 1024 standard,
-   ≤ 256 only with `nonpad_kv_seqlen`).
+7. **Contrib GQA limits MEA to `head_size ≤ 256`** — this is the safe
+   limit for current ORT releases, and mobius rewrite rules also enforce
+   it conservatively. ONNX Attention is less restrictive (≤ 1024
+   standard, ≤ 256 only with `nonpad_kv_seqlens`).
 
 ## Cross-references
 
