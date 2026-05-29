@@ -77,8 +77,10 @@ def build_and_export(
     output_dir: str,
     *,
     dtype: str = "f32",
+    device: str = "cpu",
 ) -> None:
     """Build ONNX model with mobius CLI and write ORT GenAI config."""
+    ep = "cuda" if device == "cuda" else "cpu"
     cmd = [
         sys.executable,
         "-m",
@@ -88,6 +90,8 @@ def build_and_export(
         model_id,
         "--dtype",
         dtype,
+        "--ep",
+        ep,
         "--optimize",
         "--runtime",
         "ort-genai",
@@ -351,7 +355,7 @@ def main() -> None:
 
     # ----- Export-only path -----
     if args.save_to:
-        build_and_export(args.model, args.save_to, dtype=args.dtype)
+        build_and_export(args.model, args.save_to, dtype=args.dtype, device=args.device)
         return
 
     # ----- Resolve model directory -----
@@ -362,7 +366,7 @@ def main() -> None:
         default_dir = os.path.join("output", f"gemma4_{suffix}")
         model_dir = default_dir
         if not os.path.isfile(os.path.join(model_dir, "genai_config.json")):
-            build_and_export(args.model, model_dir, dtype=args.dtype)
+            build_and_export(args.model, model_dir, dtype=args.dtype, device=args.device)
 
     # ----- Inference -----
     print("=" * 60)

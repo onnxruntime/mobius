@@ -148,6 +148,17 @@ def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     return {n: n for n in _graph_input_names(model)}
 
 
+def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
+    """Return ``{name: name}`` identity mapping for a sub-model's outputs.
+
+    Returns ``None`` when *key* is absent from *pkg*.
+    """
+    model = pkg.get(key)
+    if model is None:
+        return None
+    return {out.name: out.name for out in model.graph.outputs if out.name is not None}
+
+
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
@@ -712,6 +723,10 @@ def _write_genai_config(
                 vision_kwargs["input_names"] = vision_input_mapping
             if embedding_input_mapping is not None:
                 vision_kwargs["embedding_input_names"] = embedding_input_mapping
+
+            embedding_output_mapping = _introspect_outputs(pkg, "embedding")
+            if embedding_output_mapping is not None:
+                vision_kwargs["embedding_output_names"] = embedding_output_mapping
 
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 
