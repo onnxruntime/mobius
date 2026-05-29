@@ -27,12 +27,8 @@ __all__ = [
     "list_components",
 ]
 
-import logging
-
 from mobius._registry import _detect_fallback_registration, registry
 from mobius.tasks import ModelTask, get_task
-
-logger = logging.getLogger(__name__)
 
 
 def list_components(
