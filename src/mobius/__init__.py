@@ -39,6 +39,7 @@ __all__ = [
     "ep_registry",
     "get_build_dtype",
     "get_ep",
+    "list_components",
     "models",
     "optimize_model",
     "register_ep",
@@ -77,6 +78,7 @@ from mobius._configs import (
 from mobius._constants import OPSET_VERSION
 from mobius._diffusers_builder import build_diffusers_pipeline
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
+from mobius._introspection import list_components
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import (
