@@ -289,6 +289,8 @@ class GenaiConfigGenerator:
                 mapping.  When provided (e.g. from ONNX graph
                 introspection), used directly.  Defaults to
                 input_ids + image_features.
+            embedding_output_names: Override embedding model output name
+                mapping. Defaults to inputs_embeds.
             vision_start_token_id: Token ID for ``<|vision_start|>``.
             video_token_id: Token ID for video placeholders.
 
