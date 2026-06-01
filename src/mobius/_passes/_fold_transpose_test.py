@@ -508,3 +508,53 @@ def test_original_weight_pruned_after_full_pipeline():
     assert "weight_t" not in model.graph.initializers
     transpose_nodes = [n for n in model.graph.all_nodes() if n.op_type == "Transpose"]
     assert len(transpose_nodes) == 1
+
+
+class TestFoldTransposeDtype:
+    """Regression: a transposed fp16 weight with unset declared dtype stays fp16."""
+
+    def test_transposed_dtype_follows_const_value_when_declared_dtype_missing(self):
+        """fp16 weights lose their declared dtype after _cast_module_dtype.
+
+        The pass must resolve the transposed initializer's dtype from
+        ``const_value`` rather than defaulting to FLOAT, otherwise a fp16 weight
+        is emitted as fp32 and ORT rejects the downstream MatMul.
+        """
+        weight = ir.Value(name="weight")
+        weight.const_value = ir.tensor(np.arange(12, dtype=np.float16).reshape(4, 3))
+        # Do NOT set .dtype — declared dtype stays None.
+        assert weight.dtype is None
+
+        x = ir.Value(name="x")
+        x.shape = ir.Shape([2, 4])
+        x.dtype = ir.DataType.FLOAT16
+
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        w_t = transpose_node.outputs[0]
+        matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert result.modified
+
+        packed = model.graph.initializers["weight_t"]
+        assert packed.dtype == ir.DataType.FLOAT16, (
+            f"Transposed initializer declared dtype should be FLOAT16, got {packed.dtype}"
+        )
+        assert packed.const_value.dtype == ir.DataType.FLOAT16
+        assert packed.const_value.numpy().dtype == np.float16
