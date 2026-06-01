@@ -10,7 +10,7 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components._common import Linear
+from mobius.components._common import Linear, create_static_cache_causal_mask
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
@@ -99,14 +99,19 @@ def _apply_attention(
 
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
-        then attends over the full cache using ``nonpad_kv_seqlen``.
-        Also uses ``is_causal=1``.
+        then attends over the full cache using ``nonpad_kv_seqlen`` with
+        ``is_causal=0`` plus an explicit causal mask derived from
+        ``write_indices`` (see :func:`create_static_cache_causal_mask`).
+        ``is_causal=1`` cannot be used here: the opset-24 Attention kernel
+        rejects it together with ``nonpad_kv_seqlen`` when ``S_q`` differs
+        from the (pre-allocated) cache length, which is always the case.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
     Note:
-        Both paths set ``is_causal=1`` on the Attention op, which enables
-        built-in causal masking. This means ``attn_mask`` should encode
-        only padding information (as a bool mask), not causality.
+        The dynamic path sets ``is_causal=1`` so callers only provide a
+        bool padding mask.  The static path instead uses ``is_causal=0``
+        with a full causal+padding mask because the external-cache kernel
+        does not accept ``is_causal=1`` alongside ``nonpad_kv_seqlen``.
 
     Note:
         ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
@@ -138,28 +143,43 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache.  We pass None for attn_mask and use
-        # is_causal=1 instead — the Attention op handles causal + padding
-        # masking internally via is_causal + nonpad_kv_seqlen.  Using
-        # create_attention_bias() here would produce incorrect causality
-        # during prefill because it cannot represent the relationship
-        # between query positions and the full cache length.
+        # Attend over the full cache with is_causal=0 plus an explicit
+        # causal mask.  The opset-24 Attention CUDA kernel rejects
+        # is_causal=1 together with nonpad_kv_seqlen when S_q != total_kv
+        # and there is no past_key (the causal_cross_no_past guard in
+        # attention.cc).  With a pre-allocated [B, max_seq, ...] cache the
+        # query length never equals the total cache length, so that guard
+        # fires in BOTH prefill and decode.  Per ORT's own guidance we set
+        # is_causal=0 and pass an explicit causal mask built from
+        # write_indices: a query token at offset t attends to cache slots
+        # j <= write_indices[b] + t.  This single rule serves prefill
+        # (write_indices=0 -> triangular) and decode (write_indices=N,
+        # S_q=1 -> keep slots 0..N), and subsumes padding so it stays
+        # consistent with nonpad_kv_seqlen.
         #
-        # NOTE: The ONNX Attention spec supports attn_mask alongside
-        # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
-        # beyond causal + padding).  Currently we rely on is_causal=1 +
-        # nonpad_kv_seqlen for standard LLM causal + padding masking.
+        # nonpad_kv_seqlen is still passed: it selects the external-cache
+        # (TensorScatter) kernel path.  When both nonpad_kv_seqlen and an
+        # attn_mask are present, ORT skips Flash and routes to the
+        # memory-efficient / unfused path, which converts the bool mask to
+        # an additive bias (attention.cc ConvertAttnMaskToBias).
+        #
         # TODO(titaiwang): Support user-provided attn_mask in external
         # cache mode for advanced use cases (e.g., prefix masking,
         # document boundaries in batched inference).
         # TODO(titaiwang): Support sliding window (circular cache mode)
         # with static cache for long-context models that use local
         # attention windows.
+        static_causal_mask = create_static_cache_causal_mask(
+            op,
+            query,
+            updated_k,
+            static_cache.write_indices,
+        )
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
             updated_v,
-            None,  # no attn_mask — is_causal handles masking
+            static_causal_mask,  # explicit causal mask (is_causal=0)
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
             static_cache.nonpad_kv_seqlen,
@@ -167,7 +187,7 @@ def _apply_attention(
             kv_num_heads=num_key_value_heads,
             scale=scale,
             softcap=softcap,
-            is_causal=1,
+            is_causal=0,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v
