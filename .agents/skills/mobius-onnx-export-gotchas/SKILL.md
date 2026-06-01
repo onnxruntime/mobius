@@ -72,6 +72,16 @@ fp32 = [i.name for i in m.graph.initializer if i.data_type == onnx.TensorProto.F
 print(len(fp32), "FLOAT32 initializers (should be 0 for fp16)")
 ```
 
+### Convention (prevents the whole class from reappearing)
+Any pass that **materializes a new initializer** must resolve its dtype via
+`initializer_dtype()` (`src/mobius/_passes/_dtype_utils.py`), **never** `value.dtype or ir.DataType.FLOAT`.
+The bug class originates in `_cast_module_dtype` dropping a `Value`'s declared `.dtype` (→ `None`) while its
+`const_value` stays fp16; a bare `.dtype or FLOAT` fallback then silently mis-types the result as fp32. Fold
+passes (`_fold_concat.py`, `_fold_transpose.py`) already follow this; mirror it in any future
+initializer-producing pass. Siblings still reading `.dtype` directly remain exposed — a follow-up should
+grep `_passes/` for `.dtype or ir.DataType` and consider re-stamping the type in `_cast_module_dtype` to kill
+the class at source.
+
 ### Salvaging a stale pre-fix artifact (only if re-exporting is not an option)
 Prefer re-exporting on the fixed code. If you must repair an old model, cast its FLOAT32 initializers to
 fp16 and re-save. **Gotcha when re-saving with external data:** if you save with `location="X.data"` and
