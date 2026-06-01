@@ -102,6 +102,7 @@ def _build_static_cache_session(
     *,
     ir_dtype: ir.DataType = ir.DataType.FLOAT,
     enable_profiling: bool = False,
+    config_overrides: dict | None = None,
 ) -> tuple[ort.InferenceSession, object]:
     """Build a tiny static-cache qwen2 graph and load it on CUDA.
 
@@ -119,8 +120,12 @@ def _build_static_cache_session(
             production-precision graph used for the Flash-eligibility guard.
         enable_profiling: Turn on ORT op-level profiling so callers can
             inspect which ``If`` branch executed and with which inputs.
+        config_overrides: Optional ``_base_config`` field overrides.  Used to
+            build at the production ``head_dim`` (Phi-3.5 = 96) so the
+            Flash-eligibility guard is dispositive for the real model's head
+            dimension, not just the tiny default (``head_dim=16``).
     """
-    config = _base_config()
+    config = _base_config(**(config_overrides or {}))
     config = dataclasses.replace(config, dtype=ir_dtype)
     module = registry.get(_MODEL_TYPE)(config)
     task = CausalLMTask(static_cache=True, max_seq_len=_MAX_SEQ_LEN)
@@ -383,7 +388,25 @@ def _selected_attention_kernels(capture_file) -> list[tuple[str, int]]:
     return kernels
 
 
-def test_static_cache_decode_selects_flash_kernel_on_cuda():
+# Phi-3.5's real attention head dimension (32 heads x 96 = 3072 hidden).  The
+# tiny default config uses head_dim=16, which exercises the phase-split wiring
+# but NOT whether ORT's Flash kernel accepts the production head_dim on this
+# GPU.  Building at head_dim=96 (heads/hidden scaled down to stay tiny) makes
+# the Flash-eligibility assertion dispositive for the model we actually ship.
+_PHI35_HEAD_DIM_OVERRIDES = {
+    "hidden_size": 384,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 96,
+}
+
+
+@pytest.mark.parametrize(
+    "config_overrides",
+    [None, _PHI35_HEAD_DIM_OVERRIDES],
+    ids=["tiny-head-dim-16", "phi35-head-dim-96"],
+)
+def test_static_cache_decode_selects_flash_kernel_on_cuda(config_overrides):
     """Decode actually selects Flash; prefill selects Memory-Efficient.
 
     Structural maskless-ness (the test above) is necessary, but the *proof*
@@ -398,10 +421,18 @@ def test_static_cache_decode_selects_flash_kernel_on_cuda():
     the causal mask onto the decode branch would flip its kernel from Flash
     to Memory-Efficient and fail here, even though finiteness / scatter / If-
     count assertions would all still pass.
+
+    Parametrized over head dimension: the tiny default (``head_dim=16``) and
+    Phi-3.5's production ``head_dim=96``.  The latter makes the assertion
+    dispositive — it empirically confirms ORT's Flash kernel accepts the real
+    model's head dimension (fp16) on this GPU, rather than silently routing to
+    Memory-Efficient, which would invalidate the decode-on-Flash premise.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         session, config = _build_static_cache_session(
-            tmp_dir, ir_dtype=ir.DataType.FLOAT16
+            tmp_dir,
+            ir_dtype=ir.DataType.FLOAT16,
+            config_overrides=config_overrides,
         )
         num_layers = config.num_hidden_layers
         kv_hidden = config.num_key_value_heads * config.head_dim
