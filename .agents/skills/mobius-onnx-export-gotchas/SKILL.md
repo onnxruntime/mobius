@@ -133,7 +133,13 @@ pass a dead model.
 ### Canonical verification (load-bearing, not optional)
 VALUE-based per-slice check on each packed-QKV initializer against its source q/k/v weights:
 - per-slice correlation **≈ 1.000** (broken ≈ 0.000), AND
-- packed-QKV L2 norm **≈ 126.6** at layer 0 / mean(|abs|) **≈ 0.013** (broken ≈ 0.80 / ≈ 5e-6).
+- packed-QKV L2 norm **≈ 126.6** at layer 0 / mean(|abs|) **≈ 0.015** (broken ≈ 0.80 / ≈ 5e-6).
+
+> ⚠️ **Use mean-of-ABS or norm — NEVER the signed mean.** The good model's *signed* mean is ~2.6e-6
+> (near zero, because the weights are symmetric ±), which coincidentally looks just like the broken
+> model's mean(|abs|) ~5e-6. Checking signed mean would **falsely flag the good model as broken** — this
+> exact confusion has already caused a false alarm in this crew. Valid discriminators: mean(|abs|)
+> (good ≈ 0.015 vs broken ≈ 5e-6) or L2 norm (good ≈ 126.6 vs broken ≈ 0.80).
 
 Plus an end-to-end next-token greedy-argmax parity check vs the `attn_dynamic` reference (expect
 **~19–20 / 20**). Isolated single-token divergences are fp16 dead-ties (reference top1−top2 gap = 0.0000),
