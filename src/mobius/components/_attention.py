@@ -41,8 +41,11 @@ def _attend_over_static_cache(
     selects the external-cache / TensorScatter kernel path).  The phases
     differ in whether an explicit ``attn_mask`` is supplied, because the
     *presence* of ``attn_mask`` — regardless of its contents — disables Flash
-    Attention in ORT (``attn_mask != nullptr`` routes to the memory-efficient
-    or unfused path; see the kernel-selection cascade in ``attention.cc``):
+    Attention in ORT (``attn_mask != nullptr`` routes to the slower memory-
+    efficient or unfused path; see the kernel-selection cascade in
+    ``attention.cc``).  The phase split exists precisely to pay that
+    Flash→MEA latency cost only where it is unavoidable (multi-token prefill)
+    and never on the per-token decode hot path:
 
     * **Multi-token step** (``S_q > 1``: prefill or speculative/chunked decode):
       needs intra-query causality, so it passes an explicit causal mask built
