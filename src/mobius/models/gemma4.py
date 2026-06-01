@@ -1099,6 +1099,8 @@ class Gemma4DecoderLayer(nn.Module):
 
             self._top_k = config.num_experts_per_tok
             self._num_experts = config.num_local_experts
+            self._moe_intermediate_size = config.moe_intermediate_size
+            self._hidden_size = config.hidden_size
             moe_inter = config.moe_intermediate_size
 
             self.router = _Gemma4MoeRouter(
@@ -1175,26 +1177,74 @@ class Gemma4DecoderLayer(nn.Module):
             # Norm residual before experts
             normed_flat = self.pre_feedforward_layernorm_2(op, residual_flat)  # [B*S, H]
 
-            # NOTE: We intentionally do NOT use the fused com.microsoft::MoE
-            # op here, even when ``ep_capabilities().supports_fused_moe`` is
-            # True. The ORT MoE kernel for ``activation_type="swiglu"`` is
-            # hardcoded for GPT-OSS-style SwiGLU:
-            #   * CUDA kernel (ft_moe/moe_kernel.cu) hardcodes
-            #     ``alpha=1.702, limit=7.0`` and an interleaved gate/up
-            #     layout — neither matches Gemma 4's standard SwiGLU
-            #     (alpha=1.0, no limit, concatenated layout).
-            #   * CPU kernel (moe_cpu.cc) refuses to load unless
-            #     ``swiglu_fusion=1`` (interleaved).
-            # ``activation_type="silu"`` would also be wrong because
-            # ``fc1_experts_weights`` packs gate+up along dim 1
-            # ([E, 2*inter, hidden]), causing a shape mismatch against
-            # the kernel's expected ``[E, inter, hidden]`` for silu.
-            #
-            # Until ORT exposes a Gemma-4-compatible SwiGLU mode (standard
-            # alpha=1.0, concatenated layout) we always take the static
-            # unroll fallback. See microsoft/onnxruntime-genai#2062 for
-            # the upstream report.
-            moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
+            caps = ep_capabilities()
+            if caps.supports_fused_moe:
+                # Fused com.microsoft::MoE op handles top-k selection +
+                # expert dispatch internally. Requires ORT main (post
+                # microsoft/onnxruntime#28467, MoE GEMM Refactor) which
+                # plumbs the SwiGLU schema attributes to the kernel.
+                #
+                # Gemma 4 SwiGLU semantics (vs GPT-OSS):
+                #   activation_alpha=1.0   — silu(gate) (no GPT-OSS alpha=1.702)
+                #   activation_beta=0.0    — linear * gate (no GPT-OSS "+1" bias)
+                #   swiglu_limit=inf       — no clipping (≤0 disables the clamp)
+                #   swiglu_fusion=1        — interleaved layout
+                #                            [g_0, u_0, g_1, u_1, ...].
+                #
+                # mobius stores ``fc1_experts_weights`` chunked as
+                # ``[E, 2*inter, H]`` (first ``inter`` rows = gate,
+                # next ``inter`` = up) because that matches HuggingFace
+                # ``experts.gate_up_proj``. The fused op needs the
+                # interleaved layout, so reshape ``[E, 2, inter, H]`` →
+                # transpose to ``[E, inter, 2, H]`` → flatten back to
+                # ``[E, 2*inter, H]``. The whole chain operates on a
+                # constant initializer so ORT folds it into a single
+                # static tensor at session load.
+                #
+                # ``swiglu_fusion=1`` is required because the CPU MoE
+                # kernel still only supports the interleaved layout
+                # (``contrib_ops/cpu/moe/moe_cpu.cc:27``); the new CUDA
+                # kernel accepts either.
+                #
+                # CastLike restores the input dtype because op.MoE is a
+                # custom op with type=None on its output; without the
+                # cast downstream type inference cannot share scalar
+                # initializers in bf16/fp16 graphs.
+                e_dim = self._num_experts
+                inter = self._moe_intermediate_size
+                hidden = self._hidden_size
+                fc1_interleaved = op.Reshape(
+                    op.Transpose(
+                        op.Reshape(
+                            self.fc1_experts_weights,
+                            op.Constant(value_ints=[e_dim, 2, inter, hidden]),
+                        ),
+                        perm=[0, 2, 1, 3],
+                    ),
+                    op.Constant(value_ints=[e_dim, 2 * inter, hidden]),
+                )  # [E, 2*inter, H] interleaved
+                moe_out_flat = op.CastLike(
+                    op.MoE(  # type: ignore[attr-defined]
+                        normed_flat,
+                        router_probs,
+                        fc1_interleaved,
+                        None,  # fc1_experts_bias (slot 3, optional)
+                        self.fc2_experts_weights,
+                        activation_type="swiglu",
+                        k=self._top_k,
+                        normalize_routing_weights=1,
+                        activation_alpha=1.0,
+                        activation_beta=0.0,
+                        swiglu_limit=float("inf"),
+                        swiglu_fusion=1,
+                        _domain="com.microsoft",
+                    ),
+                    normed_flat,  # match input dtype (bf16/fp16/fp32)
+                )  # [B*S, H]
+            else:
+                # EPs without fused MoE support fall back to a static
+                # per-expert unroll.
+                moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
 
             moe_out = op.Reshape(moe_out_flat, op.Shape(residual))  # [B, S, H]
             moe_out = self.post_feedforward_layernorm_2(op, moe_out)
