@@ -467,6 +467,57 @@ class TestFoldConcatEdgeCases:
         result = FoldConcatInitializersPass()(model)
         assert not result.modified
 
+    def test_packed_dtype_follows_const_value_when_declared_dtype_missing(self):
+        """Regression: fp16 weights with an unset declared dtype must fold to fp16.
+
+        After ``_cast_module_dtype`` casts parameters to fp16, the resulting
+        initializer Values keep an fp16 ``const_value`` but lose their declared
+        ``.dtype`` (it becomes ``None``).  The pass must resolve the packed dtype
+        from ``const_value`` rather than defaulting to FLOAT, otherwise GQA's
+        packed-QKV weight is serialized as fp32 and ORT rejects the model with a
+        fp16/fp32 MatMul type-mismatch error.
+        """
+        q = ir.Value(name="q_weight")
+        q.const_value = ir.tensor(np.ones((4, 3), dtype=np.float16))
+        k = ir.Value(name="k_weight")
+        k.const_value = ir.tensor(np.ones((4, 3), dtype=np.float16))
+        v = ir.Value(name="v_weight")
+        v.const_value = ir.tensor(np.ones((4, 3), dtype=np.float16))
+        # Critically: do NOT set .dtype — declared dtype stays None.
+        assert q.dtype is None and k.dtype is None and v.dtype is None
+
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[q, k, v],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 0)],
+            num_outputs=1,
+        )
+        graph = ir.Graph(
+            inputs=[ir.Value(name="x")],
+            outputs=[concat_node.outputs[0]],
+            nodes=[concat_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(q)
+        graph.register_initializer(k)
+        graph.register_initializer(v)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldConcatInitializersPass()(model)
+        assert result.modified
+
+        packed = model.graph.initializers["q_weight__k_weight__v_weight__axis_0__concat"]
+        assert packed.dtype == ir.DataType.FLOAT16, (
+            f"Packed initializer declared dtype should be FLOAT16, got {packed.dtype}"
+        )
+        assert packed.const_value.dtype == ir.DataType.FLOAT16, (
+            "Packed LazyTensor dtype should be FLOAT16, got "
+            f"{packed.const_value.dtype}"
+        )
+        assert packed.const_value.numpy().dtype == np.float16
+
     def test_shape_computed_from_inputs_when_output_shape_missing(self):
         """When the Concat output has no shape, shape is inferred from input shapes."""
         a = np.ones((4, 3), dtype=np.float32)
@@ -512,3 +563,82 @@ class TestFoldConcatEdgeCases:
         # Shape should be computed from inputs: (4,3) + (4,3) along axis 0 → (8,3).
         packed = model.graph.initializers[packed_name]
         assert list(packed.shape) == [8, 3]
+
+
+class TestFoldConcatOrtLoad:
+    """End-to-end regression: a folded fp16 GQA-style graph must load in ORT.
+
+    Reproduces the original failure where the packed-QKV initializer was
+    serialized as fp32 while the rest of the graph was fp16, causing ORT to
+    reject the model with::
+
+        Type parameter (T) of Optype (MatMul) bound to different types
+        (tensor(float16) and tensor(float))
+
+    The failure occurs on the CPU EP too, so no GPU is needed.
+    """
+
+    def test_folded_fp16_concat_matmul_loads_in_ort(self, tmp_path):
+        import onnx
+        import onnxruntime as ort
+
+        # Three fp16 weights with UNSET declared dtype (as after _cast_module_dtype),
+        # but with shape retained so they serialize before they are pruned.
+        q = ir.Value(name="q_weight", shape=ir.Shape([8, 4]))
+        q.const_value = ir.tensor(np.random.randn(8, 4).astype(np.float16))
+        k = ir.Value(name="k_weight", shape=ir.Shape([8, 4]))
+        k.const_value = ir.tensor(np.random.randn(8, 4).astype(np.float16))
+        v = ir.Value(name="v_weight", shape=ir.Shape([8, 4]))
+        v.const_value = ir.tensor(np.random.randn(8, 4).astype(np.float16))
+
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[q, k, v],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 1)],
+            num_outputs=1,
+        )
+        packed_out = concat_node.outputs[0]  # shape (8, 12), packed QKV weight
+        packed_out.shape = ir.Shape([8, 12])
+
+        # hidden @ packed_qkv : (N, 8) @ (8, 12) -> (N, 12), all fp16.
+        hidden = ir.Value(
+            name="hidden", shape=ir.Shape(["N", 8]), type=ir.TensorType(ir.DataType.FLOAT16)
+        )
+        matmul_node = ir.Node(
+            "", "MatMul", inputs=[hidden, packed_out], num_outputs=1
+        )
+        out = matmul_node.outputs[0]
+        out.shape = ir.Shape(["N", 12])
+        out.dtype = ir.DataType.FLOAT16
+
+        graph = ir.Graph(
+            inputs=[hidden],
+            outputs=[out],
+            nodes=[concat_node, matmul_node],
+            name="qkv_matmul",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(q)
+        graph.register_initializer(k)
+        graph.register_initializer(v)
+        model = ir.Model(graph, ir_version=10)
+
+        FoldConcatInitializersPass()(model)
+
+        # Drop the now-unused source initializers (a DCE step runs after folding
+        # in the real export pipeline). Without this they linger as dead weights.
+        for dead in ("q_weight", "k_weight", "v_weight"):
+            del model.graph.initializers[dead]
+
+        model_path = tmp_path / "fp16_qkv.onnx"
+        onnx.save(ir.to_proto(model), str(model_path))
+
+        # Before the fix this raises a fp16/fp32 MatMul type-mismatch at load.
+        sess = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+        feed = {"hidden": np.random.randn(2, 8).astype(np.float16)}
+        (result,) = sess.run(None, feed)
+        assert result.shape == (2, 12)
+        assert result.dtype == np.float16

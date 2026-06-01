@@ -27,6 +27,8 @@ import logging
 import numpy as np
 import onnx_ir as ir
 
+from mobius._passes._dtype_utils import initializer_dtype
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +65,19 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             if not all(v is not None and v.is_initializer() for v in inputs):
                 continue
 
+            # All inputs must have loaded weights. Folding before weights are
+            # loaded would force the dtype to default to FLOAT and bake a wrong
+            # type into the packed initializer. Mirror FoldTransposedInitializer's
+            # guard and skip with a warning so the Concat survives for a later run.
+            if any(v.const_value is None for v in inputs):  # type: ignore[union-attr]
+                logger.warning(
+                    "FoldConcatInitializersPass: skipping Concat %r — an input "
+                    "initializer has no const_value (pass ran before weights "
+                    "were loaded, or a weight is missing).",
+                    node.name,
+                )
+                continue
+
             axis_attr = node.attributes.get("axis")
             axis: int = axis_attr.value if axis_attr is not None else 0
 
@@ -79,8 +94,10 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
             # Require uniform dtype — mixed-dtype concat is unusual and likely
             # a modelling error; skip and warn rather than silently produce
-            # a wrong result.
-            dtypes = [v.dtype for v in inputs]  # type: ignore[union-attr]
+            # a wrong result. Resolve each dtype from the declared type or, when
+            # that is missing, from the loaded ``const_value`` so an fp16 weight
+            # whose type annotation was dropped is not mistaken for fp32.
+            dtypes = [initializer_dtype(v) for v in inputs]  # type: ignore[union-attr]
             if len(set(dtypes)) > 1:
                 logger.warning(
                     "FoldConcatInitializersPass: skipping Concat with mixed dtypes %s"
@@ -88,6 +105,10 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                     dtypes,
                 )
                 continue
+
+            # Authoritative dtype for the packed initializer. Falls back to FLOAT
+            # only when neither the declared type nor const_value is available.
+            packed_dtype = dtypes[0] or ir.DataType.FLOAT
 
             # Build a name for the packed initializer from the input names and axis.
             # The name encodes both the ordered input names and the axis, so two Concat
@@ -117,7 +138,12 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 )
                 continue
 
-            new_val = ir.Value(name=packed_name, shape=out_shape, type=out_val.type)
+            # Stamp the resolved dtype on the new initializer's type so the
+            # declared type, the LazyTensor, and the materialized data all agree
+            # (out_val.type may be missing after stage-2 rewrites).
+            new_val = ir.Value(
+                name=packed_name, shape=out_shape, type=ir.TensorType(packed_dtype)
+            )
 
             captured_inputs = list(inputs)  # capture for closure
 
@@ -133,8 +159,9 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                     arrays.append(v.const_value.numpy())
                 return ir.tensor(np.concatenate(arrays, axis=ax))
 
-            dtype = inputs[0].dtype or ir.DataType.FLOAT  # type: ignore[union-attr]
-            new_val.const_value = ir.LazyTensor(_make_packed, dtype=dtype, shape=out_shape)
+            new_val.const_value = ir.LazyTensor(
+                _make_packed, dtype=packed_dtype, shape=out_shape
+            )
 
             model.graph.initializers[new_val.name] = new_val
 
