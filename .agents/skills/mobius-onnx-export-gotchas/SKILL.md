@@ -1,6 +1,6 @@
 ---
 name: mobius-onnx-export-gotchas
-description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, and a known fp16 packed-QKV FLOAT32 bug that makes GQA fp16 exports fail to load in onnxruntime.
+description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, and how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed as of df203cc).
 ---
 
 # mobius ONNX export gotchas
@@ -31,24 +31,40 @@ op). That breaks the pattern the GQA rewrite matches, so combining
   OrtValue — NOT via `--static-cache`.
 - **ONNX-Attention + in-place cache:** `--execution-provider default --static-cache --max-seq-len N`.
 
-## 3. BUG: GQA fp16 export leaves packed-QKV weights as FLOAT32 → model won't load
-For an fp16 GQA export, the per-layer packed QKV weight
-(`..q_proj.weight__k_proj.weight__v_proj.weight__axis_0__concat`) is emitted as **FLOAT32**, while its
-MatMul's other input is fp16. onnxruntime then rejects the model at load:
+## 3. FIXED: fp16 GQA export previously left packed-QKV weights as FLOAT32 → model wouldn't load
+**Status: fixed as of commit `df203cc`.** Native fp16 Phi-3.5 GQA export now loads directly in the ORT
+CUDA EP with **no manual post-cast** (32 GroupQueryAttention nodes, all-fp16 initializers). If you are on
+that commit or later, you should not hit this — skip to the verification snippet below. The history is
+kept here because old artifacts exported before the fix still carry fp32 packed weights.
+
+### Symptom (pre-fix)
+For an fp16 GQA export, a folded per-layer packed QKV weight
+(`..q_proj.weight__k_proj.weight__v_proj.weight__axis_0__concat`) was emitted as **FLOAT32**, while its
+MatMul's other input was fp16. onnxruntime then rejected the model at load on both CPU and CUDA EPs:
 
 ```
 Type Error: Type parameter (T) of Optype (MatMul) bound to different types
 (tensor(float16) and tensor(float)) in node (node_MatMul_*)
 ```
 
-You'll also see at save time: `The value type for shape [H, 3H] is not known. Skipping serialization`.
+You'd also see at save time: `The value type for shape [H, 3H] is not known. Skipping serialization`.
 
-**Root cause:** `_cast_module_dtype` (`src/mobius/_builder.py:84`) casts module params to fp16 *before*
-graph build. The GQA `PackQKVWithBias` rewrite (`src/mobius/rewrite_rules/_group_query_attention.py`)
-then emits the packed weight as a graph-level `op.Concat(q_w,k_w,v_w)` that a constant-fold collapses
-into a NEW initializer whose dtype is FLOAT32/untyped — the fp16 cast never reaches it.
+### Root cause
+`_cast_module_dtype` casts module params to fp16, but the resulting initializer `Value`s lose their
+declared `.dtype` (it becomes `None`) while their `const_value` stays fp16. The fold passes
+`FoldConcatInitializersPass` (`src/mobius/_passes/_fold_concat.py`) and `FoldTransposedInitializerPass`
+(`src/mobius/_passes/_fold_transpose.py`) then defaulted the folded initializer's dtype to `FLOAT`,
+serializing the packed QKV / transposed weights as fp32.
 
-### Detect
+### The fix
+A shared helper `initializer_dtype()` (`src/mobius/_passes/_dtype_utils.py`) resolves the effective dtype
+from the declared type, **falling back to `const_value` when the type annotation was dropped** (preferring
+the data dtype and warning on stale-metadata disagreement). Both fold passes use it to stamp the correct
+dtype on the new initializer's `TensorType` and `LazyTensor`, and `FoldConcatInitializersPass` now also
+skips folding before weights are loaded (mirroring `FoldTransposedInitializerPass`). A regression test
+loads the fp16 GQA export in the ORT CPU EP to lock this in.
+
+### Verify (still worth running on any fp16 build)
 ```python
 import onnx
 m = onnx.load("model.onnx", load_external_data=False)
@@ -56,11 +72,11 @@ fp32 = [i.name for i in m.graph.initializer if i.data_type == onnx.TensorProto.F
 print(len(fp32), "FLOAT32 initializers (should be 0 for fp16)")
 ```
 
-### Fix (post-export, numerically == intended fp16)
-Cast the FLOAT32 initializers to fp16, optionally strip dead pre-pack q/k/v initializers, re-save.
-**Gotcha when re-saving with external data:** if you save with `location="X.data"` and then rename the
-file, the references inside `model.onnx` still point to `X.data`. Either save directly with
-`location="model.onnx.data"`, or rewrite each initializer's `external_data` `location` entry.
+### Salvaging a stale pre-fix artifact (only if re-exporting is not an option)
+Prefer re-exporting on the fixed code. If you must repair an old model, cast its FLOAT32 initializers to
+fp16 and re-save. **Gotcha when re-saving with external data:** if you save with `location="X.data"` and
+then rename the file, the references inside `model.onnx` still point to `X.data`. Either save directly
+with `location="model.onnx.data"`, or rewrite each initializer's `external_data` `location` entry.
 
 ```python
 import onnx, numpy as np
@@ -73,10 +89,6 @@ for init in m.graph.initializer:
 onnx.save(m, "model.onnx", save_as_external_data=True, all_tensors_to_one_file=True,
           location="model.onnx.data", size_threshold=1024, convert_attribute=False)
 ```
-
-**Proper upstream fix:** set the packed-Concat output type to the model dtype in the GQA pack rewrite,
-or cast ALL float initializers at save time regardless of registered value_info; add an e2e test that
-loads the fp16 GQA export in onnxruntime.
 
 ## 4. Always validate the export in ORT before profiling
 Load the model on `CUDAExecutionProvider` and run one prefill + one decode `session.run`. Confirm:
