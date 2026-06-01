@@ -360,6 +360,11 @@ def _capture_attention_kernel_log():
     read the yielded file *inside* the ``with`` block (it is closed on exit);
     fd 2 and the logger severity are restored before exit so assertions made
     after the block still report normally.
+
+    Not safe under *in-process* parallelism: it mutates process-global state
+    (the default logger severity and fd 2).  That is fine here — pytest runs
+    tests sequentially in-process, and ``pytest-xdist`` isolates workers in
+    separate processes — but do not call it from threads sharing this process.
     """
     ort.set_default_logger_severity(0)
     saved_stderr_fd = os.dup(2)
