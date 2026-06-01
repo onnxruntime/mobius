@@ -1,6 +1,6 @@
 ---
 name: mobius-onnx-export-gotchas
-description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, and how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed as of df203cc).
+description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed as of df203cc), and why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights.
 ---
 
 # mobius ONNX export gotchas
@@ -94,3 +94,41 @@ onnx.save(m, "model.onnx", save_as_external_data=True, all_tensors_to_one_file=T
 Load the model on `CUDAExecutionProvider` and run one prefill + one decode `session.run`. Confirm:
 (a) the expected attention op (`com.microsoft::GroupQueryAttention` vs `ai.onnx::Attention`),
 (b) finite fp16 logits, (c) no FLOAT32 initializers for an fp16 build.
+
+These checks are **necessary but NOT sufficient** for a fp16 GQA export — see §5. A model can pass all
+three and still have silently-zeroed packed-QKV weights.
+
+## 5. Verifying a fp16 GQA export: use VALUE-based weight checks, NOT initializer count/dtype
+**A fp16 GQA export can be all-fp16, right-count, and still all-zeros — only a corr≈1.0 / norm≈126 VALUE
+check on the packed QKV proves the weights are real.**
+
+### Symptom
+The GQA model loads cleanly (32 `GroupQueryAttention` nodes, all-fp16, finite logits) but generates
+garbage (e.g. `holdou_(...artersarters`). Prefill logits come out ~3× the reference scale, with
+`max|Δlogit|` ~50+ versus the reference.
+
+### Root cause
+The packed-QKV initializer is `Transpose(Concat(q, k, v, axis=0))`. If the fold passes
+(`FoldConcatInitializersPass` / `FoldTransposedInitializerPass`) leave the packed-Concat output dtype
+UNKNOWN / defaulted-to-fp32 while the data is fp16, the serializer **skips** it and it loads as
+**near-zero** — the weights are silently dead. (This is the §3 failure mode; the upstream fix in
+`df203cc` stamps the fp16 dtype at the fold-pass source. A post-hoc cast is NOT a fix — it re-corrupts.)
+
+### Why count/dtype checks fail (the trap)
+The BROKEN export and the FIXED export can have the **same initializer count and the same fp16/fp32 dtype
+ratio** (e.g. both 197 fp16 after dead-weight stripping). Counting initializers or checking
+"0 fp32 / all fp16" does **not** distinguish a healthy model from a zeroed-weight one. §4(c) alone will
+pass a dead model.
+
+### Canonical verification (load-bearing, not optional)
+VALUE-based per-slice check on each packed-QKV initializer against its source q/k/v weights:
+- per-slice correlation **≈ 1.000** (broken ≈ 0.000), AND
+- packed-QKV L2 norm **≈ 126.6** at layer 0 / mean(|abs|) **≈ 0.013** (broken ≈ 0.80 / ≈ 5e-6).
+
+Plus an end-to-end next-token greedy-argmax parity check vs the `attn_dynamic` reference (expect
+**~19–20 / 20**). Isolated single-token divergences are fp16 dead-ties (reference top1−top2 gap = 0.0000),
+not bugs. Optional hardening: assert **0 unused initializers** and that all N packed-QKV initializers are
+present, to catch dead-weight OVER-stripping.
+
+QA's `gqa_weight_integrity_gate.py` (`--self-check --strip-audit --scan-all`, per-layer corr/norm)
+implements exactly this gate.
