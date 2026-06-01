@@ -171,6 +171,14 @@ class TestFoldConcatInitializersPass:
             "the live packed result must NOT be stripped by DCE: "
             f"{remaining}"
         )
+        # The survived packed weight must retain its exact values, not just its
+        # name — guards against a future DCE that mutates retained tensors.
+        packed = model.graph.initializers["init_0__init_1__axis_0__concat"]
+        np.testing.assert_array_equal(
+            packed.const_value.numpy(),
+            np.concatenate([a, b], axis=0),
+            err_msg="packed-QKV values corrupted by DCE",
+        )
 
     def test_uses_lazy_tensor(self):
         """The packed initializer wraps sources in a LazyTensor.
