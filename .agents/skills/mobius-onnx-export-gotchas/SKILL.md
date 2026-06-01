@@ -132,3 +132,49 @@ present, to catch dead-weight OVER-stripping.
 
 QA's `gqa_weight_integrity_gate.py` (`--self-check --strip-audit --scan-all`, per-layer corr/norm)
 implements exactly this gate.
+
+## 6. FIXED: GQA `present.*` KV-cache outputs declared the wrong `head_dim`
+**Status: fixed as of commit `cf6c5c4`.** A native fp16 GQA export now declares
+`present.{i}.{key,value}` with the correct `head_dim`, symmetric to its `past_key_values.{i}.*` inputs.
+
+### Symptom (pre-fix)
+The graph **output** `present.{i}.key/value` declared the wrong `head_dim` (e.g. `32` instead of the real
+`96` on Phi-3.5) while the matching `past_key_values.{i}.*` **input** was correct (`96`). At load ORT logged
+(once per key+value per layer — 64 on Phi-3.5):
+
+```
+[W ...MergeShapeInfo] Error merging shape info for output. 'present.0.key'
+source:{-1,32,-1,96} target:{-1,32,-1,32}. Falling back to lenient merge.
+```
+
+Runtime still produced correct (96-wide) arrays via lenient merge, but any consumer that **trusts declared
+shapes** (e.g. `onnxruntime-genai`) would see inconsistent past-vs-present KV cache types.
+
+### Root cause
+`GroupQueryAttention`'s contrib-op shape inference mis-derives the present `head_dim` (it does **not**
+reproduce on the plain `Attention` op, which infers correctly). `_register_kv_cache_outputs`
+(`src/mobius/tasks/_cache_utils.py`) added the present outputs with **no explicit shape**, so the buggy
+inference won.
+
+### The fix
+`_register_kv_cache_outputs` now opt-in **stamps** `present.{i}.{key,value}` shape+dtype symmetric to the
+past inputs when the caller passes `batch`/`num_kv_heads`/`key_head_dim`/`value_head_dim`/`total_seq_len`/
+`dtype` (wired from `_causal_lm.py`). Omitting them preserves inference-only behavior, so the other ~10
+callers are unaffected. The stamp survives `SymbolicShapeInferencePass` (policy `refine` only tightens
+unknown dims; it won't replace a concrete `96` with a conflicting `32`).
+
+### Verify
+```python
+import onnx
+m = onnx.load("model.onnx", load_external_data=False)
+d = lambda vi: [(x.dim_param or x.dim_value) for x in vi.type.tensor_type.shape.dim]
+o = {v.name: v for v in m.graph.output}
+print("present.0.key:", d(o["present.0.key"]))   # head_dim must equal the past input's (e.g. 96, NOT 32)
+```
+
+### Known remaining (separate, pre-existing, harmless)
+ORT still logs ~32 `Error merging shape info ... source:{-1,-1,3072} target:{-1,-1,1024}` warnings on the
+GQA op's **internal hidden-state output** value_info (`v_*.GroupQueryAttention_*_0`, `1024`=32×32 vs the
+correct `3072`=32×96). That value is **not** a declared graph I/O — runtime is correct and `onnxruntime-genai`
+does not trust it — so it does not bite shape-trusting consumers the way the present-output bug did. Tracked
+as a follow-up in the GQA rewrite emission path (not the KV-cache output path).
