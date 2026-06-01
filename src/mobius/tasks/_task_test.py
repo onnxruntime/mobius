@@ -91,6 +91,36 @@ class TestCausalLMTask:
         assert "present.0.key" in output_names
         assert "present.0.value" in output_names
 
+    def test_present_outputs_match_past_inputs(self):
+        """present.{i}.* must declare the same kv_heads/head_dim/dtype as the
+        corresponding past_key_values.{i}.* inputs, with total (past+current)
+        sequence length. Guards the GQA present-head_dim export bug, where the
+        contrib-op shape inference would otherwise mis-declare head_dim.
+        """
+        config = make_config()
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+        inputs = {v.name: v for v in model.graph.inputs}
+        outputs = {v.name: v for v in model.graph.outputs}
+
+        def dims(value):
+            return [d if isinstance(d, int) else str(d) for d in value.shape]
+
+        for i in range(config.num_hidden_layers):
+            for kind in ("key", "value"):
+                past = inputs[f"past_key_values.{i}.{kind}"]
+                present = outputs[f"present.{i}.{kind}"]
+                past_dims = dims(past)
+                present_dims = dims(present)
+                # batch, kv_heads, head_dim must match the past input exactly.
+                assert present_dims[0] == past_dims[0]
+                assert present_dims[1] == past_dims[1]
+                assert present_dims[3] == past_dims[3]
+                # present covers past + current tokens.
+                assert present_dims[2] == "past_sequence_len + sequence_len"
+                assert present.dtype == past.dtype
+
     def test_build_producer_info(self):
         config = make_config()
         module = CausalLMModel(config)
