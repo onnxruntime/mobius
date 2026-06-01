@@ -456,3 +456,79 @@ def test_static_cache_decode_selects_flash_kernel_on_cuda():
         f"prefill should select Memory-Efficient Attention (causal mask "
         f"present); got {prefill_kernels}"
     )
+
+
+def test_static_cache_decode_ignores_keys_beyond_nonpad_on_cuda():
+    """Out-of-bound cache slots cannot change a decode's output.
+
+    The decode branch runs maskless and relies solely on ``nonpad_kv_seqlen``
+    to bound attention to the valid keys.  The other e2e tests prove decode
+    *runs* and stays on Flash, but not that the bound is semantically applied.
+    This test closes that gap: it compares a decode over a clean carried cache
+    against a decode over the *same* cache with every slot at or beyond
+    ``nonpad`` overwritten with large garbage.  If the bound is honored the two
+    decodes produce bit-identical logits; if a regression let the kernel read
+    the whole pre-allocated cache, the garbage would perturb the softmax and
+    the logits would diverge.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session, config = _build_static_cache_session(
+            tmp_dir, ir_dtype=ir.DataType.FLOAT16
+        )
+        num_layers = config.num_hidden_layers
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        vocab = config.vocab_size
+        output_names = [out.name for out in session.get_outputs()]
+        rng = np.random.default_rng(4)
+
+        # Prefill four real tokens into slots 0..3 to populate the cache.
+        prefill_len = 4
+        prefill_feeds: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(
+                0, vocab, size=(1, prefill_len), dtype=np.int64
+            ),
+            "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
+            "write_indices": np.array([0], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
+        }
+        prefill_feeds.update(_empty_caches(num_layers, kv_hidden, np.float16))
+        prefill_out = dict(
+            zip(output_names, session.run(output_names, prefill_feeds))
+        )
+
+        # Decode one token into slot 4; valid keys are slots 0..4 (nonpad=5).
+        nonpad = prefill_len + 1
+        decode_inputs: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(1, 1), dtype=np.int64),
+            "position_ids": np.array([[prefill_len]], dtype=np.int64),
+            "write_indices": np.array([prefill_len], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([nonpad], dtype=np.int64),
+        }
+
+        clean_feeds = {
+            **decode_inputs,
+            **_carry_caches(prefill_out, num_layers),
+        }
+        baseline = dict(
+            zip(output_names, session.run(output_names, clean_feeds))
+        )
+
+        # Poison every cache slot at or beyond ``nonpad`` with large garbage;
+        # those positions must never be attended during decode.  Slot 4 (the
+        # decode write target, within nonpad) is left untouched.
+        poisoned_caches = _carry_caches(prefill_out, num_layers)
+        for layer in range(num_layers):
+            for name in (f"key_cache.{layer}", f"value_cache.{layer}"):
+                buf = poisoned_caches[name].copy()
+                buf[:, nonpad:, :] = np.float16(50.0)
+                poisoned_caches[name] = buf
+        poisoned_feeds = {**decode_inputs, **poisoned_caches}
+        perturbed = dict(
+            zip(output_names, session.run(output_names, poisoned_feeds))
+        )
+
+    assert np.array_equal(baseline["logits"], perturbed["logits"]), (
+        "decode logits changed when cache slots beyond nonpad_kv_seqlen were "
+        "poisoned — the nonpad bound is not being honored, so decode is "
+        "attending to invalid (out-of-range) keys"
+    )
