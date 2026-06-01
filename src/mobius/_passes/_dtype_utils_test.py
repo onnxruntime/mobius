@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import onnx_ir as ir
 
@@ -31,10 +33,15 @@ class TestInitializerDtype:
         assert v.dtype is None
         assert initializer_dtype(v) == ir.DataType.FLOAT16
 
-    def test_const_value_wins_on_disagreement(self):
+    def test_const_value_wins_on_disagreement(self, caplog):
         """Stale declared metadata must not override the serialized data dtype."""
         v = _value(ir.DataType.FLOAT, np.ones((2,), np.float16))
-        assert initializer_dtype(v) == ir.DataType.FLOAT16
+        with caplog.at_level(logging.WARNING, logger="mobius._passes._dtype_utils"):
+            assert initializer_dtype(v) == ir.DataType.FLOAT16
+        assert any(
+            record.levelno == logging.WARNING and "stale type metadata" in record.getMessage().lower()
+            for record in caplog.records
+        ), "expected a warning when declared dtype disagrees with const_value"
 
     def test_returns_none_when_nothing_available(self):
         v = _value(None, None)
