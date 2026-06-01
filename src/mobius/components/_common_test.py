@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius.components._common import (
@@ -13,7 +15,37 @@ from mobius.components._common import (
     Linear,
     create_attention_bias,
     create_padding_mask,
+    create_static_cache_causal_mask,
 )
+
+
+def _run_static_cache_mask(max_seq: int, query_len: int, write_index: int) -> np.ndarray:
+    """Build the static-cache causal mask subgraph and evaluate it on CPU.
+
+    Returns the bool mask array of shape ``[1, 1, query_len, max_seq]`` where
+    ``True`` means the query token attends to that cache slot.
+    """
+    builder, op, graph = create_test_builder()
+    query = create_test_input(builder, "query", [1, "S_q", 32], dtype=ir.DataType.FLOAT)
+    key_cache = create_test_input(
+        builder, "key_cache", [1, max_seq, 16], dtype=ir.DataType.FLOAT
+    )
+    write_indices = create_test_input(
+        builder, "write_indices", [1], dtype=ir.DataType.INT64
+    )
+    mask = create_static_cache_causal_mask(op, query, key_cache, write_indices)
+    mask.name = "mask"
+    graph.outputs.append(mask)
+    proto = ir.to_proto(ir.Model(graph, ir_version=10))
+    session = ort.InferenceSession(
+        proto.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    feeds = {
+        "query": np.zeros((1, query_len, 32), np.float32),
+        "key_cache": np.zeros((1, max_seq, 16), np.float32),
+        "write_indices": np.array([write_index], np.int64),
+    }
+    return session.run(None, feeds)[0]
 
 
 class TestLinear:
@@ -178,3 +210,65 @@ class TestCreatePaddingMask:
         assert count_op_type(graph_bias, "CumSum") >= 1
         assert count_op_type(graph_bias, "GreaterOrEqual") >= 1
         assert count_op_type(graph_bias, "Where") >= 1
+
+
+class TestCreateStaticCacheCausalMask:
+    """Value-level checks for the static-cache causal mask.
+
+    Query token ``t`` writes to absolute cache slot ``write_index + t`` and must
+    attend to every slot ``j <= write_index + t`` (causal), while padded/future
+    slots stay masked. This is verified by running the subgraph on CPU.
+    """
+
+    def test_structure_uses_range_and_greater_or_equal(self):
+        builder, op, graph = create_test_builder()
+        query = create_test_input(builder, "query", [1, "S_q", 32], dtype=ir.DataType.FLOAT)
+        key_cache = create_test_input(
+            builder, "key_cache", [1, 8, 16], dtype=ir.DataType.FLOAT
+        )
+        write_indices = create_test_input(
+            builder, "write_indices", [1], dtype=ir.DataType.INT64
+        )
+        mask = create_static_cache_causal_mask(op, query, key_cache, write_indices)
+        assert mask is not None
+        assert count_op_type(graph, "Range") >= 1
+        assert count_op_type(graph, "GreaterOrEqual") >= 1
+
+    def test_mask_shape_is_4d_batch_one_head(self):
+        mask = _run_static_cache_mask(max_seq=8, query_len=4, write_index=0)
+        # [B, 1, S_q, max_seq] — dim1=1 broadcasts over heads, dim0=batch.
+        assert mask.shape == (1, 1, 4, 8)
+        assert mask.dtype == bool
+
+    def test_prefill_is_triangular(self):
+        """write_index=0: each query token t attends to slots 0..t only."""
+        mask = _run_static_cache_mask(max_seq=8, query_len=4, write_index=0)
+        expected = np.array(
+            [
+                [1, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+            ],
+            dtype=bool,
+        )
+        np.testing.assert_array_equal(mask[0, 0], expected)
+
+    def test_decode_keeps_prefix_through_write_index(self):
+        """Single decode token at slot N attends to slots 0..N, masks the rest."""
+        mask = _run_static_cache_mask(max_seq=8, query_len=1, write_index=3)
+        expected = np.array([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=bool)
+        np.testing.assert_array_equal(mask[0, 0], expected)
+
+    def test_chunked_prefill_offset_write_index(self):
+        """Second prefill chunk (write_index=2, S_q=3) stays causal at absolute pos."""
+        mask = _run_static_cache_mask(max_seq=8, query_len=3, write_index=2)
+        expected = np.array(
+            [
+                [1, 1, 1, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1, 0, 0, 0],
+            ],
+            dtype=bool,
+        )
+        np.testing.assert_array_equal(mask[0, 0], expected)

@@ -4437,7 +4437,13 @@ class TestBuildStaticCacheGraph:
         assert len(proto.SerializeToString()) > 0
 
     def test_static_cache_attention_is_causal(self):
-        """Verify Attention ops use is_causal=1 in static cache mode."""
+        """Verify Attention ops use is_causal=0 in static cache mode.
+
+        The opset-24 Attention CUDA kernel rejects is_causal=1 together
+        with nonpad_kv_seqlen when S_q != total_kv with no past_key (always
+        true for a pre-allocated cache).  The static path therefore uses
+        is_causal=0 plus an explicit causal mask.
+        """
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
@@ -4448,24 +4454,50 @@ class TestBuildStaticCacheGraph:
             assert is_causal is not None, (
                 f"Attention node {node.name} missing is_causal attribute"
             )
-            assert is_causal.as_int() == 1, (
-                f"Attention node {node.name} should have is_causal=1"
+            assert is_causal.as_int() == 0, (
+                f"Attention node {node.name} should have is_causal=0 "
+                f"(causality is supplied via an explicit attn_mask)"
             )
 
-    def test_static_cache_attention_no_attn_mask_input(self):
-        """Verify Attention ops do NOT receive attn_mask in static cache mode."""
+    def test_static_cache_attention_has_causal_mask_input(self):
+        """Verify Attention ops receive an explicit causal attn_mask.
+
+        With is_causal=0, causality must come from input 3 (attn_mask).
+        The mask is produced by create_static_cache_causal_mask, whose
+        final op is a GreaterOrEqual yielding a bool mask.
+        """
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
 
         for node in attention_nodes:
-            # Input 3 (0-indexed) is attn_mask — should be empty/None
+            # Input 3 (0-indexed) is attn_mask — should be a real value now.
             attn_mask_input = node.inputs[3]
-            assert attn_mask_input is None or attn_mask_input.name == "", (
-                f"Attention node {node.name} should not have attn_mask "
-                f"connected, but got input: {attn_mask_input}"
+            assert attn_mask_input is not None and attn_mask_input.name != "", (
+                f"Attention node {node.name} should have an explicit causal "
+                f"attn_mask connected, but got: {attn_mask_input}"
             )
+            producer = attn_mask_input.producer()
+            assert producer is not None and producer.op_type == "GreaterOrEqual", (
+                f"Attention node {node.name} attn_mask should be produced by "
+                f"the causal-mask GreaterOrEqual, got "
+                f"{None if producer is None else producer.op_type}"
+            )
+
+    def test_static_cache_has_no_tensorscatter_left_unmasked(self):
+        """Static cache graph must contain the causal-mask construction ops.
+
+        Guards against regressing back to the is_causal=1 / no-mask form
+        that ORT rejects: the graph must build per-step query positions
+        (Range + Add) feeding a GreaterOrEqual mask.
+        """
+        model, _ = self._build_static_cache_model()
+        op_types = [n.op_type for n in model.graph]
+        assert "Range" in op_types, "Causal mask should use Range for positions"
+        assert "GreaterOrEqual" in op_types, (
+            "Causal mask should compare query/key positions with GreaterOrEqual"
+        )
 
     def test_static_cache_moe_graph_builds(self):
         """Build a MoE model (qwen2_moe) with static cache."""

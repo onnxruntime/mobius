@@ -321,3 +321,83 @@ def create_sliding_window_mask(
     # Combine with padding mask
     padding_mask = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
     return op.And(within_window, padding_mask)
+
+
+def create_static_cache_causal_mask(
+    op: OpBuilder,
+    query: ir.Value,
+    key_cache: ir.Value,
+    write_indices: ir.Value,
+):
+    """Build a causal attention mask for the static (TensorScatter) KV cache.
+
+    The opset-24 ONNX ``Attention`` CUDA kernel rejects ``is_causal=1``
+    together with ``nonpad_kv_seqlen`` whenever the query length differs
+    from the total KV length and there is no ``past_key`` (see
+    ``onnxruntime/core/providers/cuda/llm/attention.cc`` — the
+    ``causal_cross_no_past`` guard).  In the static cache the KV buffers
+    are pre-allocated to ``max_seq_len``, so ``S_q != total_kv`` in **both**
+    prefill and decode.  The fix, per ORT's own guidance, is to drive the
+    Attention op with ``is_causal=0`` and supply an explicit causal mask.
+
+    A query token at position ``t`` within this step writes into cache slot
+    ``write_indices[b] + t`` (``write_indices[b]`` is the number of valid
+    cache tokens *before* this step).  Causality means it may attend to
+    every cache slot ``j`` with ``j <= write_indices[b] + t``.  This single
+    rule serves both phases:
+
+    * **Prefill** (``write_indices=0``, ``S_q=N``): triangular causal mask
+      ``j <= t``.
+    * **Decode** (``write_indices=N``, ``S_q=1``): keep slots ``j <= N``,
+      i.e. all previously written tokens plus the just-written one.
+
+    Because padding slots ``j >= nonpad_kv_seqlen[b]`` are always greater
+    than ``write_indices[b] + t``, they are masked out too, so the mask is
+    consistent with the ``nonpad_kv_seqlen`` bounds (which are still passed
+    to the Attention op to select the external-cache kernel path).
+
+    The mask is 4D ``[batch, 1, S_q, max_seq]`` rather than 3D on purpose:
+    ``ConvertAttnMaskToBias`` (attention.cc) treats a 3D mask as
+    ``[heads, q, kv]`` and broadcasts over the batch dimension, which would
+    be incorrect because ``write_indices`` is per-batch.  A 4D mask with a
+    leading batch dim is honored per-batch (and ``dim1 == 1`` broadcasts
+    over heads).
+
+    Args:
+        op: The OpBuilder.
+        query: Query tensor ``[batch, S_q, hidden]``; only dims 0/1 are
+            read to derive the query sequence length ``S_q``.
+        key_cache: Pre-allocated key cache ``[batch, max_seq, kv_hidden]``;
+            dim 1 supplies the total KV length ``max_seq``.
+        write_indices: Per-batch write start position ``[batch]`` INT64 —
+            the number of valid cache tokens before this step.
+
+    Returns:
+        Bool mask ``[batch, 1, S_q, max_seq]``. ``True`` = attend,
+        ``False`` = mask out.
+    """
+    zero = op.Constant(value_int=0)
+    one = op.Constant(value_int=1)
+
+    # Scalar S_q (query length) and total KV length (max_seq) for Range.
+    q_len = op.Squeeze(op.Shape(query, start=1, end=2), op.Constant(value_ints=[0]))
+    total_kv = op.Squeeze(
+        op.Shape(key_cache, start=1, end=2), op.Constant(value_ints=[0])
+    )
+
+    # Per-step query offsets 0..S_q-1 and key slot indices 0..max_seq-1.
+    q_offsets = op.Range(zero, q_len, one)  # [S_q] int64
+    key_positions = op.Range(zero, total_kv, one)  # [max_seq] int64
+
+    # Absolute query positions: write_indices[b] + t  →  [batch, S_q].
+    query_positions = op.Add(
+        op.Unsqueeze(write_indices, [1]),  # [batch, 1]
+        op.Unsqueeze(q_offsets, [0]),  # [1, S_q]
+    )
+
+    # Reshape for broadcasting to [batch, 1, S_q, max_seq].
+    query_positions = op.Unsqueeze(query_positions, [1, 3])  # [batch, 1, S_q, 1]
+    key_positions = op.Unsqueeze(key_positions, [0, 1, 2])  # [1, 1, 1, max_seq]
+
+    # Keep key slot j for query at position p iff j <= p (causal + padding).
+    return op.GreaterOrEqual(query_positions, key_positions)
