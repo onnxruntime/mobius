@@ -11,14 +11,27 @@ length and there is no ``past_key`` (the ``causal_cross_no_past`` guard in
 cache is pre-allocated to ``max_seq_len``, that guard fires in **both**
 prefill (``S_q = N``) and decode (``S_q = 1``), raising ``NOT_IMPLEMENTED``.
 
+Three CUDA regression tests here guard against (a) the original
+``is_causal=1`` ``NOT_IMPLEMENTED`` regression and (b) a mask wired onto the
+decode branch that would silently push decode off Flash:
+
+* :func:`test_static_cache_prefill_and_decode_run_on_cuda` (fp32) — both
+  phases run without ``NOT_IMPLEMENTED``.
+* :func:`test_static_cache_decode_runs_maskless_on_cuda` (fp16) — the
+  executed decode ``Attention`` carries no ``attn_mask`` input (the
+  structural Flash-eligibility precondition), robust to log-format changes.
+* :func:`test_static_cache_decode_selects_flash_kernel_on_cuda` (fp16) — the
+  direct proof: ORT's VERBOSE kernel-selection log shows decode on **Flash**
+  and prefill on **Memory-Efficient**.
+
 The fix sets ``is_causal=0`` and phase-splits the attention behind an ``If``
 keyed on ``Shape(query)[1] > 1``: the multi-token (prefill) branch supplies an
 explicit causal mask (:func:`mobius.components._common.create_static_cache_causal_mask`,
 memory-efficient path), while the single-token decode branch omits the mask so
 ORT keeps it on Flash/XQA — the same kernel the GQA variant uses, so the
-profiling comparison stays apples-to-apples.  This test exercises the actual
+profiling comparison stays apples-to-apples.  These tests exercise the actual
 ONNX Runtime kernel for both phases so the regression cannot silently come
-back.  It requires the CUDA Execution Provider because ``TensorScatter`` and
+back.  They require the CUDA Execution Provider because ``TensorScatter`` and
 the external-cache ``Attention`` path are CUDA-only.
 
 The runnability test (:func:`test_static_cache_prefill_and_decode_run_on_cuda`)
@@ -36,8 +49,11 @@ optional ``onnxruntime-easy`` dependency.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
+import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -315,4 +331,128 @@ def test_static_cache_decode_runs_maskless_on_cuda():
     )
     assert all(e["has_mask"] for e in prefill_events), (
         "prefill-branch Attention must carry the explicit causal mask"
+    )
+
+
+# Matches the opset-24 LLM Attention kernel-selection log line emitted at
+# VERBOSE by onnxruntime/core/providers/cuda/llm/attention.cc, e.g.
+#   "ONNX Attention: using Flash Attention (batch=1, q_seq=1, total_seq=16, ...)"
+#   "ONNX Attention: using Memory Efficient Attention (batch=1, q_seq=4, ...)"
+_ATTENTION_KERNEL_LINE = re.compile(
+    r"ONNX Attention: using (?P<kernel>.+?) \(batch=\d+, q_seq=(?P<q_seq>\d+)"
+)
+
+
+@contextlib.contextmanager
+def _capture_attention_kernel_log():
+    """Capture ORT's per-op attention kernel-selection log lines.
+
+    The opset-24 LLM ``Attention`` CUDA kernel logs which kernel it selected
+    (Flash / Memory-Efficient / unfused) at VERBOSE through the *default*
+    (process-global) logger, written to the C++ ``stderr`` (fd 2).  ORT's
+    Python profiler does not surface this, so to read it we raise the default
+    logger severity to VERBOSE and redirect fd 2 around the run.  Callers must
+    read the yielded file *inside* the ``with`` block (it is closed on exit);
+    fd 2 and the logger severity are restored before exit so assertions made
+    after the block still report normally.
+    """
+    ort.set_default_logger_severity(0)
+    saved_stderr_fd = os.dup(2)
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as capture_file:
+            os.dup2(capture_file.fileno(), 2)
+            try:
+                yield capture_file
+            finally:
+                capture_file.flush()
+                os.dup2(saved_stderr_fd, 2)
+    finally:
+        os.close(saved_stderr_fd)
+        ort.set_default_logger_severity(2)  # back to ORT's default (WARNING)
+
+
+def _selected_attention_kernels(capture_file) -> list[tuple[str, int]]:
+    """Parse ``(kernel_name, q_seq)`` pairs from a captured verbose log."""
+    capture_file.seek(0)
+    text = capture_file.read().decode("utf-8", "replace")
+    kernels: list[tuple[str, int]] = []
+    for line in text.splitlines():
+        match = _ATTENTION_KERNEL_LINE.search(line)
+        if match is not None:
+            kernels.append((match.group("kernel").strip(), int(match.group("q_seq"))))
+    return kernels
+
+
+def test_static_cache_decode_selects_flash_kernel_on_cuda():
+    """Decode actually selects Flash; prefill selects Memory-Efficient.
+
+    Structural maskless-ness (the test above) is necessary, but the *proof*
+    that the phase split achieves its purpose is the kernel ORT actually runs.
+    The opset-24 LLM Attention kernel logs its choice at VERBOSE; this test
+    captures that log and asserts the single-token decode runs **Flash**
+    (the same external-cache kernel the GQA variant uses, so the decode-
+    latency comparison is apples-to-apples) while the multi-token prefill
+    runs **Memory-Efficient** (mask present, the cheap amortized path).
+
+    This is the regression guard the reviewers required: a change that wired
+    the causal mask onto the decode branch would flip its kernel from Flash
+    to Memory-Efficient and fail here, even though finiteness / scatter / If-
+    count assertions would all still pass.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session, config = _build_static_cache_session(
+            tmp_dir, ir_dtype=ir.DataType.FLOAT16
+        )
+        num_layers = config.num_hidden_layers
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        vocab = config.vocab_size
+        output_names = [out.name for out in session.get_outputs()]
+        rng = np.random.default_rng(3)
+
+        decode_feeds: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(1, 1), dtype=np.int64),
+            "position_ids": np.array([[4]], dtype=np.int64),
+            "write_indices": np.array([4], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([5], dtype=np.int64),
+        }
+        decode_feeds.update(_empty_caches(num_layers, kv_hidden, np.float16))
+
+        prefill_len = 4
+        prefill_feeds: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(
+                0, vocab, size=(1, prefill_len), dtype=np.int64
+            ),
+            "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
+            "write_indices": np.array([0], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
+        }
+        prefill_feeds.update(_empty_caches(num_layers, kv_hidden, np.float16))
+
+        with _capture_attention_kernel_log() as capture_file:
+            session.run(output_names, decode_feeds)
+            session.run(output_names, prefill_feeds)
+            kernels = _selected_attention_kernels(capture_file)
+
+    # The kernel log distinguishes phases by query length (q_seq).
+    decode_kernels = [name for name, q_seq in kernels if q_seq == 1]
+    prefill_kernels = [name for name, q_seq in kernels if q_seq == prefill_len]
+
+    assert len(decode_kernels) == num_layers, (
+        f"expected {num_layers} decode (q_seq=1) Attention kernel-selection "
+        f"log lines, got {len(decode_kernels)} (all parsed: {kernels}). If "
+        f"empty, ORT's verbose attention-kernel log format may have changed."
+    )
+    assert all("Flash" in name for name in decode_kernels), (
+        f"decode MUST select Flash Attention to stay apples-to-apples with "
+        f"GQA's decode kernel; got {decode_kernels}. A mask on the decode "
+        f"branch flips this to Memory-Efficient."
+    )
+
+    assert len(prefill_kernels) == num_layers, (
+        f"expected {num_layers} prefill (q_seq={prefill_len}) kernel-selection "
+        f"log lines, got {len(prefill_kernels)} (all parsed: {kernels})"
+    )
+    assert all("Memory Efficient" in name for name in prefill_kernels), (
+        f"prefill should select Memory-Efficient Attention (causal mask "
+        f"present); got {prefill_kernels}"
     )
