@@ -114,13 +114,54 @@ def _register_kv_cache_outputs(
     present_key_values: list[tuple[ir.Value, ir.Value]],
     *,
     prefix: str = "present",
+    batch: ir.SymbolicDim | str | None = None,
+    num_kv_heads: int | None = None,
+    key_head_dim: int | None = None,
+    value_head_dim: int | None = None,
+    total_seq_len: ir.SymbolicDim | str | int | None = None,
+    dtype: ir.DataType | None = None,
 ) -> None:
     """Name and register KV cache outputs on the graph.
 
-    Output shapes and dtypes are inferred by the shape inference pass
-    that runs during model optimization.
+    When every present-shape parameter (``batch``, ``num_kv_heads``,
+    ``key_head_dim``, ``value_head_dim``, ``total_seq_len``, ``dtype``) is
+    supplied, each ``present.{i}.{key,value}`` output is stamped with an
+    explicit ``[batch, num_kv_heads, total_seq_len, head_dim]`` type, symmetric
+    to the ``past_key_values`` inputs created by :func:`_make_kv_cache_inputs`.
+
+    This explicit stamp is required for ``com.microsoft::GroupQueryAttention``
+    exports: that contrib op's shape inference mis-derives the present
+    ``head_dim`` (it divides the *packed* QKV query hidden by
+    ``num_heads + 2 * kv_num_heads`` and lands on the wrong value), so the
+    ``present.*`` outputs would otherwise declare the wrong ``head_dim`` even
+    though the kernel produces correct data at runtime. The mismatch makes ORT
+    log a shape-merge warning and breaks present->past chaining in consumers
+    such as onnxruntime-genai that trust the declared shapes. The plain ONNX
+    ``Attention`` op infers the present shape correctly, so the stamp is a
+    no-op there.
+
+    When the parameters are omitted, output shapes/dtypes are left to the
+    shape inference pass that runs during model optimization.
     """
+    stamp = all(
+        param is not None
+        for param in (
+            batch,
+            num_kv_heads,
+            key_head_dim,
+            value_head_dim,
+            total_seq_len,
+            dtype,
+        )
+    )
     for i, (present_key, present_value) in enumerate(present_key_values):
+        if stamp:
+            present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])
+            present_key.type = ir.TensorType(dtype)
+            present_value.shape = ir.Shape(
+                [batch, num_kv_heads, total_seq_len, value_head_dim]
+            )
+            present_value.type = ir.TensorType(dtype)
         builder.add_output(present_key, f"{prefix}.{i}.key")
         builder.add_output(present_value, f"{prefix}.{i}.value")
 
