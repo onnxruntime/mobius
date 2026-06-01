@@ -1175,28 +1175,26 @@ class Gemma4DecoderLayer(nn.Module):
             # Norm residual before experts
             normed_flat = self.pre_feedforward_layernorm_2(op, residual_flat)  # [B*S, H]
 
-            caps = ep_capabilities()
-            if caps.supports_fused_moe:
-                # Fused MoE op: handles top-k selection + expert dispatch internally.
-                # NOTE: per_expert_scale is NOT applied in fused path (ORT op limitation).
-                # CastLike restores dtype after op.MoE (custom op, type=None on output)
-                # so downstream ops can correctly infer types and share scalar initializers.
-                # Using CastLike(target=normed_flat) preserves bf16/fp16/fp32 from the input.
-                moe_out_flat = op.CastLike(
-                    op.MoE(  # type: ignore[attr-defined]
-                        normed_flat,
-                        router_probs,
-                        self.fc1_experts_weights,
-                        self.fc2_experts_weights,
-                        activation_type="silu",
-                        k=self._top_k,
-                        normalize_routing_weights=1,
-                        _domain="com.microsoft",
-                    ),
-                    normed_flat,  # match input dtype (bf16/fp16/fp32)
-                )  # [B*S, H]
-            else:
-                moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
+            # NOTE: We intentionally do NOT use the fused com.microsoft::MoE
+            # op here, even when ``ep_capabilities().supports_fused_moe`` is
+            # True. The ORT MoE kernel for ``activation_type="swiglu"`` is
+            # hardcoded for GPT-OSS-style SwiGLU:
+            #   * CUDA kernel (ft_moe/moe_kernel.cu) hardcodes
+            #     ``alpha=1.702, limit=7.0`` and an interleaved gate/up
+            #     layout — neither matches Gemma 4's standard SwiGLU
+            #     (alpha=1.0, no limit, concatenated layout).
+            #   * CPU kernel (moe_cpu.cc) refuses to load unless
+            #     ``swiglu_fusion=1`` (interleaved).
+            # ``activation_type="silu"`` would also be wrong because
+            # ``fc1_experts_weights`` packs gate+up along dim 1
+            # ([E, 2*inter, hidden]), causing a shape mismatch against
+            # the kernel's expected ``[E, inter, hidden]`` for silu.
+            #
+            # Until ORT exposes a Gemma-4-compatible SwiGLU mode (standard
+            # alpha=1.0, concatenated layout) we always take the static
+            # unroll fallback. See microsoft/onnxruntime-genai#2062 for
+            # the upstream report.
+            moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
 
             moe_out = op.Reshape(moe_out_flat, op.Shape(residual))  # [B, S, H]
             moe_out = self.post_feedforward_layernorm_2(op, moe_out)
@@ -1248,7 +1246,7 @@ class Gemma4DecoderLayer(nn.Module):
         """
         # Top-K selection: top_weights/top_indices both [T, K]
         top_weights_raw, top_indices = op.TopK(
-            router_probs, op.Constant(value_ints=[self._top_k]), axis=-1
+            router_probs, op.Constant(value_ints=[self._top_k]), axis=-1, _outputs=2
         )
         # Arithmetic normalisation: weights sum to 1 (matches HF: top_k_weights /= top_k_weights.sum(-1, keepdim=True))
         top_weights = op.Div(
