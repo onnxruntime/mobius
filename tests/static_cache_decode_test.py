@@ -11,11 +11,15 @@ length and there is no ``past_key`` (the ``causal_cross_no_past`` guard in
 cache is pre-allocated to ``max_seq_len``, that guard fires in **both**
 prefill (``S_q = N``) and decode (``S_q = 1``), raising ``NOT_IMPLEMENTED``.
 
-The fix sets ``is_causal=0`` and supplies an explicit causal mask
-(:func:`mobius.components._common.create_static_cache_causal_mask`).  This test
-exercises the actual ONNX Runtime kernel for both phases so the regression
-cannot silently come back.  It requires the CUDA Execution Provider because
-``TensorScatter`` and the external-cache ``Attention`` path are CUDA-only.
+The fix sets ``is_causal=0`` and phase-splits the attention behind an ``If``
+keyed on ``Shape(query)[1] > 1``: the multi-token (prefill) branch supplies an
+explicit causal mask (:func:`mobius.components._common.create_static_cache_causal_mask`,
+memory-efficient path), while the single-token decode branch omits the mask so
+ORT keeps it on Flash/XQA — the same kernel the GQA variant uses, so the
+profiling comparison stays apples-to-apples.  This test exercises the actual
+ONNX Runtime kernel for both phases so the regression cannot silently come
+back.  It requires the CUDA Execution Provider because ``TensorScatter`` and
+the external-cache ``Attention`` path are CUDA-only.
 
 The model is built fp32: the ``is_causal`` guard fires in ORT *before* kernel
 dtype dispatch, so fp32 exercises the same external-cache code path as a
@@ -36,6 +40,7 @@ import onnxruntime as ort
 import pytest
 from _test_configs import _base_config
 
+from mobius._builder import build_from_module
 from mobius._registry import registry
 from mobius.tasks import CausalLMTask
 
@@ -72,11 +77,20 @@ def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
 def _build_static_cache_session(
     tmp_dir: str,
 ) -> tuple[ort.InferenceSession, object]:
-    """Build a tiny static-cache qwen2 graph and load it on CUDA."""
+    """Build a tiny static-cache qwen2 graph and load it on CUDA.
+
+    Uses the full ``build_from_module`` export path (not bare ``task.build``)
+    so the phase-split ``If`` subgraphs are exercised through the real
+    ``optimize_model`` pipeline — that is where a structural regression in
+    the static-cache attention would surface.
+    """
     config = _base_config()
     module = registry.get(_MODEL_TYPE)(config)
     task = CausalLMTask(static_cache=True, max_seq_len=_MAX_SEQ_LEN)
-    model = task.build(module, config)["model"]
+    package = build_from_module(
+        module, config, task=task, execution_provider="default"
+    )
+    model = package["model"]
     _fill_random_weights(model, np.random.default_rng(0))
 
     model_path = str(Path(tmp_dir) / "model.onnx")

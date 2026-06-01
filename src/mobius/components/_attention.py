@@ -7,12 +7,114 @@ import math
 from typing import NamedTuple
 
 import onnx_ir as ir
-from onnxscript import OpBuilder, nn
+from onnxscript import GraphBuilder, OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._constants import OPSET_VERSION
 from mobius.components._common import Linear, create_static_cache_causal_mask
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
+from mobius.components._scan_utils import rename_subgraph_values
+
+
+def _attend_over_static_cache(
+    op: OpBuilder,
+    query: ir.Value,
+    key_cache: ir.Value,
+    value_cache: ir.Value,
+    write_indices: ir.Value,
+    nonpad_kv_seqlen: ir.Value,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    scale: float | None,
+    softcap: float | None,
+) -> ir.Value:
+    """Attend over the static KV cache, phase-split for decode kernel fidelity.
+
+    The opset-24 ONNX ``Attention`` CUDA kernel rejects ``is_causal=1``
+    together with ``nonpad_kv_seqlen`` when ``S_q != total_kv`` with no
+    ``past_key`` (the ``causal_cross_no_past`` guard in ``attention.cc``).
+    With a pre-allocated ``[B, max_seq, ...]`` cache that condition holds in
+    both prefill and decode, so ``is_causal=0`` must be used.
+
+    Both phases run with ``is_causal=0`` and keep ``nonpad_kv_seqlen`` (which
+    selects the external-cache / TensorScatter kernel path).  The phases
+    differ in whether an explicit ``attn_mask`` is supplied, because the
+    *presence* of ``attn_mask`` — regardless of its contents — disables Flash
+    Attention in ORT (``attn_mask != nullptr`` routes to the memory-efficient
+    or unfused path; see the kernel-selection cascade in ``attention.cc``):
+
+    * **Multi-token step** (``S_q > 1``: prefill or speculative/chunked decode):
+      needs intra-query causality, so it passes an explicit causal mask built
+      from ``write_indices`` (:func:`create_static_cache_causal_mask`) and
+      therefore runs on the memory-efficient path.  This is unavoidable — the
+      static buffer makes ``K_seq == total``, so Flash prefill is blocked by
+      the same guard regardless — and is the cheap, amortized path anyway.
+    * **Single-token decode** (``S_q == 1``): a lone query needs no
+      intra-query causal mask; ``nonpad_kv_seqlen`` alone bounds attention to
+      the valid prefix ``0..write_indices[b]``.  Omitting ``attn_mask`` keeps
+      this hot path on Flash / XQA — the kernel the GQA variant also uses,
+      so the comparison stays apples-to-apples.
+
+    The two phases are emitted as the branches of an ``If`` keyed on
+    ``Shape(query)[1] > 1`` so a single exported graph serves both, while
+    decode structurally omits the mask input.
+
+    Returns:
+        The attention output for the active phase, shape ``[B, S_q, hidden]``.
+    """
+    seq_len = op.Squeeze(
+        op.Shape(query, start=1, end=2), op.Constant(value_ints=[0])
+    )
+    is_multi_token_step = op.Greater(seq_len, op.Constant(value_int=1))
+
+    def _build_attention_branch(name: str, use_causal_mask: bool) -> ir.Graph:
+        branch = ir.Graph(
+            [], [], nodes=[], name=name, opset_imports={"": OPSET_VERSION}
+        )
+        branch_op = GraphBuilder(branch).op
+        attn_mask = (
+            create_static_cache_causal_mask(
+                branch_op, query, key_cache, write_indices
+            )
+            if use_causal_mask
+            else None
+        )
+        attn_output, _, _ = branch_op.Attention(
+            query,
+            key_cache,
+            value_cache,
+            attn_mask,
+            None,  # no past_key (full cache is already provided)
+            None,  # no past_value
+            nonpad_kv_seqlen,
+            q_num_heads=num_attention_heads,
+            kv_num_heads=num_key_value_heads,
+            scale=scale,
+            softcap=softcap,
+            is_causal=0,
+            _outputs=3,
+        )
+        # Prefix internal node/value names so the two branches stay in SSA
+        # form when merged under the parent graph, then pin the branch
+        # output name (the If wires branches by output position).
+        rename_subgraph_values(branch, f"{name}_")
+        attn_output.name = f"{name}_attn_output"
+        branch.outputs.append(attn_output)
+        return branch
+
+    prefill_branch = _build_attention_branch(
+        "static_cache_prefill", use_causal_mask=True
+    )
+    decode_branch = _build_attention_branch(
+        "static_cache_decode", use_causal_mask=False
+    )
+    return op.If(
+        is_multi_token_step,
+        then_branch=prefill_branch,
+        else_branch=decode_branch,
+        _outputs=1,
+    )
 
 
 class GQAContext(NamedTuple):
@@ -100,18 +202,22 @@ def _apply_attention(
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen`` with
-        ``is_causal=0`` plus an explicit causal mask derived from
-        ``write_indices`` (see :func:`create_static_cache_causal_mask`).
-        ``is_causal=1`` cannot be used here: the opset-24 Attention kernel
-        rejects it together with ``nonpad_kv_seqlen`` when ``S_q`` differs
-        from the (pre-allocated) cache length, which is always the case.
+        ``is_causal=0``.  Causality is phase-split (see
+        :func:`_attend_over_static_cache`): multi-token steps (``S_q > 1``)
+        use an explicit causal mask derived from ``write_indices`` (memory-
+        efficient path), while single-token decode (``S_q == 1``) omits the
+        mask to stay on Flash/XQA.  ``is_causal=1`` cannot be used here: the
+        opset-24 Attention kernel rejects it together with
+        ``nonpad_kv_seqlen`` when ``S_q`` differs from the (pre-allocated)
+        cache length, which is always the case.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
     Note:
         The dynamic path sets ``is_causal=1`` so callers only provide a
         bool padding mask.  The static path instead uses ``is_causal=0``
-        with a full causal+padding mask because the external-cache kernel
-        does not accept ``is_causal=1`` alongside ``nonpad_kv_seqlen``.
+        because the external-cache kernel does not accept ``is_causal=1``
+        alongside ``nonpad_kv_seqlen``; causality is supplied per phase via
+        an explicit mask (prefill) or ``nonpad_kv_seqlen`` alone (decode).
 
     Note:
         ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
@@ -143,25 +249,13 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache with is_causal=0 plus an explicit
-        # causal mask.  The opset-24 Attention CUDA kernel rejects
-        # is_causal=1 together with nonpad_kv_seqlen when S_q != total_kv
-        # and there is no past_key (the causal_cross_no_past guard in
-        # attention.cc).  With a pre-allocated [B, max_seq, ...] cache the
-        # query length never equals the total cache length, so that guard
-        # fires in BOTH prefill and decode.  Per ORT's own guidance we set
-        # is_causal=0 and pass an explicit causal mask built from
-        # write_indices: a query token at offset t attends to cache slots
-        # j <= write_indices[b] + t.  This single rule serves prefill
-        # (write_indices=0 -> triangular) and decode (write_indices=N,
-        # S_q=1 -> keep slots 0..N), and subsumes padding so it stays
-        # consistent with nonpad_kv_seqlen.
-        #
-        # nonpad_kv_seqlen is still passed: it selects the external-cache
-        # (TensorScatter) kernel path.  When both nonpad_kv_seqlen and an
-        # attn_mask are present, ORT skips Flash and routes to the
-        # memory-efficient / unfused path, which converts the bool mask to
-        # an additive bias (attention.cc ConvertAttnMaskToBias).
+        # Attend over the full cache.  Both phases use is_causal=0 (the
+        # opset-24 Attention kernel rejects is_causal=1 + nonpad_kv_seqlen
+        # for a pre-allocated cache) and keep nonpad_kv_seqlen to select the
+        # external-cache kernel path.  Causality is enforced per-phase: the
+        # multi-token branch supplies an explicit causal mask (MEA path),
+        # while single-token decode omits the mask to stay on Flash/XQA.
+        # See _attend_over_static_cache for the full rationale.
         #
         # TODO(titaiwang): Support user-provided attn_mask in external
         # cache mode for advanced use cases (e.g., prefix masking,
@@ -169,26 +263,17 @@ def _apply_attention(
         # TODO(titaiwang): Support sliding window (circular cache mode)
         # with static cache for long-context models that use local
         # attention windows.
-        static_causal_mask = create_static_cache_causal_mask(
+        attn_output = _attend_over_static_cache(
             op,
             query,
             updated_k,
-            static_cache.write_indices,
-        )
-        attn_output, _, _ = op.Attention(
-            query,
-            updated_k,
             updated_v,
-            static_causal_mask,  # explicit causal mask (is_causal=0)
-            None,  # no past_key (full cache is already provided)
-            None,  # no past_value
+            static_cache.write_indices,
             static_cache.nonpad_kv_seqlen,
-            q_num_heads=num_attention_heads,
-            kv_num_heads=num_key_value_heads,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
             scale=scale,
             softcap=softcap,
-            is_causal=0,
-            _outputs=3,
         )
         return attn_output, updated_k, updated_v
 

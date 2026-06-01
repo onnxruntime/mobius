@@ -4338,6 +4338,23 @@ class TestBuildStaticCacheGraph:
 
     MAX_SEQ_LEN = 128
 
+    @staticmethod
+    def _walk_nodes(graph):
+        """Yield every node in ``graph``, recursing into subgraphs (e.g. If).
+
+        The static-cache attention is emitted as an ``If`` whose branches
+        each contain an ``Attention`` op, so structural assertions must look
+        inside subgraph attributes rather than only the top-level graph.
+        """
+        for node in graph:
+            yield node
+            for attr in node.attributes.values():
+                if attr.type == ir.AttributeType.GRAPH and attr.value is not None:
+                    yield from TestBuildStaticCacheGraph._walk_nodes(attr.value)
+                elif attr.type == ir.AttributeType.GRAPHS:
+                    for subgraph in attr.value:
+                        yield from TestBuildStaticCacheGraph._walk_nodes(subgraph)
+
     def _build_static_cache_model(self, model_type: str = "qwen2", **config_overrides):
         """Build a model with CausalLMTask(static_cache=True) and return (model, config)."""
         from mobius.tasks import CausalLMTask
@@ -4413,12 +4430,20 @@ class TestBuildStaticCacheGraph:
         )
 
     def test_static_cache_has_tensorscatter_and_attention(self):
-        """Verify graph contains TensorScatter and Attention ops."""
+        """Verify graph contains TensorScatter and Attention ops.
+
+        TensorScatter lives at the top level (shared by both phases);
+        Attention lives inside the phase-split If branches, so the search
+        recurses into subgraphs.
+        """
         model, _ = self._build_static_cache_model()
 
-        op_types = {n.op_type for n in model.graph}
+        op_types = {n.op_type for n in self._walk_nodes(model.graph)}
         assert "TensorScatter" in op_types, "Static cache graph should use TensorScatter"
         assert "Attention" in op_types, "Static cache graph should use Attention"
+        assert "If" in op_types, (
+            "Static cache attention should be phase-split behind an If"
+        )
 
     def test_static_cache_has_initializers(self):
         """Verify the graph has model parameters."""
@@ -4437,17 +4462,21 @@ class TestBuildStaticCacheGraph:
         assert len(proto.SerializeToString()) > 0
 
     def test_static_cache_attention_is_causal(self):
-        """Verify Attention ops use is_causal=0 in static cache mode.
+        """Verify every Attention op uses is_causal=0 in static cache mode.
 
         The opset-24 Attention CUDA kernel rejects is_causal=1 together
         with nonpad_kv_seqlen when S_q != total_kv with no past_key (always
-        true for a pre-allocated cache).  The static path therefore uses
-        is_causal=0 plus an explicit causal mask.
+        true for a pre-allocated cache).  Both phase-split branches therefore
+        use is_causal=0; causality comes from an explicit mask (prefill) or
+        nonpad_kv_seqlen alone (decode).
         """
         model, config = self._build_static_cache_model()
 
-        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
-        assert len(attention_nodes) == config.num_hidden_layers
+        attention_nodes = [
+            n for n in self._walk_nodes(model.graph) if n.op_type == "Attention"
+        ]
+        # Two branches (prefill + decode) per layer.
+        assert len(attention_nodes) == 2 * config.num_hidden_layers
 
         for node in attention_nodes:
             is_causal = node.attributes.get("is_causal")
@@ -4456,47 +4485,71 @@ class TestBuildStaticCacheGraph:
             )
             assert is_causal.as_int() == 0, (
                 f"Attention node {node.name} should have is_causal=0 "
-                f"(causality is supplied via an explicit attn_mask)"
+                f"(causality is supplied via an explicit attn_mask or "
+                f"nonpad_kv_seqlen)"
             )
 
-    def test_static_cache_attention_has_causal_mask_input(self):
-        """Verify Attention ops receive an explicit causal attn_mask.
+    def test_static_cache_phase_split_mask_presence(self):
+        """Prefill branch carries an explicit causal mask; decode omits it.
 
-        With is_causal=0, causality must come from input 3 (attn_mask).
-        The mask is produced by create_static_cache_causal_mask, whose
-        final op is a GreaterOrEqual yielding a bool mask.
+        This is the Flash-eligibility invariant: ORT disables Flash whenever
+        attn_mask is present (by pointer, not content), so single-token
+        decode MUST structurally omit the mask to stay on Flash/XQA, while
+        multi-token prefill supplies a causal mask (memory-efficient path).
         """
         model, config = self._build_static_cache_model()
 
-        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
-        assert len(attention_nodes) == config.num_hidden_layers
-
+        attention_nodes = [
+            n for n in self._walk_nodes(model.graph) if n.op_type == "Attention"
+        ]
+        with_mask = []
+        without_mask = []
         for node in attention_nodes:
-            # Input 3 (0-indexed) is attn_mask — should be a real value now.
-            attn_mask_input = node.inputs[3]
-            assert attn_mask_input is not None and attn_mask_input.name != "", (
-                f"Attention node {node.name} should have an explicit causal "
-                f"attn_mask connected, but got: {attn_mask_input}"
-            )
-            producer = attn_mask_input.producer()
-            assert producer is not None and producer.op_type == "GreaterOrEqual", (
-                f"Attention node {node.name} attn_mask should be produced by "
-                f"the causal-mask GreaterOrEqual, got "
-                f"{None if producer is None else producer.op_type}"
-            )
+            attn_mask_input = node.inputs[3] if len(node.inputs) > 3 else None
+            if attn_mask_input is not None and attn_mask_input.name != "":
+                producer = attn_mask_input.producer()
+                assert producer is not None and producer.op_type == "GreaterOrEqual", (
+                    f"Masked Attention {node.name} attn_mask should come from "
+                    f"the causal-mask GreaterOrEqual, got "
+                    f"{None if producer is None else producer.op_type}"
+                )
+                with_mask.append(node)
+            else:
+                without_mask.append(node)
 
-    def test_static_cache_has_no_tensorscatter_left_unmasked(self):
-        """Static cache graph must contain the causal-mask construction ops.
+        # Exactly one masked (prefill) and one maskless (decode) per layer.
+        assert len(with_mask) == config.num_hidden_layers, (
+            f"Expected {config.num_hidden_layers} masked (prefill) Attention "
+            f"ops, got {len(with_mask)}"
+        )
+        assert len(without_mask) == config.num_hidden_layers, (
+            f"Expected {config.num_hidden_layers} maskless (decode) Attention "
+            f"ops for Flash eligibility, got {len(without_mask)}"
+        )
 
-        Guards against regressing back to the is_causal=1 / no-mask form
-        that ORT rejects: the graph must build per-step query positions
-        (Range + Add) feeding a GreaterOrEqual mask.
+    def test_static_cache_is_phase_split_behind_if(self):
+        """Static cache attention must be a per-layer If over masked/maskless.
+
+        Guards against regressing to (a) is_causal=1 (ORT-rejected) or
+        (b) a single always-masked Attention that would force decode off
+        Flash.  Expect one If per layer plus the causal-mask ops (Range +
+        GreaterOrEqual) used only in the prefill branch.
         """
-        model, _ = self._build_static_cache_model()
-        op_types = [n.op_type for n in model.graph]
-        assert "Range" in op_types, "Causal mask should use Range for positions"
-        assert "GreaterOrEqual" in op_types, (
-            "Causal mask should compare query/key positions with GreaterOrEqual"
+        model, config = self._build_static_cache_model()
+        op_counts: dict[str, int] = {}
+        for node in self._walk_nodes(model.graph):
+            op_counts[node.op_type] = op_counts.get(node.op_type, 0) + 1
+
+        assert op_counts.get("If", 0) == config.num_hidden_layers, (
+            "Each layer's static-cache attention should be phase-split via If"
+        )
+        # Causal mask (prefill branch only): one Range + GreaterOrEqual/layer.
+        assert op_counts.get("Range", 0) >= config.num_hidden_layers, (
+            "Prefill branch should build query positions with Range"
+        )
+        assert op_counts.get("GreaterOrEqual", 0) == config.num_hidden_layers, (
+            "Causal mask (GreaterOrEqual) should appear once per layer "
+            "(prefill branch only — decode is maskless)"
         )
 
     def test_static_cache_moe_graph_builds(self):
@@ -4518,8 +4571,9 @@ class TestBuildStaticCacheGraph:
         assert "position_ids" in input_names
         assert "attention_mask" not in input_names
 
-        # Verify TensorScatter and Attention ops are present
-        op_types = {n.op_type for n in model.graph}
+        # Verify TensorScatter (top level) and Attention (inside the
+        # phase-split If branches) ops are present.
+        op_types = {n.op_type for n in self._walk_nodes(model.graph)}
         assert "TensorScatter" in op_types
         assert "Attention" in op_types
 
