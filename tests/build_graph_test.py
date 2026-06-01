@@ -4490,42 +4490,67 @@ class TestBuildStaticCacheGraph:
             )
 
     def test_static_cache_phase_split_mask_presence(self):
-        """Prefill branch carries an explicit causal mask; decode omits it.
+        """Each layer is an If whose two branches differ in mask presence.
 
-        This is the Flash-eligibility invariant: ORT disables Flash whenever
-        attn_mask is present (by pointer, not content), so single-token
-        decode MUST structurally omit the mask to stay on Flash/XQA, while
-        multi-token prefill supplies a causal mask (memory-efficient path).
+        Fail-closed structural guard for the phase split.  It locates the
+        ``If`` nodes directly and inspects *both* subgraphs, so it cannot pass
+        vacuously: a regression to a single unconditional Attention (no If)
+        fails the If-count assertion, and an inverted or single-sided mask
+        fails the per-branch checks.
+
+        Invariant (If condition is ``Greater(Shape(query)[1], 1)``):
+        * ``then_branch`` (multi-token / prefill) Attention HAS an explicit
+          causal ``attn_mask`` produced by ``GreaterOrEqual`` → memory-
+          efficient path.
+        * ``else_branch`` (single-token / decode) Attention OMITS ``attn_mask``
+          (input[3] None/empty) → Flash-eligible (ORT disables Flash whenever
+          attn_mask is present, by pointer not content).
         """
         model, config = self._build_static_cache_model()
 
-        attention_nodes = [
-            n for n in self._walk_nodes(model.graph) if n.op_type == "Attention"
-        ]
-        with_mask = []
-        without_mask = []
-        for node in attention_nodes:
-            attn_mask_input = node.inputs[3] if len(node.inputs) > 3 else None
-            if attn_mask_input is not None and attn_mask_input.name != "":
-                producer = attn_mask_input.producer()
-                assert producer is not None and producer.op_type == "GreaterOrEqual", (
-                    f"Masked Attention {node.name} attn_mask should come from "
-                    f"the causal-mask GreaterOrEqual, got "
-                    f"{None if producer is None else producer.op_type}"
-                )
-                with_mask.append(node)
-            else:
-                without_mask.append(node)
+        if_nodes = [n for n in self._walk_nodes(model.graph) if n.op_type == "If"]
+        # (a) Fail-closed: the phase-split If must exist, one per layer.
+        assert len(if_nodes) == config.num_hidden_layers, (
+            f"static-cache attention must phase-split via If "
+            f"(expected {config.num_hidden_layers}, got {len(if_nodes)}); a "
+            f"single unconditional-mask Attention would force decode off Flash"
+        )
 
-        # Exactly one masked (prefill) and one maskless (decode) per layer.
-        assert len(with_mask) == config.num_hidden_layers, (
-            f"Expected {config.num_hidden_layers} masked (prefill) Attention "
-            f"ops, got {len(with_mask)}"
+        for if_node in if_nodes:
+            then_branch = if_node.attributes["then_branch"].value
+            else_branch = if_node.attributes["else_branch"].value
+            then_attn = self._single_attention(then_branch)
+            else_attn = self._single_attention(else_branch)
+
+            # (b) then-branch (prefill) MUST carry the GreaterOrEqual mask.
+            then_mask = then_attn.inputs[3] if len(then_attn.inputs) > 3 else None
+            assert then_mask is not None and then_mask.name != "", (
+                "prefill (then) branch Attention must carry an attn_mask"
+            )
+            producer = then_mask.producer()
+            assert producer is not None and producer.op_type == "GreaterOrEqual", (
+                f"prefill attn_mask should come from the causal-mask "
+                f"GreaterOrEqual, got "
+                f"{None if producer is None else producer.op_type}"
+            )
+
+            # (b) else-branch (decode) MUST omit the mask to stay Flash-eligible.
+            else_mask = else_attn.inputs[3] if len(else_attn.inputs) > 3 else None
+            assert else_mask is None or else_mask.name == "", (
+                "decode (else) branch Attention must OMIT attn_mask so ORT "
+                "keeps it on Flash; a mask here forces the slower memory-"
+                "efficient path"
+            )
+
+    @staticmethod
+    def _single_attention(graph):
+        """Return the sole ``Attention`` node in an If branch subgraph."""
+        attention_nodes = [n for n in graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == 1, (
+            f"expected exactly one Attention per If branch, "
+            f"got {len(attention_nodes)}"
         )
-        assert len(without_mask) == config.num_hidden_layers, (
-            f"Expected {config.num_hidden_layers} maskless (decode) Attention "
-            f"ops for Flash eligibility, got {len(without_mask)}"
-        )
+        return attention_nodes[0]
 
     def test_static_cache_is_phase_split_behind_if(self):
         """Static cache attention must be a per-layer If over masked/maskless.
