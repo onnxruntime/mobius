@@ -125,7 +125,12 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             if packed_name in model.graph.initializers:
                 existing_val = model.graph.initializers[packed_name]
                 out_val.replace_all_uses_with(existing_val, replace_graph_outputs=True)
-                model.graph.remove(node)
+                # safe=True detaches the node from its inputs before removal so
+                # the folded q/k/v initializers' use lists are cleared. Otherwise
+                # `inp.uses()` still points at the removed Concat and the dead
+                # pre-pack weights survive RemoveUnusedNodesPass (~1.8 GB of
+                # orphaned weights serialized into the fp16 GQA model).
+                model.graph.remove(node, safe=True)
                 folded_count += 1
                 modified = True
 
@@ -166,7 +171,10 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             model.graph.initializers[new_val.name] = new_val
 
             out_val.replace_all_uses_with(new_val, replace_graph_outputs=True)
-            model.graph.remove(node)
+            # safe=True detaches the node from its inputs before removal so the
+            # folded q/k/v initializers' use lists are cleared; otherwise the
+            # dead pre-pack weights survive RemoveUnusedNodesPass.
+            model.graph.remove(node, safe=True)
             folded_count += 1
             modified = True
 

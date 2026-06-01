@@ -124,6 +124,51 @@ class TestFoldConcatInitializersPass:
         result = FoldConcatInitializersPass()(model)
         assert not result.modified
 
+    def test_folded_inputs_detached_so_dce_strips_dead_weights(self):
+        """After folding, the source initializers must be detached and DCE-able.
+
+        FoldConcat removes the Concat node; if it does not detach the node from
+        its inputs (``safe=True``), the source q/k/v initializers keep a stale
+        use pointing at the removed node, so RemoveUnusedNodesPass cannot strip
+        them. For fp16 GQA that leaves ~1.8 GB of dead pre-pack weights in the
+        exported model.
+        """
+        from onnx_ir.passes import common as common_passes
+
+        a = np.ones((4, 8), dtype=np.float16)
+        b = np.ones((4, 8), dtype=np.float16) * 2
+        model, init_vals = _make_concat_model([a, b], axis=0)
+        # The Concat output is the only graph output; route it through a MatMul
+        # so the packed initializer stays live while the sources become dead.
+        packed_out = model.graph.outputs[0]
+        hidden = ir.Value(
+            name="hidden",
+            shape=ir.Shape(["N", 8]),
+            type=ir.TensorType(ir.DataType.FLOAT16),
+        )
+        matmul = ir.Node("", "MatMul", inputs=[hidden, packed_out], num_outputs=1)
+        mm_out = matmul.outputs[0]
+        mm_out.shape = ir.Shape(["N", 8])
+        mm_out.dtype = ir.DataType.FLOAT16
+        model.graph.append(matmul)
+        model.graph.inputs.append(hidden)
+        model.graph.outputs[0] = mm_out
+
+        FoldConcatInitializersPass()(model)
+
+        # Sources must be detached (zero uses) so DCE can remove them.
+        for v in init_vals:
+            assert len(list(v.uses())) == 0, (
+                f"{v.name} still has uses after fold — node not detached"
+            )
+
+        common_passes.RemoveUnusedNodesPass()(model)
+        remaining = set(model.graph.initializers)
+        assert "init_0" not in remaining and "init_1" not in remaining, (
+            f"Dead pre-pack weights survived DCE: {remaining}"
+        )
+        assert "init_0__init_1__axis_0__concat" in remaining
+
     def test_uses_lazy_tensor(self):
         """The packed initializer wraps sources in a LazyTensor.
 
