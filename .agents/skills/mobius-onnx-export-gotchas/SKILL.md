@@ -126,9 +126,11 @@ UNKNOWN / defaulted-to-fp32 while the data is fp16, the serializer **skips** it 
 
 ### Why count/dtype checks fail (the trap)
 The BROKEN export and the FIXED export can have the **same initializer count and the same fp16/fp32 dtype
-ratio** (e.g. both 197 fp16 after dead-weight stripping). Counting initializers or checking
-"0 fp32 / all fp16" does **not** distinguish a healthy model from a zeroed-weight one. §4(c) alone will
-pass a dead model.
+ratio**, so neither is a validity signal. Worse, the fp16-init count is **not even stable across fixes**
+— on Phi-3.5 it shifted from ~197 to ~293 as dead-weight stripping and fold behavior changed, with no
+bearing on correctness. Counting initializers or checking "0 fp32 / all fp16" does **not** distinguish a
+healthy model from a zeroed-weight one. §4(c) alone will pass a dead model. **Never gate on the count;
+use the VALUE gate below.**
 
 ### Canonical verification (load-bearing, not optional)
 VALUE-based per-slice check on each packed-QKV initializer against its source q/k/v weights:
