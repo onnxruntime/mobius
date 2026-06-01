@@ -96,7 +96,9 @@ class ModelInfo:
             return 5
         if self.l4_golden_files:
             return 4
-        if self.l3_synthetic_parity:
+        # L3 only counts when the parity test actually passes — skip/xfail
+        # are recorded but must not inflate the model's confidence level.
+        if self.l3_synthetic_parity and self.l3_status == "pass":
             return 3
         if self.l2_arch_validation:
             return 2
@@ -315,17 +317,22 @@ def _scan_l4_golden_files(models: dict[str, ModelInfo]) -> None:
     if not golden_dir.exists():
         return
 
+    # NOTE: relies on _scan_yaml_test_cases having run first (see
+    # _collect_models call order) so l4_test_case_skipped is populated.
+    # A golden JSON may exist on disk for a model whose YAML has a
+    # skip_reason; we must not treat that as L4 coverage.
+
     # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*.json"):
         if "_generation" in golden_file.name:
             continue
         model_type = golden_file.stem
-        if model_type in models:
+        if model_type in models and not models[model_type].l4_test_case_skipped:
             models[model_type].l4_golden_files = True
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
     for model_type, info in models.items():
-        if info.l4_golden_files or not info.yaml_test_case_file:
+        if info.l4_golden_files or info.l4_test_case_skipped or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
         case_id = case_path.stem
@@ -344,15 +351,22 @@ def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
     if not golden_dir.exists():
         return
 
+    # NOTE: relies on _scan_yaml_test_cases having run first (see
+    # _collect_models call order) so l5_test_case_skipped is populated.
+
     # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*_generation.json"):
         model_type = golden_file.stem.removesuffix("_generation")
-        if model_type in models:
+        if model_type in models and not models[model_type].l5_test_case_skipped:
             models[model_type].l5_generation_golden = True
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
     for model_type, info in models.items():
-        if info.l5_generation_golden or not info.yaml_test_case_file:
+        if (
+            info.l5_generation_golden
+            or info.l5_test_case_skipped
+            or not info.yaml_test_case_file
+        ):
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
         case_id = case_path.stem
@@ -565,11 +579,13 @@ def _compute_summary(
         # Per-flag counts: how many models have each level flag set, independently.
         # These are NOT exclusive (a model counted in L3 may also be in L1/L2).
         # by_level[0] = not-tested (no flags set at all).
+        # L3 is gated on status == "pass" to match the L3 card and the
+        # confidence_level property; a skipped/xfailed L3 does not count.
         if not any(
             [
                 info.l1_graph_build,
                 info.l2_arch_validation,
-                info.l3_synthetic_parity,
+                info.l3_synthetic_parity and info.l3_status == "pass",
                 info.l4_golden_files,
                 info.l5_generation_golden,
             ]
