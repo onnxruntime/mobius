@@ -101,6 +101,22 @@ def _attend_over_static_cache(
         # Prefix internal node/value names so the two branches stay in SSA
         # form when merged under the parent graph, then pin the branch
         # output name (the If wires branches by output position).
+        #
+        # Ordering is load-bearing — do NOT reorder these three lines:
+        #   1. rename first: rename_subgraph_values renames node OUTPUT value
+        #      names but skips graph.inputs/outputs. Running it before the
+        #      output is appended (branch.outputs is still empty) means
+        #      attn_output is renamed here as an internal node output, not
+        #      protected as a graph output.
+        #   2. pin the name next: this deterministic name must be set AFTER
+        #      the rename so the rename does not clobber it, and BEFORE the
+        #      append so the If sees a stable output name.
+        #   3. append last: registers the now-stable value as the branch
+        #      output the parent If wires by position.
+        # Outer-scope captures (query/key_cache/value_cache/nonpad_kv_seqlen/
+        # write_indices) are only ever node INPUTS inside the branch, never
+        # outputs, so the rename never touches them and implicit-input capture
+        # stays intact.
         rename_subgraph_values(branch, f"{name}_")
         attn_output.name = f"{name}_attn_output"
         branch.outputs.append(attn_output)
