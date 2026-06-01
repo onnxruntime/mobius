@@ -406,6 +406,15 @@ _PHI35_HEAD_DIM_OVERRIDES = {
 }
 
 
+# ORT version whose VERBOSE attention.cc kernel-selection log strings
+# (``_ATTENTION_KERNEL_LINE``) this guard was validated against.  The log text
+# is an internal, unstable contract; on an ORT bump the kernel-name proof must
+# be re-validated (or demoted to the profiling harness) rather than fail with a
+# confusing regex-miss assertion.  Gating on this version makes that churn
+# self-announce as a skip at the exact moment the assumption is invalidated.
+_VALIDATED_ORT_VERSION = "1.27"
+
+
 @pytest.mark.parametrize(
     "config_overrides",
     [None, _PHI35_HEAD_DIM_OVERRIDES],
@@ -432,7 +441,20 @@ def test_static_cache_decode_selects_flash_kernel_on_cuda(config_overrides):
     dispositive — it empirically confirms ORT's Flash kernel accepts the real
     model's head dimension (fp16) on this GPU, rather than silently routing to
     Memory-Efficient, which would invalidate the decode-on-Flash premise.
+
+    Skips on an unvalidated ORT version: this proof reads ORT's internal
+    VERBOSE kernel-selection log strings, so a version bump must re-validate
+    those strings (the deterministic ``test_static_cache_decode_runs_maskless``
+    structural guard remains the version-robust backstop and is not gated).
     """
+    if not ort.__version__.startswith(_VALIDATED_ORT_VERSION):
+        pytest.skip(
+            f"decode-on-Flash kernel proof reads ORT's VERBOSE attention.cc "
+            f"selection log, validated only on ORT {_VALIDATED_ORT_VERSION}.x "
+            f"(running {ort.__version__}). Re-validate the log strings in "
+            f"_ATTENTION_KERNEL_LINE and bump _VALIDATED_ORT_VERSION, or demote "
+            f"this proof to the profiling harness."
+        )
     with tempfile.TemporaryDirectory() as tmp_dir:
         session, config = _build_static_cache_session(
             tmp_dir,
