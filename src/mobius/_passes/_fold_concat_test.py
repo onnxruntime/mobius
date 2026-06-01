@@ -167,7 +167,10 @@ class TestFoldConcatInitializersPass:
         assert "init_0" not in remaining and "init_1" not in remaining, (
             f"Dead pre-pack weights survived DCE: {remaining}"
         )
-        assert "init_0__init_1__axis_0__concat" in remaining
+        assert "init_0__init_1__axis_0__concat" in remaining, (
+            "the live packed result must NOT be stripped by DCE: "
+            f"{remaining}"
+        )
 
     def test_uses_lazy_tensor(self):
         """The packed initializer wraps sources in a LazyTensor.
