@@ -92,7 +92,9 @@ class TestCausalLMTask:
         assert "present.0.value" in output_names
 
     def test_present_outputs_match_past_inputs(self):
-        """present.{i}.* must declare the same kv_heads/head_dim/dtype as the
+        """Present outputs must match their past-input KV metadata.
+
+        present.{i}.* must declare the same kv_heads/head_dim/dtype as the
         corresponding past_key_values.{i}.* inputs, with total (past+current)
         sequence length. Guards the GQA present-head_dim export bug, where the
         contrib-op shape inference would otherwise mis-declare head_dim.

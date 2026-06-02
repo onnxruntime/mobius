@@ -4441,9 +4441,7 @@ class TestBuildStaticCacheGraph:
         op_types = {n.op_type for n in self._walk_nodes(model.graph)}
         assert "TensorScatter" in op_types, "Static cache graph should use TensorScatter"
         assert "Attention" in op_types, "Static cache graph should use Attention"
-        assert "If" in op_types, (
-            "Static cache attention should be phase-split behind an If"
-        )
+        assert "If" in op_types, "Static cache attention should be phase-split behind an If"
 
     def test_static_cache_has_initializers(self):
         """Verify the graph has model parameters."""
@@ -4547,8 +4545,7 @@ class TestBuildStaticCacheGraph:
         """Return the sole ``Attention`` node in an If branch subgraph."""
         attention_nodes = [n for n in graph if n.op_type == "Attention"]
         assert len(attention_nodes) == 1, (
-            f"expected exactly one Attention per If branch, "
-            f"got {len(attention_nodes)}"
+            f"expected exactly one Attention per If branch, got {len(attention_nodes)}"
         )
         return attention_nodes[0]
 

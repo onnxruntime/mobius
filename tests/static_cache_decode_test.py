@@ -129,9 +129,7 @@ def _build_static_cache_session(
     config = dataclasses.replace(config, dtype=ir_dtype)
     module = registry.get(_MODEL_TYPE)(config)
     task = CausalLMTask(static_cache=True, max_seq_len=_MAX_SEQ_LEN)
-    package = build_from_module(
-        module, config, task=task, execution_provider="default"
-    )
+    package = build_from_module(module, config, task=task, execution_provider="default")
     model = package["model"]
     _fill_random_weights(model, np.random.default_rng(0))
 
@@ -164,9 +162,7 @@ def _empty_caches(
     return feeds
 
 
-def _carry_caches(
-    outputs: dict[str, np.ndarray], num_layers: int
-) -> dict[str, np.ndarray]:
+def _carry_caches(outputs: dict[str, np.ndarray], num_layers: int) -> dict[str, np.ndarray]:
     """Feed the prefill ``updated_*`` caches back in as decode inputs."""
     feeds: dict[str, np.ndarray] = {}
     for layer in range(num_layers):
@@ -194,18 +190,14 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
         # --- Prefill: write N tokens from slot 0 (S_q = N != max_seq). ---
         prefill_len = 4
         prefill_feeds: dict[str, np.ndarray] = {
-            "input_ids": rng.integers(
-                0, vocab, size=(1, prefill_len), dtype=np.int64
-            ),
+            "input_ids": rng.integers(0, vocab, size=(1, prefill_len), dtype=np.int64),
             "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
             "write_indices": np.array([0], dtype=np.int64),
             "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
         }
         prefill_feeds.update(_empty_caches(num_layers, kv_hidden))
 
-        prefill_out = dict(
-            zip(output_names, session.run(output_names, prefill_feeds))
-        )
+        prefill_out = dict(zip(output_names, session.run(output_names, prefill_feeds)))
         prefill_logits = prefill_out["logits"]
         assert prefill_logits.shape == (1, prefill_len, vocab)
         assert np.isfinite(prefill_logits).all(), "prefill logits must be finite"
@@ -219,9 +211,7 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
         }
         decode_feeds.update(_carry_caches(prefill_out, num_layers))
 
-        decode_out = dict(
-            zip(output_names, session.run(output_names, decode_feeds))
-        )
+        decode_out = dict(zip(output_names, session.run(output_names, decode_feeds)))
         decode_logits = decode_out["logits"]
         assert decode_logits.shape == (1, 1, vocab)
         assert np.isfinite(decode_logits).all(), "decode logits must be finite"
@@ -255,9 +245,7 @@ def _executed_attention_events(profile_path: str) -> list[dict]:
         if args.get("op_name") != "Attention":
             continue
         input_shapes = args.get("input_type_shape", [])
-        has_mask = any(
-            len(next(iter(shape.values()))) == 4 for shape in input_shapes
-        )
+        has_mask = any(len(next(iter(shape.values()))) == 4 for shape in input_shapes)
         attention_events.append({"name": event["name"], "has_mask": has_mask})
     return attention_events
 
@@ -303,9 +291,7 @@ def test_static_cache_decode_runs_maskless_on_cuda():
         # Multi-token prefill (S_q = 4): the If must take the masked branch.
         prefill_len = 4
         prefill_feeds: dict[str, np.ndarray] = {
-            "input_ids": rng.integers(
-                0, vocab, size=(1, prefill_len), dtype=np.int64
-            ),
+            "input_ids": rng.integers(0, vocab, size=(1, prefill_len), dtype=np.int64),
             "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
             "write_indices": np.array([0], dtype=np.int64),
             "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
@@ -320,8 +306,7 @@ def test_static_cache_decode_runs_maskless_on_cuda():
 
     # Decode took the maskless branch on every layer (Flash-eligible).
     assert len(decode_events) == num_layers, (
-        f"expected {num_layers} decode-branch Attention executions, "
-        f"got {len(decode_events)}"
+        f"expected {num_layers} decode-branch Attention executions, got {len(decode_events)}"
     )
     assert all(not e["has_mask"] for e in decode_events), (
         "decode-branch Attention must run WITHOUT an attn_mask input so ORT "
@@ -331,8 +316,7 @@ def test_static_cache_decode_runs_maskless_on_cuda():
 
     # Prefill took the masked branch on every layer (memory-efficient path).
     assert len(prefill_events) == num_layers, (
-        f"expected {num_layers} prefill-branch Attention executions, "
-        f"got {len(prefill_events)}"
+        f"expected {num_layers} prefill-branch Attention executions, got {len(prefill_events)}"
     )
     assert all(e["has_mask"] for e in prefill_events), (
         "prefill-branch Attention must carry the explicit causal mask"
@@ -477,9 +461,7 @@ def test_static_cache_decode_selects_flash_kernel_on_cuda(config_overrides):
 
         prefill_len = 4
         prefill_feeds: dict[str, np.ndarray] = {
-            "input_ids": rng.integers(
-                0, vocab, size=(1, prefill_len), dtype=np.int64
-            ),
+            "input_ids": rng.integers(0, vocab, size=(1, prefill_len), dtype=np.int64),
             "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
             "write_indices": np.array([0], dtype=np.int64),
             "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
@@ -530,9 +512,7 @@ def test_static_cache_decode_ignores_keys_beyond_nonpad_on_cuda():
     the logits would diverge.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
-        session, config = _build_static_cache_session(
-            tmp_dir, ir_dtype=ir.DataType.FLOAT16
-        )
+        session, config = _build_static_cache_session(tmp_dir, ir_dtype=ir.DataType.FLOAT16)
         num_layers = config.num_hidden_layers
         kv_hidden = config.num_key_value_heads * config.head_dim
         vocab = config.vocab_size
@@ -542,17 +522,13 @@ def test_static_cache_decode_ignores_keys_beyond_nonpad_on_cuda():
         # Prefill four real tokens into slots 0..3 to populate the cache.
         prefill_len = 4
         prefill_feeds: dict[str, np.ndarray] = {
-            "input_ids": rng.integers(
-                0, vocab, size=(1, prefill_len), dtype=np.int64
-            ),
+            "input_ids": rng.integers(0, vocab, size=(1, prefill_len), dtype=np.int64),
             "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
             "write_indices": np.array([0], dtype=np.int64),
             "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
         }
         prefill_feeds.update(_empty_caches(num_layers, kv_hidden, np.float16))
-        prefill_out = dict(
-            zip(output_names, session.run(output_names, prefill_feeds))
-        )
+        prefill_out = dict(zip(output_names, session.run(output_names, prefill_feeds)))
 
         # Decode one token into slot 4; valid keys are slots 0..4 (nonpad=5).
         nonpad = prefill_len + 1
@@ -567,9 +543,7 @@ def test_static_cache_decode_ignores_keys_beyond_nonpad_on_cuda():
             **decode_inputs,
             **_carry_caches(prefill_out, num_layers),
         }
-        baseline = dict(
-            zip(output_names, session.run(output_names, clean_feeds))
-        )
+        baseline = dict(zip(output_names, session.run(output_names, clean_feeds)))
 
         # Poison every cache slot at or beyond ``nonpad`` with large garbage;
         # those positions must never be attended during decode.  Slot 4 (the
@@ -581,9 +555,7 @@ def test_static_cache_decode_ignores_keys_beyond_nonpad_on_cuda():
                 buf[:, nonpad:, :] = np.float16(50.0)
                 poisoned_caches[name] = buf
         poisoned_feeds = {**decode_inputs, **poisoned_caches}
-        perturbed = dict(
-            zip(output_names, session.run(output_names, poisoned_feeds))
-        )
+        perturbed = dict(zip(output_names, session.run(output_names, poisoned_feeds)))
 
     assert np.array_equal(baseline["logits"], perturbed["logits"]), (
         "decode logits changed when cache slots beyond nonpad_kv_seqlen were "

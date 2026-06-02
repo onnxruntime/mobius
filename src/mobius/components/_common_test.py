@@ -30,9 +30,7 @@ def _run_static_cache_mask(max_seq: int, query_len: int, write_index: int) -> np
     key_cache = create_test_input(
         builder, "key_cache", [1, max_seq, 16], dtype=ir.DataType.FLOAT
     )
-    write_indices = create_test_input(
-        builder, "write_indices", [1], dtype=ir.DataType.INT64
-    )
+    write_indices = create_test_input(builder, "write_indices", [1], dtype=ir.DataType.INT64)
     mask = create_static_cache_causal_mask(op, query, key_cache, write_indices)
     mask.name = "mask"
     graph.outputs.append(mask)

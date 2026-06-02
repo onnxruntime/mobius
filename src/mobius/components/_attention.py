@@ -66,20 +66,14 @@ def _attend_over_static_cache(
     Returns:
         The attention output for the active phase, shape ``[B, S_q, hidden]``.
     """
-    seq_len = op.Squeeze(
-        op.Shape(query, start=1, end=2), op.Constant(value_ints=[0])
-    )
+    seq_len = op.Squeeze(op.Shape(query, start=1, end=2), op.Constant(value_ints=[0]))
     is_multi_token_step = op.Greater(seq_len, op.Constant(value_int=1))
 
     def _build_attention_branch(name: str, use_causal_mask: bool) -> ir.Graph:
-        branch = ir.Graph(
-            [], [], nodes=[], name=name, opset_imports={"": OPSET_VERSION}
-        )
+        branch = ir.Graph([], [], nodes=[], name=name, opset_imports={"": OPSET_VERSION})
         branch_op = GraphBuilder(branch).op
         attn_mask = (
-            create_static_cache_causal_mask(
-                branch_op, query, key_cache, write_indices
-            )
+            create_static_cache_causal_mask(branch_op, query, key_cache, write_indices)
             if use_causal_mask
             else None
         )
@@ -122,12 +116,8 @@ def _attend_over_static_cache(
         branch.outputs.append(attn_output)
         return branch
 
-    prefill_branch = _build_attention_branch(
-        "static_cache_prefill", use_causal_mask=True
-    )
-    decode_branch = _build_attention_branch(
-        "static_cache_decode", use_causal_mask=False
-    )
+    prefill_branch = _build_attention_branch("static_cache_prefill", use_causal_mask=True)
+    decode_branch = _build_attention_branch("static_cache_decode", use_causal_mask=False)
     return op.If(
         is_multi_token_step,
         then_branch=prefill_branch,
