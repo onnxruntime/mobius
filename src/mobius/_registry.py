@@ -666,6 +666,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
 }
 
+
 def _create_default_registry() -> ModelRegistry:
     """Create the default registry with all built-in architectures."""
     reg = ModelRegistry()

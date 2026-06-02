@@ -38,6 +38,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import sys
 import time
@@ -838,13 +839,11 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
         ignore_mismatched_sizes=True,  # MMS lm_head shape changes per language
     )
     # For MMS, switching languages also requires loading the per-language adapter.
+    # Non-MMS Wav2Vec2ForCTC checkpoints don't have language adapters;
+    # the missing-adapter case is expected and harmless there.
     if hasattr(model, "load_adapter"):
-        try:
+        with contextlib.suppress(ValueError, KeyError, OSError):
             model.load_adapter(lang)
-        except (ValueError, KeyError, OSError):
-            # Non-MMS Wav2Vec2ForCTC checkpoints don't have language adapters;
-            # the missing-adapter case is expected and harmless there.
-            pass
     model.eval()
 
     audio_path = Path("testdata") / case.audio[0]
