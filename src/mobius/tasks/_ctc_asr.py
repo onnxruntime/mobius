@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """CTC ASR task — builds a single ONNX graph for CTC-based ASR models.
 
@@ -10,6 +10,8 @@ Supports MMS (facebook/mms-1b-all) and any Wav2Vec2ForCTC checkpoint.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 import onnx_ir as ir
 
@@ -33,6 +35,7 @@ class CTCAsrTask(ModelTask):
     """
 
     name = "ctc-asr"
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
 
     def build(
         self,
