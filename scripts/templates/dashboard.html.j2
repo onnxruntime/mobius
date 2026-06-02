@@ -14,6 +14,10 @@
   --accent: #0969da;
   --l0: #cf222e; --l1: #9a6700; --l2: #bf8700;
   --l3: #1a7f37; --l4: #116329; --l5: #0969da;
+  /* xfail: deliberately outside the L0–L5 spectrum (red→amber→green→blue)
+     because "expected failure" is a status modifier, not a level. Purple
+     avoids visual collision with the amber L1/L2 passing dots. */
+  --xfail: #8250df;
 }
 [data-theme="dark"] {
   --bg: #0d1117;
@@ -24,6 +28,7 @@
   --accent: #58a6ff;
   --l0: #f85149; --l1: #d29922; --l2: #e3b341;
   --l3: #3fb950; --l4: #2ea043; --l5: #58a6ff;
+  --xfail: #a371f7;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -103,8 +108,8 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 .dot.active-5 { background: var(--l5); border-color: var(--l5); }
 .dot.failed { background: var(--l0); border-color: var(--l0); }
 .dot.xfail {
-  /* test runs but is expected to fail — amber solid fill */
-  background: rgba(210,153,34,0.35); border-color: var(--l1);
+  /* test runs but is expected to fail — lighter interior + solid border */
+  background: rgba(163,113,247,0.35); border-color: var(--xfail);
   border-style: solid; border-width: 2px;
 }
 .dot.skipped {
@@ -154,7 +159,7 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
 }
 .l3-status { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
 .l3-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
-.l3-xfail { background: rgba(210,153,34,0.2); color: var(--l1); }
+.l3-xfail { background: rgba(163,113,247,0.2); color: var(--xfail); }
 .l3-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
 .ratio-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
 .ratio-high { background: rgba(63,185,80,0.2); color: var(--l3); }
