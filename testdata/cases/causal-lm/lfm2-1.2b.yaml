@@ -1,4 +1,5 @@
 model_id: "LiquidAI/LFM2-1.2B"
+model_type: "lfm2"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """LFM2-Audio real-time speech-to-speech conversation.
 

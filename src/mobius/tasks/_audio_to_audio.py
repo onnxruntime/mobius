@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Audio-to-audio task for end-to-end speech models.
 
@@ -16,6 +16,8 @@ Typical model split:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import nn
 
@@ -24,9 +26,11 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
+    _make_model,
+)
+from mobius.tasks._cache_utils import (
     _make_hybrid_cache_inputs,
     _make_kv_cache_inputs,
-    _make_model,
     _register_hybrid_cache_outputs,
     _register_kv_cache_outputs,
 )
@@ -46,6 +50,13 @@ class AudioToAudioTask(ModelTask):
     Supports both standard KV cache and hybrid (conv+attention) cache
     for the decoder, selected automatically based on ``config.layer_types``.
     """
+
+    model_roles: ClassVar[dict[str, str]] = {
+        "audio_encoder": "encoder",
+        "embedding": "embedding",
+        "decoder": "decoder",
+        "audio_decoder": "decoder",
+    }
 
     def build(
         self,
@@ -73,17 +84,14 @@ class AudioToAudioTask(ModelTask):
         mel_seq = ir.SymbolicDim("mel_sequence_len")
         n_mels = (config.audio.num_mel_bins or 128) if config.audio else 128
 
-        input_features = ir.Value(
-            name="input_features",
-            shape=ir.Shape([batch, n_mels, mel_seq]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="audio_encoder")
+        input_features = builder.input(
+            "input_features",
+            dtype=config.dtype,
+            shape=[batch, n_mels, mel_seq],
         )
-
-        graph, builder = _make_graph([input_features], name="audio_encoder")
         audio_features = audio_encoder(builder.op, input_features)
-
-        audio_features.name = "audio_features"
-        graph.outputs.append(audio_features)
+        builder.add_output(audio_features, "audio_features")
         return _make_model(graph)
 
     def _build_embedding(
@@ -95,20 +103,17 @@ class AudioToAudioTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph(name="embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-
-        graph, builder = _make_graph([input_ids], name="embedding")
         inputs_embeds = embedding(
             builder.op,
             input_ids=input_ids,
         )
-
-        inputs_embeds.name = "inputs_embeds"
-        graph.outputs.append(inputs_embeds)
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
     def _build_decoder(
@@ -125,34 +130,34 @@ class AudioToAudioTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        inputs_embeds = ir.Value(
-            name="inputs_embeds",
-            shape=ir.Shape([batch, seq_len, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="decoder")
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
-        attention_mask = ir.Value(
-            name="attention_mask",
-            shape=ir.Shape([batch, "past_seq_len + seq_len"]),
-            type=ir.TensorType(ir.DataType.INT64),
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
         )
-        position_ids = ir.Value(
-            name="position_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-
-        graph_inputs = [inputs_embeds, attention_mask, position_ids]
 
         # Select cache type based on config
         use_hybrid = config.layer_types is not None and any(
             lt != "full_attention" for lt in config.layer_types
         )
         if use_hybrid:
-            cache_inputs, past_key_values = _make_hybrid_cache_inputs(
-                config, config.dtype, batch, past_seq_len
+            past_key_values = _make_hybrid_cache_inputs(
+                builder, config, config.dtype, batch, past_seq_len
             )
         else:
-            cache_inputs, past_key_values = _make_kv_cache_inputs(
+            past_key_values = _make_kv_cache_inputs(
+                builder,
                 config.num_hidden_layers,
                 config.num_key_value_heads,
                 config.head_dim,
@@ -160,9 +165,7 @@ class AudioToAudioTask(ModelTask):
                 batch,
                 past_seq_len,
             )
-        graph_inputs.extend(cache_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="decoder")
         logits, present_key_values = decoder(
             builder.op,
             inputs_embeds=inputs_embeds,
@@ -171,16 +174,15 @@ class AudioToAudioTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        logits.name = "logits"
-        graph.outputs.append(logits)
+        builder.add_output(logits, "logits")
         if use_hybrid:
             _register_hybrid_cache_outputs(
-                graph,
+                builder,
                 present_key_values,
                 config.layer_types or [],
             )
         else:
-            _register_kv_cache_outputs(graph, present_key_values)
+            _register_kv_cache_outputs(builder, present_key_values)
         return _make_model(graph)
 
     def _build_audio_decoder(
@@ -212,26 +214,26 @@ class AudioToAudioTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        backbone_hidden = ir.Value(
-            name="backbone_hidden",
-            shape=ir.Shape([batch, 1, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="audio_decoder")
+        backbone_hidden = builder.input(
+            "backbone_hidden",
+            dtype=config.dtype,
+            shape=[batch, 1, config.hidden_size],
         )
-        prev_embedding = ir.Value(
-            name="prev_embedding",
-            shape=ir.Shape([batch, 1, depthformer_dim]),
-            type=ir.TensorType(config.dtype),
+        prev_embedding = builder.input(
+            "prev_embedding",
+            dtype=config.dtype,
+            shape=[batch, 1, depthformer_dim],
         )
-        codebook_idx = ir.Value(
-            name="codebook_idx",
-            shape=ir.Shape([]),
-            type=ir.TensorType(ir.DataType.INT64),
+        codebook_idx = builder.input(
+            "codebook_idx",
+            dtype=ir.DataType.INT64,
+            shape=[],
         )
-
-        graph_inputs = [backbone_hidden, prev_embedding, codebook_idx]
 
         # Depthformer KV cache (all attention layers)
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             depthformer_layers,
             depthformer_heads,
             depthformer_head_dim,
@@ -240,9 +242,7 @@ class AudioToAudioTask(ModelTask):
             past_seq_len,
             prefix="past_key_values",
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="audio_decoder")
         codebook_logits, present_kv = audio_decoder(
             builder.op,
             backbone_hidden=backbone_hidden,
@@ -251,9 +251,8 @@ class AudioToAudioTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        codebook_logits.name = "codebook_logits"
-        graph.outputs.append(codebook_logits)
-        _register_kv_cache_outputs(graph, present_kv)
+        builder.add_output(codebook_logits, "codebook_logits")
+        _register_kv_cache_outputs(builder, present_kv)
         return _make_model(graph)
 
 
@@ -270,6 +269,12 @@ class MoshiTask(AudioToAudioTask):
       (one full-dimensioned head per codebook) rather than
       ``depformer_dim // depformer_num_heads``.
     """
+
+    model_roles: ClassVar[dict[str, str]] = {
+        "embedding": "embedding",
+        "decoder": "decoder",
+        "audio_decoder": "decoder",
+    }
 
     def build(
         self,
@@ -297,22 +302,19 @@ class MoshiTask(AudioToAudioTask):
         seq_len = ir.SymbolicDim("sequence_len")
         num_codebooks = getattr(config, "num_codebooks", 16)
 
-        input_ids = ir.Value(
-            name="input_ids",
-            shape=ir.Shape([batch, seq_len]),
-            type=ir.TensorType(ir.DataType.INT64),
+        graph, builder = _make_graph(name="embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
         )
-        audio_codes = ir.Value(
-            name="audio_codes",
-            shape=ir.Shape([batch, seq_len, num_codebooks]),
-            type=ir.TensorType(ir.DataType.INT64),
+        audio_codes = builder.input(
+            "audio_codes",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len, num_codebooks],
         )
-
-        graph, builder = _make_graph([input_ids, audio_codes], name="embedding")
         inputs_embeds = embedding(builder.op, input_ids=input_ids, audio_codes=audio_codes)
-
-        inputs_embeds.name = "inputs_embeds"
-        graph.outputs.append(inputs_embeds)
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
     def _build_audio_decoder(
@@ -336,25 +338,25 @@ class MoshiTask(AudioToAudioTask):
         batch = ir.SymbolicDim("batch")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
 
-        backbone_hidden = ir.Value(
-            name="backbone_hidden",
-            shape=ir.Shape([batch, 1, config.hidden_size]),
-            type=ir.TensorType(config.dtype),
+        graph, builder = _make_graph(name="audio_decoder")
+        backbone_hidden = builder.input(
+            "backbone_hidden",
+            dtype=config.dtype,
+            shape=[batch, 1, config.hidden_size],
         )
-        prev_embedding = ir.Value(
-            name="prev_embedding",
-            shape=ir.Shape([batch, 1, depformer_dim]),
-            type=ir.TensorType(config.dtype),
+        prev_embedding = builder.input(
+            "prev_embedding",
+            dtype=config.dtype,
+            shape=[batch, 1, depformer_dim],
         )
-        codebook_idx = ir.Value(
-            name="codebook_idx",
-            shape=ir.Shape([]),
-            type=ir.TensorType(ir.DataType.INT64),
+        codebook_idx = builder.input(
+            "codebook_idx",
+            dtype=ir.DataType.INT64,
+            shape=[],
         )
 
-        graph_inputs = [backbone_hidden, prev_embedding, codebook_idx]
-
-        kv_inputs, past_key_values = _make_kv_cache_inputs(
+        past_key_values = _make_kv_cache_inputs(
+            builder,
             depformer_layers,
             depformer_heads,
             depformer_head_dim,
@@ -363,9 +365,7 @@ class MoshiTask(AudioToAudioTask):
             past_seq_len,
             prefix="past_key_values",
         )
-        graph_inputs.extend(kv_inputs)
 
-        graph, builder = _make_graph(graph_inputs, name="audio_decoder")
         codebook_logits, present_kv = audio_decoder(
             builder.op,
             backbone_hidden=backbone_hidden,
@@ -374,7 +374,6 @@ class MoshiTask(AudioToAudioTask):
             past_key_values=past_key_values,
         )
 
-        codebook_logits.name = "codebook_logits"
-        graph.outputs.append(codebook_logits)
-        _register_kv_cache_outputs(graph, present_kv)
+        builder.add_output(codebook_logits, "codebook_logits")
+        _register_kv_cache_outputs(builder, present_kv)
         return _make_model(graph)

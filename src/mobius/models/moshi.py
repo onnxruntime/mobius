@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """Moshi / PersonaPlex: full-duplex speech-to-speech model.
 
@@ -37,8 +37,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, MoshiConfig
 from mobius.components import (
@@ -92,7 +91,7 @@ class _MoshiEmbedding(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
         audio_codes: ir.Value,
     ) -> ir.Value:
@@ -146,7 +145,7 @@ class _MoshiDecoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
         position_embeddings: tuple,
@@ -195,7 +194,7 @@ class _MoshiDecoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -289,7 +288,7 @@ class _DepformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         codebook_idx: ir.Value,
         position_embeddings: tuple,
@@ -389,6 +388,7 @@ class _MoshiAudioDecoder(nn.Module):
             num_attention_heads=num_codebooks,
             head_dim=depformer_dim,
             rope_theta=10000.0,
+            rope_type="default",
             max_position_embeddings=num_codebooks,
         )
         self.rotary_emb = initialize_rope(rope_config)
@@ -398,7 +398,7 @@ class _MoshiAudioDecoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         backbone_hidden: ir.Value,
         prev_embedding: ir.Value,
         codebook_idx: ir.Value,

@@ -1,4 +1,5 @@
 model_id: "kyutai/moshiko-pytorch-bf16"
+model_type: "moshi"
 revision: "main"
 task_type: "audio-to-audio"
 dtype: "float32"

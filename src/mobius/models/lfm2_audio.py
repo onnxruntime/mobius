@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """LFM2-Audio: audio-to-audio model with hybrid conv+attention backbone.
 
@@ -34,8 +34,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import Lfm2AudioConfig
 from mobius._weight_utils import tie_word_embeddings
@@ -99,7 +98,7 @@ class _Lfm2AudioEncoder(nn.Module):
             bias=True,
         )
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value):
+    def forward(self, op: OpBuilder, input_features: ir.Value):
         """Forward: mel (B, n_mels, T) -> (B, T', hidden_size)."""
         # ConformerEncoder expects (B, T, n_mels); transpose from (B, n_mels, T)
         input_features = op.Transpose(input_features, perm=[0, 2, 1])
@@ -130,7 +129,7 @@ class _Lfm2AudioEmbedding(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         input_ids: ir.Value,
     ):
         """Forward: text_ids -> inputs_embeds.
@@ -184,7 +183,7 @@ class _Lfm2AudioDecoder(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
@@ -261,7 +260,7 @@ class _DepthformerLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
@@ -345,13 +344,14 @@ class _Lfm2AudioDecoderModule(nn.Module):
             num_attention_heads=config.depthformer_heads,
             head_dim=depthformer_dim // config.depthformer_heads,
             rope_theta=config.rope_theta,
+            rope_type="default",
             max_position_embeddings=config.max_position_embeddings,
         )
         self.rotary_emb = initialize_rope(rope_config)
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         backbone_hidden: ir.Value,
         prev_embedding: ir.Value,
         codebook_idx: ir.Value,

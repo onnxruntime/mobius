@@ -2074,6 +2074,7 @@ class MoshiConfig(ArchitectureConfig):
             hidden_act=getattr(config, "hidden_act", "silu"),
             rms_norm_eps=getattr(config, "rms_norm_eps", 1e-5),
             rope_theta=getattr(config, "rope_theta", 10000.0),
+            rope_type=getattr(config, "rope_type", "default"),
             max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
             depformer_dim=getattr(config, "depformer_dim", 1024),
             depformer_layers=getattr(config, "depformer_layers", 6),

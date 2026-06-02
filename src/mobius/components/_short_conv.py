@@ -1,5 +1,5 @@
-# Copyright (c) ONNX Project Contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 """ShortConv: gated causal depthwise Conv1d for LFM2 conv layers.
 
@@ -28,8 +28,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Linear
 
@@ -91,7 +90,7 @@ class ShortConv(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         conv_state: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value]:
