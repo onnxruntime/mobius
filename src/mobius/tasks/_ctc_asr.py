@@ -22,8 +22,11 @@ class CTCAsrTask(ModelTask):
     """Build ONNX graph for CTC-based ASR (raw waveform → frame logits).
 
     Input:
-        ``input_values``  — (batch, num_samples) raw audio at 16 kHz  FLOAT
-        ``attention_mask`` — (batch, num_samples) INT64  (optional)
+        ``input_values``   — (batch, num_samples) raw audio at 16 kHz  FLOAT
+        ``attention_mask`` — (batch, num_samples) INT64 padding mask
+                             (1 = valid sample, 0 = padding). Always a
+                             required graph input; callers with no
+                             padding should pass an all-ones mask.
 
     Output:
         ``logits`` — (batch, num_frames, vocab_size) CTC logit scores  FLOAT

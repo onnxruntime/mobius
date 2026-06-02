@@ -68,14 +68,17 @@ class _AdapterLayer(nn.Module):
         Returns:
             (batch, hidden_size, seq_len // stride)
         """
-        # Conv1d with padding=1 on both sides (matches HF padding=1)
+        # Symmetric padding = kernel_size // 2 on each side, matching HF's
+        # nn.Conv1d(padding=kernel_size // 2) used by Wav2Vec2AdapterLayer.
+        # Hard-coding pad=1 was only correct for kernel_size=3.
+        pad = self._kernel_size // 2
         hidden_states = op.Conv(
             hidden_states,
             self.conv,
             self.conv_bias,
             kernel_shape=[self._kernel_size],
             strides=[self._stride],
-            pads=[1, 1],
+            pads=[pad, pad],
             group=1,
         )
         # GLU: split along channel dim, gate with sigmoid

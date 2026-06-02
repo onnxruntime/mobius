@@ -120,9 +120,7 @@ def load_audio_file(path: str, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return waveform.mean(dim=0).numpy().astype(np.float32)
 
 
-def record_from_mic(
-    sample_rate: int = SAMPLE_RATE, max_seconds: int = 60
-) -> np.ndarray:
+def record_from_mic(sample_rate: int = SAMPLE_RATE, max_seconds: int = 60) -> np.ndarray:
     """Record audio from the default microphone until Enter is pressed."""
     import sounddevice as sd
 
@@ -194,23 +192,28 @@ def transcribe_streaming(
     audio: np.ndarray,
     *,
     chunk_seconds: float = 1.0,
-    overlap_seconds: float = 0.1,
+    overlap_seconds: float = 0.0,
     lang: str = "eng",
 ) -> str:
     """Stream-decode audio in short windows and print partial results live.
 
-    Processes the audio in small ``chunk_seconds`` windows (with a small
-    ``overlap_seconds`` tail for context at chunk boundaries) and prints
-    each decoded segment to stdout as it is ready, overwriting the previous
-    partial line.
+    Processes the audio in non-overlapping ``chunk_seconds`` windows by
+    default and prints each decoded segment to stdout as it is ready,
+    overwriting the previous partial line.
 
     Args:
         session: ORT session wrapping the ONNX MMS model.
         tokenizer: HuggingFace ``Wav2Vec2CTCTokenizer``.
         audio: Raw waveform at 16 kHz, shape ``(num_samples,)``.
         chunk_seconds: Window length in seconds (shorter = more responsive).
-        overlap_seconds: Extra context appended to each chunk to reduce
-            boundary artifacts (trimmed from decoded output).
+        overlap_seconds: Extra audio appended to each window to give the
+            CTC decoder more context across boundaries. **Defaults to 0**
+            because the current implementation appends each segment's
+            decoded text verbatim, so any overlap region is decoded
+            twice and the duplicated tokens show up in the final
+            transcript. Set this to a small positive value only if you
+            accept that trade-off (better acoustic boundaries, possible
+            duplicate tokens).
         lang: ISO-639-3 language code used in the progress prefix.
 
     Returns:
@@ -233,9 +236,7 @@ def transcribe_streaming(
         input_values = chunk[np.newaxis, :].astype(np.float32)
         attention_mask = np.ones((1, len(chunk)), dtype=np.int64)
 
-        out = session.run(
-            {"input_values": input_values, "attention_mask": attention_mask}
-        )
+        out = session.run({"input_values": input_values, "attention_mask": attention_mask})
         segment_text = ctc_greedy_decode(out["logits"], tokenizer)
         segments.append(segment_text)
 
@@ -248,9 +249,7 @@ def transcribe_streaming(
         partial = " ".join(s for s in segments if s.strip())
 
         _clear_line()
-        sys.stdout.write(
-            f"[{bar}] {elapsed_s:.1f}/{total_duration:.1f}s  📝 {partial!r}"
-        )
+        sys.stdout.write(f"[{bar}] {elapsed_s:.1f}/{total_duration:.1f}s  📝 {partial!r}")
         sys.stdout.flush()
 
         pos += chunk_len
@@ -343,6 +342,8 @@ def live_microphone_transcription(
                 if text.strip():
                     print(f"[{elapsed:6.1f}s] {text}")
     except KeyboardInterrupt:
+        # Expected exit: user pressed Ctrl-C to stop the live capture.
+        # Fall through to the ``finally`` block to release the mic stream.
         pass
     finally:
         stream.stop()
@@ -420,9 +421,7 @@ def transcribe(
         input_values = chunk[np.newaxis, :].astype(np.float32)
         attention_mask = np.ones((1, len(chunk)), dtype=np.int64)
 
-        out = session.run(
-            {"input_values": input_values, "attention_mask": attention_mask}
-        )
+        out = session.run({"input_values": input_values, "attention_mask": attention_mask})
         logits = out["logits"]  # (1, time_steps, vocab_size)
         transcripts.append(ctc_greedy_decode(logits, tokenizer))
 
@@ -575,9 +574,7 @@ def main() -> None:
         print("Sample MMS language codes (ISO 639-3):")
         for code, name in sorted(_SAMPLE_LANGS.items()):
             print(f"  {code}  {name}")
-        print(
-            "\nFull list: https://huggingface.co/facebook/mms-1b-all/blob/main/README.md"
-        )
+        print("\nFull list: https://huggingface.co/facebook/mms-1b-all/blob/main/README.md")
         return
 
     # ------------------------------------------------------------------
