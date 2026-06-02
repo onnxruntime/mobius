@@ -39,11 +39,11 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import Lfm2AudioConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
-    FCMLP,
     MLP,
     Attention,
     ConformerEncoder,
     Embedding,
+    LayerNorm,
     Linear,
     RMSNorm,
     create_attention_bias,
@@ -60,18 +60,44 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+class _Lfm2AudioAdapter(nn.Module):
+    """Audio adapter MLP for LFM2-Audio.
+
+    Matches the HuggingFace ``audio_adapter`` Sequential layout exactly::
+
+        model.0 = LayerNorm(encoder_dim)        # weight + bias both [encoder_dim]
+        model.1 = Linear(encoder_dim, hidden_size)
+        model.2 = GELU                          # no parameters
+        model.3 = Linear(hidden_size, hidden_size)
+
+    Output dimension is ``hidden_size`` (the backbone hidden dim), not
+    ``encoder_dim`` — i.e. this is *not* a residual MLP, it's a projection
+    from the conformer's hidden width up to the LM backbone's hidden width
+    followed by a hidden-size-square refinement Linear.
+    """
+
+    def __init__(self, encoder_dim: int, hidden_size: int):
+        super().__init__()
+        self.pre_norm = LayerNorm(encoder_dim, eps=1e-5)
+        self.up_proj = Linear(encoder_dim, hidden_size, bias=False)
+        self.out_proj = Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        x = self.pre_norm(op, x)
+        x = self.up_proj(op, x)
+        x = op.Gelu(x)
+        return self.out_proj(op, x)
+
+
 class _Lfm2AudioEncoder(nn.Module):
     """ConformerEncoder + adapter MLP for mel -> LFM hidden_size projection.
 
-    The adapter is a 2-layer MLP:
-        Linear(encoder_dim, hidden_size) -> GELU -> Linear(hidden_size, hidden_size)
-
-    Weight names (HF)::
+    HuggingFace weight mapping (handled by ``preprocess_weights``)::
 
         conformer.* -> encoder.*
-        audio_adapter.model.0.{weight,bias} -> adapter.up_proj.{weight,bias}
-        audio_adapter.model.1.{weight,bias} -> (batch_norm, skipped)
-        audio_adapter.model.3.{weight,bias} -> adapter.down_proj.{weight,bias}
+        audio_adapter.model.0.{weight,bias} -> adapter.pre_norm.{weight,bias}
+        audio_adapter.model.1.weight        -> adapter.up_proj.weight   (no bias in HF)
+        audio_adapter.model.3.{weight,bias} -> adapter.out_proj.{weight,bias}
     """
 
     def __init__(self, config: Lfm2AudioConfig):
@@ -79,9 +105,10 @@ class _Lfm2AudioEncoder(nn.Module):
         audio = config.audio
         assert audio is not None
 
+        encoder_dim = audio.attention_dim or audio.d_model or 512
         self.encoder = ConformerEncoder(
             input_size=audio.num_mel_bins or 128,
-            attention_dim=audio.attention_dim or audio.d_model or 512,
+            attention_dim=encoder_dim,
             attention_heads=audio.attention_heads or audio.encoder_attention_heads or 8,
             num_blocks=audio.num_blocks or audio.encoder_layers or 17,
             linear_units=(audio.linear_units or audio.encoder_ffn_dim or 2048),
@@ -90,13 +117,7 @@ class _Lfm2AudioEncoder(nn.Module):
             t5_bias_max_distance=audio.t5_bias_max_distance or 500,
         )
         # Adapter: encoder_dim -> hidden_size
-        encoder_dim = audio.attention_dim or audio.d_model or 512
-        self.adapter = FCMLP(
-            hidden_size=encoder_dim,
-            intermediate_size=config.hidden_size,
-            activation="gelu",
-            bias=True,
-        )
+        self.adapter = _Lfm2AudioAdapter(encoder_dim, config.hidden_size)
 
     def forward(self, op: OpBuilder, input_features: ir.Value):
         """Forward: mel (B, n_mels, T) -> (B, T', hidden_size)."""
@@ -559,16 +580,18 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
     if key.startswith("conformer."):
         return key.replace("conformer.", "audio_encoder.encoder.")
 
-    # Audio adapter -> audio_encoder.adapter
+    # Audio adapter: HF Sequential -> our named modules
+    #   model.0 = LayerNorm(encoder_dim)              -> pre_norm
+    #   model.1 = Linear(encoder_dim, hidden_size)    -> up_proj (no bias)
+    #   model.2 = GELU (no params)
+    #   model.3 = Linear(hidden_size, hidden_size)    -> out_proj
     if key.startswith("audio_adapter."):
         rest = key[len("audio_adapter.") :]
-        # audio_adapter.model.0.* -> adapter.up_proj.*
-        rest = rest.replace("model.0.", "up_proj.")
-        # audio_adapter.model.3.* -> adapter.down_proj.*
-        rest = rest.replace("model.3.", "down_proj.")
-        # Skip batch norm (model.1.*)
-        if "model.1." in key or "model.2." in key:
-            return None
+        if rest.startswith("model.2."):
+            return None  # GELU has no params
+        rest = rest.replace("model.0.", "pre_norm.")
+        rest = rest.replace("model.1.", "up_proj.")
+        rest = rest.replace("model.3.", "out_proj.")
         return f"audio_encoder.adapter.{rest}"
 
     # Audio embedding weights live in audio_decoder.depth_embeddings at runtime.
