@@ -370,6 +370,15 @@ def build(
             model_type = "qwen3_5_moe_vl"
         hf_config = hf_config.text_config
 
+    # Wav2Vec2 / HuBERT / WavLM ship ``model_type="wav2vec2"`` (etc.) for both
+    # feature-extraction and CTC checkpoints. Switch to the ``mms`` registration
+    # (Wav2Vec2ForCTCModel + ctc-asr task) when the architecture indicates a
+    # CTC head — this covers both MMS and vanilla Wav2Vec2ForCTC fine-tunes.
+    if model_type in ("wav2vec2", "hubert", "wavlm"):
+        architectures = getattr(parent_config, "architectures", None) or []
+        if any("ForCTC" in arch for arch in architectures):
+            model_type = "mms"
+
     if module_class is None:
         if model_type in registry:
             module_class = registry.get(model_type)

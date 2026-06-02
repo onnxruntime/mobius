@@ -53,6 +53,7 @@ from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
     CodePredictorConfig,
+    MMSConfig,
     SpeakerEncoderConfig,
     TTSConfig,
     VisionConfig,
@@ -2922,7 +2923,123 @@ class TestBuildAudioGraph:
             assert len(init_names) > 0, f"{model_type} should have initializers"
 
 
-class TestBuildUNetGraph:
+class TestBuildMMSGraph:
+    """Verify MMS (Massively Multilingual Speech) CTC model builds correctly.
+
+    Tests both the base wav2vec2 encoder + CTC head, and with the per-language
+    adapter (``add_adapter=True``) that enables language switching in MMS-1b-all.
+    """
+
+    def _mms_config(self, add_adapter: bool = False):
+        """Tiny CTC config: hidden=64, 2 layers, 10 vocab labels."""
+        return _base_config(
+            config_cls=MMSConfig,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=128,
+            vocab_size=10,
+            add_adapter=add_adapter,
+            output_hidden_size=64,
+            adapter_kernel_size=3,
+            adapter_stride=2,
+            num_adapter_layers=2,
+        )
+
+    def test_package_builds(self):
+        """Build MMS ONNX model and verify single-model package."""
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+        from mobius.tasks import CTCAsrTask
+
+        config = self._mms_config()
+        module = Wav2Vec2ForCTCModel(config)
+        pkg = CTCAsrTask().build(module, config)
+
+        assert "model" in pkg
+
+    def test_io_contract(self):
+        """Verify input/output names of the CTC model."""
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+        from mobius.tasks import CTCAsrTask
+
+        config = self._mms_config()
+        module = Wav2Vec2ForCTCModel(config)
+        pkg = CTCAsrTask().build(module, config)
+        model = pkg["model"]
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert "input_values" in input_names
+        assert "attention_mask" in input_names
+
+        output_names = {out.name for out in model.graph.outputs}
+        assert "logits" in output_names
+
+    def test_has_ctc_head_initializers(self):
+        """Verify the CTC lm_head parameters are present."""
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+        from mobius.tasks import CTCAsrTask
+
+        config = self._mms_config()
+        module = Wav2Vec2ForCTCModel(config)
+        pkg = CTCAsrTask().build(module, config)
+        model = pkg["model"]
+
+        init_names = list(model.graph.initializers)
+        assert any("lm_head" in n for n in init_names), "Should have lm_head params"
+        assert any("feature_extractor" in n for n in init_names), (
+            "Should have feature_extractor params"
+        )
+        assert any("encoder" in n for n in init_names), "Should have encoder params"
+
+    def test_adapter_variant_builds(self):
+        """Build with adapter enabled (MMS-1b-all language adapter path)."""
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+        from mobius.tasks import CTCAsrTask
+
+        config = self._mms_config(add_adapter=True)
+        module = Wav2Vec2ForCTCModel(config)
+        pkg = CTCAsrTask().build(module, config)
+        model = pkg["model"]
+
+        init_names = list(model.graph.initializers)
+        assert any("adapter" in n for n in init_names), (
+            "Should have adapter params when add_adapter=True"
+        )
+
+    def test_registry_lookup(self):
+        """Verify 'mms' is registered with ctc-asr task."""
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+
+        assert registry.get("mms") is Wav2Vec2ForCTCModel
+        assert _default_task_for_model("mms") == "ctc-asr"
+
+    def test_ort_inference(self):
+        """Build and run MMS through OnnxRuntime end-to-end."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+        from mobius.tasks import CTCAsrTask
+
+        config = self._mms_config()
+        module = Wav2Vec2ForCTCModel(config)
+        pkg = CTCAsrTask().build(module, config)
+        fill_random_weights(pkg["model"])
+
+        sess = OnnxModelSession(pkg["model"])
+        num_samples = 8000  # 0.5 sec at 16 kHz
+        waveform = np.random.randn(1, num_samples).astype(np.float32)
+        attention_mask = np.ones((1, num_samples), dtype=np.int64)
+
+        out = sess.run({"input_values": waveform, "attention_mask": attention_mask})
+        sess.close()
+
+        logits = out["logits"]
+        assert logits.shape[0] == 1  # batch
+        assert logits.shape[1] > 0  # num_frames (after CNN downsampling)
+        assert logits.shape[2] == config.vocab_size  # CTC vocab
+
     """Verify UNet2DConditionModel graph construction."""
 
     def _unet_config(self):
@@ -4265,6 +4382,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "wavlm",
     # Audio/TTS dedicated tests
     "fun_asr",
+    "mms",
     "qwen3_asr",
     "qwen3_forced_aligner",
     "qwen3_tts",

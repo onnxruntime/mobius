@@ -2024,3 +2024,43 @@ class WhisperConfig(BaseModelConfig):
             options["dtype"] = resolved
 
         return cls(**options)
+
+
+@dataclasses.dataclass
+class MMSConfig(ArchitectureConfig):
+    """Configuration for MMS (Massively Multilingual Speech) CTC models.
+
+    Extends ``ArchitectureConfig`` with the adapter parameters used in
+    ``facebook/mms-1b-all`` and related checkpoints.  When ``add_adapter=True``
+    the adapter layers are included in the exported ONNX graph; set this after
+    calling ``model.load_adapter(lang_code)`` to bake a specific language's
+    weights into the model.
+
+    HuggingFace class: ``Wav2Vec2ForCTC`` with ``config.model_type == "wav2vec2"``
+    """
+
+    add_adapter: bool = False
+    output_hidden_size: int = 0  # 0 → use hidden_size
+    adapter_kernel_size: int = 3
+    adapter_stride: int = 2
+    num_adapter_layers: int = 3
+
+    def __post_init__(self):
+        if self.output_hidden_size == 0:
+            self.output_hidden_size = self.hidden_size
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MMSConfig:
+        """Extract MMSConfig from a HuggingFace Wav2Vec2Config."""
+        base = ArchitectureConfig.from_transformers(config, parent_config=parent_config)
+        base_fields = _shallow_fields(base)
+        return cls(
+            **base_fields,
+            add_adapter=getattr(config, "add_adapter", False),
+            output_hidden_size=getattr(
+                config, "output_hidden_size", base_fields["hidden_size"]
+            ),
+            adapter_kernel_size=getattr(config, "adapter_kernel_size", 3),
+            adapter_stride=getattr(config, "adapter_stride", 2),
+            num_adapter_layers=getattr(config, "num_adapter_layers", 3),
+        )
