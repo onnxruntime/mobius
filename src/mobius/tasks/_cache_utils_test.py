@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import onnx_ir as ir
 
 from mobius.tasks._base import _make_graph
@@ -72,32 +74,40 @@ class TestRegisterKVCacheOutputs:
         assert _dims(key)[1] == 16 and _dims(key)[3] == 192
         assert _dims(value)[1] == 16 and _dims(value)[3] == 128
 
-    def test_no_params_leaves_shapes_untouched(self):
+    def test_no_params_leaves_shapes_untouched(self, caplog):
         """Without shape params the helper must not stamp (inference path)."""
         _, builder = _make_graph()
         pairs = [_present_pair("present.0", wrong_head_dim=32)]
 
-        _register_kv_cache_outputs(builder, pairs)
+        with caplog.at_level(logging.WARNING, logger="mobius.tasks._cache_utils"):
+            _register_kv_cache_outputs(builder, pairs)
 
         key, _ = pairs[0]
         # Unchanged: still the (wrong) pre-existing inferred shape.
         assert _dims(key) == ["batch", 32, "seq", 32]
+        # Opting out (zero params) is intentional and must stay silent.
+        assert caplog.text == ""
 
-    def test_partial_params_do_not_stamp(self):
-        """All shape params are required; a partial set falls back to inference."""
+    def test_partial_params_do_not_stamp(self, caplog):
+        """A partial set falls back to inference AND warns about the slip."""
         _, builder = _make_graph()
         pairs = [_present_pair("present.0", wrong_head_dim=32)]
 
-        _register_kv_cache_outputs(
-            builder,
-            pairs,
-            batch=ir.SymbolicDim("batch"),
-            num_kv_heads=32,
-            # key_head_dim / value_head_dim / total_seq_len / dtype omitted
-        )
+        with caplog.at_level(logging.WARNING, logger="mobius.tasks._cache_utils"):
+            _register_kv_cache_outputs(
+                builder,
+                pairs,
+                batch=ir.SymbolicDim("batch"),
+                num_kv_heads=32,
+                # key_head_dim / value_head_dim / total_seq_len / dtype omitted
+            )
 
         key, _ = pairs[0]
         assert _dims(key) == ["batch", 32, "seq", 32]
+        assert "partial set of present-shape parameters" in caplog.text
+        # The warning must name the omitted parameters so the slip is diagnosable.
+        for missing in ("key_head_dim", "value_head_dim", "total_seq_len", "dtype"):
+            assert missing in caplog.text
 
     def test_registers_named_outputs(self):
         """Outputs are registered with the conventional present.{i}.* names."""
