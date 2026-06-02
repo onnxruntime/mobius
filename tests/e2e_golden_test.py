@@ -361,6 +361,12 @@ _HIDDEN_STATE_TASKS: frozenset[str] = frozenset(
         "feature-extraction",
         "image-classification",
         "audio-feature-extraction",
+        # CTC ASR's model output is named "logits", but the saved golden's
+        # top-K is over the *last frame's* vocab vector. The
+        # ``_extract_logits`` path picks ``outputs["logits"]``; the test
+        # comparator below slices to the last frame so the shape matches
+        # the saved golden's per-token vector.
+        "ctc-asr",
     }
 )
 
@@ -1445,6 +1451,19 @@ class TestL4CheckpointVerified:
             session = _open_decoder_session(pkg)
             try:
                 feeds = _prepare_audio_feeds(case)
+                outputs = session.run(feeds)
+            finally:
+                session.close()
+        elif case.task_type == "ctc-asr":
+            # CTC ASR: input_values + attention_mask → logits per frame.
+            # The ONNX graph requires an explicit attention_mask (an
+            # all-ones mask when the input has no padding); the existing
+            # _prepare_audio_feeds only emits input_values, so we add the
+            # mask here from the same audio length used to build feeds.
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_audio_feeds(case)
+                feeds["attention_mask"] = np.ones_like(feeds["input_values"], dtype=np.int64)
                 outputs = session.run(feeds)
             finally:
                 session.close()

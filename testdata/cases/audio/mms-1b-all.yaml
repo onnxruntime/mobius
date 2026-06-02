@@ -1,0 +1,28 @@
+model_id: "facebook/mms-1b-all"
+model_type: "mms"
+revision: "main"
+task_type: "ctc-asr"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  lang: "eng"
+
+level: "L4+L5"
+
+skip_reason: >
+  Mobius build for the full 1B-param facebook/mms-1b-all model currently
+  exhausts host RAM during ONNX graph construction (48-layer encoder + GLU
+  adapter chain). The L4/L5 golden references are still generated from the
+  HuggingFace reference and committed for future regression coverage once
+  the build-side OOM is fixed (or a smaller CTC checkpoint is wired in).
+
+notes: >
+  MMS 1B-all CTC ASR with the English ("eng") language adapter loaded.
+  Architecture: Wav2Vec2 feature extractor + transformer encoder + 3-layer
+  GLU adapter + CTC lm_head. Test audio is a ~3.4 s English LibriSpeech
+  clip; the CTC greedy decode should reproduce the same transcript as
+  the HuggingFace Wav2Vec2ForCTC reference.
