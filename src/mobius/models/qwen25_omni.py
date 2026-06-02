@@ -12,16 +12,13 @@ HuggingFace class: Qwen2_5OmniForConditionalGeneration
 
 from __future__ import annotations
 
-import dataclasses
-
 import numpy as np
 import onnx_ir as ir
 import torch
-from onnxscript import nn
-from onnxscript._internal import builder
-
+from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius.components import Qwen25VLVisionModel
 from mobius.components._common import (
     Embedding,
     LayerNorm,
@@ -29,9 +26,10 @@ from mobius.components._common import (
     create_attention_bias,
 )
 from mobius.components._conv import Conv1d
+from mobius.components._decoder import DecoderLayer
 from mobius.components._qwen25_omni_audio import Qwen25OmniAudioEncoderLayer
-from mobius.components import Qwen25VLVisionModel
-
+from mobius.components._rms_norm import RMSNorm
+from mobius.components._rotary_embedding import initialize_rope
 
 
 def _sinusoidal_position_embedding(max_positions: int, d_model: int) -> np.ndarray:
@@ -55,7 +53,8 @@ def _sinusoidal_position_embedding(max_positions: int, d_model: int) -> np.ndarr
 
 
 class Qwen25OmniAudioEncoder(nn.Module):
-    """Qwen25-Omni audio encoder
+    """Qwen25-Omni audio encoder.
+
     Converts mel spectrogram to audio feature embeddings:
       mel (batch, num_mel_bins, seq_len)
       -> 2x Conv1d with GELU
@@ -79,23 +78,11 @@ class Qwen25OmniAudioEncoder(nn.Module):
         encoder_heads = audio.encoder_attention_heads or 20
         encoder_ffn = audio.encoder_ffn_dim or 3584
         max_source_positions = audio.max_source_positions or 1500
-        n_window = audio.n_window or 100
         output_dim = audio.output_dim or 3584
 
         # 2x Conv1d: mel -> d_model with GELU between them
-        self.conv1 = Conv1d(
-            num_mel_bin,
-            d_model,
-            kernel_size=3,
-            padding=1,
-        )
-        self.conv2 = Conv1d(
-            d_model,
-            d_model,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-        )
+        self.conv1 = Conv1d(num_mel_bin, d_model, kernel_size=3, padding=1)
+        self.conv2 = Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1)
 
         # Sinusoidal positional embeddings (frozen)
         pe_data = _sinusoidal_position_embedding(max_source_positions, d_model)
@@ -104,7 +91,6 @@ class Qwen25OmniAudioEncoder(nn.Module):
             name="positional_embedding.positional_embedding",
             data=ir.tensor(pe_data),
         )
-
 
         # Encoder transformer layers
         self.layers = nn.ModuleList(
@@ -120,7 +106,7 @@ class Qwen25OmniAudioEncoder(nn.Module):
         # Output projection: d_model -> output_dim
         self.proj = Linear(d_model, output_dim)
 
-    def forward(self, op: builder.OpBuilder, input_features: ir.Value):
+    def forward(self, op: OpBuilder, input_features: ir.Value):
         """Encode mel spectrogram to audio features.
 
         Args:
@@ -129,7 +115,6 @@ class Qwen25OmniAudioEncoder(nn.Module):
         Returns:
             audio_features: (batch, out_seq_len, output_dim)
         """
-
         # 2X Conv1d with GELU: (batch, mel, seq) -> (batch, d_model, seq//2)
         hidden_states = op.Gelu(self.conv1(op, input_features))
         hidden_states = op.Gelu(self.conv2(op, hidden_states))
@@ -143,32 +128,26 @@ class Qwen25OmniAudioEncoder(nn.Module):
             self.positional_embedding,
             op.Constant(value_ints=[0]),
             seq_len,
-            op.Constant(value_ints=[0])
+            op.Constant(value_ints=[0]),
         )
-
         hidden_states = op.Add(hidden_states, pe_slice)
 
-        # Encoder layer
         for layer in self.layers:
             hidden_states = layer(op, hidden_states)
 
-        # AvgPool1d(kernel=2, stride=2): halves sequence length
-        # Transpose to (batch, d_model, seq) for pooling, then back
+        # AvgPool1d(kernel=2, stride=2): halves sequence length.
+        # Transpose to (batch, d_model, seq) for pooling, then back.
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
         hidden_states = op.AveragePool(hidden_states, kernel_shape=[2], strides=[2])
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
 
-        # ln_post once, then proj
         hidden_states = self.ln_post(op, hidden_states)
         hidden_states = self.proj(op, hidden_states)
-
         return hidden_states
 
 
 class Qwen25OmniVisionEncoder(nn.Module):
-    """
-    Qwen2.5-Omni vision encoder - reuses Qwen2.5-VL ViT
-    """
+    """Qwen2.5-Omni vision encoder — reuses the Qwen2.5-VL ViT."""
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -177,26 +156,27 @@ class Qwen25OmniVisionEncoder(nn.Module):
 
         self.visual = Qwen25VLVisionModel(
             depth=vc.num_hidden_layers or 32,
-            hidden_size = vc.hidden_size or 1280,
-            intermediate_size = vc.intermediate_size or 3420,
-            num_heads = vc.num_attention_heads or 16,
-            patch_size = vc.patch_size or 14,
-            temporal_patch_size = vc.temporal_patch_size or 2,
-            in_channels = vc.in_channels or 3,
-            out_hidden_size = vc.out_hidden_size or 3584,
-            spatial_merge_size = vc.spatial_merge_size or 2,
-            fullatt_block_indexes = vc.fullatt_block_indexes or (7, 15, 23, 31),
-            window_size = vc.window_size or 112
+            hidden_size=vc.hidden_size or 1280,
+            intermediate_size=vc.intermediate_size or 3420,
+            num_heads=vc.num_attention_heads or 16,
+            patch_size=vc.patch_size or 14,
+            temporal_patch_size=vc.temporal_patch_size or 2,
+            in_channels=vc.in_channels or 3,
+            out_hidden_size=vc.out_hidden_size or 3584,
+            spatial_merge_size=vc.spatial_merge_size or 2,
+            fullatt_block_indexes=vc.fullatt_block_indexes or (7, 15, 23, 31),
+            window_size=vc.window_size or 112,
         )
 
-    def forward(self, op, pixel_values, image_grid_thw):
+    def forward(self, op: OpBuilder, pixel_values: ir.Value, image_grid_thw: ir.Value):
         return self.visual(op, pixel_values, image_grid_thw)
 
+
 class Qwen25OmniEmbeddingModel(nn.Module):
-    """Fuses text embedding with audio and image feature
-    
-    Replaces audio_token_id positions with audio features,
-    and image_token_id positions with image features.
+    """Fuses text embedding with audio and image features.
+
+    Replaces ``audio_token_id`` positions with audio features and
+    ``image_token_id`` positions with image features.
 
     Inputs:
         input_ids: (batch, seq_len)
@@ -210,42 +190,53 @@ class Qwen25OmniEmbeddingModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
+            config.vocab_size,
+            config.hidden_size,
+            config.pad_token_id,
         )
 
-        # Token IDs from Qwen2.5-Omni config
+        # Token IDs default to the values used by Qwen2.5-Omni-7B.
         audio = config.audio
-        self._audio_token_id = audio.audio_token_id if audio else 151646
-        self._image_token_id = audio.image_token_id or 151655
+        vision = config.vision
+        self._audio_token_id = (audio.audio_token_id if audio else None) or 151646
+        self._image_token_id = (vision.image_token_id if vision else None) or 151655
 
-    
-    def forward(self, op, inputs_ids, audio_features, image_features):
-        inputs_embeds = self.embed_tokens(op, inputs_ids)
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        audio_features: ir.Value,
+        image_features: ir.Value,
+    ):
+        inputs_embeds = self.embed_tokens(op, input_ids)
 
-        # Fuse audio features at audio token positions
+        # Fuse audio features at audio token positions.
         inputs_embeds = self._replace_tokens(
-            op, inputs_embeds, inputs_ids, audio_features, self._audio_token_id
+            op, inputs_embeds, input_ids, audio_features, self._audio_token_id
         )
 
-        # Fuse image features at image token position
+        # Fuse image features at image token positions.
         inputs_embeds = self._replace_tokens(
-            op, inputs_embeds, inputs_ids, image_features, self._image_token_ids
+            op, inputs_embeds, input_ids, image_features, self._image_token_id
         )
 
-        return input_embeds
+        return inputs_embeds
 
     def _replace_tokens(self, op, inputs_embeds, input_ids, features, token_id):
         """Replace token positions with encoder features (masked_scatter equivalent)."""
         mask = op.Equal(input_ids, op.Constant(value_int=token_id))
         mask_3d = op.Unsqueeze(mask, [-1])
 
-        # Pad with zero row for safety (text-only case: no features)
+        # Pad with a zero row for safety (text-only case: no features).
         feature_dim = op.Shape(features, start=1, end=2)
         zero_shape = op.Concat(op.Constant(value_ints=[1]), feature_dim, axis=0)
-        zero_row = op.ConstantOfShape(zero_shape, value=ir.tensor(np.zeros(1, dtype=np.float32)))
+        zero_row = op.ConstantOfShape(
+            zero_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))
+        )
         padded = op.Concat(zero_row, features, axis=0)
 
-        # CumSum to get gather indices
+        # CumSum-based per-position gather index. Mask positions get the
+        # next feature row in order; non-mask positions get the zero row.
         mask_int = op.Cast(mask, to=7)
         flat = op.Reshape(mask_int, op.Constant(value_ints=[-1]))
         indices = op.CumSum(flat, op.Constant(value_int=0))
@@ -273,9 +264,18 @@ class Qwen25OmniDecoderModel(nn.Module):
         self.rotary_emb = initialize_rope(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values=None):
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values=None,
+    ):
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(op, position_ids)
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
 
         attention_bias = create_attention_bias(
             op,
@@ -299,9 +299,108 @@ class Qwen25OmniDecoderModel(nn.Module):
         hidden_states = self.norm(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
-        )
+
 
 class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
-    pass
+    """Qwen2.5-Omni Thinker: composite audio + vision + text model.
 
+    Builds four separate ONNX models:
 
+    - ``decoder``: Qwen2.5 text decoder taking ``inputs_embeds``
+    - ``vision_encoder``: Qwen2.5-VL ViT (pixel_values + grid_thw → image features)
+    - ``audio_tower``: 2x Conv1d + transformer audio tower (mel → audio features)
+    - ``embedding``: word embedding + multimodal feature fusion
+
+    HuggingFace class: ``Qwen2_5OmniForConditionalGeneration`` (Thinker only —
+    the Talker / streaming code generation head is out of scope for now).
+    """
+
+    default_task: str = "speech-language"
+    category: str = "Multimodal"
+    config_class: type = ArchitectureConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.config = config
+        self.decoder = Qwen25OmniDecoderModel(config)
+        self.embedding = Qwen25OmniEmbeddingModel(config)
+        self.vision_encoder: Qwen25OmniVisionEncoder | None = (
+            Qwen25OmniVisionEncoder(config) if config.vision is not None else None
+        )
+        # Named ``audio_tower`` (not ``audio_encoder``) to match
+        # ``SpeechLanguageTask`` which looks up ``module.audio_tower``.
+        # The vision sub-module is currently not routed through any
+        # task — wiring a dedicated Qwen25OmniTask that builds all four
+        # ONNX sub-models is a follow-up; today the
+        # ``speech-language`` task entry only drives audio + text.
+        self.audio_tower: Qwen25OmniAudioEncoder | None = (
+            Qwen25OmniAudioEncoder(config) if config.audio is not None else None
+        )
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Qwen25OmniThinkerForConditionalGeneration is a multi-model split; the corresponding "
+            "task class builds each sub-module (decoder, embedding, vision_encoder, audio_encoder) "
+            "separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Map HuggingFace weight names to ONNX module structure.
+
+        HF Qwen2.5-Omni checkpoints prefix every Thinker key with ``thinker.``:
+
+        - ``thinker.audio_tower.*`` → ``audio_tower.*``
+        - ``thinker.visual.*`` → ``vision_encoder.visual.*``
+        - ``thinker.model.embed_tokens.*`` → ``embedding.embed_tokens.*``
+        - ``thinker.model.layers.N.*`` and ``model.norm.*`` → ``decoder.*``
+        - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
+        - ``thinker.model.rotary_emb.*`` → ``decoder.rotary_emb.*``
+
+        The Talker sub-tree (``talker.*``) and the audio-output codec head
+        are not consumed by this model and are silently dropped.
+        """
+        cleaned: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            # Strip the thinker. prefix if present.
+            if key.startswith("thinker."):
+                key = key[len("thinker.") :]
+
+            # Drop talker.* and any codec output keys — not part of Thinker.
+            if key.startswith(("talker.", "code_predictor.")):
+                continue
+
+            if key.startswith("audio_tower."):
+                cleaned[key] = value
+                continue
+
+            if key.startswith("visual."):
+                cleaned["vision_encoder." + key] = value
+                continue
+
+            if key.startswith("lm_head."):
+                cleaned["decoder." + key] = value
+                continue
+
+            if key.startswith("model."):
+                inner = key[len("model.") :]
+                if inner.startswith("embed_tokens."):
+                    cleaned["embedding." + inner] = value
+                    continue
+                if inner.startswith(("layers.", "norm.", "rotary_emb.")):
+                    cleaned["decoder." + inner] = value
+                    continue
+
+            cleaned[key] = value
+
+        # Weight tying: ``embedding.embed_tokens.weight`` ↔ ``decoder.lm_head.weight``.
+        embed_key = "embedding.embed_tokens.weight"
+        lm_key = "decoder.lm_head.weight"
+        if getattr(self.config, "tie_word_embeddings", False):
+            if embed_key in cleaned and lm_key not in cleaned:
+                cleaned[lm_key] = cleaned[embed_key]
+            elif lm_key in cleaned and embed_key not in cleaned:
+                cleaned[embed_key] = cleaned[lm_key]
+
+        return cleaned

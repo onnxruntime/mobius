@@ -17,9 +17,9 @@ from onnxscript._internal import builder
 
 from mobius.components._common import LayerNorm, Linear
 
-
 if TYPE_CHECKING:
     import onnx_ir as ir
+
 
 class Qwen25OmniAudioAttention(nn.Module):
     """Bidirectional multi-head attention for Qwen2_5Omni audio encoder.
@@ -27,6 +27,7 @@ class Qwen25OmniAudioAttention(nn.Module):
     Unlike WhisperAttention, all projections (Q, V, Out) have bias and K does not have bias.
     No causal masking — the encoder uses full bidirectional attention.
     """
+
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
         self.q_proj = Linear(d_model, d_model, bias=True)
@@ -37,7 +38,7 @@ class Qwen25OmniAudioAttention(nn.Module):
         self._head_dim = d_model // num_heads
 
     def forward(self, op: builder.OpBuilder, hidden_states: ir.Value):
-        """Bidirectional self-attention
+        """Bidirectional self-attention.
 
         Args:
             hidden_states: (batch, seq_len, d_model)
@@ -45,7 +46,6 @@ class Qwen25OmniAudioAttention(nn.Module):
         Returns:
             output: (batch, seq_len, d_model)
         """
-
         q = self.q_proj(op, hidden_states)
         k = self.k_proj(op, hidden_states)
         v = self.v_proj(op, hidden_states)
@@ -55,8 +55,8 @@ class Qwen25OmniAudioAttention(nn.Module):
             q,
             k,
             v,
-            q_num_heads = self._num_heads,
-            kv_num_heads = self._num_heads,
+            q_num_heads=self._num_heads,
+            kv_num_heads=self._num_heads,
             scale=float(self._head_dim**-0.5),
         )
         return self.out_proj(op, attn_output)
@@ -68,7 +68,7 @@ class Qwen25OmniAudioEncoderLayer(nn.Module):
     Pre-norm pattern:  LayerNorm → self-attn → residual
     → LayerNorm → FFN → residual.
     Uses GELU activation in the FFN.
-    
+
     Huggingface class: ``Qwen2_5OmniAudioEncoder``
     """
 
@@ -92,7 +92,7 @@ class Qwen25OmniAudioEncoderLayer(nn.Module):
         Args:
             hidden_states: (batch, seq_len, d_model)
 
-        returns:
+        Returns:
             hidden_states: (batch, seq_len, d_model)
         """
         # Self-attention with pre-norm and residual
@@ -110,6 +110,3 @@ class Qwen25OmniAudioEncoderLayer(nn.Module):
         hidden_states = op.Add(residual, hidden_states)
 
         return hidden_states
-
-
-

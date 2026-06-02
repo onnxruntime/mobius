@@ -4288,6 +4288,13 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
 _KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
     "deepseek_v2_moe",  # Alias for deepseek_v2 — tested via deepseek_v2
     "qwen3_5_vl_text",  # VL text decoder — tested via parent VL model
+    # Qwen2.5-Omni Thinker is a 4-model split (audio + vision + embedding +
+    # decoder). The model graph is implemented but the existing
+    # SpeechLanguageTask only knows audio + text, so wiring a dedicated
+    # task that also drives the vision encoder is a follow-up — tracked
+    # in the Qwen2.5-Omni onboarding PR (#193). When that lands, move
+    # the entry into a dedicated test (mirroring gemma4_any_to_any).
+    "qwen2_5_omni",
 }
 
 
