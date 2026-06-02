@@ -94,6 +94,7 @@ __all__ = [
     "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
+    "Qwen35MoEVL3ModelCausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
     "Qwen35VLDecoderModel",
     "Qwen35VLTextModel",
@@ -227,6 +228,7 @@ from mobius.models.qwen3_tts_tokenizer import (
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
+    Qwen35MoEVL3ModelCausalLMModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLDecoderModel,
     Qwen35VLTextModel,

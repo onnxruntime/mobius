@@ -23,10 +23,56 @@ from collections import Counter
 from pathlib import Path
 
 import tqdm
+from huggingface_hub import HfApi, hf_hub_download
 
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    """Heuristic: ``value`` matches ``owner/repo`` (no path separators, no .gguf suffix)."""
+    if value.startswith((".", "/", "~")):
+        return False
+    parts = value.split("/")
+    return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
+
+
+def _resolve_gguf_path(gguf_path: str | Path) -> str:
+    """Resolve a GGUF reference to a local file path.
+
+    Accepts:
+    - An existing local filesystem path (returned unchanged).
+    - A HuggingFace Hub reference ``"owner/repo"`` — the repo must contain
+      exactly one ``*.gguf`` file, which is downloaded.
+    - A HuggingFace Hub reference ``"owner/repo:filename.gguf"`` to pick a
+      specific file from a multi-file repo.
+    """
+    raw = str(gguf_path)
+    if Path(raw).exists():
+        return raw
+
+    # Split the optional ":filename" suffix before classifying so HF refs like
+    # "owner/repo:weights.gguf" are not mistaken for a local path ending in .gguf.
+    repo_id, _, filename = raw.partition(":")
+    if not _looks_like_hf_repo_id(repo_id):
+        # Looks like a local path that doesn't exist; let GGUFModel raise
+        # FileNotFoundError with the original path.
+        return raw
+
+    if not filename:
+        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".gguf")]
+        if not files:
+            raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
+        if len(files) > 1:
+            raise ValueError(
+                f"HF repo {repo_id!r} contains multiple .gguf files: {files}. "
+                f"Specify one via '{repo_id}:<filename.gguf>'."
+            )
+        filename = files[0]
+
+    logger.info("Downloading %s from %s", filename, repo_id)
+    return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
 def build_from_gguf(
@@ -35,6 +81,7 @@ def build_from_gguf(
     task: str | None = None,
     dtype: str | None = None,
     keep_quantized: bool = False,
+    execution_provider: str = "default",
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -50,7 +97,12 @@ def build_from_gguf(
     repacked into MatMulNBits format instead of dequantized.
 
     Args:
-        gguf_path: Path to the ``.gguf`` file.
+        gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
+            reference of the form ``"owner/repo"`` (the repo must
+            contain exactly one ``*.gguf`` file) or
+            ``"owner/repo:filename.gguf"`` to pick a specific file. HF
+            references are downloaded via ``huggingface_hub`` into the
+            standard local cache.
         task: Override the model task (e.g. ``"text-generation"``).
             When ``None``, the task is auto-detected from the
             model type.
@@ -59,6 +111,10 @@ def build_from_gguf(
         keep_quantized: When ``True``, preserve quantization for
             supported GGUF types (Q4_0, Q4_1, Q8_0) by repacking
             linear-layer weights into MatMulNBits format.
+        execution_provider: Target execution provider for EP-aware
+            optimisations (e.g. ``"cpu"`` to apply the
+            GroupQueryAttention rewrite). Defaults to ``"default"``
+            (portable, no vendor fusions).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -87,7 +143,8 @@ def build_from_gguf(
         process_tensors,
     )
 
-    # 1. Parse GGUF file
+    # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
+    gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = GGUFModel(gguf_path)
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
@@ -106,18 +163,29 @@ def build_from_gguf(
     # 3. Quantized path: detect dominant type and set config
     if keep_quantized:
         from mobius._configs import QuantizationConfig
+        from mobius._flags import flags
+        from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
 
-        bits, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+        bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+        # Float zero-point only when actually using Tencent's native 2-bit form.
+        float_zp = is_tencent_q1_0_layout(gguf_model) and flags.tencent_q1_0_use_native_2bit
         config = dataclasses.replace(
             config,
             quantization=QuantizationConfig(
                 bits=bits,
-                group_size=32,
+                group_size=block_size,
                 quant_method="gguf",
                 sym=is_sym,
+                float_zero_point=float_zp,
             ),
         )
-        logger.info("Quantized mode: bits=%d, symmetric=%s", bits, is_sym)
+        logger.info(
+            "Quantized mode: bits=%d, block_size=%d, symmetric=%s, float_zp=%s",
+            bits,
+            block_size,
+            is_sym,
+            float_zp,
+        )
 
     # 4. Look up module class and resolve task
     module_class = registry.get(model_type)
@@ -126,7 +194,7 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
-    pkg = build_from_module(module, config, task)
+    pkg = build_from_module(module, config, task, execution_provider=execution_provider)
     logger.info(
         "Built ONNX graph for %s (%d components)",
         model_type,
@@ -249,14 +317,14 @@ def _normalize_gguf_weights(
     return result
 
 
-def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
-    """Detect bits and symmetry from dominant GGUF quant type.
+def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
+    """Detect bits, block size, and symmetry from dominant GGUF quant type.
 
-    Scans block-level (projection) tensors and returns the
-    bit-width and symmetry flag of the most common repackable type.
+    Scans block-level (projection) tensors and returns the bit-width,
+    block size, and symmetry flag of the most common repackable type.
 
     Returns:
-        ``(bits, is_symmetric)`` tuple.
+        ``(bits, block_size, is_symmetric)`` tuple.
 
     Raises:
         ValueError: If no repackable quantized tensors are found.
@@ -264,17 +332,25 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
     from gguf import GGMLQuantizationType
 
     from mobius.integrations.gguf._repacker import can_repack
+    from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
 
-    q4_types = {
-        GGMLQuantizationType.Q4_0,
-        GGMLQuantizationType.Q4_1,
-    }
-    symmetric_types = {
-        GGMLQuantizationType.Q4_0,
-        GGMLQuantizationType.Q8_0,
+    # Per-type parameters: (bits, block_size, is_symmetric).
+    #
+    # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
+    # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
+    # 512-elt blocks) is inflated to 4-bit MatMulNBits with zp=3 — see
+    # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
+    # path is currently only implemented for bits=4, and the half-integer
+    # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
+    type_params: dict = {
+        GGMLQuantizationType.Q4_0: (4, 32, True),
+        GGMLQuantizationType.Q4_1: (4, 32, False),
+        GGMLQuantizationType.Q4_K: (4, 32, False),
+        GGMLQuantizationType.Q8_0: (8, 32, True),
+        GGMLQuantizationType.Q1_0: (2, 128, False),
     }
 
     counts: Counter = Counter()
@@ -292,15 +368,31 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, bool]:
         )
 
     dominant = counts.most_common(1)[0][0]
-    bits = 4 if dominant in q4_types else 8
-    is_sym = dominant in symmetric_types
+    bits, block_size, is_sym = type_params[dominant]
+
+    # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
+    # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
+    # Override the mainline defaults so the resulting QuantizedLinear
+    # matches what parse_tencent_q1_0_tensor produces (4-bit packed).
+    if dominant == GGMLQuantizationType.Q1_0 and is_tencent_q1_0_layout(gguf_model):
+        # See _tencent_q1_0.py — the bits/zp flavour depends on a flag:
+        #   default (fast):  bits=4 packed-uint8 zp=3 (inflated codebook)
+        #   opt-in (small):  bits=2 float zp=1.5 (native SEQ layout)
+        from mobius._flags import flags
+
+        if flags.tencent_q1_0_use_native_2bit:
+            bits, block_size, is_sym = 2, 128, False
+        else:
+            bits, block_size, is_sym = 4, 128, False
+
     logger.info(
-        "Dominant GGUF quant type: %s (%d tensors, bits=%d)",
+        "Dominant GGUF quant type: %s (%d tensors, bits=%d, block_size=%d)",
         dominant,
         counts[dominant],
         bits,
+        block_size,
     )
-    return bits, is_sym
+    return bits, block_size, is_sym
 
 
 def _load_dequantized_state_dict(
@@ -358,6 +450,10 @@ def _load_quantized_state_dict(
         can_repack,
         repack_gguf_tensor,
     )
+    from mobius.integrations.gguf._tencent_q1_0 import (
+        is_tencent_q1_0_layout,
+        parse_tencent_q1_0_tensor,
+    )
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
@@ -374,6 +470,19 @@ def _load_quantized_state_dict(
 
     num_heads = getattr(config, "num_attention_heads", None)
     num_kv_heads = getattr(config, "num_key_value_heads", None)
+
+    # Detect Tencent's non-mainline Q1_0 layout once per file. Reading
+    # such tensors requires a custom parser keyed on the explicit
+    # per-tensor file offset (mainline byte sizes are wrong).
+    tencent_q1_0 = is_tencent_q1_0_layout(gguf_model)
+    if tencent_q1_0:
+        gguf_path = str(gguf_model._path)
+        data_section_offset = gguf_model._reader.data_offset
+        tensors_by_name = {t.name: t for t in gguf_model._reader.tensors}
+        logger.info(
+            "Detected Tencent Q1_0 layout (block_size=512, 2-bit SEQ); "
+            "using custom per-tensor parser"
+        )
 
     state_dict: dict[str, torch.Tensor] = {}
     n_repacked = 0
@@ -394,15 +503,27 @@ def _load_quantized_state_dict(
         # Repack if the tensor is repackable AND its target ONNX
         # parameter is from a QuantizedLinear module.
         stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
-        should_repack = stem is not None and stem in quantized_stems and can_repack(qtype_val)
+        is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
+        should_repack = (
+            stem is not None
+            and stem in quantized_stems
+            and (can_repack(qtype_val) or is_tencent_q1_0_tensor)
+        )
 
         if should_repack:
-            shape_2d = (int(np_shape[0]), int(np_shape[1]))
-            repacked = repack_gguf_tensor(
-                raw.ravel().view(np.uint8),
-                qtype_val,
-                shape_2d,
-            )
+            if is_tencent_q1_0_tensor:
+                repacked = parse_tencent_q1_0_tensor(
+                    gguf_path,
+                    data_section_offset,
+                    tensors_by_name[gguf_name],
+                )
+            else:
+                shape_2d = (int(np_shape[0]), int(np_shape[1]))
+                repacked = repack_gguf_tensor(
+                    raw.ravel().view(np.uint8),
+                    qtype_val,
+                    shape_2d,
+                )
             w = torch.from_numpy(repacked.weight)
             s = torch.from_numpy(repacked.scales)
 

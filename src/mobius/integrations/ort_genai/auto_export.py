@@ -77,6 +77,9 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma4_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
+    # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
+    # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
+    "hunyuan_v1_dense": "decoder",
     # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen2_5_vl",
@@ -143,6 +146,17 @@ def _introspect_inputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     if model is None:
         return None
     return {n: n for n in _graph_input_names(model)}
+
+
+def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
+    """Return ``{name: name}`` identity mapping for a sub-model's outputs.
+
+    Returns ``None`` when *key* is absent from *pkg*.
+    """
+    model = pkg.get(key)
+    if model is None:
+        return None
+    return {out.name: out.name for out in model.graph.outputs if out.name is not None}
 
 
 def _copy_tokenizer_files(
@@ -638,6 +652,22 @@ def _write_genai_config(
     # Derive decoder filename from the actual package key
     decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
 
+    # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
+    # graph to write the KV cache in place. Only ``com.microsoft.
+    # GroupQueryAttention`` does that; the standard ONNX ``Attention`` op
+    # concatenates ``past_key`` with the new ``K`` and returns a dynamic-
+    # shape ``present_key``, which is incompatible with the pre-allocated
+    # shared buffer. Introspect the graph: if there is at least one GQA
+    # node, the model supports shared-buffer mode; otherwise force it off
+    # regardless of the EP capability flag.
+    decoder_model = pkg.get(decoder_key)
+    supports_in_place_kv_cache: bool | None = None
+    if decoder_model is not None:
+        supports_in_place_kv_cache = any(
+            node.op_type == "GroupQueryAttention" and node.domain == "com.microsoft"
+            for node in decoder_model.graph
+        )
+
     generator = GenaiConfigGenerator.from_config(
         config,
         ort_model_type,
@@ -648,6 +678,7 @@ def _write_genai_config(
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
         decoder_filename=decoder_filename,
+        supports_in_place_kv_cache=supports_in_place_kv_cache,
     )
 
     if is_vlm:
@@ -692,6 +723,10 @@ def _write_genai_config(
                 vision_kwargs["input_names"] = vision_input_mapping
             if embedding_input_mapping is not None:
                 vision_kwargs["embedding_input_names"] = embedding_input_mapping
+
+            embedding_output_mapping = _introspect_outputs(pkg, "embedding")
+            if embedding_output_mapping is not None:
+                vision_kwargs["embedding_output_names"] = embedding_output_mapping
 
             generator.with_vision(image_token_id=image_token_id, **vision_kwargs)
 

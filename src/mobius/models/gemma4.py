@@ -1099,6 +1099,8 @@ class Gemma4DecoderLayer(nn.Module):
 
             self._top_k = config.num_experts_per_tok
             self._num_experts = config.num_local_experts
+            self._moe_intermediate_size = config.moe_intermediate_size
+            self._hidden_size = config.hidden_size
             moe_inter = config.moe_intermediate_size
 
             self.router = _Gemma4MoeRouter(
@@ -1177,25 +1179,71 @@ class Gemma4DecoderLayer(nn.Module):
 
             caps = ep_capabilities()
             if caps.supports_fused_moe:
-                # Fused MoE op: handles top-k selection + expert dispatch internally.
-                # NOTE: per_expert_scale is NOT applied in fused path (ORT op limitation).
-                # CastLike restores dtype after op.MoE (custom op, type=None on output)
-                # so downstream ops can correctly infer types and share scalar initializers.
-                # Using CastLike(target=normed_flat) preserves bf16/fp16/fp32 from the input.
+                # Fused com.microsoft::MoE op handles top-k selection +
+                # expert dispatch internally. Requires ORT main (post
+                # microsoft/onnxruntime#28467, MoE GEMM Refactor) which
+                # plumbs the SwiGLU schema attributes to the kernel.
+                #
+                # Gemma 4 SwiGLU semantics (vs GPT-OSS):
+                #   activation_alpha=1.0   — silu(gate) (no GPT-OSS alpha=1.702)
+                #   activation_beta=0.0    — linear * gate (no GPT-OSS "+1" bias)
+                #   swiglu_limit=inf       — no clipping (≤0 disables the clamp)
+                #   swiglu_fusion=1        — interleaved layout
+                #                            [g_0, u_0, g_1, u_1, ...].
+                #
+                # mobius stores ``fc1_experts_weights`` chunked as
+                # ``[E, 2*inter, H]`` (first ``inter`` rows = gate,
+                # next ``inter`` = up) because that matches HuggingFace
+                # ``experts.gate_up_proj``. The fused op needs the
+                # interleaved layout, so reshape ``[E, 2, inter, H]`` →
+                # transpose to ``[E, inter, 2, H]`` → flatten back to
+                # ``[E, 2*inter, H]``. The whole chain operates on a
+                # constant initializer so ORT folds it into a single
+                # static tensor at session load.
+                #
+                # ``swiglu_fusion=1`` is required because the CPU MoE
+                # kernel still only supports the interleaved layout
+                # (``contrib_ops/cpu/moe/moe_cpu.cc:27``); the new CUDA
+                # kernel accepts either.
+                #
+                # CastLike restores the input dtype because op.MoE is a
+                # custom op with type=None on its output; without the
+                # cast downstream type inference cannot share scalar
+                # initializers in bf16/fp16 graphs.
+                e_dim = self._num_experts
+                inter = self._moe_intermediate_size
+                hidden = self._hidden_size
+                fc1_interleaved = op.Reshape(
+                    op.Transpose(
+                        op.Reshape(
+                            self.fc1_experts_weights,
+                            op.Constant(value_ints=[e_dim, 2, inter, hidden]),
+                        ),
+                        perm=[0, 2, 1, 3],
+                    ),
+                    op.Constant(value_ints=[e_dim, 2 * inter, hidden]),
+                )  # [E, 2*inter, H] interleaved
                 moe_out_flat = op.CastLike(
                     op.MoE(  # type: ignore[attr-defined]
                         normed_flat,
                         router_probs,
-                        self.fc1_experts_weights,
+                        fc1_interleaved,
+                        None,  # fc1_experts_bias (slot 3, optional)
                         self.fc2_experts_weights,
-                        activation_type="silu",
+                        activation_type="swiglu",
                         k=self._top_k,
                         normalize_routing_weights=1,
+                        activation_alpha=1.0,
+                        activation_beta=0.0,
+                        swiglu_limit=float("inf"),
+                        swiglu_fusion=1,
                         _domain="com.microsoft",
                     ),
                     normed_flat,  # match input dtype (bf16/fp16/fp32)
                 )  # [B*S, H]
             else:
+                # EPs without fused MoE support fall back to a static
+                # per-expert unroll.
                 moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
 
             moe_out = op.Reshape(moe_out_flat, op.Shape(residual))  # [B, S, H]
@@ -1248,7 +1296,7 @@ class Gemma4DecoderLayer(nn.Module):
         """
         # Top-K selection: top_weights/top_indices both [T, K]
         top_weights_raw, top_indices = op.TopK(
-            router_probs, op.Constant(value_ints=[self._top_k]), axis=-1
+            router_probs, op.Constant(value_ints=[self._top_k]), axis=-1, _outputs=2
         )
         # Arithmetic normalisation: weights sum to 1 (matches HF: top_k_weights /= top_k_weights.sum(-1, keepdim=True))
         top_weights = op.Div(
@@ -1383,13 +1431,12 @@ class Gemma4TextModel(nn.Module):
         self.rotary_emb_local = initialize_rope(local_config)
         self.rotary_emb_global = initialize_rope(global_config)
 
-        # Per-layer input embeddings (optional feature)
+        # Per-layer input dimension (used by decoder layers).
+        # In VLM 3-model split, per-layer inputs are precomputed by the
+        # embedding model and passed as per_layer_inputs. In single-model
+        # (text-only) mode, they are computed here from input_ids.
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         self._hidden_size = config.hidden_size
-        # Multimodal token IDs to mask before per-layer embedding lookup.
-        # HF masks these to pad_token_id (0) so image/audio slots don't contribute
-        # arbitrary large-ID embeddings to the per-layer gate (see
-        # Gemma4Model.forward lines 39-46 in HuggingFace transformers).
         self._image_token_id: int = config.image_token_id or 0
         self._audio_token_id: int | None = (
             config.audio.audio_token_id if config.audio is not None else None
@@ -1397,20 +1444,13 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Use per-layer embedding tables instead of one giant [V, L*D] table.
-            # Each [V, D] table has only V*D elements (e.g. 262144*256 = 67M),
-            # well under the ORT CUDA Gather int32 limit (~2.1B).  This also
-            # avoids the post-Gather reshape and per-layer axis-2 slicing.
-            self.embed_tokens_per_layer = nn.ModuleList(
-                [
-                    Gemma3TextScaledWordEmbedding(
-                        vocab_per_layer,
-                        self._per_layer_dim,
-                        config.pad_token_id,
-                        embed_scale=float(self._per_layer_dim**0.5),
-                    )
-                    for _ in range(config.num_hidden_layers)
-                ]
+            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
+            # Gather int64 index support (onnxruntime#28107).
+            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+                vocab_per_layer,
+                self._num_layers * self._per_layer_dim,
+                config.pad_token_id,
+                embed_scale=float(self._per_layer_dim**0.5),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -1424,22 +1464,10 @@ class Gemma4TextModel(nn.Module):
     def _compute_per_layer_inputs(
         self,
         op: OpBuilder,
-        input_ids: ir.Value | None,
+        input_ids: ir.Value,
         inputs_embeds: ir.Value,
-    ) -> list[ir.Value] | None:
-        """Compute per-layer input embeddings, one ``[B, S, per_layer_dim]`` per layer.
-
-        HF's ``Gemma4Model.forward`` replaces image/audio token positions with
-        ``pad_token_id`` (0) *before* calling ``embed_tokens_per_layer``.  We
-        replicate that masking here so each layer's per-layer gate sees a PAD
-        embedding at multimodal positions rather than the raw soft-token IDs
-        (258880 / 258881), which are semantically meaningless in the text
-        per-layer vocabulary.
-        """
-        if not self._per_layer_dim:
-            return None
-
-        # Project hidden states and scale by hidden_size**-0.5 (matches HF)
+    ) -> list[ir.Value]:
+        """Compute per-layer input embeddings for single-model (text-only) mode."""
         proj = self.per_layer_model_projection(op, inputs_embeds)
         proj = op.Mul(proj, float(self._hidden_size**-0.5))
         proj = op.Reshape(
@@ -1447,38 +1475,34 @@ class Gemma4TextModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
-        # Mask multimodal token IDs to pad_token_id (0)
-        masked_ids: ir.Value | None = None
-        if input_ids is not None:
-            pad = op.Constant(value_int=0)
-            masked_ids = input_ids
-            if self._image_token_id:
-                masked_ids = op.Where(
-                    op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
-                    pad,
-                    masked_ids,
-                )
-            if self._audio_token_id is not None:
-                masked_ids = op.Where(
-                    op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
-                    pad,
-                    masked_ids,
-                )
+        pad = op.Constant(value_int=0)
+        masked_ids = input_ids
+        if self._image_token_id:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
+                pad,
+                masked_ids,
+            )
+        if self._audio_token_id is not None:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
+                pad,
+                masked_ids,
+            )
 
-        # Per-layer embeddings: each table is [V, per_layer_dim] — small enough
-        # to avoid ORT CUDA Gather int32 overflow (onnxruntime#28107).
-        per_layer_results: list[ir.Value] = []
-        for i in range(self._num_layers):
-            # Slice proj along axis 2 for this layer: [B, S, L, D] → [B, S, D]
-            proj_i = op.Squeeze(op.Slice(proj, starts=[i], ends=[i + 1], axes=[2]), [2])
+        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+        fused_emb = op.Reshape(
+            fused_emb,
+            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+        )
 
-            if masked_ids is not None:
-                token_emb_i = self.embed_tokens_per_layer[i](op, masked_ids)
-                proj_i = op.Add(proj_i, token_emb_i)
+        combined = op.Add(proj, fused_emb)
+        combined = op.Mul(combined, float(0.5**0.5))
 
-            per_layer_results.append(op.Mul(proj_i, float(0.5**0.5)))
-
-        return per_layer_results
+        return [
+            op.Squeeze(op.Slice(combined, starts=[i], ends=[i + 1], axes=[2]), [2])
+            for i in range(self._num_layers)
+        ]
 
     def forward(
         self,
@@ -1488,13 +1512,30 @@ class Gemma4TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
 
-        per_layer_inputs = self._compute_per_layer_inputs(op, input_ids, hidden_states)
+        # Unpack precomputed per_layer_inputs [B, S, L*D] (VLM split),
+        # or compute from input_ids (text-only single-model).
+        per_layer_list: list[ir.Value] | None = None
+        if self._per_layer_dim and per_layer_inputs is not None:
+            # VLM split: unpack precomputed per-layer inputs
+            num_layers = len(self.layers)
+            per_layer_4d = op.Reshape(
+                per_layer_inputs,
+                op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
+            )
+            per_layer_list = [
+                op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
+                for i in range(num_layers)
+            ]
+        elif self._per_layer_dim and input_ids is not None:
+            # Text-only: compute per-layer inputs from input_ids
+            per_layer_list = self._compute_per_layer_inputs(op, input_ids, hidden_states)
 
         # Determine whether to emit GroupQueryAttention directly.
         # GQA fuses RoPE + attention + KV cache into a single op, and
@@ -1606,7 +1647,7 @@ class Gemma4TextModel(nn.Module):
         for i, (layer, layer_type, past_kv) in enumerate(
             zip(self.layers, self.layer_types, past_kvs)
         ):
-            per_layer_input = per_layer_inputs[i] if per_layer_inputs is not None else None
+            per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
             # Per-layer decision: use GQA when available. KV-shared layers
             # also use GQA (with empty K/V and shared past buffer).
@@ -1700,17 +1741,8 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict[new_key] = state_dict.pop(key)
             elif "vision_tower" in key or "embed_vision" in key:
                 state_dict.pop(key, None)
-        # Split fused per-layer embedding: HF stores one [V, L*D] tensor;
-        # we use nn.ModuleList of L separate [V, D] Embedding tables.
-        per_layer_dim = self.config.hidden_size_per_layer_input
-        if per_layer_dim > 0:
-            fused_key = "model.embed_tokens_per_layer.weight"
-            if fused_key in state_dict:
-                value = state_dict.pop(fused_key)
-                num_layers = self.config.num_hidden_layers
-                for i in range(num_layers):
-                    shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
-                    state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = shard
+        # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
+        # to our fused embedding table — no splitting needed.
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
@@ -1724,12 +1756,10 @@ class Gemma4CausalLMModel(CausalLMModel):
 class _Gemma4DecoderModel(nn.Module):
     """Gemma4 text decoder sub-model accepting ``inputs_embeds``.
 
-    When ``hidden_size_per_layer_input > 0`` (e.g. E2B), the text model also
-    needs the original ``input_ids`` to compute per-layer token embeddings that
-    condition each decoder layer.  HF's ``Gemma4ForConditionalGeneration``
-    passes *both* ``inputs_embeds`` and ``input_ids`` to the language model for
-    this reason.  We mirror that by accepting ``input_ids`` as an optional
-    ONNX graph input and forwarding it to :class:`Gemma4TextModel`.
+    When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), per-layer input
+    embeddings are precomputed by the embedding sub-model and passed as
+    ``per_layer_inputs`` (shape ``[B, S, L*D]``).  The decoder unpacks them
+    and feeds one ``[B, S, D]`` slice to each decoder layer's gating mechanism.
     """
 
     def __init__(self, config: Gemma4Config):
@@ -1744,16 +1774,17 @@ class _Gemma4DecoderModel(nn.Module):
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
-        input_ids: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
         past_key_values: list | None = None,
     ) -> tuple[ir.Value, list]:
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=input_ids,
+            input_ids=None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            per_layer_inputs=per_layer_inputs,
         )
         logits = self.lm_head(op, hidden_states)
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
@@ -1853,9 +1884,9 @@ class Gemma4EmbeddingModel(nn.Module):
     has audio support (``config.audio is not None``), ``forward()`` also accepts
     ``audio_features`` and scatters them at audio-token positions.
 
-    Both image and audio use a one-row dummy guard so that ORT's eager
-    evaluation of both ``Where`` branches never ``Gather`` on a zero-length
-    tensor during text-only / decode steps.
+    When ``hidden_size_per_layer_input > 0``, also computes per-layer input
+    embeddings that condition each decoder layer.  This moves the per-layer
+    computation out of the decoder so the decoder no longer needs ``input_ids``.
 
     Inputs (image-only variant):
     - ``input_ids [B, S]`` INT64
@@ -1866,7 +1897,9 @@ class Gemma4EmbeddingModel(nn.Module):
     - ``image_features [num_img_tokens, hidden_size]``
     - ``audio_features [num_aud_tokens, hidden_size]``
 
-    Output: ``inputs_embeds [B, S, hidden_size]``
+    Outputs:
+    - ``inputs_embeds [B, S, hidden_size]``
+    - ``per_layer_inputs [B, S, L*D]`` (only when ``hidden_size_per_layer_input > 0``)
     """
 
     def __init__(self, config: Gemma4Config):
@@ -1882,6 +1915,30 @@ class Gemma4EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
         self.audio_token_id: int | None = config.audio.audio_token_id if config.audio else None
+
+        # Per-layer input embedding components (moved from the decoder).
+        self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        self._hidden_size = config.hidden_size
+        if self._per_layer_dim:
+            self._num_layers = config.num_hidden_layers
+            vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
+            # Single fused [V, L*D] embedding table matching HuggingFace's
+            # ``embed_tokens_per_layer.weight`` shape.  The ORT CUDA Gather
+            # int32 overflow (onnxruntime#28107) is now fixed.
+            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+                vocab_per_layer,
+                self._num_layers * self._per_layer_dim,
+                config.pad_token_id,
+                embed_scale=float(self._per_layer_dim**0.5),
+            )
+            self.per_layer_model_projection = Linear(
+                config.hidden_size,
+                config.num_hidden_layers * self._per_layer_dim,
+                bias=False,
+            )
+            self.per_layer_projection_norm = RMSNorm(
+                self._per_layer_dim, eps=config.rms_norm_eps
+            )
 
     def _scatter_features(
         self,
@@ -1925,7 +1982,7 @@ class Gemma4EmbeddingModel(nn.Module):
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value | None = None,
-    ) -> ir.Value:
+    ) -> ir.Value | tuple[ir.Value, ir.Value]:
         # [B, S] → [B, S, hidden]
         hidden = self.embed_tokens(op, input_ids)
 
@@ -1944,7 +2001,53 @@ class Gemma4EmbeddingModel(nn.Module):
                 op, hidden, input_ids, self.audio_token_id, audio_features
             )
 
-        return hidden
+        if not self._per_layer_dim:
+            return hidden
+
+        # Compute per-layer input embeddings (moved from the decoder).
+        # 1. Project hidden states → [B, S, L*D] and scale by hidden_size**-0.5
+        proj = self.per_layer_model_projection(op, hidden)
+        proj = op.Mul(proj, float(self._hidden_size**-0.5))
+        # Reshape to [B, S, L, D] for per-layer RMSNorm
+        proj = op.Reshape(
+            proj, op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim])
+        )
+        proj = self.per_layer_projection_norm(op, proj)
+
+        # 2. Mask multimodal token IDs → configured pad_token_id before per-layer lookup
+        pad = op.Constant(value_int=self.config.pad_token_id)
+        masked_ids = input_ids
+        if self.image_token_id:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self.image_token_id)),
+                pad,
+                masked_ids,
+            )
+        if self.audio_token_id is not None:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self.audio_token_id)),
+                pad,
+                masked_ids,
+            )
+
+        # 3. Single Gather on fused [V, L*D] table → reshape to [B, S, L, D]
+        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+        # fused_emb: [B, S, L*D] → [B, S, L, D]
+        fused_emb = op.Reshape(
+            fused_emb,
+            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+        )
+
+        # 4. Combine: (proj + emb) * 0.707 per layer, then flatten back
+        combined = op.Add(proj, fused_emb)  # [B, S, L, D]
+        combined = op.Mul(combined, float(0.5**0.5))
+        # Flatten L*D → single per_layer_inputs output: [B, S, L*D]
+        per_layer_inputs = op.Reshape(
+            combined,
+            op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
+        )
+
+        return hidden, per_layer_inputs
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -2120,25 +2223,25 @@ class Gemma4Model(nn.Module):
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}
+        # Per-layer weight prefixes that should route to the embedding model
+        per_layer_prefixes = (
+            "embed_tokens_per_layer.",
+            "per_layer_model_projection.",
+            "per_layer_projection_norm.",
+        )
         for key, value in state_dict.items():
             if key.startswith("language_model."):
                 suffix = key[len("language_model.") :]
                 if suffix.startswith("lm_head"):
                     # lm_head lives directly under decoder (not decoder.model)
                     renamed["decoder." + suffix] = value
+                elif any(suffix.startswith(p) for p in per_layer_prefixes):
+                    # Per-layer embedding weights → embedding sub-model
+                    renamed["embedding." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
                     onnx_key = "decoder.model." + suffix
-                    if suffix == "embed_tokens_per_layer.weight":
-                        # HF stores one [V, L*D] weight; split into L separate
-                        # [V, D] tables matching our nn.ModuleList layout.
-                        num_layers = self.config.num_hidden_layers
-                        per_layer_dim = self.decoder.model._per_layer_dim
-                        for i in range(num_layers):
-                            shard = value[:, i * per_layer_dim : (i + 1) * per_layer_dim]
-                            renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = shard
-                    else:
-                        renamed[onnx_key] = value
+                    renamed[onnx_key] = value
                     if suffix == "embed_tokens.weight":
                         # Token embedding is shared with the embedding sub-model
                         renamed["embedding.embed_tokens.weight"] = value

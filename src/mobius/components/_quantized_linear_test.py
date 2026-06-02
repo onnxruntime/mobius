@@ -64,8 +64,22 @@ class TestQuantizedLinearInit:
         assert ql.weight.shape == [OUT_FEATURES, n_blocks, blob_size]
 
     def test_rejects_invalid_bits(self):
-        with pytest.raises(ValueError, match="bits must be 4 or 8"):
+        with pytest.raises(ValueError, match="bits must be 2, 4, or 8"):
             QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=3)
+
+    def test_2bit_packed_shape(self):
+        ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=2, block_size=32)
+        n_blocks = math.ceil(IN_FEATURES / 32)
+        blob_size = 32 * 2 // 8  # = 8
+        assert ql.weight.shape == [OUT_FEATURES, n_blocks, blob_size]
+
+    def test_2bit_zero_points_packed_4_per_byte(self):
+        ql = QuantizedLinear(
+            IN_FEATURES, OUT_FEATURES, bits=2, block_size=32, has_zero_point=True
+        )
+        n_blocks = math.ceil(IN_FEATURES / 32)
+        zp_dim = math.ceil(n_blocks * 2 / 8)  # 4 ZPs per byte
+        assert ql.zero_points.shape == [OUT_FEATURES, zp_dim]
 
     def test_rejects_non_power_of_2_block_size(self):
         with pytest.raises(ValueError, match="block_size must be a power of 2 >= 16"):
@@ -163,6 +177,24 @@ class TestQuantizedLinearForward:
                 attrs = {a.name: a.value for a in node.attributes.values()}
                 assert attrs["bits"] == 8
                 break
+
+    def test_2bit_forward_attributes(self):
+        ql = QuantizedLinear(
+            IN_FEATURES, OUT_FEATURES, bits=2, block_size=32, has_zero_point=True
+        )
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = ql(op, x)
+        b._adapt_outputs([result])
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["bits"] == 2
+                assert attrs["block_size"] == 32
+                assert len(node.inputs) == 4  # x, w, scales, zero_points
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
 
     def test_parameter_names(self):
         ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, has_zero_point=True, bias=True)

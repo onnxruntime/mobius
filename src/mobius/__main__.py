@@ -324,6 +324,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         gguf_path,
         dtype=args.dtype,
         keep_quantized=args.keep_quantized,
+        execution_provider=args.execution_provider,
     )
 
     pkg.save(
@@ -557,6 +558,18 @@ def main(argv: list[str] | None = None) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    gguf_parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware graph optimisations "
+            "(e.g. 'cpu' to apply the GroupQueryAttention rewrite). "
+            "Defaults to 'default' (portable ONNX, no vendor fusions)."
+        ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
 

@@ -29,7 +29,6 @@ from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ComponentSpec,
     ModelTask,
-    _cast_encoder_input,
     _make_graph,
     _make_model,
     build_decoder_from_embeds,
@@ -90,10 +89,9 @@ class Phi4MMMultiModalTask(ModelTask):
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, 3, image_size, image_size],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
         image_sizes = builder.input(
             "image_sizes",
             dtype=ir.DataType.INT64,
@@ -125,10 +123,9 @@ class Phi4MMMultiModalTask(ModelTask):
 
         audio_embeds = builder.input(
             "audio_embeds",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[batch, audio_seq_len, input_size],
         )
-        audio_embeds = _cast_encoder_input(op, audio_embeds, config)
         audio_sizes = builder.input(
             "audio_sizes",
             dtype=ir.DataType.INT64,

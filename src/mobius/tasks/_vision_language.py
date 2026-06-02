@@ -12,7 +12,6 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
-    _cast_encoder_input,
     _make_graph,
     _make_model,
 )
@@ -74,10 +73,9 @@ class Qwen3VLVisionLanguageTask(ModelTask):
         pixel_dim = in_channels * temporal_patch_size * patch_size * patch_size
         pixel_values = builder.input(
             "pixel_values",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[total_patches, pixel_dim],
         )
-        pixel_values = _cast_encoder_input(op, pixel_values, config)
         # Image grid dimensions for position embedding interpolation
         num_images = ir.SymbolicDim("num_images")
         grid_thw = builder.input(

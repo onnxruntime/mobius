@@ -387,6 +387,18 @@ full-precision model. Expected tolerances:
 Verify that generated text is coherent and semantically correct rather
 than requiring exact numerical matches.
 
+## Inference speed: Q4_K_M vs NF4
+
+For the benchmark table, use the canonical reference in
+`.agents/skills/profiling-onnx-models/SKILL.md` ("Quantization benchmark
+reference (Gemma4 E2B-IT)").
+
+**Q4_K_M is recommended over NF4** for both speed and quality:
+- Faster on both CPU and CUDA than F16 in the referenced measurement
+- NF4 is slower than F16 in the same measurement
+- Quality is comparable between Q4_K_M and NF4 in spot checks
+- Q4_K_M uses less memory than F16 (~4x compression)
+
 ## Cross-references
 
 - **Adding models:** `.agents/skills/adding-a-new-model/SKILL.md`
