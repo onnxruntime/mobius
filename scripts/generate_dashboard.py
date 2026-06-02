@@ -373,11 +373,7 @@ def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
     for model_type, info in models.items():
-        if (
-            info.l5_generation_golden
-            or info.l5_test_case_skipped
-            or not info.yaml_test_case_file
-        ):
+        if info.l5_generation_golden or info.l5_test_case_skipped or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
         case_id = case_path.stem
