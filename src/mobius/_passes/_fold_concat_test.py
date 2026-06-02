@@ -168,8 +168,7 @@ class TestFoldConcatInitializersPass:
             f"Dead pre-pack weights survived DCE: {remaining}"
         )
         assert "init_0__init_1__axis_0__concat" in remaining, (
-            "the live packed result must NOT be stripped by DCE: "
-            f"{remaining}"
+            f"the live packed result must NOT be stripped by DCE: {remaining}"
         )
         # The survived packed weight must retain its exact values, not just its
         # name — guards against a future DCE that mutates retained tensors.
@@ -569,8 +568,7 @@ class TestFoldConcatEdgeCases:
             f"Packed initializer declared dtype should be FLOAT16, got {packed.dtype}"
         )
         assert packed.const_value.dtype == ir.DataType.FLOAT16, (
-            "Packed LazyTensor dtype should be FLOAT16, got "
-            f"{packed.const_value.dtype}"
+            f"Packed LazyTensor dtype should be FLOAT16, got {packed.const_value.dtype}"
         )
         assert packed.const_value.numpy().dtype == np.float16
 
@@ -661,9 +659,7 @@ class TestFoldConcatOrtLoad:
         hidden = ir.Value(
             name="hidden", shape=ir.Shape(["N", 8]), type=ir.TensorType(ir.DataType.FLOAT16)
         )
-        matmul_node = ir.Node(
-            "", "MatMul", inputs=[hidden, packed_out], num_outputs=1
-        )
+        matmul_node = ir.Node("", "MatMul", inputs=[hidden, packed_out], num_outputs=1)
         out = matmul_node.outputs[0]
         out.shape = ir.Shape(["N", 12])
         out.dtype = ir.DataType.FLOAT16
@@ -691,10 +687,132 @@ class TestFoldConcatOrtLoad:
         onnx.save(ir.to_proto(model), str(model_path))
 
         # Before the fix this raises a fp16/fp32 MatMul type-mismatch at load.
-        sess = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
-        )
+        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         feed = {"hidden": np.random.randn(2, 8).astype(np.float16)}
         (result,) = sess.run(None, feed)
         assert result.shape == (2, 12)
         assert result.dtype == np.float16
+
+    def test_folded_fp16_packed_qkv_values_survive_serialization(self, tmp_path):
+        """Value gate: packed-QKV must keep its fp16 *values* through serialize→reload.
+
+        The other fold tests assert the packed value in memory and that ORT can
+        load+run the model, but none compare the *serialized* packed-QKV weight
+        to its source q/k/v projections.  The original garbage-export bug
+        corrupted bytes at serialization (fp16 data written under a defaulted
+        FLOAT32 dtype → near-zero/garbage) — a failure an in-memory
+        ``const_value`` check cannot see, and which a load+run check misses
+        because the model still loads and produces a right-shaped fp16 output.
+
+        This round-trips through the production save path (``ir.save`` with
+        external data, exactly like the real fp16 export's model.onnx +
+        model.onnx.data) and asserts the reloaded packed weight matches its
+        sources per-slice, catching a numerically-corrupt pack that still has
+        the right count and dtype (the corr≈0 / norm≈0.8 failure mode).
+        """
+        import onnxruntime as ort
+
+        rng = np.random.default_rng(0)
+        # fp16 q/k/v projection weights with UNSET declared dtype (the state left
+        # by _cast_module_dtype). Sized > 256 bytes so ir.save externalizes them,
+        # exercising the same external-data path as the real export. Column-concat
+        # (axis=1) mirrors the real packed-QKV layout [Q | K | V].
+        q_arr = rng.standard_normal((16, 16)).astype(np.float16)
+        k_arr = rng.standard_normal((16, 16)).astype(np.float16)
+        v_arr = rng.standard_normal((16, 16)).astype(np.float16)
+        q = ir.Value(name="q_weight", shape=ir.Shape([16, 16]))
+        q.const_value = ir.tensor(q_arr)
+        k = ir.Value(name="k_weight", shape=ir.Shape([16, 16]))
+        k.const_value = ir.tensor(k_arr)
+        v = ir.Value(name="v_weight", shape=ir.Shape([16, 16]))
+        v.const_value = ir.tensor(v_arr)
+
+        concat_node = ir.Node(
+            "",
+            "Concat",
+            inputs=[q, k, v],
+            attributes=[ir.Attr("axis", ir.AttributeType.INT, 1)],
+            num_outputs=1,
+        )
+        packed_out = concat_node.outputs[0]  # (16, 48) packed QKV weight
+        packed_out.shape = ir.Shape([16, 48])
+
+        hidden = ir.Value(
+            name="hidden", shape=ir.Shape(["N", 16]), type=ir.TensorType(ir.DataType.FLOAT16)
+        )
+        matmul_node = ir.Node("", "MatMul", inputs=[hidden, packed_out], num_outputs=1)
+        out = matmul_node.outputs[0]
+        out.shape = ir.Shape(["N", 48])
+        out.dtype = ir.DataType.FLOAT16
+
+        graph = ir.Graph(
+            inputs=[hidden],
+            outputs=[out],
+            nodes=[concat_node, matmul_node],
+            name="qkv_matmul",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(q)
+        graph.register_initializer(k)
+        graph.register_initializer(v)
+        model = ir.Model(graph, ir_version=10)
+
+        FoldConcatInitializersPass()(model)
+        # DCE step the real export runs after folding.
+        for dead in ("q_weight", "k_weight", "v_weight"):
+            del model.graph.initializers[dead]
+
+        # Serialize through the production path: external data, exactly as the
+        # real fp16 export writes model.onnx + model.onnx.data. This is where the
+        # original dtype bug corrupted the packed bytes.
+        model_path = tmp_path / "model.onnx"
+        ir.save(model, model_path, external_data="model.onnx.data")
+        assert (tmp_path / "model.onnx.data").exists(), (
+            "weights should be externalized, exercising the real export's save path"
+        )
+
+        reloaded = ir.load(model_path)
+        packed_name = "q_weight__k_weight__v_weight__axis_1__concat"
+        packed = reloaded.graph.initializers[packed_name].const_value.numpy()
+        assert packed.dtype == np.float16, (
+            f"reloaded packed-QKV must serialize as fp16, got {packed.dtype}"
+        )
+        expected = np.concatenate([q_arr, k_arr, v_arr], axis=1)
+        assert packed.shape == expected.shape
+
+        # Per-slice discriminator (mirrors QA's weight-integrity gate): each q/k/v
+        # column block of the reloaded pack must match its source projection. A
+        # serialize-time dtype corruption surfaces here as corr≈0 / norm collapse
+        # even when the pack's shape and dtype look correct.
+        blocks = {
+            "q": (packed[:, 0:16], q_arr),
+            "k": (packed[:, 16:32], k_arr),
+            "v": (packed[:, 32:48], v_arr),
+        }
+        for name, (got, src) in blocks.items():
+            got32 = got.astype(np.float32).ravel()
+            src32 = src.astype(np.float32).ravel()
+            corr = np.corrcoef(got32, src32)[0, 1]
+            assert corr >= 0.99, (
+                f"{name}-slice packed-QKV corr={corr:.4f} (<0.99) — corrupted pack"
+            )
+            src_norm = np.linalg.norm(src32)
+            rel_err = abs(np.linalg.norm(got32) - src_norm) / src_norm
+            assert rel_err <= 0.02, (
+                f"{name}-slice packed-QKV norm rel_err={rel_err:.4f} (>2%) — corrupted pack"
+            )
+
+        # fp16 concat is lossless, so the strongest assert also holds end-to-end.
+        np.testing.assert_array_equal(
+            packed,
+            expected,
+            err_msg="packed-QKV bytes corrupted by the serialization round-trip",
+        )
+
+        # Functional check: ORT inference on the reloaded model must match a numpy
+        # reference, proving the packed weight is correct in use, not just on disk.
+        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        feed = {"hidden": rng.standard_normal((2, 16)).astype(np.float16)}
+        (result,) = sess.run(None, feed)
+        reference = feed["hidden"].astype(np.float32) @ expected.astype(np.float32)
+        np.testing.assert_allclose(result.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
