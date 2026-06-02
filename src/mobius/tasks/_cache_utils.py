@@ -142,18 +142,33 @@ def _register_kv_cache_outputs(
 
     When the parameters are omitted, output shapes/dtypes are left to the
     shape inference pass that runs during model optimization.
+
+    The present-shape parameters are all-or-nothing by design: pass every one
+    to stamp the explicit type, or none to opt out and infer. A *partial* set
+    is always a wiring slip (a caller wired some dims but dropped others) and is
+    never legitimate, so it is rejected fail-closed: a partial set raises
+    :class:`ValueError` naming the provided and missing parameters, rather than
+    silently falling back to the known-wrong inference path.
     """
-    stamp = all(
-        param is not None
-        for param in (
-            batch,
-            num_kv_heads,
-            key_head_dim,
-            value_head_dim,
-            total_seq_len,
-            dtype,
+    params = {
+        "batch": batch,
+        "num_kv_heads": num_kv_heads,
+        "key_head_dim": key_head_dim,
+        "value_head_dim": value_head_dim,
+        "total_seq_len": total_seq_len,
+        "dtype": dtype,
+    }
+    provided = [name for name, value in params.items() if value is not None]
+    stamp = len(provided) == len(params)
+    if provided and not stamp:
+        missing = [name for name in params if params[name] is None]
+        raise ValueError(
+            f"_register_kv_cache_outputs received a partial set of present-shape "
+            f"parameters (provided {provided}, missing {missing}); these are "
+            f"all-or-nothing. Pass all six to stamp explicit present.* types "
+            f"(required for correct GroupQueryAttention head_dim), or none to opt "
+            f"out and infer."
         )
-    )
     for i, (present_key, present_value) in enumerate(present_key_values):
         if stamp:
             present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])

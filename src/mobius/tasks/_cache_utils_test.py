@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import onnx_ir as ir
+import pytest
 
 from mobius.tasks._base import _make_graph
 from mobius.tasks._cache_utils import _register_kv_cache_outputs
@@ -83,21 +84,29 @@ class TestRegisterKVCacheOutputs:
         # Unchanged: still the (wrong) pre-existing inferred shape.
         assert _dims(key) == ["batch", 32, "seq", 32]
 
-    def test_partial_params_do_not_stamp(self):
-        """All shape params are required; a partial set falls back to inference."""
+    def test_partial_params_raise(self):
+        """A partial present-shape set is a wiring slip -> must raise.
+
+        This is the fail-closed regression proof: the exact input that
+        previously warned-and-proceeded (shipping a structurally-wrong model
+        with mis-derived GroupQueryAttention ``head_dim``) now raises before
+        any output is registered.
+        """
         _, builder = _make_graph()
         pairs = [_present_pair("present.0", wrong_head_dim=32)]
 
-        _register_kv_cache_outputs(
-            builder,
-            pairs,
-            batch=ir.SymbolicDim("batch"),
-            num_kv_heads=32,
-            # key_head_dim / value_head_dim / total_seq_len / dtype omitted
-        )
+        with pytest.raises(ValueError, match="partial set of present-shape parameters") as exc:
+            _register_kv_cache_outputs(
+                builder,
+                pairs,
+                batch=ir.SymbolicDim("batch"),
+                num_kv_heads=32,
+                # key_head_dim / value_head_dim / total_seq_len / dtype omitted
+            )
 
-        key, _ = pairs[0]
-        assert _dims(key) == ["batch", 32, "seq", 32]
+        # The message must name every omitted parameter so the slip is diagnosable.
+        for missing in ("key_head_dim", "value_head_dim", "total_seq_len", "dtype"):
+            assert missing in str(exc.value)
 
     def test_registers_named_outputs(self):
         """Outputs are registered with the conventional present.{i}.* names."""
