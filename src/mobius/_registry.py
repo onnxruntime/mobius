@@ -467,8 +467,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "lfm2": ModelRegistration(Lfm2CausalLMModel),
     "lfm2_audio": ModelRegistration(Lfm2AudioModel, task="audio-to-audio"),
     # --- Moshi / PersonaPlex (audio-to-audio) ---
-    "moshi": ModelRegistration(MoshiModel, task="audio-to-audio"),
-    "personaplex": ModelRegistration(MoshiModel, task="audio-to-audio"),
+    "moshi": ModelRegistration(MoshiModel, task="moshi"),
+    "personaplex": ModelRegistration(MoshiModel, task="moshi"),
     # --- Hybrid linear-attention ---
     "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---

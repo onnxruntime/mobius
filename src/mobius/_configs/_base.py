@@ -1980,11 +1980,15 @@ class Lfm2Config(ArchitectureConfig):
             intermediate = multiple_of * ((intermediate + multiple_of - 1) // multiple_of)
 
         base_fields = {
-            k: v for k, v in _shallow_fields(base).items() if k not in ("intermediate_size",)
+            k: v
+            for k, v in _shallow_fields(base).items()
+            if k not in ("intermediate_size", "hidden_act")
         }
         return cls(
             **base_fields,
             intermediate_size=intermediate,
+            # LFM2 architecture always uses SiLU/SwiGLU (not set in HF config)
+            hidden_act=base.hidden_act or "silu",
             short_conv_kernel=getattr(config, "conv_L_cache", 3),
             short_conv_bias=getattr(config, "conv_bias", False),
         )
