@@ -90,15 +90,26 @@ class ModelInfo:
     l3_status_reason: str | None = None
 
     @property
+    def l3_passes(self) -> bool:
+        """True iff L3 synthetic parity is configured and expected to pass.
+
+        L3 is the only level that distinguishes "test exists" from "test
+        passes" via two fields (``l3_synthetic_parity`` + ``l3_status``)
+        because the parity suite has a richer outcome model (pass / skip /
+        xfail). L1, L2, L4, L5 collapse the two notions into a single
+        boolean. Use this property anywhere you would otherwise write
+        ``info.l3_synthetic_parity and info.l3_status == "pass"``.
+        """
+        return self.l3_synthetic_parity and self.l3_status == "pass"
+
+    @property
     def confidence_level(self) -> int:
         """Return the highest confidence level achieved (0-5)."""
         if self.l5_generation_golden:
             return 5
         if self.l4_golden_files:
             return 4
-        # L3 only counts when the parity test actually passes — skip/xfail
-        # are recorded but must not inflate the model's confidence level.
-        if self.l3_synthetic_parity and self.l3_status == "pass":
+        if self.l3_passes:
             return 3
         if self.l2_arch_validation:
             return 2
@@ -579,13 +590,13 @@ def _compute_summary(
         # Per-flag counts: how many models have each level flag set, independently.
         # These are NOT exclusive (a model counted in L3 may also be in L1/L2).
         # by_level[0] = not-tested (no flags set at all).
-        # L3 is gated on status == "pass" to match the L3 card and the
-        # confidence_level property; a skipped/xfailed L3 does not count.
+        # L3 uses the ``l3_passes`` property so skipped/xfailed L3 does not
+        # count — matching the L3 card and the confidence_level property.
         if not any(
             [
                 info.l1_graph_build,
                 info.l2_arch_validation,
-                info.l3_synthetic_parity and info.l3_status == "pass",
+                info.l3_passes,
                 info.l4_golden_files,
                 info.l5_generation_golden,
             ]
@@ -595,7 +606,7 @@ def _compute_summary(
             by_level[1] += 1
         if info.l2_arch_validation:
             by_level[2] += 1
-        if info.l3_synthetic_parity and info.l3_status == "pass":
+        if info.l3_passes:
             by_level[3] += 1
         if info.l4_golden_files:
             by_level[4] += 1
@@ -720,7 +731,7 @@ def _render_html(
                 "confidence_label": info.confidence_label,
                 "l1": info.l1_graph_build,
                 "l2": info.l2_arch_validation,
-                "l3": info.l3_synthetic_parity and info.l3_status == "pass",
+                "l3": info.l3_passes,
                 "l4": info.l4_golden_files,
                 "l5": info.l5_generation_golden,
                 "l4_case": info.l4_has_test_case,
