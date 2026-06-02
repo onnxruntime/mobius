@@ -11,12 +11,15 @@ multi-component graph builders live in :mod:`mobius.tasks._base`.
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
 
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
 from mobius._configs import BaseModelConfig
+
+logger = logging.getLogger(__name__)
 
 _FUNCTIONS_DOMAIN = "com.microsoft"
 
@@ -142,18 +145,35 @@ def _register_kv_cache_outputs(
 
     When the parameters are omitted, output shapes/dtypes are left to the
     shape inference pass that runs during model optimization.
+
+    The present-shape parameters are all-or-nothing by design: pass every one
+    to stamp the explicit type, or none to opt out and infer. A *partial* set
+    is almost always a wiring slip (a caller wired some dims but dropped
+    others), so it is treated conservatively -- the stamp is skipped, the
+    shapes fall back to the known-wrong inference path, and a warning is
+    logged naming the missing parameters so the slip is loud rather than silent.
     """
-    stamp = all(
-        param is not None
-        for param in (
-            batch,
-            num_kv_heads,
-            key_head_dim,
-            value_head_dim,
-            total_seq_len,
-            dtype,
+    params = {
+        "batch": batch,
+        "num_kv_heads": num_kv_heads,
+        "key_head_dim": key_head_dim,
+        "value_head_dim": value_head_dim,
+        "total_seq_len": total_seq_len,
+        "dtype": dtype,
+    }
+    provided = [name for name, value in params.items() if value is not None]
+    stamp = len(provided) == len(params)
+    if provided and not stamp:
+        missing = [name for name in params if params[name] is None]
+        logger.warning(
+            "_register_kv_cache_outputs received a partial set of present-shape "
+            "parameters (provided %s, missing %s); these are all-or-nothing, so "
+            "the explicit present.* stamp is SKIPPED and shapes fall back to "
+            "inference (which mis-derives head_dim for GroupQueryAttention). "
+            "Pass all six parameters to stamp, or none to opt out.",
+            provided,
+            missing,
         )
-    )
     for i, (present_key, present_value) in enumerate(present_key_values):
         if stamp:
             present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])
