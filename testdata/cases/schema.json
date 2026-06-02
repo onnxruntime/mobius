@@ -44,6 +44,7 @@
         "audio-feature-extraction",
         "audio-to-audio",
         "codec",
+        "ctc-asr",
         "depth-estimation",
         "feature-extraction",
         "fun-asr-speech-language",
@@ -131,6 +132,10 @@
         "eos_token_id": {
           "type": "integer",
           "description": "End-of-sequence token ID. Overrides the model's default to ensure generation stops correctly."
+        },
+        "lang": {
+          "type": "string",
+          "description": "Target language code for multilingual models (e.g. MMS uses ISO-639-3 codes like 'eng' to pick the per-language adapter)."
         }
       },
       "additionalProperties": false,
