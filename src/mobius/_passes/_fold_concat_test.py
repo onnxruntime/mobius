@@ -801,6 +801,16 @@ class TestFoldConcatOrtLoad:
             assert rel_err <= 0.02, (
                 f"{name}-slice packed-QKV norm rel_err={rel_err:.4f} (>2%) — corrupted pack"
             )
+            # Non-degenerate magnitude. Use mean of ABSOLUTE values, not signed
+            # mean: symmetric fp16 weights have a signed mean ~1e-6 that is
+            # indistinguishable from a broken near-zero tensor, whereas mean|abs|
+            # separates cleanly (healthy ~0.0x vs unserialized ~1e-6). This also
+            # catches the near-zero failure mode robustly where corr is undefined
+            # (a constant/zero slice has zero variance → corrcoef is nan).
+            mean_abs = float(np.abs(got32).mean())
+            assert mean_abs >= 1e-3, (
+                f"{name}-slice packed-QKV mean|abs|={mean_abs:.2e} (~0) — near-zero/unserialized"
+            )
 
         # fp16 concat is lossless, so the strongest assert also holds end-to-end.
         np.testing.assert_array_equal(
@@ -816,3 +826,67 @@ class TestFoldConcatOrtLoad:
         (result,) = sess.run(None, feed)
         reference = feed["hidden"].astype(np.float32) @ expected.astype(np.float32)
         np.testing.assert_allclose(result.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
+
+    def test_value_gate_catches_corrupted_packed_slice(self, tmp_path):
+        """Negative control: the per-slice value gate must FAIL on a bad pack.
+
+        Proves the discriminators in
+        ``test_folded_fp16_packed_qkv_values_survive_serialization`` actually
+        catch the original failure signature — a packed-QKV with a near-zero
+        slice (corr≈0 / norm collapse) — and that the corruption survives the
+        serialize→reload round-trip rather than being silently "healed" by
+        save/load.  Without this negative control a future change could neuter
+        the value asserts and still go green.
+        """
+        rng = np.random.default_rng(1)
+        q_arr = rng.standard_normal((16, 16)).astype(np.float16)
+        k_arr = rng.standard_normal((16, 16)).astype(np.float16)
+        v_arr = rng.standard_normal((16, 16)).astype(np.float16)
+
+        # Poison the K slice to zero — the exact "unserialized / near-zero packed
+        # weight" signature of the original garbage export.
+        poisoned = np.concatenate([q_arr, k_arr, v_arr], axis=1).copy()
+        poisoned[:, 16:32] = 0
+
+        packed = ir.Value(
+            name="packed_qkv",
+            shape=ir.Shape([16, 48]),
+            type=ir.TensorType(ir.DataType.FLOAT16),
+        )
+        packed.const_value = ir.tensor(poisoned)
+        graph = ir.Graph(
+            inputs=[],
+            outputs=[packed],
+            nodes=[],
+            name="poisoned_pack",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(packed)
+        model = ir.Model(graph, ir_version=10)
+
+        model_path = tmp_path / "model.onnx"
+        ir.save(model, model_path, external_data="model.onnx.data")
+        reloaded = ir.load(model_path)
+        got = reloaded.graph.initializers["packed_qkv"].const_value.numpy()
+
+        # The corruption must survive the round-trip (save/load must not "fix" it).
+        np.testing.assert_array_equal(got[:, 16:32], np.zeros((16, 16), dtype=np.float16))
+
+        # The gate's discriminators must flag the zeroed K slice. mean|abs| is the
+        # robust primary signal: corr is undefined (nan) for a zero-variance slice,
+        # which is exactly why a corr-only gate would be unsafe here.
+        k_block = got[:, 16:32].astype(np.float32).ravel()
+        k_ref = k_arr.astype(np.float32).ravel()
+        assert np.abs(k_block).mean() < 1e-3, (
+            "mean|abs| discriminator must flag a zeroed packed slice"
+        )
+        rel_err = abs(np.linalg.norm(k_block) - np.linalg.norm(k_ref)) / np.linalg.norm(k_ref)
+        assert rel_err > 0.02, "norm rel_err discriminator must flag a zeroed packed slice"
+
+        # The untouched Q and V slices must still read as healthy — the gate is
+        # specific to the corrupted slice, not a blanket failure.
+        for sl, ref in ((got[:, 0:16], q_arr), (got[:, 32:48], v_arr)):
+            sl32 = sl.astype(np.float32).ravel()
+            assert np.abs(sl32).mean() >= 1e-3
+            corr = np.corrcoef(sl32, ref.astype(np.float32).ravel())[0, 1]
+            assert corr >= 0.99
