@@ -590,7 +590,10 @@ def build_lfm2_models(model_id: str, save_dir: Path | None = None) -> dict:
         save_dir.mkdir(parents=True, exist_ok=True)
         for name, model in pkg.items():
             out_path = save_dir / f"{name}.onnx"
-            onnx_ir.save(model, out_path)
+            # Use external data; the decoder proto can exceed the 2 GB
+            # protobuf limit, and even smaller components benefit from
+            # having tensor weights in a sidecar file.
+            onnx_ir.save(model, out_path, external_data=f"{name}.data")
             print(f"[lfm2]   Saved {name} → {out_path}")
 
     return pkg

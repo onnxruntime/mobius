@@ -2013,21 +2013,65 @@ class Lfm2AudioConfig(Lfm2Config):
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Lfm2AudioConfig:
-        # LFM2-Audio uses a custom config format from liquid-audio,
-        # not a standard HuggingFace config. The base fields come from
-        # the nested 'lfm' sub-config.
-        base = Lfm2Config.from_transformers(config, parent_config)
+        # LFM2-Audio uses a custom config format from liquid-audio with
+        # nested sub-configs:
+        #
+        #   ``config.lfm``          — the LFM2 LM backbone (model_type=lfm2)
+        #   ``config.encoder``      — the conformer audio encoder
+        #   ``config.preprocessor`` — the mel feature extractor parameters
+        #   ``config.depthformer``  — the per-step depthformer for codebooks
+        #
+        # The backbone fields therefore have to come from ``config.lfm`` (or
+        # the top level, if a flat config is somehow provided).
+        from mobius._configs._sub_configs import AudioConfig
+
+        lfm = getattr(config, "lfm", None) or config
+        base = Lfm2Config.from_transformers(lfm, parent_config)
         base_fields = _shallow_fields(base)
 
-        depthformer = getattr(config, "depthformer", None) or {}
-        if hasattr(depthformer, "__dict__"):
-            depthformer = depthformer.__dict__
+        depthformer = getattr(config, "depthformer", None)
+        if depthformer is None:
+            depthformer_layers = 6
+            depthformer_dim = 1024
+            depthformer_heads = 16
+            depthformer_tie = True
+        else:
+            depthformer_layers = getattr(depthformer, "layers", 6)
+            depthformer_dim = getattr(depthformer, "dim", 1024)
+            depthformer_heads = getattr(depthformer, "heads", 16)
+            depthformer_tie = getattr(depthformer, "tie", True)
+
+        encoder = getattr(config, "encoder", None)
+        preprocessor = getattr(config, "preprocessor", None)
+        audio: AudioConfig | None = None
+        if encoder is not None:
+            audio = AudioConfig(
+                d_model=getattr(encoder, "d_model", None),
+                attention_dim=getattr(encoder, "d_model", None),
+                attention_heads=getattr(encoder, "n_heads", None),
+                num_blocks=getattr(encoder, "n_layers", None),
+                linear_units=int(
+                    (getattr(encoder, "ff_expansion_factor", 4) or 4)
+                    * (getattr(encoder, "d_model", 512) or 512)
+                ),
+                kernel_size=getattr(encoder, "conv_kernel_size", 9),
+                conv_channels=getattr(encoder, "subsampling_conv_channels", 256),
+                input_size=getattr(encoder, "feat_in", None),
+                num_mel_bins=(
+                    getattr(preprocessor, "features", None)
+                    if preprocessor is not None
+                    else None
+                )
+                or getattr(encoder, "feat_in", None),
+            )
+        base_fields["audio"] = audio
 
         return cls(
             **base_fields,
-            depthformer_layers=depthformer.get("layers", 6),
-            depthformer_dim=depthformer.get("dim", 1024),
-            depthformer_tie=depthformer.get("tie", True),
+            depthformer_layers=depthformer_layers,
+            depthformer_dim=depthformer_dim,
+            depthformer_heads=depthformer_heads,
+            depthformer_tie=depthformer_tie,
             num_codebooks=getattr(config, "codebooks", 8),
             audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
         )

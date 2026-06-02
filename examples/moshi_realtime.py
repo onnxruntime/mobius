@@ -516,7 +516,9 @@ def build_moshi_models(model_id: str, save_dir: Path | None = None) -> dict:
         save_dir.mkdir(parents=True, exist_ok=True)
         for name, model in pkg.items():
             out_path = save_dir / f"{name}.onnx"
-            onnx_ir.save(model, out_path)
+            # External data is required because the decoder proto is well
+            # over the 2 GB protobuf limit for personaplex-7b.
+            onnx_ir.save(model, out_path, external_data=f"{name}.data")
             print(f"[moshi]   Saved {name} → {out_path}")
 
     return pkg

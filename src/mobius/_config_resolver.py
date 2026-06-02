@@ -101,9 +101,27 @@ def _try_load_config_json(model_id: str):
 
     model_type = config_dict.get("model_type")
     if not model_type:
-        return None
+        # Some HF repos (e.g. LiquidAI/LFM2-Audio-1.5B) ship a config.json
+        # without ``model_type`` but with an ``architectures`` list we can map
+        # back to a registered mobius model.
+        for arch in config_dict.get("architectures") or ():
+            inferred = _ARCHITECTURE_TO_MODEL_TYPE.get(arch)
+            if inferred is not None:
+                model_type = inferred
+                config_dict["model_type"] = inferred
+                break
+        if not model_type:
+            return None
 
     return _dict_to_pretrained_config(config_dict)
+
+
+# Architectures that ship in HF configs without a ``model_type`` field.
+# Map them back to the mobius registry name so :func:`_try_load_config_json`
+# can still reach the right model class.
+_ARCHITECTURE_TO_MODEL_TYPE: dict[str, str] = {
+    "Lfm2AudioForConditionalGeneration": "lfm2_audio",
+}
 
 
 def _dict_to_pretrained_config(d: dict):
@@ -131,6 +149,12 @@ def _dict_to_pretrained_config(d: dict):
         "vision_config",
         "code_predictor_config",
         "speaker_encoder_config",
+        # LFM2-Audio nests the LM backbone under ``lfm`` and the conformer
+        # speech encoder under ``encoder`` / ``preprocessor`` / ``depthformer``.
+        "lfm",
+        "encoder",
+        "depthformer",
+        "preprocessor",
     )
     is_composite = any(isinstance(d.get(k), dict) for k in nested_config_keys)
     rope_keys = ("rope_scaling", "rope_parameters")
