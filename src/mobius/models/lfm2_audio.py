@@ -118,13 +118,6 @@ class _Conv2dPreEncode(nn.Module):
         )
 
 
-class _ReLUModule(nn.Module):
-    """ReLU as an nn.Module so it can sit in a ``ModuleList`` indexed slot."""
-
-    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        return op.Relu(x)
-
-
 class _NeMoSubsampling(nn.Module):
     """NeMo ``pre_encode`` (depthwise-separable conv subsampling).
 
@@ -145,6 +138,25 @@ class _NeMoSubsampling(nn.Module):
 
     Input shape:  ``[B, T, n_mels]`` (channel = 1 added internally).
     Output shape: ``[B, ceil(T/8), d_model]``.
+
+    Padding-frame masking
+    ---------------------
+    HF wraps the conv stack in a ``MaskedConvSequential`` that re-zeros
+    padded time frames before *every* layer call. This matters because each
+    Conv2d carries a bias: an all-zero input frame would otherwise produce
+    a non-zero (bias-only) output that then leaks into neighbouring valid
+    frames via subsequent stride-2 convolutions. Skipping the mask causes
+    a few-tenths-scale parity gap at the trailing edge that attention then
+    smears across every output frame (~0.12 max-abs-diff with HF on a
+    1-second clip).
+
+    The mobius graph does not receive an explicit ``feat_lengths`` input.
+    Instead we *derive* a time mask from the mel itself: padded frames are
+    written as exact zeros by the mel preprocessor (after normalization),
+    so ``ReduceMax(|mel|, dim=freq) > 0`` recovers the validity mask. After
+    each stride-2 layer the per-batch valid length ``L`` is updated via
+    ``L_next = (L - 1) // 2 + 1`` (same formula HF uses) and a fresh
+    ``arange(T_new) < L_next`` mask is broadcast back over the conv output.
     """
 
     def __init__(self, n_mels: int, conv_channels: int, d_model: int):
@@ -155,31 +167,95 @@ class _NeMoSubsampling(nn.Module):
         for _ in range(3):
             freq = (freq + 2 - 3) // 2 + 1
 
-        self.conv = nn.ModuleList(
-            [
-                _Conv2dPreEncode(1, c, kernel_size=3, stride=2, padding=1),  # 0
-                _ReLUModule(),  # 1
-                _Conv2dPreEncode(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 2
-                _Conv2dPreEncode(c, c, kernel_size=1),  # 3
-                _ReLUModule(),  # 4
-                _Conv2dPreEncode(c, c, kernel_size=3, stride=2, padding=1, groups=c),  # 5
-                _Conv2dPreEncode(c, c, kernel_size=1),  # 6
-                _ReLUModule(),  # 7
-            ]
-        )
+        # Conv layers as named attributes (no Sequential; we need to interleave
+        # masking between them, and depthwise/pointwise convs have different
+        # stride/group patterns we want to be explicit about).
+        self.conv_0 = _Conv2dPreEncode(1, c, kernel_size=3, stride=2, padding=1)
+        self.conv_2 = _Conv2dPreEncode(c, c, kernel_size=3, stride=2, padding=1, groups=c)
+        self.conv_3 = _Conv2dPreEncode(c, c, kernel_size=1)
+        self.conv_5 = _Conv2dPreEncode(c, c, kernel_size=3, stride=2, padding=1, groups=c)
+        self.conv_6 = _Conv2dPreEncode(c, c, kernel_size=1)
         self.out = Linear(c * freq, d_model, bias=True)
         self._conv_channels = c
         self._freq_out = freq
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        # -------- derive time-mask from input (padded frames are all zero) --
+        # x: [B, T, n_mels]
+        abs_x = op.Abs(x)  # [B, T, n_mels]
+        frame_max = op.ReduceMax(abs_x, op.Constant(value_ints=[-1]), keepdims=0)  # [B, T]
+        zero_like = op.CastLike(op.Constant(value_float=0.0), frame_max)
+        valid_bool = op.Greater(frame_max, zero_like)  # [B, T] bool
+        valid_f = op.CastLike(valid_bool, x)  # [B, T] in model dtype
+        valid_len = op.Cast(
+            op.ReduceSum(valid_f, op.Constant(value_ints=[1]), keepdims=0),
+            to=ir.DataType.INT64,
+        )  # [B] int64 — per-batch number of valid frames
+
         # x: [B, T, n_mels] → [B, 1, T, n_mels]
         x = op.Unsqueeze(x, [1])
-        for layer in self.conv:
-            x = layer(op, x)
-        # [B, C, T', F'] → [B, T', C, F'] → [B, T', C*F']
+        # mask shape [B, 1, T, 1] broadcast over (C, F)
+        mask = op.Unsqueeze(op.Unsqueeze(valid_f, [1]), [-1])
+
+        # Conv stages (3 stride-2 conv2ds + 2 pointwise + ReLU after each
+        # depthwise group). Between layers we re-mask and (for stride-2)
+        # downsample the validity length.
+        x = self._apply_mask_and_conv(op, x, mask, self.conv_0)
+        valid_len, mask = self._downsample_mask(op, x, valid_len)
+        x = op.Relu(op.Mul(x, mask))  # mask-before-ReLU == mask-after-ReLU here
+
+        x = self._apply_mask_and_conv(op, x, mask, self.conv_2)
+        valid_len, mask = self._downsample_mask(op, x, valid_len)
+        x = self._apply_mask_and_conv(op, x, mask, self.conv_3)  # 1x1, no stride
+        x = op.Relu(op.Mul(x, mask))
+
+        x = self._apply_mask_and_conv(op, x, mask, self.conv_5)
+        valid_len, mask = self._downsample_mask(op, x, valid_len)
+        x = self._apply_mask_and_conv(op, x, mask, self.conv_6)  # 1x1, no stride
+        x = op.Relu(op.Mul(x, mask))
+
+        # Final masking, then [B, C, T', F'] → [B, T', C*F']
+        x = op.Mul(x, mask)
         x = op.Transpose(x, perm=[0, 2, 1, 3])
         x = op.Reshape(x, op.Constant(value_ints=[0, 0, self._conv_channels * self._freq_out]))
         return self.out(op, x)
+
+    @staticmethod
+    def _apply_mask_and_conv(
+        op: OpBuilder, x: ir.Value, mask: ir.Value, conv: _Conv2dPreEncode
+    ) -> ir.Value:
+        """Zero padded frames, then run a single Conv2d layer."""
+        return conv(op, op.Mul(x, mask))
+
+    @staticmethod
+    def _downsample_mask(
+        op: OpBuilder, conv_out: ir.Value, valid_len: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        """Recompute (length, mask) after a stride-2/k=3/pad=1 Conv2d.
+
+        New per-batch length follows ``L_new = (L - 1) // 2 + 1`` (same as
+        HF's ``calculate_conv_output_size`` for k=3, stride=2, pad=(1,1)).
+        New mask is ``arange(T_new) < L_new`` broadcast back to ``[B, 1, T_new, 1]``.
+        """
+        one_i = op.Constant(value_ints=[1])
+        two_i = op.Constant(value_ints=[2])
+        # L_new = (L - 1) // 2 + 1
+        new_len = op.Add(op.Div(op.Sub(valid_len, one_i), two_i), one_i)  # [B]
+        # T_new is dim-2 of the conv output ([B, C, T_new, F_new]).
+        new_t = op.Shape(conv_out, start=2, end=3)  # [1] int64
+        arange = op.Range(
+            op.Constant(value_int=0),
+            op.Squeeze(new_t, [0]),
+            op.Constant(value_int=1),
+        )  # [T_new] int64
+        # mask_2d[b, t] = t < L_new[b]
+        mask_2d = op.Less(
+            op.Unsqueeze(arange, [0]),  # [1, T_new]
+            op.Unsqueeze(new_len, [1]),  # [B, 1]
+        )  # [B, T_new]
+        mask_f = op.CastLike(mask_2d, conv_out)
+        mask = op.Unsqueeze(op.Unsqueeze(mask_f, [1]), [-1])  # [B, 1, T_new, 1]
+        return new_len, mask
 
 
 class _NeMoFeedForward(nn.Module):
@@ -1262,7 +1338,19 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
             return None
         if key.endswith(".num_batches_tracked"):
             return None
-        return key.replace("conformer.", "audio_encoder.encoder.")
+        rest = key[len("conformer.") :]
+        # pre_encode.conv.{0,2,3,5,6}.{weight,bias} -> pre_encode.conv_{N}.{...}
+        # (HF stores the conv stack as Sequential indices including ReLUs at
+        # 1/4/7; mobius hoists each Conv2d into a named attribute so we can
+        # interleave per-step masking — see _NeMoSubsampling.)
+        m = re.match(r"^pre_encode\.conv\.(\d+)\.(.+)$", rest)
+        if m:
+            idx = m.group(1)
+            tail = m.group(2)
+            if idx in ("1", "4", "7"):  # ReLU slots have no params
+                return None
+            rest = f"pre_encode.conv_{idx}.{tail}"
+        return f"audio_encoder.encoder.{rest}"
 
     # Audio adapter: HF Sequential -> our named modules
     #   model.0 = LayerNorm(encoder_dim)              -> pre_norm

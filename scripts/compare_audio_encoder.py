@@ -12,7 +12,7 @@ from liquid_audio.processor import LFM2AudioProcessor
 
 REPO = "LiquidAI/LFM2-Audio-1.5B"
 AUDIO_PATH = "testdata/652-129742-0006.flac"
-ONNX_PATH = "/tmp/lfm2-out/audio_encoder.onnx"
+ONNX_PATH = "/tmp/lfm2-out-fixed/model.onnx"
 TARGET_SECONDS = 1.0
 
 
