@@ -54,11 +54,23 @@ def _dtype_str(value: ir.Value) -> str:
     return "UNKNOWN"
 
 
+# Sentinel keys marking a recursively-canonicalised subgraph payload inside an
+# attribute's comparable value.  diff_graphs uses these to render subgraph
+# deltas readably instead of dumping a raw nested canonical dict.
+_SUBGRAPH_KEY = "__subgraph__"
+_SUBGRAPHS_KEY = "__subgraphs__"
+
+
 def _attr_to_comparable(attr: ir.Attr) -> Any:
     """Convert an attribute to a JSON-serialisable comparable value.
 
-    Graph and tensor attributes are reduced to their type string so
-    that canonicalisation stays lightweight.
+    Most attributes reduce to their scalar / list value.  GRAPH-typed
+    attributes (``If``'s ``then_branch`` / ``else_branch``, ``Loop`` /
+    ``Scan`` bodies) are *recursively canonicalised* so subgraph structure
+    participates in the diff — without this, per-layer phase-split ``If``
+    subgraphs are invisible to the architecture diff.  Remaining opaque
+    types (TENSOR, SPARSE_TENSOR, TYPE_PROTO, …) are recorded as their type
+    string to keep canonicalisation lightweight.
     """
     simple_types = {
         ir.AttributeType.FLOAT,
@@ -74,7 +86,14 @@ def _attr_to_comparable(attr: ir.Attr) -> Any:
         if isinstance(v, tuple):
             return list(v)
         return v
-    # For TENSOR, GRAPH etc. just record the type
+    # Recurse into subgraphs so their node structure is compared, not collapsed.
+    # Subgraphs reuse canonicalize_graph, so inner node/value names are ignored
+    # the same way top-level ones are (see canonicalize_graph's name-independence).
+    if attr.type == ir.AttributeType.GRAPH:
+        return {_SUBGRAPH_KEY: canonicalize_graph(attr.value)}
+    if attr.type == ir.AttributeType.GRAPHS:
+        return {_SUBGRAPHS_KEY: [canonicalize_graph(g) for g in attr.value]}
+    # For TENSOR, SPARSE_TENSOR, TYPE_PROTO, … just record the type.
     return f"<{attr.type.name}>"
 
 
@@ -203,13 +222,92 @@ def _describe_port_diff(base_port: dict, head_port: dict) -> str:
     return "; ".join(parts) or "changed"
 
 
+def _is_subgraph_payload(value: Any) -> bool:
+    """True if *value* is a recursively-canonicalised subgraph payload."""
+    return isinstance(value, dict) and (_SUBGRAPH_KEY in value or _SUBGRAPHS_KEY in value)
+
+
+def _subgraph_list(value: Any) -> list[dict]:
+    """Extract the list of subgraph canonical forms from an attr payload."""
+    if isinstance(value, dict):
+        if _SUBGRAPH_KEY in value:
+            return [value[_SUBGRAPH_KEY]]
+        if _SUBGRAPHS_KEY in value:
+            return list(value[_SUBGRAPHS_KEY])
+    return []
+
+
+# Nested sub-change types that make a subgraph delta *structurally* significant
+# (a node/branch was added/removed, rewired, or the subgraph interface moved),
+# as opposed to a mere inner-attribute tweak.  Any of these promotes the
+# containing attribute to a subgraph_structure_change → MODERATE.  Note this is
+# uniformly MODERATE: unlike a *top-level* interface_change (MAJOR, an external
+# model-contract break), a subgraph's interface is internal control-flow plumbing,
+# so it stays MODERATE here — a deliberate asymmetry.
+# ``subgraph_structure_change`` is included so structural significance
+# *propagates* upward through nested subgraphs (e.g. an If inside an If).
+_STRUCTURAL_SUB_TYPES = frozenset(
+    {
+        "added_node",
+        "removed_node",
+        "changed_connectivity",
+        "interface_change",
+        "subgraph_structure_change",
+    }
+)
+
+
+def _describe_subgraph_attr_change(key: str, base_val: Any, head_val: Any) -> tuple[str, bool]:
+    """Describe a GRAPH-typed attribute change, recursing into the subgraph(s).
+
+    Returns ``(detail, structural)`` where *detail* is a readable summary
+    that surfaces the nested diff (e.g. ``"then_branch: node[0] Concat:
+    axis: 0 → 1"`` or ``"then_branch: + Mul; - Add"``) and *structural* is
+    True when the nested delta adds/removes a node or branch, rewires
+    connectivity, or changes the subgraph interface — i.e. a change that
+    should outrank a pure inner-attribute tweak.
+    """
+    base_subs = _subgraph_list(base_val)
+    head_subs = _subgraph_list(head_val)
+    count = max(len(base_subs), len(head_subs))
+    structural = False
+    parts: list[str] = []
+    for idx in range(count):
+        bs = base_subs[idx] if idx < len(base_subs) else None
+        hs = head_subs[idx] if idx < len(head_subs) else None
+        # The attribute *key* already names a single subgraph (then_branch,
+        # body, …); only disambiguate by index when there are several (GRAPHS).
+        label = "" if count == 1 else f"subgraph[{idx}]"
+        if bs is None or hs is None:
+            # A whole branch/body was added or removed.
+            structural = True
+            verb = "added" if bs is None else "removed"
+            parts.append(f"{label} {verb}".strip())
+            continue
+        sub_changes = diff_graphs(bs, hs)
+        if not sub_changes:
+            continue
+        if {c["type"] for c in sub_changes} & _STRUCTURAL_SUB_TYPES:
+            structural = True
+        inner = "; ".join(c["details"] for c in sub_changes)
+        parts.append(f"{label}: {inner}" if label else inner)
+    detail = f"{key}: " + ("; ".join(parts) if parts else "subgraph changed")
+    return detail, structural
+
+
 def diff_graphs(base: dict, head: dict) -> list[dict[str, Any]]:
     """Compare two canonical graph representations.
 
     Returns a list of change dicts.  Each dict has a ``"type"`` key with
     one of: ``"added_node"``, ``"removed_node"``, ``"changed_attrs"``,
+    ``"subgraph_structure_change"``, ``"changed_connectivity"``,
     ``"interface_change"``, ``"initializer_change"``.  A ``"details"``
     key carries human-readable information about the change.
+
+    ``subgraph_structure_change`` is emitted for a GRAPH-typed attribute
+    (``If`` branches, ``Loop`` / ``Scan`` bodies) whose nested graph gains
+    or loses a node/branch, is rewired, or changes interface; a subgraph
+    delta that only tweaks an inner attribute stays ``changed_attrs``.
     """
     changes: list[dict[str, Any]] = []
 
@@ -304,19 +402,32 @@ def diff_graphs(base: dict, head: dict) -> list[dict[str, Any]]:
         if bn["attributes"] != hn["attributes"]:
             ba = bn["attributes"]
             ha = hn["attributes"]
-            attr_details: list[str] = []
+            plain_details: list[str] = []
             all_keys = sorted(set(ba) | set(ha))
             for k in all_keys:
                 bv = ba.get(k)
                 hv = ha.get(k)
-                if bv != hv:
-                    attr_details.append(f"{k}: {bv!r} → {hv!r}")
-            changes.append(
-                {
-                    "type": "changed_attrs",
-                    "details": (f"node[{i}] {bn['op_type']}: " + ", ".join(attr_details)),
-                }
-            )
+                if bv == hv:
+                    continue
+                if _is_subgraph_payload(bv) or _is_subgraph_payload(hv):
+                    detail, structural = _describe_subgraph_attr_change(k, bv, hv)
+                    changes.append(
+                        {
+                            "type": (
+                                "subgraph_structure_change" if structural else "changed_attrs"
+                            ),
+                            "details": f"node[{i}] {bn['op_type']}: {detail}",
+                        }
+                    )
+                else:
+                    plain_details.append(f"{k}: {bv!r} → {hv!r}")
+            if plain_details:
+                changes.append(
+                    {
+                        "type": "changed_attrs",
+                        "details": (f"node[{i}] {bn['op_type']}: " + ", ".join(plain_details)),
+                    }
+                )
         if bn["input_ids"] != hn["input_ids"]:
             changes.append(
                 {
@@ -343,7 +454,12 @@ def _change_status(change_list: list[dict[str, Any]]) -> str:
     types = {c["type"] for c in change_list}
     if types & {"interface_change"}:
         return _STATUS_MAJOR
-    if types & {"added_node", "removed_node", "changed_connectivity"}:
+    if types & {
+        "added_node",
+        "removed_node",
+        "changed_connectivity",
+        "subgraph_structure_change",
+    }:
         return _STATUS_MODERATE
     if types & {"changed_attrs", "initializer_change"}:
         return _STATUS_MINOR
@@ -459,6 +575,7 @@ def render_markdown(
             removed = [c for c in change_list if c["type"] == "removed_node"]
             attrs = [c for c in change_list if c["type"] == "changed_attrs"]
             connectivity = [c for c in change_list if c["type"] == "changed_connectivity"]
+            subgraph = [c for c in change_list if c["type"] == "subgraph_structure_change"]
             iface = [c for c in change_list if c["type"] == "interface_change"]
             inits = [c for c in change_list if c["type"] == "initializer_change"]
 
@@ -471,6 +588,12 @@ def render_markdown(
             if removed:
                 lines.append("**Removed nodes:**")
                 for c in removed:
+                    lines.append(f"- `{c['details']}`")
+                lines.append("")
+
+            if subgraph:
+                lines.append("**Subgraph structure changes:**")
+                for c in subgraph:
                     lines.append(f"- `{c['details']}`")
                 lines.append("")
 
