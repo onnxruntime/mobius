@@ -157,10 +157,13 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   font-size: 0.7em; font-weight: 600; padding: 1px 5px; border-radius: 4px;
   white-space: nowrap;
 }
-.l3-status { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
-.l3-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
-.l3-xfail { background: rgba(163,113,247,0.2); color: var(--xfail); }
-.l3-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
+/* Per-level status badges (xfail / pass / skip). Level-neutral by design:
+   the same classes are reused for L2 and L3 badges so visual treatment of
+   "expected failure", "pass", and "skipped" stays consistent across levels. */
+.status-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
+.status-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
+.status-xfail { background: rgba(163,113,247,0.2); color: var(--xfail); }
+.status-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
 .ratio-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
 .ratio-high { background: rgba(63,185,80,0.2); color: var(--l3); }
 .ratio-medium { background: rgba(210,153,34,0.2); color: var(--l1); }
@@ -581,19 +584,19 @@ function renderModelRow(m) {
   // L2 status badge (xfail / xfail_graph_only annotated next to model_type).
   let l2Badge = '';
   if (m.l2_status === 'xfail') {
-    l2Badge = ` <span class="l3-status l3-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">xfail</span>`;
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">xfail</span>`;
   } else if (m.l2_status === 'xfail_graph_only') {
-    l2Badge = ` <span class="l3-status l3-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">xfail</span>`;
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">xfail</span>`;
   }
 
   // L3 status badge
   let l3Badge = '';
   if (m.l3_status === 'pass') {
-    l3Badge = ' <span class="l3-status l3-pass" title="L3 synthetic parity passes">\u2713</span>';
+    l3Badge = ' <span class="status-badge status-pass" title="L3 synthetic parity passes">\u2713</span>';
   } else if (m.l3_status === 'xfail') {
-    l3Badge = ` <span class="l3-status l3-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">xfail</span>`;
+    l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">xfail</span>`;
   } else if (m.l3_status === 'skip') {
-    l3Badge = ` <span class="l3-status l3-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">skip</span>`;
+    l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">skip</span>`;
   }
 
   // min_token_match_ratio badge
