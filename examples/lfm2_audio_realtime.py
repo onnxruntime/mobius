@@ -77,7 +77,12 @@ _DEFAULT_HIDDEN_SIZE = 2048  # fallback for conv_state shape when dim is symboli
 # Depthformer (audio decoder) defaults
 _DEFAULT_DEPTHFORMER_DIM = 1024
 _DEFAULT_DEPTHFORMER_LAYERS = 6
-_DEFAULT_DEPTHFORMER_HEADS = 16
+# The depthformer hardcodes head_dim=32 (so 32 query heads from
+# depthformer_dim=1024) with 8 KV heads — *not* depthformer_dim //
+# depthformer_heads, contrary to the old ``depthformer_heads=16``
+# assumption that the original PR shipped with.
+_DEFAULT_DEPTHFORMER_HEAD_DIM = 32
+_DEFAULT_DEPTHFORMER_KV_HEADS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +264,8 @@ class Lfm2AudioOnnxPipeline:
         *,
         depthformer_dim: int = _DEFAULT_DEPTHFORMER_DIM,
         depthformer_layers: int = _DEFAULT_DEPTHFORMER_LAYERS,
-        depthformer_heads: int = _DEFAULT_DEPTHFORMER_HEADS,
+        depthformer_head_dim: int = _DEFAULT_DEPTHFORMER_HEAD_DIM,
+        depthformer_kv_heads: int = _DEFAULT_DEPTHFORMER_KV_HEADS,
         num_codebooks: int = NUM_CODEBOOKS,
         dtype: np.dtype = np.float32,
     ):
@@ -280,10 +286,13 @@ class Lfm2AudioOnnxPipeline:
         # Hybrid decoder cache: initialized by inspecting decoder session inputs
         self._decoder_cache = _init_hybrid_cache(self._decoder, batch=1)
 
-        # Depthformer KV cache (pure attention, no conv layers)
-        depthformer_head_dim = depthformer_dim // depthformer_heads
+        # Depthformer KV cache (pure GQA: 8 KV heads × 32 head_dim, regardless
+        # of how many query heads the attention has).
         self._depthformer_cache = _make_zero_kv_cache(
-            depthformer_layers, depthformer_heads, depthformer_head_dim, dtype=dtype
+            depthformer_layers,
+            depthformer_kv_heads,
+            depthformer_head_dim,
+            dtype=dtype,
         )
 
         self._step = 0
@@ -339,12 +348,15 @@ class Lfm2AudioOnnxPipeline:
         mel = _audio_to_mel(audio_frame, n_mels=N_MELS)
         audio_features = self._audio_encoder.run(None, {"input_features": mel})[0]
 
-        # 2. Embedding: text + audio → inputs_embeds (1, S, hidden)
-        emb_feeds = {
-            "input_ids": np.array([[text_token]], dtype=np.int64),
-            "audio_features": audio_features,  # (1, T', hidden)
-        }
-        inputs_embeds = self._embedding.run(None, emb_feeds)[0]  # (1, S, hidden)
+        # 2. Text embedding: only text_ids go through the embedding sub-model;
+        # the audio features were already projected to hidden_size by the
+        # audio_encoder's adapter, so we just splice them onto the front of
+        # the text embeddings in Python.
+        text_embeds = self._embedding.run(
+            None, {"input_ids": np.array([[text_token]], dtype=np.int64)}
+        )[0]  # (1, 1, hidden)
+        # (1, T'+1, hidden)
+        inputs_embeds = np.concatenate([audio_features, text_embeds], axis=1)
 
         # 3. Decoder: inputs_embeds → logits + updated hybrid cache
         dec_feeds: dict = {
@@ -582,7 +594,9 @@ def build_lfm2_models(model_id: str, save_dir: Path | None = None) -> dict:
     from mobius import build
 
     print(f"[lfm2] Building ONNX models from {model_id} ...")
-    pkg = build(model_id)
+    # Use float32 for CPU inference; the HF checkpoint is bfloat16 but
+    # most CPU EPs don't have BF16 Conv kernels for the subsampling stage.
+    pkg = build(model_id, dtype="float32")
 
     if save_dir is not None:
         import onnx_ir
@@ -682,7 +696,9 @@ def main() -> None:
         model_paths = {}
         for name, model in onnx_models.items():
             out = tmp_dir / f"{name}.onnx"
-            onnx_ir.save(model, out)
+            # Pass external_data because the decoder proto exceeds the 2 GB
+            # protobuf limit for LFM2-Audio-1.5B (~5 GB total backbone weights).
+            onnx_ir.save(model, out, external_data=f"{name}.data")
             model_paths[name] = str(out)
         print(f"[lfm2] Temporary ONNX models saved to {tmp_dir}")
 
