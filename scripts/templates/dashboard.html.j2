@@ -581,9 +581,9 @@ function renderModelRow(m) {
   // L2 status badge (xfail / xfail_graph_only annotated next to model_type).
   let l2Badge = '';
   if (m.l2_status === 'xfail') {
-    l2Badge = ` <span class="l3-status l3-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">L2 xfail</span>`;
+    l2Badge = ` <span class="l3-status l3-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">xfail</span>`;
   } else if (m.l2_status === 'xfail_graph_only') {
-    l2Badge = ` <span class="l3-status l3-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">L2 graph xfail</span>`;
+    l2Badge = ` <span class="l3-status l3-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">xfail</span>`;
   }
 
   // L3 status badge
