@@ -292,6 +292,10 @@ jobs:
             -k "smollm-135m or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2" \
             --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
         timeout-minutes: 15
+      - name: Static-cache decode runtime tests
+        run: |
+          pytest tests/static_cache_decode_test.py -v --tb=short
+        timeout-minutes: 10
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v6
