@@ -197,7 +197,7 @@ class _Lfm2TextModel(nn.Module):
             else:
                 self.layers.append(Lfm2AttentionDecoderLayer(config))
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embedding_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
 
     def forward(
@@ -230,7 +230,7 @@ class _Lfm2TextModel(nn.Module):
             )
             present_key_values.append(present_kv)
 
-        hidden_states = self.norm(op, hidden_states)
+        hidden_states = self.embedding_norm(op, hidden_states)
         return hidden_states, present_key_values
 
 
@@ -302,8 +302,8 @@ def _rename_lfm2_weight(key: str) -> str:
     """Rename a single HF weight key to match ONNX module structure.
 
     Global renames:
-        model.embed_tokens.weight → model.embed_tokens.weight  (no change)
-        model.norm.weight → model.norm.weight  (no change)
+        model.embed_tokens.weight    → model.embed_tokens.weight  (no change)
+        model.embedding_norm.weight  → model.embedding_norm.weight  (no change)
 
     Per-layer renames (within model.layers.N):
         conv.conv.weight → conv.conv_weight  (nested module → parameter)
