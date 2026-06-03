@@ -1,0 +1,27 @@
+{
+  "model_id": "LiquidAI/LFM2-1.2B",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    509,
+    1286,
+    779,
+    14587,
+    803,
+    779,
+    4915,
+    521,
+    1490,
+    768,
+    45016,
+    803,
+    8780,
+    1421,
+    542,
+    809,
+    1174,
+    59470,
+    812,
+    2163
+  ],
+  "generated_text": "\n\nIn the quiet of the night, under a blanket of stars,\nA lone owl hoot"
+}
