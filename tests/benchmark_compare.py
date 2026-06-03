@@ -33,6 +33,30 @@ THRESHOLDS: dict[str, tuple[float, float]] = {
     "num_nodes": (0.05, 0.10),
 }
 
+# Intended structural changes that would otherwise trip a deterministic-metric
+# blocker, keyed by model display key -> metric -> the exact (baseline, current)
+# values to waive. ABSOLUTE counts (not a relative delta) are pinned on purpose:
+# the waiver fires only for this exact base->current transition, so once the
+# change merges into the base branch (baseline becomes the new value) the entry
+# can NEVER match again and is truly self-cleaning — a later regression that
+# happens to add the same number of nodes still blocks. Only the exact pinned
+# transition is waived; any other base/current pair falls through to the normal
+# threshold logic and can block, so this never masks an accidental regression.
+#
+# PR #328 (static-cache export): the is_causal=0 static-cache path wraps each
+# decoder layer's attention in a phase-split ``If(Greater(seq_len, 1))`` subgraph
+# (prefill takes the explicit-causal-mask branch, decode the maskless branch)
+# plus the prefill mask-build nodes. This intentionally raises num_nodes by a
+# fixed +10 top-level nodes per static-cache export. These are correct, not a
+# regression. Safe to delete this whole table after PR #328 merges. (If an
+# unrelated opset/ORT/exporter change shifts the baseline counts before merge,
+# update the pinned values here — a mismatch fails closed with a RED blocker.)
+EXPECTED_CHANGES: dict[str, dict[str, tuple[int, int]]] = {
+    "llama (static-cache)": {"num_nodes": (58, 68)},
+    "qwen2 (static-cache)": {"num_nodes": (58, 68)},
+    "phi3 (static-cache)": {"num_nodes": (56, 66)},
+}
+
 _GITHUB_REPO_URL = "https://github.com/onnxruntime/mobius"
 
 
@@ -58,7 +82,12 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
                 continue
             delta_pct = (curr_val - base_val) / base_val
             warn_t, block_t = THRESHOLDS[metric]
-            if delta_pct > block_t:
+            expected = EXPECTED_CHANGES.get(model, {}).get(metric)
+            if expected is not None and (base_val, curr_val) == expected:
+                # Intended structural change (e.g. the static-cache phase-split
+                # If+mask). Waive only this exact pinned base->current transition.
+                status = "\U0001f7e6"  # blue square: accepted intended change
+            elif delta_pct > block_t:
                 status = "\U0001f534"  # red circle
                 has_blocker = True
             elif delta_pct > warn_t:
@@ -105,7 +134,14 @@ def compare(current_path: str, baseline_path: str) -> tuple[str, bool]:
     elif any(r[5] == "\u26a0\ufe0f" for r in rows):
         md += "\n> Warning: minor regressions detected. Review flagged metrics.\n"
     else:
-        md += "\n> No performance regressions.\n"
+        md += "\n> No blocking regressions.\n"
+
+    if any(r[5] == "\U0001f7e6" for r in rows):
+        md += (
+            "\n> \U0001f7e6 = intended structural change accepted via "
+            "`EXPECTED_CHANGES` (exact pinned base→current values; see "
+            "`tests/benchmark_compare.py`).\n"
+        )
 
     return md, has_blocker
 
