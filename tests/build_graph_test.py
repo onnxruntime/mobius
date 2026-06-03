@@ -4456,23 +4456,6 @@ class TestBuildStaticCacheGraph:
 
     MAX_SEQ_LEN = 128
 
-    @staticmethod
-    def _walk_nodes(graph):
-        """Yield every node in ``graph``, recursing into subgraphs (e.g. If).
-
-        The static-cache attention is emitted as an ``If`` whose branches
-        each contain an ``Attention`` op, so structural assertions must look
-        inside subgraph attributes rather than only the top-level graph.
-        """
-        for node in graph:
-            yield node
-            for attr in node.attributes.values():
-                if attr.type == ir.AttributeType.GRAPH and attr.value is not None:
-                    yield from TestBuildStaticCacheGraph._walk_nodes(attr.value)
-                elif attr.type == ir.AttributeType.GRAPHS:
-                    for subgraph in attr.value:
-                        yield from TestBuildStaticCacheGraph._walk_nodes(subgraph)
-
     def _build_static_cache_model(self, model_type: str = "qwen2", **config_overrides):
         """Build a model with CausalLMTask(static_cache=True) and return (model, config)."""
         from mobius.tasks import CausalLMTask
@@ -4556,7 +4539,7 @@ class TestBuildStaticCacheGraph:
         """
         model, _ = self._build_static_cache_model()
 
-        op_types = {n.op_type for n in self._walk_nodes(model.graph)}
+        op_types = {n.op_type for n in model.graph.all_nodes()}
         assert "TensorScatter" in op_types, "Static cache graph should use TensorScatter"
         assert "Attention" in op_types, "Static cache graph should use Attention"
         assert "If" in op_types, "Static cache attention should be phase-split behind an If"
@@ -4588,9 +4571,7 @@ class TestBuildStaticCacheGraph:
         """
         model, config = self._build_static_cache_model()
 
-        attention_nodes = [
-            n for n in self._walk_nodes(model.graph) if n.op_type == "Attention"
-        ]
+        attention_nodes = [n for n in model.graph.all_nodes() if n.op_type == "Attention"]
         # Two branches (prefill + decode) per layer.
         assert len(attention_nodes) == 2 * config.num_hidden_layers
 
@@ -4624,7 +4605,7 @@ class TestBuildStaticCacheGraph:
         """
         model, config = self._build_static_cache_model()
 
-        if_nodes = [n for n in self._walk_nodes(model.graph) if n.op_type == "If"]
+        if_nodes = [n for n in model.graph.all_nodes() if n.op_type == "If"]
         # (a) Fail-closed: the phase-split If must exist, one per layer.
         assert len(if_nodes) == config.num_hidden_layers, (
             f"static-cache attention must phase-split via If "
@@ -4633,8 +4614,8 @@ class TestBuildStaticCacheGraph:
         )
 
         for if_node in if_nodes:
-            then_branch = if_node.attributes["then_branch"].value
-            else_branch = if_node.attributes["else_branch"].value
+            then_branch = if_node.attributes["then_branch"].as_graph()
+            else_branch = if_node.attributes["else_branch"].as_graph()
             then_attn = self._single_attention(then_branch)
             else_attn = self._single_attention(else_branch)
 
@@ -4677,7 +4658,7 @@ class TestBuildStaticCacheGraph:
         """
         model, config = self._build_static_cache_model()
         op_counts: dict[str, int] = {}
-        for node in self._walk_nodes(model.graph):
+        for node in model.graph.all_nodes():
             op_counts[node.op_type] = op_counts.get(node.op_type, 0) + 1
 
         assert op_counts.get("If", 0) == config.num_hidden_layers, (
@@ -4713,7 +4694,7 @@ class TestBuildStaticCacheGraph:
 
         # Verify TensorScatter (top level) and Attention (inside the
         # phase-split If branches) ops are present.
-        op_types = {n.op_type for n in self._walk_nodes(model.graph)}
+        op_types = {n.op_type for n in model.graph.all_nodes()}
         assert "TensorScatter" in op_types
         assert "Attention" in op_types
 
