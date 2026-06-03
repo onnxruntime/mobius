@@ -4788,6 +4788,9 @@ class TestBuildLfm2AudioGraph:
             depthformer_layers=2,
             depthformer_dim=TINY_HIDDEN,
             depthformer_heads=TINY_HEADS,
+            depthformer_head_dim=TINY_HEAD_DIM,
+            depthformer_kv_heads=TINY_KV_HEADS,
+            depthformer_intermediate_size=TINY_INTERMEDIATE,
             num_codebooks=2,
             audio_vocab_size=32,
             audio=AudioConfig(

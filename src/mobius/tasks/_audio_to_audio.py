@@ -208,8 +208,14 @@ class AudioToAudioTask(ModelTask):
         """
         depthformer_dim = getattr(config, "depthformer_dim", config.hidden_size)
         depthformer_layers = getattr(config, "depthformer_layers", 6)
-        depthformer_heads = getattr(config, "depthformer_heads", 16)
-        depthformer_head_dim = depthformer_dim // depthformer_heads
+        # LFM2-Audio uses GQA with a hardcoded head_dim; pull those from the
+        # config (with safe fallbacks for legacy configs lacking the fields).
+        depthformer_head_dim = getattr(config, "depthformer_head_dim", None) or (
+            depthformer_dim // getattr(config, "depthformer_heads", 16)
+        )
+        depthformer_kv_heads = getattr(config, "depthformer_kv_heads", None) or getattr(
+            config, "depthformer_heads", 16
+        )
 
         batch = ir.SymbolicDim("batch")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -235,7 +241,7 @@ class AudioToAudioTask(ModelTask):
         past_key_values = _make_kv_cache_inputs(
             builder,
             depthformer_layers,
-            depthformer_heads,
+            depthformer_kv_heads,
             depthformer_head_dim,
             config.dtype,
             batch,

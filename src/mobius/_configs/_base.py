@@ -2001,10 +2001,23 @@ class Lfm2AudioConfig(Lfm2Config):
     Extends Lfm2Config with depthformer and audio codec fields.
     """
 
-    # Depthformer parameters
+    # Depthformer parameters.
+    #
+    # ``depthformer_heads`` is retained as a legacy field but is *not* the
+    # geometry source of truth — LFM2-Audio hardcodes ``head_dim=32`` and
+    # uses GQA with ``kv_heads=8``. The effective number of query heads is
+    # ``depthformer_dim // depthformer_head_dim``. ``depthformer_heads`` is
+    # only consumed by downstream code that has not been migrated yet.
     depthformer_layers: int = 6
     depthformer_dim: int = 1024
     depthformer_heads: int = 16
+    depthformer_head_dim: int = 32
+    depthformer_kv_heads: int = 8
+    # SwiGLU intermediate size for depthformer feed-forward. If ``None``,
+    # falls back to the LFM2 ``block_auto_adjust_ff_dim`` formula
+    # (``round_up(2 * 4 * dim / 3, 256)``), which yields ``2816`` for
+    # ``dim=1024`` to match the LFM2-Audio-1.5B checkpoint.
+    depthformer_intermediate_size: int | None = None
     depthformer_tie: bool = True
 
     # Audio codec parameters
@@ -2034,11 +2047,19 @@ class Lfm2AudioConfig(Lfm2Config):
             depthformer_layers = 6
             depthformer_dim = 1024
             depthformer_heads = 16
+            depthformer_head_dim = 32
+            depthformer_kv_heads = 8
+            depthformer_intermediate_size: int | None = None
             depthformer_tie = True
         else:
             depthformer_layers = getattr(depthformer, "layers", 6)
             depthformer_dim = getattr(depthformer, "dim", 1024)
             depthformer_heads = getattr(depthformer, "heads", 16)
+            depthformer_head_dim = getattr(depthformer, "head_dim", 32)
+            depthformer_kv_heads = getattr(depthformer, "kv_heads", 8)
+            depthformer_intermediate_size = getattr(
+                depthformer, "intermediate_size", None
+            ) or getattr(depthformer, "hidden_dim", None)
             depthformer_tie = getattr(depthformer, "tie", True)
 
         encoder = getattr(config, "encoder", None)
@@ -2071,6 +2092,9 @@ class Lfm2AudioConfig(Lfm2Config):
             depthformer_layers=depthformer_layers,
             depthformer_dim=depthformer_dim,
             depthformer_heads=depthformer_heads,
+            depthformer_head_dim=depthformer_head_dim,
+            depthformer_kv_heads=depthformer_kv_heads,
+            depthformer_intermediate_size=depthformer_intermediate_size,
             depthformer_tie=depthformer_tie,
             num_codebooks=getattr(config, "codebooks", 8),
             audio_vocab_size=getattr(config, "audio_vocab_size", 2049),
