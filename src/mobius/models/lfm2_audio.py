@@ -589,12 +589,26 @@ class Lfm2AudioModel(nn.Module):
               ``depthformer_tie=True``) are stacked into
               ``audio_decoder.stacked_head_weights``.
         """
-        if self.config.tie_word_embeddings:
+        # LFM2-Audio doesn't carry an explicit ``tie_word_embeddings`` flag
+        # in its custom config, but the checkpoint omits ``lfm.lm_head.weight``
+        # so the embedding is always tied. Force the tie whenever lm_head is
+        # missing and embed_tokens is present so the decoder lm_head gets a
+        # weight regardless of how config.tie_word_embeddings was inferred.
+        force_tie = (
+            "lfm.lm_head.weight" not in state_dict and "lfm.embed_tokens.weight" in state_dict
+        )
+        if self.config.tie_word_embeddings or force_tie:
             tie_word_embeddings(
                 state_dict,
                 embed_key="lfm.embed_tokens.weight",
                 head_key="lfm.lm_head.weight",
             )
+            # In multi-model splits the embedding and lm_head end up in
+            # *different* ONNX sub-graphs (``embedding`` and ``decoder``).
+            # mobius's apply_weights deduplicates tensors that share Python
+            # storage, which would drop the decoder copy entirely. Clone so
+            # each sub-model gets its own initializer.
+            state_dict["lfm.lm_head.weight"] = state_dict["lfm.lm_head.weight"].clone()
 
         # Split fused depthformer qkv_proj into q/k/v.
         head_dim = self.config.depthformer_head_dim
@@ -674,6 +688,11 @@ def _rename_lfm2_audio_weight(key: str) -> str | None:
             layer_rest = layer_rest.replace("self_attn.q_layernorm.", "self_attn.q_norm.")
             layer_rest = layer_rest.replace("self_attn.k_layernorm.", "self_attn.k_norm.")
             return f"decoder.layers.{idx}.{layer_rest}"
+
+        # HF stores the post-layers RMSNorm as ``lfm.embedding_norm.weight``,
+        # but our :class:`_Lfm2AudioDecoder` exposes it as ``self.norm``.
+        if rest == "embedding_norm.weight":
+            return "decoder.norm.weight"
 
         # lfm.norm -> decoder.norm
         return f"decoder.{rest}"
