@@ -403,22 +403,40 @@ const LEVEL_DESCRIPTIONS = {
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     if (i === 3) {
-      // L3: show pass/xfail/skip parity status breakdown
+      // L3: show pass/xfail/skip/untested parity status breakdown.
+      // `untested` = registered model_type with no L3 test parametrization
+      // and no entry in any L3 skip/xfail dict. Surfacing it makes the
+      // four buckets sum to SUMMARY.total instead of silently dropping
+      // models from the card annotation.
       const l3s = SUMMARY.l3_status_counts || {};
       const parts = [];
       if (l3s.pass) parts.push(`${l3s.pass} pass`);
       if (l3s.xfail) parts.push(`${l3s.xfail} xfail`);
       if (l3s.skip) parts.push(`${l3s.skip} skip`);
+      if (l3s.untested) parts.push(`${l3s.untested} untested`);
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     if (i === 4 || i === 5) {
       const skipped = i === 4 ? (SUMMARY.l4_skipped_count || 0) : (SUMMARY.l5_skipped_count || 0);
       const caseKey = i === 4 ? 'l4_case' : 'l5_case';
       const levelKey = 'l' + i;
-      const awaiting = MODEL_DATA.filter(m => m[caseKey] && !m[levelKey]).length;
+      const skipKey = i === 4 ? 'l4_skipped' : 'l5_skipped';
+      // `awaiting` = yaml case exists, no golden yet, AND not skipped.
+      // Skipped cases by definition have no golden; excluding them avoids
+      // double-counting them in both the `skipped` and `awaiting` buckets.
+      const awaiting = MODEL_DATA.filter(m =>
+        m[caseKey] && !m[levelKey] && !m[skipKey]
+      ).length;
+      // `untested` = no golden, no skip flag, no yaml case at all.
+      // Makes the four buckets (pass / skipped / awaiting / untested) sum
+      // to SUMMARY.total.
+      const untested = MODEL_DATA.filter(m =>
+        !m[levelKey] && !m[skipKey] && !m[caseKey]
+      ).length;
       const parts = [];
       if (skipped) parts.push(`${skipped} skipped`);
       if (awaiting) parts.push(`${awaiting} awaiting data`);
+      if (untested) parts.push(`${untested} untested`);
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     bar.innerHTML += `<div class="summary-card level-${i}" title="${LEVEL_DESCRIPTIONS[i]}">
