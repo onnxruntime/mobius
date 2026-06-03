@@ -633,7 +633,6 @@ class TestFoldConcatOrtLoad:
     """
 
     def test_folded_fp16_concat_matmul_loads_in_ort(self, tmp_path):
-        import onnx
         import onnxruntime as ort
 
         # Three fp16 weights with UNSET declared dtype (as after _cast_module_dtype),
@@ -684,7 +683,7 @@ class TestFoldConcatOrtLoad:
             del model.graph.initializers[dead]
 
         model_path = tmp_path / "fp16_qkv.onnx"
-        onnx.save(ir.to_proto(model), str(model_path))
+        ir.save(model, model_path)
 
         # Before the fix this raises a fp16/fp32 MatMul type-mismatch at load.
         sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
