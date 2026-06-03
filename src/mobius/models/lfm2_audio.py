@@ -628,7 +628,7 @@ class _Lfm2AudioAdapter(nn.Module):
     def __init__(self, encoder_dim: int, hidden_size: int):
         super().__init__()
         self.pre_norm = LayerNorm(encoder_dim, eps=1e-5)
-        self.up_proj = Linear(encoder_dim, hidden_size, bias=False)
+        self.up_proj = Linear(encoder_dim, hidden_size, bias=True)
         self.out_proj = Linear(hidden_size, hidden_size, bias=True)
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
@@ -646,7 +646,7 @@ class _Lfm2AudioEncoder(nn.Module):
         conformer.pre_encode.* -> encoder.pre_encode.*
         conformer.layers.K.*   -> encoder.layers.K.*
         audio_adapter.model.0.{weight,bias} -> adapter.pre_norm.{weight,bias}
-        audio_adapter.model.1.weight        -> adapter.up_proj.weight   (no bias in HF)
+        audio_adapter.model.1.{weight,bias} -> adapter.up_proj.{weight,bias}
         audio_adapter.model.3.{weight,bias} -> adapter.out_proj.{weight,bias}
     """
 

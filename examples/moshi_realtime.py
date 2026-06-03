@@ -508,7 +508,9 @@ def build_moshi_models(model_id: str, save_dir: Path | None = None) -> dict:
     from mobius import build
 
     print(f"[moshi] Building ONNX models from {model_id} ...")
-    pkg = build(model_id)
+    # Use float32 for CPU inference; the live HF checkpoint is bfloat16 but
+    # ORT's CPU EP lacks BF16 kernels for several ops used in the depformer.
+    pkg = build(model_id, dtype="float32")
 
     if save_dir is not None:
         import onnx_ir
@@ -602,7 +604,9 @@ def main() -> None:
         model_paths = {}
         for name, model in onnx_models.items():
             out = tmp_dir / f"{name}.onnx"
-            onnx_ir.save(model, out)
+            # Pass external_data because the decoder proto exceeds the 2 GB
+            # protobuf limit for personaplex-7b (~14 GB at float32).
+            onnx_ir.save(model, out, external_data=f"{name}.data")
             model_paths[name] = str(out)
         print(f"[moshi] Temporary ONNX models saved to {tmp_dir}")
 
@@ -637,13 +641,33 @@ def main() -> None:
     )
 
     if codec is None:
-        # Dry-run demo: simulate one step without real audio
-        print("[moshi] Running dry-run step (no codec, no audio device) ...")
-        dummy_codes = np.zeros(NUM_CODEBOOKS, dtype=np.int64)
-        text_token, out_codes = pipeline.step(0, dummy_codes)
-        print(
-            f"[moshi] Dry-run OK — text_token={text_token}, out_codes shape={out_codes.shape}"
-        )
+        # Dry-run demo: simulate several steps without real audio. With no
+        # Mimi codec available we feed *varying* synthetic audio codes so the
+        # per-frame text tokens and codebook codes actually exercise the
+        # backbone (which sees a different embedding each step) instead of
+        # collapsing onto the same zero input across all frames.
+        n_frames = 5
+        print(f"[moshi] Running {n_frames}-frame dry-run (no codec) ...")
+        rng = np.random.default_rng(0)
+        text_token = 0
+        all_ok = True
+        for frame in range(n_frames):
+            codes_in = rng.integers(
+                0, AUDIO_VOCAB_SIZE, size=NUM_CODEBOOKS, dtype=np.int64
+            )
+            text_token, out_codes = pipeline.step(text_token, codes_in)
+            text_ok = 0 <= text_token < TEXT_VOCAB_SIZE
+            codes_ok = bool(
+                (out_codes >= 0).all() and (out_codes < AUDIO_VOCAB_SIZE).all()
+            )
+            ok = text_ok and codes_ok
+            all_ok = all_ok and ok
+            print(
+                f"[moshi] frame={frame} text_token={text_token} "
+                f"audio_codes={out_codes.tolist()} "
+                f"(text_in_vocab={text_ok}, codes_in_vocab={codes_ok})"
+            )
+        print(f"[moshi] Dry-run {'OK' if all_ok else 'FAILED — out-of-range tokens'}.")
         return
 
     # ------------------------------------------------------------------
