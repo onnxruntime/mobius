@@ -393,7 +393,7 @@ shared transformer + per-layer Q/K/V/MLP low-rank adapters.
 | `tie_word_embeddings(state_dict)` | Ensure both `embed_tokens.weight` and `lm_head.weight` exist when `tie_word_embeddings=True`. |
 | `strip_prefix(state_dict, prefix)` | Drop a common key prefix. |
 | `vlm_decoder_weights` / `vlm_embedding_weights` / `vlm_vision_weights` | VLM sub-model weight extraction (decoder strip+tie, embedding filter+strip, vision-tower filter + `fc1/fc2`→`up_proj/down_proj`). |
-| `_rename_moe_expert_weights` | MoE expert weight remapping across architectures. |
+| `_rename_moe_expert_weights` (in `mobius.models.moe`, not `_weight_utils`) | MoE expert weight remapping across architectures. |
 
 Example — a pure-rename `preprocess_weights`:
 
