@@ -142,9 +142,9 @@ def test_scan_l4_does_not_set_flag_when_yaml_skipped(gd, tmp_repo, strategy):
     gd._scan_l4_golden_files(models)
 
     info = models["dinov3_vit"]
-    assert info.l4_test_case_skipped is True
-    assert info.l4_golden_files is False, (
-        f"L4 golden flag must remain False when YAML has skip_reason "
+    assert info.l4_status == "skip"
+    assert info.l4_passes is False, (
+        f"L4 must not pass when YAML has skip_reason "
         f"(strategy={strategy}); skip_reason was set to "
         f"{info.yaml_test_case_skip_reason!r}"
     )
@@ -178,8 +178,8 @@ def test_scan_l5_does_not_set_flag_when_yaml_skipped(gd, tmp_repo, strategy):
     gd._scan_l5_generation_golden(models)
 
     info = models["skipped_only"]
-    assert info.l5_test_case_skipped is True
-    assert info.l5_generation_golden is False
+    assert info.l5_status == "skip"
+    assert info.l5_passes is False
 
 
 def test_scan_l4_still_sets_flag_when_yaml_not_skipped(gd, tmp_repo):
@@ -201,8 +201,8 @@ def test_scan_l4_still_sets_flag_when_yaml_not_skipped(gd, tmp_repo):
     gd._scan_l4_golden_files(models)
 
     info = models["dinov3_vit"]
-    assert info.l4_test_case_skipped is False
-    assert info.l4_golden_files is True
+    assert info.l4_status == "pass"
+    assert info.l4_passes is True
 
 
 # ---------------------------------------------------------------------------
@@ -249,12 +249,12 @@ def test_bug1_confidence_level_reflects_real_passing_level(gd, tmp_repo):
 def test_bug2_compute_summary_l4_card_excludes_skipped(gd, tmp_repo):
     """Summary L4 card counts only models with real L4 coverage.
 
-    Skipped models contribute to ``l4_skipped_count`` instead.
+    Skipped models contribute to ``l4_status_counts["skip"]`` instead.
     """
     models = _setup_skipped_l4_pipeline(gd, tmp_repo, l2=True)
     summary = gd._compute_summary(models)
     assert summary["by_level"][4] == 0
-    assert summary["l4_skipped_count"] == 1
+    assert summary["l4_status_counts"]["skip"] == 1
 
 
 def test_bug3_compute_summary_not_tested_includes_skipped_only(gd, tmp_repo):
@@ -312,7 +312,7 @@ def test_bugs_4_6_7_render_html_l4_json_false_when_skipped(gd, tmp_repo):
     assert len(data) == 1
     m = data[0]
     assert m["l4"] is False
-    assert m["l4_skipped"] is True
+    assert m["l4_status"] == "skip"
     assert m["confidence_level"] == 2
 
 
@@ -848,9 +848,9 @@ def test_yaml_model_type_field_disambiguates_shared_test_model_id(gd, tmp_repo):
     gd._scan_yaml_test_cases(models)
 
     # Only dinov2 should claim the YAML.
-    assert models["dinov2"].l4_test_case_skipped is True
+    assert models["dinov2"].l4_status == "skip"
     assert models["dinov2"].yaml_test_case_file is not None
-    assert models["dinov3_vit"].l4_test_case_skipped is False, (
+    assert models["dinov3_vit"].l4_status is None, (
         "dinov3_vit must NOT inherit the dinov2 YAML case via shared test_model_id"
     )
     assert models["dinov3_vit"].yaml_test_case_file is None
@@ -1031,8 +1031,10 @@ def test_confidence_level_truth_table(gd, flags, expected):
         l2_status=l2_arg if l2_arg != "none" else None,
         l3_synthetic_parity=(l3_arg != "none"),
         l3_status=l3_arg if l3_arg != "none" else None,
-        l4_golden_files=(l4_arg == "l4"),
-        l5_generation_golden=(l5_arg == "l5"),
+        l4_has_test_case=(l4_arg == "l4"),
+        l4_status=("pass" if l4_arg == "l4" else None),
+        l5_has_test_case=(l5_arg == "l5"),
+        l5_status=("pass" if l5_arg == "l5" else None),
     )
     assert info.confidence_level == expected, (
         f"flags={flags} should give level {expected}, got {info.confidence_level} "
@@ -1086,8 +1088,10 @@ def test_compute_summary_level_flags_are_independent(gd):
         l2_status="pass",
         l3_synthetic_parity=True,
         l3_status="pass",
-        l4_golden_files=True,
-        l5_generation_golden=True,
+        l4_has_test_case=True,
+        l4_status="pass",
+        l5_has_test_case=True,
+        l5_status="pass",
     )
     summary = gd._compute_summary({"stack": info})
     assert summary["by_level"][1] == 1
