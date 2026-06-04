@@ -13,7 +13,23 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import PurePosixPath
 from typing import Any
+
+
+def _component_field(filename: str | None) -> dict[str, str]:
+    """Return ``{"component": <leading dir>}`` for a sub-dirred filename.
+
+    Each model role's ONNX file lives under its own sub-directory (e.g.
+    ``vision_encoder/model.onnx``); the leading directory doubles as the role's
+    component label. Returns ``{}`` when ``filename`` has no leading directory
+    so callers can spread the result into a role dict unconditionally.
+    """
+    if filename:
+        parts = PurePosixPath(filename).parts
+        if len(parts) >= 2:
+            return {"component": parts[0]}
+    return {}
 
 
 def _default_decoder_inputs(
@@ -317,6 +333,7 @@ class GenaiConfigGenerator:
             "inputs": input_names,
             "outputs": output_names,
             "session_options": _make_session_options(self.ep),
+            **_component_field(filename),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -330,6 +347,7 @@ class GenaiConfigGenerator:
                 "inputs_embeds": "inputs_embeds",
             },
             "session_options": _make_session_options(self.ep),
+            **_component_field(embedding_filename),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -380,6 +398,7 @@ class GenaiConfigGenerator:
             "inputs": input_names,
             "outputs": output_names,
             "session_options": _make_session_options(self.ep),
+            **_component_field(filename),
         }
 
         if audio_token_id is not None:
@@ -400,9 +419,10 @@ class GenaiConfigGenerator:
         else:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
+        resolved_decoder_filename = self._decoder_filename or decoder_filename
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(self.ep),
-            "filename": self._decoder_filename or decoder_filename,
+            "filename": resolved_decoder_filename,
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
@@ -410,6 +430,7 @@ class GenaiConfigGenerator:
             "num_attention_heads": self.num_attention_heads,
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
+            **_component_field(resolved_decoder_filename),
         }
 
         # Model section
