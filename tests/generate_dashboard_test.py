@@ -243,7 +243,7 @@ def test_bug1_confidence_level_reflects_real_passing_level(gd, tmp_repo):
     models = _setup_skipped_l4_pipeline(gd, tmp_repo, l2=True)
     info = models["dinov3_vit"]
     assert info.confidence_level == 2
-    assert info.confidence_label == "L2: Config compatible"
+    assert info.confidence_label == "L2: Config Compatible"
 
 
 def test_bug2_compute_summary_l4_card_excludes_skipped(gd, tmp_repo):
@@ -363,7 +363,7 @@ def test_l3_skip_or_xfail_not_counted_as_confidence_3(gd, l3_status):
         f"L3 {l3_status!r} should not count as L3 passing; "
         f"got confidence_level={info.confidence_level}"
     )
-    assert info.confidence_label == "L2: Config compatible"
+    assert info.confidence_label == "L2: Config Compatible"
 
 
 @pytest.mark.parametrize("l3_status", ["skip", "xfail"])
@@ -608,7 +608,7 @@ def test_confidence_level_excludes_l2_xfail(gd, l2_status):
     info.l2_status = l2_status
     info.l2_status_reason = "config requires trust_remote_code"
     assert info.confidence_level == 1
-    assert info.confidence_label == "L1: Graph builds"
+    assert info.confidence_label == "L1: Graph Builds"
 
 
 @pytest.mark.parametrize("l2_status", ["xfail", "xfail_graph_only"])
@@ -1045,12 +1045,12 @@ def test_confidence_level_truth_table(gd, flags, expected):
 @pytest.mark.parametrize(
     "level,expected_label",
     [
-        (0, "Not tested"),
-        (1, "L1: Graph builds"),
-        (2, "L2: Config compatible"),
-        (3, "L3: Synthetic parity"),
-        (4, "L4: Golden match"),
-        (5, "L5: Generation verified"),
+        (0, "Not Tested"),
+        (1, "L1: Graph Builds"),
+        (2, "L2: Config Compatible"),
+        (3, "L3: Synthetic Parity"),
+        (4, "L4: Golden Match"),
+        (5, "L5: Generation Verified"),
     ],
 )
 def test_confidence_label_matches_label_table(gd, level, expected_label):
