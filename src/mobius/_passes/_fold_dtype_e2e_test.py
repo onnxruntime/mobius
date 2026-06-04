@@ -174,12 +174,18 @@ def _assert_matmul_weights_roundtrip_as_fp16(model: ir.Model, tmp_path: Path) ->
         )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def fp16_export() -> tuple[ArchitectureConfig, ir.Model]:
     """A real fp16 packed-QKV export: build + ``apply_weights`` (folds inside).
 
-    Module-scoped so the (read-only) realistic-export assertions share a single
-    build instead of rebuilding per test.
+    Function-scoped (a fresh build per test) on purpose: the serialize-roundtrip
+    test calls ``ir.save`` on the model, and on some ``onnx_ir`` versions that
+    offloads the initializers' ``const_value`` to external tensors in place. A
+    shared (module-scoped) model could then leak that mutated/externalized state
+    into another test, and under ``pytest-xdist`` the tests' execution order is
+    not guaranteed — making such cross-test contamination order-dependent and
+    flaky. A fresh model per test keeps each test hermetic and deterministic. The
+    build is tiny, so the rebuild cost is negligible.
     """
     config = _make_fp16_llama_config()
     model = _build_fp16_decoder(config)
