@@ -23,6 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### Developer Tooling
+
+#### Internal
+
+- The Architecture-Diff CI tool (`src/mobius/_graph_diff.py`) now recurses into
+  `If` / `Loop` / `Scan` `GRAPH`-typed attributes instead of collapsing them to a
+  bare type string, so changes *inside* control-flow subgraphs are visible in the
+  diff. A dedicated `subgraph_structure_change` (MODERATE) severity is emitted for
+  structural in-branch deltas (node added/removed/rewired, branch added/removed),
+  while pure inner-attribute tweaks stay `changed_attrs` (MINOR). Added here
+  because this PR introduces the static-cache per-layer phase-split
+  `If(Greater(seq_len, 1))` — the first control-flow/subgraph change the old
+  top-level-only diff could not see — so the tool that guards architectural
+  changes must be able to see it. Developer-tooling only; no exported-graph or
+  runtime impact.
+
+---
+
 ### GQA Present KV-Cache Shape Fix
 
 #### Fixed
