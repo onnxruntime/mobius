@@ -60,12 +60,14 @@ class ModelInfo:
     task: str
     category: str
     family: str
-    # Confidence levels (True if covered at that level)
+    # Confidence levels (True if covered at that level).
+    # L1 is a single boolean; L2/L3/L4/L5 use a "test configured" boolean
+    # PLUS a richer ``<level>_status`` field ("pass" / "xfail" / "skip" /
+    # None) so the dashboard can distinguish passes, expected failures,
+    # documented skips, and awaiting-data states uniformly.
     l1_graph_build: bool = False
     l2_arch_validation: bool = False
     l3_synthetic_parity: bool = False
-    l4_golden_files: bool = False
-    l5_generation_golden: bool = False
     # Code paths exercised by test configs
     code_paths: set[str] = dataclasses.field(default_factory=set)
     # Config overrides from test configs (for drill-down)
@@ -76,56 +78,77 @@ class ModelInfo:
     has_integration_test: bool = False
     # Whether the model has a test_model_id
     test_model_id: str | None = None
-    # Golden test case coverage (from testdata/cases/ YAML files)
+    # Golden test case coverage (from testdata/cases/ YAML files).
+    # ``l{4,5}_has_test_case`` is the "test configured" signal that
+    # parallels ``l2_arch_validation`` / ``l3_synthetic_parity`` and is
+    # True when a YAML case exists for that level (skipped cases do NOT
+    # set this; the skipped state is represented via ``l{4,5}_status``).
     l4_has_test_case: bool = False
     l5_has_test_case: bool = False
-    l4_test_case_skipped: bool = False
-    l5_test_case_skipped: bool = False
     yaml_test_case_file: str | None = None
     yaml_test_case_skip_reason: str | None = None
     yaml_test_case_ci_skip_reason: str | None = None
     yaml_min_token_match_ratio: float | None = None
-    # L2 architecture-validation status: "pass", "xfail", "xfail_graph_only", or None.
-    # "xfail_graph_only" means the config-parse subtest passes but the
-    # full-graph build subtest xfails (the dashboard treats both flavors of
-    # xfail as not-passing for L2).
+    # YAML ``task_type`` field — used to construct the pytest test ID
+    # ``"{task_type}/{case_id}"`` for matching against L4/L5 xfail dicts
+    # in ``e2e_golden_test.py``. May differ from the parent directory name.
+    yaml_task_type: str | None = None
+    # Per-level status fields. Each follows the same {"pass", "xfail",
+    # "skip", None} contract so the template can dispatch uniformly.
+    # L2 also admits "xfail_graph_only" (the config-parse subtest passes
+    # but the full-graph build subtest xfails). All flavors of xfail
+    # count as not-passing.
     l2_status: str | None = None
     l2_status_reason: str | None = None
-    # L3 synthetic parity status: "pass", "xfail", "skip", or None
     l3_status: str | None = None
     l3_status_reason: str | None = None
+    # L4 status comes from yaml skip_reason, the e2e xfail dicts, or the
+    # presence of a matching golden file on disk (in that precedence
+    # order — skip > xfail > pass). ``None`` with ``l4_has_test_case=True``
+    # means the YAML case exists but no golden has been generated yet
+    # (the "awaiting data" state).
+    l4_status: str | None = None
+    l4_status_reason: str | None = None
+    l5_status: str | None = None
+    l5_status_reason: str | None = None
 
     @property
     def l2_passes(self) -> bool:
         """True iff L2 architecture validation is configured and expected to pass.
 
-        Mirrors :attr:`l3_passes`. L2 distinguishes "test exists"
-        (``l2_arch_validation``) from "test passes" (``l2_status``)
-        because ``arch_validation_test.py`` xfails subtests for models with
-        known config / graph-build limitations (e.g. VL models needing
-        ``trust_remote_code``).
+        L2 distinguishes "test exists" (``l2_arch_validation``) from "test
+        passes" (``l2_status``) because ``arch_validation_test.py`` xfails
+        subtests for models with known config / graph-build limitations
+        (e.g. VL models needing ``trust_remote_code``).
         """
         return self.l2_arch_validation and self.l2_status == "pass"
 
     @property
     def l3_passes(self) -> bool:
-        """True iff L3 synthetic parity is configured and expected to pass.
-
-        L3 is the only level that distinguishes "test exists" from "test
-        passes" via two fields (``l3_synthetic_parity`` + ``l3_status``)
-        because the parity suite has a richer outcome model (pass / skip /
-        xfail). L1, L2, L4, L5 collapse the two notions into a single
-        boolean. Use this property anywhere you would otherwise write
-        ``info.l3_synthetic_parity and info.l3_status == "pass"``.
-        """
+        """True iff L3 synthetic parity is configured and expected to pass."""
         return self.l3_synthetic_parity and self.l3_status == "pass"
+
+    @property
+    def l4_passes(self) -> bool:
+        """True iff L4 golden test is configured and expected to pass.
+
+        Mirrors :attr:`l2_passes` / :attr:`l3_passes`. An xfailed L4 test
+        has a golden file on disk (it is the HF reference output) but the
+        test is expected to fail, so it must not count as passing.
+        """
+        return self.l4_has_test_case and self.l4_status == "pass"
+
+    @property
+    def l5_passes(self) -> bool:
+        """True iff L5 generation test is configured and expected to pass."""
+        return self.l5_has_test_case and self.l5_status == "pass"
 
     @property
     def confidence_level(self) -> int:
         """Return the highest confidence level achieved (0-5)."""
-        if self.l5_generation_golden:
+        if self.l5_passes:
             return 5
-        if self.l4_golden_files:
+        if self.l4_passes:
             return 4
         if self.l3_passes:
             return 3
@@ -284,13 +307,20 @@ def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
             models[model_type].l1_graph_build = True
 
 
-def _parse_status_dict(content: str, dict_name: str) -> dict[str, str]:
+def _parse_status_dict(
+    content: str,
+    dict_name: str,
+    key_pattern: str = r"[\w-]+",
+) -> dict[str, str]:
     r"""Extract entries from a ``{name: dict[str, str] = {...}}`` literal.
 
     Uses a regex pass over the source text so the dashboard generator does
     not have to import the test file (avoiding side effects from pytest
     collection). Keys may contain hyphens (e.g. ``"xlm-roberta"``,
-    ``"data2vec-text"``) so the key character class is ``[\w-]+``.
+    ``"data2vec-text"``) so the default key character class is ``[\w-]+``.
+    Callers that expect richer keys (e.g. ``"text-generation/helium-1-2b"``
+    in the e2e golden xfail dicts) can pass a custom ``key_pattern`` such
+    as ``[^"]+``.
 
     The dict name must appear at the start of a line (after optional
     leading whitespace) so a stray docstring mention of the name does not
@@ -309,7 +339,8 @@ def _parse_status_dict(content: str, dict_name: str) -> dict[str, str]:
     if block is None:
         return {}
     return {
-        m.group(1): m.group(2) for m in re.finditer(r'"([\w-]+)":\s*"([^"]+)"', block.group(1))
+        m.group(1): m.group(2)
+        for m in re.finditer(rf'"({key_pattern})":\s*"([^"]+)"', block.group(1))
     }
 
 
@@ -404,46 +435,50 @@ def _scan_l3_synthetic_parity(models: dict[str, ModelInfo]) -> None:
 
 
 def _scan_l4_golden_files(models: dict[str, ModelInfo]) -> None:
-    """Mark L4 coverage from testdata/golden/ directory.
+    """Mark L4 ``status='pass'`` for models with a golden file on disk.
 
     Two matching strategies:
     1. Direct: ``golden/<category>/<model_type>.json`` — works when the golden
        file stem equals the registry model_type.
     2. Indirect: when a model has a YAML test case, derive the expected golden
-       path from the case_id (the YAML file stem).  This handles cases like
+       path from the case_id (the YAML file stem). This handles cases like
        ``golden/vision-language/qwen2_5-vl-3b.json`` → model_type ``qwen2_5_vl``.
+
+    Skipped cases (``l4_status='skip'`` set earlier by
+    :func:`_scan_yaml_test_cases`) are left untouched: a golden may exist
+    on disk for a skipped model, but the skip wins.
     """
     golden_dir = _REPO_ROOT / "testdata" / "golden"
     if not golden_dir.exists():
         return
 
     # NOTE: relies on _scan_yaml_test_cases having run first (see
-    # _collect_models call order) so l4_test_case_skipped is populated.
-    # A golden JSON may exist on disk for a model whose YAML has a
-    # skip_reason; we must not treat that as L4 coverage.
+    # collect_all_model_info call order) so any skip status is in place.
 
     # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*.json"):
         if "_generation" in golden_file.name:
             continue
         model_type = golden_file.stem
-        if model_type in models and not models[model_type].l4_test_case_skipped:
-            models[model_type].l4_golden_files = True
+        info = models.get(model_type)
+        if info is None or info.l4_status is not None:
+            continue
+        info.l4_status = "pass"
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
     for model_type, info in models.items():
-        if info.l4_golden_files or info.l4_test_case_skipped or not info.yaml_test_case_file:
+        if info.l4_status is not None or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
         case_id = case_path.stem
         task_dir = case_path.parent.name
         golden_path = golden_dir / task_dir / f"{case_id}.json"
         if golden_path.exists():
-            models[model_type].l4_golden_files = True
+            info.l4_status = "pass"
 
 
 def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
-    """Mark L5 coverage from generation golden files.
+    """Mark L5 ``status='pass'`` for models with a generation golden on disk.
 
     Uses the same two-strategy matching as :func:`_scan_l4_golden_files`.
     """
@@ -451,29 +486,24 @@ def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
     if not golden_dir.exists():
         return
 
-    # NOTE: relies on _scan_yaml_test_cases having run first (see
-    # _collect_models call order) so l5_test_case_skipped is populated.
-
     # Strategy 1: direct stem → model_type match
     for golden_file in golden_dir.rglob("*_generation.json"):
         model_type = golden_file.stem.removesuffix("_generation")
-        if model_type in models and not models[model_type].l5_test_case_skipped:
-            models[model_type].l5_generation_golden = True
+        info = models.get(model_type)
+        if info is None or info.l5_status is not None:
+            continue
+        info.l5_status = "pass"
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
     for model_type, info in models.items():
-        if (
-            info.l5_generation_golden
-            or info.l5_test_case_skipped
-            or not info.yaml_test_case_file
-        ):
+        if info.l5_status is not None or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
         case_id = case_path.stem
         task_dir = case_path.parent.name
         gen_path = golden_dir / task_dir / f"{case_id}_generation.json"
         if gen_path.exists():
-            models[model_type].l5_generation_golden = True
+            info.l5_status = "pass"
 
 
 def _scan_integration_tests(models: dict[str, ModelInfo]) -> None:
@@ -533,6 +563,7 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
 
         model_id = data.get("model_id", "")
         yaml_model_type = data.get("model_type")
+        yaml_task_type = data.get("task_type")
         level = data.get("level", "")
         rel_path = str(yaml_file.relative_to(_REPO_ROOT))
 
@@ -553,19 +584,28 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
                 if model_type in models:
                     models[model_type].yaml_test_case_file = rel_path
                     models[model_type].yaml_test_case_skip_reason = skip_reason
+                    if yaml_task_type:
+                        models[model_type].yaml_task_type = yaml_task_type
                     if min_token_match_ratio is not None:
                         models[model_type].yaml_min_token_match_ratio = float(
                             min_token_match_ratio
                         )
+                    # Skipped cases set status="skip" (not l*_has_test_case)
+                    # so the "configured" signal stays consistent with L2/L3
+                    # ("configured" means a runnable test exists).
                     if "L4" in level:
-                        models[model_type].l4_test_case_skipped = True
+                        models[model_type].l4_status = "skip"
+                        models[model_type].l4_status_reason = skip_reason
                     if "L5" in level:
-                        models[model_type].l5_test_case_skipped = True
+                        models[model_type].l5_status = "skip"
+                        models[model_type].l5_status_reason = skip_reason
             continue
 
         for model_type in matched_types:
             if model_type in models:
                 models[model_type].yaml_test_case_file = rel_path
+                if yaml_task_type:
+                    models[model_type].yaml_task_type = yaml_task_type
                 if ci_skip_reason:
                     models[model_type].yaml_test_case_ci_skip_reason = ci_skip_reason
                 if min_token_match_ratio is not None:
@@ -617,6 +657,74 @@ def _scan_l3_parity_status(models: dict[str, ModelInfo]) -> None:
             info.l3_status = "pass"
 
 
+def _scan_l4_l5_xfail_status(models: dict[str, ModelInfo]) -> None:
+    """Extract L4 / L5 xfail status from e2e_golden_test.py.
+
+    Parses ``_XFAIL_REASONS`` (applies to L4 *and* L5) and
+    ``_L5_ONLY_XFAIL_REASONS`` (L5-only). Keys are pytest test IDs in the
+    form ``"<task_type>/<case_id>"``; the case_id is the YAML file stem.
+
+    For each xfail entry, the corresponding model's ``l4_status`` /
+    ``l5_status`` is set to ``"xfail"`` (with reason), overriding any
+    prior ``"pass"`` status. The golden file may exist on disk (it is the
+    HuggingFace reference output) but an xfailed test is not a passing
+    test. Skip status is NOT overridden \u2014 a skipped test does not run, so
+    the xfail marker is irrelevant.
+
+    Must run AFTER :func:`_scan_yaml_test_cases` (for the test_id \u2192
+    model_type reverse map) and AFTER :func:`_scan_l4_golden_files` /
+    :func:`_scan_l5_generation_golden` (so xfail can override their
+    ``"pass"`` writes).
+    """
+    e2e_test = _REPO_ROOT / "tests" / "e2e_golden_test.py"
+    if not e2e_test.exists():
+        return
+
+    content = e2e_test.read_text(encoding="utf-8")
+    # Test IDs contain '/' so the default [\w-]+ key class won't match;
+    # widen to [^"] to capture the full "<task>/<case_id>" key.
+    l4_l5_xfails = _parse_status_dict(content, "_XFAIL_REASONS", key_pattern=r"[^\"]+")
+    l5_only_xfails = _parse_status_dict(
+        content, "_L5_ONLY_XFAIL_REASONS", key_pattern=r"[^\"]+"
+    )
+
+    # Build (task_type, case_id) -> model_type reverse map from already-
+    # scanned YAML files. test_id uses the YAML ``task_type`` field, which
+    # may differ from the on-disk directory name (e.g. the directory is
+    # ``causal-lm`` but task_type is ``text-generation``).
+    test_id_to_model: dict[str, str] = {}
+    for model_type, info in models.items():
+        if not info.yaml_test_case_file or not info.yaml_task_type:
+            continue
+        case_id = Path(info.yaml_test_case_file).stem
+        test_id = f"{info.yaml_task_type}/{case_id}"
+        test_id_to_model[test_id] = model_type
+
+    def _apply_xfail(info: ModelInfo, level: int, reason: str) -> None:
+        attr = f"l{level}_status"
+        # Do not overwrite "skip" \u2014 the test does not run, so xfail is moot.
+        if getattr(info, attr) == "skip":
+            return
+        setattr(info, attr, "xfail")
+        setattr(info, f"l{level}_status_reason", reason)
+
+    # _XFAIL_REASONS applies to both L4 and L5 (e2e_golden_test._discover_cases
+    # passes it as xfails= for both levels).
+    for test_id, reason in l4_l5_xfails.items():
+        model_type = test_id_to_model.get(test_id)
+        if model_type is None:
+            continue
+        _apply_xfail(models[model_type], 4, reason)
+        _apply_xfail(models[model_type], 5, reason)
+
+    # _L5_ONLY_XFAIL_REASONS applies only to L5; L4 prefill still passes.
+    for test_id, reason in l5_only_xfails.items():
+        model_type = test_id_to_model.get(test_id)
+        if model_type is None:
+            continue
+        _apply_xfail(models[model_type], 5, reason)
+
+
 def collect_all_model_info() -> dict[str, ModelInfo]:
     """Collect all model information by scanning registry and tests."""
     models = _scan_registry()
@@ -630,6 +738,10 @@ def collect_all_model_info() -> dict[str, ModelInfo]:
     _scan_yaml_test_cases(models)
     _scan_l4_golden_files(models)
     _scan_l5_generation_golden(models)
+    # L4/L5 xfail status must run after both golden scanners so it can
+    # clear the pass flag for xfailed tests (golden file exists on disk
+    # but the test is expected to fail).
+    _scan_l4_l5_xfail_status(models)
     _scan_integration_tests(models)
     return models
 
@@ -653,6 +765,11 @@ def _compute_summary(
     by_category: dict[str, int] = {}
     all_code_paths: set[str] = set()
     code_path_coverage: dict[str, int] = {}
+    # Per-level status breakdowns. All levels share the same five-bucket
+    # taxonomy so the template can dispatch uniformly. ``awaiting`` and
+    # ``untested`` are derived per-level (see notes below); the explicit
+    # ``pass`` / ``xfail`` / ``skip`` come from the ``l<N>_status`` field.
+    # By construction the five buckets sum to ``total`` for every level.
     l2_status_counts: dict[str, int] = {
         "pass": 0,
         "xfail": 0,
@@ -665,26 +782,36 @@ def _compute_summary(
         "skip": 0,
         "untested": 0,
     }
-    l4_case_count = 0
-    l5_case_count = 0
-    l4_skipped_count = 0
-    l5_skipped_count = 0
+    l4_status_counts: dict[str, int] = {
+        "pass": 0,
+        "xfail": 0,
+        "skip": 0,
+        "awaiting": 0,
+        "untested": 0,
+    }
+    l5_status_counts: dict[str, int] = {
+        "pass": 0,
+        "xfail": 0,
+        "skip": 0,
+        "awaiting": 0,
+        "untested": 0,
+    }
     ci_skip_count = 0
 
     for info in models.values():
         # Per-flag counts: how many models have each level flag set, independently.
         # These are NOT exclusive (a model counted in L3 may also be in L1/L2).
         # by_level[0] = not-tested (no flags set at all).
-        # L2 and L3 use the ``l2_passes`` / ``l3_passes`` properties so
-        # xfailed/skipped tests do not count — matching their card counts
-        # and the confidence_level property.
+        # L2/L3/L4/L5 use their ``_passes`` properties so xfailed/skipped
+        # tests do not count — matching their card counts and the
+        # confidence_level property.
         if not any(
             [
                 info.l1_graph_build,
                 info.l2_passes,
                 info.l3_passes,
-                info.l4_golden_files,
-                info.l5_generation_golden,
+                info.l4_passes,
+                info.l5_passes,
             ]
         ):
             by_level[0] += 1
@@ -694,9 +821,9 @@ def _compute_summary(
             by_level[2] += 1
         if info.l3_passes:
             by_level[3] += 1
-        if info.l4_golden_files:
+        if info.l4_passes:
             by_level[4] += 1
-        if info.l5_generation_golden:
+        if info.l5_passes:
             by_level[5] += 1
         by_category[info.category] = by_category.get(info.category, 0) + 1
         all_code_paths.update(info.code_paths)
@@ -711,15 +838,19 @@ def _compute_summary(
             l3_status_counts[info.l3_status] = l3_status_counts.get(info.l3_status, 0) + 1
         else:
             l3_status_counts["untested"] += 1
-        # Golden case coverage
-        if info.l4_has_test_case:
-            l4_case_count += 1
-        if info.l5_has_test_case:
-            l5_case_count += 1
-        if info.l4_test_case_skipped:
-            l4_skipped_count += 1
-        if info.l5_test_case_skipped:
-            l5_skipped_count += 1
+        # L4 / L5 status. The dataclass field uses {"pass","xfail","skip",None};
+        # ``None`` splits into two card buckets:
+        #   - ``awaiting`` = yaml case exists but no golden generated yet
+        #   - ``untested`` = no yaml case at all
+        for level, counts in ((4, l4_status_counts), (5, l5_status_counts)):
+            status = getattr(info, f"l{level}_status")
+            has_case = getattr(info, f"l{level}_has_test_case")
+            if status:
+                counts[status] = counts.get(status, 0) + 1
+            elif has_case:
+                counts["awaiting"] += 1
+            else:
+                counts["untested"] += 1
         if info.yaml_test_case_ci_skip_reason:
             ci_skip_count += 1
 
@@ -731,10 +862,8 @@ def _compute_summary(
         "all_code_paths": sorted(all_code_paths),
         "l2_status_counts": l2_status_counts,
         "l3_status_counts": l3_status_counts,
-        "l4_case_count": l4_case_count,
-        "l5_case_count": l5_case_count,
-        "l4_skipped_count": l4_skipped_count,
-        "l5_skipped_count": l5_skipped_count,
+        "l4_status_counts": l4_status_counts,
+        "l5_status_counts": l5_status_counts,
         "ci_skip_count": ci_skip_count,
     }
 
@@ -823,20 +952,30 @@ def _render_html(
                 "family": info.family,
                 "confidence_level": info.confidence_level,
                 "confidence_label": info.confidence_label,
+                # Per-level passing booleans. The template uses these for
+                # the "passed" dot color. xfail / skip / awaiting / untested
+                # are derived from the status fields below.
                 "l1": info.l1_graph_build,
                 "l2": info.l2_passes,
                 "l3": info.l3_passes,
-                "l4": info.l4_golden_files,
-                "l5": info.l5_generation_golden,
-                "l4_case": info.l4_has_test_case,
-                "l5_case": info.l5_has_test_case,
-                "l4_skipped": info.l4_test_case_skipped,
-                "l5_skipped": info.l5_test_case_skipped,
+                "l4": info.l4_passes,
+                "l5": info.l5_passes,
+                # "Test configured" signal (parallels l2_configured).
                 "l2_configured": info.l2_arch_validation,
+                "l3_configured": info.l3_synthetic_parity,
+                "l4_configured": info.l4_has_test_case,
+                "l5_configured": info.l5_has_test_case,
+                # Unified status fields ({pass, xfail, skip, None}; L2 also
+                # admits xfail_graph_only). Status drives dot color, badges,
+                # and the per-card bucket annotations.
                 "l2_status": info.l2_status,
                 "l2_reason": info.l2_status_reason,
                 "l3_status": info.l3_status,
                 "l3_reason": info.l3_status_reason,
+                "l4_status": info.l4_status,
+                "l4_reason": info.l4_status_reason,
+                "l5_status": info.l5_status,
+                "l5_reason": info.l5_status_reason,
                 "yaml_case": info.yaml_test_case_file,
                 "yaml_skip_reason": info.yaml_test_case_skip_reason,
                 "yaml_ci_skip_reason": info.yaml_test_case_ci_skip_reason,
