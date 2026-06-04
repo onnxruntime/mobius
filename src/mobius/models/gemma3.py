@@ -18,7 +18,11 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+    vlm_vision_weights,
+)
 from mobius.components import (
     Gemma3MultiModalProjector,
     Linear,
@@ -93,15 +97,7 @@ class _Gemma3VisionEncoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if not key.startswith(("vision_tower.", "multi_modal_projector.")):
-                continue
-            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
-            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            renamed[key] = value
-        return renamed
+        return vlm_vision_weights(state_dict, ("vision_tower.", "multi_modal_projector."))
 
 
 class _Gemma3EmbeddingModel(nn.Module):

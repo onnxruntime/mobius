@@ -20,6 +20,7 @@ from mobius._weight_utils import (
     tie_word_embeddings,
     vlm_decoder_weights,
     vlm_embedding_weights,
+    vlm_vision_weights,
 )
 
 
@@ -328,6 +329,44 @@ class TestVlmEmbeddingWeights:
         }
         result = vlm_embedding_weights(sd, keyword="word_embedding", prefixes=("model.",))
         assert list(result.keys()) == ["word_embedding.weight"]
+
+
+class TestVlmVisionWeights:
+    """Tests for vlm_vision_weights."""
+
+    def test_filters_and_renames(self):
+        """Keeps prefixed keys and renames fc1/fc2."""
+        fc1 = torch.randn(4, 8)
+        fc2 = torch.randn(8, 4)
+        sd = {
+            "vision_tower.encoder.layers.0.mlp.fc1.weight": fc1,
+            "vision_tower.encoder.layers.0.mlp.fc2.weight": fc2,
+            "multi_modal_projector.linear.weight": torch.randn(4),
+            "language_model.model.layers.0.weight": torch.randn(4),
+        }
+        result = vlm_vision_weights(sd, ("vision_tower.", "multi_modal_projector."))
+        assert set(result.keys()) == {
+            "vision_tower.encoder.layers.0.mlp.up_proj.weight",
+            "vision_tower.encoder.layers.0.mlp.down_proj.weight",
+            "multi_modal_projector.linear.weight",
+        }
+        assert result["vision_tower.encoder.layers.0.mlp.up_proj.weight"].data_ptr() == (
+            fc1.data_ptr()
+        )
+
+    def test_single_prefix(self):
+        """Works with a single-element prefix tuple."""
+        sd = {
+            "vision_model.layers.0.mlp.fc1.weight": torch.randn(2),
+            "other.weight": torch.randn(2),
+        }
+        result = vlm_vision_weights(sd, ("vision_model.",))
+        assert list(result.keys()) == ["vision_model.layers.0.mlp.up_proj.weight"]
+
+    def test_empty_when_no_match(self):
+        """Returns empty dict when no key matches the prefixes."""
+        sd = {"language_model.layers.0.weight": torch.randn(2)}
+        assert vlm_vision_weights(sd, ("vision_tower.",)) == {}
 
 
 class TestPreprocessGptqWeights:
