@@ -161,16 +161,16 @@ class ModelInfo:
     @property
     def confidence_label(self) -> str:
         """Human-readable confidence label."""
-        return _CONFIDENCE_LABELS.get(self.confidence_level, "Not tested")
+        return _CONFIDENCE_LABELS.get(self.confidence_level, "Not Tested")
 
 
 _CONFIDENCE_LABELS = {
-    0: "Not tested",
-    1: "L1: Graph builds",
-    2: "L2: Config compatible",
-    3: "L3: Synthetic parity",
-    4: "L4: Golden match",
-    5: "L5: Generation verified",
+    0: "Not Tested",
+    1: "L1: Graph Builds",
+    2: "L2: Config Compatible",
+    3: "L3: Synthetic Parity",
+    4: "L4: Golden Match",
+    5: "L5: Generation Verified",
 }
 
 # Task strings from the registry to dashboard category mapping.
@@ -1056,7 +1056,7 @@ def main() -> None:
     total = summary["total"]
     by_level = summary["by_level"]
     print(f"Dashboard generated: {output_path}")
-    print(f"  Total models: {total}")
+    print(f"  Total Models: {total}")
     for level, count in sorted(by_level.items()):
         pct = round(count / total * 100, 1) if total > 0 else 0
         label = _CONFIDENCE_LABELS.get(level, f"L{level}")

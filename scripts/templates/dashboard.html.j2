@@ -279,7 +279,7 @@ document.documentElement.setAttribute('data-theme',t);}())
   </div>
 </div>
 <p class="subtitle">
-  Generated {{ timestamp }} &middot; Commit <code>{{ commit }}</code> &middot; {{ total_models }} registered model types
+  Generated {{ timestamp }} &middot; Commit <code>{{ commit }}</code> &middot; {{ total_models }} Registered Model Types
 </p>
 <div class="summary" role="region" aria-label="Coverage summary" id="summary-bar"></div>
 
@@ -305,10 +305,10 @@ document.documentElement.setAttribute('data-theme',t);}())
   <div class="dot-legend">
     <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Tested</span>
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
-    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected failure</span>
+    <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected Failure</span>
     <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
-    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Awaiting data</span>
-    <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No test</span>
+    <span class="dot-legend-item"><span class="dot pending" style="display:inline-block;vertical-align:middle"></span> Awaiting Data</span>
+    <span class="dot-legend-item"><span class="dot untested" style="display:inline-block;vertical-align:middle"></span> No Test</span>
   </div>
 </div>
 
@@ -387,7 +387,7 @@ const LEVEL_DESCRIPTIONS = {
   const bar = document.getElementById('summary-bar');
   const totalCard = `<div class="summary-card">
     <div class="number">${SUMMARY.total}</div>
-    <div class="label">Total models</div>
+    <div class="label">Total Models</div>
   </div>`;
   bar.innerHTML = totalCard;
   for (let i = 0; i <= 5; i++) {
@@ -402,7 +402,7 @@ const LEVEL_DESCRIPTIONS = {
       const s = SUMMARY.l2_status_counts || {};
       const parts = [];
       const xf = (s.xfail || 0) + (s.xfail_graph_only || 0);
-      if (xf) parts.push(`${xf} xfail`);
+      if (xf) parts.push(`${xf} XFail`);
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     if (i >= 3) {
@@ -411,10 +411,10 @@ const LEVEL_DESCRIPTIONS = {
       // repeating it below is redundant noise.
       const s = SUMMARY[`l${i}_status_counts`] || {};
       const parts = [];
-      if (s.xfail) parts.push(`${s.xfail} xfail`);
-      if (s.skip) parts.push(`${s.skip} skip`);
-      if (s.awaiting) parts.push(`${s.awaiting} awaiting data`);
-      if (s.untested) parts.push(`${s.untested} untested`);
+      if (s.xfail) parts.push(`${s.xfail} XFail`);
+      if (s.skip) parts.push(`${s.skip} Skip`);
+      if (s.awaiting) parts.push(`${s.awaiting} Awaiting Data`);
+      if (s.untested) parts.push(`${s.untested} Untested`);
       if (parts.length) annotation = `<div class="card-annotation">${parts.join(' \u00B7 ')}</div>`;
     }
     bar.innerHTML += `<div class="summary-card level-${i}" title="${LEVEL_DESCRIPTIONS[i]}">
@@ -582,25 +582,25 @@ function renderModelRow(m) {
   // state that is otherwise visually identical to a fail.
   let l2Badge = '';
   if (m.l2_status === 'xfail') {
-    l2Badge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">xfail</span>`;
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">XFail</span>`;
   } else if (m.l2_status === 'xfail_graph_only') {
-    l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">xfail</span>`;
+    l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
   }
   let l3Badge = '';
   if (m.l3_status === 'pass') {
     l3Badge = ' <span class="status-badge status-pass" title="L3 synthetic parity passes">\u2713</span>';
   } else if (m.l3_status === 'xfail') {
-    l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">xfail</span>`;
+    l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
   } else if (m.l3_status === 'skip') {
-    l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">skip</span>`;
+    l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
   }
   let l4Badge = '';
   if (m.l4_status === 'xfail') {
-    l4Badge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">xfail</span>`;
+    l4Badge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">XFail</span>`;
   }
   let l5Badge = '';
   if (m.l5_status === 'xfail') {
-    l5Badge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">xfail</span>`;
+    l5Badge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">XFail</span>`;
   }
 
   // min_token_match_ratio badge
@@ -820,8 +820,8 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   // Map confidence level (0–5) to a CSS class for the cell background.
   const levelClass = l => l <= 0 ? '' : `cell-l${Math.min(l, 5)}`;
   const levelTitle = l => {
-    const labels = ['No test', 'L1: Graph builds', 'L2: Config compat',
-                    'L3: Synthetic parity', 'L4: Golden match', 'L5: Generation'];
+    const labels = ['No Test', 'L1: Graph Builds', 'L2: Config Compatible',
+                    'L3: Synthetic Parity', 'L4: Golden Match', 'L5: Generation Verified'];
     return labels[Math.max(0, Math.min(l, 5))];
   };
 
