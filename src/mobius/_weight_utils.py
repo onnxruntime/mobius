@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 
 import torch
 
@@ -269,6 +270,50 @@ def rename_mlp_projections(
     return name.replace(f".mlp.{old_up}.", f".mlp.{new_up}.").replace(
         f".mlp.{old_down}.", f".mlp.{new_down}."
     )
+
+
+def rename_weight_keys(
+    state_dict: dict[str, torch.Tensor],
+    replacements: Sequence[tuple[str, str]],
+) -> dict[str, torch.Tensor]:
+    """Apply ordered substring replacements to every key in a state dict.
+
+    Centralises the ``for name, tensor in state_dict.items(): name =
+    name.replace(...)`` rename loop that is duplicated across many model
+    ``preprocess_weights`` implementations.  Each ``(old, new)`` pair is
+    applied with :py:meth:`str.replace` to the *progressively updated* key,
+    so the replacements are **ordered** and may cascade (the output of an
+    earlier replacement can match the input of a later one) — this matches
+    the semantics of the hand-written loops it replaces.  Use substrings
+    specific enough (e.g. dot-delimited like ``".attention_layernorm."``)
+    to avoid renaming unintended portions of a key.
+
+    Tensor values are shared with *state_dict* (not cloned), matching the
+    behaviour of the loops this replaces.
+
+    Args:
+        state_dict: Weight dictionary to transform (not modified).
+        replacements: Ordered sequence of ``(old, new)`` substring pairs.
+
+    Returns:
+        A new dictionary with renamed keys.
+
+    Raises:
+        ValueError: If two distinct source keys map to the same renamed key
+            (a collision that would otherwise silently drop a tensor).
+    """
+    result: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        new_name = name
+        for old, new in replacements:
+            new_name = new_name.replace(old, new)
+        if new_name in result:
+            raise ValueError(
+                f"Weight key collision after rename: {name!r} -> {new_name!r} "
+                f"(already produced by another key)"
+            )
+        result[new_name] = tensor
+    return result
 
 
 def split_codegen_qkv(
