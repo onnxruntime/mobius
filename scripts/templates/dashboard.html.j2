@@ -215,12 +215,12 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   color: var(--text-muted); white-space: nowrap;
   background: var(--surface); position: sticky; right: 0; z-index: 2;
 }
-/* Level color scale — rgba keeps it readable in both light and dark themes */
-.cell-l1 { background: rgba(76,175,80,0.15); }
-.cell-l2 { background: rgba(76,175,80,0.32); }
-.cell-l3 { background: rgba(76,175,80,0.52); }
-.cell-l4 { background: rgba(76,175,80,0.72); }
-.cell-l5 { background: rgba(76,175,80,0.92); }
+/* Component matrix uses the same L1-L5 hues as coverage dots/badges. */
+.cell-l1 { background: color-mix(in srgb, var(--l1) 28%, transparent); border-color: var(--l1); }
+.cell-l2 { background: color-mix(in srgb, var(--l2) 32%, transparent); border-color: var(--l2); }
+.cell-l3 { background: color-mix(in srgb, var(--l3) 36%, transparent); border-color: var(--l3); }
+.cell-l4 { background: color-mix(in srgb, var(--l4) 40%, transparent); border-color: var(--l4); }
+.cell-l5 { background: color-mix(in srgb, var(--l5) 44%, transparent); border-color: var(--l5); }
 .matrix-legend {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
   font-size: 0.8em; color: var(--text-muted); flex-wrap: wrap;
@@ -263,6 +263,8 @@ table, th, .detail-row td, .config-block, .component-section,
   margin-left: auto; font-size: 0.8em; color: var(--text-muted);
 }
 .dot-legend-item { display: flex; gap: 4px; align-items: center; }
+.dot-legend-pass { display: inline-flex; gap: 3px; align-items: center; }
+.dot-legend-pass .dot { width: 12px; height: 12px; }
 </style>
 </head>
 <body>
@@ -303,7 +305,7 @@ document.documentElement.setAttribute('data-theme',t);}())
     <button data-group="flat" aria-pressed="false">Flat</button>
   </div>
   <div class="dot-legend">
-    <span class="dot-legend-item"><span class="dot active-3" style="display:inline-block;vertical-align:middle"></span> Tested</span>
+    <span class="dot-legend-item"><span class="dot-legend-pass"><span class="dot active-1"></span><span class="dot active-2"></span><span class="dot active-3"></span><span class="dot active-4"></span><span class="dot active-5"></span></span> Pass (L1-L5)</span>
     <span class="dot-legend-item"><span class="dot failed" style="display:inline-block;vertical-align:middle"></span> Failed</span>
     <span class="dot-legend-item"><span class="dot xfail" style="display:inline-block;vertical-align:middle"></span> Expected Failure</span>
     <span class="dot-legend-item"><span class="dot skipped" style="display:inline-block;vertical-align:middle"></span> Skipped</span>
@@ -331,7 +333,7 @@ document.documentElement.setAttribute('data-theme',t);}())
 
 <div class="component-section">
   <h2>Component Coverage</h2>
-  <p class="subtitle">Which architectural components are exercised — and at what test level (darker = higher)</p>
+  <p class="subtitle">Which architectural components are exercised — and at what test level (L1-L5 colors mirror the main coverage dots)</p>
   <div class="matrix-scroll"><div id="component-matrix-container"></div></div>
   <details style="margin-top:16px">
     <summary style="cursor:pointer;font-size:0.9em;color:var(--text-muted)">Component details &amp; example configs</summary>
@@ -879,7 +881,12 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   CODE_PATH_INFO.forEach(cp => {
     const count = SUMMARY.code_path_coverage[cp.label] || 0;
     const pct = total > 0 ? Math.round(count / total * 100) : 0;
-    const color = pct > 50 ? 'var(--l3)' : pct > 20 ? 'var(--l2)' : 'var(--l0)';
+    const color = pct >= 90 ? 'var(--l5)'
+      : pct >= 70 ? 'var(--l4)'
+      : pct >= 50 ? 'var(--l3)'
+      : pct >= 30 ? 'var(--l2)'
+      : pct > 0 ? 'var(--l1)'
+      : 'var(--l0)';
     grid.innerHTML += `<div class="component-card">
       <h4><span class="tag">${esc(cp.label)}</span> ${esc(cp.description)}</h4>
       <div class="coverage">${count} / ${total} models (${pct}%)</div>
