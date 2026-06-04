@@ -167,6 +167,11 @@ Multimodal HF models often prefix text weights differently. Implement
 | `language_model.model.layers.0.…` | `layers.0.…` |
 | `vision_tower.vision_model.encoder.…` | `vision_tower.encoder.…` |
 
+Prefer the shared helpers in `mobius._weight_utils` over hand-written loops:
+`vlm_decoder_weights` (strip + tie), `vlm_embedding_weights` (filter + strip),
+and `vlm_vision_weights` (vision-tower filter + `fc1/fc2`→`up_proj/down_proj`).
+See the `weight-name-alignment` skill for the full helper table.
+
 > Read `references/weight-mappings.md` when you need full weight mapping
 > tables, shape mismatch fixes, ClippableLinear weight conventions, or
 > per-layer embedding splitting details.
