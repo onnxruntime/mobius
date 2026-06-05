@@ -1,6 +1,6 @@
 ---
 name: mobius-onnx-export-gotchas
-description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed as of df203cc), and why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights.
+description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed by the fp16 GQA fold-fix), and why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights.
 ---
 
 # mobius ONNX export gotchas
@@ -32,7 +32,7 @@ op). That breaks the pattern the GQA rewrite matches, so combining
 - **ONNX-Attention + in-place cache:** `--execution-provider default --static-cache --max-seq-len N`.
 
 ## 3. FIXED: fp16 GQA export previously left packed-QKV weights as FLOAT32 → model wouldn't load
-**Status: fixed as of commit `df203cc`.** Native fp16 Phi-3.5 GQA export now loads directly in the ORT
+**Status: fixed (the fp16 GQA fold-fix).** Native fp16 Phi-3.5 GQA export now loads directly in the ORT
 CUDA EP with **no manual post-cast** (32 GroupQueryAttention nodes, all-fp16 initializers). If you are on
 that commit or later, you should not hit this — skip to the verification snippet below. The history is
 kept here because old artifacts exported before the fix still carry fp32 packed weights.
@@ -122,7 +122,7 @@ The packed-QKV initializer is `Transpose(Concat(q, k, v, axis=0))`. If the fold 
 (`FoldConcatInitializersPass` / `FoldTransposedInitializerPass`) leave the packed-Concat output dtype
 UNKNOWN / defaulted-to-fp32 while the data is fp16, the serializer **skips** it and it loads as
 **near-zero** — the weights are silently dead. (This is the §3 failure mode; the upstream fix in
-`df203cc` stamps the fp16 dtype at the fold-pass source. A post-hoc cast is NOT a fix — it re-corrupts.)
+The fp16 GQA fold-fix stamps the fp16 dtype at the fold-pass source. A post-hoc cast is NOT a fix — it re-corrupts.)
 
 ### Why count/dtype checks fail (the trap)
 The BROKEN export and the FIXED export can have the **same initializer count and the same fp16/fp32 dtype
@@ -154,7 +154,7 @@ QA's `gqa_weight_integrity_gate.py` (`--self-check --strip-audit --scan-all`, pe
 implements exactly this gate.
 
 ## 6. FIXED: GQA `present.*` KV-cache outputs declared the wrong `head_dim`
-**Status: fixed as of commit `cf6c5c4`.** A native fp16 GQA export now declares
+**Status: fixed (the GQA present-KV shape fix).** A native fp16 GQA export now declares
 `present.{i}.{key,value}` with the correct `head_dim`, symmetric to its `past_key_values.{i}.*` inputs.
 
 ### Symptom (pre-fix)

@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### GQA Present KV-Cache Shape Fix
+
+#### Fixed
+
+- GroupQueryAttention exports now declare correct `present.{i}.key` /
+  `present.{i}.value` graph-output shapes and dtype. The GQA contrib op's shape
+  inference mis-derived the present KV `head_dim` (e.g. 32 instead of 96 on
+  `microsoft/Phi-3.5-mini-instruct`), so the present KV-cache outputs declared a
+  `head_dim` inconsistent with the (correct) `past_key_values` inputs. ORT logged
+  `Error merging shape info ... lenient merge` (64 warnings on Phi-3.5) and any
+  consumer that chains `present` → `past` and trusts declared shapes (e.g.
+  `onnxruntime-genai`) saw mismatched past-vs-present KV cache types. This is a
+  metadata / declared-shape correction only — runtime numerics are unchanged
+  (weights byte-identical, next-token parity 20/20). `_register_kv_cache_outputs`
+  now stamps the present KV outputs symmetric to the past inputs. Affects
+  GQA-fusion packed-QKV exports (Phi-3.5, Llama-3.2, Qwen2, Mistral, Phi-3-GQA).
+
+---
+
 ### WebGPU Shape Op Support
 
 #### Changed
