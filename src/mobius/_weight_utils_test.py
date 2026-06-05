@@ -12,6 +12,7 @@ from mobius._weight_utils import (
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
     split_gate_up_proj,
@@ -20,6 +21,7 @@ from mobius._weight_utils import (
     tie_word_embeddings,
     vlm_decoder_weights,
     vlm_embedding_weights,
+    vlm_vision_weights,
 )
 
 
@@ -167,6 +169,71 @@ class TestStripPrefix:
         t = torch.randn(3, 4)
         result = strip_prefix({"prefix.key": t}, "prefix")
         assert result["key"].data_ptr() == t.data_ptr()
+
+
+class TestRenameWeightKeys:
+    """Tests for rename_weight_keys."""
+
+    def test_applies_replacements(self):
+        """Each (old, new) pair is applied to every key."""
+        state_dict = {
+            "model.layers.0.attention_layernorm.weight": torch.tensor(1.0),
+            "model.layers.0.feedforward_layernorm.weight": torch.tensor(2.0),
+            "model.embed.weight": torch.tensor(3.0),
+        }
+        result = rename_weight_keys(
+            state_dict,
+            [
+                (".attention_layernorm.", ".input_layernorm."),
+                (".feedforward_layernorm.", ".post_attention_layernorm."),
+            ],
+        )
+        assert set(result.keys()) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.embed.weight",
+        }
+
+    def test_replacements_are_ordered_and_cascade(self):
+        """Replacements apply to the progressively updated key, in order."""
+        state_dict = {"a.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [("a.", "b."), ("b.", "c.")])
+        assert list(result.keys()) == ["c.weight"]
+
+    def test_no_replacements_is_identity(self):
+        """An empty replacement list returns a key-equivalent copy."""
+        state_dict = {"x.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [])
+        assert list(result.keys()) == ["x.weight"]
+        assert result is not state_dict
+
+    def test_shares_tensor_values(self):
+        """Tensor values are shared, not cloned."""
+        t = torch.randn(2, 3)
+        result = rename_weight_keys({"old.k": t}, [("old.", "new.")])
+        assert result["new.k"].data_ptr() == t.data_ptr()
+
+    def test_collision_raises(self):
+        """Two source keys mapping to the same renamed key raises.
+
+        The error message must name both the colliding key and the original
+        producer key to aid debugging in large checkpoints.
+        """
+        state_dict = {
+            "a.weight": torch.tensor(1.0),
+            "b.weight": torch.tensor(2.0),
+        }
+        with pytest.raises(ValueError, match="collision") as exc_info:
+            rename_weight_keys(state_dict, [("a.", "x."), ("b.", "x.")])
+        message = str(exc_info.value)
+        # The producer ("a.weight", processed first) and the colliding key
+        # ("b.weight") must both appear.
+        assert "a.weight" in message
+        assert "b.weight" in message
+
+    def test_empty_state_dict(self):
+        """Empty input returns empty output."""
+        assert rename_weight_keys({}, [("a", "b")]) == {}
 
 
 class TestSplitFusedQkvValidation:
@@ -328,6 +395,44 @@ class TestVlmEmbeddingWeights:
         }
         result = vlm_embedding_weights(sd, keyword="word_embedding", prefixes=("model.",))
         assert list(result.keys()) == ["word_embedding.weight"]
+
+
+class TestVlmVisionWeights:
+    """Tests for vlm_vision_weights."""
+
+    def test_filters_and_renames(self):
+        """Keeps prefixed keys and renames fc1/fc2."""
+        fc1 = torch.randn(4, 8)
+        fc2 = torch.randn(8, 4)
+        sd = {
+            "vision_tower.encoder.layers.0.mlp.fc1.weight": fc1,
+            "vision_tower.encoder.layers.0.mlp.fc2.weight": fc2,
+            "multi_modal_projector.linear.weight": torch.randn(4),
+            "language_model.model.layers.0.weight": torch.randn(4),
+        }
+        result = vlm_vision_weights(sd, ("vision_tower.", "multi_modal_projector."))
+        assert set(result.keys()) == {
+            "vision_tower.encoder.layers.0.mlp.up_proj.weight",
+            "vision_tower.encoder.layers.0.mlp.down_proj.weight",
+            "multi_modal_projector.linear.weight",
+        }
+        assert result["vision_tower.encoder.layers.0.mlp.up_proj.weight"].data_ptr() == (
+            fc1.data_ptr()
+        )
+
+    def test_single_prefix(self):
+        """Works with a single-element prefix tuple."""
+        sd = {
+            "vision_model.layers.0.mlp.fc1.weight": torch.randn(2),
+            "other.weight": torch.randn(2),
+        }
+        result = vlm_vision_weights(sd, ("vision_model.",))
+        assert list(result.keys()) == ["vision_model.layers.0.mlp.up_proj.weight"]
+
+    def test_empty_when_no_match(self):
+        """Returns empty dict when no key matches the prefixes."""
+        sd = {"language_model.layers.0.weight": torch.randn(2)}
+        assert vlm_vision_weights(sd, ("vision_tower.",)) == {}
 
 
 class TestPreprocessGptqWeights:

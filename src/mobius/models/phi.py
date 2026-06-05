@@ -16,7 +16,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import split_fused_qkv
+from mobius._weight_utils import rename_weight_keys, split_fused_qkv
 from mobius.components import (
     FCMLP,
     ConformerEncoder,
@@ -192,12 +192,14 @@ class PhiCausalLMModel(CausalLMModel):
         2. MLP up:   ``mlp.fc1.*`` → ``mlp.up_proj.*``
         3. MLP down: ``mlp.fc2.*`` → ``mlp.down_proj.*``
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            key = key.replace(".self_attn.dense.", ".self_attn.o_proj.")
-            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            new_state_dict[key] = value
+        new_state_dict: dict[str, torch.Tensor] = rename_weight_keys(
+            state_dict,
+            [
+                (".self_attn.dense.", ".self_attn.o_proj."),
+                (".mlp.fc1.", ".mlp.up_proj."),
+                (".mlp.fc2.", ".mlp.down_proj."),
+            ],
+        )
         return super().preprocess_weights(new_state_dict)
 
 
