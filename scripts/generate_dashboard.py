@@ -586,10 +586,10 @@ def _scan_yaml_test_cases(models: dict[str, ModelInfo]) -> None:
                     models[model_type].yaml_test_case_skip_reason = skip_reason
                     if yaml_task_type:
                         models[model_type].yaml_task_type = yaml_task_type
-                    if min_token_match_ratio is not None:
-                        models[model_type].yaml_min_token_match_ratio = float(
-                            min_token_match_ratio
-                        )
+                    # Deliberately do NOT record min_token_match_ratio for
+                    # skipped cases: the test never runs, so surfacing its
+                    # configured pass threshold on the dashboard would
+                    # misrepresent declared config as a measured result.
                     # Skipped cases set status="skip" (not l*_has_test_case)
                     # so the "configured" signal stays consistent with L2/L3
                     # ("configured" means a runnable test exists).
