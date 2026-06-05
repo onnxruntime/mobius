@@ -1379,27 +1379,27 @@ def _compute_block_sequence_ids(
     input_ids: ir.Value,
     *,
     image_token_id: int,
-    audio_token_id: int | None,
 ) -> ir.Value:
     """Compute Gemma4 ``block_sequence_ids`` [B, S] from ``input_ids``.
 
     Mirrors HuggingFace ``get_block_sequence_ids_for_mask``: each contiguous
-    run of vision tokens (image OR audio placeholder ids) gets a unique,
-    monotonically increasing block id (``>= 0``); text positions get ``-1``.
+    run of image placeholder tokens gets a unique, monotonically increasing
+    block id (``>= 0``); every other position (text **and audio**) gets ``-1``.
     Tokens within the same block may attend to each other bidirectionally.
 
-    A new block starts only on a non-vision -> vision transition, so an
-    image run immediately followed by an audio run (no text in between) is
-    treated as a single block, matching HF exactly.
+    Only image tokens form blocks. HF derives ``is_vision`` from
+    ``mm_token_type_ids`` as ``(== 1) | (== 2)`` (image or video); audio is
+    token-type ``3`` and is deliberately excluded, so audio placeholders keep
+    plain causal attention. gemma4_unified has no video modality, so this
+    reduces to image tokens alone.
+
+    A new block starts only on a non-image -> image transition.
 
     Returns an INT64 tensor of shape ``[B, S]``.
     """
-    # is_vision [B, S] BOOL: token is an image or audio placeholder.
+    # is_vision [B, S] BOOL: token is an image placeholder. Audio tokens are
+    # intentionally NOT included (HF block mask covers image/video only).
     is_vision = op.Equal(input_ids, op.Constant(value_int=image_token_id))
-    if audio_token_id is not None:
-        is_vision = op.Or(
-            is_vision, op.Equal(input_ids, op.Constant(value_int=audio_token_id))
-        )
 
     # is_prev_vision: is_vision shifted right by one along the sequence axis,
     # with position 0 forced to False. Implemented without ConstantOfShape
@@ -1624,23 +1624,22 @@ class Gemma4TextModel(nn.Module):
         # the float-bias Attention path with ``is_causal=0`` and bake the
         # full mask (causal + sliding + padding + blockwise OR) into the bias.
         #
-        # ``block_sequence_ids`` [B, S] identifies contiguous image/audio token
-        # blocks. It is derived from ``input_ids`` (image/audio token spans).
-        # In the multimodal 3/4-model split the decoder receives ``input_ids``
-        # alongside ``inputs_embeds`` and computes the overlay here, so it does
-        # not need a separate cross-model tensor (onnxruntime-genai forwards
-        # ``input_ids`` to the decoder but cannot forward an arbitrary int
-        # tensor). When a caller supplies ``block_sequence_ids`` directly it is
-        # used as-is. The text-only path has no image/audio tokens, so the
-        # overlay is a no-op and plain causal attention (GQA-eligible) is kept,
-        # matching HuggingFace.
+        # ``block_sequence_ids`` [B, S] identifies contiguous image token
+        # blocks. It is derived from ``input_ids`` (image token spans only;
+        # audio keeps causal attention, matching HF). In the multimodal
+        # 3/4-model split the decoder receives ``input_ids`` alongside
+        # ``inputs_embeds`` and computes the overlay here, so it does not need a
+        # separate cross-model tensor (onnxruntime-genai forwards ``input_ids``
+        # to the decoder but cannot forward an arbitrary int tensor). When a
+        # caller supplies ``block_sequence_ids`` directly it is used as-is. The
+        # text-only path has no image tokens, so the overlay is a no-op and
+        # plain causal attention (GQA-eligible) is kept, matching HuggingFace.
         bidirectional = self._use_bidirectional_attention == "vision"
         if bidirectional and block_sequence_ids is None and input_ids is not None:
             block_sequence_ids = _compute_block_sequence_ids(
                 op,
                 input_ids,
                 image_token_id=self._image_token_id,
-                audio_token_id=self._audio_token_id,
             )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 

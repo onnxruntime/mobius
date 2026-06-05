@@ -192,21 +192,25 @@ class TestGemma4BlockSequenceIds:
         graph, builder = _make_graph()
         op = builder.op
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, "S"])
-        out = _compute_block_sequence_ids(
-            op, input_ids, image_token_id=255, audio_token_id=254
-        )
+        out = _compute_block_sequence_ids(op, input_ids, image_token_id=255)
         builder.add_output(out, "block_sequence_ids")
         session = OnnxModelSession(_make_model(graph), device="cpu")
 
         # text  img img  text  aud aud  text  img  text
         ids = np.array([[10, 255, 255, 11, 254, 254, 11, 255, 12]], dtype=np.int64)
         result = session.run({"input_ids": ids})["block_sequence_ids"]
-        # 3 contiguous vision runs separated by text -> groups 0, 1, 2; text -> -1.
-        expected = np.array([[-1, 0, 0, -1, 1, 1, -1, 2, -1]], dtype=np.int64)
+        # Only image runs form blocks (groups 0, 1). Audio (254) and text -> -1,
+        # matching HF where audio is token-type 3 and excluded from is_vision.
+        expected = np.array([[-1, 0, 0, -1, -1, -1, -1, 1, -1]], dtype=np.int64)
         np.testing.assert_array_equal(result, expected)
 
-    def test_adjacent_image_audio_same_block(self):
-        """Image run immediately followed by audio run = single block (HF parity)."""
+    def test_audio_tokens_excluded_from_blocks(self):
+        """Audio placeholders never join a vision block (HF parity).
+
+        HF derives ``is_vision`` from ``mm_token_type_ids`` as ``(==1)|(==2)``
+        (image or video); audio is token-type ``3`` and is excluded, so an audio
+        run adjacent to an image run does NOT extend the block.
+        """
         import numpy as np
 
         from mobius._testing.ort_inference import OnnxModelSession
@@ -216,16 +220,14 @@ class TestGemma4BlockSequenceIds:
         graph, builder = _make_graph()
         op = builder.op
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, "S"])
-        out = _compute_block_sequence_ids(
-            op, input_ids, image_token_id=255, audio_token_id=254
-        )
+        out = _compute_block_sequence_ids(op, input_ids, image_token_id=255)
         builder.add_output(out, "block_sequence_ids")
         session = OnnxModelSession(_make_model(graph), device="cpu")
 
         ids = np.array([[10, 255, 255, 254, 254, 11]], dtype=np.int64)
         result = session.run({"input_ids": ids})["block_sequence_ids"]
-        # No text gap between image and audio -> one contiguous block (id 0).
-        expected = np.array([[-1, 0, 0, 0, 0, -1]], dtype=np.int64)
+        # Image run -> block 0; the adjacent audio run (254) stays -1 (causal).
+        expected = np.array([[-1, 0, 0, -1, -1, -1]], dtype=np.int64)
         np.testing.assert_array_equal(result, expected)
 
     def test_package_wires_block_sequence_ids_end_to_end(self):
