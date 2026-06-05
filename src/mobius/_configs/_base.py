@@ -1279,8 +1279,9 @@ class Gemma4Config(VisionLanguageConfig):
       included (HF marks audio as token-type 3, excluded from the vision
       block mask), so audio tokens keep causal attention.
     - ``"all"``: HF mode where every token attends bidirectionally. Not used
-      by any currently supported Gemma4 model and not implemented here; it is
-      treated as fully causal (only ``"vision"`` activates the overlay).
+      by any currently supported Gemma4 model and not implemented here; the
+      decoder raises ``NotImplementedError`` rather than silently degrading to
+      causal attention (only ``None`` and ``"vision"`` are accepted).
     """
 
     @classmethod

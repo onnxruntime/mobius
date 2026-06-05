@@ -204,6 +204,16 @@ class TestGemma4BlockSequenceIds:
         expected = np.array([[-1, 0, 0, -1, -1, -1, -1, 1, -1]], dtype=np.int64)
         np.testing.assert_array_equal(result, expected)
 
+    def test_unsupported_bidirectional_mode_raises(self):
+        """``use_bidirectional_attention='all'`` is rejected, not silently causal."""
+        import pytest
+
+        from mobius.models.gemma4 import Gemma4TextModel
+
+        config = _tiny_gemma4_config(use_bidirectional_attention="all")
+        with pytest.raises(NotImplementedError, match="use_bidirectional_attention"):
+            Gemma4TextModel(config)
+
     def test_audio_tokens_excluded_from_blocks(self):
         """Audio placeholders never join a vision block (HF parity).
 

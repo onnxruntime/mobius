@@ -1465,10 +1465,20 @@ class Gemma4TextModel(nn.Module):
             )
         self.layer_types = layer_types
         self.sliding_window = config.sliding_window
-        # Bidirectional attention mode (None | "vision" | "all"). When
-        # "vision", contiguous vision-token blocks attend bidirectionally;
-        # the overlay is supplied at runtime via ``block_sequence_ids`` and
-        # forces the float-bias attention path (``is_causal=0``).
+        # Bidirectional attention mode (None | "vision"). When "vision",
+        # contiguous image-token blocks attend bidirectionally; the overlay is
+        # derived from input_ids at runtime via ``block_sequence_ids`` and forces
+        # the float-bias attention path (``is_causal=0``). HF also defines an
+        # "all" mode (every token bidirectional, no causal mask); it is not used
+        # by any supported Gemma4 checkpoint and not implemented here, so reject
+        # it explicitly rather than silently falling back to causal attention.
+        if config.use_bidirectional_attention not in (None, "vision"):
+            raise NotImplementedError(
+                "Gemma4 use_bidirectional_attention="
+                f"{config.use_bidirectional_attention!r} is not supported; only "
+                "None (fully causal) and 'vision' (image-block bidirectional) "
+                "are implemented."
+            )
         self._use_bidirectional_attention = config.use_bidirectional_attention
 
         # Local (sliding window) config — full rotation, local rope_theta
