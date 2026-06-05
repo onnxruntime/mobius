@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### fp16 GQA Export Fix
+
+#### Fixed
+
+- Native fp16 GroupQueryAttention exports (e.g. `microsoft/Phi-3.5-mini-instruct`
+  with `--dtype f16 --execution-provider cuda`) no longer emit fp32 packed-QKV /
+  transposed weights. Previously the fold passes (`FoldConcatInitializersPass`,
+  `FoldTransposedInitializerPass`) defaulted a folded initializer's dtype to
+  `FLOAT` when the source `Value`'s declared type had been dropped during fp16
+  casting, producing a model onnxruntime rejected at load with a
+  `MatMul` type-parameter error (`tensor(float16)` vs `tensor(float)`) on both
+  CPU and CUDA EPs. A new `mobius._passes._dtype_utils.initializer_dtype()`
+  helper now resolves the effective dtype from `const_value` when the type
+  annotation is missing, so fp16 GQA models load directly with no manual
+  post-cast.
+
+---
+
 ### WebGPU Shape Op Support
 
 #### Changed
