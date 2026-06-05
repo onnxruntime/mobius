@@ -266,3 +266,189 @@ class TestGemma4BlockSequenceIds:
         dec_inputs = {i.name for i in pkg["decoder"].graph.inputs}
         assert "block_sequence_ids" not in emb_outputs
         assert "block_sequence_ids" not in dec_inputs
+
+
+def _tiny_gemma4_unified_config(**overrides) -> Gemma4Config:
+    """Minimal gemma4_unified config (dense decoder + encoder-free embedders)."""
+    from mobius._configs import Gemma4AudioConfig, VisionConfig
+
+    base = dict(
+        model_type="gemma4_unified",
+        enable_moe_block=False,
+        tie_word_embeddings=True,
+        use_bidirectional_attention="vision",
+        image_token_id=255,
+        vision=VisionConfig(
+            hidden_size=32,
+            position_embedding_size=1120,
+            patch_size=4,
+            pooling_kernel_size=3,
+            out_hidden_size=32,
+            norm_eps=1e-6,
+        ),
+        audio=Gemma4AudioConfig(hidden_size=16, output_proj_dims=16, audio_token_id=254),
+    )
+    base.update(overrides)
+    return _tiny_gemma4_config(**base)
+
+
+class TestGemma4UnifiedPreprocessWeights:
+    """Gemma4UnifiedModel.preprocess_weights — checkpoint name mapping."""
+
+    def test_full_checkpoint_rename(self):
+        from mobius.models.gemma4 import Gemma4UnifiedModel
+
+        config = _tiny_gemma4_unified_config()
+        model = Gemma4UnifiedModel(config)
+
+        # pos_embedding stored as [posemb, 2, mm_embed_dim]; x-axis = [:, 0, :],
+        # y-axis = [:, 1, :]. Use distinct constants to verify the split.
+        pos_embedding = torch.empty(1120, 2, 32)
+        pos_embedding[:, 0, :] = 1.0
+        pos_embedding[:, 1, :] = 2.0
+
+        fake_sd = {
+            "model.language_model.embed_tokens.weight": torch.zeros(256, 64),
+            "model.language_model.layers.0.input_layernorm.weight": torch.zeros(64),
+            "model.vision_embedder.patch_ln1.weight": torch.zeros(432),
+            "model.vision_embedder.patch_dense.weight": torch.zeros(32, 432),
+            "model.vision_embedder.pos_embedding": pos_embedding,
+            "model.vision_embedder.pos_norm.weight": torch.zeros(32),
+            "model.embed_vision.embedding_projection.weight": torch.zeros(64, 32),
+            "model.embed_audio.embedding_projection.weight": torch.zeros(64, 16),
+            # Scale-free RMSNorms have no learnable weight in the checkpoint, but
+            # assert they are dropped even if a stray key appears.
+            "model.embed_vision.embedding_pre_projection_norm.weight": torch.zeros(32),
+            "model.embed_audio.embedding_pre_projection_norm.weight": torch.zeros(16),
+        }
+        result = model.preprocess_weights(fake_sd)
+
+        # Text backbone → decoder.model.* and tied embedding/lm_head.
+        assert "decoder.model.embed_tokens.weight" in result
+        assert "embedding.embed_tokens.weight" in result
+        assert "decoder.lm_head.weight" in result  # synthesized from tied embed
+        assert "decoder.model.layers.0.input_layernorm.weight" in result
+
+        # Vision front-end → vision_encoder.*; pos_embedding split into x/y.
+        assert "vision_encoder.patch_ln1.weight" in result
+        assert "vision_encoder.patch_dense.weight" in result
+        assert "vision_encoder.pos_norm.weight" in result
+        assert result["vision_encoder.pos_emb_x.weight"].shape == (1120, 32)
+        assert result["vision_encoder.pos_emb_y.weight"].shape == (1120, 32)
+        assert torch.allclose(result["vision_encoder.pos_emb_x.weight"], torch.tensor(1.0))
+        assert torch.allclose(result["vision_encoder.pos_emb_y.weight"], torch.tensor(2.0))
+
+        # Projections → vision_encoder.projector / audio_encoder.projector.
+        assert "vision_encoder.projector.weight" in result
+        assert "audio_encoder.projector.weight" in result
+
+        # Scale-free pre-projection norms must be dropped (no graph initializer).
+        assert not any("embedding_pre_projection_norm" in k for k in result)
+        # The raw checkpoint module prefixes must not leak through.
+        assert not any(k.startswith("vision_embedder.") for k in result)
+        assert not any(k.startswith("embed_vision.") for k in result)
+        assert not any(k.startswith("language_model.") for k in result)
+
+    def test_vision_embedder_preprocess_standalone(self):
+        from mobius.models.gemma4 import _Gemma4UnifiedVisionEmbedderModel
+
+        config = _tiny_gemma4_unified_config()
+        embedder = _Gemma4UnifiedVisionEmbedderModel(config)
+
+        pos_embedding = torch.empty(1120, 2, 32)
+        pos_embedding[:, 0, :] = 3.0
+        pos_embedding[:, 1, :] = 4.0
+        fake_sd = {
+            "vision_embedder.patch_ln1.weight": torch.zeros(432),
+            "vision_embedder.pos_embedding": pos_embedding,
+            "embed_vision.embedding_projection.weight": torch.zeros(64, 32),
+            "embed_vision.embedding_pre_projection_norm.weight": torch.zeros(32),
+        }
+        result = embedder.preprocess_weights(fake_sd)
+
+        assert "patch_ln1.weight" in result
+        assert "projector.weight" in result
+        assert torch.allclose(result["pos_emb_x.weight"], torch.tensor(3.0))
+        assert torch.allclose(result["pos_emb_y.weight"], torch.tensor(4.0))
+        assert not any("embedding_pre_projection_norm" in k for k in result)
+
+    def test_audio_embedder_preprocess_standalone(self):
+        from mobius.models.gemma4 import _Gemma4UnifiedAudioEmbedderModel
+
+        config = _tiny_gemma4_unified_config()
+        embedder = _Gemma4UnifiedAudioEmbedderModel(config)
+
+        fake_sd = {
+            "embed_audio.embedding_projection.weight": torch.zeros(64, 16),
+            "embed_audio.embedding_pre_projection_norm.weight": torch.zeros(16),
+        }
+        result = embedder.preprocess_weights(fake_sd)
+
+        assert result["projector.weight"].shape == (64, 16)
+        assert not any("embedding_pre_projection_norm" in k for k in result)
+
+
+class TestGemma4UnifiedConfigHooks:
+    """Config extraction hooks map unified vision/audio sub-configs."""
+
+    def test_vision_hook_maps_fields(self):
+        from types import SimpleNamespace
+
+        from mobius._configs.per_model._gemma4_unified_vision import (
+            _gemma4_unified_vision,
+        )
+
+        composite = SimpleNamespace(
+            model_type="gemma4_unified",
+            image_token_id=258880,
+            vision_config=SimpleNamespace(
+                mm_embed_dim=3840,
+                patch_size=16,
+                pooling_kernel_size=3,
+                mm_posemb_size=1120,
+                output_proj_dims=3840,
+                rms_norm_eps=1e-6,
+            ),
+        )
+        fields: dict = {}
+        _gemma4_unified_vision(composite, None, "gemma4_unified", fields)
+
+        assert fields["hidden_size"] == 3840
+        assert fields["patch_size"] == 16
+        assert fields["pooling_kernel_size"] == 3
+        assert fields["position_embedding_size"] == 1120
+        assert fields["out_hidden_size"] == 3840
+        assert fields["image_token_id"] == 258880
+
+    def test_vision_hook_skips_unrelated_model(self):
+        from types import SimpleNamespace
+
+        from mobius._configs.per_model._gemma4_unified_vision import (
+            _gemma4_unified_vision,
+        )
+
+        composite = SimpleNamespace(model_type="qwen2_vl", vision_config=object())
+        fields: dict = {}
+        result = _gemma4_unified_vision(composite, None, "qwen2_vl", fields)
+        assert result is None
+        assert fields == {}
+
+    def test_audio_hook_maps_fields(self):
+        from types import SimpleNamespace
+
+        from mobius._configs.per_model._gemma4_unified_audio import (
+            _gemma4_unified_audio,
+        )
+
+        composite = SimpleNamespace(
+            model_type="gemma4_unified",
+            audio_token_id=258881,
+            audio_config=SimpleNamespace(audio_embed_dim=640),
+        )
+        result = _gemma4_unified_audio(composite, None, "gemma4_unified", {})
+
+        assert result is not None
+        audio_cfg = result["audio"]
+        assert audio_cfg.hidden_size == 640
+        assert audio_cfg.output_proj_dims == 640
+        assert audio_cfg.audio_token_id == 258881
