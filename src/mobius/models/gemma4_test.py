@@ -229,10 +229,12 @@ class TestGemma4BlockSequenceIds:
         np.testing.assert_array_equal(result, expected)
 
     def test_package_wires_block_sequence_ids_end_to_end(self):
-        """Embedding emits block_sequence_ids and decoder declares it as input.
+        """Decoder takes input_ids and derives the vision-block overlay itself.
 
-        With ``use_bidirectional_attention='vision'`` the overlay must be
-        plumbed embedding -> decoder.
+        With ``use_bidirectional_attention='vision'`` the embedding no longer
+        emits ``block_sequence_ids``; instead the decoder receives ``input_ids``
+        (alongside ``inputs_embeds``) and computes the overlay internally. This
+        avoids a cross-model tensor that onnxruntime-genai cannot forward.
         """
         from mobius.models.gemma4 import Gemma4Model
         from mobius.tasks._gemma4 import Gemma4Task
@@ -242,8 +244,9 @@ class TestGemma4BlockSequenceIds:
 
         emb_outputs = {o.name for o in pkg["embedding"].graph.outputs}
         dec_inputs = {i.name for i in pkg["decoder"].graph.inputs}
-        assert "block_sequence_ids" in emb_outputs
-        assert "block_sequence_ids" in dec_inputs
+        assert "block_sequence_ids" not in emb_outputs
+        assert "block_sequence_ids" not in dec_inputs
+        assert "input_ids" in dec_inputs
 
         # Decoder attention must drop GQA and disable the op's built-in causal
         # mask (is_causal=0) so the baked blockwise bias is honored.
@@ -255,7 +258,7 @@ class TestGemma4BlockSequenceIds:
             assert n.attributes["is_causal"].as_int() == 0
 
     def test_no_block_sequence_ids_when_causal(self):
-        """Without bidirectional attention, no block_sequence_ids is wired."""
+        """Without bidirectional attention, no input_ids/overlay is wired."""
         from mobius.models.gemma4 import Gemma4Model
         from mobius.tasks._gemma4 import Gemma4Task
 
@@ -266,6 +269,7 @@ class TestGemma4BlockSequenceIds:
         dec_inputs = {i.name for i in pkg["decoder"].graph.inputs}
         assert "block_sequence_ids" not in emb_outputs
         assert "block_sequence_ids" not in dec_inputs
+        assert "input_ids" not in dec_inputs
 
 
 def _tiny_gemma4_unified_config(**overrides) -> Gemma4Config:

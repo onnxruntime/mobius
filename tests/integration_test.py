@@ -5462,10 +5462,10 @@ def test_gemma4_unified_12b_multimodal_prefill():
     1. ``vision_encoder``: raw image patches → 3840-d image features
        (compared against HF ``model.get_image_features`` ``pooler_output``).
     2. ``embedding``: scatters the image features into the scaled word
-       embeddings and emits ``block_sequence_ids`` (the vision-block ids that
-       drive the decoder's bidirectional mask).
+       embeddings to produce ``inputs_embeds``.
     3. ``decoder``: 48-layer gemma4 text decoder with vision-block
        bidirectional attention (``use_bidirectional_attention="vision"``).
+       It derives the vision-block ids internally from ``input_ids``.
 
     The bidirectional reference REQUIRES passing ``mm_token_type_ids`` to HF —
     without it HF falls back to a purely causal mask.  Loads the 24 GB
@@ -5572,7 +5572,7 @@ def test_gemma4_unified_12b_multimodal_prefill():
     print(f"\nGemma4 unified 12B vision cos_sim={vis_cos:.6f}")
     assert vis_cos > 0.999
 
-    # Stage 2: embedding fusion (also emits block_sequence_ids).
+    # Stage 2: embedding fusion → inputs_embeds.
     embedding_session = _make_session(pkg["embedding"])
     emb_out = embedding_session.run(
         {
@@ -5583,15 +5583,16 @@ def test_gemma4_unified_12b_multimodal_prefill():
     )
     embedding_session.close()
     inputs_embeds = emb_out["inputs_embeds"]
-    block_sequence_ids = emb_out["block_sequence_ids"]
 
-    # Stage 3: decoder with vision-block bidirectional attention.
+    # Stage 3: decoder with vision-block bidirectional attention. The decoder
+    # derives ``block_sequence_ids`` internally from ``input_ids`` (forwarded
+    # alongside ``inputs_embeds``).
     decoder_session = _make_session(pkg["decoder"])
     feeds = {
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
-        "block_sequence_ids": block_sequence_ids,
+        "input_ids": input_ids,
     }
     layer_types = gemma4_config.layer_types
     for i in range(gemma4_config.num_hidden_layers):

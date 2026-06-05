@@ -1624,11 +1624,24 @@ class Gemma4TextModel(nn.Module):
         # the float-bias Attention path with ``is_causal=0`` and bake the
         # full mask (causal + sliding + padding + blockwise OR) into the bias.
         #
-        # ``block_sequence_ids`` is plumbed from the embedding sub-model (VLM
-        # split) where image/audio tokens are known. The text-only path keeps
-        # plain causal attention (and GQA eligibility), matching HF, which
-        # only injects the overlay in the multimodal wrapper.
+        # ``block_sequence_ids`` [B, S] identifies contiguous image/audio token
+        # blocks. It is derived from ``input_ids`` (image/audio token spans).
+        # In the multimodal 3/4-model split the decoder receives ``input_ids``
+        # alongside ``inputs_embeds`` and computes the overlay here, so it does
+        # not need a separate cross-model tensor (onnxruntime-genai forwards
+        # ``input_ids`` to the decoder but cannot forward an arbitrary int
+        # tensor). When a caller supplies ``block_sequence_ids`` directly it is
+        # used as-is. The text-only path has no image/audio tokens, so the
+        # overlay is a no-op and plain causal attention (GQA-eligible) is kept,
+        # matching HuggingFace.
         bidirectional = self._use_bidirectional_attention == "vision"
+        if bidirectional and block_sequence_ids is None and input_ids is not None:
+            block_sequence_ids = _compute_block_sequence_ids(
+                op,
+                input_ids,
+                image_token_id=self._image_token_id,
+                audio_token_id=self._audio_token_id,
+            )
         use_block_overlay = bidirectional and block_sequence_ids is not None
 
         use_gqa = (
@@ -1869,10 +1882,15 @@ class _Gemma4DecoderModel(nn.Module):
         per_layer_inputs: ir.Value | None = None,
         past_key_values: list | None = None,
         block_sequence_ids: ir.Value | None = None,
+        input_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
+        # ``input_ids`` is forwarded alongside ``inputs_embeds`` so the text
+        # model can derive the bidirectional vision-block overlay internally
+        # (see Gemma4TextModel.forward). ``inputs_embeds`` still takes
+        # precedence for the actual token embeddings.
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=None,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -2009,10 +2027,6 @@ class Gemma4EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
         self.audio_token_id: int | None = config.audio.audio_token_id if config.audio else None
-        # When the text decoder uses vision-block bidirectional attention,
-        # the embedding model also emits ``block_sequence_ids`` (computed from
-        # input_ids) for the decoder's attention-mask overlay.
-        self._emit_block_sequence_ids = config.use_bidirectional_attention == "vision"
 
         # Per-layer input embedding components (moved from the decoder).
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
@@ -2084,8 +2098,12 @@ class Gemma4EmbeddingModel(nn.Module):
         """Return a dict of named embedding outputs.
 
         Always contains ``inputs_embeds``. Contains ``per_layer_inputs`` when
-        ``hidden_size_per_layer_input > 0``, and ``block_sequence_ids`` when
-        the decoder uses vision-block bidirectional attention.
+        ``hidden_size_per_layer_input > 0``.
+
+        The vision-block bidirectional attention overlay is NOT emitted here:
+        the decoder derives it from ``input_ids`` directly (see
+        ``Gemma4TextModel.forward``), which avoids a cross-model tensor that
+        onnxruntime-genai cannot forward between sub-models.
         """
         # [B, S] → [B, S, hidden]
         hidden = self.embed_tokens(op, input_ids)
@@ -2106,15 +2124,6 @@ class Gemma4EmbeddingModel(nn.Module):
             )
 
         outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
-
-        # Vision-block bidirectional attention overlay ids for the decoder.
-        if self._emit_block_sequence_ids:
-            outputs["block_sequence_ids"] = _compute_block_sequence_ids(
-                op,
-                input_ids,
-                image_token_id=self.image_token_id,
-                audio_token_id=self.audio_token_id,
-            )
 
         if not self._per_layer_dim:
             return outputs
@@ -2633,11 +2642,11 @@ class Gemma4UnifiedModel(nn.Module):
     Builds a 3- or 4-model package (built by :class:`~mobius.tasks.Gemma4UnifiedTask`):
 
     Always produced:
-    - ``decoder``: gemma4 text decoder taking ``inputs_embeds``
-      (dual head_dim, k_eq_v, vision-block bidirectional attention)
+    - ``decoder``: gemma4 text decoder taking ``inputs_embeds`` (and
+      ``input_ids`` for the vision-block bidirectional mask, which it derives
+      internally; dual head_dim, k_eq_v)
     - ``vision_encoder``: raw-patch vision embedder
     - ``embedding``: scaled word embedding + multimodal feature fusion
-      (also emits ``block_sequence_ids`` for the decoder's bidirectional mask)
 
     Added when ``config.audio is not None``:
     - ``audio_encoder``: raw-frame audio embedder

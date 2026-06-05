@@ -1466,19 +1466,22 @@ class TestBuildGraphVisionLanguage:
         assert a_inputs == {"input_features", "input_features_mask"}
         assert "audio_features" in {o.name for o in audio.graph.outputs}
 
-        # Embedding: fuses both modalities + emits block_sequence_ids (bidir)
+        # Embedding: fuses both modalities → inputs_embeds (no block_sequence_ids;
+        # the decoder derives the bidirectional overlay from input_ids itself)
         embedding = pkg["embedding"]
         e_inputs = {i.name for i in embedding.graph.inputs}
         assert {"input_ids", "image_features", "audio_features"} <= e_inputs
         e_outputs = {o.name for o in embedding.graph.outputs}
         assert "inputs_embeds" in e_outputs
-        assert "block_sequence_ids" in e_outputs
+        assert "block_sequence_ids" not in e_outputs
 
-        # Decoder: consumes inputs_embeds + block_sequence_ids
+        # Decoder: consumes inputs_embeds + input_ids (for the vision-block
+        # bidirectional overlay, derived internally)
         decoder = pkg["decoder"]
         d_inputs = {i.name for i in decoder.graph.inputs}
         assert "inputs_embeds" in d_inputs
-        assert "block_sequence_ids" in d_inputs
+        assert "input_ids" in d_inputs
+        assert "block_sequence_ids" not in d_inputs
         assert "logits" in {o.name for o in decoder.graph.outputs}
 
     def test_gemma4_kv_shared_layer_tracing(self):

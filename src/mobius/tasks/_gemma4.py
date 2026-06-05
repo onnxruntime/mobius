@@ -260,13 +260,17 @@ class Gemma4Task(ModelTask):
                 shape=[batch, seq_len, total_per_layer],
             )
 
-        # Vision-block bidirectional attention overlay ids (plumbed from the
-        # embedding model). Only present for models with
-        # ``use_bidirectional_attention == "vision"`` (larger Gemma4 models).
-        block_sequence_ids_val: ir.Value | None = None
+        # Vision-block bidirectional attention: the decoder receives the raw
+        # ``input_ids`` (alongside ``inputs_embeds``) and derives the block
+        # overlay internally. This avoids a separate cross-model
+        # ``block_sequence_ids`` tensor, which onnxruntime-genai cannot forward
+        # between the embedding and decoder sub-models (it can forward
+        # ``input_ids``). Only models with
+        # ``use_bidirectional_attention == "vision"`` need it.
+        input_ids_val: ir.Value | None = None
         if config.use_bidirectional_attention == "vision":
-            block_sequence_ids_val = builder.input(
-                "block_sequence_ids",
+            input_ids_val = builder.input(
+                "input_ids",
                 dtype=ir.DataType.INT64,
                 shape=[batch, seq_len],
             )
@@ -280,7 +284,7 @@ class Gemma4Task(ModelTask):
             position_ids=position_ids,
             per_layer_inputs=per_layer_inputs_val,
             past_key_values=past_key_values,
-            block_sequence_ids=block_sequence_ids_val,
+            input_ids=input_ids_val,
         )
 
         builder.add_output(logits, "logits")
@@ -431,13 +435,10 @@ class Gemma4Task(ModelTask):
         )
 
         # ``embedding`` returns a dict of named outputs: always
-        # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating)
-        # and ``block_sequence_ids`` (vision-block bidirectional attention).
+        # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
         builder.add_output(result["inputs_embeds"], "inputs_embeds")
         if "per_layer_inputs" in result:
             builder.add_output(result["per_layer_inputs"], "per_layer_inputs")
-        if "block_sequence_ids" in result:
-            builder.add_output(result["block_sequence_ids"], "block_sequence_ids")
         return _make_model(graph)
 
 
