@@ -4603,7 +4603,7 @@ class TestBuildStaticCacheGraph:
                 f"{None if producer is None else producer.op_type}"
             )
 
-    def test_static_cache_has_no_tensorscatter_left_unmasked(self):
+    def test_static_cache_graph_contains_causal_mask_ops(self):
         """Static cache graph must contain the causal-mask construction ops.
 
         Guards against regressing back to the is_causal=1 / no-mask form

@@ -123,6 +123,58 @@ class TestCausalLMTask:
                 assert present_dims[2] == "past_sequence_len + sequence_len"
                 assert present.dtype == past.dtype
 
+    def test_present_outputs_match_past_inputs_mla_distinct_head_dims(self):
+        """present/past KV symmetry holds when key_head_dim != value_head_dim.
+
+        The default-config sibling test only exercises
+        ``key_head_dim == value_head_dim == head_dim``, so it cannot catch a
+        call-site wiring slip that swaps or drops one of the two distinct dims.
+        An MLA (DeepSeek-style) config gives the keys a head dim of
+        ``qk_nope_head_dim + qk_rope_head_dim`` and the values a *different*
+        ``v_head_dim``; this guards the present-KV head_dim stamping fix for the
+        very case it was written for (MLA distinct key/value head dims).
+        """
+        config = make_config(
+            q_lora_rank=16,
+            kv_lora_rank=32,
+            qk_nope_head_dim=12,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+        )
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+        inputs = {v.name: v for v in model.graph.inputs}
+        outputs = {v.name: v for v in model.graph.outputs}
+
+        # Precondition: the config must actually produce distinct key/value
+        # head dims, otherwise this test degenerates into the default case.
+        key_head_dim = inputs["past_key_values.0.key"].shape[3]
+        value_head_dim = inputs["past_key_values.0.value"].shape[3]
+        assert key_head_dim != value_head_dim, (
+            "MLA config did not yield distinct key/value head dims "
+            f"(key={key_head_dim}, value={value_head_dim}); the test would not "
+            "exercise the distinct-head-dim path it is meant to guard"
+        )
+
+        def dims(value):
+            return [d if isinstance(d, int) else str(d) for d in value.shape]
+
+        for i in range(config.num_hidden_layers):
+            for kind in ("key", "value"):
+                past = inputs[f"past_key_values.{i}.{kind}"]
+                present = outputs[f"present.{i}.{kind}"]
+                past_dims = dims(past)
+                present_dims = dims(present)
+                # batch, kv_heads, head_dim must match the past input exactly --
+                # including the per-kind (key vs value) distinct head_dim.
+                assert present_dims[0] == past_dims[0]
+                assert present_dims[1] == past_dims[1]
+                assert present_dims[3] == past_dims[3]
+                # present covers past + current tokens.
+                assert present_dims[2] == "past_sequence_len + sequence_len"
+                assert present.dtype == past.dtype
+
     def test_build_producer_info(self):
         config = make_config()
         module = CausalLMModel(config)

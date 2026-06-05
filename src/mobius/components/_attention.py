@@ -181,7 +181,7 @@ def _apply_attention(
             updated_k,
             static_cache.write_indices,
         )
-        attn_output, _, _ = op.Attention(
+        attn_output = op.Attention(
             query,
             updated_k,
             updated_v,
@@ -194,7 +194,10 @@ def _apply_attention(
             scale=scale,
             softcap=softcap,
             is_causal=0,
-            _outputs=3,
+            # Only attn_output is consumed; the updated cache comes from the
+            # TensorScatter writes (updated_k/updated_v), not the op's present
+            # outputs, so request a single output instead of discarding two.
+            _outputs=1,
         )
         return attn_output, updated_k, updated_v
 

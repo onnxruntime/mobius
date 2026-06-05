@@ -61,7 +61,10 @@ class CausalLMTask(ModelTask):
             - logits: FLOAT
             - updated_key_cache.{i} / updated_value_cache.{i}: FLOAT
 
-        No ``attention_mask`` input — causal masking uses ``is_causal=1``.
+        No ``attention_mask`` input — the static cache drives the
+        ``Attention`` op with ``is_causal=0`` and an explicit offset-aware
+        causal mask built from ``write_indices``/``nonpad_kv_seqlen`` (see
+        :func:`mobius.components._common.create_static_cache_causal_mask`).
 
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
@@ -371,10 +374,13 @@ def _validate_static_cache_support(module: nn.Module) -> None:
       ``create_attention_bias()``, so ``attention_mask=None`` would
       fail.  Needs position embedding adaptation.
 
-    - **Falcon (ALiBi)**: The ALiBi variant uses ``is_causal=0`` with a
-      position-dependent bias that encodes both causal masking and
-      distance-based attention decay.  This is fundamentally
-      incompatible with the ``is_causal=1`` static cache pattern.
+    - **Falcon (ALiBi)**: The ALiBi variant replaces a plain causal mask
+      with a position-dependent *additive* bias that encodes both causal
+      masking and distance-based attention decay.  The static cache path
+      already occupies the ``attn_mask`` input with its own explicit
+      offset-aware causal mask (``is_causal=0``), so ALiBi support would
+      require folding the distance-decay bias into that static-mask
+      construction rather than passing a separate bias.
 
     Raises:
         TypeError: If any decoder layer is not a supported type.

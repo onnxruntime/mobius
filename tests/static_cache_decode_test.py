@@ -48,6 +48,13 @@ _MAX_SEQ_LEN = 16
 _MODEL_TYPE = "qwen2"
 _CACHE_DTYPE = np.float32
 
+# CUDA attention logits are not bit-reproducible across kernels/drivers, so the
+# "unchanged" poison controls compare with a tolerance rather than exact
+# equality.  The poison magnitude (50.0) moves attended logits far outside this
+# band, so the "changed" controls stay decisive.
+_LOGIT_RTOL = 1e-5
+_LOGIT_ATOL = 1e-5
+
 
 def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
     """Fill empty initializers with small random values of their dtype.
@@ -167,7 +174,7 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
 def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
     """Always-masked decode does not attend to padding slots beyond ``nonpad``.
 
-    Option Y exports the static cache with ``is_causal=0`` plus an explicit
+    The static cache exports the attention with ``is_causal=0`` plus an explicit
     :func:`mobius.components._common.create_static_cache_causal_mask`, which keeps
     key slot ``j`` for a query at absolute position ``p = write_indices[b] + t``
     iff ``j <= p``.  For a single-token decode (``S_q=1``, ``write_indices=N``)
@@ -236,10 +243,16 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         out_of_range_feeds = {**decode_inputs, **out_of_range}
         masked_out = dict(zip(output_names, session.run(output_names, out_of_range_feeds)))
 
-        assert np.array_equal(baseline["logits"], masked_out["logits"]), (
-            "decode logits changed when padding slots (j >= nonpad_kv_seqlen) "
-            "were poisoned — the static-cache mask is not excluding unwritten "
-            "padding from attention"
+        np.testing.assert_allclose(
+            masked_out["logits"],
+            baseline["logits"],
+            rtol=_LOGIT_RTOL,
+            atol=_LOGIT_ATOL,
+            err_msg=(
+                "decode logits changed when padding slots (j >= nonpad_kv_seqlen) "
+                "were poisoned — the static-cache mask is not excluding unwritten "
+                "padding from attention"
+            ),
         )
 
         # Positive control: poison an in-range slot (0, strictly inside the
@@ -254,7 +267,12 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         in_range_feeds = {**decode_inputs, **in_range}
         attended = dict(zip(output_names, session.run(output_names, in_range_feeds)))
 
-    assert not np.array_equal(baseline["logits"], attended["logits"]), (
+    assert not np.allclose(
+        attended["logits"],
+        baseline["logits"],
+        rtol=_LOGIT_RTOL,
+        atol=_LOGIT_ATOL,
+    ), (
         "decode logits were unchanged when an in-frontier cache slot (0) was "
         "poisoned — decode is not attending to valid in-range keys, so the "
         "out-of-range guard would pass vacuously"
@@ -329,10 +347,16 @@ def test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cu
         future_feeds = {**block_inputs, **future}
         future_poisoned = dict(zip(output_names, session.run(output_names, future_feeds)))
 
-        assert np.array_equal(baseline["logits"], future_poisoned["logits"]), (
-            "block logits changed when a valid within-nonpad but causally-future "
-            "key (slot 3, future of query positions 1 and 2) was poisoned — the "
-            "explicit causal mask is not enforcing j <= write_indices + t"
+        np.testing.assert_allclose(
+            future_poisoned["logits"],
+            baseline["logits"],
+            rtol=_LOGIT_RTOL,
+            atol=_LOGIT_ATOL,
+            err_msg=(
+                "block logits changed when a valid within-nonpad but causally-future "
+                "key (slot 3, future of query positions 1 and 2) was poisoned — the "
+                "explicit causal mask is not enforcing j <= write_indices + t"
+            ),
         )
 
         # In-range (positive) control: poison slot 0 — causal past of both rows
@@ -346,8 +370,101 @@ def test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cu
         past_feeds = {**block_inputs, **past}
         past_poisoned = dict(zip(output_names, session.run(output_names, past_feeds)))
 
-    assert not np.array_equal(baseline["logits"], past_poisoned["logits"]), (
+    assert not np.allclose(
+        past_poisoned["logits"],
+        baseline["logits"],
+        rtol=_LOGIT_RTOL,
+        atol=_LOGIT_ATOL,
+    ), (
         "block logits were unchanged when a causal-past key (slot 0) was "
         "poisoned — the query rows are not attending their causal history, so "
         "the future-key guard would pass vacuously"
+    )
+
+
+def test_static_cache_decode_mask_is_per_batch_on_cuda():
+    """Each batch row's causal frontier follows *its own* ``write_indices``.
+
+    The 4D ``[batch, 1, S_q, max_seq]`` mask exists so that per-row
+    ``write_indices`` are honored independently (a 3D mask would broadcast one
+    frontier across the whole batch).  This is the value-level guard for that:
+    two rows decode with *different* ``write_indices`` over an identical cache,
+    then a single shared slot that is in one row's frontier but the other's
+    future is poisoned.  Only the row that legitimately attends the slot may
+    change; the other row must be untouched — which can only hold if the mask
+    is built per batch.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session, config = _build_static_cache_session(tmp_dir)
+        num_layers = config.num_hidden_layers
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        vocab = config.vocab_size
+        output_names = [out.name for out in session.get_outputs()]
+        rng = np.random.default_rng(23)
+        batch = 2
+
+        # Prefill five real tokens into slots 0..4 for both rows.
+        prefill_len = 5
+        prefill_feeds: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(batch, prefill_len), dtype=np.int64),
+            "position_ids": np.tile(np.arange(prefill_len, dtype=np.int64), (batch, 1)),
+            "write_indices": np.zeros((batch,), dtype=np.int64),
+            "nonpad_kv_seqlen": np.full((batch,), prefill_len, dtype=np.int64),
+        }
+        for layer in range(num_layers):
+            zeros = np.zeros((batch, _MAX_SEQ_LEN, kv_hidden), dtype=_CACHE_DTYPE)
+            prefill_feeds[f"key_cache.{layer}"] = zeros.copy()
+            prefill_feeds[f"value_cache.{layer}"] = zeros.copy()
+        prefill_out = dict(zip(output_names, session.run(output_names, prefill_feeds)))
+
+        # Decode one token per row with DIFFERENT write_indices: row 0's frontier
+        # is j <= 2, row 1's is j <= 4.  Each writes its new token into its own
+        # write slot (2 / 4), so the shared probe slot 3 is left untouched by the
+        # scatter in both rows.  Per the compact-cache invariant nonpad == write
+        # + S_q, so nonpad = [3, 5].
+        decode_inputs: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(batch, 1), dtype=np.int64),
+            "position_ids": np.array([[2], [4]], dtype=np.int64),
+            "write_indices": np.array([2, 4], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([3, 5], dtype=np.int64),
+        }
+
+        clean_feeds = {**decode_inputs, **_carry_caches(prefill_out, num_layers)}
+        baseline = dict(zip(output_names, session.run(output_names, clean_feeds)))
+
+        # Poison the shared probe slot 3 in both rows.  Slot 3 is in row 1's
+        # frontier (3 <= 4) but row 0's future (3 > 2), and is padding for row 0
+        # (3 >= nonpad 3) yet valid for row 1 (3 < nonpad 5).
+        poisoned = _carry_caches(prefill_out, num_layers)
+        probe_slot = 3
+        for layer in range(num_layers):
+            for name in (f"key_cache.{layer}", f"value_cache.{layer}"):
+                buf = poisoned[name].copy()
+                buf[:, probe_slot, :] = _CACHE_DTYPE(50.0)
+                poisoned[name] = buf
+        poisoned_feeds = {**decode_inputs, **poisoned}
+        poisoned_out = dict(zip(output_names, session.run(output_names, poisoned_feeds)))
+
+    # Row 0 must be untouched: slot 3 is beyond its per-row frontier.
+    np.testing.assert_allclose(
+        poisoned_out["logits"][0],
+        baseline["logits"][0],
+        rtol=_LOGIT_RTOL,
+        atol=_LOGIT_ATOL,
+        err_msg=(
+            "row 0 logits changed when slot 3 was poisoned, but slot 3 is beyond "
+            "row 0's frontier (write_indices=2) — the mask is not applying "
+            "per-batch write_indices (it leaked row 1's wider frontier onto row 0)"
+        ),
+    )
+    # Row 1 must change: slot 3 is within its per-row frontier and attended.
+    assert not np.allclose(
+        poisoned_out["logits"][1],
+        baseline["logits"][1],
+        rtol=_LOGIT_RTOL,
+        atol=_LOGIT_ATOL,
+    ), (
+        "row 1 logits were unchanged when slot 3 (within its frontier, "
+        "write_indices=4) was poisoned — row 1 is not attending an in-frontier "
+        "key, so the per-batch row 0 control would pass vacuously"
     )

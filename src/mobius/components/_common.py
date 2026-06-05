@@ -351,10 +351,25 @@ def create_static_cache_causal_mask(
     * **Decode** (``write_indices=N``, ``S_q=1``): keep slots ``j <= N``,
       i.e. all previously written tokens plus the just-written one.
 
-    Because padding slots ``j >= nonpad_kv_seqlen[b]`` are always greater
-    than ``write_indices[b] + t``, they are masked out too, so the mask is
-    consistent with the ``nonpad_kv_seqlen`` bounds (which are still passed
-    to the Attention op to select the external-cache kernel path).
+    **Cache contract — compact / right-trimmed.** The mask is *purely
+    positional*: it keeps slot ``j`` iff ``j <= write_indices[b] + t`` and
+    never reads ``nonpad_kv_seqlen`` in the mask math.  Correctness therefore
+    relies on the **compact-cache invariant** — valid tokens occupy cache
+    slots ``[0, write_indices[b] + t]`` contiguously, with padding only on the
+    right, i.e. ``nonpad_kv_seqlen[b] == write_indices[b] + S_q`` per batch.
+    Under that invariant the padding slots ``j >= nonpad_kv_seqlen[b]`` are
+    always greater than ``write_indices[b] + t``, so they are masked out as a
+    side effect (the explicit ``nonpad_kv_seqlen`` bound is still passed to the
+    Attention op, but only to select the external-cache kernel path).  mobius's
+    ``TensorScatter`` writes with sequential ``write_indices`` satisfy this for
+    standard batched generation (per-row prefill scatters ``[0, prompt_len)``).
+
+    Ragged / left / interior padding is **out of scope**: a cache that places
+    valid tokens *after* pad slots (or leaves holes below
+    ``write_indices[b] + t``) would have those low pad slots treated as
+    attendable and corrupt the logits.  This export does not support ragged
+    caches; if that changes, add a defensive ``key_positions <
+    nonpad_kv_seqlen[b]`` term to the mask.
 
     The mask is 4D ``[batch, 1, S_q, max_seq]`` rather than 3D on purpose:
     ``ConvertAttnMaskToBias`` (attention.cc) treats a 3D mask as
