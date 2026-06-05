@@ -99,7 +99,7 @@ pkg = build("facebook/wav2vec2-base")
 Convert a GGUF model (e.g. from llama.cpp) to ONNX:
 
 ```python
-from mobius.integrations.gguf import build_from_gguf
+from mobius import build_from_gguf
 
 pkg = build_from_gguf("path/to/model.gguf")
 pkg.save("output/model/")

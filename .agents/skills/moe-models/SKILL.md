@@ -200,12 +200,17 @@ Qwen35MoEDecoderLayer
 
 | Class | File | Purpose |
 |-------|------|---------|
-| `Qwen35MoEBlock` | `models/qwen.py` | MoE block with routed + shared experts |
-| `Qwen35MoEDecoderLayer` | `models/qwen.py` | Hybrid attention + MoE FFN layer |
-| `Qwen35MoETextModel` | `models/qwen.py` | Stacks decoder layers with RoPE |
-| `Qwen35MoECausalLMModel` | `models/qwen.py` | Top-level causal LM model |
+| `Qwen35MoEBlock` | `models/qwen35.py` | MoE block with routed + shared experts (subclasses `Qwen2MoELayer`) |
+| `Qwen35MoEDecoderLayer` | `models/qwen35.py` | Hybrid attention + MoE FFN layer |
+| `Qwen35MoETextModel` | `models/qwen35.py` | Stacks decoder layers with RoPE |
+| `Qwen35MoECausalLMModel` | `models/qwen35.py` | Top-level causal LM model |
 
 ### MoE block (`Qwen35MoEBlock`)
+
+`Qwen35MoEBlock` is a thin subclass of `Qwen2MoELayer` (`models/moe.py`) —
+the routed + gated-shared-expert composition is op-for-op identical, so it
+reuses the parent `forward` rather than duplicating the routing loop. Only
+construction (config wiring) differs.
 
 - **TopKGate routing**: 256 experts, top-8 in the full model (configurable
   via `num_local_experts` / `num_experts_per_tok`)
