@@ -559,24 +559,24 @@ function renderModelRow(m) {
     let label = dotLabels[i-1];
     if (active) {
       cls += ' active-' + i;
-      label += ' (passed)';
+      label += ' (Passed)';
     } else if (isXfail) {
       cls += ' xfail';
       const reason = m[`l${i}_reason`] || 'xfail';
-      label += ` (expected failure: ${esc(reason)})`;
+      label += ` (Expected failure: ${esc(reason)})`;
     } else if (isSkipped) {
       const reason = m[`l${i}_reason`] || m.yaml_skip_reason || 'known issue';
       cls += ' skipped';
-      label += ` (skipped: ${esc(reason)})`;
+      label += ` (Skipped: ${esc(reason)})`;
     } else if (isPending) {
       cls += ' pending';
-      label += ' (test case defined, awaiting golden data)';
+      label += ' (Test case defined, awaiting golden data)';
     } else if (configured) {
       cls += ' failed';
-      label += ' (test exists, not passing)';
+      label += ' (Test exists, not passing)';
     } else {
       cls += ' untested';
-      label += ' (no test)';
+      label += ' (No test)';
     }
     return `<div class="${cls}" title="${label}" role="img" aria-label="${label}"></div>`;
   }).join('');
@@ -694,11 +694,11 @@ function renderDetailRow(m) {
   // the test itself is expected to fail \u2014 reporting "available" would be
   // misleading.
   function goldenDetail(status, passing, configured, reason) {
-    if (status === 'xfail') return `xfail (${esc(reason || '')})`;
-    if (passing) return 'available';
-    if (status === 'skip') return `skipped (${esc(reason || m.yaml_skip_reason || 'known issue')})`;
-    if (configured) return 'test case exists, run generate_golden.py';
-    return 'none';
+    if (status === 'xfail') return `XFail (${esc(reason || '')})`;
+    if (passing) return 'Available';
+    if (status === 'skip') return `Skipped (${esc(reason || m.yaml_skip_reason || 'known issue')})`;
+    if (configured) return 'Test case exists, run generate_golden.py';
+    return 'None';
   }
   const l4Icon = statusIcon(m.l4_status, m.l4, m.l4_configured);
   goldenHtml += `<div class="status-row"><span class="status-icon">${l4Icon}</span> L4 golden data: ${goldenDetail(m.l4_status, m.l4, m.l4_configured, m.l4_reason)}</div>`;
@@ -709,8 +709,8 @@ function renderDetailRow(m) {
     const r = m.min_token_match_ratio;
     const ratioClass = r >= 0.9 ? 'ratio-high' : r >= 0.5 ? 'ratio-medium' : 'ratio-low';
     const pct = Math.round(r * 100);
-    const msg = r < 0.5 ? ' \u26A0\uFE0F low \u2014 test may not be meaningful'
-              : r < 0.9 ? ' \u26A0\uFE0F below recommended threshold (0.9)'
+    const msg = r < 0.5 ? ' \u26A0\uFE0F Low \u2014 test may not be meaningful'
+              : r < 0.9 ? ' \u26A0\uFE0F Below recommended threshold (0.9)'
               : '';
     goldenHtml += `<div class="status-row"><span class="status-icon">\uD83C\uDFAF</span> L5 token match threshold: <span class="ratio-badge ${ratioClass}">${pct}%</span><span style="color:var(--text-muted)">${msg}</span></div>`;
   }
@@ -721,9 +721,9 @@ function renderDetailRow(m) {
 
   if (m.l2_status) {
     const l2Color = m.l2_status === 'pass' ? 'var(--l3)' : 'var(--l1)';
-    const l2Label = m.l2_status === 'pass' ? 'pass'
-      : m.l2_status === 'xfail' ? 'known failure (parse+graph xfail)'
-      : m.l2_status === 'xfail_graph_only' ? 'known failure (graph-build xfail)'
+    const l2Label = m.l2_status === 'pass' ? 'Pass'
+      : m.l2_status === 'xfail' ? 'Known failure (parse+graph xfail)'
+      : m.l2_status === 'xfail_graph_only' ? 'Known failure (graph-build xfail)'
       : m.l2_status;
     goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${l2Color}">\u25CF</span> L2 arch validation: <strong>${l2Label}</strong>`;
     if (m.l2_reason) goldenHtml += ` <span style="color:var(--text-muted)">\u2014 ${esc(m.l2_reason)}</span>`;
@@ -732,9 +732,9 @@ function renderDetailRow(m) {
 
   if (m.l3_status) {
     const statusColor = m.l3_status === 'pass' ? 'var(--l3)' : m.l3_status === 'xfail' ? 'var(--l1)' : 'var(--text-muted)';
-    const statusLabel = m.l3_status === 'pass' ? 'pass'
-      : m.l3_status === 'xfail' ? 'known failure (xfail)'
-      : m.l3_status === 'skip'  ? 'skipped / not run'
+    const statusLabel = m.l3_status === 'pass' ? 'Pass'
+      : m.l3_status === 'xfail' ? 'Known failure (xfail)'
+      : m.l3_status === 'skip'  ? 'Skipped / not run'
       : m.l3_status;
     goldenHtml += `<div class="status-row"><span class="status-icon" style="color:${statusColor}">\u25CF</span> L3 parity: <strong>${statusLabel}</strong>`;
     if (m.l3_reason) goldenHtml += ` <span style="color:var(--text-muted)">\u2014 ${esc(m.l3_reason)}</span>`;
