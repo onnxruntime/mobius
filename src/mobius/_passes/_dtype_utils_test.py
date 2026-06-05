@@ -39,7 +39,8 @@ class TestInitializerDtype:
         with caplog.at_level(logging.WARNING, logger="mobius._passes._dtype_utils"):
             assert initializer_dtype(v) == ir.DataType.FLOAT16
         assert any(
-            record.levelno == logging.WARNING and "stale type metadata" in record.getMessage().lower()
+            record.levelno == logging.WARNING
+            and "stale type metadata" in record.getMessage().lower()
             for record in caplog.records
         ), "expected a warning when declared dtype disagrees with const_value"
 
