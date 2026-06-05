@@ -4554,7 +4554,7 @@ class TestBuildStaticCacheGraph:
         proto = ir.serde.serialize_model(model)
         assert len(proto.SerializeToString()) > 0
 
-    def test_static_cache_attention_is_causal(self):
+    def test_static_cache_attention_causal_via_explicit_mask(self):
         """Verify Attention ops use is_causal=0 in static cache mode.
 
         The opset-24 Attention CUDA kernel rejects is_causal=1 together
