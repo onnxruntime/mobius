@@ -381,9 +381,7 @@ def create_static_cache_causal_mask(
 
     # Scalar S_q (query length) and total KV length (max_seq) for Range.
     q_len = op.Squeeze(op.Shape(query, start=1, end=2), op.Constant(value_ints=[0]))
-    total_kv = op.Squeeze(
-        op.Shape(key_cache, start=1, end=2), op.Constant(value_ints=[0])
-    )
+    total_kv = op.Squeeze(op.Shape(key_cache, start=1, end=2), op.Constant(value_ints=[0]))
 
     # Per-step query offsets 0..S_q-1 and key slot indices 0..max_seq-1.
     q_offsets = op.Range(zero, q_len, one)  # [S_q] int64
