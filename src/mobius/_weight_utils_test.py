@@ -213,13 +213,22 @@ class TestRenameWeightKeys:
         assert result["new.k"].data_ptr() == t.data_ptr()
 
     def test_collision_raises(self):
-        """Two source keys mapping to the same renamed key raises."""
+        """Two source keys mapping to the same renamed key raises.
+
+        The error message must name both the colliding key and the original
+        producer key to aid debugging in large checkpoints.
+        """
         state_dict = {
             "a.weight": torch.tensor(1.0),
             "b.weight": torch.tensor(2.0),
         }
-        with pytest.raises(ValueError, match="collision"):
+        with pytest.raises(ValueError, match="collision") as exc_info:
             rename_weight_keys(state_dict, [("a.", "x."), ("b.", "x.")])
+        message = str(exc_info.value)
+        # The producer ("a.weight", processed first) and the colliding key
+        # ("b.weight") must both appear.
+        assert "a.weight" in message
+        assert "b.weight" in message
 
     def test_empty_state_dict(self):
         """Empty input returns empty output."""

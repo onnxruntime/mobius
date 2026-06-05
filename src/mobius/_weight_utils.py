@@ -303,6 +303,7 @@ def rename_weight_keys(
             (a collision that would otherwise silently drop a tensor).
     """
     result: dict[str, torch.Tensor] = {}
+    producers: dict[str, str] = {}
     for name, tensor in state_dict.items():
         new_name = name
         for old, new in replacements:
@@ -310,9 +311,10 @@ def rename_weight_keys(
         if new_name in result:
             raise ValueError(
                 f"Weight key collision after rename: {name!r} -> {new_name!r} "
-                f"(already produced by another key)"
+                f"(already produced by {producers[new_name]!r})"
             )
         result[new_name] = tensor
+        producers[new_name] = name
     return result
 
 
