@@ -215,11 +215,15 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
   background: var(--surface); position: sticky; right: 0; z-index: 2;
 }
 /* Component matrix uses the same L1-L5 hues as coverage dots/badges. */
-.cell-l1 { background: color-mix(in srgb, var(--l1) 28%, transparent); border-color: var(--l1); }
-.cell-l2 { background: color-mix(in srgb, var(--l2) 32%, transparent); border-color: var(--l2); }
-.cell-l3 { background: color-mix(in srgb, var(--l3) 36%, transparent); border-color: var(--l3); }
-.cell-l4 { background: color-mix(in srgb, var(--l4) 40%, transparent); border-color: var(--l4); }
-.cell-l5 { background: color-mix(in srgb, var(--l5) 44%, transparent); border-color: var(--l5); }
+/* Solid fills (not translucent) so cells read at full saturation, matching
+   the main coverage dots. Translucency washed colors toward the dark
+   surface and crushed the brightness gap between same-hue neighbors
+   (L1 vs L2 amber, L3 vs L4 green), making them indistinguishable. */
+.cell-l1 { background: var(--l1); border-color: var(--l1); }
+.cell-l2 { background: var(--l2); border-color: var(--l2); }
+.cell-l3 { background: var(--l3); border-color: var(--l3); }
+.cell-l4 { background: var(--l4); border-color: var(--l4); }
+.cell-l5 { background: var(--l5); border-color: var(--l5); }
 .matrix-legend {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
   font-size: 0.8em; color: var(--text-muted); flex-wrap: wrap;
@@ -863,8 +867,8 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
 
   // Colour legend.
   html += '<div class="matrix-legend">';
-  html += '<span>Level key:</span>';
-  [['', 'Not used'], ['cell-l1', 'L1'], ['cell-l2', 'L2'],
+  html += '<span>Level Key:</span>';
+  [['', 'Not Used'], ['cell-l1', 'L1'], ['cell-l2', 'L2'],
    ['cell-l3', 'L3'], ['cell-l4', 'L4'], ['cell-l5', 'L5']].forEach(([cls, lbl]) => {
     const extra = cls ? '' : 'border:1px solid var(--border)';
     html += `<span class="legend-item"><span class="legend-dot ${cls}" style="${extra}"></span>${lbl}</span>`;
