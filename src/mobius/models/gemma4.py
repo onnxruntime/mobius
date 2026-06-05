@@ -2264,6 +2264,47 @@ class _Gemma4AudioEncoderModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class _F32Linear(Linear):
+    """Linear that computes its MatMul in float32 regardless of model dtype.
+
+    Used by the gemma4_unified vision embedder's ``patch_dense`` projection
+    **only when the model dtype is float16**, whose output magnitude (~77000)
+    exceeds the float16 range (65504). The weights are stored in the model dtype;
+    activations and weights are upcast to float32 for the MatMul so the result
+    does not overflow to +inf. The output stays float32 (the following
+    ``_F32LayerNorm`` normalizes it back into a float16-safe range). bfloat16 and
+    float32 models have the range natively and use a plain :class:`Linear`.
+    """
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        w_t = op.Cast(
+            op.Transpose(self.weight, perm=[1, 0]), to=ir.DataType.FLOAT
+        )  # [in_features, out_features]
+        result = op.MatMul(op.Cast(x, to=ir.DataType.FLOAT), w_t)
+        if self.bias is not None:
+            result = op.Add(result, op.Cast(self.bias, to=ir.DataType.FLOAT))
+        return result  # float32
+
+
+class _F32LayerNorm(LayerNorm):
+    """LayerNorm that computes in float32 and returns a float32 output.
+
+    Pairs with :class:`_F32Linear` in the gemma4_unified vision embedder, **only
+    for float16 models**, so the large (out-of-float16-range) ``patch_dense``
+    output is normalized in float32 before being cast back to the model dtype.
+    bfloat16 and float32 models use a plain :class:`LayerNorm`.
+    """
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        return op.LayerNormalization(
+            op.Cast(hidden_states, to=ir.DataType.FLOAT),
+            op.Cast(self.weight, to=ir.DataType.FLOAT),
+            op.Cast(self.bias, to=ir.DataType.FLOAT),
+            epsilon=self.eps,
+            axis=-1,
+        )  # float32
+
+
 class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
     """Encoder-free vision embedder for ``gemma4_unified`` (gemma-4-12B).
 
@@ -2308,8 +2349,18 @@ class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
         self._text_hidden_size = config.hidden_size
 
         self.patch_ln1 = LayerNorm(patch_dim, eps=eps)
-        self.patch_dense = Linear(patch_dim, mm_embed_dim, bias=True)
-        self.patch_ln2 = LayerNorm(mm_embed_dim, eps=eps)
+        # patch_dense produces activations whose magnitude (~77000, measured) is
+        # outside the float16 range (max 65504); HF runs this embedder in bfloat16
+        # (max ~3.4e38). Only float16 actually overflows, so we upcast the dense
+        # projection + the following LayerNorm to float32 *only* when the model
+        # dtype is float16. bfloat16 and float32 have the range natively and keep
+        # their dtype (matching HF for bfloat16). See _F32Linear / _F32LayerNorm.
+        if config.dtype == ir.DataType.FLOAT16:
+            self.patch_dense = _F32Linear(patch_dim, mm_embed_dim, bias=True)
+            self.patch_ln2 = _F32LayerNorm(mm_embed_dim, eps=eps)
+        else:
+            self.patch_dense = Linear(patch_dim, mm_embed_dim, bias=True)
+            self.patch_ln2 = LayerNorm(mm_embed_dim, eps=eps)
         # Factorized 2D positional embedding: HF stores a single
         # [posemb_size, 2, mm_embed_dim] table looked up per axis. We split it
         # into two [posemb_size, mm_embed_dim] tables (x and y) in
@@ -2337,9 +2388,17 @@ class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
         pixel_position_ids: ir.Value,
     ) -> ir.Value:
         # Patch embedding: LN → Dense → LN.  [B, N, patch_dim] → [B, N, mm_embed_dim]
+        # For float16 models patch_dense + patch_ln2 run in float32 (see __init__
+        # and _F32Linear / _F32LayerNorm): the dense projection produces activations
+        # whose magnitude exceeds the float16 range (measured absmax ~77000 > 65504;
+        # HF runs this embedder in bfloat16), so an f16 intermediate would overflow
+        # to +inf and patch_ln2 would emit NaN. patch_ln2 normalizes the result back
+        # into a float16-safe range. For bfloat16 / float32 the projection stays in
+        # the model dtype and CastLike below is a no-op.
         h = self.patch_ln1(op, pixel_values)
-        h = self.patch_dense(op, h)
-        h = self.patch_ln2(op, h)
+        h = self.patch_dense(op, h)  # f16 model: f16 in → f32 out; else native dtype
+        h = self.patch_ln2(op, h)  # f16 model: f32 in → f32 out (normalized)
+        h = op.CastLike(h, pixel_values)  # back to the model dtype (no-op unless upcast)
 
         # Factorized positional embedding.  Split (x, y) coords on the last axis.
         x_ids = op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=-1)  # [B, N]
