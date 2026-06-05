@@ -31,6 +31,20 @@ op). That breaks the pattern the GQA rewrite matches, so combining
   OrtValue — NOT via `--static-cache`.
 - **ONNX-Attention + in-place cache:** `--execution-provider default --static-cache --max-seq-len N`.
 
+### Static cache requires `is_causal=0` + an explicit mask (not `is_causal=1`)
+The opset-24 `Attention` CUDA kernel rejects `is_causal=1` together with
+`nonpad_kv_seqlen` when `S_q != total_kv` and there is no `past_key` (the
+`causal_cross_no_past` guard in `attention.cc`) → ORT raises `NOT_IMPLEMENTED` at
+session init. A static cache is pre-allocated to `max_seq_len`, so `S_q != total_kv`
+in **both** prefill and decode and the guard always fires.
+
+- **Remedy:** drive the static-cache `Attention` with `is_causal=0` and supply an
+  explicit offset-aware causal mask (`create_static_cache_causal_mask` — keeps key
+  slot `j` for a query at absolute position `write_indices + t` iff `j <= write_indices + t`).
+  This is also **branchless**, hence graph-capture-safe — do **not** express the
+  prefill/decode masking difference with an `If(Greater(S_q, 1))` phase-split. See
+  §7 (Graph-capture compatibility) for why in-graph control flow is disallowed.
+
 ## 3. FIXED: fp16 GQA export previously left packed-QKV weights as FLOAT32 → model wouldn't load
 **Status: fixed (the fp16 GQA fold-fix).** Native fp16 Phi-3.5 GQA export now loads directly in the ORT
 CUDA EP with **no manual post-cast** (32 GroupQueryAttention nodes, all-fp16 initializers). If you are on

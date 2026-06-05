@@ -163,6 +163,12 @@ def _apply_attention(
         # memory-efficient / unfused path, which converts the bool mask to
         # an additive bias (attention.cc ConvertAttnMaskToBias).
         #
+        # This single always-masked (branchless) formulation deliberately
+        # trades decode-on-Flash for graph-capture compatibility: an
+        # If(Greater(S_q, 1)) phase-split could keep decode maskless on Flash,
+        # but emits in-graph control flow that fails CUDA Graph capture at
+        # session init (see the graph-capture compatibility gotcha skill).
+        #
         # TODO(titaiwang): Support user-provided attn_mask in external
         # cache mode for advanced use cases (e.g., prefix masking,
         # document boundaries in batched inference).

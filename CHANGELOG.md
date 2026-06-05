@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Static-cache Attention Causal-Mask Fix
+
+#### Fixed
+
+- Static-cache exports (`--static-cache`, the ONNX `Attention` + `TensorScatter`
+  in-place KV-cache path) now drive the `Attention` op with `is_causal=0` plus an
+  explicit offset-aware causal mask instead of `is_causal=1`. The opset-24
+  `Attention` CUDA kernel rejects `is_causal=1` together with `nonpad_kv_seqlen`
+  when the query length differs from the total KV length and there is no
+  `past_key` (the `causal_cross_no_past` guard in `attention.cc`). Because the
+  static cache is pre-allocated to `max_seq_len`, `S_q != total_kv` in **both**
+  prefill and decode, so that guard fired and ORT raised `NOT_IMPLEMENTED` at
+  session init. A new `create_static_cache_causal_mask` helper builds a mask that
+  keeps key slot `j` for a query at absolute position `write_indices[b] + t` iff
+  `j <= write_indices[b] + t`, serving prefill (triangular) and decode (prefix)
+  with a single rule and subsuming the padding bound. The formulation is
+  branchless (no `If` phase-split), so the exported graph stays compatible with
+  CUDA Graph capture (see the export-gotchas skill, "Graph-capture
+  compatibility"); decode and prefill both run on the Memory-Efficient Attention
+  kernel.
+
+---
+
 ### fp16 GQA Export Fix
 
 #### Fixed
