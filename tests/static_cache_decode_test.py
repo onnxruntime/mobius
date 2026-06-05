@@ -165,24 +165,28 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
 
 
 def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
-    """Always-masked decode attends only to cache slots within the causal frontier.
+    """Always-masked decode does not attend to padding slots beyond ``nonpad``.
 
     Option Y exports the static cache with ``is_causal=0`` plus an explicit
     :func:`mobius.components._common.create_static_cache_causal_mask`, which keeps
     key slot ``j`` for a query at absolute position ``p = write_indices[b] + t``
-    iff ``j <= p``.  Because the op runs ``is_causal=0``, at a non-zero decode
-    offset this explicit mask is the *only* thing bounding attention: it must zero
-    out every slot beyond the frontier ``j <= write_indices + t`` — equivalently
-    every padding slot ``j >= nonpad_kv_seqlen`` — so out-of-range cache garbage
-    can never reach the softmax.
+    iff ``j <= p``.  For a single-token decode (``S_q=1``, ``write_indices=N``)
+    the causal frontier ``p = N`` coincides with the padding boundary, so this
+    test exercises the **padding** side of the mask: cache slots
+    ``j >= nonpad_kv_seqlen`` are unwritten padding and must never reach the
+    softmax.
 
-    This is the masked-semantics counterpart of the (dropped) phase-split
-    maskless-nonpad guard: here the bound is enforced by the explicit mask, not by
-    a maskless decode reading exactly ``nonpad`` keys.  It is checked two ways:
+    The intra-sequence **causal** side — a *written*, within-``nonpad`` key that
+    is in the future of an earlier query row — is a distinct bound that a
+    single-token decode cannot isolate; it is covered separately by
+    :func:`test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cuda`.
 
-    * **Out-of-range (negative) control:** poisoning every slot at or beyond the
-      frontier with large garbage must NOT change the decode logits — those keys
-      are masked out, so the result is bit-identical to the clean-cache decode.
+    Checked two ways:
+
+    * **Padding (negative) control:** poisoning every padding slot
+      ``j >= nonpad`` with large garbage must NOT change the decode logits —
+      those slots are masked out, so the result is bit-identical to the
+      clean-cache decode.
     * **In-range (positive) control:** poisoning a slot strictly inside the
       frontier MUST change the decode logits — proving the decode genuinely
       attends to in-range keys, so the negative control is meaningful rather than
@@ -220,8 +224,9 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         clean_feeds = {**decode_inputs, **_carry_caches(prefill_out, num_layers)}
         baseline = dict(zip(output_names, session.run(output_names, clean_feeds)))
 
-        # Negative control: poison every slot at/beyond the frontier (j >= nonpad).
-        # The explicit mask zeroes these, so the decode logits must be unchanged.
+        # Padding (negative) control: poison every padding slot (j >= nonpad).
+        # These are unwritten padding; the mask excludes them, so the decode
+        # logits must be unchanged.
         out_of_range = _carry_caches(prefill_out, num_layers)
         for layer in range(num_layers):
             for name in (f"key_cache.{layer}", f"value_cache.{layer}"):
@@ -232,9 +237,9 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         masked_out = dict(zip(output_names, session.run(output_names, out_of_range_feeds)))
 
         assert np.array_equal(baseline["logits"], masked_out["logits"]), (
-            "decode logits changed when cache slots beyond the causal frontier "
-            "(j >= nonpad_kv_seqlen) were poisoned — the explicit static-cache "
-            "mask is not bounding attention to j <= write_indices + t"
+            "decode logits changed when padding slots (j >= nonpad_kv_seqlen) "
+            "were poisoned — the static-cache mask is not excluding unwritten "
+            "padding from attention"
         )
 
         # Positive control: poison an in-range slot (0, strictly inside the
@@ -253,4 +258,96 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         "decode logits were unchanged when an in-frontier cache slot (0) was "
         "poisoned — decode is not attending to valid in-range keys, so the "
         "out-of-range guard would pass vacuously"
+    )
+
+
+def test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cuda():
+    """The causal mask blocks *future* keys that are valid (within ``nonpad``).
+
+    The decode guard above only exercises the *padding* side of the mask (slots
+    ``j >= nonpad``).  This test isolates the orthogonal **causal** side: a key
+    slot that is genuinely written and within ``nonpad`` — so the padding bound
+    alone would admit it — but lies in the *future* of an earlier query row, and
+    so must be excluded by the explicit causal mask ``j <= write_indices + t``.
+    A single-token decode cannot probe this (it has no within-``nonpad`` future
+    slot); a multi-row step at a non-terminal offset can.
+
+    Setup: prefill positions 0..3 to populate slots 0..3, then re-run a 2-token
+    block at positions 1,2 (``write_indices=1``, ``nonpad=4`` so every slot 0..3
+    is valid, not padding).  This block scatters into slots 1,2 only, leaving the
+    carried slots 0 and 3 untouched and poisonable:
+
+    * **Causal (negative) control:** slot 3 is valid (within ``nonpad``) but in
+      the future of both query rows (positions 1 and 2 < 3).  Poisoning it must
+      NOT change either row's logits — only the causal mask, not the padding
+      bound, can exclude a within-``nonpad`` slot.
+    * **In-range (positive) control:** slot 0 is in the causal past of both rows
+      and is carried (not rewritten).  Poisoning it MUST change both rows'
+      logits, proving the rows genuinely attend their causal history (so the
+      negative control is not vacuous).
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        session, config = _build_static_cache_session(tmp_dir)
+        num_layers = config.num_hidden_layers
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        vocab = config.vocab_size
+        output_names = [out.name for out in session.get_outputs()]
+        rng = np.random.default_rng(11)
+
+        # Populate slots 0..3 with real keys (positions 0..3).
+        seed_len = 4
+        seed_feeds: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(1, seed_len), dtype=np.int64),
+            "position_ids": np.arange(seed_len, dtype=np.int64)[None, :],
+            "write_indices": np.array([0], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([seed_len], dtype=np.int64),
+        }
+        seed_feeds.update(_empty_caches(num_layers, kv_hidden))
+        seed_out = dict(zip(output_names, session.run(output_names, seed_feeds)))
+
+        # Re-run a 2-token block at positions 1,2.  write_indices=1 scatters into
+        # slots 1,2 only; nonpad=4 keeps slots 0..3 all valid (none are padding).
+        block_inputs: dict[str, np.ndarray] = {
+            "input_ids": rng.integers(0, vocab, size=(1, 2), dtype=np.int64),
+            "position_ids": np.array([[1, 2]], dtype=np.int64),
+            "write_indices": np.array([1], dtype=np.int64),
+            "nonpad_kv_seqlen": np.array([seed_len], dtype=np.int64),
+        }
+
+        clean_feeds = {**block_inputs, **_carry_caches(seed_out, num_layers)}
+        baseline = dict(zip(output_names, session.run(output_names, clean_feeds)))
+
+        # Causal (negative) control: poison slot 3 — valid (within nonpad) but in
+        # the future of both query rows (positions 1, 2).  Not rewritten by this
+        # block (write region is {1, 2}), so the poison survives the scatter.
+        future = _carry_caches(seed_out, num_layers)
+        for layer in range(num_layers):
+            for name in (f"key_cache.{layer}", f"value_cache.{layer}"):
+                buf = future[name].copy()
+                buf[:, 3, :] = _CACHE_DTYPE(50.0)
+                future[name] = buf
+        future_feeds = {**block_inputs, **future}
+        future_poisoned = dict(zip(output_names, session.run(output_names, future_feeds)))
+
+        assert np.array_equal(baseline["logits"], future_poisoned["logits"]), (
+            "block logits changed when a valid within-nonpad but causally-future "
+            "key (slot 3, future of query positions 1 and 2) was poisoned — the "
+            "explicit causal mask is not enforcing j <= write_indices + t"
+        )
+
+        # In-range (positive) control: poison slot 0 — causal past of both rows
+        # and carried (not rewritten) — so it must change the logits.
+        past = _carry_caches(seed_out, num_layers)
+        for layer in range(num_layers):
+            for name in (f"key_cache.{layer}", f"value_cache.{layer}"):
+                buf = past[name].copy()
+                buf[:, 0, :] = _CACHE_DTYPE(50.0)
+                past[name] = buf
+        past_feeds = {**block_inputs, **past}
+        past_poisoned = dict(zip(output_names, session.run(output_names, past_feeds)))
+
+    assert not np.array_equal(baseline["logits"], past_poisoned["logits"]), (
+        "block logits were unchanged when a causal-past key (slot 0) was "
+        "poisoned — the query rows are not attending their causal history, so "
+        "the future-key guard would pass vacuously"
     )
