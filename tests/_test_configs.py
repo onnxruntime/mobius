@@ -337,6 +337,31 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        # gemma-4-12B text backbone (reuses Gemma4CausalLMModel): dual head_dim
+        # (local 16 / global 32), single global KV head with attention_k_eq_v,
+        # vision-block bidirectional attention.  Built generically here; numeric
+        # parity is covered by the real-weight integration test (no HF model_type
+        # for this internal alias, so it is excluded from synthetic parity).
+        "gemma4_unified_text",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    (
         "gemma3n_text",
         {
             "_config_cls": Gemma3nConfig,
@@ -2089,6 +2114,38 @@ VL_CONFIGS: list[tuple[str, dict, bool]] = [
     # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
     # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
     # because it uses the unified "gemma4" registry key, same as the VL-only config above.
+    # --- Gemma4 unified gemma-4-12B (encoder-free 3-model split here; the 4-model
+    # audio path is exercised by test_gemma4_unified_multimodal_graph) ---
+    (
+        "gemma4_unified",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "image_token_id": 255999,
+            "tie_word_embeddings": True,
+            # Encoder-free vision embedder (raw patches → pooled image features).
+            "vision": VisionConfig(
+                hidden_size=48,
+                patch_size=4,
+                pooling_kernel_size=2,
+                position_embedding_size=64,
+                out_hidden_size=48,
+                norm_eps=1e-6,
+            ),
+        },
+        False,
+    ),
     # --- Blip2 (ViT + Q-Former + LLM) ---
     (
         "blip-2",

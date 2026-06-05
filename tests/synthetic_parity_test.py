@@ -234,6 +234,12 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
+        # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
+        # registered with AutoModelForCausalLM, so a reference model cannot be
+        # constructed here.  Text parity is covered by the real-weight
+        # integration test (test_gemma4_unified_12b_text_prefill).
+        "gemma4_unified_text",
         # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
         # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
         "falcon_h1",

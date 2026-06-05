@@ -825,6 +825,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
     "gemma4": "google/gemma-4-E2B-it",
     "gemma4_unified": "google/gemma-4-12B",
+    "gemma4_unified_text": "google/gemma-4-12B",
     "internvl2": "OpenGVLab/InternVL2-1B",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
