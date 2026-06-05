@@ -164,6 +164,12 @@ class TestCausalLMTask:
             for kind in ("key", "value"):
                 past = inputs[f"past_key_values.{i}.{kind}"]
                 present = outputs[f"present.{i}.{kind}"]
+                # Fail clearly (not with a cryptic TypeError inside dims()) if the
+                # present-KV head_dim stamp left the shape undeclared.
+                assert present.shape is not None, (
+                    f"present.{i}.{kind} has no declared shape — the present-KV "
+                    "head_dim stamp did not run for the MLA distinct-head-dim path"
+                )
                 past_dims = dims(past)
                 present_dims = dims(present)
                 # batch, kv_heads, head_dim must match the past input exactly --

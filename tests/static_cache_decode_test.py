@@ -53,7 +53,10 @@ _CACHE_DTYPE = np.float32
 # exact equality.  The "changed" (negative) controls instead use exact
 # inequality (``not np.array_equal``): any bit of change proves the slot was
 # attended, and the poison magnitude (50.0) guarantees a large, unambiguous
-# change there.
+# change there.  That same 50.0 poison also far exceeds the 1e-5 tolerance
+# below, so a genuine leak into a masked slot would move the logits well
+# outside the band — the tolerant "unchanged" check still cannot mask a real
+# leak.
 _LOGIT_RTOL = 1e-5
 _LOGIT_ATOL = 1e-5
 
