@@ -5344,3 +5344,125 @@ def test_gemma4_e2b_text_prefill_bf16():
     )
 
     assert_logits_close(onnx_logits, hf_logits, rtol=1e-2, atol=5e-3)
+
+# ---------------------------------------------------------------------------
+# Gemma 4 bidirectional (vision-block) attention mask parity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_gemma4_bidirectional_mask_parity():
+    """Mobius's vision-block attention bias matches HuggingFace exactly.
+
+    Larger Gemma 4 models use ``use_bidirectional_attention="vision"``: a
+    contiguous run of image/audio placeholder tokens attends bidirectionally
+    within its block (on BOTH full and sliding layers), while text stays
+    causal.  This test compares mobius's ``create_attention_bias`` output
+    (with ``block_sequence_ids`` from ``_compute_block_sequence_ids``) against
+    HuggingFace's real ``create_causal_mask`` / ``create_sliding_window_causal_mask``
+    for the actual ``gemma-4-26b-a4b-it`` config.  It needs only the config
+    (no weights), so it is cheap and deterministic.
+    """
+    import onnx_ir as ir
+    import torch
+    from transformers.masking_utils import (
+        create_causal_mask,
+        create_sliding_window_causal_mask,
+    )
+
+    from mobius._testing import create_test_builder, create_test_input
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius.components._common import create_attention_bias
+    from mobius.models.gemma4 import _compute_block_sequence_ids
+    from mobius.tasks._base import _make_graph, _make_model
+
+    model_id = "google/gemma-4-26b-a4b-it"
+    if not _model_accessible(model_id):
+        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
+
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
+    text_cfg = hf_config.text_config
+    text_cfg._attn_implementation = "eager"  # always returns a dense float mask
+    assert text_cfg.use_bidirectional_attention == "vision"
+    image_token_id = hf_config.image_token_id
+
+    # Synthetic layout: text, image block, text, image block, text.
+    seq_len = 12
+    input_ids = np.full((1, seq_len), 5, dtype=np.int64)
+    input_ids[0, 2:7] = image_token_id
+    input_ids[0, 9:11] = image_token_id
+    attention_mask = np.ones((1, seq_len), dtype=np.int64)
+    position_ids = np.arange(seq_len, dtype=np.int64)[None, :]
+
+    # Mobius block_sequence_ids from input_ids.
+    graph, builder = _make_graph()
+    op = builder.op
+    iid = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, seq_len])
+    bsid = _compute_block_sequence_ids(
+        op, iid, image_token_id=image_token_id, audio_token_id=None
+    )
+    builder.add_output(bsid, "bsid")
+    block_ids = OnnxModelSession(_make_model(graph), device="cpu").run(
+        {"input_ids": input_ids}
+    )["bsid"]
+    # Two contiguous image runs separated by text -> groups 0 and 1.
+    np.testing.assert_array_equal(
+        block_ids[0],
+        np.array([-1, -1, 0, 0, 0, 0, 0, -1, -1, 1, 1, -1], dtype=np.int64),
+    )
+
+    def mobius_attended(sliding_window):
+        b, bop, g = create_test_builder()
+        ii = create_test_input(b, "input_ids", [1, seq_len], dtype=ir.DataType.INT64)
+        am = create_test_input(b, "attention_mask", [1, seq_len], dtype=ir.DataType.INT64)
+        bk = create_test_input(
+            b, "block_sequence_ids", [1, seq_len], dtype=ir.DataType.INT64
+        )
+        bias = create_attention_bias(
+            bop,
+            ii,
+            am,
+            sliding_window=sliding_window,
+            dtype=ir.DataType.FLOAT,
+            block_sequence_ids=bk,
+        )
+        bias.name = "bias"
+        g.outputs.append(bias)
+        out = OnnxModelSession(ir.Model(g, ir_version=10), device="cpu").run(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "block_sequence_ids": block_ids,
+            }
+        )["bias"]
+        return out[0, 0] > -1.0  # True where the position is attended
+
+    inputs_embeds = torch.zeros(1, seq_len, 8)
+    blk = torch.from_numpy(block_ids)
+    hf_full = create_causal_mask(
+        text_cfg,
+        inputs_embeds,
+        torch.from_numpy(attention_mask),
+        None,
+        torch.from_numpy(position_ids),
+        block_sequence_ids=blk,
+    )
+    hf_sliding = create_sliding_window_causal_mask(
+        text_cfg,
+        inputs_embeds,
+        torch.from_numpy(attention_mask),
+        None,
+        torch.from_numpy(position_ids),
+        block_sequence_ids=blk,
+    )
+
+    def hf_attended(mask):
+        m = mask[0, 0].numpy()
+        return m if m.dtype == bool else (m > -1e30)
+
+    # Full-attention layers: causal OR same-block, AND padding.
+    np.testing.assert_array_equal(mobius_attended(None), hf_attended(hf_full))
+    # Sliding layers: (causal AND window) OR same-block, AND padding.
+    np.testing.assert_array_equal(
+        mobius_attended(text_cfg.sliding_window), hf_attended(hf_sliding)
+    )

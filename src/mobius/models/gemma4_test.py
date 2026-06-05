@@ -176,3 +176,93 @@ class TestScaleFreeRMSNormOverflow:
             np.ones_like(output, dtype=np.float32),
             atol=0.01,
         )
+
+
+class TestGemma4BlockSequenceIds:
+    """Vision-block bidirectional attention wiring (use_bidirectional_attention)."""
+
+    def test_compute_block_sequence_ids_values(self):
+        """``_compute_block_sequence_ids`` matches HF get_block_sequence_ids_for_mask."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _compute_block_sequence_ids
+        from mobius.tasks._base import _make_graph, _make_model
+
+        graph, builder = _make_graph()
+        op = builder.op
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, "S"])
+        out = _compute_block_sequence_ids(
+            op, input_ids, image_token_id=255, audio_token_id=254
+        )
+        builder.add_output(out, "block_sequence_ids")
+        session = OnnxModelSession(_make_model(graph), device="cpu")
+
+        # text  img img  text  aud aud  text  img  text
+        ids = np.array([[10, 255, 255, 11, 254, 254, 11, 255, 12]], dtype=np.int64)
+        result = session.run({"input_ids": ids})["block_sequence_ids"]
+        # 3 contiguous vision runs separated by text -> groups 0, 1, 2; text -> -1.
+        expected = np.array([[-1, 0, 0, -1, 1, 1, -1, 2, -1]], dtype=np.int64)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_adjacent_image_audio_same_block(self):
+        """Image run immediately followed by audio run = single block (HF parity)."""
+        import numpy as np
+
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _compute_block_sequence_ids
+        from mobius.tasks._base import _make_graph, _make_model
+
+        graph, builder = _make_graph()
+        op = builder.op
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, "S"])
+        out = _compute_block_sequence_ids(
+            op, input_ids, image_token_id=255, audio_token_id=254
+        )
+        builder.add_output(out, "block_sequence_ids")
+        session = OnnxModelSession(_make_model(graph), device="cpu")
+
+        ids = np.array([[10, 255, 255, 254, 254, 11]], dtype=np.int64)
+        result = session.run({"input_ids": ids})["block_sequence_ids"]
+        # No text gap between image and audio -> one contiguous block (id 0).
+        expected = np.array([[-1, 0, 0, 0, 0, -1]], dtype=np.int64)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_package_wires_block_sequence_ids_end_to_end(self):
+        """Embedding emits block_sequence_ids and decoder declares it as input.
+
+        With ``use_bidirectional_attention='vision'`` the overlay must be
+        plumbed embedding -> decoder.
+        """
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(use_bidirectional_attention="vision", image_token_id=255)
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        emb_outputs = {o.name for o in pkg["embedding"].graph.outputs}
+        dec_inputs = {i.name for i in pkg["decoder"].graph.inputs}
+        assert "block_sequence_ids" in emb_outputs
+        assert "block_sequence_ids" in dec_inputs
+
+        # Decoder attention must drop GQA and disable the op's built-in causal
+        # mask (is_causal=0) so the baked blockwise bias is honored.
+        dec = pkg["decoder"].graph
+        assert not any(n.op_type == "GroupQueryAttention" for n in dec)
+        attn_nodes = [n for n in dec if n.op_type == "Attention"]
+        assert attn_nodes
+        for n in attn_nodes:
+            assert n.attributes["is_causal"].as_int() == 0
+
+    def test_no_block_sequence_ids_when_causal(self):
+        """Without bidirectional attention, no block_sequence_ids is wired."""
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(use_bidirectional_attention=None)
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+
+        emb_outputs = {o.name for o in pkg["embedding"].graph.outputs}
+        dec_inputs = {i.name for i in pkg["decoder"].graph.inputs}
+        assert "block_sequence_ids" not in emb_outputs
+        assert "block_sequence_ids" not in dec_inputs

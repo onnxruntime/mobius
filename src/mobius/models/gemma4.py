@@ -707,6 +707,7 @@ class Gemma4TextAttention(nn.Module):
         position_embeddings: tuple | None = None,
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
+        is_causal: int = 1,
     ):
         from mobius.components._attention import (
             GQAContext,
@@ -806,6 +807,7 @@ class Gemma4TextAttention(nn.Module):
                     num_key_value_heads=self.num_key_value_heads,
                     scale=self.scaling,
                     softcap=self.softcap,
+                    is_causal=is_causal,
                 )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
@@ -928,6 +930,7 @@ class Gemma4TextAttention(nn.Module):
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
+                is_causal=is_causal,
             )
 
             # Source layers store K,V for downstream KV-shared layers.
@@ -1136,6 +1139,7 @@ class Gemma4DecoderLayer(nn.Module):
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
         past_key_value: tuple | None,
+        is_causal: int = 1,
     ):
         # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
@@ -1147,6 +1151,7 @@ class Gemma4DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             shared_kv_states=shared_kv_states,
             past_key_value=past_key_value,
+            is_causal=is_causal,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
@@ -1367,6 +1372,62 @@ class Gemma4DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _compute_block_sequence_ids(
+    op: OpBuilder,
+    input_ids: ir.Value,
+    *,
+    image_token_id: int,
+    audio_token_id: int | None,
+) -> ir.Value:
+    """Compute Gemma4 ``block_sequence_ids`` [B, S] from ``input_ids``.
+
+    Mirrors HuggingFace ``get_block_sequence_ids_for_mask``: each contiguous
+    run of vision tokens (image OR audio placeholder ids) gets a unique,
+    monotonically increasing block id (``>= 0``); text positions get ``-1``.
+    Tokens within the same block may attend to each other bidirectionally.
+
+    A new block starts only on a non-vision -> vision transition, so an
+    image run immediately followed by an audio run (no text in between) is
+    treated as a single block, matching HF exactly.
+
+    Returns an INT64 tensor of shape ``[B, S]``.
+    """
+    # is_vision [B, S] BOOL: token is an image or audio placeholder.
+    is_vision = op.Equal(input_ids, op.Constant(value_int=image_token_id))
+    if audio_token_id is not None:
+        is_vision = op.Or(
+            is_vision, op.Equal(input_ids, op.Constant(value_int=audio_token_id))
+        )
+
+    # is_prev_vision: is_vision shifted right by one along the sequence axis,
+    # with position 0 forced to False. Implemented without ConstantOfShape
+    # (which blocks ONNX shape inference): left-pad the int mask with one
+    # zero column, then drop the last column.
+    is_vision_int = op.Cast(is_vision, to=ir.DataType.INT64)
+    padded = op.Pad(
+        is_vision_int,
+        op.Constant(value_ints=[0, 1, 0, 0]),  # prepend 1 col on axis 1
+        op.Constant(value_int=0),
+    )  # [B, S + 1]
+    prev_int = op.Slice(
+        padded,
+        op.Constant(value_ints=[0]),
+        op.Constant(value_ints=[-1]),
+        op.Constant(value_ints=[1]),
+    )  # [B, S]
+    is_prev_vision = op.Cast(prev_int, to=ir.DataType.BOOL)
+
+    # new_vision_starts = is_vision AND NOT is_prev_vision
+    new_starts = op.And(is_vision, op.Not(is_prev_vision))
+    # vision_group_ids = cumsum(new_starts) - 1  (along sequence axis)
+    group_ids = op.Sub(
+        op.CumSum(op.Cast(new_starts, to=ir.DataType.INT64), op.Constant(value_int=1)),
+        op.Constant(value_int=1),
+    )
+    # block_sequence_ids = where(is_vision, group_ids, -1)
+    return op.Where(is_vision, group_ids, op.Constant(value_int=-1))
+
+
 class Gemma4TextModel(nn.Module):
     """Gemma4 text transformer with hybrid local/global attention.
 
@@ -1402,6 +1463,11 @@ class Gemma4TextModel(nn.Module):
             )
         self.layer_types = layer_types
         self.sliding_window = config.sliding_window
+        # Bidirectional attention mode (None | "vision" | "all"). When
+        # "vision", contiguous vision-token blocks attend bidirectionally;
+        # the overlay is supplied at runtime via ``block_sequence_ids`` and
+        # forces the float-bias attention path (``is_causal=0``).
+        self._use_bidirectional_attention = config.use_bidirectional_attention
 
         # Local (sliding window) config — full rotation, local rope_theta
         local_config = dataclasses.replace(
@@ -1513,6 +1579,7 @@ class Gemma4TextModel(nn.Module):
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
         per_layer_inputs: ir.Value | None = None,
+        block_sequence_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -1547,11 +1614,31 @@ class Gemma4TextModel(nn.Module):
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
+
+        # Bidirectional vision-block overlay (Gemma4 larger models). When
+        # active, contiguous vision-token blocks attend bidirectionally on
+        # BOTH full and sliding layers. This cannot be expressed by the
+        # GroupQueryAttention op (causal / local-window only), so we force
+        # the float-bias Attention path with ``is_causal=0`` and bake the
+        # full mask (causal + sliding + padding + blockwise OR) into the bias.
+        #
+        # ``block_sequence_ids`` is plumbed from the embedding sub-model (VLM
+        # split) where image/audio tokens are known. The text-only path keeps
+        # plain causal attention (and GQA eligibility), matching HF, which
+        # only injects the overlay in the multimodal wrapper.
+        bidirectional = self._use_bidirectional_attention == "vision"
+        use_block_overlay = bidirectional and block_sequence_ids is not None
+
         use_gqa = (
             attention_mask is not None
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
+            and not use_block_overlay
         )
+        # When the blockwise overlay is active the Attention op must NOT
+        # re-apply its built-in causal mask (it would cancel the
+        # future-position unmasking baked into the float bias).
+        attn_is_causal = 0 if use_block_overlay else 1
 
         if use_gqa:
             # Calling forward() on the RoPE modules materializes their
@@ -1615,12 +1702,14 @@ class Gemma4TextModel(nn.Module):
                     attention_mask=attention_mask,
                     sliding_window=self.sliding_window,
                     dtype=self._dtype,
+                    block_sequence_ids=block_sequence_ids if use_block_overlay else None,
                 ),
                 "full_attention": create_attention_bias(
                     op,
                     input_ids=query_input,
                     attention_mask=attention_mask,
                     dtype=self._dtype,
+                    block_sequence_ids=block_sequence_ids if use_block_overlay else None,
                 ),
             }
             fallback_pos_dict = position_embeddings_dict
@@ -1666,6 +1755,7 @@ class Gemma4TextModel(nn.Module):
                 shared_kv_states=shared_kv_states,
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
+                is_causal=attn_is_causal,
             )
             # KV-shared layers borrow K,V from source layers — exclude from
             # present_key_values so the output has exactly num_kv_layers entries.
@@ -1776,6 +1866,7 @@ class _Gemma4DecoderModel(nn.Module):
         position_ids: ir.Value,
         per_layer_inputs: ir.Value | None = None,
         past_key_values: list | None = None,
+        block_sequence_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
         hidden_states, present_key_values = self.model(
             op,
@@ -1785,6 +1876,7 @@ class _Gemma4DecoderModel(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
+            block_sequence_ids=block_sequence_ids,
         )
         logits = self.lm_head(op, hidden_states)
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
@@ -1915,6 +2007,10 @@ class Gemma4EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
         self.audio_token_id: int | None = config.audio.audio_token_id if config.audio else None
+        # When the text decoder uses vision-block bidirectional attention,
+        # the embedding model also emits ``block_sequence_ids`` (computed from
+        # input_ids) for the decoder's attention-mask overlay.
+        self._emit_block_sequence_ids = config.use_bidirectional_attention == "vision"
 
         # Per-layer input embedding components (moved from the decoder).
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
@@ -1982,7 +2078,13 @@ class Gemma4EmbeddingModel(nn.Module):
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value | None = None,
-    ) -> ir.Value | tuple[ir.Value, ir.Value]:
+    ) -> dict[str, ir.Value]:
+        """Return a dict of named embedding outputs.
+
+        Always contains ``inputs_embeds``. Contains ``per_layer_inputs`` when
+        ``hidden_size_per_layer_input > 0``, and ``block_sequence_ids`` when
+        the decoder uses vision-block bidirectional attention.
+        """
         # [B, S] → [B, S, hidden]
         hidden = self.embed_tokens(op, input_ids)
 
@@ -2001,8 +2103,19 @@ class Gemma4EmbeddingModel(nn.Module):
                 op, hidden, input_ids, self.audio_token_id, audio_features
             )
 
+        outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
+
+        # Vision-block bidirectional attention overlay ids for the decoder.
+        if self._emit_block_sequence_ids:
+            outputs["block_sequence_ids"] = _compute_block_sequence_ids(
+                op,
+                input_ids,
+                image_token_id=self.image_token_id,
+                audio_token_id=self.audio_token_id,
+            )
+
         if not self._per_layer_dim:
-            return hidden
+            return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
         # 1. Project hidden states → [B, S, L*D] and scale by hidden_size**-0.5
@@ -2046,8 +2159,9 @@ class Gemma4EmbeddingModel(nn.Module):
             combined,
             op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
         )
+        outputs["per_layer_inputs"] = per_layer_inputs
 
-        return hidden, per_layer_inputs
+        return outputs
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

@@ -1267,6 +1267,17 @@ class Gemma4Config(VisionLanguageConfig):
     enable_moe_block: bool = False
     attention_k_eq_v: bool = False
     boa_token_id: int | None = None
+    use_bidirectional_attention: str | None = None
+    """Bidirectional attention mode for the text decoder.
+
+    Mirrors HF ``Gemma4TextConfig.use_bidirectional_attention``:
+    - ``None``: fully causal (smaller Gemma4 models, e.g. E2B).
+    - ``"vision"``: text stays causal, but contiguous vision-token blocks
+      (image/audio placeholders) attend bidirectionally within each block
+      (larger models, e.g. 12B/26B/32B). Implemented via a per-position
+      ``block_sequence_ids`` overlay added onto the causal mask.
+    - ``"all"``: every token attends bidirectionally (no causal mask).
+    """
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
@@ -1340,6 +1351,7 @@ class Gemma4Config(VisionLanguageConfig):
             enable_moe_block=getattr(config, "enable_moe_block", False),
             attention_k_eq_v=getattr(config, "attention_k_eq_v", False),
             boa_token_id=getattr(parent_config, "boa_token_id", None),
+            use_bidirectional_attention=getattr(config, "use_bidirectional_attention", None),
         )
 
 
