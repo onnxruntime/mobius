@@ -801,9 +801,10 @@ def _compute_summary(
     for info in models.values():
         # Per-flag counts: how many models have each level flag set, independently.
         # These are NOT exclusive (a model counted in L3 may also be in L1/L2).
-        # by_level[0] = not-tested (no flags set at all).
+        # by_level[0] = not-tested (no *passing* coverage at any level — a
+        # model that is L2/L3-configured but xfailed/skipped still lands here).
         # L2/L3/L4/L5 use their ``_passes`` properties so xfailed/skipped
-        # tests do not count — matching their card counts and the
+        # tests do not count as coverage — matching their card counts and the
         # confidence_level property.
         if not any(
             [
