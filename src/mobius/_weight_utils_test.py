@@ -12,6 +12,7 @@ from mobius._weight_utils import (
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
     split_gate_up_proj,
@@ -167,6 +168,71 @@ class TestStripPrefix:
         t = torch.randn(3, 4)
         result = strip_prefix({"prefix.key": t}, "prefix")
         assert result["key"].data_ptr() == t.data_ptr()
+
+
+class TestRenameWeightKeys:
+    """Tests for rename_weight_keys."""
+
+    def test_applies_replacements(self):
+        """Each (old, new) pair is applied to every key."""
+        state_dict = {
+            "model.layers.0.attention_layernorm.weight": torch.tensor(1.0),
+            "model.layers.0.feedforward_layernorm.weight": torch.tensor(2.0),
+            "model.embed.weight": torch.tensor(3.0),
+        }
+        result = rename_weight_keys(
+            state_dict,
+            [
+                (".attention_layernorm.", ".input_layernorm."),
+                (".feedforward_layernorm.", ".post_attention_layernorm."),
+            ],
+        )
+        assert set(result.keys()) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.embed.weight",
+        }
+
+    def test_replacements_are_ordered_and_cascade(self):
+        """Replacements apply to the progressively updated key, in order."""
+        state_dict = {"a.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [("a.", "b."), ("b.", "c.")])
+        assert list(result.keys()) == ["c.weight"]
+
+    def test_no_replacements_is_identity(self):
+        """An empty replacement list returns a key-equivalent copy."""
+        state_dict = {"x.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [])
+        assert list(result.keys()) == ["x.weight"]
+        assert result is not state_dict
+
+    def test_shares_tensor_values(self):
+        """Tensor values are shared, not cloned."""
+        t = torch.randn(2, 3)
+        result = rename_weight_keys({"old.k": t}, [("old.", "new.")])
+        assert result["new.k"].data_ptr() == t.data_ptr()
+
+    def test_collision_raises(self):
+        """Two source keys mapping to the same renamed key raises.
+
+        The error message must name both the colliding key and the original
+        producer key to aid debugging in large checkpoints.
+        """
+        state_dict = {
+            "a.weight": torch.tensor(1.0),
+            "b.weight": torch.tensor(2.0),
+        }
+        with pytest.raises(ValueError, match="collision") as exc_info:
+            rename_weight_keys(state_dict, [("a.", "x."), ("b.", "x.")])
+        message = str(exc_info.value)
+        # The producer ("a.weight", processed first) and the colliding key
+        # ("b.weight") must both appear.
+        assert "a.weight" in message
+        assert "b.weight" in message
+
+    def test_empty_state_dict(self):
+        """Empty input returns empty output."""
+        assert rename_weight_keys({}, [("a", "b")]) == {}
 
 
 class TestSplitFusedQkvValidation:

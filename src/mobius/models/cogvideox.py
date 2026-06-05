@@ -28,6 +28,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._diffusers_configs import CogVideoXConfig
+from mobius._weight_utils import rename_weight_keys
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
 from mobius.components._activations import SiLU as _SiLU
@@ -648,9 +649,10 @@ class CogVideoXTransformer3DModel(nn.Module):
         - ``ff.net.0.proj.*`` → ``ff.gelu_proj.*``
         - ``ff.net.2.*`` → ``ff.linear_out.*``
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for name, tensor in state_dict.items():
-            name = name.replace(".ff.net.0.proj.", ".ff.gelu_proj.")
-            name = name.replace(".ff.net.2.", ".ff.linear_out.")
-            new_state_dict[name] = tensor
-        return new_state_dict
+        return rename_weight_keys(
+            state_dict,
+            [
+                (".ff.net.0.proj.", ".ff.gelu_proj."),
+                (".ff.net.2.", ".ff.linear_out."),
+            ],
+        )
