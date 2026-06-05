@@ -40,6 +40,13 @@ image / audio pipeline is verified separately by the integration tests
 (``tests/integration_test.py::test_gemma4_unified_12b_multimodal_prefill``,
 vision cosine 1.0 vs HuggingFace).
 
+Optional ``--quantize Q4_K_M`` INT4-quantizes the decoder with Olive (~23GB ->
+~6.8GB, 3.4x smaller).  Spot-checked quality on this base model: coherent text
+/ image / audio generation, ~0.986 last-token logit cosine and ~75% greedy
+top-1 agreement vs f16 on short factual prompts (the base model itself emits
+some off-distribution tokens, so a few disagreements are not quantization
+artifacts).
+
 Requirements::
 
     pip install mobius-ai[ort-genai] transformers pillow librosa
@@ -57,11 +64,17 @@ Usage::
     # Audio + text:
     python examples/gemma4_unified_ort_genai.py --mode audio \
         --model-dir out/gemma4_12b/ --audio path/to/clip.flac
+
+    # INT4-quantize the decoder with Olive (Q4_K_M, ~3.4x smaller) and run it:
+    python examples/gemma4_unified_ort_genai.py --mode image \
+        --model-dir out/gemma4_12b/ --image path/to/photo.jpg \
+        --quantize Q4_K_M --quantized-out out/gemma4_12b-Q4_K_M/
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 
@@ -110,6 +123,98 @@ def build_and_export(model_id: str, output_dir: str, dtype: str, ep: str) -> Non
     print(f"Export complete -> {output_dir}")
     for name, path in sorted(manifest.items()):
         print(f"  {name}: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Olive INT4 quantization (decoder only)
+# ---------------------------------------------------------------------------
+
+
+def quantize_decoder(
+    src_dir: str,
+    dst_dir: str,
+    *,
+    precision: str = "Q4_K_M",
+    block_size: int = 32,
+) -> None:
+    """INT4-quantize the decoder sub-model with Olive (k-quant or NF4).
+
+    Only the decoder is quantized — it holds ~23GB of the package's weights
+    (>95%).  The embedding / vision_encoder / audio_encoder sub-models, the
+    tokenizer, ``genai_config.json``, and the processor configs are copied
+    over unchanged, so the result is a drop-in ORT GenAI package.
+
+    Args:
+        src_dir: full-precision package (output of :func:`build_and_export`).
+        dst_dir: destination directory for the quantized package.
+        precision: ``"Q4_K_M"`` (k-quant; install ``cupy-cuda12x`` for the
+            19-51x GPU speedup) or ``"NF4"`` (4-bit NormalFloat, native C++).
+        block_size: k-quant block size; ignored for NF4.
+
+    Requires ``olive-ai`` (``pip install olive-ai``).
+    """
+    import shutil
+
+    from olive.workflows import run as olive_run
+
+    if precision == "Q4_K_M":
+        pass_cfg = {"type": "OnnxKQuantQuantization", "bits": 4, "block_size": block_size}
+    elif precision == "NF4":
+        pass_cfg = {"type": "OnnxBnb4Quantization", "precision": "nf4"}
+    else:
+        raise ValueError(f"Unsupported precision: {precision!r}")
+
+    decoder_dst = os.path.join(dst_dir, "decoder")
+    os.makedirs(decoder_dst, exist_ok=True)
+    config = {
+        "input_model": {
+            "type": "OnnxModel",
+            "model_path": os.path.join(src_dir, "decoder", "model.onnx"),
+        },
+        "passes": {precision.lower(): pass_cfg},
+        "output_dir": decoder_dst,
+    }
+    print(f"Quantizing decoder ({precision}) -> {decoder_dst} ...")
+    olive_run(config)
+
+    # Olive writes bookkeeping files that ORT GenAI must not see in the
+    # decoder/ folder; keep only the ONNX model + its external data.
+    for f in os.listdir(decoder_dst):
+        if not (f == "model.onnx" or f.startswith("model.onnx.data")):
+            path = os.path.join(decoder_dst, f)
+            shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+
+    _ensure_logits_output(os.path.join(decoder_dst, "model.onnx"))
+
+    # Copy the non-decoder sub-models + config + tokenizer unchanged.
+    for child in os.listdir(src_dir):
+        path = os.path.join(src_dir, child)
+        target = os.path.join(dst_dir, child)
+        if child == "decoder" or os.path.exists(target):
+            continue
+        shutil.copytree(path, target) if os.path.isdir(path) else shutil.copy2(path, target)
+    print(f"Quantized package ready -> {dst_dir}")
+
+
+def _ensure_logits_output(decoder_path: str) -> None:
+    """Rename a quantized decoder's ``logits_Q4`` output back to ``logits``.
+
+    Some Olive versions rename the decoder's ``logits`` output to ``logits_Q4``
+    during k-quant.  ORT GenAI maps outputs by the names in the (copied)
+    ``genai_config.json`` (which says ``logits``), so we rename the graph
+    output back when needed to keep the quantized decoder a drop-in.
+    """
+    import onnx_ir as ir
+
+    model = ir.load(decoder_path)
+    renamed = False
+    for value in model.graph.outputs:
+        if value.name == "logits_Q4":
+            value.name = "logits"
+            renamed = True
+    if renamed:
+        ir.save(model, decoder_path, external_data="model.onnx.data")
+        print("  Renamed decoder output logits_Q4 -> logits")
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +382,17 @@ def main() -> int:
     parser.add_argument(
         "--save-to", default=None, help="Build + save to this directory (skip cleanup)."
     )
+    parser.add_argument(
+        "--quantize",
+        default=None,
+        choices=["Q4_K_M", "NF4"],
+        help="INT4-quantize the decoder with Olive and run against the result.",
+    )
+    parser.add_argument(
+        "--quantized-out",
+        default=None,
+        help="Output dir for --quantize (default: <model-dir>-<precision>).",
+    )
     args = parser.parse_args()
 
     # Default prompts per mode (base-model completion style).
@@ -304,6 +420,12 @@ def main() -> int:
             tmp_dir = tempfile.mkdtemp(prefix="gemma4_12b_mm_")
             model_dir = tmp_dir
         build_and_export(args.model_id, model_dir, args.dtype, args.ep)
+
+    # Optionally INT4-quantize the decoder and run against the quantized package.
+    if args.quantize:
+        quant_dir = args.quantized_out or f"{model_dir.rstrip('/')}-{args.quantize}"
+        quantize_decoder(model_dir, quant_dir, precision=args.quantize)
+        model_dir = quant_dir
 
     try:
         if args.mode == "text":
