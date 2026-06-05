@@ -521,6 +521,39 @@ def vlm_embedding_weights(
     return renamed
 
 
+def vlm_vision_weights(
+    state_dict: dict[str, torch.Tensor],
+    prefixes: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Extract vision-tower weights for a VLM vision sub-model.
+
+    Keeps only keys starting with one of *prefixes* and renames the vision
+    MLP projections ``mlp.fc1`` → ``mlp.up_proj`` and ``mlp.fc2`` →
+    ``mlp.down_proj`` to match our ``FCMLP`` component naming.
+
+    This is the standard pattern for VLM vision sub-models (LLaVA, Gemma3,
+    Mllama) whose HuggingFace vision encoders use ``fc1``/``fc2`` MLP names.
+
+    Args:
+        state_dict: Full model state dict.
+        prefixes: Prefixes identifying vision-tower weights to keep, e.g.
+            ``("vision_tower.", "multi_modal_projector.")`` or
+            ``("vision_model.",)``.
+
+    Returns:
+        New dictionary with the kept vision weights and renamed MLP keys.
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not key.startswith(prefixes):
+            continue
+        new_key = key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+            ".mlp.fc2.", ".mlp.down_proj."
+        )
+        renamed[new_key] = value
+    return renamed
+
+
 def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor:
     """Transpose and reshape a packed qweight tensor for MatMulNBits.
 
