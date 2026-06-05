@@ -429,8 +429,6 @@ def test_template_dot_class_assignments_match_css():
     one has a matching ``.dot.X`` rule. The dynamic ``active-N`` family
     is checked explicitly for ``N \u2208 [1, 5]``.
     """
-    import re
-
     text = _TEMPLATE_PATH.read_text(encoding="utf-8")
     # Find all class names the JS adds to dots via `cls += ' XXX'`.
     js_classes = set(re.findall(r"cls\s*\+=\s*[\"']\s+([\w-]+)\s*[\"']", text))
