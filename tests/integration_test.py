@@ -5420,14 +5420,14 @@ def test_gemma4_unified_12b_text_prefill():
     hf_logits = hf_out.logits.numpy()
 
     session = _make_session(pkg["model"])
-    feeds = _make_gemma4_prefill_feeds(
-        gemma4_config, input_ids, attention_mask, position_ids
-    )
+    feeds = _make_gemma4_prefill_feeds(gemma4_config, input_ids, attention_mask, position_ids)
     # gemma4_unified full-attention layers use a single global KV head; the
     # generic feed helper assumes num_key_value_heads, so rebuild KV feeds with
     # the per-layer-type KV head count.
     lt = gemma4_config.layer_types
-    for i in range(gemma4_config.num_hidden_layers - (gemma4_config.num_kv_shared_layers or 0)):
+    for i in range(
+        gemma4_config.num_hidden_layers - (gemma4_config.num_kv_shared_layers or 0)
+    ):
         is_full = lt[i] == "full_attention"
         hd = gemma4_config.global_head_dim if is_full else gemma4_config.head_dim
         kvh = (
@@ -5449,6 +5449,181 @@ def test_gemma4_unified_12b_text_prefill():
     )
     assert not np.isnan(onnx_logits).any()
     assert_logits_close(onnx_logits, hf_logits, rtol=5e-2, atol=2e-2)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_gemma4_unified_12b_multimodal_prefill():
+    """gemma-4-12B (``gemma4_unified``) full multimodal prefill parity vs HF.
+
+    Exercises the complete encoder-free multimodal pipeline end to end and
+    compares against ``Gemma4UnifiedForConditionalGeneration``:
+
+    1. ``vision_encoder``: raw image patches → 3840-d image features
+       (compared against HF ``model.get_image_features`` ``pooler_output``).
+    2. ``embedding``: scatters the image features into the scaled word
+       embeddings and emits ``block_sequence_ids`` (the vision-block ids that
+       drive the decoder's bidirectional mask).
+    3. ``decoder``: 48-layer gemma4 text decoder with vision-block
+       bidirectional attention (``use_bidirectional_attention="vision"``).
+
+    The bidirectional reference REQUIRES passing ``mm_token_type_ids`` to HF —
+    without it HF falls back to a purely causal mask.  Loads the 24 GB
+    checkpoint in float32 (~48 GB host RAM).  Runs on ``MOBIUS_TEST_DEVICE``
+    (set ``cuda`` for GPU).
+    """
+    import dataclasses
+
+    import onnx_ir as ir
+    from PIL import Image
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    from mobius._configs import Gemma4Config
+    from mobius._weight_loading import _download_weights, apply_weights
+    from mobius.models.gemma4 import Gemma4UnifiedModel
+    from mobius.tasks import TASK_REGISTRY
+
+    model_id = "google/gemma-4-12B"
+
+    if not _model_accessible(model_id):
+        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
+
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
+    hf_full = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    ).eval()
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    # Build a single-image multimodal input. The unified processor expands the
+    # `<|image|>` placeholder into the right number of soft tokens and emits
+    # pixel_values [B, N, P^2*3], image_position_ids [B, N, 2] and
+    # mm_token_type_ids [B, S] (1 = image span).
+    image = Image.new("RGB", (112, 112), (100, 150, 200))
+    proc_inputs = processor(
+        text=[f"{processor.image_token} Describe the image."],
+        images=[image],
+        return_tensors="pt",
+    )
+    input_ids = proc_inputs["input_ids"].numpy().astype(np.int64)
+    seq_len = input_ids.shape[1]
+    attention_mask = np.ones((1, seq_len), dtype=np.int64)
+    position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+    pixel_values = proc_inputs["pixel_values"]
+    image_position_ids = proc_inputs["image_position_ids"]
+    mm_token_type_ids = proc_inputs["mm_token_type_ids"]
+
+    # HF reference: full multimodal forward (mm_token_type_ids enables the
+    # vision-block bidirectional mask) and the isolated image features.
+    with torch.no_grad():
+        hf_out = hf_full(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        hf_image_features = (
+            hf_full.model.get_image_features(
+                pixel_values, image_position_ids, return_dict=True
+            )
+            .pooler_output.numpy()
+            .astype(np.float32)
+        )
+    hf_logits = hf_out.logits.numpy()
+
+    # Build the 4-model gemma4_unified package and load real weights.
+    gemma4_config = Gemma4Config.from_transformers(
+        hf_config.text_config, parent_config=hf_config
+    )
+    gemma4_config = dataclasses.replace(gemma4_config, dtype=ir.DataType.FLOAT)
+    module = Gemma4UnifiedModel(gemma4_config)
+    pkg = TASK_REGISTRY["gemma4-unified"]().build(module, gemma4_config)
+    # Load the raw safetensors checkpoint (production weight path). The unified
+    # checkpoint stores `vision_embedder.*` / `embed_vision.embedding_projection.*`
+    # names, which differ from the runtime module names in hf_full.state_dict();
+    # preprocess_weights maps the checkpoint names.
+    preprocessed = module.preprocess_weights(_download_weights(model_id))
+    for name in ("decoder", "vision_encoder", "audio_encoder", "embedding"):
+        if name in pkg:
+            apply_weights(pkg[name], preprocessed)
+
+    # Stage 1: vision embedder.
+    vision_session = _make_session(pkg["vision_encoder"])
+    image_features = vision_session.run(
+        {
+            "pixel_values": pixel_values.numpy().astype(np.float32),
+            "pixel_position_ids": image_position_ids.numpy().astype(np.int64),
+        }
+    )["image_features"]
+    vision_session.close()
+    assert image_features.shape == hf_image_features.shape
+    vis_cos = float(
+        np.mean(
+            np.sum(image_features * hf_image_features, axis=1)
+            / (
+                np.linalg.norm(image_features, axis=1)
+                * np.linalg.norm(hf_image_features, axis=1)
+                + 1e-9
+            )
+        )
+    )
+    print(f"\nGemma4 unified 12B vision cos_sim={vis_cos:.6f}")
+    assert vis_cos > 0.999
+
+    # Stage 2: embedding fusion (also emits block_sequence_ids).
+    embedding_session = _make_session(pkg["embedding"])
+    emb_out = embedding_session.run(
+        {
+            "input_ids": input_ids,
+            "image_features": image_features,
+            "audio_features": np.zeros((0, gemma4_config.hidden_size), dtype=np.float32),
+        }
+    )
+    embedding_session.close()
+    inputs_embeds = emb_out["inputs_embeds"]
+    block_sequence_ids = emb_out["block_sequence_ids"]
+
+    # Stage 3: decoder with vision-block bidirectional attention.
+    decoder_session = _make_session(pkg["decoder"])
+    feeds = {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "block_sequence_ids": block_sequence_ids,
+    }
+    layer_types = gemma4_config.layer_types
+    for i in range(gemma4_config.num_hidden_layers):
+        is_full = layer_types[i] == "full_attention"
+        head_dim = gemma4_config.global_head_dim if is_full else gemma4_config.head_dim
+        kv_heads = (
+            gemma4_config.num_global_key_value_heads
+            if (is_full and gemma4_config.num_global_key_value_heads)
+            else gemma4_config.num_key_value_heads
+        )
+        feeds[f"past_key_values.{i}.key"] = np.zeros(
+            (1, kv_heads, 0, head_dim), dtype=np.float32
+        )
+        feeds[f"past_key_values.{i}.value"] = np.zeros(
+            (1, kv_heads, 0, head_dim), dtype=np.float32
+        )
+    onnx_logits = decoder_session.run(feeds)["logits"]
+    decoder_session.close()
+
+    max_diff = float(np.max(np.abs(onnx_logits - hf_logits)))
+    last_cos = float(
+        np.dot(onnx_logits[0, -1], hf_logits[0, -1])
+        / (np.linalg.norm(onnx_logits[0, -1]) * np.linalg.norm(hf_logits[0, -1]) + 1e-9)
+    )
+    print(
+        f"Gemma4 unified 12B multimodal prefill parity — "
+        f"max_abs_diff={max_diff:.4f}, last_token_cos_sim={last_cos:.6f}"
+    )
+    assert not np.isnan(onnx_logits).any()
+    assert last_cos > 0.999
+    assert onnx_logits[0, -1].argmax() == hf_logits[0, -1].argmax()
+
 
 # ---------------------------------------------------------------------------
 # Gemma 4 bidirectional (vision-block) attention mask parity
@@ -5520,9 +5695,7 @@ def test_gemma4_bidirectional_mask_parity():
         b, bop, g = create_test_builder()
         ii = create_test_input(b, "input_ids", [1, seq_len], dtype=ir.DataType.INT64)
         am = create_test_input(b, "attention_mask", [1, seq_len], dtype=ir.DataType.INT64)
-        bk = create_test_input(
-            b, "block_sequence_ids", [1, seq_len], dtype=ir.DataType.INT64
-        )
+        bk = create_test_input(b, "block_sequence_ids", [1, seq_len], dtype=ir.DataType.INT64)
         bias = create_attention_bias(
             bop,
             ii,

@@ -31,6 +31,7 @@ __all__ = [
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
     "Gemma4Task",
+    "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
     "HybridCausalLMTask",
     "HybridQwenVLTask",
@@ -83,6 +84,7 @@ from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,
     Gemma4TextCausalLMTask,
+    Gemma4UnifiedTask,
 )
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
@@ -134,6 +136,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
+    "gemma4-unified": Gemma4UnifiedTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,

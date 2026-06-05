@@ -38,6 +38,8 @@ from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
     ClippableLinear,
+    Embedding,
+    LayerNorm,
     Linear,
     RMSNorm,
     create_attention_bias,
@@ -2249,6 +2251,189 @@ class _Gemma4AudioEncoderModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# gemma4_unified (gemma-4-12B) encoder-free vision / audio embedders
+# ---------------------------------------------------------------------------
+
+
+class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
+    """Encoder-free vision embedder for ``gemma4_unified`` (gemma-4-12B).
+
+    Unlike gemma4's SigLIP tower, the unified model has **no vision encoder**.
+    Raw merged pixel patches are projected directly into language-model space.
+
+    Replicates HF ``Gemma4UnifiedVisionEmbedder``:
+
+        patch_ln1 (LayerNorm, patch_dim)
+        → patch_dense (Linear patch_dim → mm_embed_dim)
+        → patch_ln2 (LayerNorm, mm_embed_dim)
+        → + factorized 2D positional embedding
+        → pos_norm (LayerNorm, mm_embed_dim)
+        → embedding_pre_projection_norm (scale-free RMSNorm)
+        → embedding_projection (Linear mm_embed_dim → text_hidden)
+
+    ``patch_dim = (patch_size * pooling_kernel_size)^2 * 3`` (48*48*3 = 6912).
+
+    Inputs:
+    - ``pixel_values [B, N, patch_dim]``: raw merged pixel patches.
+    - ``pixel_position_ids [B, N, 2]``: integer (x, y) patch coordinates;
+      ``(-1, -1)`` marks padding patch slots.
+
+    Output:
+    - ``image_features [num_valid_patches, text_hidden_size]``: padding
+      patches (position == -1) are stripped so the output rows align 1:1 with
+      image placeholder tokens in the text sequence (matches HF, which selects
+      ``vision_outputs[~padding_mask]``).
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        vc = config.vision  # VisionConfig populated by the gemma4_unified hook
+        patch_size = (vc.patch_size if vc else None) or 16
+        pooling = (vc.pooling_kernel_size if vc else None) or 3
+        model_patch_size = patch_size * pooling
+        patch_dim = 3 * model_patch_size * model_patch_size
+        mm_embed_dim = (vc.hidden_size if vc else None) or config.hidden_size
+        posemb_size = (vc.position_embedding_size if vc else None) or 1120
+        out_proj_dim = (vc.out_hidden_size if vc else None) or mm_embed_dim
+        eps = (vc.norm_eps if vc else None) or config.rms_norm_eps or 1e-6
+        self._text_hidden_size = config.hidden_size
+
+        self.patch_ln1 = LayerNorm(patch_dim, eps=eps)
+        self.patch_dense = Linear(patch_dim, mm_embed_dim, bias=True)
+        self.patch_ln2 = LayerNorm(mm_embed_dim, eps=eps)
+        # Factorized 2D positional embedding: HF stores a single
+        # [posemb_size, 2, mm_embed_dim] table looked up per axis. We split it
+        # into two [posemb_size, mm_embed_dim] tables (x and y) in
+        # preprocess_weights so each axis is a plain Gather.
+        self.pos_emb_x = Embedding(posemb_size, mm_embed_dim)
+        self.pos_emb_y = Embedding(posemb_size, mm_embed_dim)
+        self.pos_norm = LayerNorm(mm_embed_dim, eps=eps)
+        # Scale-free RMSNorm before the projection (HF
+        # embed_vision.multimodal_embedder.embedding_pre_projection_norm).
+        self.projector_norm = _Gemma4ScaleFreeRMSNorm(out_proj_dim, eps=eps)
+        # HF embed_vision.multimodal_embedder.embedding_projection (no bias).
+        self.projector = Linear(out_proj_dim, config.hidden_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        pixel_position_ids: ir.Value,
+    ) -> ir.Value:
+        # Patch embedding: LN → Dense → LN.  [B, N, patch_dim] → [B, N, mm_embed_dim]
+        h = self.patch_ln1(op, pixel_values)
+        h = self.patch_dense(op, h)
+        h = self.patch_ln2(op, h)
+
+        # Factorized positional embedding.  Split (x, y) coords on the last axis.
+        x_ids = op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=-1)  # [B, N]
+        y_ids = op.Gather(pixel_position_ids, op.Constant(value_int=1), axis=-1)  # [B, N]
+        # Padding patches carry -1: clamp to a valid index for the Gather, then
+        # zero their contribution via the validity mask.
+        zero = op.Constant(value_int=0)
+        clamped_x = op.Max(x_ids, zero)
+        clamped_y = op.Max(y_ids, zero)
+        neg_one = op.Constant(value_int=-1)
+        valid_x = op.Unsqueeze(
+            op.CastLike(op.Not(op.Equal(x_ids, neg_one)), h), [-1]
+        )  # [B, N, 1]
+        valid_y = op.Unsqueeze(op.CastLike(op.Not(op.Equal(y_ids, neg_one)), h), [-1])
+        pos_x = op.Mul(self.pos_emb_x(op, clamped_x), valid_x)  # [B, N, mm_embed_dim]
+        pos_y = op.Mul(self.pos_emb_y(op, clamped_y), valid_y)
+        h = op.Add(h, op.Add(pos_x, pos_y))
+        h = self.pos_norm(op, h)
+
+        # Scale-free RMSNorm → projection to text hidden size.
+        h = self.projector_norm(op, h)
+        h = self.projector(op, h)  # [B, N, text_hidden]
+
+        # Strip padding patches so output rows align 1:1 with placeholder tokens.
+        h_flat = op.Reshape(h, op.Constant(value_ints=[-1, self._text_hidden_size]))
+        keep = op.Reshape(
+            op.Not(op.Equal(x_ids, neg_one)), op.Constant(value_ints=[-1])
+        )  # [B*N] BOOL
+        return op.Compress(h_flat, keep, axis=0)  # [num_valid, text_hidden]
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("vision_embedder.pos_embedding"):
+                # HF [posemb_size, 2, mm_embed_dim] → two [posemb_size, mm_embed_dim]
+                renamed["pos_emb_x.weight"] = value[:, 0, :].contiguous()
+                renamed["pos_emb_y.weight"] = value[:, 1, :].contiguous()
+            elif key.startswith("vision_embedder."):
+                renamed[key[len("vision_embedder.") :]] = value
+            elif key.startswith("embed_vision.embedding_projection."):
+                renamed["projector." + key[len("embed_vision.embedding_projection.") :]] = (
+                    value
+                )
+            # embed_vision.*.embedding_pre_projection_norm: scale-free, no weight.
+        return renamed
+
+
+class _Gemma4UnifiedAudioEmbedderModel(nn.Module):
+    """Encoder-free audio embedder for ``gemma4_unified`` (gemma-4-12B).
+
+    The unified model has **no Conformer audio tower**.  Raw waveform-frame
+    features are projected directly into language-model space.
+
+    Replicates HF ``Gemma4UnifiedMultimodalEmbedder`` (the ``embed_audio``
+    branch):
+
+        embedding_pre_projection_norm (scale-free RMSNorm, audio_embed_dim)
+        → embedding_projection (Linear audio_embed_dim → text_hidden)
+
+    Inputs:
+    - ``input_features [B, T, audio_embed_dim]``: raw waveform-frame features.
+    - ``input_features_mask [B, T]``: BOOL mask, ``True`` for valid frames.
+
+    Output:
+    - ``audio_features [num_valid_frames, text_hidden_size]``: padding frames
+      are stripped so output rows align 1:1 with audio placeholder tokens
+      (matches HF, which selects ``audio_features[audio_mask]``).
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        ac = config.audio  # Gemma4AudioConfig populated by the gemma4_unified hook
+        audio_embed_dim = (ac.hidden_size if ac else None) or 640
+        eps = config.rms_norm_eps or 1e-6
+        self._text_hidden_size = config.hidden_size
+        # HF embed_audio.embedding_pre_projection_norm (scale-free RMSNorm).
+        self.projector_norm = _Gemma4ScaleFreeRMSNorm(audio_embed_dim, eps=eps)
+        # HF embed_audio.embedding_projection (no bias).
+        self.projector = Linear(audio_embed_dim, config.hidden_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_features: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        # [B, T, audio_embed_dim] → scale-free RMSNorm → [B, T, text_hidden]
+        h = self.projector_norm(op, input_features)
+        h = self.projector(op, h)
+        if input_features_mask is None:
+            return h, None
+        # Strip padding frames so output rows align 1:1 with placeholder tokens.
+        h_flat = op.Reshape(h, op.Constant(value_ints=[-1, self._text_hidden_size]))
+        keep = op.Reshape(input_features_mask, op.Constant(value_ints=[-1]))  # [B*T]
+        return op.Compress(h_flat, keep, axis=0), None  # [num_valid, text_hidden]
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("embed_audio.embedding_projection."):
+                renamed["projector." + key[len("embed_audio.embedding_projection.") :]] = value
+            # embed_audio.embedding_pre_projection_norm: scale-free, no weight.
+        return renamed
+
+
+# ---------------------------------------------------------------------------
 # Gemma4Model — unified vision-language (+ optional audio) model
 # ---------------------------------------------------------------------------
 
@@ -2420,5 +2605,121 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        return renamed
+
+
+# ---------------------------------------------------------------------------
+# Gemma4UnifiedModel — gemma-4-12B encoder-free multimodal model
+# ---------------------------------------------------------------------------
+
+
+class Gemma4UnifiedModel(nn.Module):
+    """Unified gemma-4-12B (``gemma4_unified``) multimodal model.
+
+    Encoder-free counterpart to :class:`Gemma4Model`: it shares the gemma4
+    text decoder and the multimodal-fusion embedding sub-model, but replaces
+    the SigLIP vision tower and Conformer audio tower with the lightweight
+    encoder-free embedders (:class:`_Gemma4UnifiedVisionEmbedderModel` and
+    :class:`_Gemma4UnifiedAudioEmbedderModel`).
+
+    Builds a 3- or 4-model package (built by :class:`~mobius.tasks.Gemma4UnifiedTask`):
+
+    Always produced:
+    - ``decoder``: gemma4 text decoder taking ``inputs_embeds``
+      (dual head_dim, k_eq_v, vision-block bidirectional attention)
+    - ``vision_encoder``: raw-patch vision embedder
+    - ``embedding``: scaled word embedding + multimodal feature fusion
+      (also emits ``block_sequence_ids`` for the decoder's bidirectional mask)
+
+    Added when ``config.audio is not None``:
+    - ``audio_encoder``: raw-frame audio embedder
+
+    Registered as ``gemma4_unified``.
+    """
+
+    default_task: str = "gemma4-unified"
+    category: str = "Multimodal"
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        self.config = config
+        self.decoder = _Gemma4DecoderModel(config)
+        self.vision_encoder = _Gemma4UnifiedVisionEmbedderModel(config)
+        self.embedding = Gemma4EmbeddingModel(config)
+        self.audio_encoder: _Gemma4UnifiedAudioEmbedderModel | None = (
+            _Gemma4UnifiedAudioEmbedderModel(config) if config.audio is not None else None
+        )
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Gemma4UnifiedModel is a multi-model split; Gemma4UnifiedTask builds "
+            "each sub-module (decoder, vision_encoder, embedding, and optionally "
+            "audio_encoder) separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Rename HuggingFace ``gemma4_unified`` checkpoint keys to ONNX names.
+
+        After stripping the leading ``model.`` prefix:
+
+        - ``language_model.lm_head.*`` → ``decoder.lm_head.*``
+        - ``language_model.*`` → ``decoder.model.*`` (token embedding is also
+          shared with ``embedding.embed_tokens.weight``)
+        - ``vision_embedder.*`` → ``vision_encoder.*`` (``pos_embedding`` is
+          split into ``pos_emb_x``/``pos_emb_y``)
+        - ``embed_vision.embedding_projection.*`` → ``vision_encoder.projector.*``
+        - ``embed_audio.embedding_projection.*`` → ``audio_encoder.projector.*``
+        - ``embed_{vision,audio}.*.embedding_pre_projection_norm.*`` → skip
+          (scale-free RMSNorm, no learnable weight)
+        """
+        # Strip top-level "model." prefix used by HF multimodal checkpoints.
+        state_dict = {
+            (key[len("model.") :] if key.startswith("model.") else key): value
+            for key, value in state_dict.items()
+        }
+
+        # Synthesize lm_head from embed_tokens when weights are tied.
+        if self.config.tie_word_embeddings:
+            embed_key = "language_model.embed_tokens.weight"
+            head_key = "language_model.lm_head.weight"
+            if head_key not in state_dict and embed_key in state_dict:
+                state_dict[head_key] = state_dict[embed_key]
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("language_model."):
+                suffix = key[len("language_model.") :]
+                if suffix.startswith("lm_head"):
+                    renamed["decoder." + suffix] = value
+                else:
+                    renamed["decoder.model." + suffix] = value
+                    if suffix == "embed_tokens.weight":
+                        renamed["embedding.embed_tokens.weight"] = value
+
+            elif key.startswith("vision_embedder.pos_embedding"):
+                # [posemb_size, 2, mm_embed_dim] → two [posemb_size, mm_embed_dim]
+                renamed["vision_encoder.pos_emb_x.weight"] = value[:, 0, :].contiguous()
+                renamed["vision_encoder.pos_emb_y.weight"] = value[:, 1, :].contiguous()
+
+            elif key.startswith("vision_embedder."):
+                renamed["vision_encoder." + key[len("vision_embedder.") :]] = value
+
+            elif key.startswith("embed_vision.embedding_projection."):
+                suffix = key[len("embed_vision.embedding_projection.") :]
+                renamed["vision_encoder.projector." + suffix] = value
+
+            elif key.startswith("embed_audio.embedding_projection."):
+                suffix = key[len("embed_audio.embedding_projection.") :]
+                renamed["audio_encoder.projector." + suffix] = value
+
+            elif key.startswith(("embed_vision.", "embed_audio.")):
+                # *.embedding_pre_projection_norm.*: scale-free RMSNorm, no weight.
+                pass
+
+            else:
+                renamed[key] = value
 
         return renamed
