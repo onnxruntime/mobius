@@ -398,6 +398,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    "gemma4_unified_text": ModelRegistration(
+        Gemma4CausalLMModel, config_class=Gemma4Config
+    ),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),

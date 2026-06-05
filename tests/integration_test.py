@@ -5345,6 +5345,111 @@ def test_gemma4_e2b_text_prefill_bf16():
 
     assert_logits_close(onnx_logits, hf_logits, rtol=1e-2, atol=5e-3)
 
+
+# ---------------------------------------------------------------------------
+# Gemma 4 unified (gemma-4-12B) text backbone prefill parity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_gemma4_unified_12b_text_prefill():
+    """gemma-4-12B (``gemma4_unified``) text backbone: ONNX logits match HF.
+
+    Builds Gemma4CausalLMModel from the ``google/gemma-4-12B`` unified text
+    config and compares a single prefill forward pass against the HuggingFace
+    ``Gemma4UnifiedForConditionalGeneration`` text path.  This exercises the
+    real 48-layer 12B architecture: dual head_dim (local 256 / global 512),
+    ``attention_k_eq_v`` with a single global KV head, dual RoPE, and
+    final-logit softcapping.
+
+    Loads the 24 GB checkpoint in float32 (~48 GB host RAM).  Runs on the
+    device from ``MOBIUS_TEST_DEVICE`` (set ``cuda`` for GPU).  Tolerances
+    atol=2e-2 / rtol=5e-2 account for the deep (48-layer) network and CUDA
+    floating-point accumulation.
+    """
+    import dataclasses
+
+    import onnx_ir as ir
+    from transformers import AutoModelForImageTextToText
+
+    from mobius import build_from_module
+    from mobius._configs import Gemma4Config
+    from mobius._weight_loading import apply_weights
+    from mobius.models.gemma4 import Gemma4CausalLMModel
+
+    model_id = "google/gemma-4-12B"
+
+    if not _model_accessible(model_id):
+        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
+
+    hf_config = transformers.AutoConfig.from_pretrained(model_id)
+    hf_full = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    ).eval()
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+
+    # Build Gemma4Config from the unified text sub-config (parent supplies
+    # boa/image/audio token ids and use_bidirectional_attention="vision").
+    text_cfg = hf_config.text_config
+    gemma4_config = Gemma4Config.from_transformers(text_cfg, parent_config=hf_config)
+    gemma4_config = dataclasses.replace(gemma4_config, dtype=ir.DataType.FLOAT)
+
+    onnx_module = Gemma4CausalLMModel(gemma4_config)
+    pkg = build_from_module(onnx_module, gemma4_config, task="gemma4-text-generation")
+    assert "model" in pkg
+
+    preprocessed = onnx_module.preprocess_weights(dict(hf_full.state_dict()))
+    apply_weights(pkg["model"], preprocessed)
+
+    prompt = "Hello, world!"
+    tokens = tokenizer(prompt, return_tensors="np")
+    input_ids = tokens["input_ids"].astype(np.int64)
+    attention_mask = tokens["attention_mask"].astype(np.int64)
+    seq_len = input_ids.shape[1]
+    position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+
+    with torch.no_grad():
+        hf_out = hf_full(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+        )
+    hf_logits = hf_out.logits.numpy()
+
+    session = _make_session(pkg["model"])
+    feeds = _make_gemma4_prefill_feeds(
+        gemma4_config, input_ids, attention_mask, position_ids
+    )
+    # gemma4_unified full-attention layers use a single global KV head; the
+    # generic feed helper assumes num_key_value_heads, so rebuild KV feeds with
+    # the per-layer-type KV head count.
+    lt = gemma4_config.layer_types
+    for i in range(gemma4_config.num_hidden_layers - (gemma4_config.num_kv_shared_layers or 0)):
+        is_full = lt[i] == "full_attention"
+        hd = gemma4_config.global_head_dim if is_full else gemma4_config.head_dim
+        kvh = (
+            gemma4_config.num_global_key_value_heads
+            if (is_full and gemma4_config.num_global_key_value_heads)
+            else gemma4_config.num_key_value_heads
+        )
+        feeds[f"past_key_values.{i}.key"] = np.zeros((1, kvh, 0, hd), dtype=np.float32)
+        feeds[f"past_key_values.{i}.value"] = np.zeros((1, kvh, 0, hd), dtype=np.float32)
+    onnx_outputs = session.run(feeds)
+    session.close()
+    onnx_logits = onnx_outputs["logits"]
+
+    max_diff = float(np.max(np.abs(onnx_logits - hf_logits)))
+    mean_diff = float(np.mean(np.abs(onnx_logits - hf_logits)))
+    print(
+        f"\nGemma4 unified 12B text prefill parity — "
+        f"max_abs_diff={max_diff:.6f}, mean_abs_diff={mean_diff:.6f}"
+    )
+    assert not np.isnan(onnx_logits).any()
+    assert_logits_close(onnx_logits, hf_logits, rtol=5e-2, atol=2e-2)
+
 # ---------------------------------------------------------------------------
 # Gemma 4 bidirectional (vision-block) attention mask parity
 # ---------------------------------------------------------------------------

@@ -1249,6 +1249,57 @@ class TestBuildGraphVisionLanguage:
         assert "input_ids" in input_names
         assert "logits" in output_names
 
+    def test_gemma4_unified_text_graph(self):
+        """Build the gemma4_unified (gemma-4-12B) text backbone via Gemma4CausalLMModel.
+
+        ``gemma4_unified_text`` reuses Gemma4CausalLMModel.  This exercises the
+        12B-family text architecture: dual head_dim (local 16 / global 32),
+        ``attention_k_eq_v`` with a single global KV head, vision-block
+        bidirectional attention, and final-logit softcapping.
+        """
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            pad_token_id=0,
+            tie_word_embeddings=True,
+        )
+        model_cls = registry.get("gemma4_unified_text")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4_unified_text")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert "model" in pkg
+        model = pkg["model"]
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        assert "input_ids" in input_names
+        assert "logits" in output_names
+        # Full-attention layer uses the single global KV head, so its cache
+        # entry has a different head_dim than the sliding layer.
+        assert "past_key_values.0.key" in input_names
+        assert "past_key_values.1.key" in input_names
+
     def test_gemma4_any_to_any_graph(self):
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
@@ -4351,6 +4402,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "deepseek_vl_v2",
     "gemma3",
     "gemma4",
+    "gemma4_unified_text",
     "llava",
     "mllama",
     "phi4_multimodal",
