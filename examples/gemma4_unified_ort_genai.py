@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+r"""Gemma-4-12B (``gemma4_unified``) multimodal generation with onnxruntime-genai.
+
+``google/gemma-4-12B`` is an **encoder-free unified multimodal** checkpoint
+(HuggingFace ``model_type == "gemma4_unified"``).  ``mobius.build`` auto-detects
+it and produces a **4-model package**: ``decoder`` + ``embedding`` +
+``vision_encoder`` + ``audio_encoder``.  Unlike the released ``gemma4`` models
+there is no SigLIP / Conformer tower — raw merged pixel patches (48x48, 6912-dim)
+and raw waveform-frame features (640-dim) are projected directly into language
+space by ``vision_encoder`` / ``audio_encoder``, then scattered into
+``inputs_embeds`` by ``embedding`` at the image / audio placeholder positions.
+
+This script builds the full package via the real
+``mobius.integrations.ort_genai`` export path and runs **text**, **image+text**,
+and **audio+text** generation through onnxruntime-genai on the same package.
+
+Two runtime caveats are handled below:
+
+1. **Patched onnxruntime-genai required.**  gemma-4-12B has a *mixed* KV cache:
+   most layers use 8 heads x head_dim 256, but the global-attention layers use a
+   single 1 head x head_dim 512 KV.  A stock genai build assumes uniform KV
+   shapes and fails to load the decoder.  Use a build that reads per-layer
+   ``num_heads`` / ``head_dim`` from each ``past_key_values.*`` input shape.
+
+2. **HuggingFace preprocessing for image / audio.**  genai's built-in
+   ``Gemma4ImageTransform`` targets the SigLIP ``gemma4`` patch contract
+   (16px, 768-dim), which does **not** match this encoder-free unified model
+   (48px merged patches, 6912-dim).  Until a genai-native unified transform
+   exists, this example preprocesses image / audio with the HuggingFace
+   ``AutoProcessor`` and feeds the resulting tensors to genai via
+   ``Generator.set_inputs(NamedTensors)`` (which bypasses genai's own
+   transform).  Text generation uses the native genai path.
+
+``google/gemma-4-12B`` is a **base** (non-instruction-tuned) checkpoint, so
+outputs are completions, not chat answers.  Numerical correctness of the
+image / audio pipeline is verified separately by the integration tests
+(``tests/integration_test.py::test_gemma4_unified_12b_multimodal_prefill``,
+vision cosine 1.0 vs HuggingFace).
+
+Requirements::
+
+    pip install mobius-ai[ort-genai] transformers pillow librosa
+    # plus a per-layer-KV-aware onnxruntime-genai build (see caveat 1)
+
+Usage::
+
+    # Build the package once and reuse it across modes:
+    python examples/gemma4_unified_ort_genai.py --mode text --save-to out/gemma4_12b/
+
+    # Image + text (reuse the built dir):
+    python examples/gemma4_unified_ort_genai.py --mode image \
+        --model-dir out/gemma4_12b/ --image path/to/photo.jpg
+
+    # Audio + text:
+    python examples/gemma4_unified_ort_genai.py --mode audio \
+        --model-dir out/gemma4_12b/ --audio path/to/clip.flac
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+
+import numpy as np
+import onnxruntime_genai as og
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MODEL_ID = "google/gemma-4-12B"
+# gemma uses BOS id 2.  genai's tokenizer defaults to add_special_tokens=false
+# and this base checkpoint has no chat template, so BOS must be added manually.
+BOS_TOKEN_ID = 2
+IMAGE_TOKEN_ID = 258880
+AUDIO_TOKEN_ID = 258881
+MAX_NEW_TOKENS = 40
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+
+def build_and_export(model_id: str, output_dir: str, dtype: str, ep: str) -> None:
+    """Build the full unified multimodal package and write ORT GenAI artifacts.
+
+    Produces ``decoder`` + ``embedding`` + ``vision_encoder`` + ``audio_encoder``
+    ONNX models plus ``genai_config.json``, tokenizer files, ``image_processor``
+    and audio feature-extraction configs, via the real
+    ``mobius.integrations.ort_genai.auto_export`` path.
+
+    Args:
+        model_id: HuggingFace model ID (``google/gemma-4-12B``).
+        output_dir: Directory to write all outputs.
+        dtype: Model dtype (``"f16"`` recommended for CUDA).
+        ep: Execution provider for ``genai_config.json`` session options.
+    """
+    from mobius.integrations.ort_genai import auto_export
+
+    print(
+        f"Building unified multimodal package for {model_id!r} "
+        f"(dtype={dtype}, ep={ep}) — this downloads ~25GB of weights ..."
+    )
+    manifest = auto_export(model_id, output_dir, dtype=dtype, ep=ep)
+    print(f"Export complete -> {output_dir}")
+    for name, path in sorted(manifest.items()):
+        print(f"  {name}: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Generation helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_model(model_dir: str, ep: str) -> tuple[og.Model, og.Tokenizer]:
+    config = og.Config(model_dir)
+    config.clear_providers()
+    if ep != "cpu":
+        config.append_provider(ep)
+    model = og.Model(config)
+    return model, og.Tokenizer(model)
+
+
+def _decode_loop(
+    model: og.Model, generator: og.Generator, tokenizer: og.Tokenizer, max_new: int
+) -> str:
+    stream = tokenizer.create_stream()
+    tokens: list[int] = []
+    for _ in range(max_new):
+        if generator.is_done():
+            break
+        generator.generate_next_token()
+        tok = int(generator.get_next_tokens()[0])
+        tokens.append(tok)
+        print(stream.decode(tok), end="", flush=True)
+    print()
+    return tokenizer.decode(tokens)
+
+
+def generate_text(model_dir: str, prompt: str, ep: str, max_new: int) -> str:
+    """Greedy text generation through the native genai path (BOS prepended)."""
+    model, tokenizer = _load_model(model_dir, ep)
+    # Prepend BOS manually: base checkpoint, no chat template (see BOS_TOKEN_ID).
+    input_ids = [BOS_TOKEN_ID, *tokenizer.encode(prompt)]
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=len(input_ids) + max_new, do_sample=False)
+    generator = og.Generator(model, params)
+    generator.append_tokens(input_ids)
+
+    print(f"\nPrompt: {prompt}\n" + "-" * 40)
+    text = _decode_loop(model, generator, tokenizer, max_new)
+    print("-" * 40)
+    del generator
+    return text
+
+
+def generate_image(
+    model_dir: str, model_id: str, image_path: str, prompt: str, ep: str, max_new: int
+) -> str:
+    """Image+text generation: HF unified processor -> genai ``set_inputs``.
+
+    genai's built-in image transform targets the SigLIP ``gemma4`` contract, so
+    we preprocess with the HuggingFace processor (48px merged patches, 6912-dim)
+    and inject the tensors directly.  ``set_inputs`` bypasses genai's transform;
+    genai then runs ``vision_encoder -> embedding -> decoder``.
+    """
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    model, tokenizer = _load_model(model_dir, ep)
+    processor = AutoProcessor.from_pretrained(model_id)
+    image = Image.open(image_path).convert("RGB")
+
+    # The HF processor inserts IMAGE_TOKEN_ID placeholders and (for gemma) BOS.
+    proc = processor(
+        text=[f"{processor.image_token}{prompt}"], images=[image], return_tensors="pt"
+    )
+    input_ids = proc["input_ids"].numpy().astype(np.int32)
+    n_image_tokens = int((input_ids == IMAGE_TOKEN_ID).sum())
+
+    nt = og.NamedTensors()
+    nt["input_ids"] = input_ids
+    # Graph input names: pixel_values, pixel_position_ids (HF names them
+    # pixel_values / image_position_ids).
+    nt["pixel_values"] = proc["pixel_values"].numpy().astype(np.float16)
+    nt["pixel_position_ids"] = proc["image_position_ids"].numpy().astype(np.int64)
+    nt["num_image_tokens"] = np.array([n_image_tokens], dtype=np.int64)
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=input_ids.shape[1] + max_new, do_sample=False)
+    generator = og.Generator(model, params)
+    generator.set_inputs(nt)
+
+    print(f"\nImage: {image_path}\nPrompt: {prompt}\n" + "-" * 40)
+    text = _decode_loop(model, generator, tokenizer, max_new)
+    print("-" * 40)
+    del generator
+    return text
+
+
+def generate_audio(
+    model_dir: str, model_id: str, audio_path: str, prompt: str, ep: str, max_new: int
+) -> str:
+    """Audio+text generation: HF unified processor -> genai ``set_inputs``.
+
+    Mirrors :func:`generate_image` for the audio branch.  genai derives the
+    audio-token count from the summed ``audio_sizes`` input, then runs
+    ``audio_encoder -> embedding -> decoder``.
+    """
+    import librosa
+    from transformers import AutoProcessor
+
+    model, tokenizer = _load_model(model_dir, ep)
+    processor = AutoProcessor.from_pretrained(model_id)
+    waveform, _ = librosa.load(audio_path, sr=16000)
+
+    proc = processor(
+        text=[f"{processor.audio_token}{prompt}"],
+        audio=[waveform],
+        return_tensors="pt",
+    )
+    input_ids = proc["input_ids"].numpy().astype(np.int32)
+    n_audio_tokens = int((input_ids == AUDIO_TOKEN_ID).sum())
+
+    nt = og.NamedTensors()
+    nt["input_ids"] = input_ids
+    nt["input_features"] = proc["input_features"].numpy().astype(np.float16)
+    nt["input_features_mask"] = proc["input_features_mask"].numpy().astype(bool)
+    # genai sums audio_sizes to get the audio-token count for the speech branch.
+    nt["audio_sizes"] = np.array([n_audio_tokens], dtype=np.int64)
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=input_ids.shape[1] + max_new, do_sample=False)
+    generator = og.Generator(model, params)
+    generator.set_inputs(nt)
+
+    print(f"\nAudio: {audio_path}\nPrompt: {prompt}\n" + "-" * 40)
+    text = _decode_loop(model, generator, tokenizer, max_new)
+    print("-" * 40)
+    del generator
+    return text
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--mode",
+        default="text",
+        choices=["text", "image", "audio"],
+        help="Which modality to demonstrate.",
+    )
+    parser.add_argument("--model-id", default=MODEL_ID, help="HuggingFace model ID.")
+    parser.add_argument("--prompt", default=None, help="Generation prompt.")
+    parser.add_argument("--image", default=None, help="Image path (image mode).")
+    parser.add_argument("--audio", default=None, help="Audio path (audio mode).")
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=MAX_NEW_TOKENS, help="Max new tokens."
+    )
+    parser.add_argument(
+        "--dtype", default="f16", choices=["f32", "f16", "bf16"], help="Model dtype."
+    )
+    parser.add_argument("--ep", default="cuda", help="Execution provider.")
+    parser.add_argument(
+        "--model-dir", default=None, help="Reuse a pre-built export directory."
+    )
+    parser.add_argument(
+        "--save-to", default=None, help="Build + save to this directory (skip cleanup)."
+    )
+    args = parser.parse_args()
+
+    # Default prompts per mode (base-model completion style).
+    prompt = (
+        args.prompt
+        or {
+            "text": "The capital of France is",
+            "image": " Describe the image:",
+            "audio": " The speaker says",
+        }[args.mode]
+    )
+
+    if args.mode == "image" and not args.image:
+        parser.error("--image is required for --mode image")
+    if args.mode == "audio" and not args.audio:
+        parser.error("--audio is required for --mode audio")
+
+    # Determine the export directory.
+    tmp_dir: str | None = None
+    if args.model_dir is not None:
+        model_dir = args.model_dir
+    else:
+        model_dir = args.save_to
+        if model_dir is None:
+            tmp_dir = tempfile.mkdtemp(prefix="gemma4_12b_mm_")
+            model_dir = tmp_dir
+        build_and_export(args.model_id, model_dir, args.dtype, args.ep)
+
+    try:
+        if args.mode == "text":
+            out = generate_text(model_dir, prompt, args.ep, args.max_new_tokens)
+        elif args.mode == "image":
+            out = generate_image(
+                model_dir,
+                args.model_id,
+                args.image,
+                prompt,
+                args.ep,
+                args.max_new_tokens,
+            )
+        else:
+            out = generate_audio(
+                model_dir,
+                args.model_id,
+                args.audio,
+                prompt,
+                args.ep,
+                args.max_new_tokens,
+            )
+        print(f"\nORT GenAI output:\n{out}")
+    finally:
+        if tmp_dir is not None and args.save_to is None:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
