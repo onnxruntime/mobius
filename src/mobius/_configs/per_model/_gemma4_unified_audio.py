@@ -33,5 +33,6 @@ def _gemma4_unified_audio(config, parent_config, model_type: str, fields: dict):
             hidden_size=audio_embed_dim,
             output_proj_dims=audio_embed_dim,
             audio_token_id=getattr(composite, "audio_token_id", None),
+            rms_norm_eps=getattr(hf_audio, "rms_norm_eps", None),
         )
     }

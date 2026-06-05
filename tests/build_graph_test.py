@@ -1399,8 +1399,9 @@ class TestBuildGraphVisionLanguage:
         Produces a 4-model split (decoder + vision_encoder + audio_encoder +
         embedding).  The vision/audio encoders are encoder-free embedders
         (no SigLIP/Conformer tower); the decoder uses vision-block
-        bidirectional attention, so the embedding model also emits
-        ``block_sequence_ids``.
+        bidirectional attention, which it derives internally from
+        ``input_ids`` (the embedding model does *not* emit
+        ``block_sequence_ids``).
         """
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
 

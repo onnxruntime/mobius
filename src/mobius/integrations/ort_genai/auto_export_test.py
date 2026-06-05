@@ -138,6 +138,15 @@ class TestWriteProcessorConfig:
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
 
+    def test_gemma4_unified_skips_image_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
+        vision = mock.MagicMock()
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma4_unified"
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
+
     def test_pixtral_vision_config(self, tmp_path):
         """Generates pixtral-specific processor config with 7 transforms."""
         vision = mock.MagicMock()
@@ -276,6 +285,13 @@ class TestFixChatTemplate:
         config = mock.MagicMock()
         config.audio = mock.MagicMock()
         config.model_type = "whisper"
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_gemma4_unified_skips_audio_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no audio_processor.json."""
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "gemma4_unified"
         assert _write_audio_processor_config(config, str(tmp_path)) is None
 
     def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):

@@ -5681,9 +5681,7 @@ def test_gemma4_bidirectional_mask_parity():
     graph, builder = _make_graph()
     op = builder.op
     iid = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[1, seq_len])
-    bsid = _compute_block_sequence_ids(
-        op, iid, image_token_id=image_token_id, audio_token_id=None
-    )
+    bsid = _compute_block_sequence_ids(op, iid, image_token_id=image_token_id)
     builder.add_output(bsid, "bsid")
     block_ids = OnnxModelSession(_make_model(graph), device="cpu").run(
         {"input_ids": input_ids}

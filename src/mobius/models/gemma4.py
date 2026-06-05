@@ -1516,6 +1516,12 @@ class Gemma4TextModel(nn.Module):
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         self._hidden_size = config.hidden_size
         self._image_token_id: int = config.image_token_id or 0
+        # The vision-block overlay keys on image_token_id. A 0/None id means the
+        # model has no image-placeholder token (e.g. the text-only backbone
+        # split), so no image tokens can appear — keep pure causal attention
+        # (GQA-eligible) and never build the overlay. This also avoids the
+        # footgun of a 0 fallback marking real token-0 positions as vision.
+        self._has_image_token: bool = bool(config.image_token_id)
         self._audio_token_id: int | None = (
             config.audio.audio_token_id if config.audio is not None else None
         )
@@ -1641,10 +1647,21 @@ class Gemma4TextModel(nn.Module):
         # ``inputs_embeds`` and computes the overlay here, so it does not need a
         # separate cross-model tensor (onnxruntime-genai forwards ``input_ids``
         # to the decoder but cannot forward an arbitrary int tensor). When a
-        # caller supplies ``block_sequence_ids`` directly it is used as-is. The
-        # text-only path has no image tokens, so the overlay is a no-op and
-        # plain causal attention (GQA-eligible) is kept, matching HuggingFace.
-        bidirectional = self._use_bidirectional_attention == "vision"
+        # caller supplies ``block_sequence_ids`` directly it is used as-is.
+        #
+        # Trade-off: the overlay is a *static* graph choice — once a model is
+        # built with ``use_bidirectional_attention == "vision"`` the decoder
+        # always takes the float-bias (``is_causal=0``) path and forgoes GQA,
+        # for text-only prompts and every decode step too. This is unavoidable
+        # in a single static graph: image-token presence is data-dependent at
+        # runtime, and the same graph serves both image prefill and text decode.
+        # It stays numerically correct everywhere — when there are no image
+        # tokens the block ids are all ``-1`` and the ``q_group >= 0`` guard in
+        # ``create_attention_bias`` makes the overlay a pure no-op (plain causal,
+        # matching HuggingFace). Only the fused/GQA fast path is given up.
+        bidirectional = (
+            self._use_bidirectional_attention == "vision" and self._has_image_token
+        )
         if bidirectional and block_sequence_ids is None and input_ids is not None:
             block_sequence_ids = _compute_block_sequence_ids(
                 op,
@@ -2483,7 +2500,8 @@ class _Gemma4UnifiedAudioEmbedderModel(nn.Module):
         super().__init__()
         ac = config.audio  # Gemma4AudioConfig populated by the gemma4_unified hook
         audio_embed_dim = (ac.hidden_size if ac else None) or 640
-        eps = config.rms_norm_eps or 1e-6
+        # Prefer the audio config's own eps; fall back to the text decoder's.
+        eps = (ac.rms_norm_eps if ac else None) or config.rms_norm_eps or 1e-6
         self._text_hidden_size = config.hidden_size
         # HF embed_audio.embedding_pre_projection_norm (scale-free RMSNorm).
         self.projector_norm = _Gemma4ScaleFreeRMSNorm(audio_embed_dim, eps=eps)
