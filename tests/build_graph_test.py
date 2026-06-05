@@ -4485,8 +4485,9 @@ class TestBuildStaticCacheGraph:
         assert "input_ids" in input_names
         assert "position_ids" in input_names
 
-        # No attention_mask in static cache mode — causal masking is
-        # handled by is_causal=1 on the Attention op.
+        # No attention_mask in static cache mode — causal masking is handled
+        # by is_causal=0 plus an explicit offset-aware causal mask built from
+        # write_indices (create_static_cache_causal_mask).
         assert "attention_mask" not in input_names
 
         # Per-layer static cache inputs

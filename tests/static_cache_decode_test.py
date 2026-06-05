@@ -49,9 +49,11 @@ _MODEL_TYPE = "qwen2"
 _CACHE_DTYPE = np.float32
 
 # CUDA attention logits are not bit-reproducible across kernels/drivers, so the
-# "unchanged" poison controls compare with a tolerance rather than exact
-# equality.  The poison magnitude (50.0) moves attended logits far outside this
-# band, so the "changed" controls stay decisive.
+# "unchanged" (equality) poison controls compare with a tolerance rather than
+# exact equality.  The "changed" (negative) controls instead use exact
+# inequality (``not np.array_equal``): any bit of change proves the slot was
+# attended, and the poison magnitude (50.0) guarantees a large, unambiguous
+# change there.
 _LOGIT_RTOL = 1e-5
 _LOGIT_ATOL = 1e-5
 
@@ -267,16 +269,13 @@ def test_static_cache_decode_mask_bounds_attention_to_frontier_on_cuda():
         in_range_feeds = {**decode_inputs, **in_range}
         attended = dict(zip(output_names, session.run(output_names, in_range_feeds)))
 
-    assert not np.allclose(
-        attended["logits"],
-        baseline["logits"],
-        rtol=_LOGIT_RTOL,
-        atol=_LOGIT_ATOL,
-    ), (
-        "decode logits were unchanged when an in-frontier cache slot (0) was "
-        "poisoned — decode is not attending to valid in-range keys, so the "
-        "out-of-range guard would pass vacuously"
-    )
+        # Exact inequality is correct for this negative control: any change at
+        # all proves decode attended the in-range slot (no fp-tolerance band).
+        assert not np.array_equal(baseline["logits"], attended["logits"]), (
+            "decode logits were unchanged when an in-frontier cache slot (0) was "
+            "poisoned — decode is not attending to valid in-range keys, so the "
+            "out-of-range guard would pass vacuously"
+        )
 
 
 def test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cuda():
@@ -370,16 +369,13 @@ def test_static_cache_prefill_causal_mask_blocks_future_keys_within_nonpad_on_cu
         past_feeds = {**block_inputs, **past}
         past_poisoned = dict(zip(output_names, session.run(output_names, past_feeds)))
 
-    assert not np.allclose(
-        past_poisoned["logits"],
-        baseline["logits"],
-        rtol=_LOGIT_RTOL,
-        atol=_LOGIT_ATOL,
-    ), (
-        "block logits were unchanged when a causal-past key (slot 0) was "
-        "poisoned — the query rows are not attending their causal history, so "
-        "the future-key guard would pass vacuously"
-    )
+        # Exact inequality is correct for this negative control: any change at
+        # all proves the rows attended their causal history (no tolerance band).
+        assert not np.array_equal(baseline["logits"], past_poisoned["logits"]), (
+            "block logits were unchanged when a causal-past key (slot 0) was "
+            "poisoned — the query rows are not attending their causal history, so "
+            "the future-key guard would pass vacuously"
+        )
 
 
 def test_static_cache_decode_mask_is_per_batch_on_cuda():
@@ -445,26 +441,22 @@ def test_static_cache_decode_mask_is_per_batch_on_cuda():
         poisoned_feeds = {**decode_inputs, **poisoned}
         poisoned_out = dict(zip(output_names, session.run(output_names, poisoned_feeds)))
 
-    # Row 0 must be untouched: slot 3 is beyond its per-row frontier.
-    np.testing.assert_allclose(
-        poisoned_out["logits"][0],
-        baseline["logits"][0],
-        rtol=_LOGIT_RTOL,
-        atol=_LOGIT_ATOL,
-        err_msg=(
-            "row 0 logits changed when slot 3 was poisoned, but slot 3 is beyond "
-            "row 0's frontier (write_indices=2) — the mask is not applying "
-            "per-batch write_indices (it leaked row 1's wider frontier onto row 0)"
-        ),
-    )
-    # Row 1 must change: slot 3 is within its per-row frontier and attended.
-    assert not np.allclose(
-        poisoned_out["logits"][1],
-        baseline["logits"][1],
-        rtol=_LOGIT_RTOL,
-        atol=_LOGIT_ATOL,
-    ), (
-        "row 1 logits were unchanged when slot 3 (within its frontier, "
-        "write_indices=4) was poisoned — row 1 is not attending an in-frontier "
-        "key, so the per-batch row 0 control would pass vacuously"
-    )
+        # Row 0 must be untouched: slot 3 is beyond its per-row frontier.
+        np.testing.assert_allclose(
+            poisoned_out["logits"][0],
+            baseline["logits"][0],
+            rtol=_LOGIT_RTOL,
+            atol=_LOGIT_ATOL,
+            err_msg=(
+                "row 0 logits changed when slot 3 was poisoned, but slot 3 is beyond "
+                "row 0's frontier (write_indices=2) — the mask is not applying "
+                "per-batch write_indices (it leaked row 1's wider frontier onto row 0)"
+            ),
+        )
+        # Row 1 must change: slot 3 is within its per-row frontier and attended.
+        # Exact inequality is correct for this negative control (no tolerance band).
+        assert not np.array_equal(baseline["logits"][1], poisoned_out["logits"][1]), (
+            "row 1 logits were unchanged when slot 3 (within its frontier, "
+            "write_indices=4) was poisoned — row 1 is not attending an in-frontier "
+            "key, so the per-batch row 0 control would pass vacuously"
+        )
