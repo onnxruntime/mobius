@@ -85,6 +85,16 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi") == "phi"
 
+    def test_gemma4_unified_model_types(self):
+        # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
+        # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
+        # text decoder ("gemma4_unified_text") maps to "gemma4_text".
+        assert _resolve_ort_genai_model_type("gemma4_unified") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_unified_text") == "gemma4_text"
+        # Released gemma4 mappings remain unchanged.
+        assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
+
 
 class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):

@@ -75,6 +75,12 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma2": "gemma",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
+    # gemma-4-12B "unified" (encoder-free) variant reuses the gemma4 ORT GenAI
+    # pipelines: the multimodal package (decoder taking inputs_embeds + vision
+    # embedder + embedding fusion) maps to "gemma4"; the standalone text
+    # backbone maps to "gemma4_text".
+    "gemma4_unified": "gemma4",
+    "gemma4_unified_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
@@ -88,7 +94,9 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_5_vl": "qwen2_5_vl",
 }
 
-_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_GEMMA4_MODEL_TYPES = frozenset(
+    {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"}
+)
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
