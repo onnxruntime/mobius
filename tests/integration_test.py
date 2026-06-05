@@ -5417,7 +5417,7 @@ def test_gemma4_unified_12b_text_prefill():
             attention_mask=torch.from_numpy(attention_mask),
             position_ids=torch.from_numpy(position_ids),
         )
-    hf_logits = hf_out.logits.numpy()
+    hf_logits = hf_out.logits.detach().cpu().numpy()
 
     session = _make_session(pkg["model"])
     feeds = _make_gemma4_prefill_feeds(gemma4_config, input_ids, attention_mask, position_ids)
@@ -5528,10 +5528,12 @@ def test_gemma4_unified_12b_multimodal_prefill():
             hf_full.model.get_image_features(
                 pixel_values, image_position_ids, return_dict=True
             )
-            .pooler_output.numpy()
+            .pooler_output.detach()
+            .cpu()
+            .numpy()
             .astype(np.float32)
         )
-    hf_logits = hf_out.logits.numpy()
+    hf_logits = hf_out.logits.detach().cpu().numpy()
 
     # Build the 4-model gemma4_unified package and load real weights.
     gemma4_config = Gemma4Config.from_transformers(

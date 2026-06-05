@@ -1272,11 +1272,15 @@ class Gemma4Config(VisionLanguageConfig):
 
     Mirrors HF ``Gemma4TextConfig.use_bidirectional_attention``:
     - ``None``: fully causal (smaller Gemma4 models, e.g. E2B).
-    - ``"vision"``: text stays causal, but contiguous vision-token blocks
-      (image/audio placeholders) attend bidirectionally within each block
-      (larger models, e.g. 12B/26B/32B). Implemented via a per-position
-      ``block_sequence_ids`` overlay added onto the causal mask.
-    - ``"all"``: every token attends bidirectionally (no causal mask).
+    - ``"vision"``: text stays causal, but contiguous image-token blocks
+      attend bidirectionally within each block (larger models, e.g.
+      12B/26B/32B). Implemented via a per-position ``block_sequence_ids``
+      overlay added onto the causal mask. Audio placeholders are *not*
+      included (HF marks audio as token-type 3, excluded from the vision
+      block mask), so audio tokens keep causal attention.
+    - ``"all"``: HF mode where every token attends bidirectionally. Not used
+      by any currently supported Gemma4 model and not implemented here; it is
+      treated as fully causal (only ``"vision"`` activates the overlay).
     """
 
     @classmethod
