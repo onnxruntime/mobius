@@ -32,6 +32,7 @@ import numpy as np
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._weight_utils import rename_weight_keys
 from mobius.components import LayerNorm as _LayerNorm
 from mobius.components import Linear as _Linear
 from mobius.components import SiLU as _SiLU
@@ -577,13 +578,14 @@ class HunyuanDiT2DModel(nn.Module):
         - blocks.{i}.ff.net.2 → blocks.{i}.ff.linear_out
         - time_extra_emb.timestep_embedder → time_embed (simplified)
         """
-        new_state_dict: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            new_key = key
-            # GEGLU FFN renames
-            new_key = new_key.replace(".ff.net.0.proj.", ".ff.geglu.proj.")
-            new_key = new_key.replace(".ff.net.2.", ".ff.linear_out.")
-            # Timestep embedding (simplified from HF's combined embedding)
-            new_key = new_key.replace("time_extra_emb.timestep_embedder.", "time_embed.")
-            new_state_dict[new_key] = value
+        new_state_dict: dict[str, torch.Tensor] = rename_weight_keys(
+            state_dict,
+            [
+                # GEGLU FFN renames
+                (".ff.net.0.proj.", ".ff.geglu.proj."),
+                (".ff.net.2.", ".ff.linear_out."),
+                # Timestep embedding (simplified from HF's combined embedding)
+                ("time_extra_emb.timestep_embedder.", "time_embed."),
+            ],
+        )
         return new_state_dict

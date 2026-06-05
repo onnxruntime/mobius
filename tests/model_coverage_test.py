@@ -195,6 +195,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "wav2vec2-conformer": "Audio model — requires audio inputs",
     "wavlm": "Audio model — requires audio inputs",
     "whisper": "Speech-to-text — requires audio inputs",
+    "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",

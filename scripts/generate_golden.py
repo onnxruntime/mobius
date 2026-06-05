@@ -38,6 +38,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import sys
 import time
@@ -804,6 +805,88 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
     )
 
 
+def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for CTC-based ASR (Wav2Vec2ForCTC / MMS).
+
+    The model output is per-frame logits over a vocabulary; we save the
+    top-K over the final frame's logit vector (matching the existing
+    audio-feature-extraction pattern), and when L5 is requested we also
+    save the CTC-greedy-decoded transcript as a token-id sequence so the
+    end-to-end test can compare against the runtime's greedy decode.
+
+    MMS specifically requires picking a target language adapter via
+    ``processor.tokenizer.set_target_lang(lang)`` and
+    ``model.load_adapter(lang)`` before the forward pass. The language is
+    read from ``case.generation_params['lang']`` (default ``"eng"``).
+    """
+    import librosa
+    import torch
+    import transformers
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    lang = case.generation_params.get("lang", "eng")
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code, target_lang=lang
+    )
+    model = transformers.Wav2Vec2ForCTC.from_pretrained(
+        case.model_id,
+        torch_dtype=torch.float32,
+        device_map=device,
+        trust_remote_code=case.trust_remote_code,
+        target_lang=lang,
+        ignore_mismatched_sizes=True,  # MMS lm_head shape changes per language
+    )
+    # For MMS, switching languages also requires loading the per-language adapter.
+    # Non-MMS Wav2Vec2ForCTC checkpoints don't have language adapters;
+    # the missing-adapter case is expected and harmless there.
+    if hasattr(model, "load_adapter"):
+        with contextlib.suppress(ValueError, KeyError, OSError):
+            model.load_adapter(lang)
+    model.eval()
+
+    audio_path = Path("testdata") / case.audio[0]
+    audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
+    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
+        next(model.parameters()).device
+    )
+
+    with torch.no_grad():
+        outputs = model(**processed)
+
+    # CTC logits: (batch, num_frames, vocab_size). Use last frame for top-K.
+    logits = outputs.logits[0]  # (num_frames, vocab_size)
+    last_logits = logits[-1].cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=np.array([[0]], dtype=np.int64),  # placeholder
+    )
+
+    if "L5" in case.level:
+        # CTC greedy decode: argmax over vocab per frame, then collapse
+        # repeats and remove blanks. Save the post-collapse token IDs (and
+        # the decoded text for human inspection) into the standard
+        # ``*_generation.json`` sidecar.
+        predicted_ids = torch.argmax(logits, dim=-1).cpu().numpy()
+        transcript = processor.batch_decode(predicted_ids[np.newaxis, :])[0]
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=str(audio_path),
+            generated_tokens=predicted_ids.tolist(),
+            generated_text=transcript,
+        )
+
+
 def _generate_image_classification(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for image classification (ViT, CLIP, etc.).
 
@@ -1186,6 +1269,7 @@ _GENERATORS = {
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
+    "ctc-asr": _generate_ctc_asr,
     # Vision tasks that produce last_hidden_state — reuse image classification.
     "depth-estimation": _generate_image_classification,
     "image-segmentation": _generate_image_classification,

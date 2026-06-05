@@ -65,11 +65,12 @@ pkg = build(model_id, execution_provider='cuda', dtype='float16')
 tmpdir = tempfile.mkdtemp(prefix="memcpy_profile_")
 
 for name, model in pkg.items():
-    # IMPORTANT: lower opset to 23 — CUDA EP doesn't register many ops
-    # (including Reshape, Cast) at opset 24.  Without this, you'll see
-    # hundreds of false-positive Memcpy from ops that work fine at opset 23.
-    if model.opset_imports.get("", 0) > 23:
-        model.opset_imports[""] = 23
+    # NOTE: ORT ≤1.24.x didn't register CUDA kernels for some opset 24
+    # standard ops.  If profiling on older ORT, lower opset to 23 to
+    # avoid false-positive Memcpy nodes.  On current ORT this is
+    # unnecessary — the correct fix is updating ORT kernel registration.
+    # if model.opset_imports.get("", 0) > 23:
+    #     model.opset_imports[""] = 23
 
     path = os.path.join(tmpdir, f"{name}.onnx")
     ir.save(model, path, external_data=f"{name}.onnx.data")
@@ -120,14 +121,16 @@ This gives you the exact node names causing Memcpy.  Common categories:
 - **Equal/Cast on token IDs** — usually low-impact (small tensors)
 - **CumSum on INT64** — inherent, no GPU kernel
 
-### Critical: opset 24 false positives
+### Critical: opset 24 false positives (ORT ≤1.24.x)
 
-**Always lower opset to 23 before profiling.**  ORT CUDA EP (≤1.24.x)
-does not register kernels for many standard ops at opset 24, including
-`Reshape`, `Cast`, and others.  A Gemma4 decoder at opset 24 shows
-**280 Memcpy** nodes; at opset 23, it shows **4**.  The
-`ort_lower_opset_for_ep` flag in `_flags.py` handles this at runtime,
-but you must apply it manually when profiling with raw ORT sessions.
+**On ORT ≤1.24.x**, CUDA EP did not register kernels for many standard
+ops at opset 24, including `Reshape`, `Cast`, and others.  A Gemma4
+decoder at opset 24 showed **280 Memcpy** nodes; at opset 23, just **4**.
+The correct fix is to update ORT kernel registration for the missing
+opset versions — not to lower the model's opset.  The
+`ort_lower_opset_for_ep` flag in `_flags.py` is available as a
+workaround (disabled by default, opt-in via
+`MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).
 
 ## CPU-only op reference (ORT CUDA EP)
 
@@ -223,6 +226,11 @@ and the `GreaterOrEqual` for causality.
 with `is_causal=1`.  Not applicable to `GroupQueryAttention` (GQA handles
 masking internally via `local_window_size`).
 
+> **Note**: For complex attention patterns (e.g. dual head_dim, KV-shared
+> layers, mixed sliding/full attention), prefer **float additive bias** over
+> bool masks.  Float masks are batch-safe and work correctly with MEA
+> (Memory Efficient Attention) on CUDA.
+
 ### Pattern 3: Use GQA's built-in local_window_size
 
 **Problem**: Sliding-window attention requires an explicit mask (CumSum-based)
@@ -303,12 +311,14 @@ at opset 23.  Results after optimization:
 | Decoder | 4 | `input_ids` (input), 2× `Equal` (token masks), `Where` (bool mask) |
 | Embedding | 3 | `input_ids` (input), 2× `Equal` (token masks) |
 
-### Opset 24 trap
+### Opset 24 historical note (ORT ≤1.24.x)
 
-Without opset lowering, the decoder showed **280 Memcpy** nodes because
-CUDA EP doesn't register `Reshape`, `Cast`, and other standard ops at
-opset 24.  The `ort_lower_opset_for_ep` flag (enabled by default) fixes
-this at runtime.  Always lower to opset 23 before profiling.
+On ORT ≤1.24.x, the decoder showed **280 Memcpy** nodes because
+CUDA EP didn't register `Reshape`, `Cast`, and other standard ops at
+opset 24.  This has been fixed in newer ORT versions.  The
+`ort_lower_opset_for_ep` flag (disabled by default, opt-in via
+`MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`) is available as a workaround for
+older ORT builds.
 
 ## Impact assessment
 
