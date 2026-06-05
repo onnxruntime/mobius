@@ -1,6 +1,6 @@
 ---
 name: mobius-onnx-export-gotchas
-description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed by the fp16 GQA fold-fix), and why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights.
+description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed by the fp16 GQA fold-fix), why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights, and the graph-capture-compatibility rule for graph construction (never emit in-graph If/Loop/Scan control flow — it hard-fails session init under CUDA Graph capture).
 ---
 
 # mobius ONNX export gotchas
@@ -198,3 +198,76 @@ GQA op's **internal hidden-state output** value_info (`v_*.GroupQueryAttention_*
 correct `3072`=32×96). That value is **not** a declared graph I/O — runtime is correct and `onnxruntime-genai`
 does not trust it — so it does not bite shape-trusting consumers the way the present-output bug did. Tracked
 as a follow-up in the GQA rewrite emission path (not the KV-cache output path).
+
+## 7. Graph-capture compatibility: never emit in-graph control flow
+
+This is general guidance for **anyone constructing model graphs in mobius**, broader
+than the static-cache case below — it constrains how *every* exported graph must be
+built.
+
+### Principle: exported graphs must run under graph capture, not just eager
+
+mobius ships models for **onnxruntime / onnxruntime-genai**. On the production and edge
+execution paths these run under **CUDA Graph capture**:
+
+- CUDA EP with `enable_cuda_graph=1`,
+- DML EP **always** captures,
+- NvTensorRtRtx EP captures (with shared buffers),
+- onnxruntime-genai's default decode design uses `past_present_share_buffer` + static
+  shapes, purpose-built for capture.
+
+Capture records the kernel-launch sequence once and replays it, eliminating the
+per-launch overhead that dominates the decode loop. So an exported graph **must** be
+capture-compatible. **Do not ship a model that only runs in eager.**
+
+### Hard constraint: control-flow nodes make session init FAIL under capture
+
+When a graph-capture-enabled EP loads a model that contains **control-flow nodes**, ORT
+**hard-fails session init** — it does not silently fall back to eager.
+
+- Source: onnxruntime `core/session/inference_session.cc`. `HasControlflowNodes(graph)`
+  returns true for any node that owns a subgraph (**`If` / `Loop` / `Scan`**), and ORT
+  then returns `ORT_MAKE_STATUS(..., FAIL, "This session cannot use the graph capture
+  feature as the model has control flow nodes which can't be supported by <EP>")`.
+- It is **branch-agnostic**: an `If` that always takes the same branch at runtime
+  **still** triggers the failure — the node is physically present in the graph, which is
+  all the check inspects.
+- Secondary break: capture requires a single partition / no `Memcpy` nodes; control-flow
+  plumbing that lands partly on the CPU EP also defeats capture even where the primary
+  check would not.
+
+### Empirically confirmed
+
+A per-layer-`If` static-cache export loaded on **CUDA EP with `enable_cuda_graph=1`**
+fails with `FAIL: ... model has control flow nodes which can't be supported by
+CUDAExecutionProvider`. The **same** model loads fine in **eager** (`enable_cuda_graph=0`).
+DML and NvTensorRtRtx follow the same EP-agnostic gate (source-reasoned; DML not
+runtime-tested on Linux).
+
+### Measurement caveat
+
+A control-flow node's **own** GPU cost measured in **eager** (e.g. a CUPTI per-node
+profile) can read as ~0 and is **not** representative: in capture mode that same node
+prevents capture *entirely*, so its real cost is "the whole model can't be captured."
+Always evaluate export choices against the **capture path**, not eager.
+
+### Rule for graph construction
+
+Avoid **in-graph, data-dependent control flow** (`If` / `Loop` / `Scan`). Express
+phase- or shape-dependent behavior via either:
+
+1. **Host-side dispatch** — separate prefill/decode `Run` calls (which onnxruntime-genai
+   already does), or
+2. **Branchless formulations** — compute the same result without a subgraph.
+
+Concrete: static-cache causal masking must use **`is_causal=0` + an explicit
+offset-aware mask** (branchless), **not** an `If(Greater(S_q, 1))` phase-split.
+
+### Cautionary example (why this PR ships the branchless path)
+
+A per-layer `If(Greater(S_q, 1))` phase-split (prefill-masked / decode-maskless) was
+numerically correct and even kept decode on the Flash kernel — but it **fails to load
+under graph capture** and was abandoned for exactly that reason. The always-masked
+**`is_causal=0` + explicit-mask** path (decode runs on Memory-Efficient Attention) is
+**branchless and capture-safe**, and that is what this PR ships. See §2 / the
+`create_static_cache_causal_mask` helper for the masking mechanics.
