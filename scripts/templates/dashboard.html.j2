@@ -161,7 +161,6 @@ tr:hover { background: rgba(88, 166, 255, 0.05); }
    the same classes are reused for L2 and L3 badges so visual treatment of
    "expected failure", "pass", and "skipped" stays consistent across levels. */
 .status-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
-.status-pass { background: rgba(63,185,80,0.2); color: var(--l3); }
 .status-xfail { background: rgba(163,113,247,0.2); color: var(--xfail); }
 .status-skip { background: rgba(139,148,158,0.2); color: var(--text-muted); }
 .ratio-badge { font-size: 0.75em; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
@@ -588,10 +587,12 @@ function renderModelRow(m) {
   } else if (m.l2_status === 'xfail_graph_only') {
     l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
   }
+  // Positive states (L3 parity pass, L5 e2e verified) are intentionally NOT
+  // badged here: they would duplicate the Confidence column and the L1-L5 dot
+  // strip. Only exception states (xfail / skip) get inline badges, since those
+  // are the signals not otherwise distinguishable at a glance.
   let l3Badge = '';
-  if (m.l3_status === 'pass') {
-    l3Badge = ' <span class="status-badge status-pass" title="L3 synthetic parity passes">\u2713</span>';
-  } else if (m.l3_status === 'xfail') {
+  if (m.l3_status === 'xfail') {
     l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
   } else if (m.l3_status === 'skip') {
     l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
