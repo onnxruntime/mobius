@@ -34,11 +34,27 @@ Two runtime caveats are handled below:
    ``Generator.set_inputs(NamedTensors)`` (which bypasses genai's own
    transform).  Text generation uses the native genai path.
 
+3. **Structural-token suppression.**  HF's ``generation_config`` suppresses the
+   ``<end_of_image>`` / ``<end_of_audio>`` tokens (``suppress_tokens``).  genai
+   has no native equivalent, so without it this base checkpoint degenerates into
+   repeating ``<image|>`` after an image instead of describing it.  The decode
+   loop masks those token ids to ``-inf`` before sampling (see SUPPRESS_TOKEN_IDS
+   and ``_decode_loop``).
+
 ``google/gemma-4-12B`` is a **base** (non-instruction-tuned) checkpoint, so
-outputs are completions, not chat answers.  Numerical correctness of the
-image / audio pipeline is verified separately by the integration tests
-(``tests/integration_test.py::test_gemma4_unified_12b_multimodal_prefill``,
-vision cosine 1.0 vs HuggingFace).
+completion-style leads work far better than instructions (the defaults use
+"This image shows" / "The audio says", not "Describe ...").  Verified outputs on
+GPU (f16, greedy, matching HuggingFace ``model.generate``):
+
+- text  "The capital of Japan is"  -> " Tokyo."
+- image (Sydney Chinatown photo)   -> " the Chinese Arch in the Chinatown of
+  Sydney, Australia."
+- audio (LibriSpeech clip)          -> " He hoped there would be stew for
+  dinner, turnips and carrots and bruised potatoes ..."
+
+Numerical correctness of the image / audio pipeline is also verified by the
+integration tests (``tests/integration_test.py::
+test_gemma4_unified_12b_multimodal_prefill``, vision cosine 1.0 vs HuggingFace).
 
 Optional ``--quantize Q4_K_M`` INT4-quantizes the decoder with Olive (~23GB ->
 ~6.8GB, 3.4x smaller).  Spot-checked quality on this base model: coherent text
@@ -91,6 +107,12 @@ MODEL_ID = "google/gemma-4-12B"
 BOS_TOKEN_ID = 2
 IMAGE_TOKEN_ID = 258880
 AUDIO_TOKEN_ID = 258881
+# Structural multimodal tokens that the base model tends to emit verbatim during
+# generation (``<end_of_image>`` / ``<end_of_audio>``).  HF's generation_config
+# lists them in ``suppress_tokens``; genai has no native suppression, so the
+# decode loop forces their logits to -inf (see _decode_loop).  Without this the
+# base checkpoint degenerates into repeating ``<image|>`` instead of captioning.
+SUPPRESS_TOKEN_IDS = (258882, 258883)
 MAX_NEW_TOKENS = 40
 
 
@@ -239,6 +261,12 @@ def _decode_loop(
     for _ in range(max_new):
         if generator.is_done():
             break
+        # Suppress the structural multimodal tokens before sampling, mirroring
+        # HF generation_config's ``suppress_tokens`` (genai has no native
+        # equivalent).  get_logits -> mask -> set_logits -> sample.
+        logits = generator.get_logits()
+        logits[..., list(SUPPRESS_TOKEN_IDS)] = float("-inf")
+        generator.set_logits(logits)
         generator.generate_next_token()
         tok = int(generator.get_next_tokens()[0])
         tokens.append(tok)
@@ -395,13 +423,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Default prompts per mode (base-model completion style).
+    # Default prompts per mode. This is a *base* (non-instruction-tuned)
+    # checkpoint, so completion-style leads work far better than instructions.
     prompt = (
         args.prompt
         or {
             "text": "The capital of France is",
-            "image": " Describe the image:",
-            "audio": " The speaker says",
+            "image": "This image shows",
+            "audio": "The audio says",
         }[args.mode]
     )
 
