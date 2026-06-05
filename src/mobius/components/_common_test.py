@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components._common import (
     Embedding,
     Linear,
@@ -128,8 +130,6 @@ class TestBlockwiseAttentionBias:
 
     @staticmethod
     def _build(sliding):
-        import onnx_ir as ir
-
         b, op, g = create_test_builder()
         input_ids = create_test_input(b, "input_ids", [1, "S"], dtype=ir.DataType.INT64)
         attn = create_test_input(b, "attention_mask", [1, "T"], dtype=ir.DataType.INT64)
@@ -148,8 +148,6 @@ class TestBlockwiseAttentionBias:
 
     @staticmethod
     def _ref(block_ids, attn, sliding):
-        import numpy as np
-
         cumsum = np.cumsum(attn)
         qi = cumsum[:, None]
         ki = cumsum[None, :]
@@ -162,10 +160,6 @@ class TestBlockwiseAttentionBias:
         return m & (np.array(attn)[None, :].astype(bool))
 
     def _run(self, sliding, block_ids, attn):
-        import numpy as np
-
-        from mobius._testing.ort_inference import OnnxModelSession
-
         sess = OnnxModelSession(self._build(sliding), device="cpu")
         block_ids = np.array([block_ids], dtype=np.int64)
         attn = np.array([attn], dtype=np.int64)
@@ -181,8 +175,6 @@ class TestBlockwiseAttentionBias:
         return attended, expected
 
     def test_multi_block_full_attention(self):
-        import numpy as np
-
         # Two vision blocks (pos 1-2 and 4-5) separated by text.
         attended, expected = self._run(None, [-1, 0, 0, -1, 1, 1, -1, -1], [1] * 8)
         assert np.array_equal(attended, expected)
@@ -192,8 +184,6 @@ class TestBlockwiseAttentionBias:
         assert not attended[3, 4]
 
     def test_block_wider_than_sliding_window(self):
-        import numpy as np
-
         # Single block spanning positions 1..4 with a window of 2: the block
         # must escape the sliding window (same-block OR overrides the window).
         attended, expected = self._run(2, [-1, 0, 0, 0, 0, -1, -1, -1], [1] * 8)
@@ -201,8 +191,6 @@ class TestBlockwiseAttentionBias:
         assert attended[4, 1]  # distance 3 >= window, allowed via same block
 
     def test_padding_still_masked(self):
-        import numpy as np
-
         # Last two positions are padding (attention_mask == 0).
         attended, expected = self._run(
             2, [-1, 0, 0, -1, -1, -1, -1, -1], [1, 1, 1, 1, 1, 1, 0, 0]
@@ -211,11 +199,7 @@ class TestBlockwiseAttentionBias:
         assert not attended[:, 6:].any()  # nothing attends to padding
 
     def test_decode_single_query_is_causal(self):
-        import numpy as np
-
         # Decode step: q_len=1 (new text token, group -1), kv total length 8.
-        from mobius._testing.ort_inference import OnnxModelSession
-
         sess = OnnxModelSession(self._build(None), device="cpu")
         out = sess.run(
             {
