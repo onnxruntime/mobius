@@ -2310,9 +2310,16 @@ class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
         self.pos_norm = LayerNorm(mm_embed_dim, eps=eps)
         # Scale-free RMSNorm before the projection (HF
         # embed_vision.multimodal_embedder.embedding_pre_projection_norm).
-        self.projector_norm = _Gemma4ScaleFreeRMSNorm(out_proj_dim, eps=eps)
+        # The projection consumes the post-position-norm activations, whose
+        # last dim is mm_embed_dim (HF embedding_projection: mm_embed_dim →
+        # text_hidden). out_proj_dim is retained only as a sanity check.
+        assert out_proj_dim == mm_embed_dim, (
+            "gemma4_unified vision projector expects output_proj_dims == "
+            f"mm_embed_dim, got {out_proj_dim} != {mm_embed_dim}"
+        )
+        self.projector_norm = _Gemma4ScaleFreeRMSNorm(mm_embed_dim, eps=eps)
         # HF embed_vision.multimodal_embedder.embedding_projection (no bias).
-        self.projector = Linear(out_proj_dim, config.hidden_size, bias=False)
+        self.projector = Linear(mm_embed_dim, config.hidden_size, bias=False)
 
     def forward(
         self,
