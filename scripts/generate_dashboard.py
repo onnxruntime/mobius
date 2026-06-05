@@ -466,7 +466,7 @@ def _scan_l4_golden_files(models: dict[str, ModelInfo]) -> None:
         info.l4_status = "pass"
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
-    for model_type, info in models.items():
+    for info in models.values():
         if info.l4_status is not None or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
@@ -495,7 +495,7 @@ def _scan_l5_generation_golden(models: dict[str, ModelInfo]) -> None:
         info.l5_status = "pass"
 
     # Strategy 2: YAML-derived path (case_id may differ from model_type)
-    for model_type, info in models.items():
+    for info in models.values():
         if info.l5_status is not None or not info.yaml_test_case_file:
             continue
         case_path = _REPO_ROOT / info.yaml_test_case_file
