@@ -403,10 +403,14 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
 
-    # Build chat-formatted prompt with image placeholders if the
-    # processor supports apply_chat_template (Qwen-VL, Gemma-3, etc.)
+    # Build chat-formatted prompt with image placeholders if the processor has a
+    # usable chat template (Qwen-VL, Gemma-3, etc.). Base checkpoints (e.g.
+    # google/gemma-4-12B) ship no chat template, so fall back to manually
+    # prepending one image placeholder token per image — the processor then
+    # expands each into the correct number of soft tokens (mirrors how
+    # examples/gemma4_unified_ort_genai.py formats image prompts).
     prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
+    if getattr(processor, "chat_template", None):
         content: list[dict[str, str]] = []
         for img_path in case.images:
             content.append({"type": "image", "image": str(Path("testdata") / img_path)})
@@ -415,6 +419,8 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+    elif getattr(processor, "image_token", None):
+        prompt_text = processor.image_token * len(case.images) + prompt_text
 
     # Process multimodal inputs through the HF processor
     processed = processor(
@@ -739,7 +745,7 @@ def _prepare_speech_language_inputs(
     else:
         # Gemma4-style: text prompt + audio
         prompt_text = case.prompts[0]
-        if hasattr(processor, "apply_chat_template"):
+        if getattr(processor, "chat_template", None):
             content: list[dict[str, str]] = [
                 {"type": "audio", "audio": str(audio_path)},
                 {"type": "text", "text": prompt_text},
@@ -748,6 +754,10 @@ def _prepare_speech_language_inputs(
             prompt_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+        elif getattr(processor, "audio_token", None):
+            # Base checkpoint (no chat template): manually prepend the audio
+            # placeholder; the processor expands it to the right token count.
+            prompt_text = processor.audio_token + prompt_text
         model_device = _get_model_device(model, device)
         processed = processor(
             text=prompt_text,

@@ -6,7 +6,7 @@ dtype: "float32"
 
 inputs:
   prompts:
-    - "Describe this image in detail."
+    - "This image shows"
   images:
     - "pipeline-cat-chonk.jpeg"
 
@@ -15,6 +15,7 @@ level: "L4+L5"
 generation:
   max_new_tokens: 30
   do_sample: false
+  eos_token_id: 1
 
-skip_reason: "Gated repo (google/gemma-4-12B requires authentication). Model is 12B — too large for CI."
+ci_skip_reason: "Model is 12B — too large for CI hardware. Runs locally (gated repo needs HF auth); golden files are generated and committed."
 notes: "Gemma 4 12B unified (encoder-free) Image-Text-to-Text. Raw-patch vision embedder instead of a SigLIP tower. Split: decoder + vision_encoder + embedding (audio_encoder added when config.audio is set). Vision-block bidirectional attention in the decoder."

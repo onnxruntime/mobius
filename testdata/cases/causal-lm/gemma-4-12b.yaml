@@ -14,5 +14,5 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-skip_reason: "Gated repo (google/gemma-4-12B requires authentication). Model is 12B — too large for CI."
+ci_skip_reason: "Model is 12B — too large for CI hardware. Runs locally (gated repo needs HF auth); golden files are generated and committed."
 notes: "Gemma 4 12B unified (text-only path) via Gemma4CausalLMModel. Dual head_dim (separate attention/value head_dim), single shared KV head (k_eq_v), KV sharing, sliding+global attention, logit softcapping."
