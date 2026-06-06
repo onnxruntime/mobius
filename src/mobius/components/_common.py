@@ -384,8 +384,9 @@ def create_static_cache_causal_mask(
 
     Args:
         op: The OpBuilder.
-        query: Query tensor ``[batch, S_q, hidden]``; only dims 0/1 are
-            read to derive the query sequence length ``S_q``.
+        query: Query sequence source ``[batch, S_q, hidden]`` (3D) **or**
+            ``[batch, S_q]`` (2D, e.g. ``input_ids``); only dim 1 is read,
+            to derive the query sequence length ``S_q``.
         key_cache: Pre-allocated key cache ``[batch, max_seq, kv_hidden]``;
             dim 1 supplies the total KV length ``max_seq``.
         write_indices: Per-batch write start position ``[batch]`` INT64 —
@@ -416,5 +417,7 @@ def create_static_cache_causal_mask(
     query_positions = op.Unsqueeze(query_positions, [1, 3])  # [batch, 1, S_q, 1]
     key_positions = op.Unsqueeze(key_positions, [0, 1, 2])  # [1, 1, 1, max_seq]
 
-    # Keep key slot j for query at position p iff j <= p (causal + padding).
+    # Keep key slot j for query at position p iff j <= p (positional causal
+    # bound only; the nonpad/padding key-bound is enforced by the ORT Attention
+    # kernel via nonpad_kv_seqlen, input #6 — this mask must not re-encode it).
     return op.GreaterOrEqual(query_positions, key_positions)

@@ -460,3 +460,128 @@ class TestGQAContextDispatch:
         # Neither path should leave any standard Attention nodes
         assert ops_direct.get("Attention", 0) == 0
         assert ops_rewrite.get("Attention", 0) == 0
+
+
+class TestApplyAttentionStaticCacheFallback:
+    """`_apply_attention` static-cache mask fallback when ``causal_mask`` is None.
+
+    Production hoists a single shared mask via ``StaticCacheState.causal_mask``.
+    Direct callers (e.g. unit tests) may leave ``causal_mask=None``; the
+    fallback must then build the mask on demand via the 4-arg
+    ``create_static_cache_causal_mask`` path, yielding a graph equivalent to the
+    hoisted path. This covers the otherwise-untested ``None`` branch.
+    """
+
+    NUM_HEADS = 2
+    KV_HEADS = 2
+    HEAD_DIM = 8
+    BATCH = 1
+    S_Q = 2
+    MAX_SEQ = 4
+
+    def _build_static_cache_attention(self, *, hoist: bool):
+        """Build a graph that calls ``_apply_attention`` in static-cache mode.
+
+        When ``hoist`` is True the mask is built once up front and threaded
+        through ``StaticCacheState.causal_mask`` (production path); when False
+        the field is ``None`` so ``_apply_attention`` must build it on demand
+        (fallback path). Returns ``(graph, hoisted_mask_or_None)``.
+        """
+        from mobius.components._attention import (
+            StaticCacheState,
+            _apply_attention,
+        )
+        from mobius.components._common import create_static_cache_causal_mask
+
+        hidden = self.NUM_HEADS * self.HEAD_DIM
+        builder, op, graph = create_test_builder()
+        query = create_test_input(builder, "query", [self.BATCH, self.S_Q, hidden])
+        key = create_test_input(builder, "key", [self.BATCH, self.S_Q, hidden])
+        value = create_test_input(builder, "value", [self.BATCH, self.S_Q, hidden])
+        key_cache = create_test_input(builder, "key_cache", [self.BATCH, self.MAX_SEQ, hidden])
+        value_cache = create_test_input(
+            builder, "value_cache", [self.BATCH, self.MAX_SEQ, hidden]
+        )
+        write_indices = create_test_input(
+            builder, "write_indices", [self.BATCH], ir.DataType.INT64
+        )
+        nonpad_kv_seqlen = create_test_input(
+            builder, "nonpad_kv_seqlen", [self.BATCH], ir.DataType.INT64
+        )
+
+        hoisted_mask = None
+        if hoist:
+            hoisted_mask = create_static_cache_causal_mask(op, query, key_cache, write_indices)
+
+        static_cache = StaticCacheState(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            write_indices=write_indices,
+            nonpad_kv_seqlen=nonpad_kv_seqlen,
+            causal_mask=hoisted_mask,
+        )
+        _apply_attention(
+            op,
+            query,
+            key,
+            value,
+            None,
+            None,
+            None,
+            num_attention_heads=self.NUM_HEADS,
+            num_key_value_heads=self.KV_HEADS,
+            scale=self.HEAD_DIM**-0.5,
+            static_cache=static_cache,
+        )
+        return graph, hoisted_mask
+
+    def test_fallback_builds_causal_mask_when_none(self):
+        """causal_mask=None → Attention attn_mask is built via the 4-arg path."""
+        graph, _ = self._build_static_cache_attention(hoist=False)
+
+        attention_nodes = [n for n in graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == 1
+
+        attn_mask_input = attention_nodes[0].inputs[3]
+        assert attn_mask_input is not None and attn_mask_input.name != "", (
+            f"fallback should connect an explicit causal attn_mask, got {attn_mask_input}"
+        )
+        producer = attn_mask_input.producer()
+        assert producer is not None and producer.op_type == "GreaterOrEqual", (
+            "fallback should build the mask via create_static_cache_causal_mask "
+            f"(GreaterOrEqual root), got {None if producer is None else producer.op_type}"
+        )
+        # The mask construction subgraph is present exactly once (built on demand):
+        # one GreaterOrEqual root over two Range index vectors (q_offsets, key_positions).
+        assert count_op_type(graph, "GreaterOrEqual") == 1
+        assert count_op_type(graph, "Range") == 2
+
+    def test_hoisted_mask_is_consumed_not_rebuilt(self):
+        """causal_mask present → the exact shared Value is consumed, no rebuild."""
+        graph, hoisted_mask = self._build_static_cache_attention(hoist=True)
+
+        attention_nodes = [n for n in graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == 1
+        # Identity: the hoisted mask Value is consumed directly.
+        assert attention_nodes[0].inputs[3] is hoisted_mask
+        # Still exactly one mask root — the hoisted one, not a second rebuild.
+        assert count_op_type(graph, "GreaterOrEqual") == 1
+
+    def test_fallback_graph_equivalent_to_hoisted(self):
+        """The fallback-built mask is equivalent to the hoisted mask.
+
+        Both paths call ``create_static_cache_causal_mask`` exactly once with the
+        same args and run the same ``_apply_attention`` body, so the resulting
+        graphs must have identical op-type multisets.
+        """
+        from collections import Counter
+
+        graph_fallback, _ = self._build_static_cache_attention(hoist=False)
+        graph_hoist, _ = self._build_static_cache_attention(hoist=True)
+
+        counts_fallback = Counter(n.op_type for n in graph_fallback)
+        counts_hoist = Counter(n.op_type for n in graph_hoist)
+        assert counts_fallback == counts_hoist, (
+            "fallback-built mask graph differs from the hoisted-mask graph: "
+            f"{dict(counts_fallback)} vs {dict(counts_hoist)}"
+        )

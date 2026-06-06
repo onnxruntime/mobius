@@ -323,6 +323,12 @@ def _make_static_cache_inputs(
         )
         cache_pairs.append((key_cache, value_cache))
 
+    # A zero-layer model has no cache and no mask to build; return early
+    # before indexing cache_pairs[0][0] (which would raise IndexError) and
+    # before registering shared inputs that would have no consumer.
+    if not cache_pairs:
+        return []
+
     # Shared inputs across all layers
     write_indices = builder.input(
         "write_indices",
