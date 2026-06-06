@@ -4583,13 +4583,17 @@ class TestBuildStaticCacheGraph:
 
         With is_causal=0, causality must come from input 3 (attn_mask).
         The mask is produced by create_static_cache_causal_mask, whose
-        final op is a GreaterOrEqual yielding a bool mask.
+        final op is a GreaterOrEqual yielding a bool mask.  Because the mask is
+        layer-invariant it is hoisted and built once, so every Attention node
+        must reference the *same* mask ``ir.Value`` (identity), not a per-layer
+        rebuild.
         """
         model, config = self._build_static_cache_model()
 
         attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
         assert len(attention_nodes) == config.num_hidden_layers
 
+        shared_mask = None
         for node in attention_nodes:
             # Input 3 (0-indexed) is attn_mask — should be a real value now.
             attn_mask_input = node.inputs[3]
@@ -4603,6 +4607,47 @@ class TestBuildStaticCacheGraph:
                 f"the causal-mask GreaterOrEqual, got "
                 f"{None if producer is None else producer.op_type}"
             )
+            # Hoist invariant: all layers share the identical mask Value.
+            if shared_mask is None:
+                shared_mask = attn_mask_input
+            else:
+                assert attn_mask_input is shared_mask, (
+                    "Attention nodes reference different mask Values — the "
+                    "layer-invariant static-cache mask was rebuilt per layer "
+                    "instead of being hoisted/shared"
+                )
+
+    def test_static_cache_mask_built_once(self):
+        """The layer-invariant mask is built once and shared, not per layer.
+
+        The mask depends only on S_q, max_seq and write_indices — all identical
+        across layers — so the construction ops must appear exactly once
+        regardless of layer count, and every Attention node must consume that
+        single shared mask Value.
+        """
+        model, config = self._build_static_cache_model()
+        num_layers = config.num_hidden_layers
+        assert num_layers >= 2, "Need >=2 layers to prove the mask is not per-layer"
+
+        op_type_counts: dict[str, int] = {}
+        for node in model.graph:
+            op_type_counts[node.op_type] = op_type_counts.get(node.op_type, 0) + 1
+
+        # Mask root op appears ONCE (not once per layer).
+        assert op_type_counts.get("GreaterOrEqual", 0) == 1, (
+            f"Expected exactly 1 GreaterOrEqual (single shared mask root), got "
+            f"{op_type_counts.get('GreaterOrEqual', 0)} — mask appears to be "
+            f"rebuilt per layer"
+        )
+
+        # Every Attention node references the one shared mask Value.
+        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == num_layers
+        mask_values = {id(n.inputs[3]) for n in attention_nodes}
+        assert len(mask_values) == 1, (
+            f"Attention nodes reference {len(mask_values)} distinct mask Values; "
+            f"expected 1 shared hoisted mask across all {num_layers} layers"
+        )
 
     def test_static_cache_graph_contains_causal_mask_ops(self):
         """Static cache graph must contain the causal-mask construction ops.

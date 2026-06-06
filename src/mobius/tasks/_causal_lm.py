@@ -11,6 +11,7 @@ from onnxscript import GraphBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
+from mobius.components._common import create_static_cache_causal_mask
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -134,6 +135,7 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 max_seq_len,
+                input_ids,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -287,15 +289,24 @@ def _make_static_cache_inputs(
     dtype: ir.DataType,
     batch: ir.SymbolicDim,
     max_seq_len: int,
+    query_seq_source: ir.Value,
 ) -> list[StaticCacheState]:
     """Create static KV cache inputs for ``num_layers`` layers.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
 
+    Args:
+        query_seq_source: Any ``[batch, S_q, ...]`` or ``[batch, S_q]`` Value
+            (``input_ids`` works) — only dim 1 is read, to derive the query
+            sequence length ``S_q`` for the shared causal mask.
+
     Returns:
         A list of :class:`StaticCacheState` tuples for passing to the
-        module via ``past_key_values``.
+        module via ``past_key_values``.  Every entry carries the SAME
+        ``causal_mask`` Value (the mask is layer-invariant, so it is built
+        once here and shared across layers).
     """
+    op = builder.op
     kv_hidden = num_key_value_heads * head_dim
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
 
@@ -324,7 +335,20 @@ def _make_static_cache_inputs(
         shape=[batch],
     )
 
-    # Build StaticCacheState for each layer (shared indices)
+    # Build the static-cache causal mask ONCE — it is layer-invariant
+    # (depends only on S_q, max_seq and write_indices, all identical across
+    # layers).  The first layer's key_cache supplies max_seq (identical for
+    # every layer).  The same ir.Value is then threaded to every layer's
+    # StaticCacheState below, so the graph holds a single shared mask subgraph
+    # instead of one rebuilt copy per layer.
+    causal_mask = create_static_cache_causal_mask(
+        op,
+        query_seq_source,
+        cache_pairs[0][0],
+        write_indices,
+    )
+
+    # Build StaticCacheState for each layer (shared indices + shared mask Value)
     static_caches: list[StaticCacheState] = []
     for key_cache, value_cache in cache_pairs:
         static_caches.append(
@@ -333,6 +357,7 @@ def _make_static_cache_inputs(
                 value_cache=value_cache,
                 write_indices=write_indices,
                 nonpad_kv_seqlen=nonpad_kv_seqlen,
+                causal_mask=causal_mask,
             )
         )
 

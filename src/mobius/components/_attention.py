@@ -66,12 +66,20 @@ class StaticCacheState(NamedTuple):
         value_cache: Pre-allocated value cache [B, max_seq, kv_hidden] 3D.
         write_indices: Position to write new tokens [B] int64.
         nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
+        causal_mask: Prebuilt causal mask [B, 1, S_q, max_seq] bool, shared
+            (same ``ir.Value``) across all layers.  The mask is layer-invariant
+            (depends only on S_q, max_seq and write_indices), so the task layer
+            builds it once and threads the same Value to every layer instead of
+            rebuilding it per layer.  When ``None`` (e.g. a direct
+            ``_apply_attention`` caller that did not hoist the mask) the
+            attention path builds it on demand.
     """
 
     key_cache: ir.Value
     value_cache: ir.Value
     write_indices: ir.Value
     nonpad_kv_seqlen: ir.Value
+    causal_mask: ir.Value | None = None
 
 
 def _apply_attention(
@@ -175,12 +183,19 @@ def _apply_attention(
         # TODO(titaiwang): Support sliding window (circular cache mode)
         # with static cache for long-context models that use local
         # attention windows.
-        static_causal_mask = create_static_cache_causal_mask(
-            op,
-            query,
-            updated_k,
-            static_cache.write_indices,
-        )
+        # The causal mask is layer-invariant, so the task layer normally builds
+        # it ONCE and shares the same ir.Value across every layer via
+        # static_cache.causal_mask (graph-size / perf win that scales with
+        # layer count).  Fall back to building it here for direct callers
+        # (e.g. unit tests) that did not hoist the mask.
+        static_causal_mask = static_cache.causal_mask
+        if static_causal_mask is None:
+            static_causal_mask = create_static_cache_causal_mask(
+                op,
+                query,
+                updated_k,
+                static_cache.write_indices,
+            )
         attn_output = op.Attention(
             query,
             updated_k,

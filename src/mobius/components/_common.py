@@ -359,17 +359,21 @@ def create_static_cache_causal_mask(
     right, i.e. ``nonpad_kv_seqlen[b] == write_indices[b] + S_q`` per batch.
     Under that invariant the padding slots ``j >= nonpad_kv_seqlen[b]`` are
     always greater than ``write_indices[b] + t``, so they are masked out as a
-    side effect (the explicit ``nonpad_kv_seqlen`` bound is still passed to the
-    Attention op, but only to select the external-cache kernel path).  mobius's
-    ``TensorScatter`` writes with sequential ``write_indices`` satisfy this for
-    standard batched generation (per-row prefill scatters ``[0, prompt_len)``).
+    side effect.  The padding bound itself is **enforced by the ORT Attention
+    kernel** via ``nonpad_kv_seqlen`` (external-cache input #6): the kernel
+    clamps attention to key slots ``j < nonpad_kv_seqlen[b]`` independently of
+    this attn_mask, on both the CUDA and CPU EPs (verified: poisoning slots
+    ``[nonpad, max_seq)`` yields bit-identical logits).  This mask is therefore
+    **causal-only** — it must not re-encode the nonpad bound, since a
+    ``j < nonpad_kv_seqlen[b]`` term here would merely duplicate input #6 and
+    add dead graph nodes.  mobius's ``TensorScatter`` writes with sequential
+    ``write_indices`` satisfy the compact invariant for standard batched
+    generation (per-row prefill scatters ``[0, prompt_len)``).
 
-    Ragged / left / interior padding is **out of scope**: a cache that places
-    valid tokens *after* pad slots (or leaves holes below
-    ``write_indices[b] + t``) would have those low pad slots treated as
-    attendable and corrupt the logits.  This export does not support ragged
-    caches; if that changes, add a defensive ``key_positions <
-    nonpad_kv_seqlen[b]`` term to the mask.
+    Ragged / left / interior padding is **out of contract**: a scalar
+    ``nonpad_kv_seqlen`` can only express a compact valid prefix ``[0, nonpad)``
+    and cannot describe interior holes, so neither this mask nor the kernel's
+    input #6 can represent them.  This export does not support ragged caches.
 
     The mask is 4D ``[batch, 1, S_q, max_seq]`` rather than 3D on purpose:
     ``ConvertAttnMaskToBias`` (attention.cc) treats a 3D mask as

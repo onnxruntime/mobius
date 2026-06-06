@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Static-cache mask: build-once hoist
+
+#### Performance
+
+- The static-cache causal mask is now built **once** and shared (same
+  `ir.Value`) across all decoder layers instead of being rebuilt per layer. The
+  mask is layer-invariant (it depends only on `S_q`, `max_seq` and
+  `write_indices`, all identical across layers). A new
+  `StaticCacheState.causal_mask` field threads the shared value from
+  `_make_static_cache_inputs`; `_apply_attention` consumes it and keeps a
+  fallback that builds the mask on demand for direct callers. This removes
+  `~(mask_nodes)·(num_layers − 1)` duplicated nodes from the graph, scaling with
+  layer count (e.g. ~16 nodes × 31 saved on a 32-layer model).
+
 ### Static-cache Attention Causal-Mask Fix
 
 #### Fixed
@@ -22,7 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session init. A new `create_static_cache_causal_mask` helper builds a mask that
   keeps key slot `j` for a query at absolute position `write_indices[b] + t` iff
   `j <= write_indices[b] + t`, serving prefill (triangular) and decode (prefix)
-  with a single rule and subsuming the padding bound. The formulation is
+  with a single rule. The mask is **causal-only**; the `nonpad_kv_seqlen`
+  key-bound is enforced by the ORT `Attention` kernel itself (external-cache
+  input #6, on both CUDA and CPU EPs), so the mask does not re-encode it.
+  Non-compact / interior padding holes are out of contract (a scalar
+  `nonpad_kv_seqlen` cannot express them). The formulation is
   branchless (no `If` phase-split), so the exported graph stays compatible with
   CUDA Graph capture (see the export-gotchas skill, "Graph-capture
   compatibility"); decode and prefill both run on the Memory-Efficient Attention
