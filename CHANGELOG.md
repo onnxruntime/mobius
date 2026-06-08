@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### KV-cache present-shape: fail-closed on partial parameter sets
+
+#### Fixed
+
+- `_register_kv_cache_outputs` now **raises `ValueError`** when given a partial
+  set of present-shape parameters (1–5 of the six `batch`, `num_kv_heads`,
+  `key_head_dim`, `value_head_dim`, `total_seq_len`, `dtype`) instead of logging
+  a warning and proceeding. A partial set is always a wiring slip with no
+  legitimate use; the previous fail-open shipped a structurally-wrong model
+  (mis-derived `GroupQueryAttention` present `head_dim`) with only a log line.
+  Passing all six (stamp) or none (infer) is unaffected. (closes #341)
+
 ### Static-cache mask: build-once hoist
 
 #### Performance

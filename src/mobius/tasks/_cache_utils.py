@@ -11,15 +11,12 @@ multi-component graph builders live in :mod:`mobius.tasks._base`.
 
 from __future__ import annotations
 
-import logging
 from typing import NamedTuple
 
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
 from mobius._configs import BaseModelConfig
-
-logger = logging.getLogger(__name__)
 
 _FUNCTIONS_DOMAIN = "com.microsoft"
 
@@ -149,9 +146,9 @@ def _register_kv_cache_outputs(
     The present-shape parameters are all-or-nothing by design: pass every one
     to stamp the explicit type, or none to opt out and infer. A *partial* set
     is almost always a wiring slip (a caller wired some dims but dropped
-    others), so it is treated conservatively -- the stamp is skipped, the
-    shapes fall back to the known-wrong inference path, and a warning is
-    logged naming the missing parameters so the slip is loud rather than silent.
+    others) and has no legitimate use, so it is rejected fail-closed: a partial
+    set raises :class:`ValueError` naming the provided and missing parameters,
+    rather than silently falling back to the known-wrong inference path.
     """
     params = {
         "batch": batch,
@@ -165,14 +162,12 @@ def _register_kv_cache_outputs(
     stamp = len(provided) == len(params)
     if provided and not stamp:
         missing = [name for name in params if params[name] is None]
-        logger.warning(
-            "_register_kv_cache_outputs received a partial set of present-shape "
-            "parameters (provided %s, missing %s); these are all-or-nothing, so "
-            "the explicit present.* stamp is SKIPPED and shapes fall back to "
-            "inference (which mis-derives head_dim for GroupQueryAttention). "
-            "Pass all six parameters to stamp, or none to opt out.",
-            provided,
-            missing,
+        raise ValueError(
+            f"_register_kv_cache_outputs received a partial set of present-shape "
+            f"parameters (provided {provided}, missing {missing}); these are "
+            f"all-or-nothing. Pass all six to stamp explicit present.* types "
+            f"(required for correct GroupQueryAttention head_dim), or none to opt "
+            f"out and infer."
         )
     for i, (present_key, present_value) in enumerate(present_key_values):
         if stamp:
