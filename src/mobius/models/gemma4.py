@@ -55,6 +55,21 @@ if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
 
 
+def _dtype_safe_compress(
+    op: OpBuilder, data: ir.Value, condition: ir.Value, *, axis: int
+) -> ir.Value:
+    """Row-select ``data`` by ``condition`` in a dtype that ORT supports.
+
+    ORT does not register a ``Compress`` kernel for ``bfloat16``, so a bf16
+    package would fail to load. Run the selection in float32 and cast the
+    result back to ``data``'s dtype. The float16/bfloat16 round-trip through
+    float32 is lossless, so this is exact for every supported build dtype.
+    """
+    data_f32 = op.Cast(data, to=ir.DataType.FLOAT)
+    selected = op.Compress(data_f32, condition, axis=axis)
+    return op.CastLike(selected, data)
+
+
 # ---------------------------------------------------------------------------
 # Shared weight preprocessing helpers
 # ---------------------------------------------------------------------------
@@ -1659,9 +1674,7 @@ class Gemma4TextModel(nn.Module):
         # tokens the block ids are all ``-1`` and the ``q_group >= 0`` guard in
         # ``create_attention_bias`` makes the overlay a pure no-op (plain causal,
         # matching HuggingFace). Only the fused/GQA fast path is given up.
-        bidirectional = (
-            self._use_bidirectional_attention == "vision" and self._has_image_token
-        )
+        bidirectional = self._use_bidirectional_attention == "vision" and self._has_image_token
         if bidirectional and block_sequence_ids is None and input_ids is not None:
             block_sequence_ids = _compute_block_sequence_ids(
                 op,
@@ -2453,7 +2466,7 @@ class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
         keep = op.Reshape(
             op.Not(op.Equal(x_ids, neg_one)), op.Constant(value_ints=[-1])
         )  # [B*N] BOOL
-        return op.Compress(h_flat, keep, axis=0)  # [num_valid, text_hidden]
+        return _dtype_safe_compress(op, h_flat, keep, axis=0)  # [num_valid, text_hidden]
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -2522,7 +2535,7 @@ class _Gemma4UnifiedAudioEmbedderModel(nn.Module):
         # Strip padding frames so output rows align 1:1 with placeholder tokens.
         h_flat = op.Reshape(h, op.Constant(value_ints=[-1, self._text_hidden_size]))
         keep = op.Reshape(input_features_mask, op.Constant(value_ints=[-1]))  # [B*T]
-        return op.Compress(h_flat, keep, axis=0), None  # [num_valid, text_hidden]
+        return _dtype_safe_compress(op, h_flat, keep, axis=0), None  # [num_valid, text_hidden]
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
