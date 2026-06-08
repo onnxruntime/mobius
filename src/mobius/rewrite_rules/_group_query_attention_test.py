@@ -130,6 +130,38 @@ class TestGroupQueryAttentionRules:
         assert counts_after.get("Attention", 0) == 0
         assert counts_after["GroupQueryAttention"] == 28
 
+    def test_skips_when_head_dim_exceeds_max(self):
+        """GQA fusion is skipped when head_dim exceeds the EP capability limit.
+
+        Qwen3-0.6B has head_dim=128. Passing ``max_head_dim=64`` (below the
+        model's head_dim) must leave every decoder ``Attention`` node as a
+        standard op — this is the gate that keeps Gemma4's head_dim=512
+        global-attention layers out of GQA on EPs whose kernel only supports
+        head_dim <= 256.
+        """
+        pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
+        model = pkg["model"]
+        assert count_ops(model)["Attention"] == 28
+
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules(max_head_dim=64))
+
+        counts_after = count_ops(model)
+        assert counts_after.get("Attention", 0) == 28
+        assert counts_after.get("GroupQueryAttention", 0) == 0
+
+    def test_fuses_when_head_dim_within_max(self):
+        """Raising ``max_head_dim`` to the model's head_dim allows fusion."""
+        pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
+        model = pkg["model"]
+        assert count_ops(model)["Attention"] == 28
+
+        # Qwen3-0.6B head_dim=128; an explicit limit at/above it fuses all layers.
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules(max_head_dim=128))
+
+        counts_after = count_ops(model)
+        assert counts_after.get("Attention", 0) == 0
+        assert counts_after["GroupQueryAttention"] == 28
+
     def test_absorbs_rotary_embedding(self):
         """RotaryEmbedding ops are absorbed into GQA with do_rotary=1."""
         pkg = build("Qwen/Qwen3-0.6B", load_weights=False)
