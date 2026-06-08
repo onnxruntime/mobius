@@ -145,10 +145,10 @@ def _register_kv_cache_outputs(
 
     The present-shape parameters are all-or-nothing by design: pass every one
     to stamp the explicit type, or none to opt out and infer. A *partial* set
-    is almost always a wiring slip (a caller wired some dims but dropped
-    others) and has no legitimate use, so it is rejected fail-closed: a partial
-    set raises :class:`ValueError` naming the provided and missing parameters,
-    rather than silently falling back to the known-wrong inference path.
+    is always a wiring slip (a caller wired some dims but dropped others) and is
+    never legitimate, so it is rejected fail-closed: a partial set raises
+    :class:`ValueError` naming the provided and missing parameters, rather than
+    silently falling back to the known-wrong inference path.
     """
     params = {
         "batch": batch,

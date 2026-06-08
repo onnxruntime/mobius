@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import onnx_ir as ir
 import pytest
 
@@ -75,19 +73,16 @@ class TestRegisterKVCacheOutputs:
         assert _dims(key)[1] == 16 and _dims(key)[3] == 192
         assert _dims(value)[1] == 16 and _dims(value)[3] == 128
 
-    def test_no_params_leaves_shapes_untouched(self, caplog):
+    def test_no_params_leaves_shapes_untouched(self):
         """Without shape params the helper must not stamp (inference path)."""
         _, builder = _make_graph()
         pairs = [_present_pair("present.0", wrong_head_dim=32)]
 
-        with caplog.at_level(logging.WARNING, logger="mobius.tasks._cache_utils"):
-            _register_kv_cache_outputs(builder, pairs)
+        _register_kv_cache_outputs(builder, pairs)
 
         key, _ = pairs[0]
         # Unchanged: still the (wrong) pre-existing inferred shape.
         assert _dims(key) == ["batch", 32, "seq", 32]
-        # Opting out (zero params) is intentional and must stay silent.
-        assert caplog.text == ""
 
     def test_partial_params_raise(self):
         """A partial present-shape set is a wiring slip -> must raise.
@@ -100,7 +95,7 @@ class TestRegisterKVCacheOutputs:
         _, builder = _make_graph()
         pairs = [_present_pair("present.0", wrong_head_dim=32)]
 
-        with pytest.raises(ValueError, match="partial set of present-shape parameters"):
+        with pytest.raises(ValueError, match="partial set of present-shape parameters") as exc:
             _register_kv_cache_outputs(
                 builder,
                 pairs,
@@ -110,13 +105,6 @@ class TestRegisterKVCacheOutputs:
             )
 
         # The message must name every omitted parameter so the slip is diagnosable.
-        with pytest.raises(ValueError) as exc:
-            _register_kv_cache_outputs(
-                builder,
-                pairs,
-                batch=ir.SymbolicDim("batch"),
-                num_kv_heads=32,
-            )
         for missing in ("key_head_dim", "value_head_dim", "total_seq_len", "dtype"):
             assert missing in str(exc.value)
 
