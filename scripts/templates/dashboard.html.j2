@@ -584,29 +584,41 @@ function renderModelRow(m) {
   // Per-level inline badge next to the model_type. To avoid duplicated
   // badges (e.g. an L3 Skip alongside an L5 XFail for the same model), we
   // emit at most ONE badge per row, picking the highest-level non-pass
-  // status. Higher-level failures supersede lower-level ones because the
+  // status. Higher-level outcomes supersede lower-level ones because the
   // confidence column already reflects the highest attained level — the
   // badge calls out the most consequential outstanding issue.
   //
-  // Precedence (highest → lowest): L5 xfail > L4 xfail > L3 xfail/skip >
-  // L2 xfail / xfail_graph_only. Positive states (L3 parity pass, L5 e2e
-  // verified) are intentionally NOT badged: they would duplicate the
-  // Confidence column and the L1-L5 dot strip. Only exception states
-  // (xfail / skip) get inline badges, since those are the signals not
-  // otherwise distinguishable at a glance.
+  // Precedence: walk L5 → L2 and emit the first xfail/skip encountered.
+  // Both xfail and skip are reportable at every level (each level can be
+  // skipped or marked xfail independently). Within a level, xfail and
+  // skip are mutually exclusive in the data model, so we just check each.
+  // L2 also admits "xfail_graph_only" (parse passes, full-graph build
+  // xfails). Positive states (L3 parity pass, L5 e2e verified) are
+  // intentionally NOT badged: they would duplicate the Confidence column
+  // and the L1-L5 dot strip. Only exception states (xfail / skip) get
+  // inline badges, since those are the signals not otherwise
+  // distinguishable at a glance.
+  const xfailBadge = (level, reason) =>
+    ` <span class="status-badge status-xfail" title="L${level} known failure: ${esc(reason || '')}">XFail</span>`;
+  const skipBadge = (level, reason) =>
+    ` <span class="status-badge status-skip" title="L${level} skipped / not run: ${esc(reason || '')}">Skip</span>`;
   let statusBadge = '';
-  if (m.l5_status === 'xfail') {
-    statusBadge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">XFail</span>`;
-  } else if (m.l4_status === 'xfail') {
-    statusBadge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">XFail</span>`;
-  } else if (m.l3_status === 'xfail') {
-    statusBadge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
-  } else if (m.l3_status === 'skip') {
-    statusBadge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
-  } else if (m.l2_status === 'xfail') {
-    statusBadge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">XFail</span>`;
-  } else if (m.l2_status === 'xfail_graph_only') {
-    statusBadge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
+  for (const [level, status, reason] of [
+    [5, m.l5_status, m.l5_reason],
+    [4, m.l4_status, m.l4_reason],
+    [3, m.l3_status, m.l3_reason],
+    [2, m.l2_status, m.l2_reason],
+  ]) {
+    if (status === 'xfail' || status === 'xfail_graph_only') {
+      statusBadge = (level === 2 && status === 'xfail_graph_only')
+        ? ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(reason || '')}">XFail</span>`
+        : xfailBadge(level, reason);
+      break;
+    }
+    if (status === 'skip') {
+      statusBadge = skipBadge(level, reason);
+      break;
+    }
   }
 
   // min_token_match_ratio badge
