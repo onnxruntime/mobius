@@ -127,7 +127,6 @@ def _build_mm_prompt(
     return base_prompt
 
 
-
 def _make_empty_kv_cache(
     session: OnnxModelSession,
     config: object,
