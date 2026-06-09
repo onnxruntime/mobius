@@ -86,16 +86,6 @@ class EpCapabilities:
             devices.  ``True`` only for WebGPU (consumer GPU); ``False`` for
             CUDA / CPU / DML / TRT-RTX where the runtime can handle large
             pre-allocations.
-        max_gqa_head_dim: Maximum ``head_dim`` for which this EP's
-            ``GroupQueryAttention`` kernel is fused, or ``None`` for no limit.
-            Attention layers with a larger ``head_dim`` keep the standard
-            ``Attention`` op instead of being rewritten to GQA.  Defaults to
-            ``256``: released ORT GQA kernels (Flash / XQA / memory-efficient)
-            support only ``head_dim`` ∈ {64, 128, 256}.  The CUDA EP sets this
-            to ``None`` because its GQA kernel handles any ``head_dim`` via the
-            unfused FP32-QK-accumulation fallback (ORT PR #28198, fixes #28195)
-            — required for Gemma4 global-attention layers (``head_dim=512``).
-            EPs whose runtime lacks larger-head-dim support keep the 256 cap.
     """
 
     name: str
@@ -110,7 +100,6 @@ class EpCapabilities:
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
-    max_gqa_head_dim: int | None = 256
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -241,10 +230,6 @@ def _register_builtins() -> None:
                 "enable_skip_layer_norm_strict_mode": "1",
             },
             supports_past_present_share_buffer=True,
-            # CUDA GQA handles any head_dim (FP32-QK-accumulation unfused
-            # fallback, ORT #28198). No cap — needed for Gemma4 global-attention
-            # layers (head_dim=512).
-            max_gqa_head_dim=None,
         ),
         EpCapabilities(
             name="dml",

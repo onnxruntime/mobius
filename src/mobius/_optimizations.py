@@ -287,7 +287,7 @@ def _get_optimization_passes(
         fuse.append(
             (
                 "GQAFusion",
-                list(group_query_attention_rules(max_head_dim=caps.max_gqa_head_dim)),
+                list(group_query_attention_rules()),
             )
         )
 
