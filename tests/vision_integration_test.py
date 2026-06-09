@@ -55,7 +55,7 @@ class _TorchViTAttention(nn.Module):
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.k_proj = nn.Linear(hidden_size, hidden_size)
         self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.o_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x):
         b, n, c = x.shape
@@ -63,7 +63,7 @@ class _TorchViTAttention(nn.Module):
         k = self.k_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o_proj(attn.transpose(1, 2).reshape(b, n, c))
+        return self.out_proj(attn.transpose(1, 2).reshape(b, n, c))
 
 
 class _TorchViTEncoderLayer(nn.Module):
@@ -202,7 +202,7 @@ class _TorchCLIPAttention(nn.Module):
         self.q_proj = nn.Linear(_HIDDEN, _HIDDEN)
         self.k_proj = nn.Linear(_HIDDEN, _HIDDEN)
         self.v_proj = nn.Linear(_HIDDEN, _HIDDEN)
-        self.o_proj = nn.Linear(_HIDDEN, _HIDDEN)
+        self.out_proj = nn.Linear(_HIDDEN, _HIDDEN)
 
     def forward(self, x):
         b, n, c = x.shape
@@ -210,7 +210,7 @@ class _TorchCLIPAttention(nn.Module):
         k = self.k_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return self.o_proj(attn.transpose(1, 2).reshape(b, n, c))
+        return self.out_proj(attn.transpose(1, 2).reshape(b, n, c))
 
 
 class _TorchCLIPMLP(nn.Module):
@@ -218,13 +218,13 @@ class _TorchCLIPMLP(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(_HIDDEN, _INTERMEDIATE)
-        self.fc2 = nn.Linear(_INTERMEDIATE, _HIDDEN)
+        self.up_proj = nn.Linear(_HIDDEN, _INTERMEDIATE)
+        self.down_proj = nn.Linear(_INTERMEDIATE, _HIDDEN)
 
     def forward(self, x):
-        x = self.fc1(x)
+        x = self.up_proj(x)
         x = x * torch.sigmoid(1.702 * x)  # quick_gelu
-        return self.fc2(x)
+        return self.down_proj(x)
 
 
 # ---------------------------------------------------------------------------
