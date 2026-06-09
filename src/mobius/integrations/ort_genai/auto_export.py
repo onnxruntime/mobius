@@ -75,6 +75,12 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma2": "gemma",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
+    # gemma-4-12B "unified" (encoder-free) variant reuses the gemma4 ORT GenAI
+    # pipelines: the multimodal package (decoder taking inputs_embeds + vision
+    # embedder + embedding fusion) maps to "gemma4"; the standalone text
+    # backbone maps to "gemma4_text".
+    "gemma4_unified": "gemma4",
+    "gemma4_unified_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
@@ -88,7 +94,18 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen3_5_vl": "qwen2_5_vl",
 }
 
-_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_GEMMA4_MODEL_TYPES = frozenset(
+    {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"}
+)
+# Encoder-free gemma-4-12B "unified" variants. Their image/audio inputs are raw
+# merged pixel patches (48px, 6912-dim) / raw waveform frames (640-dim), NOT the
+# SigLIP 16px / 128-dim log-mel contract that the ort-extensions
+# ``Gemma4ImageTransform`` / ``Gemma4LogMel`` ops implement. There is no
+# genai-native transform for the unified contract, so we deliberately do NOT
+# emit image_processor.json / audio_processor.json for these models — callers
+# must preprocess with the HuggingFace processor and feed tensors via
+# ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
+_GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
@@ -384,6 +401,9 @@ def _write_vision_processor_config(
 
     - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
       with a ``DecodeImage → Gemma4ImageTransform`` pipeline.
+    - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
+      encoder-free model has no matching ort-extensions transform; callers feed
+      HF-preprocessed pixel_values via ``Generator.set_inputs``.
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -397,6 +417,17 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
+    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
+        # Encoder-free unified model: no ort-extensions transform matches its
+        # raw merged-patch contract. Emit no image_processor.json; callers feed
+        # HF-preprocessed pixel_values via Generator.set_inputs.
+        logger.info(
+            "Skipping image_processor.json for encoder-free %s "
+            "(no native ort-extensions transform; use HF processor + set_inputs)",
+            model_type,
+        )
+        return None
+
     vision_model_type = getattr(vision, "model_type", None)
     is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
 
@@ -572,6 +603,17 @@ def _write_audio_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
+
+    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
+        # Encoder-free unified model: raw 640-dim waveform frames, not the
+        # 128-dim log-mel Gemma4LogMel contract. Emit no audio_processor.json;
+        # callers feed HF-preprocessed input_features via Generator.set_inputs.
+        logger.info(
+            "Skipping audio_processor.json for encoder-free %s "
+            "(no native ort-extensions transform; use HF processor + set_inputs)",
+            model_type,
+        )
+        return None
 
     if model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 USM-style 128-dim log-mel spectrogram.

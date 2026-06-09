@@ -260,6 +260,21 @@ class Gemma4Task(ModelTask):
                 shape=[batch, seq_len, total_per_layer],
             )
 
+        # Vision-block bidirectional attention: the decoder receives the raw
+        # ``input_ids`` (alongside ``inputs_embeds``) and derives the block
+        # overlay internally. This avoids a separate cross-model
+        # ``block_sequence_ids`` tensor, which onnxruntime-genai cannot forward
+        # between the embedding and decoder sub-models (it can forward
+        # ``input_ids``). Only models with
+        # ``use_bidirectional_attention == "vision"`` need it.
+        input_ids_val: ir.Value | None = None
+        if config.use_bidirectional_attention == "vision":
+            input_ids_val = builder.input(
+                "input_ids",
+                dtype=ir.DataType.INT64,
+                shape=[batch, seq_len],
+            )
+
         past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
 
         logits, present_key_values = decoder(
@@ -269,6 +284,7 @@ class Gemma4Task(ModelTask):
             position_ids=position_ids,
             per_layer_inputs=per_layer_inputs_val,
             past_key_values=past_key_values,
+            input_ids=input_ids_val,
         )
 
         builder.add_output(logits, "logits")
@@ -418,13 +434,116 @@ class Gemma4Task(ModelTask):
             audio_features=audio_features_val,
         )
 
-        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        if per_layer_dim:
-            # Embedding model returns (inputs_embeds, per_layer_inputs) when
-            # per-layer input gating is enabled.
-            inputs_embeds, per_layer_inputs = result
-            builder.add_output(inputs_embeds, "inputs_embeds")
-            builder.add_output(per_layer_inputs, "per_layer_inputs")
-        else:
-            builder.add_output(result, "inputs_embeds")
+        # ``embedding`` returns a dict of named outputs: always
+        # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
+        builder.add_output(result["inputs_embeds"], "inputs_embeds")
+        if "per_layer_inputs" in result:
+            builder.add_output(result["per_layer_inputs"], "per_layer_inputs")
+        return _make_model(graph)
+
+
+class Gemma4UnifiedTask(Gemma4Task):
+    """Task for ``gemma4_unified`` (gemma-4-12B) encoder-free multimodal models.
+
+    Reuses :class:`Gemma4Task`'s ``decoder`` and ``embedding`` builders (the
+    text decoder and multimodal fusion are identical to gemma4), but overrides
+    the vision and audio builders for the encoder-free embedders:
+
+    - **vision** — raw merged pixel patches ``pixel_values [B, N, P^2*3]`` and
+      integer patch coordinates ``pixel_position_ids [B, N, 2]`` →
+      ``image_features [num_valid_patches, text_hidden]`` (padding patches,
+      with position ``-1``, are stripped inside the graph).
+    - **audio** — raw waveform-frame features ``input_features [B, T, D_a]``
+      and a validity mask ``input_features_mask [B, T]`` →
+      ``audio_features [num_valid_frames, text_hidden]`` (padding frames are
+      stripped inside the graph; no separate mask output is needed).
+    """
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build the encoder-free vision embedder.
+
+        Inputs:
+        - ``pixel_values [B, N, P^2*3]``: raw merged pixel patches, where
+          ``P = patch_size * pooling_kernel_size`` (48 for gemma-4-12B).
+        - ``pixel_position_ids [B, N, 2]``: integer (x, y) patch coordinates;
+          ``(-1, -1)`` marks padding slots.
+
+        Output:
+        - ``image_features [num_valid_patches, text_hidden]``.
+        """
+        batch = ir.SymbolicDim("batch")
+        num_patches = ir.SymbolicDim("num_patches")
+        vc = config.vision
+        patch_size = (vc.patch_size if vc else None) or 16
+        pooling = (vc.pooling_kernel_size if vc else None) or 3
+        model_patch_size = patch_size * pooling
+        pixel_dim = 3 * model_patch_size * model_patch_size
+
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[batch, num_patches, pixel_dim],
+        )
+        pixel_position_ids = builder.input(
+            "pixel_position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, num_patches, 2],
+        )
+
+        image_features = vision(
+            op,
+            pixel_values=pixel_values,
+            pixel_position_ids=pixel_position_ids,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+    def _build_audio(
+        self,
+        audio: nn.Module,
+        config: Gemma4Config,
+    ) -> ir.Model:
+        """Build the encoder-free audio embedder.
+
+        Inputs:
+        - ``input_features [B, T, D_a]``: raw waveform-frame features
+          (``D_a = audio_embed_dim``, 640 for gemma-4-12B).
+        - ``input_features_mask [B, T]``: BOOL mask, ``True`` for valid frames.
+
+        Output:
+        - ``audio_features [num_valid_frames, text_hidden]``.
+        """
+        batch = ir.SymbolicDim("batch")
+        time = ir.SymbolicDim("time")
+        audio_embed_dim = (
+            getattr(config.audio, "hidden_size", None) if config.audio else None
+        ) or 640
+
+        graph, builder = _make_graph(name="audio_encoder")
+        op = builder.op
+
+        input_features = builder.input(
+            "input_features",
+            dtype=config.dtype,
+            shape=[batch, time, audio_embed_dim],
+        )
+        input_features_mask = builder.input(
+            "input_features_mask",
+            dtype=ir.DataType.BOOL,
+            shape=[batch, time],
+        )
+
+        audio_features, _ = audio(
+            op,
+            input_features,
+            input_features_mask=input_features_mask,
+        )
+        builder.add_output(audio_features, "audio_features")
         return _make_model(graph)

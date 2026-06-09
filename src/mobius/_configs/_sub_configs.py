@@ -201,6 +201,9 @@ class AudioConfig:
     audio_start_token_id: int | None = None
     audio_end_token_id: int | None = None
     classify_num: int | None = None
+    # RMSNorm epsilon for the audio encoder/embedder (may differ from the text
+    # decoder's rms_norm_eps). Falls back to the text value when unset.
+    rms_norm_eps: float | None = None
     # Qwen3-ASR chunked conv parameters. ``n_window`` is half the
     # number of mel frames per conv chunk (so chunk_size = 2 *
     # n_window). ``n_window_infer`` is the attention window in mel

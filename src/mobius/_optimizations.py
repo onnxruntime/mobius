@@ -284,7 +284,12 @@ def _get_optimization_passes(
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
-        fuse.append(("GQAFusion", list(group_query_attention_rules())))
+        fuse.append(
+            (
+                "GQAFusion",
+                list(group_query_attention_rules()),
+            )
+        )
 
     # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
     if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:

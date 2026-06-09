@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components._common import (
     Embedding,
     Linear,
@@ -115,6 +117,100 @@ class TestCreateAttentionBias:
         assert any(name == "input_ids" for name in shape_inputs), (
             "Shape(input_ids, 1) must be present to extract query_length correctly"
         )
+
+
+class TestBlockwiseAttentionBias:
+    """Numerically verify the Gemma4 vision-block bidirectional overlay.
+
+    ``create_attention_bias(block_sequence_ids=...)`` must bake the FULL mask
+    (causal [+ sliding] OR same-block, AND padding) so the Attention op can be
+    called with ``is_causal=0``. We build the graph, run it via ORT, and
+    compare the attended pattern (bias == 0) against a numpy reference.
+    """
+
+    @staticmethod
+    def _build(sliding):
+        b, op, g = create_test_builder()
+        input_ids = create_test_input(b, "input_ids", [1, "S"], dtype=ir.DataType.INT64)
+        attn = create_test_input(b, "attention_mask", [1, "T"], dtype=ir.DataType.INT64)
+        bsid = create_test_input(b, "block_sequence_ids", [1, "S"], dtype=ir.DataType.INT64)
+        bias = create_attention_bias(
+            op,
+            input_ids,
+            attn,
+            sliding_window=sliding,
+            dtype=ir.DataType.FLOAT,
+            block_sequence_ids=bsid,
+        )
+        bias.name = "bias"
+        g.outputs.append(bias)
+        return ir.Model(g, ir_version=10)
+
+    @staticmethod
+    def _ref(block_ids, attn, sliding):
+        cumsum = np.cumsum(attn)
+        qi = cumsum[:, None]
+        ki = cumsum[None, :]
+        m = qi >= ki
+        if sliding is not None:
+            m = m & ((qi - ki) < sliding)
+        qg = np.array(block_ids)[:, None]
+        kg = np.array(block_ids)[None, :]
+        m = m | ((qg == kg) & (qg >= 0))
+        return m & (np.array(attn)[None, :].astype(bool))
+
+    def _run(self, sliding, block_ids, attn):
+        sess = OnnxModelSession(self._build(sliding), device="cpu")
+        block_ids = np.array([block_ids], dtype=np.int64)
+        attn = np.array([attn], dtype=np.int64)
+        out = sess.run(
+            {
+                "input_ids": np.zeros_like(block_ids),
+                "attention_mask": attn,
+                "block_sequence_ids": block_ids,
+            }
+        )["bias"]
+        attended = out[0, 0] > -1.0
+        expected = self._ref(block_ids[0], attn[0], sliding)
+        return attended, expected
+
+    def test_multi_block_full_attention(self):
+        # Two vision blocks (pos 1-2 and 4-5) separated by text.
+        attended, expected = self._run(None, [-1, 0, 0, -1, 1, 1, -1, -1], [1] * 8)
+        assert np.array_equal(attended, expected)
+        # A vision token attends to a LATER token in the same block (bidirectional).
+        assert attended[1, 2]
+        # But text stays causal: position 3 cannot see position 4.
+        assert not attended[3, 4]
+
+    def test_block_wider_than_sliding_window(self):
+        # Single block spanning positions 1..4 with a window of 2: the block
+        # must escape the sliding window (same-block OR overrides the window).
+        attended, expected = self._run(2, [-1, 0, 0, 0, 0, -1, -1, -1], [1] * 8)
+        assert np.array_equal(attended, expected)
+        assert attended[4, 1]  # distance 3 >= window, allowed via same block
+
+    def test_padding_still_masked(self):
+        # Last two positions are padding (attention_mask == 0).
+        attended, expected = self._run(
+            2, [-1, 0, 0, -1, -1, -1, -1, -1], [1, 1, 1, 1, 1, 1, 0, 0]
+        )
+        assert np.array_equal(attended, expected)
+        assert not attended[:, 6:].any()  # nothing attends to padding
+
+    def test_decode_single_query_is_causal(self):
+        # Decode step: q_len=1 (new text token, group -1), kv total length 8.
+        sess = OnnxModelSession(self._build(None), device="cpu")
+        out = sess.run(
+            {
+                "input_ids": np.zeros((1, 1), dtype=np.int64),
+                "attention_mask": np.ones((1, 8), dtype=np.int64),
+                "block_sequence_ids": np.array([[-1]], dtype=np.int64),
+            }
+        )["bias"]
+        assert out.shape == (1, 1, 1, 8)
+        # Text decode token attends to all past positions (pure causal row).
+        assert bool((out[0, 0, 0] > -1.0).all())
 
 
 class TestCreatePaddingMask:

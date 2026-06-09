@@ -1,0 +1,21 @@
+model_id: "google/gemma-4-12B"
+model_type: "gemma4_unified"
+revision: "main"
+task_type: "speech-language"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The audio says"
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+  eos_token_id: 1
+
+ci_skip_reason: "Model is 12B — too large for CI hardware. Runs locally (gated repo needs HF auth); golden files are generated and committed."
+notes: "Gemma 4 12B unified (encoder-free) audio input. Raw 640-dim waveform-frame embedder instead of a Conformer tower. 4-model split: decoder + vision_encoder + audio_encoder + embedding. Base checkpoint, so completion-style prompt + structural-token suppression (suppress_tokens 258882/258883)."

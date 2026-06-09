@@ -88,6 +88,7 @@ def _apply_attention(
     scale: float,
     softcap: float = 0.0,
     static_cache: StaticCacheState | None = None,
+    is_causal: int = 1,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Apply the ONNX Attention op with internal or static KV cache.
 
@@ -103,10 +104,20 @@ def _apply_attention(
         Also uses ``is_causal=1``.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
+    Args:
+        is_causal: Whether the Attention op applies its built-in causal
+            mask (default ``1``). Set to ``0`` when ``attn_mask`` already
+            bakes the FULL mask (causal + sliding + padding, and any
+            bidirectional unmasking such as Gemma4's vision-block overlay)
+            into a float additive bias. Leaving ``is_causal=1`` in that
+            case would re-apply causality and cancel any future-position
+            unmasking encoded in the bias.
+
     Note:
-        Both paths set ``is_causal=1`` on the Attention op, which enables
-        built-in causal masking. This means ``attn_mask`` should encode
-        only padding information (as a bool mask), not causality.
+        Both paths default to ``is_causal=1`` on the Attention op, which
+        enables built-in causal masking. This means ``attn_mask`` should
+        encode only padding information (as a bool mask), not causality,
+        unless ``is_causal=0`` is passed explicitly.
 
     Note:
         ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
@@ -167,7 +178,7 @@ def _apply_attention(
             kv_num_heads=num_key_value_heads,
             scale=scale,
             softcap=softcap,
-            is_causal=1,
+            is_causal=is_causal,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v
@@ -191,7 +202,7 @@ def _apply_attention(
         kv_num_heads=num_key_value_heads,
         scale=scale,
         softcap=softcap,
-        is_causal=1,
+        is_causal=is_causal,
         _outputs=3,
     )
     return attn_output, present_key, present_value

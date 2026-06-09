@@ -161,6 +161,7 @@ def create_attention_bias(
     attention_mask,
     sliding_window: int | None = None,
     dtype: ir.DataType = ir.DataType.FLOAT,
+    block_sequence_ids=None,
 ):
     """Create causal attention bias for use in attention mechanisms.
 
@@ -172,6 +173,18 @@ def create_attention_bias(
         dtype: Data type for the bias tensor. The masked value uses the
             minimum representable value for this dtype (e.g. -65504 for
             float16, -3.4e38 for float32).
+        block_sequence_ids: Optional INT tensor of shape
+            (batch_size, query_length) giving a contiguous vision-block id
+            per current-sequence position (``>= 0`` for vision tokens in the
+            same block, ``-1`` for text). When provided, a bidirectional
+            "blockwise overlay" is OR-ed onto the causal (and sliding) mask:
+            two positions in the same block (same id ``>= 0``) may attend to
+            each other regardless of causal order. This mirrors HuggingFace
+            ``blockwise_overlay`` for Gemma4 ``use_bidirectional_attention``.
+            The returned bias bakes in causal + sliding + padding + blockwise,
+            so the consuming ``Attention`` op MUST be called with
+            ``is_causal=0`` to avoid re-applying the causal constraint and
+            cancelling the bidirectional unmasking.
 
     Returns:
         Attention bias tensor of shape (batch_size, 1, query_length, total_length).
@@ -209,6 +222,34 @@ def create_attention_bias(
         dist = op.Sub(q_indices, kv_indices)
         within_window = op.Less(dist, sliding_window)
         full_mask = op.And(full_mask, within_window)
+
+    if block_sequence_ids is not None:
+        # Bidirectional vision-block overlay (OR-ed onto causal/sliding mask,
+        # BEFORE the padding AND, matching HF blockwise_overlay ordering).
+        #
+        # q_group: block id per query position -> (batch, query_length, 1).
+        # block_sequence_ids covers the current input (== the query), so it
+        # aligns 1:1 with the query positions.
+        q_group = op.Unsqueeze(block_sequence_ids, [2])  # (B, q_len, 1)
+        # kv_group: block id per kv position -> (batch, 1, total_length).
+        # The kv axis spans past + current; past positions are text in the
+        # cache, so left-pad with -1 to width total_length.
+        pad_width = op.Sub(total_length, query_length)  # [1], == past length
+        zero_1d = op.Constant(value_ints=[0])
+        # Pad spec for a 2-D tensor [B, q_len]: [b_begin, s_begin, b_end, s_end].
+        pads = op.Concat(zero_1d, pad_width, zero_1d, zero_1d, axis=0)
+        kv_group_2d = op.Pad(
+            block_sequence_ids,
+            pads,
+            op.Constant(value_int=-1),
+        )  # (B, total_length)
+        kv_group = op.Unsqueeze(kv_group_2d, [1])  # (B, 1, total_length)
+        # same_block = (q_group == kv_group) AND (q_group >= 0)
+        same_block = op.And(
+            op.Equal(q_group, kv_group),
+            op.GreaterOrEqual(q_group, op.Constant(value_int=0)),
+        )
+        full_mask = op.Or(full_mask, same_block)
 
     # Combine with attention_mask
     attn_mask_bool = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)

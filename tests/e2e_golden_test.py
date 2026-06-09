@@ -68,6 +68,65 @@ def _get_test_device_kwargs() -> dict[str, str]:
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
+def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
+    """Return ``generation_config.suppress_tokens`` for a model (empty if none).
+
+    Mirrors HuggingFace ``generate()``: tokens in ``suppress_tokens`` are forced
+    to ``-inf`` at every decode step. Needed for base checkpoints (e.g.
+    ``google/gemma-4-12B``) whose generation_config suppresses the structural
+    ``<end_of_image>`` / ``<end_of_audio>`` tokens — without it, greedy decode
+    degenerates (repeating those tokens) and diverges from the golden reference
+    produced by ``model.generate``. For models with no suppress_tokens this is a
+    no-op, so it is safe to apply unconditionally.
+    """
+    import transformers
+
+    try:
+        gen_config = transformers.GenerationConfig.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
+    except Exception:
+        return []
+    return [int(t) for t in (gen_config.suppress_tokens or [])]
+
+
+def _suppress_logits(logits: np.ndarray, suppress_ids: list[int]) -> np.ndarray:
+    """Force ``suppress_ids`` columns of the last-position logits to ``-inf``."""
+    if suppress_ids:
+        logits[..., suppress_ids] = -np.inf
+    return logits
+
+
+def _build_mm_prompt(
+    processor: object,
+    base_prompt: str,
+    media_paths: list[str],
+    media_kind: str,
+) -> str:
+    """Format a multimodal prompt, falling back when there is no chat template.
+
+    Instruction-tuned processors expose a chat template that injects the right
+    media placeholder tokens. Base checkpoints (e.g. ``google/gemma-4-12B``)
+    ship none, so manually prepend one placeholder token per media item — the
+    processor then expands each into the correct number of soft tokens.
+
+    ``media_kind`` is ``"image"`` or ``"audio"``.
+    """
+    if getattr(processor, "chat_template", None):
+        content: list[dict[str, str]] = []
+        for path in media_paths:
+            content.append({"type": media_kind, media_kind: str(_TESTDATA_DIR / path)})
+        content.append({"type": "text", "text": base_prompt})
+        messages = [{"role": "user", "content": content}]
+        return processor.apply_chat_template(  # type: ignore[attr-defined]
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    placeholder = getattr(processor, f"{media_kind}_token", None)
+    if placeholder:
+        return placeholder * len(media_paths) + base_prompt
+    return base_prompt
+
+
 def _make_empty_kv_cache(
     session: OnnxModelSession,
     config: object,
@@ -570,17 +629,8 @@ def _run_vision_language_prefill(
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
-    # Build chat template for models that need it
-    prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = []
-        for img_path in case.images:
-            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
-        content.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    # Build the prompt (chat template when available, else manual placeholder).
+    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
 
     # Use PyTorch tensors then convert — some processors don't support np
     processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
@@ -764,16 +814,8 @@ def _run_vl_generation(
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
-    prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = []
-        for img_path in case.images:
-            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
-        content.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
 
     processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
     processed: dict[str, np.ndarray] = {
@@ -879,7 +921,7 @@ def _run_vl_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
-        logits = prefill_out["logits"]
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
         _update_vl_cache(past_cache, prefill_out, config)
 
@@ -941,7 +983,7 @@ def _run_vl_generation(
                     step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
-            logits = step_out["logits"]
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
             next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)
@@ -1750,6 +1792,7 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
@@ -1861,7 +1904,7 @@ def _run_speech_language_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
-        logits = prefill_out["logits"]
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
         _update_vl_cache(past_cache, prefill_out, config)
 
@@ -1910,7 +1953,7 @@ def _run_speech_language_generation(
                     step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
-            logits = step_out["logits"]
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
             next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)

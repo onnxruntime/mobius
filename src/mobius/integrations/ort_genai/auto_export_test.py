@@ -85,6 +85,16 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi") == "phi"
 
+    def test_gemma4_unified_model_types(self):
+        # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
+        # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
+        # text decoder ("gemma4_unified_text") maps to "gemma4_text".
+        assert _resolve_ort_genai_model_type("gemma4_unified") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_unified_text") == "gemma4_text"
+        # Released gemma4 mappings remain unchanged.
+        assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
+
 
 class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):
@@ -127,6 +137,15 @@ class TestWriteProcessorConfig:
         norm_attrs = transforms[4]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_gemma4_unified_skips_image_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
+        vision = mock.MagicMock()
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma4_unified"
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
 
     def test_pixtral_vision_config(self, tmp_path):
         """Generates pixtral-specific processor config with 7 transforms."""
@@ -266,6 +285,13 @@ class TestFixChatTemplate:
         config = mock.MagicMock()
         config.audio = mock.MagicMock()
         config.model_type = "whisper"
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_gemma4_unified_skips_audio_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no audio_processor.json."""
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "gemma4_unified"
         assert _write_audio_processor_config(config, str(tmp_path)) is None
 
     def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):

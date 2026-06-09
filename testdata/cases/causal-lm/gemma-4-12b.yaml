@@ -1,0 +1,18 @@
+model_id: "google/gemma-4-12B"
+model_type: "gemma4_unified_text"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+ci_skip_reason: "Model is 12B — too large for CI hardware. Runs locally (gated repo needs HF auth); golden files are generated and committed."
+notes: "Gemma 4 12B unified (text-only path) via Gemma4CausalLMModel. Dual head_dim (separate attention/value head_dim), single shared KV head (k_eq_v), KV sharing, sliding+global attention, logit softcapping."

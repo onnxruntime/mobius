@@ -49,25 +49,6 @@ from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleSet,
 )
 
-# CUDA EP's GroupQueryAttention kernel historically enforced MAX_HEAD_SIZE = 256.
-# Keep the rewrite-rule limit conservative until GQA fusion is gated on a
-# runtime/EP capability check. This avoids emitting GroupQueryAttention nodes
-# with head_dim=512 that can still fail on released ORT builds.
-_MAX_GQA_HEAD_DIM = 256
-
-
-def _head_dim_exceeds_gqa_limit(past_key) -> int | None:
-    """Return the head_dim if it exceeds the GQA kernel limit, else None.
-
-    ``past_key`` is expected to have shape ``(batch, kv_heads, seq, head_dim)``.
-    """
-    if past_key is None or past_key.shape is None or len(past_key.shape) < 4:
-        return None
-    hd = past_key.shape[3]
-    if isinstance(hd, int) and hd > _MAX_GQA_HEAD_DIM:
-        return hd
-    return None
-
 
 class RotaryAttentionToGQA(RewriteRuleClassBase):
     """Replace RotaryEmbedding + Attention with GroupQueryAttention.
@@ -165,11 +146,6 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
             return result.fail("past_key is not a graph input")
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
-
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
-        hd = _head_dim_exceeds_gqa_limit(past_key)
-        if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
 
         return result
 
@@ -595,11 +571,6 @@ class AttentionToGQA(RewriteRuleClassBase):
         if not any(gi.name == "attention_mask" for gi in graph.inputs):
             return result.fail("No attention_mask graph input — cannot build seqlens_k")
 
-        # Skip when head_dim exceeds CUDA GQA MAX_HEAD_SIZE (256).
-        hd = _head_dim_exceeds_gqa_limit(past_key)
-        if hd is not None:
-            return result.fail(f"head_dim={hd} exceeds GQA MAX_HEAD_SIZE={_MAX_GQA_HEAD_DIM}")
-
         return result
 
     # ------------------------------------------------------------------ rewrite
@@ -675,13 +646,23 @@ def group_query_attention_rules() -> RewriteRuleSet:
        position embeddings are not expressed as standard ``RotaryEmbedding``
        ops (e.g. Qwen3.5 3D mRoPE via ``Where`` nodes).
 
+    GQA fusion is applied uniformly to every decoder ``Attention`` node
+    regardless of ``head_dim`` — there is no head-dim cap.  Whether a given
+    runtime's GQA kernel supports a particular ``head_dim`` is a separate EP
+    concern, gated by :attr:`~mobius._execution_providers.EpCapabilities.gqa_dtypes`.
+
     QKV packing is a separate optional pass; use
     :func:`pack_qkv_for_gqa_rules` for that.
 
     Returns:
         :class:`RewriteRuleSet` containing the GQA fusion rules.
     """
-    return RewriteRuleSet([RotaryAttentionToGQA().rule(), AttentionToGQA().rule()])
+    return RewriteRuleSet(
+        [
+            RotaryAttentionToGQA.rule(),
+            AttentionToGQA.rule(),
+        ]
+    )
 
 
 def pack_qkv_for_gqa_rules() -> RewriteRuleSet:

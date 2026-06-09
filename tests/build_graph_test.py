@@ -1249,6 +1249,57 @@ class TestBuildGraphVisionLanguage:
         assert "input_ids" in input_names
         assert "logits" in output_names
 
+    def test_gemma4_unified_text_graph(self):
+        """Build the gemma4_unified (gemma-4-12B) text backbone via Gemma4CausalLMModel.
+
+        ``gemma4_unified_text`` reuses Gemma4CausalLMModel.  This exercises the
+        12B-family text architecture: dual head_dim (local 16 / global 32),
+        ``attention_k_eq_v`` with a single global KV head, vision-block
+        bidirectional attention, and final-logit softcapping.
+        """
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            pad_token_id=0,
+            tie_word_embeddings=True,
+        )
+        model_cls = registry.get("gemma4_unified_text")
+        module = model_cls(config)
+        task_name = _default_task_for_model("gemma4_unified_text")
+        task = get_task(task_name)
+        pkg = task.build(module, config)
+
+        assert "model" in pkg
+        model = pkg["model"]
+        input_names = {i.name for i in model.graph.inputs}
+        output_names = {o.name for o in model.graph.outputs}
+        assert "input_ids" in input_names
+        assert "logits" in output_names
+        # Full-attention layer uses the single global KV head, so its cache
+        # entry has a different head_dim than the sliding layer.
+        assert "past_key_values.0.key" in input_names
+        assert "past_key_values.1.key" in input_names
+
     def test_gemma4_any_to_any_graph(self):
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
@@ -1341,6 +1392,98 @@ class TestBuildGraphVisionLanguage:
         assert "present.0.value" in decoder_output_names
         assert "present.1.key" not in decoder_output_names  # shared layer excluded
         assert "present.1.value" not in decoder_output_names  # shared layer excluded
+
+    def test_gemma4_unified_multimodal_graph(self):
+        """Build gemma4_unified (gemma-4-12B) encoder-free multimodal model.
+
+        Produces a 4-model split (decoder + vision_encoder + audio_encoder +
+        embedding).  The vision/audio encoders are encoder-free embedders
+        (no SigLIP/Conformer tower); the decoder uses vision-block
+        bidirectional attention, which it derives internally from
+        ``input_ids`` (the embedding model does *not* emit
+        ``block_sequence_ids``).
+        """
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            image_token_id=255999,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=48,
+                patch_size=4,
+                pooling_kernel_size=2,
+                position_embedding_size=64,
+                out_hidden_size=48,
+                norm_eps=1e-6,
+            ),
+            audio=Gemma4AudioConfig(
+                hidden_size=40,
+                output_proj_dims=40,
+                audio_token_id=255998,
+            ),
+        )
+        model_cls = registry.get("gemma4_unified")
+        module = model_cls(config)
+        task = get_task(_default_task_for_model("gemma4_unified"))
+        pkg = task.build(module, config)
+
+        assert set(pkg.keys()) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }, f"gemma4_unified should produce 4 models, got: {set(pkg.keys())}"
+
+        # Vision embedder: raw patches (no encoder layers) → image_features
+        vision = pkg["vision_encoder"]
+        v_inputs = {i.name for i in vision.graph.inputs}
+        assert v_inputs == {"pixel_values", "pixel_position_ids"}
+        assert "image_features" in {o.name for o in vision.graph.outputs}
+
+        # Audio embedder: raw frames + mask → audio_features
+        audio = pkg["audio_encoder"]
+        a_inputs = {i.name for i in audio.graph.inputs}
+        assert a_inputs == {"input_features", "input_features_mask"}
+        assert "audio_features" in {o.name for o in audio.graph.outputs}
+
+        # Embedding: fuses both modalities → inputs_embeds (no block_sequence_ids;
+        # the decoder derives the bidirectional overlay from input_ids itself)
+        embedding = pkg["embedding"]
+        e_inputs = {i.name for i in embedding.graph.inputs}
+        assert {"input_ids", "image_features", "audio_features"} <= e_inputs
+        e_outputs = {o.name for o in embedding.graph.outputs}
+        assert "inputs_embeds" in e_outputs
+        assert "block_sequence_ids" not in e_outputs
+
+        # Decoder: consumes inputs_embeds + input_ids (for the vision-block
+        # bidirectional overlay, derived internally)
+        decoder = pkg["decoder"]
+        d_inputs = {i.name for i in decoder.graph.inputs}
+        assert "inputs_embeds" in d_inputs
+        assert "input_ids" in d_inputs
+        assert "block_sequence_ids" not in d_inputs
+        assert "logits" in {o.name for o in decoder.graph.outputs}
 
     def test_gemma4_kv_shared_layer_tracing(self):
         """Verify all num_hidden_layers are traced and KV outputs = num_kv_layers.
@@ -4351,6 +4494,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "deepseek_vl_v2",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
+    "gemma4_unified_text",
     "llava",
     "mllama",
     "phi4_multimodal",
