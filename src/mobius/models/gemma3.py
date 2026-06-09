@@ -92,7 +92,12 @@ class _Gemma3VisionEncoderModel(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.vision_tower(op, pixel_values)
-        return self.multi_modal_projector(op, vision_features)
+        image_features = self.multi_modal_projector(op, vision_features)
+        # Projector returns (batch, tokens, hidden); squeeze the leading
+        # batch dim to (tokens, hidden) to match the 2-D ``image_features``
+        # contract expected by the embedding sub-model (Gather along axis 0)
+        # and the ort-genai runtime, which processes one image at a time.
+        return op.Squeeze(image_features, [0])
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -197,7 +202,13 @@ class Gemma3MultiModalModel(nn.Module):
                 if key == "language_model.model.embed_tokens.weight":
                     renamed["embedding.embed_tokens.weight"] = value
             elif key.startswith("vision_tower."):
-                renamed["vision_encoder." + key] = value
+                # Vision MLP uses ``fc1``/``fc2`` in HF; rename to the
+                # ``FCMLP`` component naming (``up_proj``/``down_proj``).
+                new_key = "vision_encoder." + key
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                    ".mlp.fc2.", ".mlp.down_proj."
+                )
+                renamed[new_key] = value
             elif key.startswith("multi_modal_projector."):
                 renamed["vision_encoder." + key] = value
             else:
