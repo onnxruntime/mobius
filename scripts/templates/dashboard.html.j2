@@ -581,33 +581,32 @@ function renderModelRow(m) {
     return `<div class="${cls}" title="${label}" role="img" aria-label="${label}"></div>`;
   }).join('');
 
-  // Per-level inline badges next to the model_type. L3 surfaces all three
-  // pass/xfail/skip outcomes; L2/L4/L5 surface only xfail because their
-  // dot already conveys pass/skip unambiguously and xfail is the only
-  // state that is otherwise visually identical to a fail.
-  let l2Badge = '';
-  if (m.l2_status === 'xfail') {
-    l2Badge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">XFail</span>`;
-  } else if (m.l2_status === 'xfail_graph_only') {
-    l2Badge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
-  }
-  // Positive states (L3 parity pass, L5 e2e verified) are intentionally NOT
-  // badged here: they would duplicate the Confidence column and the L1-L5 dot
-  // strip. Only exception states (xfail / skip) get inline badges, since those
-  // are the signals not otherwise distinguishable at a glance.
-  let l3Badge = '';
-  if (m.l3_status === 'xfail') {
-    l3Badge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
-  } else if (m.l3_status === 'skip') {
-    l3Badge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
-  }
-  let l4Badge = '';
-  if (m.l4_status === 'xfail') {
-    l4Badge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">XFail</span>`;
-  }
-  let l5Badge = '';
+  // Per-level inline badge next to the model_type. To avoid duplicated
+  // badges (e.g. an L3 Skip alongside an L5 XFail for the same model), we
+  // emit at most ONE badge per row, picking the highest-level non-pass
+  // status. Higher-level failures supersede lower-level ones because the
+  // confidence column already reflects the highest attained level — the
+  // badge calls out the most consequential outstanding issue.
+  //
+  // Precedence (highest → lowest): L5 xfail > L4 xfail > L3 xfail/skip >
+  // L2 xfail / xfail_graph_only. Positive states (L3 parity pass, L5 e2e
+  // verified) are intentionally NOT badged: they would duplicate the
+  // Confidence column and the L1-L5 dot strip. Only exception states
+  // (xfail / skip) get inline badges, since those are the signals not
+  // otherwise distinguishable at a glance.
+  let statusBadge = '';
   if (m.l5_status === 'xfail') {
-    l5Badge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">XFail</span>`;
+    statusBadge = ` <span class="status-badge status-xfail" title="L5 known failure: ${esc(m.l5_reason || '')}">XFail</span>`;
+  } else if (m.l4_status === 'xfail') {
+    statusBadge = ` <span class="status-badge status-xfail" title="L4 known failure: ${esc(m.l4_reason || '')}">XFail</span>`;
+  } else if (m.l3_status === 'xfail') {
+    statusBadge = ` <span class="status-badge status-xfail" title="L3 known failure: ${esc(m.l3_reason || '')}">XFail</span>`;
+  } else if (m.l3_status === 'skip') {
+    statusBadge = ` <span class="status-badge status-skip" title="L3 skipped / not run: ${esc(m.l3_reason || '')}">Skip</span>`;
+  } else if (m.l2_status === 'xfail') {
+    statusBadge = ` <span class="status-badge status-xfail" title="L2 known failure: ${esc(m.l2_reason || '')}">XFail</span>`;
+  } else if (m.l2_status === 'xfail_graph_only') {
+    statusBadge = ` <span class="status-badge status-xfail" title="L2 graph-build xfail: ${esc(m.l2_reason || '')}">XFail</span>`;
   }
 
   // min_token_match_ratio badge
@@ -626,7 +625,7 @@ function renderModelRow(m) {
   // Use single-quoted HTML attributes so JSON.stringify's double quotes don't
   // break attribute parsing when this string is set via innerHTML.
   let row = `<tr style="cursor:pointer" onclick='toggleDetail(${JSON.stringify(m.model_type)})'>
-    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${l2Badge}${l3Badge}${l4Badge}${l5Badge}${ratioBadge}</td>
+    <td style="padding-left: ${groupByFamily ? '32px' : '12px'}">${esc(m.model_type)}${statusBadge}${ratioBadge}</td>
     <td>${esc(m.category)}</td>
     <td><code style="font-size:0.8em">${esc(m.module_class)}</code></td>
     <td><span class="badge badge-${m.confidence_level}">${LEVEL_LABELS[m.confidence_level]}</span></td>
