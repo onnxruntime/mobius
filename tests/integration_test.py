@@ -651,7 +651,10 @@ class TestVLFullForward:
             position_ids_3d = torch_model.model.compute_3d_position_ids(
                 input_ids=hf_inputs["input_ids"],
                 image_grid_thw=hf_inputs["image_grid_thw"],
+                video_grid_thw=None,
+                mm_token_type_ids=hf_inputs["mm_token_type_ids"],
                 attention_mask=hf_inputs["attention_mask"],
+                past_key_values=None,
                 inputs_embeds=inputs_embeds,
             )
         position_ids = position_ids_3d.numpy().astype(np.int64)
@@ -754,7 +757,10 @@ class TestVLFullForward:
             position_ids_3d = torch_model.model.compute_3d_position_ids(
                 input_ids=hf_inputs["input_ids"],
                 image_grid_thw=hf_inputs["image_grid_thw"],
+                video_grid_thw=None,
+                mm_token_type_ids=hf_inputs["mm_token_type_ids"],
                 attention_mask=hf_inputs["attention_mask"],
+                past_key_values=None,
                 inputs_embeds=inputs_embeds,
             )
         position_ids = position_ids_3d.numpy().astype(np.int64)
@@ -982,7 +988,7 @@ class TestQwen25VL3Model:
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
+                "image_grid_thw": grid_thw,
             }
         )
         vision_session.close()
@@ -1025,7 +1031,10 @@ class TestQwen25VL3Model:
             position_ids_3d = torch_model.model.compute_3d_position_ids(
                 input_ids=hf_inputs["input_ids"],
                 image_grid_thw=hf_inputs["image_grid_thw"],
+                video_grid_thw=None,
+                mm_token_type_ids=hf_inputs["mm_token_type_ids"],
                 attention_mask=hf_inputs["attention_mask"],
+                past_key_values=None,
                 inputs_embeds=hf_embeds,
             )
         position_ids = position_ids_3d.numpy().astype(np.int64)
@@ -1092,6 +1101,11 @@ class TestQwen25VL3Model:
                 hf_inputs["pixel_values"],
                 grid_thw=hf_inputs["image_grid_thw"],
             )
+        # transformers >=5.x returns BaseModelOutputWithPooling; the merged
+        # patch features fed to the LLM are ``pooler_output`` (last_hidden_state
+        # is the pre-merge sequence).
+        if hasattr(hf_visual, "pooler_output"):
+            hf_visual = hf_visual.pooler_output
         hf_features = hf_visual.cpu().numpy()
 
         # ONNX vision forward
@@ -1099,7 +1113,9 @@ class TestQwen25VL3Model:
         grid_thw = hf_inputs["image_grid_thw"].numpy().astype(np.int64)
 
         vision_session = _make_session(pkg["vision_encoder"])
-        vision_out = vision_session.run({"pixel_values": pixel_values, "grid_thw": grid_thw})
+        vision_out = vision_session.run(
+            {"pixel_values": pixel_values, "image_grid_thw": grid_thw}
+        )
         vision_session.close()
         onnx_features = vision_out["image_features"]
 
@@ -1288,7 +1304,7 @@ class TestQwen3VL3Model:
         vision_out = vision_session.run(
             {
                 "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
+                "image_grid_thw": grid_thw,
             }
         )
         vision_session.close()
@@ -1313,7 +1329,10 @@ class TestQwen3VL3Model:
             position_ids_3d = torch_model.model.compute_3d_position_ids(
                 input_ids=hf_inputs["input_ids"],
                 image_grid_thw=hf_inputs["image_grid_thw"],
+                video_grid_thw=None,
+                mm_token_type_ids=hf_inputs["mm_token_type_ids"],
                 attention_mask=hf_inputs["attention_mask"],
+                past_key_values=None,
                 inputs_embeds=hf_embeds,
             )
         position_ids = position_ids_3d.numpy().astype(np.int64)
