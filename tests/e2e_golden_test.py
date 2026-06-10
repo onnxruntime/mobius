@@ -1344,6 +1344,29 @@ def _run_speech_language_prefill(
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
             audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+        # Qwen3-ASR requires ``feature_attention_mask`` of shape
+        # ``(batch, mel_seq)`` where ``input_features`` is
+        # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
+        # ``padding=False`` so every frame is real -> all-ones is correct.
+        if (
+            "feature_attention_mask" in audio_session.input_names
+            and "feature_attention_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            real_len = feats.shape[2]
+            # Whisper-style feature extractors pad mel frames to 3000 (30s);
+            # the audio tower reshapes mel_seq into chunks of 100, so it must
+            # be a multiple of 100.  Pad ``input_features`` with zeros to the
+            # padded length and mark the real frames in the attention mask.
+            target_len = max(3000, ((real_len + 99) // 100) * 100)
+            if target_len != real_len:
+                feats = np.pad(feats, ((0, 0), (0, 0), (0, target_len - real_len)))
+                audio_feeds["input_features"] = feats
+            mask_dtype = audio_session.get_input_dtype("feature_attention_mask") or np.int64
+            mask = np.zeros((feats.shape[0], target_len), dtype=mask_dtype)
+            mask[:, :real_len] = 1
+            audio_feeds["feature_attention_mask"] = mask
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1813,6 +1836,29 @@ def _run_speech_language_generation(
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
             audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+        # Qwen3-ASR requires ``feature_attention_mask`` of shape
+        # ``(batch, mel_seq)`` where ``input_features`` is
+        # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
+        # ``padding=False`` so every frame is real -> all-ones is correct.
+        if (
+            "feature_attention_mask" in audio_session.input_names
+            and "feature_attention_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            real_len = feats.shape[2]
+            # Whisper-style feature extractors pad mel frames to 3000 (30s);
+            # the audio tower reshapes mel_seq into chunks of 100, so it must
+            # be a multiple of 100.  Pad ``input_features`` with zeros to the
+            # padded length and mark the real frames in the attention mask.
+            target_len = max(3000, ((real_len + 99) // 100) * 100)
+            if target_len != real_len:
+                feats = np.pad(feats, ((0, 0), (0, 0), (0, target_len - real_len)))
+                audio_feeds["input_features"] = feats
+            mask_dtype = audio_session.get_input_dtype("feature_attention_mask") or np.int64
+            mask = np.zeros((feats.shape[0], target_len), dtype=mask_dtype)
+            mask[:, :real_len] = 1
+            audio_feeds["feature_attention_mask"] = mask
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
