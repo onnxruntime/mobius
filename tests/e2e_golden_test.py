@@ -471,11 +471,14 @@ def _token_match_ratio(
 
 def _prepare_vision_feeds(
     case: GoldenTestCase,
+    forced_size: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """Prepare input feeds for an image-classification forward pass.
 
     Loads the test image and preprocesses it with the HuggingFace
-    image processor to produce ``pixel_values``.
+    image processor to produce ``pixel_values``.  When ``forced_size`` is
+    given (object-detection), the processor is forced to that exact
+    resolution to match the model's fixed-size export.
     """
     import transformers
     from PIL import Image
@@ -484,11 +487,34 @@ def _prepare_vision_feeds(
         case.model_id, trust_remote_code=case.trust_remote_code
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
-    processed = processor(images=image, return_tensors="np")
+    proc_kwargs: dict = {"images": image, "return_tensors": "np"}
+    if forced_size is not None:
+        proc_kwargs["size"] = forced_size
+    processed = processor(**proc_kwargs)
     feeds: dict[str, np.ndarray] = {
         "pixel_values": processed["pixel_values"].astype(np.float32),
     }
     return feeds
+
+
+def _detection_forced_size(case: GoldenTestCase) -> dict | None:
+    """Return the fixed ``{height, width}`` export size for object detection.
+
+    mobius exports object-detection models at a fixed resolution from
+    ``config.image_size`` (no position-embedding interpolation), so the
+    image processor must emit exactly that size.
+    """
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    image_size = getattr(config, "image_size", None)
+    if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+        return {"height": int(image_size[0]), "width": int(image_size[1])}
+    if isinstance(image_size, int):
+        return {"height": image_size, "width": image_size}
+    return None
 
 
 def _prepare_audio_feeds(
@@ -1509,6 +1535,17 @@ class TestL4CheckpointVerified:
             session = _open_decoder_session(pkg)
             try:
                 feeds = _prepare_vision_feeds(case)
+                outputs = session.run(feeds)
+            finally:
+                session.close()
+        elif case.task_type == "object-detection":
+            # Object detection (e.g. YOLOS): pixel_values → class logits +
+            # predicted boxes. The golden top-K is over the last query's
+            # class ``logits``. The processor is forced to the model's fixed
+            # export resolution (no position-embedding interpolation).
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_vision_feeds(case, forced_size=_detection_forced_size(case))
                 outputs = session.run(feeds)
             finally:
                 session.close()
