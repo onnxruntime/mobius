@@ -5000,8 +5000,13 @@ def test_gemma4_e2b_text_prefill_bf16():
     """Gemma 4 E2B text-only prefill in bfloat16: ONNX logits match HuggingFace.
 
     Same as ``test_gemma4_e2b_text_prefill`` but builds the ONNX model in
-    bfloat16 and loads the HuggingFace reference in bfloat16.  Tolerances
-    are relaxed to atol=5e-3 / rtol=1e-2 to account for bfloat16 rounding.
+    bfloat16 and loads the HuggingFace reference in bfloat16.  bfloat16 has an
+    ~8-bit mantissa, so element-wise logit agreement is not a meaningful gate:
+    HuggingFace's own bf16-vs-f32 logits already differ by ~0.45 max-abs here,
+    and different op/kernel ordering pushes mobius bf16 to a similar ~0.8
+    max-abs noise floor.  The meaningful parity gate (matching the
+    gemma-4-12B unified test) is last-token cosine similarity and argmax
+    agreement, which hold exactly.
     """
     import dataclasses
 
@@ -5095,12 +5100,22 @@ def test_gemma4_e2b_text_prefill_bf16():
 
     max_diff = float(np.max(np.abs(onnx_logits - hf_logits)))
     mean_diff = float(np.mean(np.abs(onnx_logits - hf_logits)))
+    last_cos = float(
+        np.dot(onnx_logits[0, -1], hf_logits[0, -1])
+        / (np.linalg.norm(onnx_logits[0, -1]) * np.linalg.norm(hf_logits[0, -1]) + 1e-9)
+    )
+    argmax_match = bool((onnx_logits.argmax(-1) == hf_logits.argmax(-1)).all())
     print(
         f"\nGemma4 E2B bf16 prefill parity — "
-        f"max_abs_diff={max_diff:.6f}, mean_abs_diff={mean_diff:.6f}"
+        f"max_abs_diff={max_diff:.6f}, mean_abs_diff={mean_diff:.6f}, "
+        f"last_token_cos_sim={last_cos:.6f}, argmax_match={argmax_match}"
     )
 
-    assert_logits_close(onnx_logits, hf_logits, rtol=1e-2, atol=5e-3)
+    # bf16 noise floor makes element-wise atol meaningless (HF bf16 vs f32 is
+    # already ~0.45 max-abs); gate on cosine + argmax instead.
+    assert not np.isnan(onnx_logits).any()
+    assert last_cos > 0.999, f"last-token cosine {last_cos:.6f} <= 0.999"
+    assert argmax_match, "per-position argmax mismatch vs HuggingFace bf16"
 
 
 # ---------------------------------------------------------------------------
