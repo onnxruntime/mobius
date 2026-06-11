@@ -102,18 +102,26 @@ class VisionAttention(nn.Module):
         self.v_proj = _VisionLinear(hidden_size, hidden_size)
         self.out_proj = _VisionLinear(hidden_size, hidden_size)
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         # hidden_states: [batch, seq_len, hidden_size]
         q = self.q_proj(op, hidden_states)
         k = self.k_proj(op, hidden_states)
         v = self.v_proj(op, hidden_states)
 
-        # op.Attention expects [batch, seq_len, num_heads * head_dim]
-        # No mask, no past KV for vision (bidirectional)
+        # op.Attention expects [batch, seq_len, num_heads * head_dim].
+        # attention_mask (optional) is an additive bias broadcastable to
+        # [batch, num_heads, q_seq, kv_seq] — used by encoders with padded
+        # patches (e.g. Phi4MM HD sub-crops) so padding keys are masked out.
         attn_output = op.Attention(
             q,
             k,
             v,
+            attention_mask,
             kv_num_heads=self.num_heads,
             q_num_heads=self.num_heads,
             scale=self.scale,
@@ -189,10 +197,15 @@ class VisionEncoderLayer(nn.Module):
             linear_class=_VisionLinear,
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         residual = hidden_states
         hidden_states = self.layer_norm1(op, hidden_states)
-        hidden_states = self.self_attn(op, hidden_states)
+        hidden_states = self.self_attn(op, hidden_states, attention_mask)
         hidden_states = op.Add(residual, hidden_states)
 
         residual = hidden_states
@@ -221,9 +234,14 @@ class VisionEncoder(nn.Module):
             ]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value | None = None,
+    ):
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states)
+            hidden_states = layer(op, hidden_states, attention_mask)
         return hidden_states
 
 

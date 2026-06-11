@@ -413,6 +413,93 @@ class Phi4MMCausalLMModel(Phi3CausalLMModel):
 
 # -----------------------------------------------------------------------
 # Phi4-MM Multimodal Model (Vision + Audio + Text with LoRA)
+class _Phi4MMNaViTPatchEmbedding(PatchEmbedding):
+    """SigLIP NaViT patch embedding with mask-aware position IDs.
+
+    HF's ``SiglipVisionEmbeddings`` (vision_siglip_navit.py:571) assigns
+    position embeddings based on each crop's *valid* patch grid rather than a
+    fixed 0..N-1 sequence.  For a crop with ``nb_h`` valid rows and ``nb_w``
+    valid cols (the top-left block; padding is on the right/bottom), the valid
+    patch at grid (r, c) gets::
+
+        pos_id = floor(r * P / nb_h) * P + floor(c * P / nb_w)
+
+    (``P`` = patches per side).  This is exactly HF's ``bucketize`` of evenly
+    spaced fractional coordinates against ``arange(1/P, 1, 1/P)``.  Padded
+    patches get position id 0.  Without this redistribution, padded HD
+    sub-crops diverge sharply from HF (cos ~0.8) even with attention masking.
+    """
+
+    def __init__(self, image_size: int, patch_size: int, hidden_size: int):
+        super().__init__(image_size=image_size, patch_size=patch_size, hidden_size=hidden_size)
+        self._P = image_size // patch_size  # patches per side
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        patch_attention_mask: ir.Value | None = None,
+    ):
+        # Conv patchify → (N, P*P, hidden), mirroring PatchEmbedding.
+        patches = op.Conv(
+            pixel_values,
+            self.patch_embedding,
+            self.patch_embedding_bias,
+            kernel_shape=[self.patch_embedding.shape[2], self.patch_embedding.shape[3]],
+            strides=[self.patch_embedding.shape[2], self.patch_embedding.shape[3]],
+        )
+        batch_size = op.Shape(patches, start=0, end=1)
+        hidden_dim = op.Shape(patches, start=1, end=2)
+        patches = op.Reshape(
+            patches,
+            op.Concat(batch_size, hidden_dim, op.Constant(value_ints=[-1]), axis=0),
+        )
+        patches = op.Transpose(patches, perm=[0, 2, 1])  # (N, P*P, hidden)
+
+        if patch_attention_mask is None:
+            return op.Add(patches, self.position_embedding)
+
+        P = self._P  # noqa: N806
+        # mask: (N, P, P) {0,1} → counts of valid rows/cols (top-left block).
+        mask_i = op.Cast(patch_attention_mask, to=ir.DataType.INT64)
+        # nb_h = sum of column 0 over rows; nb_w = sum of row 0 over cols.
+        col0 = op.Slice(
+            mask_i,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[2]),
+        )  # (N, P, 1)
+        nb_h = op.ReduceSum(col0, op.Constant(value_ints=[1]), keepdims=1)  # (N,1,1)
+        row0 = op.Slice(
+            mask_i,
+            op.Constant(value_ints=[0]),
+            op.Constant(value_ints=[1]),
+            op.Constant(value_ints=[1]),
+        )  # (N, 1, P)
+        nb_w = op.ReduceSum(row0, op.Constant(value_ints=[2]), keepdims=1)  # (N,1,1)
+
+        # r: (1, P, 1), c: (1, 1, P)
+        idx = op.Constant(value_ints=list(range(P)))
+        r = op.Reshape(idx, op.Constant(value_ints=[1, P, 1]))
+        c = op.Reshape(idx, op.Constant(value_ints=[1, 1, P]))
+        p_const = op.Constant(value_int=P)  # scalar int64
+        # pos_h = floor(r * P / nb_h); pos_w = floor(c * P / nb_w)
+        pos_h = op.Div(op.Mul(r, p_const), nb_h)  # (N, P, 1)
+        pos_w = op.Div(op.Mul(c, p_const), nb_w)  # (N, 1, P)
+        # pos_id(r,c) = pos_h * P + pos_w → (N, P, P)
+        pos_id = op.Add(op.Mul(pos_h, p_const), pos_w)
+        # Valid patches are the top-left nb_h × nb_w block; others → id 0.
+        valid = op.And(op.Less(r, nb_h), op.Less(c, nb_w))  # (N, P, P)
+        zero = op.Constant(value_int=0)
+        pos_id = op.Where(valid, pos_id, zero)
+        pos_id_flat = op.Reshape(
+            pos_id, op.Concat(batch_size, op.Constant(value_ints=[-1]), axis=0)
+        )  # (N, P*P)
+        # Gather per-crop position embeddings: (N, P*P, hidden)
+        pos_emb = op.Gather(self.position_embedding, pos_id_flat, axis=0)
+        return op.Add(patches, pos_emb)
+
+
 # -----------------------------------------------------------------------
 
 
@@ -435,7 +522,8 @@ class _Phi4MMSigLIPEncoder(nn.Module):
         num_heads = vc.num_attention_heads or 4 if vc else 4
         num_layers = vc.num_hidden_layers or 2 if vc else 2
         norm_eps = vc.norm_eps if vc else 1e-6
-        self.embeddings = PatchEmbedding(
+        self._dtype = config.dtype
+        self.embeddings = _Phi4MMNaViTPatchEmbedding(
             image_size=image_size,
             patch_size=patch_size,
             hidden_size=hidden_size,
@@ -451,9 +539,41 @@ class _Phi4MMSigLIPEncoder(nn.Module):
             norm_eps=norm_eps,
         )
 
-    def forward(self, op: OpBuilder, pixel_values: ir.Value):
-        hidden_states = self.embeddings(op, pixel_values)
-        return self.encoder(op, hidden_states)
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        image_attention_mask: ir.Value | None = None,
+    ):
+        hidden_states = self.embeddings(
+            op, pixel_values, patch_attention_mask=image_attention_mask
+        )
+        attn_bias = None
+        if image_attention_mask is not None:
+            # image_attention_mask: (N_crops, H, H) of {0, 1} → flatten to the
+            # patch sequence (N_crops, 1, 1, H*H) and build an additive
+            # attention bias: 0 for valid patches, large-negative for padding.
+            # This replicates HF's ``patch_attention_mask`` so padded patches
+            # do not leak into valid patches via self-attention.  ORT's
+            # Attention requires the bias' query dim to equal the Q seq length,
+            # so broadcast (Expand) the key-padding bias across all queries:
+            # (N_crops, 1, 1, S) → (N_crops, 1, S, S).
+            n_crops = op.Shape(image_attention_mask, start=0, end=1)  # (1,)
+            seq = op.Shape(hidden_states, start=1, end=2)  # (1,) = H*H
+            flat_shape = op.Concat(
+                n_crops,
+                op.Constant(value_ints=[1, 1, -1]),
+                axis=0,
+            )
+            mask_flat = op.Reshape(image_attention_mask, flat_shape)
+            mask_flat = op.Cast(mask_flat, to=self._dtype)
+            one = op.Cast(op.Constant(value_floats=[1.0]), to=self._dtype)
+            neg = op.Cast(op.Constant(value_floats=[-50000.0]), to=self._dtype)
+            # (1 - mask) * -50000 → 0 where valid, -50000 where padded.
+            attn_bias = op.Mul(op.Sub(one, mask_flat), neg)
+            target_shape = op.Concat(n_crops, op.Constant(value_ints=[1]), seq, seq, axis=0)
+            attn_bias = op.Expand(attn_bias, target_shape)
+        return self.encoder(op, hidden_states, attn_bias)
 
 
 class _GELUModule(nn.Module):
@@ -696,6 +816,7 @@ class _Phi4MMVisionModel(nn.Module):
         op: OpBuilder,
         pixel_values: ir.Value,
         image_sizes: ir.Value,
+        image_attention_mask: ir.Value | None = None,
     ):
         """Encode crops through SigLIP + HD spatial reassembly.
 
@@ -706,9 +827,18 @@ class _Phi4MMVisionModel(nn.Module):
           4. Global crop (index 0): reshape to (1, Hp, Hp, C) and append
              sub_GN row separators → (1, Hp*(Hp+1), C)
           5. Sub crops (indices 1..h*w): arrange in (h, w) grid →
-             (1, h*Hp, w*Hp, C) and append sub_GN row separators
+             (1, h*Hp, w*Hp, C), optionally crop padded rows/cols using
+             ``image_attention_mask``, then append sub_GN row separators
           6. Assemble sub-first: [sub | glb_GN | global]
           7. Project flat sequence through img_projection MLP
+
+        When ``image_attention_mask`` (N_crops, H, H) is provided, padded
+        sub-crops are cropped to their useful height/width before the row
+        separators are added — replicating HuggingFace's masked HD transform
+        (``modeling_phi4mm.py`` lines 376-387).  Without it, the full
+        (h*Hp, w*Hp) grid is emitted, which only matches HF when no sub-crop
+        is padded.  Phi4MM's processor always emits the mask, so for parity
+        (and correct multi-image token alignment) it must be passed.
         """
         H = self._H  # noqa: N806  # 32 patches per side from SigLIP
         Hp = self._Hp  # noqa: N806  # 16 patches per side after AvgPool
@@ -717,7 +847,11 @@ class _Phi4MMVisionModel(nn.Module):
         # ── Step 1: SigLIP encode all crops ────────────────────────────
         # pixel_values: (N_crops, 3, 448, 448)
         # vision_features: (N_crops, H*H, C) = (N_crops, 1024, 1152)
-        vision_features = self.img_processor(op, pixel_values)
+        # The patch mask excludes padded patches from self-attention so the
+        # valid patches' features match HF (which passes patch_attention_mask).
+        vision_features = self.img_processor(
+            op, pixel_values, image_attention_mask=image_attention_mask
+        )
 
         # ── Step 2: AvgPool2d — compress 32x32 patches to 16x16 ───────
         # Reshape: (N_crops, H*H, C) -> (N_crops, H, H, C)
@@ -815,18 +949,101 @@ class _Phi4MMVisionModel(nn.Module):
         )
         sub_grid = op.Reshape(sub_6d_t, sub_flat_shape)  # (1, h*16, w*16, 1152)
 
-        # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
-        sub_sep_tile = op.Concat(
-            op.Constant(value_ints=[1]),
-            op.Unsqueeze(h_hp, [0]),
-            op.Constant(value_ints=[1, 1]),
-            axis=0,
-        )
-        temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
-        # Append one separator per row: (1, h*Hp, w*Hp+1, C)
-        sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
-        # Flatten rows: (1, h*Hp*(w*Hp+1), C)
-        sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+        # ── Optional mask crop: drop padded sub-crop rows/cols ────────
+        # HF (modeling_phi4mm.py:376-382) uses image_attention_mask to crop
+        # the assembled grid to its useful height/width before adding the
+        # row separators.  The mask is at the pre-AvgPool resolution (H×H);
+        # HF samples it stride-2 (``[..., 0::2, 0::2]``) so each value maps
+        # to one post-AvgPool position (Hp×Hp per crop).
+        if image_attention_mask is not None:
+            # Sub-crop masks: crops 1..B_ → (h*w, H, H)
+            sub_mask = op.Slice(
+                image_attention_mask,
+                op.Constant(value_ints=[1]),
+                B_plus_1,
+                op.Constant(value_ints=[0]),
+            )  # (h*w, 32, 32)
+            # Stride-2 downsample to match AvgPool: (h*w, Hp, Hp)
+            sub_mask = op.Slice(
+                sub_mask,
+                op.Constant(value_ints=[0, 0]),
+                op.Constant(value_ints=[H, H]),
+                op.Constant(value_ints=[1, 2]),
+                op.Constant(value_ints=[2, 2]),
+            )  # (h*w, 16, 16)
+            # Arrange in spatial grid mirroring the feature layout:
+            # (1, h, w, Hp, Hp) -> (1, h, Hp, w, Hp) -> (1, h*Hp, w*Hp)
+            mask_5d_shape = op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Unsqueeze(h, [0]),
+                op.Unsqueeze(w, [0]),
+                op.Constant(value_ints=[Hp, Hp]),
+                axis=0,
+            )
+            mask_6d = op.Reshape(sub_mask, mask_5d_shape)
+            mask_6d_t = op.Transpose(mask_6d, perm=[0, 1, 3, 2, 4])
+            mask_grid = op.Reshape(
+                mask_6d_t,
+                op.Concat(
+                    op.Constant(value_ints=[1]),
+                    op.Unsqueeze(h_hp, [0]),
+                    op.Unsqueeze(w_hp, [0]),
+                    axis=0,
+                ),
+            )  # (1, h*Hp, w*Hp)
+            # useful_height = sum of column 0; useful_width = sum of row 0
+            col0 = op.Slice(
+                mask_grid,
+                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
+                op.Constant(value_ints=[2]),
+            )  # (1, h*Hp, 1)
+            row0 = op.Slice(
+                mask_grid,
+                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
+                op.Constant(value_ints=[1]),
+            )  # (1, 1, w*Hp)
+            useful_h = op.Cast(
+                op.ReduceSum(col0, op.Constant(value_ints=[0, 1, 2]), keepdims=0),
+                to=ir.DataType.INT64,
+            )  # scalar
+            useful_w = op.Cast(
+                op.ReduceSum(row0, op.Constant(value_ints=[0, 1, 2]), keepdims=0),
+                to=ir.DataType.INT64,
+            )  # scalar
+            uh = op.Unsqueeze(useful_h, [0])  # (1,)
+            uw = op.Unsqueeze(useful_w, [0])  # (1,)
+            # Crop grid: (1, useful_h, useful_w, C)
+            sub_grid = op.Slice(
+                sub_grid,
+                op.Constant(value_ints=[0, 0]),
+                op.Concat(uh, uw, axis=0),
+                op.Constant(value_ints=[1, 2]),
+            )
+            # Row separators tiled to useful_height instead of h*Hp.
+            sub_sep_tile = op.Concat(
+                op.Constant(value_ints=[1]),
+                uh,
+                op.Constant(value_ints=[1, 1]),
+                axis=0,
+            )
+            temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, useful_h, 1, C)
+            sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+            sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
+        else:
+            # Row separators: sub_GN (1, 1, 1, C) tiled to (1, h*Hp, 1, C)
+            sub_sep_tile = op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Unsqueeze(h_hp, [0]),
+                op.Constant(value_ints=[1, 1]),
+                axis=0,
+            )
+            temp_sub_gn = op.Tile(self.sub_GN, sub_sep_tile)  # (1, h*16, 1, 1152)
+            # Append one separator per row: (1, h*Hp, w*Hp+1, C)
+            sub_rows = op.Concat(sub_grid, temp_sub_gn, axis=2)
+            # Flatten rows: (1, h*Hp*(w*Hp+1), C)
+            sub_img = op.Reshape(sub_rows, op.Constant(value_ints=[1, -1, C]))
 
         # ── Step 7: Assemble sub-first and project ────────────────────
         # HF hd_transform_order = "sub_glb": [sub | glb_GN | global]

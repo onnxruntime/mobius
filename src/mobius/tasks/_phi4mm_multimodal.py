@@ -82,6 +82,9 @@ class Phi4MMMultiModalTask(ModelTask):
         batch = ir.SymbolicDim("batch")
         num_images = ir.SymbolicDim("num_images")
         image_size = (config.vision.image_size if config.vision else None) or 448
+        patch_size = (config.vision.patch_size if config.vision else None) or 14
+        # Mask spatial dim = patches per side from the vision tower (e.g. 32).
+        mask_dim = image_size // patch_size
 
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
@@ -96,8 +99,21 @@ class Phi4MMMultiModalTask(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[num_images, 2],
         )
+        # Per-crop validity mask (1 = real patch, 0 = padding).  Phi4MM's
+        # processor emits this for the HD transform; the encoder crops padded
+        # sub-crops so the emitted token count matches HuggingFace.
+        image_attention_mask = builder.input(
+            "image_attention_mask",
+            dtype=config.dtype,
+            shape=[batch, mask_dim, mask_dim],
+        )
 
-        image_features = vision(op, pixel_values, image_sizes=image_sizes)
+        image_features = vision(
+            op,
+            pixel_values,
+            image_sizes=image_sizes,
+            image_attention_mask=image_attention_mask,
+        )
 
         builder.add_output(image_features, "image_features")
         return _make_model(graph)

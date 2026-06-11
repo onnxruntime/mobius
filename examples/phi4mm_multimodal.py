@@ -16,7 +16,8 @@ generation across all supported modalities:
 The model is split into 4 ONNX graphs, each running in its own
 ONNX Runtime session:
 
-    - **Vision**:    ``pixel_values`` + ``image_sizes`` → ``image_features``
+    - **Vision**:    ``pixel_values`` + ``image_sizes`` +
+      ``image_attention_mask`` → ``image_features``
       (SigLIP encoder + projection)
     - **Speech**:    ``audio_features`` + ``audio_sizes`` +
       ``audio_projection_mode`` → ``audio_features``
@@ -111,12 +112,16 @@ def prepare_vision_feeds(
     """Prepare feeds for the **vision** session.
 
     Returns:
-        ``{"pixel_values": [1, 3, H, W], "image_sizes": [1, 2]}``
-        ready for the vision ONNX model.
+        ``{"pixel_values": [crops, 3, H, W], "image_sizes": [1, 2],
+        "image_attention_mask": [crops, P, P]}`` ready for the vision
+        ONNX model (single image).
     """
-    pixel_values = _load_image(image_path, processor)
-    image_sizes = np.array([[pixel_values.shape[-2], pixel_values.shape[-1]]], dtype=np.int64)
-    return {"pixel_values": pixel_values, "image_sizes": image_sizes}
+    pixel_values, image_sizes, image_attention_mask = _load_image(image_path, processor)
+    return {
+        "pixel_values": pixel_values,
+        "image_sizes": image_sizes,
+        "image_attention_mask": image_attention_mask,
+    }
 
 
 def prepare_speech_feeds(
@@ -279,17 +284,27 @@ def _build_input_ids_vision_audio(
 # ---------------------------------------------------------------------------
 
 
-def _load_image(image_path: str, processor) -> np.ndarray:
+def _load_image(image_path: str, processor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load and preprocess an image using the HuggingFace processor.
 
+    Phi4MM's image processor performs an HD multi-crop transform and emits
+    ``input_image_embeds`` (the crop pixel tensor), ``image_sizes`` and an
+    ``image_attention_mask`` marking valid (non-padding) patches per crop.
+
     Returns:
-        ``pixel_values`` as ``[1, 3, H, W]`` float32 numpy array.
+        ``(pixel_values [crops, 3, H, W], image_sizes [1, 2],
+        image_attention_mask [crops, P, P])`` as float32/int64 arrays for a
+        single image.
     """
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
     processed = processor.image_processor(images=img, return_tensors="np")
-    return processed["pixel_values"].astype(np.float32)
+    # Single image -> index 0 of the leading num_images dimension.
+    pixel_values = processed["input_image_embeds"][0].astype(np.float32)
+    image_sizes = processed["image_sizes"][0:1].astype(np.int64)
+    image_attention_mask = processed["image_attention_mask"][0].astype(np.float32)
+    return pixel_values, image_sizes, image_attention_mask
 
 
 def _load_audio(

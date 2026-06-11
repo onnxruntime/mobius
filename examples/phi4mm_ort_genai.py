@@ -144,6 +144,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 "inputs": {
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
+                    "image_attention_mask": "image_attention_mask",
                 },
                 "outputs": {
                     "image_features": "image_features",

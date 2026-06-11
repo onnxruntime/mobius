@@ -19,6 +19,7 @@ the full weight files.
 from __future__ import annotations
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 import transformers
@@ -37,6 +38,31 @@ _NUM_TEXT_LAYERS = 2
 _NUM_VISION_LAYERS = 2
 _NUM_AUDIO_BLOCKS = 2
 
+_PHI4MM_COMPAT_APPLIED = False
+
+
+def _ensure_phi4mm_compat() -> None:
+    """Apply Phi4MM transformers-5.x compat shims (idempotent).
+
+    Phi4MM's remote modeling code targets transformers 4.x and fails to load
+    under 5.x (``_tied_weights_keys`` is a list, meta-tensor ``int()`` calls,
+    etc.). The canonical shims live in ``scripts/generate_golden.py``; reuse
+    them so the integration test loads the same HF reference the goldens use.
+    """
+    global _PHI4MM_COMPAT_APPLIED
+    if _PHI4MM_COMPAT_APPLIED:
+        return
+    import os
+    import sys
+
+    scripts_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from generate_golden import _apply_phi4mm_compat_patches
+
+    _apply_phi4mm_compat_patches()
+    _PHI4MM_COMPAT_APPLIED = True
+
 
 def _load_phi4mm_config():
     """Load ArchitectureConfig for Phi4-MM, overriding layer counts."""
@@ -44,6 +70,10 @@ def _load_phi4mm_config():
     text_config = hf_config if not hasattr(hf_config, "text_config") else hf_config.text_config
     text_config.num_hidden_layers = _NUM_TEXT_LAYERS
     config = ArchitectureConfig.from_transformers(text_config)
+    # Build the ONNX pipeline in float32 to match the float32 HF reference
+    # (the checkpoint defaults to bfloat16, which also lacks an ORT CPU Conv
+    # kernel for the vision patch embedding).
+    config.dtype = ir.DataType.FLOAT
     if config.vision is not None:
         config.vision.num_hidden_layers = _NUM_VISION_LAYERS
     if config.audio is not None:
@@ -73,6 +103,7 @@ def _run_onnx_pipeline(
     *,
     pixel_values: np.ndarray | None = None,
     image_sizes: np.ndarray | None = None,
+    image_attention_mask: np.ndarray | None = None,
     audio_features: np.ndarray | None = None,
     audio_projection_mode: int = 0,
 ) -> np.ndarray:
@@ -99,8 +130,25 @@ def _run_onnx_pipeline(
                 [[pixel_values.shape[-2], pixel_values.shape[-1]]],
                 dtype=np.int64,
             )
+        # Flatten mask to crops too: [N, crops, M, M] → [N*crops, M, M]
+        if image_attention_mask is not None and image_attention_mask.ndim == 4:
+            image_attention_mask = image_attention_mask.reshape(
+                -1, image_attention_mask.shape[-2], image_attention_mask.shape[-1]
+            )
+        if image_attention_mask is None:
+            # All-valid mask (no padded crops) sized to the vision tower grid.
+            mask_dim = pixel_values.shape[-1] // (
+                (config.vision.patch_size if config.vision else None) or 14
+            )
+            image_attention_mask = np.ones(
+                (pixel_values.shape[0], mask_dim, mask_dim), dtype=np.float32
+            )
         vision_out = vision_session.run(
-            {"pixel_values": pixel_values, "image_sizes": image_sizes}
+            {
+                "pixel_values": pixel_values,
+                "image_sizes": image_sizes,
+                "image_attention_mask": image_attention_mask.astype(np.float32),
+            }
         )
         image_features = vision_out["image_features"]
         vision_session.close()
@@ -147,6 +195,10 @@ def _run_onnx_pipeline(
         "attention_mask": np.ones((1, seq_len), dtype=np.int64),
         "position_ids": np.arange(seq_len, dtype=np.int64)[np.newaxis, :],
     }
+    # The HF reference merges ALL LoRA adapters (vision + speech) into its
+    # base weights, so activate both gates to apply every adapter in ONNX.
+    decoder_feeds["vision_gate"] = np.array(1.0, dtype=np.float32)
+    decoder_feeds["speech_gate"] = np.array(1.0, dtype=np.float32)
     for i in range(config.num_hidden_layers):
         decoder_feeds[f"past_key_values.{i}.key"] = np.zeros(
             (1, config.num_key_value_heads, 0, config.head_dim),
@@ -203,6 +255,27 @@ def _merge_all_lora_adapters(model):
     print(f"  Merged {merged_count} LoRA adapter weights into base model")
 
 
+def _truncate_vision_layers(model, num_layers: int) -> None:
+    """Truncate the HF Phi4MM SigLIP vision encoder to ``num_layers``.
+
+    The ONNX vision encoder is built with a reduced layer count for fast
+    tests; the HF reference defaults to the full depth (27). Slice its
+    ``encoder.layers`` ModuleList so both towers have matching depth.
+    """
+    try:
+        vision = model.model.embed_tokens_extend.image_embed.img_processor
+    except AttributeError:
+        return
+    encoder = getattr(vision, "encoder", None)
+    layers = getattr(encoder, "layers", None)
+    if layers is None:
+        return
+    if len(layers) > num_layers:
+        encoder.layers = layers[:num_layers]
+        if hasattr(vision, "config"):
+            vision.config.num_hidden_layers = num_layers
+
+
 def _load_torch_phi4mm():
     """Load HuggingFace Phi4-MM model with layer counts overridden.
 
@@ -210,6 +283,7 @@ def _load_torch_phi4mm():
     so the model's behavior matches the ONNX model (which always applies
     all LoRA adapters regardless of input mode).
     """
+    _ensure_phi4mm_compat()
     hf_config = transformers.AutoConfig.from_pretrained(_MODEL_ID, trust_remote_code=True)
     text_config = hf_config if not hasattr(hf_config, "text_config") else hf_config.text_config
     text_config.num_hidden_layers = _NUM_TEXT_LAYERS
@@ -230,7 +304,15 @@ def _load_torch_phi4mm():
     print(f"  HF model: loading {loaded}/{total} weights ({lora_loaded}/{lora_in_model} LoRA)")
 
     model.load_state_dict(filtered, strict=False)
+    # Checkpoint weights are bf16; run the reference in float32 for parity
+    # comparison (and so logits convert cleanly to numpy).
+    model = model.float()
     model.eval()
+
+    # The ONNX package builds the vision encoder with only
+    # ``config.vision.num_hidden_layers`` layers, so truncate the HF vision
+    # tower to the same depth (layers 0..N-1 keep their loaded weights).
+    _truncate_vision_layers(model, _NUM_VISION_LAYERS)
 
     # Merge all LoRA adapters into base weights to match ONNX behavior
     _merge_all_lora_adapters(model)
@@ -265,8 +347,9 @@ def _create_dummy_pixel_values(config, batch_size: int = 1):
     # Phi4MM image_processor returns 'input_image_embeds' as the pixel tensor
     pixel_values = inputs["input_image_embeds"].astype(np.float32)
     image_sizes = inputs["image_sizes"].astype(np.int64)
+    image_attention_mask = inputs["image_attention_mask"].astype(np.float32)
     num_img_tokens = int(inputs["num_img_tokens"][0])
-    return pixel_values, image_sizes, num_img_tokens
+    return pixel_values, image_sizes, image_attention_mask, num_img_tokens
 
 
 def _create_dummy_audio_features(config, batch_size: int = 1) -> np.ndarray:
@@ -309,11 +392,6 @@ class TestPhi4MMMultiModalForward:
 
         assert_logits_close(onnx_logits, torch_logits, rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.skip(
-        reason="Vision encoder HD crop processing differs between ONNX and HF. "
-        "Text tokens match (diff<1e-5) but image features diverge "
-        "through the projection MLP. Requires vision encoder parity work."
-    )
     def test_vision_prefill_logits_match(self):
         """Prefill with text + image should match PyTorch."""
         config = _load_phi4mm_config()
@@ -324,7 +402,9 @@ class TestPhi4MMMultiModalForward:
         tokens = tokenizer(prompt, return_tensors="np")
         input_ids = tokens["input_ids"].astype(np.int64)
 
-        pixel_values, image_sizes_np, num_img_tokens = _create_dummy_pixel_values(config)
+        pixel_values, image_sizes_np, image_attention_mask, num_img_tokens = (
+            _create_dummy_pixel_values(config)
+        )
 
         # Insert image placeholder tokens (count must match vision encoder output)
         image_token_id = config.image_token_id
@@ -341,6 +421,7 @@ class TestPhi4MMMultiModalForward:
         dtype = next(torch_model.parameters()).dtype
         seq_len = input_ids.shape[1]
         pv_tensor = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
+        mask_tensor = torch.from_numpy(image_attention_mask).to(device=device)
         with torch.no_grad():
             torch_out = torch_model(
                 input_ids=torch.from_numpy(input_ids).to(device),
@@ -348,6 +429,7 @@ class TestPhi4MMMultiModalForward:
                 position_ids=torch.arange(seq_len, device=device).unsqueeze(0),
                 input_image_embeds=pv_tensor,
                 image_sizes=torch.from_numpy(image_sizes_np).to(device),
+                image_attention_mask=mask_tensor,
                 input_mode=1,  # InputMode.VISION
                 use_cache=True,
             )
@@ -360,6 +442,7 @@ class TestPhi4MMMultiModalForward:
             input_ids,
             pixel_values=pixel_values,
             image_sizes=image_sizes_np,
+            image_attention_mask=image_attention_mask,
         )
 
         assert_logits_close(onnx_logits, torch_logits, rtol=1e-2, atol=1e-2)
@@ -416,10 +499,6 @@ class TestPhi4MMMultiModalForward:
 
         assert_logits_close(onnx_logits, torch_logits, rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.skip(
-        reason="Vision encoder HD crop processing differs between ONNX and HF. "
-        "Depends on vision encoder parity (same root cause as vision-only test)."
-    )
     def test_vision_and_audio_prefill_logits_match(self):
         """Prefill with text + image + audio should match PyTorch."""
         config = _load_phi4mm_config()
@@ -430,7 +509,9 @@ class TestPhi4MMMultiModalForward:
         tokens = tokenizer(prompt, return_tensors="np")
         input_ids = tokens["input_ids"].astype(np.int64)
 
-        pixel_values, image_sizes_np, num_img_tokens = _create_dummy_pixel_values(config)
+        pixel_values, image_sizes_np, image_attention_mask, num_img_tokens = (
+            _create_dummy_pixel_values(config)
+        )
         audio_features = _create_dummy_audio_features(config)
 
         # Insert both image and audio placeholder tokens
@@ -457,6 +538,7 @@ class TestPhi4MMMultiModalForward:
         seq_len = input_ids.shape[1]
         pv_tensor = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
         af_tensor = torch.from_numpy(audio_features).to(device=device, dtype=dtype)
+        mask_tensor = torch.from_numpy(image_attention_mask).to(device=device)
         with torch.no_grad():
             torch_out = torch_model(
                 input_ids=torch.from_numpy(input_ids).to(device),
@@ -464,6 +546,7 @@ class TestPhi4MMMultiModalForward:
                 position_ids=torch.arange(seq_len, device=device).unsqueeze(0),
                 input_image_embeds=pv_tensor,
                 image_sizes=torch.from_numpy(image_sizes_np).to(device),
+                image_attention_mask=mask_tensor,
                 input_audio_embeds=af_tensor,
                 audio_embed_sizes=torch.tensor([audio_features.shape[1]], device=device),
                 input_mode=3,  # InputMode.VISION_SPEECH
@@ -478,6 +561,7 @@ class TestPhi4MMMultiModalForward:
             input_ids,
             pixel_values=pixel_values,
             image_sizes=image_sizes_np,
+            image_attention_mask=image_attention_mask,
             audio_features=audio_features,
             audio_projection_mode=1,
         )
