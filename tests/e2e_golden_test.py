@@ -66,7 +66,6 @@ def _get_test_device_kwargs() -> dict[str, str]:
 
 
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
-_TEST_DEVICE = os.environ.get("MOBIUS_TEST_DEVICE", "").lower()
 
 
 def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
@@ -247,52 +246,6 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
     "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
-
-# Failures that only apply to L5 generation on the CUDA execution provider.
-# These pass on CPU (graph is correct) but diverge on CUDA due to an
-# ORT CUDA EP backend bug, so they are only xfailed when running on GPU.
-_L5_CUDA_ONLY_XFAIL_REASONS: dict[str, str] = {
-    # Gemma4 KV-shared layers (num_kv_shared_layers>0) wire the source layer's
-    # GQA PRESENT K/V as the shared layer's past_key/past_value with an empty
-    # new key/value (kv_sequence_length=0). CPU fp32 incremental decode matches
-    # the golden tokens exactly, but the CUDA EP GroupQueryAttention backend
-    # mishandles this kv_sequence_length=0 shared-KV decode path, diverging
-    # after the first generated token. L4 single-forward and full re-prefill
-    # generation both pass; the defect is the ORT CUDA GQA shared-KV decode
-    # kernel, not the mobius graph.
-    "text-generation/gemma-4-e2b": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-    "text-generation/gemma-4-e4b": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-    # Gemma4 multimodal L5 runs through the same KV-shared GQA decoder, so it
-    # hits the identical ORT CUDA shared-KV decode defect during generation.
-    "image-text-to-text/gemma-4-e2b-it": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-    "image-text-to-text/gemma-4-e4b-it": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-    "speech-language/gemma-4-e2b-it-audio": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-    "speech-language/gemma-4-e4b-it-audio": (
-        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
-        "passes on CPU and at L4 prefill"
-    ),
-}
-
-if _TEST_DEVICE == "cuda":
-    _L5_ONLY_XFAIL_REASONS = {
-        **_L5_ONLY_XFAIL_REASONS,
-        **_L5_CUDA_ONLY_XFAIL_REASONS,
-    }
 
 
 def _discover_cases(
