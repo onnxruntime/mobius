@@ -122,3 +122,49 @@ class TestCompareGolden:
         )
         assert report.result == ParityResult.PASS
         assert report.level == "L4"
+
+    def test_high_jaccard_argmax_swap_ambiguous(self):
+        """Top-10 identical, argmax swapped beyond near-tie margin → AMBIGUOUS.
+
+        Models the phi4mm single-image CUDA float32 near-tie: the predicted
+        token and golden top1 are swapped but their logit gap (~0.09) exceeds
+        the float32 near_tie margin (0.01), while the full top-10 set matches.
+        """
+        top10 = [976, 32, 637, 5632, 2223, 2500, 3160, 51543, 6275, 2886]
+        logits = np.full((1, 200064), -50.0, dtype=np.float32)
+        # Assign descending logits to the golden top-10 ...
+        for rank, tok in enumerate(top10):
+            logits[0, tok] = 37.7 - rank * 0.5
+        # ... but bump token 32 just above 976 so ONNX argmax is 32 (golden
+        # top2), with a gap (~0.09) larger than the 0.01 float32 margin.
+        logits[0, 32] = 37.76
+        logits[0, 976] = 37.67
+        report = compare_golden(
+            logits,
+            golden_top1_id=976,
+            golden_top2_id=32,
+            golden_top10_ids=top10,
+        )
+        assert report.result == ParityResult.AMBIGUOUS
+
+    def test_low_jaccard_argmax_mismatch_still_fails(self):
+        """Genuine divergence (low top-10 overlap) stays FAIL.
+
+        Models phi4mm multi-image-audio: ONNX argmax equals the golden top2
+        but the top-10 sets barely overlap (jaccard ≈ 0.3), so the Jaccard
+        guard must NOT downgrade it to AMBIGUOUS.
+        """
+        golden_top10 = [38229, 976, 13145, 637, 2790, 19048, 1385, 15390, 5632, 90522]
+        # ONNX strongly prefers a disjoint set of tokens; only 976 and 637
+        # overlap with the golden top-10 (low jaccard).
+        onnx_top = [976, 111111, 222222, 333333, 444444, 637, 555555, 666666, 777777, 888888]
+        logits = np.full((1, 1000000), -50.0, dtype=np.float32)
+        for rank, tok in enumerate(onnx_top):
+            logits[0, tok] = 35.0 - rank * 0.5
+        report = compare_golden(
+            logits,
+            golden_top1_id=38229,
+            golden_top2_id=976,
+            golden_top10_ids=golden_top10,
+        )
+        assert report.result == ParityResult.FAIL

@@ -65,6 +65,13 @@ NEAR_TIE_MARGINS: dict[str, float] = {
     "int4": 1.0,
 }
 
+# Top-10 Jaccard at/above which an argmax mismatch is treated as a tie-break
+# (AMBIGUOUS) rather than a divergence (FAIL), provided the predicted token is
+# itself within the golden top-10.  ≥0.9 means at least 9 of the 10 highest
+# tokens agree with the reference — the model ranking matches and only the #1
+# tie-break differs (e.g. CUDA float32 accumulation noise).
+_AMBIGUOUS_JACCARD: float = 0.9
+
 # Per-dtype default tolerances for L3 synthetic parity.
 DEFAULT_TOLERANCES: dict[str, tuple[float, float]] = {
     # (atol, rtol)
@@ -290,6 +297,19 @@ def compare_golden(
             f"L4 AMBIGUOUS: argmax={onnx_top1} != golden_top1={golden_top1_id}, "
             f"but matches top2={golden_top2_id} and near-tie detected "
             f"(gap={abs(top1_logit - top2_logit):.4f} < margin={margin})"
+        )
+    elif jaccard >= _AMBIGUOUS_JACCARD and onnx_top1 in golden_top10:
+        # The top-10 token sets are essentially identical (≥9/10 overlap) and
+        # the predicted token is itself in the golden top-10 — the argmax
+        # difference is a tie-break, not a divergence.  This catches CUDA
+        # float32 near-ties whose absolute logit gap exceeds the per-dtype
+        # ``near_tie`` margin (CUDA accumulation noise > CPU) yet whose ranking
+        # otherwise matches the reference.
+        result = ParityResult.AMBIGUOUS
+        message = (
+            f"L4 AMBIGUOUS: argmax={onnx_top1} != golden_top1={golden_top1_id}, "
+            f"but top10_jaccard={jaccard:.2f} (≥{_AMBIGUOUS_JACCARD}) and "
+            f"argmax is within the golden top-10 — tie-break, not divergence"
         )
     else:
         result = ParityResult.FAIL

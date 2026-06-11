@@ -1202,10 +1202,13 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
         processor = transformers.AutoProcessor.from_pretrained(
             case.model_id, trust_remote_code=True
         )
-        # Load in bfloat16 to reduce memory (14B model)
+        # Load in float32 to match the f32 runtime used by the L4/L5 tests.
+        # bf16 goldens produced flat/tied logit distributions that caused
+        # argmax instability against the f32 model output (see phi4mm L4
+        # false-failures: exact top-2 ties, top-10 spans <3 logits).
         model = transformers.AutoModelForCausalLM.from_pretrained(
             case.model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             device_map=device,
             trust_remote_code=True,
             _attn_implementation="eager",

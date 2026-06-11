@@ -221,13 +221,61 @@ def _parse_lora_adapters(
 
 def _make_lora_linear_factory(
     lora_adapters: list[tuple[str, int, float]],
+    gate_holder: dict[str, ir.Value] | None = None,
 ):
-    """Create a LoRALinear factory that captures lora_adapters via closure."""
+    """Create a LoRALinear factory that captures lora_adapters via closure.
+
+    When ``gate_holder`` is provided, every ``LoRALinear`` built by this
+    factory shares the same mapping, so the owning model can populate the
+    per-modality gate values once (in ``forward``) and have them applied
+    across all decoder layers.
+    """
 
     def factory(in_features: int, out_features: int, bias: bool = True) -> LoRALinear:
-        return LoRALinear(in_features, out_features, bias=bias, lora_adapters=lora_adapters)
+        return LoRALinear(
+            in_features,
+            out_features,
+            bias=bias,
+            lora_adapters=lora_adapters,
+            gate_holder=gate_holder,
+        )
 
     return factory
+
+
+# Phi4MM ``InputMode`` (see HF ``processing_phi4mm.InputMode``):
+#   LANGUAGE=0 (no adapter), VISION=1 / VISION_SPEECH=3 (vision adapter),
+#   SPEECH=2 (speech adapter).  HF activates exactly one adapter per forward
+#   via ``set_lora_adapter`` (modeling_phi4mm.py).  We derive the equivalent
+#   per-adapter activation from the special tokens present in ``input_ids``.
+def _compute_phi4mm_lora_gates(
+    op: OpBuilder,
+    input_ids: ir.Value,
+    image_token_id: int,
+    audio_token_id: int,
+    dtype: ir.DataType,
+) -> tuple[ir.Value, ir.Value]:
+    """Derive ``(vision_gate, speech_gate)`` scalars from ``input_ids``.
+
+    - ``vision`` adapter is active when any image token is present
+      (covers ``VISION`` and ``VISION_SPEECH``).
+    - ``speech`` adapter is active when any audio token is present *and*
+      no image token is present (``SPEECH`` only; ``VISION_SPEECH`` uses
+      the vision adapter, matching HF).
+    """
+    img_tok = op.Constant(value_int=image_token_id)
+    aud_tok = op.Constant(value_int=audio_token_id)
+    # Reduce over the whole sequence to a 0/1 float scalar.
+    has_image = op.ReduceMax(
+        op.Cast(op.Equal(input_ids, img_tok), to=ir.DataType.FLOAT), keepdims=False
+    )
+    has_audio = op.ReduceMax(
+        op.Cast(op.Equal(input_ids, aud_tok), to=ir.DataType.FLOAT), keepdims=False
+    )
+    one = op.Constant(value_float=1.0)
+    vision_gate = op.Cast(has_image, to=dtype)
+    speech_gate = op.Cast(op.Mul(has_audio, op.Sub(one, has_image)), to=dtype)
+    return vision_gate, speech_gate
 
 
 class _LoRATextModel(TextModel):
@@ -256,15 +304,18 @@ def _preprocess_phi4mm_weights(
 ) -> dict[str, torch.Tensor]:
     """Shared weight preprocessing for Phi4MM models (LoRA + fused weight splitting).
 
-    **LoRA strategy — separate parameters, not merged:**
+    **LoRA strategy — separate parameters, gated per modality:**
     The ONNX model keeps lora_A.{name}.weight and lora_B.{name}.weight as
     separate initializers.  ``LoRALinear.forward()`` applies them at runtime:
-    ``out = base(x) + scale * x @ A.T @ B.T``.  This matches HuggingFace when
-    HF runs with ``merge_and_unload()`` (both vision + speech adapters merged).
+    ``out = base(x) + gate_{name} * scale * x @ A.T @ B.T``.  HuggingFace
+    activates exactly one adapter per forward based on the input modality
+    (``set_lora_adapter``): vision for image / image+audio, speech for
+    audio-only, none for text-only.  In the 4-model split task the embedding
+    model derives ``vision_gate``/``speech_gate`` from ``input_ids`` and the
+    decoder multiplies each adapter by its gate, reproducing HF exactly.
 
-    Do NOT merge LoRA into the base weight here — the separate-parameter
-    approach is intentional and produces correct output (100% token-match
-    parity confirmed in ``examples/phi4mm_parity.py``).
+    Do NOT merge LoRA into the base weight here — keeping adapters separate is
+    what allows the per-modality gating above.
 
     Steps performed:
     1. Strip ``base_layer.`` from LoRA-wrapped weight names so
@@ -860,10 +911,15 @@ class _Phi4MMEmbeddingModel(nn.Module):
         audio_features: [num_speech_tokens, hidden_size]
     Outputs:
         inputs_embeds: [batch, seq_len, hidden_size]
+        vision_gate: scalar — 1.0 if any image token present else 0.0
+        speech_gate: scalar — 1.0 if audio present and no image else 0.0
     """
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        self._dtype = config.dtype
+        self._image_token_id = config.image_token_id or 200010
+        self._audio_token_id = (config.audio.token_id if config.audio else None) or 200011
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -888,7 +944,12 @@ class _Phi4MMEmbeddingModel(nn.Module):
         audio_features_3d = op.Unsqueeze(audio_features, [0])
         hidden_states = self._image_mixer(op, hidden_states, image_features_3d, input_ids)
         hidden_states = self._audio_mixer(op, hidden_states, audio_features_3d, input_ids)
-        return hidden_states
+        # Derive per-modality LoRA gates here (the decoder only sees
+        # ``inputs_embeds`` and cannot recover the modality from input_ids).
+        vision_gate, speech_gate = _compute_phi4mm_lora_gates(
+            op, input_ids, self._image_token_id, self._audio_token_id, self._dtype
+        )
+        return hidden_states, vision_gate, speech_gate
 
 
 class _Phi4MMDecoderModel(nn.Module):
@@ -903,6 +964,8 @@ class _Phi4MMDecoderModel(nn.Module):
         attention_mask: [batch, past_seq_len + seq_len]
         position_ids: [batch, seq_len]
         past_key_values: list of (key, value) tuples
+        vision_gate: scalar LoRA gate for the vision adapter (optional)
+        speech_gate: scalar LoRA gate for the speech adapter (optional)
     Outputs:
         logits: [batch, seq_len, vocab_size]
         present_key_values: list of (key, value) tuples
@@ -912,7 +975,10 @@ class _Phi4MMDecoderModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
         lora_adapters = _parse_lora_adapters(config)
-        lora_factory = _make_lora_linear_factory(lora_adapters)
+        # Shared mapping {adapter_name: gate ir.Value}, populated in forward()
+        # so every LoRALinear gates its adapter by the active input modality.
+        self._lora_gates: dict[str, ir.Value] = {}
+        lora_factory = _make_lora_linear_factory(lora_adapters, self._lora_gates)
 
         self.layers = nn.ModuleList(
             [
@@ -931,7 +997,17 @@ class _Phi4MMDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        vision_gate: ir.Value | None = None,
+        speech_gate: ir.Value | None = None,
     ):
+        # Publish the per-modality LoRA gates (computed in the embedding model
+        # from input_ids) so every LoRALinear in the decoder applies only the
+        # adapter active for the current modality.
+        if vision_gate is not None:
+            self._lora_gates["vision"] = vision_gate
+        if speech_gate is not None:
+            self._lora_gates["speech"] = speech_gate
+
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
         # Use inputs_embeds for query_length since decoder has no input_ids
