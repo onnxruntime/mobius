@@ -66,6 +66,7 @@ def _get_test_device_kwargs() -> dict[str, str]:
 
 
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
+_TEST_DEVICE = os.environ.get("MOBIUS_TEST_DEVICE", "").lower()
 
 
 def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
@@ -236,9 +237,62 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
     "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
     "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
+    # Nemotron-H hybrid Mamba2 SSM decode loop diverges from HF after the first
+    # token. L4 prefill passes (argmax matches); identical CPU+CUDA. The golden
+    # is a degenerate greedy repetition, so the token-match ratio is near zero.
+    "text-generation/nemotron-h-nano-4b": (
+        "Nemotron-H hybrid Mamba2 SSM decode loop diverges from HF after first "
+        "token (L4 prefill passes; identical CPU+CUDA; golden is degenerate)"
+    ),
     # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
     "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
+
+# Failures that only apply to L5 generation on the CUDA execution provider.
+# These pass on CPU (graph is correct) but diverge on CUDA due to an
+# ORT CUDA EP backend bug, so they are only xfailed when running on GPU.
+_L5_CUDA_ONLY_XFAIL_REASONS: dict[str, str] = {
+    # Gemma4 KV-shared layers (num_kv_shared_layers>0) wire the source layer's
+    # GQA PRESENT K/V as the shared layer's past_key/past_value with an empty
+    # new key/value (kv_sequence_length=0). CPU fp32 incremental decode matches
+    # the golden tokens exactly, but the CUDA EP GroupQueryAttention backend
+    # mishandles this kv_sequence_length=0 shared-KV decode path, diverging
+    # after the first generated token. L4 single-forward and full re-prefill
+    # generation both pass; the defect is the ORT CUDA GQA shared-KV decode
+    # kernel, not the mobius graph.
+    "text-generation/gemma-4-e2b": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+    "text-generation/gemma-4-e4b": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+    # Gemma4 multimodal L5 runs through the same KV-shared GQA decoder, so it
+    # hits the identical ORT CUDA shared-KV decode defect during generation.
+    "image-text-to-text/gemma-4-e2b-it": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+    "image-text-to-text/gemma-4-e4b-it": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+    "speech-language/gemma-4-e2b-it-audio": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+    "speech-language/gemma-4-e4b-it-audio": (
+        "ORT CUDA GQA shared-KV decode (kv_sequence_length=0) diverges; "
+        "passes on CPU and at L4 prefill"
+    ),
+}
+
+if _TEST_DEVICE == "cuda":
+    _L5_ONLY_XFAIL_REASONS = {
+        **_L5_ONLY_XFAIL_REASONS,
+        **_L5_CUDA_ONLY_XFAIL_REASONS,
+    }
 
 
 def _discover_cases(
@@ -1701,6 +1755,117 @@ def _run_causal_lm_generation(
     return all_ids[0, prompt_len:]
 
 
+def _run_multimodel_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+    golden: GoldenRef,
+    max_new_tokens: int = 20,
+    eos_token_id: int | None = None,
+) -> np.ndarray:
+    """Greedy generation for multi-model text-generation packages.
+
+    Some text-only models (e.g. Gemma4 "any-to-any") split into separate
+    ``embedding`` and ``decoder`` ONNX models even on the text path: the
+    embedding model maps ``input_ids`` to ``inputs_embeds`` (plus extra
+    decoder inputs such as Gemma4 ``per_layer_inputs``) and the decoder
+    consumes embeddings rather than raw ``input_ids``.
+
+    This mirrors :func:`_run_vl_generation` without any vision/audio
+    encoder, using 1D position IDs.  Returns newly generated token IDs
+    (prompt excluded).
+    """
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    device_kwargs = _get_test_device_kwargs()
+
+    dec_key = "decoder" if "decoder" in pkg else "model"
+    dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+    batch_size = 1
+
+    def _embed(ids: np.ndarray) -> dict[str, np.ndarray]:
+        """Run the embedding model for ``ids``, zero-filling extra inputs."""
+        feeds: dict[str, np.ndarray] = {"input_ids": ids}
+        for name in emb_session.input_names:
+            if name in feeds:
+                continue
+            shape = emb_session.get_input_shape(name) or []
+            static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+            feeds[name] = np.zeros(
+                static_shape, dtype=emb_session.get_input_dtype(name) or np.float32
+            )
+        return emb_session.run(feeds)
+
+    try:
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+
+        def _decoder_feeds(
+            emb_out: dict[str, np.ndarray],
+            ids: np.ndarray,
+            total_len: int,
+            position_ids: np.ndarray,
+            past_cache: dict[str, np.ndarray],
+        ) -> dict[str, np.ndarray]:
+            inputs_embeds = emb_out[next(iter(emb_out))]
+            if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+                inputs_embeds = inputs_embeds.astype(embeds_dtype)
+            feeds: dict[str, np.ndarray] = {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
+                **past_cache,
+            }
+            if "input_ids" in dec_session.input_names:
+                feeds["input_ids"] = ids
+            if "position_ids" in dec_session.input_names:
+                feeds["position_ids"] = position_ids
+            # Wire extra embedding outputs the decoder expects by name
+            # (e.g. Gemma4 ``per_layer_inputs``).
+            for name in dec_session.input_names:
+                if name not in feeds and name in emb_out:
+                    feeds[name] = emb_out[name]
+            return feeds
+
+        # --- Prefill ---
+        prompt_seq_len = input_ids.shape[1]
+        past_cache = _make_empty_kv_cache(dec_session, config)
+        prefill_emb = _embed(input_ids)
+        prefill_pos = np.arange(prompt_seq_len, dtype=np.int64).reshape(1, -1)
+        prefill_out = dec_session.run(
+            _decoder_feeds(prefill_emb, input_ids, prompt_seq_len, prefill_pos, past_cache)
+        )
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
+        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        _update_vl_cache(past_cache, prefill_out, config)
+
+        generated = [next_token]
+        past_seq_len = prompt_seq_len
+        next_pos = prompt_seq_len
+
+        # --- Decode loop ---
+        for _ in range(max_new_tokens - 1):
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+            step_emb = _embed(next_token)
+            total_len = past_seq_len + 1
+            step_pos = np.array([[next_pos]], dtype=np.int64)
+            step_out = dec_session.run(
+                _decoder_feeds(step_emb, next_token, total_len, step_pos, past_cache)
+            )
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
+            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            generated.append(next_token)
+            _update_vl_cache(past_cache, step_out, config)
+            past_seq_len = total_len
+            next_pos += 1
+    finally:
+        dec_session.close()
+        emb_session.close()
+
+    return np.concatenate(generated, axis=1)[0]
+
+
 def _run_seq2seq_generation(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -2159,11 +2324,16 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
             )
         elif len(pkg) > 1 and "embedding" in pkg:
-            # Multi-model text-generation (e.g. Gemma4) — L5 generation
-            # requires embedding → decoder loop, not yet implemented.
-            pytest.skip(
-                f"L5 generation for multi-model text-generation "
-                f"not yet implemented ({case.case_id})"
+            # Multi-model text-generation (e.g. Gemma4 any-to-any text path):
+            # embedding model maps input_ids -> inputs_embeds (+ extra decoder
+            # inputs), and the decoder consumes embeddings.
+            new_tokens = _run_multimodel_text_generation(
+                pkg,
+                case,
+                config,
+                golden,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 20),
+                eos_token_id=case.generation_params.get("eos_token_id"),
             )
         else:
             new_tokens = _run_causal_lm_generation(pkg, case, golden)
