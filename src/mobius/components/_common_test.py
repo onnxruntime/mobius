@@ -15,6 +15,7 @@ from mobius.components._common import (
     Linear,
     create_attention_bias,
     create_padding_mask,
+    create_sliding_window_mask,
 )
 
 
@@ -274,3 +275,71 @@ class TestCreatePaddingMask:
         assert count_op_type(graph_bias, "CumSum") >= 1
         assert count_op_type(graph_bias, "GreaterOrEqual") >= 1
         assert count_op_type(graph_bias, "Where") >= 1
+
+
+class TestMaskHeadDimRank:
+    """Padding / sliding-window bool masks must be 4-D ``(B, 1, q, total)``.
+
+    A 3-D ``(B, q, total)`` mask is right-aligned by the ONNX Attention op so
+    the batch axis is misread as ``q_num_heads`` — it happens to work for
+    ``batch == 1`` (head dim broadcasts) but is rejected once ``batch > 1``.
+    The explicit singleton head dim keeps the contract batch-agnostic.
+    """
+
+    @staticmethod
+    def _build_padding():
+        b, op, g = create_test_builder()
+        input_ids = create_test_input(b, "input_ids", ["B", "S"], dtype=ir.DataType.INT64)
+        attn = create_test_input(b, "attention_mask", ["B", "T"], dtype=ir.DataType.INT64)
+        mask = create_padding_mask(op, input_ids, attn)
+        mask.name = "mask"
+        g.outputs.append(mask)
+        return ir.Model(g, ir_version=10)
+
+    @staticmethod
+    def _build_sliding(window):
+        b, op, g = create_test_builder()
+        input_ids = create_test_input(b, "input_ids", ["B", "S"], dtype=ir.DataType.INT64)
+        attn = create_test_input(b, "attention_mask", ["B", "T"], dtype=ir.DataType.INT64)
+        mask = create_sliding_window_mask(op, input_ids, attn, window)
+        mask.name = "mask"
+        g.outputs.append(mask)
+        return ir.Model(g, ir_version=10)
+
+    def test_padding_mask_is_4d_with_singleton_head_dim(self):
+        sess = OnnxModelSession(self._build_padding(), device="cpu")
+        out = sess.run(
+            {
+                "input_ids": np.zeros((3, 4), dtype=np.int64),
+                "attention_mask": np.ones((3, 8), dtype=np.int64),
+            }
+        )["mask"]
+        # (batch, 1, q_len, total_len)
+        assert out.shape == (3, 1, 4, 8)
+
+    def test_sliding_mask_is_4d_with_singleton_head_dim(self):
+        sess = OnnxModelSession(self._build_sliding(2), device="cpu")
+        out = sess.run(
+            {
+                "input_ids": np.zeros((3, 4), dtype=np.int64),
+                "attention_mask": np.ones((3, 8), dtype=np.int64),
+            }
+        )["mask"]
+        assert out.shape == (3, 1, 4, 8)
+
+    def test_padding_mask_per_row_independent(self):
+        """With batch>1, each row's padding is honoured independently."""
+        sess = OnnxModelSession(self._build_padding(), device="cpu")
+        attn = np.ones((2, 5), dtype=np.int64)
+        attn[1, :2] = 0  # row 1 has two leading padding tokens
+        out = sess.run(
+            {
+                "input_ids": np.zeros((2, 5), dtype=np.int64),
+                "attention_mask": attn,
+            }
+        )["mask"]
+        assert out.shape == (2, 1, 5, 5)
+        # Row 0 attends to every kv position; row 1 masks the two pad columns.
+        assert bool(out[0, 0].all())
+        assert not bool(out[1, 0, :, :2].any())
+        assert bool(out[1, 0, :, 2:].all())

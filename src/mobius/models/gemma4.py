@@ -802,16 +802,32 @@ class Gemma4TextAttention(nn.Module):
                     **gqa_attrs,
                 )
             else:
-                # Fallback Attention path: transpose shared KV from BNSH to 3D.
-                # present_key/value from the ONNX Attention op is 4D:
-                #   [batch, kv_heads, total_seq, head_dim]
-                # The Attention op expects key/value as 3D:
-                #   [batch, total_seq, kv_heads * head_dim]
+                # Fallback Attention path (non-GQA / CPU-style graphs).
+                #
+                # The shared K,V buffer is the source layer's present K/V, 4D
+                # BNSH [batch, kv_heads, kv_len, head_dim], and already contains
+                # the FULL sequence (with RoPE applied).  Transpose it to the 3D
+                # layout the Attention op expects:
+                #   [batch, kv_len, kv_heads * head_dim].
                 src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
                 src_key = op.Reshape(src_key, [0, 0, -1])
                 src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
                 src_value = op.Reshape(src_value, [0, 0, -1])
 
+                # IMPORTANT: pass is_causal=0 here, NOT the caller's is_causal.
+                #
+                # We feed the FULL shared sequence as key/value with no past, so
+                # q_len < kv_len during decode.  ``attention_bias`` from
+                # ``create_attention_bias`` already bakes in the complete
+                # bottom-right causal (+ sliding + padding) mask, so causality is
+                # fully handled by the bias.  If we ALSO set is_causal=1 the
+                # Attention op applies its own built-in causal mask on top — and
+                # for q_len < kv_len the two EPs disagree on its alignment (per
+                # the ONNX spec is_causal is UPPER-LEFT aligned: CUDA follows the
+                # spec and a single decode query attends only to kv[0], while the
+                # CPU EP bottom-right aligns).  That double-masking is what made
+                # gemma4 decode diverge on CUDA.  Relying solely on the float
+                # bias (is_causal=0) is correct and identical on CPU and CUDA.
                 attn_output, present_key, present_value = _apply_attention(
                     op,
                     query_states,
@@ -824,7 +840,7 @@ class Gemma4TextAttention(nn.Module):
                     num_key_value_heads=self.num_key_value_heads,
                     scale=self.scaling,
                     softcap=self.softcap,
-                    is_causal=is_causal,
+                    is_causal=0,
                 )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.

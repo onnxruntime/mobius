@@ -514,7 +514,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     # === Falcon and Bloom ===
     # dual_ln=True: Falcon with new_decoder_architecture uses separate ln_attn + ln_mlp.
-    ("falcon", {"parallel_attn": True, "dual_ln": True}, True),
+    # hidden_act="gelu": real Falcon uses GELU (HF FalconConfig.activation default);
+    # the generic _base_config default is "silu", so set it explicitly to match HF.
+    ("falcon", {"parallel_attn": True, "dual_ln": True, "hidden_act": "gelu"}, True),
     (
         "falcon_h1",
         # ALiBi bias shape (1, num_heads, q, total) requires kv_num_heads == num_heads

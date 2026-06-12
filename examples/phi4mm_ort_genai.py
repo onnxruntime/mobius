@@ -110,6 +110,8 @@ def _write_genai_config(config, output_dir: str) -> None:
                     "inputs_embeds": "inputs_embeds",
                     "attention_mask": "attention_mask",
                     "position_ids": "position_ids",
+                    "vision_gate": "vision_gate",
+                    "speech_gate": "speech_gate",
                     "past_key_names": "past_key_values.%d.key",
                     "past_value_names": "past_key_values.%d.value",
                 },
@@ -132,6 +134,8 @@ def _write_genai_config(config, output_dir: str) -> None:
                 },
                 "outputs": {
                     "inputs_embeds": "inputs_embeds",
+                    "vision_gate": "vision_gate",
+                    "speech_gate": "speech_gate",
                 },
             },
             "vision": {
@@ -144,6 +148,7 @@ def _write_genai_config(config, output_dir: str) -> None:
                 "inputs": {
                     "pixel_values": "pixel_values",
                     "image_sizes": "image_sizes",
+                    "image_attention_mask": "image_attention_mask",
                 },
                 "outputs": {
                     "image_features": "image_features",
