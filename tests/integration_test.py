@@ -5111,9 +5111,14 @@ def test_gemma4_e2b_text_prefill_bf16():
         f"last_token_cos_sim={last_cos:.6f}, argmax_match={argmax_match}"
     )
 
-    # bf16 noise floor makes element-wise atol meaningless (HF bf16 vs f32 is
-    # already ~0.45 max-abs); gate on cosine + argmax instead.
+    # bf16 noise floor makes a tight element-wise atol meaningless (HF bf16 vs
+    # f32 is already ~0.45 max-abs, and op/kernel ordering pushes mobius to
+    # ~0.8); gate primarily on cosine + argmax.  Still keep a loose finite
+    # max/mean-abs ceiling so a gross numerical regression (NaN-free but wildly
+    # off) cannot slip through with a coincidentally high cosine.
     assert not np.isnan(onnx_logits).any()
+    assert max_diff < 5.0, f"bf16 max-abs diff {max_diff:.4f} >= 5.0 (gross divergence)"
+    assert mean_diff < 0.5, f"bf16 mean-abs diff {mean_diff:.4f} >= 0.5 (gross divergence)"
     assert last_cos > 0.999, f"last-token cosine {last_cos:.6f} <= 0.999"
     assert argmax_match, "per-position argmax mismatch vs HuggingFace bf16"
 
