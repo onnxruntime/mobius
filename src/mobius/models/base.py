@@ -45,6 +45,14 @@ class TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
         self._dtype = config.dtype
+        # When non-empty, the forward pass additionally returns the
+        # post-residual outputs of the listed decoder layers (before the
+        # final ``self.norm``).  See ``ArchitectureConfig.output_layer_indices``
+        # for the index convention. ``None``/empty preserves the legacy
+        # 2-tuple return.
+        self.output_layer_indices: list[int] | None = (
+            list(getattr(config, "output_layer_indices", None) or []) or None
+        )
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
@@ -169,8 +177,11 @@ class TextModel(nn.Module):
                 attention_bias = None
 
         present_key_values = []
+        captured_hidden_states: list[ir.Value] = []
+        output_layer_indices = getattr(self, "output_layer_indices", None)
+        capture_set = set(output_layer_indices or ())
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -179,8 +190,18 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            if layer_idx in capture_set:
+                captured_hidden_states.append(hidden_states)
 
         hidden_states = self.norm(op, hidden_states)
+        if output_layer_indices is not None:
+            # Preserve the user-supplied order so caller can rely on
+            # ``zip(config.output_layer_indices, intermediate_hidden_states)``.
+            order = {idx: pos for pos, idx in enumerate(output_layer_indices)}
+            ordered = [None] * len(output_layer_indices)
+            for idx, hs in zip(sorted(capture_set), captured_hidden_states):
+                ordered[order[idx]] = hs
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 
@@ -219,13 +240,18 @@ class CausalLMModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        hidden_states, present_key_values = self.model(
+        result = self.model(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if len(result) == 3:
+            hidden_states, present_key_values, intermediate_hidden_states = result
+            logits = self.lm_head(op, hidden_states)
+            return logits, present_key_values, intermediate_hidden_states
+        hidden_states, present_key_values = result
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

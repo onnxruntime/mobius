@@ -137,6 +137,49 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
+    def test_build_with_output_layer_indices(self):
+        config = make_config(num_hidden_layers=4, output_layer_indices=[1, 2])
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        output_names = [v.name for v in model.graph.outputs]
+        assert "logits" in output_names
+        assert "hidden_states.1" in output_names
+        assert "hidden_states.2" in output_names
+        assert "hidden_states.0" not in output_names
+        assert "hidden_states.3" not in output_names
+
+    def test_build_without_output_layer_indices_unchanged(self):
+        # Default (None) must preserve the legacy 2-tuple output set:
+        # logits + present.{i}.key/value only, no hidden_states.* outputs.
+        config = make_config(num_hidden_layers=2)
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        output_names = [v.name for v in model.graph.outputs]
+        assert not any(n.startswith("hidden_states.") for n in output_names)
+
+    def test_build_output_layer_indices_preserves_order(self):
+        # Caller-supplied order is preserved in the graph outputs, so a
+        # downstream draft model can zip(indices, outputs) without sorting.
+        config = make_config(num_hidden_layers=5, output_layer_indices=[3, 0, 2])
+        module = CausalLMModel(config)
+        model = build_from_module(module, config)["model"]
+        hs_outputs = [
+            v.name for v in model.graph.outputs if v.name.startswith("hidden_states.")
+        ]
+        assert hs_outputs == ["hidden_states.3", "hidden_states.0", "hidden_states.2"]
+
+
+class TestTextModelOutputHiddenStates:
+    def test_textmodel_output_layer_indices_default_none(self):
+        config = make_config()
+        model = TextModel(config)
+        assert model.output_layer_indices is None
+
+    def test_textmodel_output_layer_indices_set(self):
+        config = make_config(num_hidden_layers=4, output_layer_indices=[0, 3])
+        model = TextModel(config)
+        assert model.output_layer_indices == [0, 3]
+
 
 class TestModelRegistry:
     def test_registry_not_empty(self):

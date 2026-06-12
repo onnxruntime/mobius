@@ -474,6 +474,17 @@ class ArchitectureConfig(BaseModelConfig):
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
 
+    # Speculative-decoding draft-target support.
+    # When set to a non-empty list, ``TextModel`` captures the post-residual
+    # output of ``self.layers[k]`` for each ``k`` in the list (before the
+    # final norm), and ``CausalLMTask`` registers them as additional ONNX
+    # outputs named ``hidden_states.{k}``.  Indices follow the HF
+    # convention used by drafters such as DFlash: ``k`` refers to the
+    # 0-based decoder layer whose output you want — equivalent to
+    # ``model(..., output_hidden_states=True).hidden_states[k + 1]`` in
+    # transformers (where index 0 is the embedding output).
+    output_layer_indices: list[int] | None = None
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
