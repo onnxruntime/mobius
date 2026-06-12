@@ -951,6 +951,79 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
 
+def _detection_forced_size(model_id: str, trust_remote_code: bool) -> dict | None:
+    """Return a fixed ``{height, width}`` size for object-detection export.
+
+    mobius exports object-detection models (e.g. YOLOS) at a *fixed* input
+    resolution taken from ``config.image_size`` (position embeddings are not
+    interpolated for arbitrary sizes).  To keep the golden reference and the
+    ONNX forward pass on the same footing, the HF image processor must be
+    forced to emit exactly that resolution instead of its default
+    aspect-preserving resize.
+    """
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code
+    )
+    image_size = getattr(config, "image_size", None)
+    if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+        return {"height": int(image_size[0]), "width": int(image_size[1])}
+    if isinstance(image_size, int):
+        return {"height": image_size, "width": image_size}
+    return None
+
+
+def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for object detection (e.g. YOLOS).
+
+    The model emits per-query class ``logits`` of shape
+    ``[batch, num_queries, num_labels + 1]``.  The golden top-K is taken over
+    the *last* query's class-logit vector to match ``compare_golden``, which
+    slices ``logits[:, -1, :]``.  The image processor is forced to the model's
+    fixed export resolution so the golden and ONNX forward pass agree.
+    """
+    import torch
+    import transformers
+    from PIL import Image
+
+    from mobius._testing.golden import save_golden_ref
+
+    processor = transformers.AutoImageProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    model = transformers.AutoModelForObjectDetection.from_pretrained(
+        case.model_id,
+        torch_dtype=torch.float32,
+        device_map=device,
+        trust_remote_code=case.trust_remote_code,
+    ).eval()
+
+    image = Image.open(Path("testdata") / case.images[0])
+    forced_size = _detection_forced_size(case.model_id, case.trust_remote_code)
+    proc_kwargs = {"images": image, "return_tensors": "pt"}
+    if forced_size is not None:
+        proc_kwargs["size"] = forced_size
+    processed = processor(**proc_kwargs)
+    pixel_values = processed["pixel_values"].to(device)
+
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+    # logits: [batch, num_queries, num_labels + 1] -> last query's class vector
+    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=np.array([[0]], dtype=np.int64),  # placeholder (no text input)
+    )
+
+
 # ---- Phi4MM multimodal generator ----
 
 
@@ -1129,10 +1202,13 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
         processor = transformers.AutoProcessor.from_pretrained(
             case.model_id, trust_remote_code=True
         )
-        # Load in bfloat16 to reduce memory (14B model)
+        # Load in float32 to match the f32 runtime used by the L4/L5 tests.
+        # bf16 goldens produced flat/tied logit distributions that caused
+        # argmax instability against the f32 model output (see phi4mm L4
+        # false-failures: exact top-2 ties, top-10 spans <3 logits).
         model = transformers.AutoModelForCausalLM.from_pretrained(
             case.model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             device_map=device,
             trust_remote_code=True,
             _attn_implementation="eager",
@@ -1284,7 +1360,7 @@ _GENERATORS = {
     "depth-estimation": _generate_image_classification,
     "image-segmentation": _generate_image_classification,
     "image-to-image": _generate_image_classification,
-    "object-detection": _generate_image_classification,
+    "object-detection": _generate_object_detection,
     "phi4mm-multimodal": _generate_phi4mm_multimodal,
 }
 

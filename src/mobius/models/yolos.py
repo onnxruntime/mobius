@@ -35,13 +35,14 @@ class _YolosEmbeddings(nn.Module):
 
     def __init__(self, config: YolosConfig):
         super().__init__()
-        image_size = config.image_size
         patch_size = config.patch_size
         num_channels = config.num_channels
         hidden_size = config.hidden_size
         num_detection_tokens = config.num_detection_tokens
 
-        num_patches = (image_size // patch_size) ** 2
+        # YOLOS uses a rectangular input (e.g. 800x1333), so the patch grid is
+        # (H // patch) * (W // patch), not (image_size // patch) ** 2.
+        num_patches = (config.image_height // patch_size) * (config.image_width // patch_size)
         num_positions = num_patches + num_detection_tokens + 1  # patches + det + CLS
 
         self.patch_embeddings = _Conv2dPatchEmbed(num_channels, hidden_size, patch_size)
@@ -172,7 +173,9 @@ class YolosForObjectDetection(nn.Module):
         self.layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Mid-position embeddings (added between encoder layers)
-        num_patches = (config.image_size // config.patch_size) ** 2
+        num_patches = (config.image_height // config.patch_size) * (
+            config.image_width // config.patch_size
+        )
         seq_length = 1 + num_patches + config.num_detection_tokens
         if config.num_hidden_layers > 1:
             self.mid_position_embeddings = nn.Parameter(

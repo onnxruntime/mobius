@@ -16,6 +16,8 @@ To run a single model::
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -326,6 +328,59 @@ class TestBuildGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+class TestTextDecoderBatchGreaterThanOne:
+    """Text-only causal LM decoders must run with ``batch_size > 1``.
+
+    Regression guard for the attention-mask head-dim bug: ``create_padding_mask``
+    / ``create_sliding_window_mask`` previously returned a 3-D ``(B, q, total)``
+    mask whose batch axis was right-aligned onto ``q_num_heads`` by the ONNX
+    Attention op — it worked for ``batch == 1`` but ORT rejected ``batch > 1``.
+    Covers a plain decoder, GQA, and sliding-window architectures, with ragged
+    padding across rows.
+    """
+
+    @pytest.mark.parametrize("model_type", ["qwen2", "llama", "mistral", "gemma2"])
+    def test_batch2_prefill_runs(self, model_type: str):
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+        overrides = dict(_MODEL_CONFIGS)[model_type]
+        config = _base_config(**overrides)
+        module = registry.get(model_type)(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+        fill_random_weights(model)
+        sess = OnnxModelSession(model)
+
+        batch, seq = 2, 6
+        rng = np.random.default_rng(0)
+        input_ids = rng.integers(1, config.vocab_size, size=(batch, seq)).astype(np.int64)
+        attention_mask = np.ones((batch, seq), dtype=np.int64)
+        attention_mask[1, :2] = 0  # row 1 has two leading padding tokens
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        feeds: dict[str, np.ndarray] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = np.zeros(
+                (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+            feeds[f"past_key_values.{i}.value"] = np.zeros(
+                (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+
+        out = sess.run(feeds)
+        sess.close()
+        logits = out["logits"]
+        assert logits.shape[0] == batch
+        assert logits.shape[1] == seq
+        # Independent rows (different inputs) must produce different logits.
+        assert not np.allclose(logits[0], logits[1])
 
 
 # === Encoder-only model configs (imported from _test_configs) ===
@@ -1205,6 +1260,65 @@ class TestBuildGraphVisionLanguage:
         assert "image_features" in emb_input_names
         assert "audio_features" not in emb_input_names
         assert "inputs_embeds" in {o.name for o in embedding.graph.outputs}
+
+    def test_gemma4_kv_shared_fallback_attention_is_causal_zero(self):
+        """KV-shared layers must use is_causal=0 in the non-GQA fallback.
+
+        The shared-KV fallback feeds the full borrowed K/V as key/value with
+        no past (so q_len < kv_len during decode) and relies on the float
+        causal bias from ``create_attention_bias`` for masking.  It must NOT
+        also set is_causal=1: the ONNX Attention op's built-in causal mask is
+        upper-left aligned on CUDA but bottom-right on CPU, so double-masking
+        diverges across EPs.  Source/non-shared layers keep is_causal=1.
+        """
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config(
+            num_hidden_layers=4,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            attn_qk_norm=True,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window=8,
+            global_head_dim=16,
+            global_rope_theta=10_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=0.0,
+            hidden_size_per_layer_input=0,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            num_kv_shared_layers=2,
+        )
+        module = registry.get("gemma4_text")(config)
+        task = get_task(_default_task_for_model("gemma4_text"))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+
+        # The fp32 build (no EP) takes the ONNX Attention fallback path.
+        is_causal_by_layer: dict[int, int] = {}
+        for node in model.graph:
+            if node.op_type != "Attention":
+                continue
+            m = re.search(r"layers\.(\d+)/self_attn", node.name)
+            assert m is not None, node.name
+            layer_idx = int(m.group(1))
+            attr = next(a for a in node.attributes.values() if a.name == "is_causal")
+            is_causal_by_layer[layer_idx] = attr.value
+
+        # Source/non-shared layers (0,1) keep is_causal=1; the last
+        # num_kv_shared_layers layers (2,3) must use is_causal=0.
+        assert is_causal_by_layer == {0: 1, 1: 1, 2: 0, 3: 0}, is_causal_by_layer
 
     def test_gemma4_moe_graph(self):
         """Build Gemma4 text-only model with enable_moe_block=True (MoE path)."""

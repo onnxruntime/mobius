@@ -174,6 +174,19 @@ _VIT_LAYER_RENAMES = {
 
 _LAYER_PATTERN = re.compile(r"^encoder\.layer\.(\d+)\.(.+)$")
 
+# transformers >=5.x flattened the ViT state dict: encoder layers are
+# ``layers.N.<sub>`` (no ``encoder.`` prefix) with consolidated attention
+# (``attention.{q,k,v,o}_proj``) and MLP (``mlp.fc1``/``mlp.fc2``) names.
+_LAYER_PATTERN_NEW = re.compile(r"^layers\.(\d+)\.(.+)$")
+_VIT_NEW_LAYER_RENAMES = {
+    "attention.q_proj": "self_attn.q_proj",
+    "attention.k_proj": "self_attn.k_proj",
+    "attention.v_proj": "self_attn.v_proj",
+    "attention.o_proj": "self_attn.out_proj",
+    "mlp.fc1": "mlp.up_proj",
+    "mlp.fc2": "mlp.down_proj",
+}
+
 
 def _rename_vit_weight(name: str) -> str | None:
     """Rename HF ViT weight to our naming convention."""
@@ -183,7 +196,7 @@ def _rename_vit_weight(name: str) -> str | None:
     if first_dot > 0:
         after = name[first_dot + 1 :]
         if after.startswith(
-            ("embeddings.", "encoder.", "layernorm.", "pooler.", "classifier.")
+            ("embeddings.", "encoder.", "layers.", "layernorm.", "pooler.", "classifier.")
         ):
             name = after
 
@@ -210,6 +223,18 @@ def _rename_vit_weight(name: str) -> str | None:
     # Final layernorm
     if name.startswith("layernorm."):
         return name  # Already correct
+
+    # transformers >=5.x flattened encoder layers: ``layers.N.<sub>``.
+    m_new = _LAYER_PATTERN_NEW.match(name)
+    if m_new:
+        layer_idx, suffix = m_new.group(1), m_new.group(2)
+        if suffix.startswith("layernorm_"):
+            return f"encoder.layer.{layer_idx}.{suffix}"
+        for old, new in _VIT_NEW_LAYER_RENAMES.items():
+            if suffix.startswith(old):
+                remainder = suffix[len(old) :]
+                return f"encoder.layer.{layer_idx}.{new}{remainder}"
+        return None
 
     # Encoder layers
     m = _LAYER_PATTERN.match(name)

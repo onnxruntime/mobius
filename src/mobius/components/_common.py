@@ -280,10 +280,14 @@ def create_padding_mask(
     Attention eligibility in ORT, since Flash requires ``attn_mask`` to be
     either ``nullptr`` or ``bool`` type.
 
-    The output is a 3D ``(batch_size, q_len, total_length)`` bool tensor.
-    The ORT Attention op requires ``mask_dim[-2] == q_sequence_length``
-    (validated in ``attention_helper.h:ComputeOutputShapeForAttention``),
-    so the padding mask is broadcast-expanded along the query dimension.
+    The output is a 4D ``(batch_size, 1, q_len, total_length)`` bool tensor.
+    The ORT Attention op requires ``mask_dim[-2] == q_sequence_length`` and a
+    head dimension (``mask_dim[-3]``) that is either ``1`` or ``q_num_heads``
+    (validated in ``attention_helper.h:ComputeOutputShapeForAttention``).  An
+    explicit singleton head dim is required so that, for ``batch_size > 1``, the
+    batch dimension is not right-aligned onto (and misread as) the head
+    dimension — a 3D ``(batch, q_len, total)`` mask broadcasts as
+    ``(q_num_heads=batch, ...)`` and is rejected once ``batch != 1``.
 
     Args:
         op: The OpBuilder.
@@ -295,7 +299,7 @@ def create_padding_mask(
             INT64 tensor with ``1`` = valid token, ``0`` = padding.
 
     Returns:
-        Bool mask of shape ``(batch_size, q_length, total_length)``.
+        Bool mask of shape ``(batch_size, 1, q_length, total_length)``.
         ``True`` = attend, ``False`` = mask out.
     """
     bool_mask = op.Cast(attention_mask, to=ir.DataType.BOOL)
@@ -312,7 +316,10 @@ def create_padding_mask(
     q_len = op.Shape(input_ids, start=1, end=2)
     total_len = op.Shape(attention_mask, start=1, end=2)
     target_shape = op.Concat(batch_size, q_len, total_len, axis=0)
-    return op.Expand(mask_3d, target_shape)
+    mask_3d = op.Expand(mask_3d, target_shape)  # (B, q_len, total_len)
+    # Insert a singleton head dim -> (B, 1, q_len, total_len) so the head axis
+    # is explicit and the batch axis is never misread as q_num_heads.
+    return op.Unsqueeze(mask_3d, [1])
 
 
 def create_sliding_window_mask(
@@ -330,7 +337,9 @@ def create_sliding_window_mask(
     2. **Sliding window**: each query position only attends to the
        ``window_size`` most recent key positions.
 
-    The output is a 3D ``(batch_size, q_len, total_length)`` bool tensor.
+    The output is a 4D ``(batch_size, 1, q_len, total_length)`` bool tensor.
+    The explicit singleton head dim (``mask_dim[-3]``) ensures the batch axis is
+    not misread as ``q_num_heads`` by the ORT Attention op when ``batch > 1``.
 
     Args:
         op: The OpBuilder.
@@ -339,7 +348,7 @@ def create_sliding_window_mask(
         window_size: The number of recent tokens each position attends to.
 
     Returns:
-        Bool mask ``(batch_size, q_len, total_length)``.
+        Bool mask ``(batch_size, 1, q_len, total_length)``.
     """
     # Position indices via cumsum on attention_mask
     # CumSum gives 1-based indices for non-padding tokens, 0 stays 0
@@ -361,4 +370,7 @@ def create_sliding_window_mask(
 
     # Combine with padding mask
     padding_mask = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
-    return op.And(within_window, padding_mask)
+    mask_3d = op.And(within_window, padding_mask)  # (B, q_len, total_len)
+    # Insert a singleton head dim -> (B, 1, q_len, total_len) so the head axis
+    # is explicit and the batch axis is never misread as q_num_heads.
+    return op.Unsqueeze(mask_3d, [1])

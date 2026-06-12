@@ -88,6 +88,10 @@ class OnnxGenerator:
                 shape = self.session.get_input_shape(name) or []
                 static = [d if isinstance(d, int) and d > 0 else batch_size for d in shape]
                 past_kv[name] = np.zeros(static, dtype=np.float32)
+            elif ltype in ("mlp", "moe"):
+                # Pure feed-forward layers (e.g. NemotronH hybrid) carry no
+                # attention KV and no recurrent state — nothing to initialize.
+                continue
             else:
                 past_kv[f"past_key_values.{i}.key"] = np.zeros(
                     (batch_size, num_kv_heads, 0, head_dim), dtype=np.float32
@@ -154,6 +158,9 @@ class OnnxGenerator:
                     dst = f"past_key_values.{i}.conv_state"
                     if src in outputs:
                         past_kv[dst] = outputs[src]
+                elif ltype in ("mlp", "moe"):
+                    # Pure feed-forward layers have no cache state to carry.
+                    continue
                 else:
                     past_kv[f"past_key_values.{i}.key"] = outputs[f"present.{i}.key"]
                     past_kv[f"past_key_values.{i}.value"] = outputs[f"present.{i}.value"]

@@ -132,6 +132,79 @@ class TestRenameVitWeight:
         assert _rename_vit_weight("vit.pooler.dense.weight") is None
 
 
+class TestRenameVitWeightTransformers5x:
+    """transformers >=5.x flattened ``layers.N.<sub>`` encoder layout.
+
+    The 5.x ``ViTForImageClassification`` checkpoint prefixes encoder layers
+    with ``vit.layers.N.*`` (no ``encoder.`` segment) and consolidates the
+    attention/MLP projections.  The prefix-strip allowlist must include
+    ``layers.`` so these keys are not silently dropped (returned ``None``).
+    """
+
+    def test_vit5x_attention_q_proj(self):
+        assert (
+            _rename_vit_weight("vit.layers.0.attention.q_proj.weight")
+            == "encoder.layer.0.self_attn.q_proj.weight"
+        )
+
+    def test_vit5x_attention_k_proj(self):
+        assert (
+            _rename_vit_weight("vit.layers.2.attention.k_proj.bias")
+            == "encoder.layer.2.self_attn.k_proj.bias"
+        )
+
+    def test_vit5x_attention_v_proj(self):
+        assert (
+            _rename_vit_weight("vit.layers.1.attention.v_proj.weight")
+            == "encoder.layer.1.self_attn.v_proj.weight"
+        )
+
+    def test_vit5x_attention_o_proj(self):
+        assert (
+            _rename_vit_weight("vit.layers.3.attention.o_proj.weight")
+            == "encoder.layer.3.self_attn.out_proj.weight"
+        )
+
+    def test_vit5x_mlp_fc1(self):
+        assert (
+            _rename_vit_weight("vit.layers.0.mlp.fc1.weight")
+            == "encoder.layer.0.mlp.up_proj.weight"
+        )
+
+    def test_vit5x_mlp_fc2(self):
+        assert (
+            _rename_vit_weight("vit.layers.5.mlp.fc2.bias")
+            == "encoder.layer.5.mlp.down_proj.bias"
+        )
+
+    def test_vit5x_layernorm_before(self):
+        assert (
+            _rename_vit_weight("vit.layers.0.layernorm_before.weight")
+            == "encoder.layer.0.layernorm_before.weight"
+        )
+
+    def test_vit5x_layernorm_after(self):
+        assert (
+            _rename_vit_weight("vit.layers.4.layernorm_after.bias")
+            == "encoder.layer.4.layernorm_after.bias"
+        )
+
+    def test_vit5x_layers_not_dropped(self):
+        """Regression: ``layers.N.*`` keys must not silently map to None."""
+        keys = [
+            "vit.layers.0.attention.q_proj.weight",
+            "vit.layers.0.attention.k_proj.weight",
+            "vit.layers.0.attention.v_proj.weight",
+            "vit.layers.0.attention.o_proj.weight",
+            "vit.layers.0.mlp.fc1.weight",
+            "vit.layers.0.mlp.fc2.weight",
+            "vit.layers.0.layernorm_before.weight",
+            "vit.layers.0.layernorm_after.weight",
+        ]
+        for key in keys:
+            assert _rename_vit_weight(key) is not None, f"Key {key!r} mapped to None"
+
+
 class TestRenameVitWeightBatch:
     """Test full fake state_dict rename round-trips."""
 

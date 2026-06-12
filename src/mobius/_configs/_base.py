@@ -1370,13 +1370,32 @@ class YolosConfig(EncoderConfig):
     """
 
     num_detection_tokens: int = 100
+    # YOLOS uses a rectangular input resolution (e.g. [800, 1333] for
+    # yolos-tiny). The base ArchitectureConfig collapses ``image_size`` to a
+    # single int (height), which would size the learned position embeddings
+    # for a square image and mismatch the pretrained weights. Preserve both
+    # dimensions here so the patch grid (and position-embedding length) is
+    # computed correctly.
+    image_height: int = 800
+    image_width: int = 1333
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> YolosConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        raw_image_size = getattr(config, "image_size", [base.image_size, base.image_size])
+        if isinstance(raw_image_size, dict):
+            height = int(raw_image_size.get("height", base.image_size))
+            width = int(raw_image_size.get("width", base.image_size))
+        elif isinstance(raw_image_size, (list, tuple)):
+            height = int(raw_image_size[0])
+            width = int(raw_image_size[-1])
+        else:
+            height = width = int(raw_image_size)
         return cls(
             **_shallow_fields(base),
             num_detection_tokens=getattr(config, "num_detection_tokens", 100),
+            image_height=height,
+            image_width=width,
         )
 
 

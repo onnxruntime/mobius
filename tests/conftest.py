@@ -5,10 +5,21 @@
 
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
 import pytest
+
+# Disable TF32 for all test runs.  On Ampere+/Hopper GPUs the ORT CUDA EP
+# uses TF32 for fp32 matmuls by default, while the PyTorch reference computes
+# in true fp32 (torch defaults ``allow_tf32=False``).  That ~1e-2 discrepancy
+# makes fp32 logits-parity tests (rtol/atol 1e-3) fail spuriously on GPU.
+# Forcing the CUDA libraries to ignore TF32 aligns ORT with the reference.
+# Set here (before any test imports torch / onnxruntime and initializes the
+# CUDA libraries) so the override is honoured.  ``setdefault`` lets a user opt
+# back in by exporting the variable explicitly.
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
 
 
 # ---------------------------------------------------------------------------
