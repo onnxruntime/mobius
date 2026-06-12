@@ -495,7 +495,7 @@ class _Phi4MMNaViTPatchEmbedding(PatchEmbedding):
         pos_w = op.Div(op.Mul(c, p_const), nb_w_div)  # (N, 1, P)
         # pos_id(r,c) = pos_h * P + pos_w → (N, P, P)
         pos_id = op.Add(op.Mul(pos_h, p_const), pos_w)
-        # Valid patches are the top-left nb_h × nb_w block; others → id 0.
+        # Valid patches are the top-left nb_h x nb_w block; others -> id 0.
         valid = op.And(op.Less(r, nb_h), op.Less(c, nb_w))  # (N, P, P)
         zero = op.Constant(value_int=0)
         pos_id = op.Where(valid, pos_id, zero)
@@ -959,9 +959,9 @@ class _Phi4MMVisionModel(nn.Module):
         # ── Optional mask crop: drop padded sub-crop rows/cols ────────
         # HF (modeling_phi4mm.py:376-382) uses image_attention_mask to crop
         # the assembled grid to its useful height/width before adding the
-        # row separators.  The mask is at the pre-AvgPool resolution (H×H);
+        # row separators.  The mask is at the pre-AvgPool resolution (HxH);
         # HF samples it stride-2 (``[..., 0::2, 0::2]``) so each value maps
-        # to one post-AvgPool position (Hp×Hp per crop).
+        # to one post-AvgPool position (HpxHp per crop).
         if image_attention_mask is not None:
             # Sub-crop masks: crops 1..B_ → (h*w, H, H)
             sub_mask = op.Slice(
