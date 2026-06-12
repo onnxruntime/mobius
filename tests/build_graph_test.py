@@ -330,6 +330,59 @@ class TestBuildGraph:
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
 
 
+class TestTextDecoderBatchGreaterThanOne:
+    """Text-only causal LM decoders must run with ``batch_size > 1``.
+
+    Regression guard for the attention-mask head-dim bug: ``create_padding_mask``
+    / ``create_sliding_window_mask`` previously returned a 3-D ``(B, q, total)``
+    mask whose batch axis was right-aligned onto ``q_num_heads`` by the ONNX
+    Attention op — it worked for ``batch == 1`` but ORT rejected ``batch > 1``.
+    Covers a plain decoder, GQA, and sliding-window architectures, with ragged
+    padding across rows.
+    """
+
+    @pytest.mark.parametrize("model_type", ["qwen2", "llama", "mistral", "gemma2"])
+    def test_batch2_prefill_runs(self, model_type: str):
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+        overrides = dict(_MODEL_CONFIGS)[model_type]
+        config = _base_config(**overrides)
+        module = registry.get(model_type)(config)
+        task = get_task(_default_task_for_model(model_type))
+        pkg = task.build(module, config)
+        model = pkg["model"]
+        fill_random_weights(model)
+        sess = OnnxModelSession(model)
+
+        batch, seq = 2, 6
+        rng = np.random.default_rng(0)
+        input_ids = rng.integers(1, config.vocab_size, size=(batch, seq)).astype(np.int64)
+        attention_mask = np.ones((batch, seq), dtype=np.int64)
+        attention_mask[1, :2] = 0  # row 1 has two leading padding tokens
+        position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        feeds: dict[str, np.ndarray] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = np.zeros(
+                (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+            feeds[f"past_key_values.{i}.value"] = np.zeros(
+                (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+            )
+
+        out = sess.run(feeds)
+        sess.close()
+        logits = out["logits"]
+        assert logits.shape[0] == batch
+        assert logits.shape[1] == seq
+        # Independent rows (different inputs) must produce different logits.
+        assert not np.allclose(logits[0], logits[1])
+
+
 # === Encoder-only model configs (imported from _test_configs) ===
 _ENCODER_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in ENCODER_CONFIGS]
 

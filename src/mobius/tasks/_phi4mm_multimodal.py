@@ -15,6 +15,16 @@ This is the Phi-4-multimodal-specific task. Unlike the generic
 ``MultiModalTask`` (single unified model), this splits each component
 into its own ONNX graph for independent optimization and runtime
 flexibility.
+
+.. note::
+    **Batch size is assumed to be 1.** Although the embedding and decoder
+    graphs declare a symbolic ``batch`` dimension, the per-modality LoRA
+    gates (``vision_gate``/``speech_gate``) are scalars derived from the
+    whole input — a single modality decision is applied to the entire
+    batch. Image/audio features are also a single flattened stream. True
+    ``batch > 1`` (with per-row modalities and ragged feature counts) is
+    unsupported and tracked separately; callers must run one sequence at a
+    time (matching the onnxruntime-genai MultiModal pipeline contract).
 """
 
 from __future__ import annotations

@@ -97,6 +97,10 @@ class _Gemma3VisionEncoderModel(nn.Module):
         # batch dim to (tokens, hidden) to match the 2-D ``image_features``
         # contract expected by the embedding sub-model (Gather along axis 0)
         # and the ort-genai runtime, which processes one image at a time.
+        #
+        # Precondition: this assumes exactly one image (leading dim == 1).
+        # True batch>1 / multi-image inference is unsupported here; callers
+        # run the vision encoder once per image and concatenate features.
         return op.Squeeze(image_features, [0])
 
     def preprocess_weights(
