@@ -5,21 +5,23 @@
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import onnx_ir as ir
+import pytest
 
 from mobius._passes._dtype_utils import initializer_dtype
 
 
 def _value(dtype: ir.DataType | None, const: np.ndarray | None) -> ir.Value:
-    v = ir.Value(name="w")
-    if dtype is not None:
-        v.dtype = dtype
-    if const is not None:
-        v.const_value = ir.tensor(const)
-    return v
+    # Built via the ir.Value constructor rather than the ir.val() factory: these
+    # fixtures deliberately construct degenerate initializers (a dropped declared
+    # type alongside a const_value, and a declared type that contradicts the
+    # const_value dtype) that ir.val() validates against and refuses to build.
+    return ir.Value(
+        name="w",
+        type=ir.TensorType(dtype) if dtype is not None else None,
+        const_value=ir.tensor(const) if const is not None else None,
+    )
 
 
 class TestInitializerDtype:
@@ -33,16 +35,15 @@ class TestInitializerDtype:
         assert v.dtype is None
         assert initializer_dtype(v) == ir.DataType.FLOAT16
 
-    def test_const_value_wins_on_disagreement(self, caplog):
-        """Stale declared metadata must not override the serialized data dtype."""
+    def test_raises_on_dtype_contradiction(self):
+        """A declared type that contradicts the serialized data is corrupt
+        metadata and must fail closed rather than silently pick one dtype."""
         v = _value(ir.DataType.FLOAT, np.ones((2,), np.float16))
-        with caplog.at_level(logging.WARNING, logger="mobius._passes._dtype_utils"):
-            assert initializer_dtype(v) == ir.DataType.FLOAT16
-        assert any(
-            record.levelno == logging.WARNING
-            and "stale type metadata" in record.getMessage().lower()
-            for record in caplog.records
-        ), "expected a warning when declared dtype disagrees with const_value"
+        with pytest.raises(ValueError) as excinfo:
+            initializer_dtype(v)
+        message = str(excinfo.value)
+        assert "FLOAT" in message and "FLOAT16" in message
+        assert "w" in message
 
     def test_returns_none_when_nothing_available(self):
         v = _value(None, None)

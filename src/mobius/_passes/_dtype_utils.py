@@ -13,27 +13,28 @@ type parameter ``T``).
 
 from __future__ import annotations
 
-import logging
-
 import onnx_ir as ir
-
-logger = logging.getLogger(__name__)
 
 
 def initializer_dtype(value: ir.Value) -> ir.DataType | None:
     """Return the effective dtype of an initializer ``value``.
 
     Uses the value's declared ``type`` dtype, but falls back to the dtype of its
-    ``const_value`` when the type annotation is missing. When both are present
-    but disagree, the ``const_value`` dtype wins (it is the data actually
-    serialized) and a warning is logged, since a healthy initializer should
-    never have a declared type that contradicts its data.
+    ``const_value`` when the type annotation is missing.
 
     Graph building can drop the declared ``type`` on an initializer while its
     actual tensor data (``const_value``) still carries the correct dtype. In
     that situation, defaulting to ``ir.DataType.FLOAT`` would emit fp32 weights
     into an otherwise fp16 model. Reading the dtype from ``const_value`` keeps
     folded initializers consistent with the weights they are derived from.
+
+    When both a declared type and ``const_value`` are present but **disagree**,
+    this raises :class:`ValueError`: a declared type that contradicts the
+    serialized data is corrupt metadata with no legitimate use, so fail closed
+    (consistent with the fail-closed contract elsewhere in the export pipeline)
+    rather than silently picking one and shipping a structurally-wrong model.
+    The declared-is-``None`` fallback — the path this helper exists for — is
+    unaffected and never raises.
 
     Returns ``None`` only when neither the declared type nor ``const_value`` is
     available; callers decide on a final fallback.
@@ -42,14 +43,12 @@ def initializer_dtype(value: ir.Value) -> ir.DataType | None:
     const_dtype = value.const_value.dtype if value.const_value is not None else None
 
     if declared is not None and const_dtype is not None and declared != const_dtype:
-        logger.warning(
-            "Initializer %r declares dtype %s but its data is %s; using the data "
-            "dtype. This indicates stale type metadata.",
-            value.name,
-            declared,
-            const_dtype,
+        raise ValueError(
+            f"Initializer {value.name!r} declares dtype {declared} but its "
+            f"const_value data is {const_dtype}. A declared type that "
+            f"contradicts the serialized data indicates corrupt initializer "
+            f"metadata."
         )
-        return const_dtype
     if declared is not None:
         return declared
     return const_dtype

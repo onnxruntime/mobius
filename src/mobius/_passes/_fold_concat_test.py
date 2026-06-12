@@ -19,10 +19,11 @@ def _make_concat_model(
     """Build a model with a Concat node over initializers."""
     init_vals: list[ir.Value] = []
     for i, arr in enumerate(arrays):
+        tensor = ir.tensor(arr)
         v = ir.Value(name=f"init_{i}")
         v.shape = ir.Shape(list(arr.shape))
-        v.dtype = ir.DataType.FLOAT
-        v.const_value = ir.tensor(arr)
+        v.dtype = tensor.dtype
+        v.const_value = tensor
         init_vals.append(v)
 
     inputs_to_concat: list[ir.Value] = list(init_vals)
@@ -44,7 +45,7 @@ def _make_concat_model(
     cat_shape[axis] = sum(a.shape[axis] for a in arrays)
     if not add_dynamic_input:
         out.shape = ir.Shape(cat_shape)
-    out.dtype = ir.DataType.FLOAT
+    out.dtype = ir.tensor(arrays[0]).dtype
 
     graph_inputs = [ir.Value(name="x")]
     if add_dynamic_input:
