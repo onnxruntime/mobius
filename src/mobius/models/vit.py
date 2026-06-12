@@ -196,7 +196,7 @@ def _rename_vit_weight(name: str) -> str | None:
     if first_dot > 0:
         after = name[first_dot + 1 :]
         if after.startswith(
-            ("embeddings.", "encoder.", "layernorm.", "pooler.", "classifier.")
+            ("embeddings.", "encoder.", "layers.", "layernorm.", "pooler.", "classifier.")
         ):
             name = after
 
