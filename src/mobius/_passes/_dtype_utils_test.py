@@ -36,8 +36,11 @@ class TestInitializerDtype:
         assert initializer_dtype(v) == ir.DataType.FLOAT16
 
     def test_raises_on_dtype_contradiction(self):
-        """A declared type that contradicts the serialized data is corrupt
-        metadata and must fail closed rather than silently pick one dtype."""
+        """Reject values whose declared dtype contradicts the serialized data.
+
+        Such a value is corrupt metadata and must fail closed rather than
+        silently pick one dtype.
+        """
         v = _value(ir.DataType.FLOAT, np.ones((2,), np.float16))
         with pytest.raises(ValueError) as excinfo:
             initializer_dtype(v)
