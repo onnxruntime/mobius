@@ -4654,6 +4654,11 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # Hybrid SSM+Attention dedicated tests
     "bamba",
     "jamba",
+    # Speculative-decoding draft models with bespoke IO contracts
+    # (DFlash drafter takes noise_embedding + target_hidden instead of
+    # input_ids; the generic ALL_CAUSAL_LM_CONFIGS matrix can't drive it).
+    # Covered by src/mobius/models/_dflash_test.py.
+    "DFlashDraftModel",
 }
 
 # Registered model types that truly have no test coverage yet.

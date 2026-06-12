@@ -27,6 +27,7 @@ from mobius._configs._base import (
     BambaConfig,
     BaseModelConfig,
     CausalLMConfig,
+    DFlashConfig,
     DepthAnythingConfig,
     EncoderConfig,
     Gemma2Config,

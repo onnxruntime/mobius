@@ -390,6 +390,21 @@ def build(
         if any("ForCTC" in arch for arch in architectures):
             model_type = "mms"
 
+    # DFlash speculative-decoding drafters ship ``model_type="qwen3"`` (the
+    # base Qwen3 family) but declare ``architectures=["DFlashDraftModel"]``.
+    # Re-route via the architectures field so build() picks the cross-
+    # attending drafter class + dflash-draft task instead of the standard
+    # CausalLMModel + text-generation task.
+    architectures = getattr(parent_config, "architectures", None) or []
+    if architectures and architectures[0] in registry:
+        arch_key = architectures[0]
+        # Only override when the architecture-keyed registration is *more
+        # specific* than the model_type-keyed one (i.e. different class).
+        model_type_class = registry.get(model_type) if model_type in registry else None
+        arch_class = registry.get(arch_key)
+        if model_type_class is not arch_class:
+            model_type = arch_key
+
     if module_class is None:
         if model_type in registry:
             module_class = registry.get(model_type)

@@ -1107,6 +1107,56 @@ class VisionLanguageConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class DFlashConfig(CausalLMConfig):
+    """Configuration for the DFlash speculative-decoding draft model.
+
+    DFlash drafters (z-lab/dflash) condition on intermediate target hidden
+    states fused into every draft layer.  The HuggingFace ``config.json``
+    of a DFlash checkpoint stores DFlash-specific fields under a nested
+    ``dflash_config`` dict; we lift them onto the top-level mobius config
+    so the rest of the build pipeline (component init, task graph wiring,
+    weight loading) can read them through standard attribute access.
+
+    Fields:
+        target_layer_ids: 0-based decoder layer indices on the *target*
+            model whose post-residual hidden states feed each draft layer.
+            Same convention as
+            :class:`ArchitectureConfig.output_layer_indices`.
+        block_size: Number of mask/draft tokens the drafter consumes per
+            speculative step (``b16`` in checkpoint names means 16).
+        mask_token_id: Token id used to embed the masked draft positions
+            via the target's ``embed_tokens``; ``None`` is allowed and
+            indicates a pure noise embedding.
+        num_target_layers: Total number of decoder layers on the target
+            model.  Used together with ``target_layer_ids`` for runtime
+            consistency checks.
+    """
+
+    target_layer_ids: list[int] | None = None
+    block_size: int | None = None
+    mask_token_id: int | None = None
+    num_target_layers: int | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> DFlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        dflash_cfg = getattr(config, "dflash_config", None) or {}
+        if not isinstance(dflash_cfg, dict):
+            # Some checkpoints expose ``dflash_config`` as a nested config object.
+            dflash_cfg = {
+                "target_layer_ids": getattr(dflash_cfg, "target_layer_ids", None),
+                "mask_token_id": getattr(dflash_cfg, "mask_token_id", None),
+            }
+        return cls(
+            **_shallow_fields(base),
+            target_layer_ids=dflash_cfg.get("target_layer_ids"),
+            block_size=getattr(config, "block_size", None),
+            mask_token_id=dflash_cfg.get("mask_token_id"),
+            num_target_layers=getattr(config, "num_target_layers", None),
+        )
+
+
+@dataclasses.dataclass
 class Gemma2Config(CausalLMConfig):
     """Configuration for Gemma2 models with attention soft-capping.
 
