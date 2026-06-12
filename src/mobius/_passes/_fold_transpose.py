@@ -26,6 +26,8 @@ import logging
 
 import onnx_ir as ir
 
+from mobius._passes._dtype_utils import initializer_dtype
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,6 +109,11 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
                 new_name = f"{inp.name}_t"
 
+                # Resolve the dtype from the declared type or, when it was
+                # dropped during graph building, from the loaded const_value, so
+                # a transposed fp16 weight is not silently emitted as fp32.
+                transposed_dtype = initializer_dtype(inp) or ir.DataType.FLOAT
+
                 # Derive shape of the transposed tensor from the Transpose output.
                 # Fall back to computing from the input shape if shape inference
                 # did not propagate to this new node (e.g. after stage-2 rewrites).
@@ -115,7 +122,11 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                     perm = list(perm_attr.value)
                     t_shape = ir.Shape([inp.shape[p] for p in perm])
 
-                new_val = ir.Value(name=new_name, shape=t_shape, type=inp.type)
+                new_val = ir.Value(
+                    name=new_name,
+                    shape=t_shape,
+                    type=ir.TensorType(transposed_dtype),
+                )
 
                 # Create a LazyTensor that transposes the original data on demand.
                 # The actual numpy transposition is deferred until serialization,
@@ -123,7 +134,7 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 src = inp  # captured for the closure below
                 new_val.const_value = ir.LazyTensor(
                     lambda s=src: ir.tensor(s.const_value.numpy().T),  # type: ignore[union-attr]
-                    dtype=inp.dtype or ir.DataType.FLOAT,
+                    dtype=transposed_dtype,
                     shape=t_shape,
                     name=new_val.name,
                 )
