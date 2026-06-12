@@ -477,6 +477,13 @@ class _Phi4MMNaViTPatchEmbedding(PatchEmbedding):
             op.Constant(value_ints=[1]),
         )  # (N, 1, P)
         nb_w = op.ReduceSum(row0, op.Constant(value_ints=[2]), keepdims=1)  # (N,1,1)
+        # Guard against a fully-padded crop (nb_h or nb_w == 0): clamp the
+        # divisor to >=1 to avoid a division by zero.  Such crops have no valid
+        # patches, so every position is masked to id 0 by ``valid`` below and
+        # the clamped quotient is never used.
+        one_i = op.Constant(value_int=1)
+        nb_h_div = op.Max(nb_h, one_i)
+        nb_w_div = op.Max(nb_w, one_i)
 
         # r: (1, P, 1), c: (1, 1, P)
         idx = op.Constant(value_ints=list(range(P)))
@@ -484,8 +491,8 @@ class _Phi4MMNaViTPatchEmbedding(PatchEmbedding):
         c = op.Reshape(idx, op.Constant(value_ints=[1, 1, P]))
         p_const = op.Constant(value_int=P)  # scalar int64
         # pos_h = floor(r * P / nb_h); pos_w = floor(c * P / nb_w)
-        pos_h = op.Div(op.Mul(r, p_const), nb_h)  # (N, P, 1)
-        pos_w = op.Div(op.Mul(c, p_const), nb_w)  # (N, 1, P)
+        pos_h = op.Div(op.Mul(r, p_const), nb_h_div)  # (N, P, 1)
+        pos_w = op.Div(op.Mul(c, p_const), nb_w_div)  # (N, 1, P)
         # pos_id(r,c) = pos_h * P + pos_w → (N, P, P)
         pos_id = op.Add(op.Mul(pos_h, p_const), pos_w)
         # Valid patches are the top-left nb_h × nb_w block; others → id 0.
@@ -1219,7 +1226,9 @@ class _Phi4MMDecoderModel(nn.Module):
     ):
         # Publish the per-modality LoRA gates (computed in the embedding model
         # from input_ids) so every LoRALinear in the decoder applies only the
-        # adapter active for the current modality.
+        # adapter active for the current modality.  Clear any gates from a
+        # previous forward so a stale gate cannot leak across calls.
+        self._lora_gates.clear()
         if vision_gate is not None:
             self._lora_gates["vision"] = vision_gate
         if speech_gate is not None:

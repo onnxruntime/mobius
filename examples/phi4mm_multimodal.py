@@ -180,6 +180,8 @@ def prepare_decoder_feeds(
     inputs_embeds: np.ndarray,
     past_seq_len: int,
     past_kv: dict[str, np.ndarray],
+    vision_gate: np.ndarray,
+    speech_gate: np.ndarray,
 ) -> dict[str, np.ndarray]:
     """Prepare feeds for the **decoder** session.
 
@@ -190,6 +192,10 @@ def prepare_decoder_feeds(
         inputs_embeds: ``[batch, cur_seq_len, hidden_size]`` float32.
         past_seq_len: Number of tokens already in the KV cache.
         past_kv: Dict of ``past_key_values.{i}.key/value`` arrays.
+        vision_gate: Scalar LoRA gate emitted by the embedding model
+            (1.0 if any image token is present, else 0.0).
+        speech_gate: Scalar LoRA gate emitted by the embedding model
+            (1.0 if audio present and no image, else 0.0).
 
     Returns:
         Complete feeds dict for the decoder ONNX model.
@@ -202,6 +208,11 @@ def prepare_decoder_feeds(
         "inputs_embeds": inputs_embeds,
         "attention_mask": np.ones((batch_size, total_seq_len), dtype=np.int64),
         "position_ids": np.arange(past_seq_len, total_seq_len, dtype=np.int64)[np.newaxis, :],
+        # The decoder declares vision_gate/speech_gate as required scalar
+        # inputs; they are produced by the embedding model and select the
+        # active per-modality LoRA adapter.
+        "vision_gate": vision_gate,
+        "speech_gate": speech_gate,
         **past_kv,
     }
 
@@ -432,9 +443,15 @@ def generate(
         )
         embed_out = embedding_session.run(embed_feeds)
         inputs_embeds = embed_out["inputs_embeds"]
+        # The embedding model also emits the per-modality LoRA gates derived
+        # from input_ids; thread them into the decoder, which requires them.
+        vision_gate = embed_out["vision_gate"]
+        speech_gate = embed_out["speech_gate"]
 
         # --- Decoder session ---
-        decoder_feeds = prepare_decoder_feeds(inputs_embeds, past_seq_len, past_kv)
+        decoder_feeds = prepare_decoder_feeds(
+            inputs_embeds, past_seq_len, past_kv, vision_gate, speech_gate
+        )
         outputs = decoder_session.run(decoder_feeds)
 
         logits = outputs["logits"]
