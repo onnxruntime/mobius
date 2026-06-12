@@ -242,6 +242,7 @@ def build(
     *,
     module_class: type[nn.Module] | None = None,
     dtype: str | ir.DataType | None = None,
+    output_layer_indices: list[int] | None = None,
     load_weights: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
@@ -275,6 +276,16 @@ def build(
             ``"f16"``, ``"bf16"``) or :class:`ir.DataType` values.
             When ``None``, the dtype is auto-detected from the HuggingFace
             config.
+        output_layer_indices: Optional list of decoder layer indices for
+            which to emit additional ``hidden_states.{k}`` ONNX outputs
+            alongside the standard ``logits`` / ``present.*`` outputs.
+            Each ``k`` follows the HF ``output_hidden_states`` convention
+            and refers to the post-residual output of decoder layer ``k``
+            (equivalent to ``model(...).hidden_states[k + 1]`` in
+            transformers).  Used by speculative-decoding draft models
+            such as DFlash that condition on intermediate target hidden
+            states.  See
+            :class:`mobius.ArchitectureConfig.output_layer_indices`.
         load_weights: Whether to download and apply weights from HuggingFace.
         trust_remote_code: Whether to trust remote code when loading the
             HuggingFace config.
@@ -404,6 +415,15 @@ def build(
     if dtype is not None:
         dtype = resolve_dtype(dtype)
         config = dataclasses.replace(config, dtype=dtype)
+
+    if output_layer_indices is not None:
+        # Opt-in: emit additional `hidden_states.{k}` ONNX outputs for each
+        # listed decoder layer index.  Used by speculative-decoding draft
+        # models (e.g. DFlash) that condition on intermediate target hidden
+        # states.  See ``ArchitectureConfig.output_layer_indices``.
+        config = dataclasses.replace(
+            config, output_layer_indices=list(output_layer_indices)
+        )
 
     if task is None:
         task = _default_task_for_model(model_type)
