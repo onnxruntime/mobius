@@ -65,12 +65,17 @@ NEAR_TIE_MARGINS: dict[str, float] = {
     "int4": 1.0,
 }
 
-# Top-10 Jaccard at/above which an argmax mismatch is treated as a tie-break
-# (AMBIGUOUS) rather than a divergence (FAIL), provided the predicted token is
-# itself within the golden top-10.  ≥0.9 means at least 9 of the 10 highest
-# tokens agree with the reference — the model ranking matches and only the #1
-# tie-break differs (e.g. CUDA float32 accumulation noise).
-_AMBIGUOUS_JACCARD: float = 0.9
+# Minimum top-10 overlap (count of shared tokens) at/above which an argmax
+# mismatch is treated as a tie-break (AMBIGUOUS) rather than a divergence
+# (FAIL).  A count of >=9 means at least 9 of the 10 highest tokens agree with
+# the reference.  NOTE: this MUST be a count, not a Jaccard ratio: for two
+# size-10 sets sharing k tokens the Jaccard is k/(20-k), so 9/10 overlap is
+# only 0.818 (a >=0.9 ratio would require identical sets, k=10, defeating the
+# "9 of 10 agree" intent).  The branch additionally requires the predicted
+# token to be within the golden top-10 AND the golden argmax to remain in the
+# ONNX top-2, so it only rescues genuine #1/#2 tie-break swaps (e.g. CUDA
+# float32 accumulation noise), not a low-ranked token promoted to #1.
+_AMBIGUOUS_TOP10_OVERLAP: int = 9
 
 # Per-dtype default tolerances for L3 synthetic parity.
 DEFAULT_TOLERANCES: dict[str, tuple[float, float]] = {
@@ -278,14 +283,15 @@ def compare_golden(
 
     argmax_match = onnx_top1 == golden_top1_id
 
-    # Top-10 Jaccard
+    # Top-10 Jaccard (reported) and raw overlap count (gate).
     onnx_top10 = set(np.argsort(onnx_last_f64)[-10:].tolist())
     golden_top10 = set(golden_top10_ids)
-    jaccard = (
-        len(onnx_top10 & golden_top10) / len(onnx_top10 | golden_top10)
-        if golden_top10
-        else 0.0
-    )
+    overlap = len(onnx_top10 & golden_top10)
+    jaccard = overlap / len(onnx_top10 | golden_top10) if golden_top10 else 0.0
+    # ONNX top-2 token ids, used to confirm an argmax mismatch is a #1/#2
+    # tie-break swap (golden argmax still ranked #1 or #2 by ONNX) rather than
+    # a low-ranked token being promoted to #1.
+    onnx_top2_ids = set(np.argsort(onnx_last_f64)[-2:].tolist())
 
     # Gate decision
     if argmax_match:
@@ -298,18 +304,25 @@ def compare_golden(
             f"but matches top2={golden_top2_id} and near-tie detected "
             f"(gap={abs(top1_logit - top2_logit):.4f} < margin={margin})"
         )
-    elif jaccard >= _AMBIGUOUS_JACCARD and onnx_top1 in golden_top10:
-        # The top-10 token sets are essentially identical (≥9/10 overlap) and
-        # the predicted token is itself in the golden top-10 — the argmax
-        # difference is a tie-break, not a divergence.  This catches CUDA
-        # float32 near-ties whose absolute logit gap exceeds the per-dtype
-        # ``near_tie`` margin (CUDA accumulation noise > CPU) yet whose ranking
-        # otherwise matches the reference.
+    elif (
+        overlap >= _AMBIGUOUS_TOP10_OVERLAP
+        and onnx_top1 in golden_top10
+        and golden_top1_id in onnx_top2_ids
+    ):
+        # >=9 of the golden top-10 tokens agree, the predicted token is itself a
+        # golden top-10 token, AND the golden argmax is still ranked #1 or #2 by
+        # ONNX — i.e. the argmax difference is a near-tie #1/#2 swap, not a
+        # divergence.  This catches CUDA float32 near-ties whose absolute logit
+        # gap exceeds the per-dtype ``near_tie`` margin (CUDA accumulation noise
+        # > CPU) yet whose ranking otherwise matches the reference.  Requiring
+        # the golden argmax to stay in the ONNX top-2 prevents masking a real
+        # divergence where a low-ranked token is promoted to #1 with a large gap.
         result = ParityResult.AMBIGUOUS
         message = (
             f"L4 AMBIGUOUS: argmax={onnx_top1} != golden_top1={golden_top1_id}, "
-            f"but top10_jaccard={jaccard:.2f} (≥{_AMBIGUOUS_JACCARD}) and "
-            f"argmax is within the golden top-10 — tie-break, not divergence"
+            f"but {overlap}/10 of the golden top-10 agree, argmax is within the "
+            f"golden top-10, and golden_top1 remains in the ONNX top-2 "
+            f"— tie-break, not divergence"
         )
     else:
         result = ParityResult.FAIL

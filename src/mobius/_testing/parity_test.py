@@ -168,3 +168,56 @@ class TestCompareGolden:
             golden_top10_ids=golden_top10,
         )
         assert report.result == ParityResult.FAIL
+
+    def test_nine_of_ten_overlap_tie_break_ambiguous(self):
+        """Exactly 9/10 top-10 overlap with a #1/#2 swap → AMBIGUOUS.
+
+        Boundary case for the count-based overlap gate: 9 of the golden top-10
+        agree (Jaccard would be only 9/11 ≈ 0.818, below the old 0.9 ratio, so
+        this case used to FAIL incorrectly).  The golden argmax stays in the
+        ONNX top-2 and the predicted token is itself a golden top-10 token, so
+        it is a genuine tie-break swap.
+        """
+        golden_top10 = [976, 32, 637, 5632, 2223, 2500, 3160, 51543, 6275, 2886]
+        logits = np.full((1, 200064), -50.0, dtype=np.float32)
+        for rank, tok in enumerate(golden_top10):
+            logits[0, tok] = 37.7 - rank * 0.5
+        # Swap #1/#2 beyond the float32 near-tie margin: ONNX argmax is 32
+        # (golden top2), golden top1 (976) remains ONNX #2.
+        logits[0, 32] = 37.76
+        logits[0, 976] = 37.67
+        # Replace one golden top-10 token (2886) with a non-golden token so the
+        # overlap is exactly 9/10 (not identical sets).
+        logits[0, 2886] = -50.0
+        logits[0, 199999] = 30.0
+        report = compare_golden(
+            logits,
+            golden_top1_id=976,
+            golden_top2_id=32,
+            golden_top10_ids=golden_top10,
+        )
+        assert report.result == ParityResult.AMBIGUOUS
+
+    def test_identical_top10_low_token_promoted_still_fails(self):
+        """Identical top-10 but golden argmax buried in ONNX → FAIL.
+
+        Guards against the over-lenient case flagged in review: even with a
+        perfect top-10 overlap, if the golden top1 is NOT in the ONNX top-2
+        (a low-ranked token was promoted to #1 with a large gap), this is a
+        real divergence and must stay FAIL — not be masked as AMBIGUOUS.
+        """
+        golden_top10 = [976, 32, 637, 5632, 2223, 2500, 3160, 51543, 6275, 2886]
+        logits = np.full((1, 200064), -50.0, dtype=np.float32)
+        # ONNX ranks the SAME 10 tokens but in a very different order: token
+        # 2886 (golden #10) is promoted to #1 with a large gap, while golden #1
+        # (976) is pushed down to ONNX rank ~5 (outside the top-2).
+        onnx_order = [2886, 32, 637, 5632, 976, 2500, 3160, 51543, 6275, 2223]
+        for rank, tok in enumerate(onnx_order):
+            logits[0, tok] = 40.0 - rank * 1.0
+        report = compare_golden(
+            logits,
+            golden_top1_id=976,
+            golden_top2_id=32,
+            golden_top10_ids=golden_top10,
+        )
+        assert report.result == ParityResult.FAIL
