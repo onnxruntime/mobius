@@ -1156,6 +1156,7 @@ class DFlashConfig(CausalLMConfig):
         )
 
 
+
 @dataclasses.dataclass
 class Gemma2Config(CausalLMConfig):
     """Configuration for Gemma2 models with attention soft-capping.
@@ -1420,6 +1421,108 @@ class Gemma4Config(VisionLanguageConfig):
             use_bidirectional_attention=getattr(config, "use_bidirectional_attention", None),
         )
 
+
+@dataclasses.dataclass
+class Gemma4AssistantConfig(Gemma4Config):
+    """Configuration for the Gemma4-Assistant MTP draft model.
+
+    The HuggingFace Gemma4-Assistant checkpoint
+    (``google/gemma-4-{E2B,E4B,12B,26B,31B}-it-assistant``) is a small
+    Gemma4-style decoder that is hooked up to a target Gemma4 model for
+    speculative decoding.  Its HF config layout is::
+
+        Gemma4AssistantConfig
+        ├── text_config: Gemma4TextConfig   ← all the standard Gemma4 fields
+        ├── backbone_hidden_size: int        ← target model's hidden size
+        ├── use_ordered_embeddings: bool
+        ├── num_centroids: int
+        └── centroid_intermediate_top_k: int
+
+    We flatten this into a single mobius dataclass by extracting the
+    nested ``text_config`` fields onto the top level (via
+    :meth:`Gemma4Config.from_transformers`) and adding the assistant-
+    specific fields below.
+
+    Constraints enforced by the HF config (mirrored here):
+    - All draft layers must be KV-shared with the target — i.e.
+      ``num_kv_shared_layers == num_hidden_layers``.  The drafter has no
+      KV cache of its own; per-layer K/V is fed in from the target's
+      shared K/V buffers at inference time.
+    - ``hidden_size_per_layer_input == 0`` (no per-layer input gating).
+    - ``enable_moe_block == False`` (no MoE).
+    - ``use_double_wide_mlp == False``.
+    - ``vocab_size_per_layer_input == 0``.
+
+    Fields (assistant-specific):
+        backbone_hidden_size: Hidden size of the target model the
+            assistant was trained against (so the assistant's
+            ``pre_projection`` and ``post_projection`` know the right
+            input/output dims for the shared hidden state).
+        use_ordered_embeddings: When True, the assistant routes its
+            output through a centroid-based ordered-embedding LM head
+            (``Gemma4AssistantMaskedEmbedder``).  Currently unsupported
+            in mobius — see ``Gemma4AssistantCausalLMModel``.
+        num_centroids: Number of centroids used by the ordered-embedding
+            head when ``use_ordered_embeddings`` is True.
+        centroid_intermediate_top_k: Top-K centroid count for the
+            ordered-embedding head.
+    """
+
+    backbone_hidden_size: int = 1536
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 2048
+    centroid_intermediate_top_k: int = 32
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma4AssistantConfig:
+        # The HF Gemma4AssistantConfig nests the Gemma4 text config under
+        # ``text_config``.  Drive Gemma4Config.from_transformers on that
+        # nested config to lift all the standard text-decoder fields onto
+        # the top level, then layer on the assistant-specific knobs.
+        text_cfg = getattr(config, "text_config", None) or config
+        base = Gemma4Config.from_transformers(text_cfg, parent_config=parent_config)
+        return cls(
+            **_shallow_fields(base),
+            backbone_hidden_size=getattr(config, "backbone_hidden_size", 1536),
+            use_ordered_embeddings=bool(getattr(config, "use_ordered_embeddings", False)),
+            num_centroids=int(getattr(config, "num_centroids", 2048)),
+            centroid_intermediate_top_k=int(
+                getattr(config, "centroid_intermediate_top_k", 32)
+            ),
+        )
+
+    def validate(self) -> None:
+        super().validate()
+        errors: list[str] = []
+        if self.num_kv_shared_layers != self.num_hidden_layers:
+            errors.append(
+                "Gemma4-Assistant requires every layer to be KV-shared with the "
+                f"target: num_kv_shared_layers ({self.num_kv_shared_layers}) "
+                f"must equal num_hidden_layers ({self.num_hidden_layers})."
+            )
+        if self.hidden_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer input gating; "
+                f"hidden_size_per_layer_input must be 0, got {self.hidden_size_per_layer_input}."
+            )
+        if self.enable_moe_block:
+            errors.append(
+                "Gemma4-Assistant does not support MoE layers; enable_moe_block must be False."
+            )
+        if self.use_double_wide_mlp:
+            errors.append(
+                "Gemma4-Assistant does not support double-wide MLP; "
+                "use_double_wide_mlp must be False."
+            )
+        if self.vocab_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer vocab; "
+                f"vocab_size_per_layer_input must be 0, got {self.vocab_size_per_layer_input}."
+            )
+        if errors:
+            raise ValueError(
+                "Invalid Gemma4AssistantConfig:\n" + "\n".join(f"  - {e}" for e in errors)
+            )
 
 @dataclasses.dataclass
 class YolosConfig(EncoderConfig):

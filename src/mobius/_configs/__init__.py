@@ -32,6 +32,7 @@ from mobius._configs._base import (
     EncoderConfig,
     Gemma2Config,
     Gemma3nConfig,
+    Gemma4AssistantConfig,
     Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,

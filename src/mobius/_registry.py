@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
     WhisperConfig,
@@ -44,6 +45,7 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4AssistantCausalLMModel,
     Gemma4CausalLMModel,
     Gemma4Model,
     Gemma4UnifiedModel,
@@ -401,6 +403,21 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    # Gemma4-Assistant ships ``model_type="gemma4_assistant"`` plus
+    # ``architectures=["Gemma4AssistantForCausalLM"]``.  Both keys point
+    # at the assistant drafter so build() can dispatch via either.
+    "gemma4_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "Gemma4AssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),

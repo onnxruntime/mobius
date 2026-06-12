@@ -45,6 +45,7 @@ __all__ = [
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
     "Gemma3nCausalLMModel",
+    "Gemma4AssistantCausalLMModel",
     "Gemma4CausalLMModel",
     "Gemma4Model",
     "Gemma4UnifiedModel",
@@ -170,6 +171,7 @@ from mobius.models.gemma4 import (
     Gemma4Model,
     Gemma4UnifiedModel,
 )
+from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
