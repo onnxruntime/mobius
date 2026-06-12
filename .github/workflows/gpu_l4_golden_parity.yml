@@ -110,13 +110,13 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: always() && steps.check_golden.outputs.has_golden == 'true'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: gpu-l4
       - name: Upload L4 test results to Codecov
         if: steps.check_golden.outputs.has_golden == 'true' && !cancelled()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: gpu-l4
