@@ -40,27 +40,32 @@ from mobius.components._common import Linear
 from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
+from mobius.components._attention import GQAContext
 
 if TYPE_CHECKING:
     pass
 
 
 class Gemma4AssistantAttention(nn.Module):
-    """Q-only attention against externally-supplied K/V.
+    """Q-only attention against externally-supplied K/V (from the target's cache).
 
-    The K/V tensors arrive in ``[B, num_kv_heads, kv_len, head_dim]``
-    (BNSH) — the layout produced by the target's KV cache — and are
-    transposed to ``[B, kv_len, num_kv_heads * head_dim]`` (BSH) before
-    being fed to ``op.Attention``.
+    Two emission paths:
 
-    Args:
-        config: The flattened :class:`Gemma4AssistantConfig`.
-        layer_type: Either ``"sliding_attention"`` or ``"full_attention"``;
-            controls which per-layer-type head_dim / KV head count is used.
-        rotary_embedding_dim: Dimensions to rotate inside RoPE.  Always 0
-            (full rotation) for Gemma4 — both DefaultRope (sliding) and
-            ProportionalRope (full, zero-padded) handle partial rotation
-            inside their cos/sin tables.
+    * **Generic (Attention op)** — when ``gqa_ctx`` is None.  Transposes the
+      shared K/V from BNSH to BSH and runs ``op.Attention`` with
+      ``is_causal=0``.  Works on every EP and any dtype.
+
+    * **GroupQueryAttention** — when ``gqa_ctx`` is given (active EP supports
+      GQA fusion for the build dtype).  Routes the shared K/V as
+      ``past_key`` / ``past_value`` directly in BNSH (no transpose), passes an
+      empty new K/V (``kv_sequence_length=0`` so nothing is appended), and
+      lets GQA's ``seqlens_k`` + ``do_rotary`` handle masking and RoPE on Q
+      automatically.  Mirrors the gemma4 KV-shared layer pattern at
+      ``mobius/models/gemma4.py:758-803``.
+
+    The GQA path is what lets the orchestrator share a single max-cache-len KV
+    buffer between target and assistant (the assistant just reads the buffer
+    in-place; ``seqlens_k`` drives the mask).
     """
 
     def __init__(
@@ -100,7 +105,8 @@ class Gemma4AssistantAttention(nn.Module):
         hidden_states: ir.Value,
         shared_key: ir.Value,
         shared_value: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
+        gqa_ctx: GQAContext | None = None,
     ) -> ir.Value:
         # Q projection + per-head Q norm.
         q = self.q_proj(op, hidden_states)
@@ -108,6 +114,57 @@ class Gemma4AssistantAttention(nn.Module):
         q = self.q_norm(op, q)
         q = op.Reshape(q, [0, 0, -1])
 
+        if gqa_ctx is not None:
+            # ===== GQA path =====
+            # Route shared K/V (already RoPE'd by the target) directly as
+            # past_key / past_value in BNSH.  Pass an empty new K/V so GQA
+            # does not try to append anything.
+            #
+            # GQA with do_rotary=1 applies RoPE to Q internally using the
+            # per-batch position derived from seqlens_k (= sum(mask)-1) and
+            # the new_seqlen=0 of the K input, so the Q's position becomes
+            # ``past_seq_len = seqlens_k + 1``, i.e. the position of the
+            # next token to predict.
+            batch_dim = op.Shape(q, start=0, end=1)
+            kv_hidden = self.num_key_value_heads * self.head_dim
+            empty_shape = op.Concat(
+                batch_dim,
+                op.Constant(value_ints=[0, kv_hidden]),
+                axis=0,
+            )
+            empty_kv = op.CastLike(op.ConstantOfShape(empty_shape), q)
+
+            gqa_attrs: dict = {
+                "num_heads": self.num_attention_heads,
+                "kv_num_heads": self.num_key_value_heads,
+                "scale": self.scaling,
+                "do_rotary": 1,
+                "rotary_interleaved": int(self._rope_interleave),
+            }
+            if self.softcap:
+                gqa_attrs["softcap"] = self.softcap
+            if self.rotary_embedding_dim:
+                gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+            if gqa_ctx.local_window_size > 0:
+                gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
+
+            attn_output, _present_k, _present_v = op.GroupQueryAttention(
+                q,
+                empty_kv,
+                empty_kv,
+                shared_key,
+                shared_value,
+                gqa_ctx.seqlens_k,
+                gqa_ctx.total_seq_len,
+                gqa_ctx.cos_cache,
+                gqa_ctx.sin_cache,
+                _domain="com.microsoft",
+                _outputs=3,
+                **gqa_attrs,
+            )
+            return self.o_proj(op, attn_output)
+
+        # ===== Generic Attention path =====
         # Apply RoPE to Q.  The shared K from the target is already RoPE'd by
         # the target's forward pass; we only need to RoPE the assistant Q.
         q = apply_rotary_pos_emb(
@@ -127,27 +184,9 @@ class Gemma4AssistantAttention(nn.Module):
         v = op.Reshape(v, [0, 0, -1])
 
         # Full attention: is_causal=0, no attention_bias.  See module
-        # docstring for why this is correct.
-        #
-        # WHY NOT is_causal=1?  For ``q_len < kv_len`` (always the case
-        # here — assistant Q is ~1 token, target K is the full prefill+
-        # generated prefix) the two EPs disagree on alignment: per the
-        # ONNX spec ``is_causal`` is upper-left-aligned, so CUDA makes
-        # Q[0] attend to K[0] only (silently wrong), while CPU bottom-
-        # right-aligns to the correct K[0..kv_len-1].  This is the same
-        # pitfall documented for the Gemma4 KV-shared path in
-        # ``mobius/models/gemma4.py:818-829``.  Using is_causal=0 with
-        # no bias is correct on every EP.
-        #
-        # FOR FUTURE GQA FUSION: the right path is NOT is_causal=1 on
-        # ``op.Attention``; it is to emit ``com.microsoft::GroupQueryAttention``
-        # directly with the shared K/V routed as past_key/past_value and
-        # empty new key/value, exactly as ``gemma4.py:758-803`` does for
-        # the KV-shared layers.  GQA's masking is governed by seqlens_k
-        # + total_seq_len, which align correctly across EPs; it does not
-        # consult ``is_causal`` on the inner Attention op at all.  Adding
-        # that dispatch here is a localised follow-up (~50 LOC) and does
-        # not require any change to this fallback path.
+        # docstring for why this is correct.  For q_len < kv_len the two EPs
+        # disagree on ``is_causal`` alignment; with is_causal=0 + no bias the
+        # graph is correct on every EP.
         attn_output, _present_k, _present_v = _apply_attention(
             op,
             q,
@@ -235,7 +274,8 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         hidden_states: ir.Value,
         shared_key: ir.Value,
         shared_value: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
+        gqa_ctx: GQAContext | None = None,
     ) -> ir.Value:
         # --- Attention block: pre-norm -> attn -> post-norm -> residual ---
         residual = hidden_states
@@ -246,6 +286,7 @@ class Gemma4AssistantDecoderLayer(nn.Module):
             shared_key=shared_key,
             shared_value=shared_value,
             position_embeddings=position_embeddings,
+            gqa_ctx=gqa_ctx,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)

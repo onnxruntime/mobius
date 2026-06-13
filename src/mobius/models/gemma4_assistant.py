@@ -154,16 +154,22 @@ class Gemma4AssistantCausalLMModel(nn.Module):
         inputs_embeds: ir.Value,
         position_ids: ir.Value,
         shared_kv: dict[str, tuple[ir.Value, ir.Value]],
+        attention_mask: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value]:
         """Build the Gemma4-Assistant ONNX graph.
 
         Args:
             op: onnxscript OpBuilder.
             inputs_embeds: ``[B, q_len, 2 * backbone_hidden_size]``.
-            position_ids: ``[B, q_len]`` INT64.  Drives the RoPE on Q.
+            position_ids: ``[B, q_len]`` INT64.  Drives the RoPE on Q in the
+                non-GQA path; unused under GQA fusion (positions are derived
+                internally from seqlens_k).
             shared_kv: dict keyed by layer type (``"full_attention"``,
                 ``"sliding_attention"``) → ``(key, value)`` ir.Values in
                 BNSH layout ``[B, num_kv_heads, kv_len, head_dim]``.
+            attention_mask: ``[B, kv_len]`` INT (0/1).  REQUIRED for the GQA
+                fusion path (used to compute ``seqlens_k`` and
+                ``total_seq_len``); ignored by the non-GQA fallback path.
 
         Returns:
             ``(logits, projected_state)``:
@@ -179,6 +185,7 @@ class Gemma4AssistantCausalLMModel(nn.Module):
             hidden_states=hidden_states,
             position_ids=position_ids,
             shared_kv=shared_kv,
+            attention_mask=attention_mask,
         )
 
         # Heads.
@@ -262,16 +269,77 @@ class _Gemma4AssistantTextModel(nn.Module):
         hidden_states: ir.Value,
         position_ids: ir.Value,
         shared_kv: dict[str, tuple[ir.Value, ir.Value]],
+        attention_mask: ir.Value | None = None,
     ) -> ir.Value:
-        # Gather RoPE embeddings for Q once each.  Layers pick the
-        # appropriate one based on layer_type.
+        from mobius._build_context import ep_capabilities, get_build_dtype
+        import onnx_ir as ir_mod
+        from mobius.components._attention import GQAContext
+
+        caps = ep_capabilities()
+        dtype = get_build_dtype()
+        use_gqa = (
+            attention_mask is not None
+            and dtype in caps.gqa_dtypes
+            and caps.supports_fused_rope
+        )
+
+        if use_gqa:
+            # Materialize RoPE caches as graph initializers (GQA references
+            # them directly).  Calling .forward() on the RoPE module is what
+            # registers the cos/sin Parameter — without this they would be
+            # absent from the graph.
+            _ = self.rotary_emb_local(op, position_ids)
+            _ = self.rotary_emb_global(op, position_ids)
+
+            one_i32 = op.Constant(value_int=1)
+            seqlens_k = op.Cast(
+                op.Sub(
+                    op.ReduceSum(attention_mask, [1], keepdims=0),
+                    one_i32,
+                ),
+                to=ir_mod.DataType.INT32,
+            )
+            total_seq_len = op.Cast(
+                op.Gather(op.Shape(attention_mask), 1),
+                to=ir_mod.DataType.INT32,
+            )
+            gqa_ctx_by_type: dict[str, GQAContext] = {
+                "sliding_attention": GQAContext(
+                    seqlens_k=seqlens_k,
+                    total_seq_len=total_seq_len,
+                    cos_cache=self.rotary_emb_local.cos_cache,
+                    sin_cache=self.rotary_emb_local.sin_cache,
+                    local_window_size=(
+                        getattr(self.layers[0].self_attn, "sliding_window", -1)
+                        or -1
+                    ),
+                ),
+                "full_attention": GQAContext(
+                    seqlens_k=seqlens_k,
+                    total_seq_len=total_seq_len,
+                    cos_cache=self.rotary_emb_global.cos_cache,
+                    sin_cache=self.rotary_emb_global.sin_cache,
+                ),
+            }
+            for layer in self.layers:
+                shared_k, shared_v = shared_kv[layer.layer_type]
+                hidden_states = layer(
+                    op,
+                    hidden_states=hidden_states,
+                    shared_key=shared_k,
+                    shared_value=shared_v,
+                    position_embeddings=None,
+                    gqa_ctx=gqa_ctx_by_type[layer.layer_type],
+                )
+            return self.norm(op, hidden_states)
+
+        # Fallback (generic Attention) path.
         pos_emb_local = self.rotary_emb_local(op, position_ids)
         pos_emb_global = self.rotary_emb_global(op, position_ids)
         pos_emb_by_type = {
             "sliding_attention": pos_emb_local,
             "full_attention": pos_emb_global,
         }
-
         for layer in self.layers:
             shared_k, shared_v = shared_kv[layer.layer_type]
             hidden_states = layer(
@@ -280,5 +348,6 @@ class _Gemma4AssistantTextModel(nn.Module):
                 shared_key=shared_k,
                 shared_value=shared_v,
                 position_embeddings=pos_emb_by_type[layer.layer_type],
+                gqa_ctx=None,
             )
         return self.norm(op, hidden_states)
