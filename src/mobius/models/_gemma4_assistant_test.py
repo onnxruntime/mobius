@@ -294,3 +294,57 @@ class TestGemma4AssistantBuildGraph:
         cfg, model = self._build()
         ps = next(v for v in model.graph.outputs if v.name == "projected_state")
         assert ps.shape[-1] == cfg.backbone_hidden_size
+
+
+class TestGemma4AssistantPreprocessWeights:
+    """Verify the HF state-dict bridge for tied weights and dropped extras."""
+
+    def _model(self):
+        cfg = Gemma4AssistantConfig.from_transformers(
+            _e2b_like_hf_config(), parent_config=_e2b_like_hf_config()
+        )
+        return Gemma4AssistantCausalLMModel(cfg)
+
+    def test_aliases_embed_tokens_to_lm_head(self):
+        import torch
+
+        m = self._model()
+        embed = torch.zeros(262144, 256)
+        sd = {"model.embed_tokens.weight": embed}
+        sd = m.preprocess_weights(sd)
+        assert "lm_head.weight" in sd
+        assert sd["lm_head.weight"] is embed
+        # The original embed_tokens key is dropped (no mobius consumer).
+        assert "model.embed_tokens.weight" not in sd
+
+    def test_does_not_overwrite_existing_lm_head(self):
+        import torch
+
+        m = self._model()
+        existing_head = torch.ones(262144, 256)
+        sd = {
+            "lm_head.weight": existing_head,
+            "model.embed_tokens.weight": torch.zeros(262144, 256),
+        }
+        sd = m.preprocess_weights(sd)
+        assert sd["lm_head.weight"] is existing_head
+
+    def test_drops_unsupported_masked_embedding_keys(self):
+        import torch
+
+        m = self._model()
+        sd = {
+            "lm_head.weight": torch.zeros(262144, 256),
+            "masked_embedding.centroids.weight": torch.zeros(2048, 256),
+            "masked_embedding.token_ordering": torch.zeros(262144, dtype=torch.long),
+        }
+        sd = m.preprocess_weights(sd)
+        assert "masked_embedding.centroids.weight" not in sd
+        assert "masked_embedding.token_ordering" not in sd
+
+    def test_idempotent_when_keys_missing(self):
+        m = self._model()
+        sd = {}
+        # Should not raise even when both keys are absent.
+        sd = m.preprocess_weights(sd)
+        assert sd == {}

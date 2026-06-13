@@ -107,6 +107,42 @@ class Gemma4AssistantCausalLMModel(nn.Module):
             config.hidden_size, config.backbone_hidden_size, bias=False
         )
 
+    def preprocess_weights(self, state_dict):
+        """Bridge HF state-dict naming to our module layout.
+
+        The HF ``Gemma4AssistantForCausalLM`` wraps an inner ``Gemma4TextModel``
+        (via ``AutoModel.from_config(text_config)``) which has its own
+        ``embed_tokens`` table.  With ``tie_word_embeddings=True`` the HF
+        checkpoint stores ONLY ``model.embed_tokens.weight`` (and not
+        ``lm_head.weight``) — the LM head is reconstructed via the
+        ``_tied_weights_keys`` aliasing.
+
+        Our mobius assistant has no ``model.embed_tokens`` (it consumes
+        ``inputs_embeds`` directly from the target), so we redirect the
+        embedding weight to feed our ``lm_head``.  After the alias, the
+        original ``model.embed_tokens.weight`` key is removed because no
+        mobius module consumes it.
+
+        For ``use_ordered_embeddings=True`` checkpoints (e.g. E2B-it-assistant)
+        the state dict also contains ``masked_embedding.centroids.weight``
+        and ``masked_embedding.token_ordering``.  These are dropped here
+        because we do not implement the sparse centroid LM head yet — the
+        weight loader would otherwise warn about unused keys.
+        """
+        if (
+            "lm_head.weight" not in state_dict
+            and "model.embed_tokens.weight" in state_dict
+        ):
+            state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+        # Drop keys our mobius layout does not consume.
+        for unused in (
+            "model.embed_tokens.weight",
+            "masked_embedding.centroids.weight",
+            "masked_embedding.token_ordering",
+        ):
+            state_dict.pop(unused, None)
+        return state_dict
+
     def forward(
         self,
         op: OpBuilder,
