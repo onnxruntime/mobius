@@ -443,3 +443,21 @@ class TestGemma4AssistantOrderedEmbeddings:
         init_names = list(pkg["model"].graph.initializers.keys())
         assert any("centroids" in n for n in init_names)
         assert any("token_ordering" in n for n in init_names)
+
+    def test_build_with_ordered_embeddings_realizes_lm_head_weight(self):
+        # Regression: the sparse head reads lm_head.weight via Gather but
+        # does not call the Linear module's forward, so Module.__call__'s
+        # automatic parameter realization never fires for it.  We explicitly
+        # realize lm_head.weight before the Gather; without it the saved
+        # graph has a dangling reference and the lm_head.weight initializer
+        # never appears in the file.
+        from mobius._builder import build_from_module
+        cfg, module = self._model()
+        pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
+        init_names = list(pkg["model"].graph.initializers.keys())
+        assert "lm_head.weight" in init_names, (
+            f"lm_head.weight missing from initializers; got {sorted(init_names)}"
+        )
+        # And it has the right shape.
+        init = pkg["model"].graph.initializers["lm_head.weight"]
+        assert list(init.shape) == [cfg.vocab_size, cfg.hidden_size]

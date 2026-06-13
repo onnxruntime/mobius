@@ -186,6 +186,21 @@ class Gemma4AssistantCausalLMModel(nn.Module):
             # Centroid-routed sparse LM head: routes top_k centroids per
             # position, gathers their lm_head rows, computes dot products
             # with hidden_states, scatters into a vocab-sized buffer.
+            #
+            # We pass ``self.lm_head.weight`` straight into the Gather op
+            # rather than calling ``self.lm_head.forward`` (which would
+            # do a full dense MatMul we don't need).  Module.__call__
+            # only realizes the parameters of the module being called
+            # — see onnxscript/nn/_module.py:80-81 — and the qualified
+            # initializer name is built from the module-stack context, so
+            # we manually push the ``lm_head`` module here so the
+            # registered initializer is named ``lm_head.weight`` to match
+            # the HF state-dict key.
+            op.builder.push_module("lm_head", "Linear")
+            try:
+                self.lm_head.weight._realize(op.builder)
+            finally:
+                op.builder.pop_module()
             logits = self.masked_embedding(op, hidden_states, self.lm_head.weight)
         else:
             logits = self.lm_head(op, hidden_states)
