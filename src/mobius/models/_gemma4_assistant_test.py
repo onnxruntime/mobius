@@ -117,6 +117,24 @@ class TestGemma4AssistantConfigFromTransformers:
         assert cfg.num_centroids == 2048
         assert cfg.centroid_intermediate_top_k == 32
 
+    def test_assistant_fields_resolved_via_parent_when_unwrapped(self):
+        # Regression: ``build()`` unwraps ``hf_config.text_config`` before
+        # calling _config_from_hf, so ``config`` arrives as the inner
+        # Gemma4TextConfig (without backbone_hidden_size /
+        # use_ordered_embeddings / num_centroids /
+        # centroid_intermediate_top_k).  Those fields must be resolved
+        # from ``parent_config`` (the original wrapper).
+        full = _e2b_like_hf_config()
+        text_only = full.text_config  # what build() would pass as ``config``
+        cfg = Gemma4AssistantConfig.from_transformers(text_only, parent_config=full)
+        assert cfg.backbone_hidden_size == 1536
+        assert cfg.use_ordered_embeddings is True
+        assert cfg.num_centroids == 2048
+        assert cfg.centroid_intermediate_top_k == 32
+        # And the standard Gemma4 fields are still correct.
+        assert cfg.hidden_size == 256
+        assert cfg.num_hidden_layers == 4
+
 
 class TestGemma4AssistantConfigValidate:
     def _cfg(self, **overrides):

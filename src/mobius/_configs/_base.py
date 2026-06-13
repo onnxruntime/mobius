@@ -1479,15 +1479,32 @@ class Gemma4AssistantConfig(Gemma4Config):
         # ``text_config``.  Drive Gemma4Config.from_transformers on that
         # nested config to lift all the standard text-decoder fields onto
         # the top level, then layer on the assistant-specific knobs.
+        #
+        # NOTE: ``build()`` unwraps ``config.text_config`` BEFORE calling
+        # us when the wrapper has a ``text_config`` attribute (see
+        # _builder.py:370-382).  In that case ``config`` is the unwrapped
+        # Gemma4TextConfig and the assistant-specific fields
+        # (use_ordered_embeddings, backbone_hidden_size, num_centroids,
+        # centroid_intermediate_top_k) live on ``parent_config`` instead.
+        # Resolve from whichever object has them.
         text_cfg = getattr(config, "text_config", None) or config
         base = Gemma4Config.from_transformers(text_cfg, parent_config=parent_config)
+
+        def _resolve(name, default):
+            for src in (config, parent_config):
+                if src is not None and hasattr(src, name):
+                    val = getattr(src, name)
+                    if val is not None:
+                        return val
+            return default
+
         return cls(
             **_shallow_fields(base),
-            backbone_hidden_size=getattr(config, "backbone_hidden_size", 1536),
-            use_ordered_embeddings=bool(getattr(config, "use_ordered_embeddings", False)),
-            num_centroids=int(getattr(config, "num_centroids", 2048)),
+            backbone_hidden_size=int(_resolve("backbone_hidden_size", 1536)),
+            use_ordered_embeddings=bool(_resolve("use_ordered_embeddings", False)),
+            num_centroids=int(_resolve("num_centroids", 2048)),
             centroid_intermediate_top_k=int(
-                getattr(config, "centroid_intermediate_top_k", 32)
+                _resolve("centroid_intermediate_top_k", 32)
             ),
         )
 
