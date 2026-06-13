@@ -221,3 +221,146 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(op, hidden_states)
         hidden_states = self.mlp(op, hidden_states)
         return op.Add(residual, hidden_states)
+
+
+class Gemma4AssistantMaskedEmbedder(nn.Module):
+    """Centroid-routed sparse LM head used when ``use_ordered_embeddings=True``.
+
+    Mirrors upstream ``Gemma4AssistantMaskedEmbedder.forward``:
+
+        centroid_logits  = centroids(hidden)                          # [B, L, C]
+        top_k_indices    = TopK(centroid_logits, k=top_k)             # [B, L, top_k]
+        canonical_per_c  = token_ordering.view(C, K)                  # [C, K]
+        selected_canon   = canonical_per_c[top_k_indices]             # [B, L, top_k, K]
+        selected_emb     = lm_head_weight[selected_canon.flatten()]   # gather rows
+        selected_logits  = hidden @ selected_emb.T                    # [B, L, top_k*K]
+        mask_value       = selected_logits.min() - 1
+        output           = full([B, L, vocab], mask_value)
+        scatter_idx      = selected_canon.view(B, L, top_k*K)
+        output.scatter_(dim=-1, index=scatter_idx, src=selected_logits)
+
+    Where ``C = num_centroids`` and ``K = vocab_size // num_centroids`` is the
+    number of vocab tokens routed by each centroid.  For E2B-it-assistant
+    these are ``C=2048``, ``top_k=32``, ``K=128`` (so ``top_k*K = 4096`` ≪
+    vocab=262144 — only 1.6% of vocab positions ever get a non-mask logit).
+
+    Weight layout (matches HF):
+        centroids.weight       [num_centroids, hidden_size]  float
+        token_ordering         [vocab_size]                  int64
+
+    The ``lm_head.weight`` (separately owned by
+    :class:`Gemma4AssistantCausalLMModel`) is passed in as ``lm_head_weight``;
+    we do not duplicate it inside this module.
+    """
+
+    def __init__(self, config: Gemma4AssistantConfig):
+        super().__init__()
+        if config.vocab_size % config.num_centroids != 0:
+            raise ValueError(
+                f"vocab_size ({config.vocab_size}) must be divisible by "
+                f"num_centroids ({config.num_centroids})"
+            )
+        self.num_centroids = config.num_centroids
+        self.centroid_intermediate_top_k = config.centroid_intermediate_top_k
+        self.vocab_size = config.vocab_size
+        self.vocab_size_per_centroid = config.vocab_size // config.num_centroids
+        self.hidden_size = config.hidden_size
+
+        self.centroids = Linear(
+            config.hidden_size, config.num_centroids, bias=False
+        )
+        # token_ordering is a learnable INT64 buffer in upstream (registered
+        # via register_buffer); in mobius we declare it as an INT64 Parameter
+        # so the weight loader populates it from the HF state_dict key
+        # ``masked_embedding.token_ordering``.
+        self.token_ordering = nn.Parameter(
+            [config.vocab_size],
+            dtype=ir.DataType.INT64,
+            name="token_ordering",
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        lm_head_weight: ir.Value,
+    ) -> ir.Value:
+        # ``top_k * vocab_size_per_centroid`` is the number of vocab positions
+        # we score per token; everything else gets ``mask_value`` (effectively
+        # -inf for argmax / softmax).
+        top_k = self.centroid_intermediate_top_k
+        K = self.vocab_size_per_centroid
+        top_kK = top_k * K
+
+        # centroid_logits: [B, L, num_centroids]
+        centroid_logits = self.centroids(op, hidden_states)
+
+        # TopK over the last dim → top_k centroid indices per (B, L).
+        # _values is discarded; we only need indices.
+        _vals, top_k_indices = op.TopK(
+            centroid_logits,
+            op.Constant(value_ints=[top_k]),
+            axis=-1,
+            largest=1,
+            sorted=0,
+            _outputs=2,
+        )
+        # top_k_indices: [B, L, top_k] INT64
+
+        # Reshape the INT64 token_ordering buffer [vocab] → [num_centroids, K].
+        canonical_per_cluster = op.Reshape(
+            self.token_ordering,
+            op.Constant(value_ints=[self.num_centroids, K]),
+        )  # [C, K] INT64
+
+        # Gather canonical vocab positions for each selected centroid.
+        # canonical_per_cluster: [C, K], top_k_indices: [B, L, top_k]
+        # axis=0 → [B, L, top_k, K] INT64
+        selected_canonical = op.Gather(
+            canonical_per_cluster, top_k_indices, axis=0
+        )
+
+        # Gather LM-head rows at those canonical positions.
+        # lm_head_weight: [vocab, hidden], selected_canonical: [B, L, top_k, K]
+        # axis=0 → [B, L, top_k, K, hidden] (model dtype)
+        selected_embeddings = op.Gather(lm_head_weight, selected_canonical, axis=0)
+
+        # Flatten the (top_k, K) axes to one (top_k*K) axis so we can do a
+        # single batched matmul.  Shape: [B, L, top_k*K, hidden].
+        selected_emb_flat = op.Reshape(
+            selected_embeddings,
+            op.Constant(value_ints=[0, 0, top_kK, self.hidden_size]),
+        )
+
+        # Compute the selected logits.  Upstream does:
+        #   hidden.unsqueeze(-2) @ selected_embeddings.transpose(-1, -2)
+        # i.e. [B, L, 1, hidden] @ [B, L, hidden, top_k*K] → [B, L, 1, top_k*K]
+        # → squeeze(-2) → [B, L, top_k*K].
+        h_4d = op.Unsqueeze(hidden_states, op.Constant(value_ints=[-2]))
+        emb_t = op.Transpose(selected_emb_flat, perm=[0, 1, 3, 2])
+        sel_logits_4d = op.MatMul(h_4d, emb_t)
+        selected_logits = op.Squeeze(sel_logits_4d, op.Constant(value_ints=[-2]))
+        # selected_logits: [B, L, top_k*K] (model dtype)
+
+        # mask_value = min(selected_logits) - 1  (scalar, in model dtype)
+        min_logit = op.ReduceMin(selected_logits, keepdims=0)
+        one_like = op.CastLike(op.Constant(value_float=1.0), selected_logits)
+        mask_value = op.Sub(min_logit, one_like)
+
+        # Build output buffer [B, L, vocab] filled with mask_value.
+        # Take dims [B, L] from hidden_states and append vocab.
+        bl_shape = op.Shape(hidden_states, start=0, end=2)
+        vocab_dim = op.Constant(value_ints=[self.vocab_size])
+        out_shape = op.Concat(bl_shape, vocab_dim, axis=0)
+        # Reshape scalar mask_value → [1, 1, 1] so Expand can broadcast it
+        # across the full vocab dim.
+        mask_3d = op.Reshape(mask_value, op.Constant(value_ints=[1, 1, 1]))
+        output = op.Expand(mask_3d, out_shape)
+
+        # Scatter selected_logits into output at the per-position canonical
+        # vocab indices.  axis=-1 (the vocab dim).
+        scatter_idx = op.Reshape(
+            selected_canonical,
+            op.Constant(value_ints=[0, 0, top_kK]),
+        )  # [B, L, top_k*K] INT64
+        return op.ScatterElements(output, scatter_idx, selected_logits, axis=-1)

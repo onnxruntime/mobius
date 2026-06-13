@@ -286,9 +286,17 @@ class TestGemma4AssistantBuildGraph:
         assert sliding_k.shape[-1] == cfg.head_dim
 
     def test_logits_last_dim_is_vocab(self):
+        import onnx_ir as ir
         cfg, model = self._build()
         logits = next(v for v in model.graph.outputs if v.name == "logits")
-        assert logits.shape[-1] == cfg.vocab_size
+        last = logits.shape[-1]
+        # With the centroid-routed sparse head (use_ordered_embeddings=True
+        # in the test fixture), the scatter-built output may carry a
+        # symbolic last dim through shape inference even though at runtime
+        # the values have shape vocab_size.  Accept either form.
+        assert (
+            last == cfg.vocab_size or isinstance(last, ir.SymbolicDim)
+        ), f"expected vocab_size ({cfg.vocab_size}) or a symbolic dim, got {last!r}"
 
     def test_projected_state_last_dim_is_backbone(self):
         cfg, model = self._build()
@@ -332,7 +340,14 @@ class TestGemma4AssistantPreprocessWeights:
     def test_drops_unsupported_masked_embedding_keys(self):
         import torch
 
-        m = self._model()
+        # Use a config with ordered_embeddings disabled so the model
+        # has no masked_embedding module — the preprocess should drop
+        # the keys.
+        cfg = Gemma4AssistantConfig.from_transformers(
+            _e2b_like_hf_config(), parent_config=_e2b_like_hf_config()
+        )
+        cfg = dataclasses.replace(cfg, use_ordered_embeddings=False)
+        m = Gemma4AssistantCausalLMModel(cfg)
         sd = {
             "lm_head.weight": torch.zeros(262144, 256),
             "masked_embedding.centroids.weight": torch.zeros(2048, 256),
@@ -348,3 +363,65 @@ class TestGemma4AssistantPreprocessWeights:
         # Should not raise even when both keys are absent.
         sd = m.preprocess_weights(sd)
         assert sd == {}
+
+    def test_keeps_masked_embedding_keys_when_ordered_embeddings_on(self):
+        import torch
+
+        # E2B test fixture has use_ordered_embeddings=True.
+        m = self._model()
+        assert m.config.use_ordered_embeddings is True
+        sd = {
+            "lm_head.weight": torch.zeros(262144, 256),
+            "masked_embedding.centroids.weight": torch.zeros(2048, 256),
+            "masked_embedding.token_ordering": torch.zeros(262144, dtype=torch.long),
+        }
+        sd = m.preprocess_weights(sd)
+        # Must be kept — the mobius masked_embedding module needs them.
+        assert "masked_embedding.centroids.weight" in sd
+        assert "masked_embedding.token_ordering" in sd
+
+
+class TestGemma4AssistantOrderedEmbeddings:
+    """When use_ordered_embeddings=True, the assistant must build the
+    centroid-routed sparse LM head and route logits through it."""
+
+    def _model(self, **cfg_over):
+        cfg = Gemma4AssistantConfig.from_transformers(
+            _e2b_like_hf_config(), parent_config=_e2b_like_hf_config()
+        )
+        if cfg_over:
+            cfg = dataclasses.replace(cfg, **cfg_over)
+        return cfg, Gemma4AssistantCausalLMModel(cfg)
+
+    def test_masked_embedding_module_present(self):
+        _cfg, m = self._model()
+        assert m.masked_embedding is not None
+        # Centroids: Linear[hidden -> num_centroids]
+        out_f, in_f = m.masked_embedding.centroids.weight.shape
+        assert in_f == 256
+        assert out_f == 2048
+        # token_ordering: [vocab_size] INT64
+        ord_shape = m.masked_embedding.token_ordering.shape
+        assert list(ord_shape) == [262144]
+
+    def test_masked_embedding_absent_when_disabled(self):
+        _cfg, m = self._model(use_ordered_embeddings=False)
+        assert m.masked_embedding is None
+
+    def test_build_with_ordered_embeddings_produces_logits(self):
+        from mobius._builder import build_from_module
+        cfg, module = self._model()
+        pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
+        names = [v.name for v in pkg["model"].graph.outputs]
+        # Same outputs regardless of head choice (the sparse head produces
+        # a dense [B, q_len, vocab] tensor with mask_value at unselected positions).
+        assert "logits" in names
+        assert "projected_state" in names
+
+    def test_build_with_ordered_embeddings_has_centroid_weights(self):
+        from mobius._builder import build_from_module
+        cfg, module = self._model()
+        pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
+        init_names = list(pkg["model"].graph.initializers.keys())
+        assert any("centroids" in n for n in init_names)
+        assert any("token_ordering" in n for n in init_names)

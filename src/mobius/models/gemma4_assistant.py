@@ -34,12 +34,7 @@ Where:
   plain full attention and stays correct for any ``q_len`` that does
   not require causality among Q positions.
 
-Limitations of this initial implementation:
-- ``use_ordered_embeddings=True`` (centroid-routed sparse LM head used by
-  E2B-it-assistant) is not supported; we fall back to the standard
-  ``lm_head`` dense projection.  Adding the sparse head requires a
-  TopK + Gather + Scatter sequence and a parametric ``token_ordering``
-  buffer; left as a follow-up.
+Limitations of this implementation:
 - ``q_len > 1`` cases that need causal masking among Q positions would
   require adding back the bidirectional masks.  Not exercised by the
   standard HF assisted-generation loop.
@@ -57,7 +52,10 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import Gemma4AssistantConfig, Gemma4Config
 from mobius.components import Linear, RMSNorm, initialize_rope
-from mobius.components._gemma4_assistant import Gemma4AssistantDecoderLayer
+from mobius.components._gemma4_assistant import (
+    Gemma4AssistantDecoderLayer,
+    Gemma4AssistantMaskedEmbedder,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -106,6 +104,11 @@ class Gemma4AssistantCausalLMModel(nn.Module):
         self.post_projection = Linear(
             config.hidden_size, config.backbone_hidden_size, bias=False
         )
+        # Optional centroid-routed sparse LM head (used by the released
+        # E2B-it-assistant checkpoint, which has use_ordered_embeddings=True).
+        self.masked_embedding: Gemma4AssistantMaskedEmbedder | None = (
+            Gemma4AssistantMaskedEmbedder(config) if config.use_ordered_embeddings else None
+        )
 
     def preprocess_weights(self, state_dict):
         """Bridge HF state-dict naming to our module layout.
@@ -123,24 +126,26 @@ class Gemma4AssistantCausalLMModel(nn.Module):
         original ``model.embed_tokens.weight`` key is removed because no
         mobius module consumes it.
 
-        For ``use_ordered_embeddings=True`` checkpoints (e.g. E2B-it-assistant)
-        the state dict also contains ``masked_embedding.centroids.weight``
-        and ``masked_embedding.token_ordering``.  These are dropped here
-        because we do not implement the sparse centroid LM head yet — the
-        weight loader would otherwise warn about unused keys.
+        When ``use_ordered_embeddings=False`` the ``masked_embedding.*``
+        keys (if present in the state dict) are dropped because no mobius
+        module would consume them.
         """
         if (
             "lm_head.weight" not in state_dict
             and "model.embed_tokens.weight" in state_dict
         ):
             state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
-        # Drop keys our mobius layout does not consume.
-        for unused in (
-            "model.embed_tokens.weight",
-            "masked_embedding.centroids.weight",
-            "masked_embedding.token_ordering",
-        ):
-            state_dict.pop(unused, None)
+        # The HF Gemma4TextModel's embed_tokens table is never consumed by
+        # the mobius assistant — drop it after the alias.
+        state_dict.pop("model.embed_tokens.weight", None)
+        # When ordered-embeddings isn't built, also drop the unused
+        # masked_embedding.* keys so the loader doesn't warn about them.
+        if not self.config.use_ordered_embeddings:
+            for unused in (
+                "masked_embedding.centroids.weight",
+                "masked_embedding.token_ordering",
+            ):
+                state_dict.pop(unused, None)
         return state_dict
 
     def forward(
@@ -177,14 +182,13 @@ class Gemma4AssistantCausalLMModel(nn.Module):
         )
 
         # Heads.
-        if self.config.use_ordered_embeddings:
-            # Ordered-embedding (centroid-routed sparse) head not implemented;
-            # see module docstring.  Fall back to standard dense lm_head so
-            # the graph builds — caller is responsible for choosing a
-            # checkpoint without ordered embeddings for now, or
-            # post-processing the lm_head weight to undo the centroid order.
-            pass
-        logits = self.lm_head(op, hidden_states)
+        if self.masked_embedding is not None:
+            # Centroid-routed sparse LM head: routes top_k centroids per
+            # position, gathers their lm_head rows, computes dot products
+            # with hidden_states, scatters into a vocab-sized buffer.
+            logits = self.masked_embedding(op, hidden_states, self.lm_head.weight)
+        else:
+            logits = self.lm_head(op, hidden_states)
         projected_state = self.post_projection(op, hidden_states)
         return logits, projected_state
 
