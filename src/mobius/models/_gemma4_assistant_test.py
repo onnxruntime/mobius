@@ -186,10 +186,19 @@ class TestGemma4AssistantModelWeights:
         assert m.post_projection.bias is None
         assert m.lm_head.bias is None
 
-    def test_forward_raises_not_implemented(self):
+    def test_model_submodule_layout(self):
         m = Gemma4AssistantCausalLMModel(self._cfg())
-        with pytest.raises(NotImplementedError):
-            m.forward(None)
+        assert hasattr(m, "model")
+        assert hasattr(m.model, "layers")
+        assert hasattr(m.model, "norm")
+        assert hasattr(m.model, "rotary_emb_local")
+        assert hasattr(m.model, "rotary_emb_global")
+        assert len(m.model.layers) == self._cfg().num_hidden_layers
+
+    def test_layer_types_match_config(self):
+        cfg = self._cfg()
+        m = Gemma4AssistantCausalLMModel(cfg)
+        assert [layer.layer_type for layer in m.model.layers] == cfg.layer_types
 
 
 class TestGemma4AssistantRegistry:
@@ -214,3 +223,74 @@ class TestGemma4AssistantRegistry:
     def test_task_name_resolves_to_instance(self):
         task = get_task("gemma4-assistant")
         assert isinstance(task, Gemma4AssistantTask)
+
+
+class TestGemma4AssistantBuildGraph:
+    """End-to-end graph build: drive Gemma4AssistantTask + the real model."""
+
+    def _cfg(self):
+        return Gemma4AssistantConfig.from_transformers(
+            _e2b_like_hf_config(), parent_config=_e2b_like_hf_config()
+        )
+
+    def _build(self):
+        cfg = self._cfg()
+        module = Gemma4AssistantCausalLMModel(cfg)
+        from mobius._builder import build_from_module
+        pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
+        return cfg, pkg["model"]
+
+    def test_build_returns_valid_model(self):
+        import onnx_ir as ir
+        _cfg, model = self._build()
+        assert isinstance(model, ir.Model)
+        assert model.graph.num_nodes() > 0
+
+    def test_graph_inputs(self):
+        cfg, model = self._build()
+        names = [v.name for v in model.graph.inputs]
+        assert "inputs_embeds" in names
+        assert "position_ids" in names
+        # E2B has both sliding and full layers — both shared_kv pairs present.
+        assert "shared_kv.sliding_attention.key" in names
+        assert "shared_kv.sliding_attention.value" in names
+        assert "shared_kv.full_attention.key" in names
+        assert "shared_kv.full_attention.value" in names
+        # No own KV cache.
+        assert not any(n.startswith("past_key_values.") for n in names)
+
+    def test_graph_outputs(self):
+        cfg, model = self._build()
+        names = [v.name for v in model.graph.outputs]
+        assert "logits" in names
+        assert "projected_state" in names
+        # No own KV cache.
+        assert not any(n.startswith("present.") for n in names)
+
+    def test_inputs_embeds_shape(self):
+        cfg, model = self._build()
+        ie = next(v for v in model.graph.inputs if v.name == "inputs_embeds")
+        # Last dim = 2 * backbone_hidden_size.
+        assert ie.shape[-1] == 2 * cfg.backbone_hidden_size
+
+    def test_shared_kv_full_shape_uses_global_head_dim(self):
+        cfg, model = self._build()
+        full_k = next(v for v in model.graph.inputs if v.name == "shared_kv.full_attention.key")
+        assert full_k.shape[-1] == (cfg.global_head_dim or cfg.head_dim)
+
+    def test_shared_kv_sliding_shape_uses_local_head_dim(self):
+        cfg, model = self._build()
+        sliding_k = next(
+            v for v in model.graph.inputs if v.name == "shared_kv.sliding_attention.key"
+        )
+        assert sliding_k.shape[-1] == cfg.head_dim
+
+    def test_logits_last_dim_is_vocab(self):
+        cfg, model = self._build()
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert logits.shape[-1] == cfg.vocab_size
+
+    def test_projected_state_last_dim_is_backbone(self):
+        cfg, model = self._build()
+        ps = next(v for v in model.graph.outputs if v.name == "projected_state")
+        assert ps.shape[-1] == cfg.backbone_hidden_size
