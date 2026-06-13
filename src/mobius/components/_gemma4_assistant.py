@@ -168,10 +168,31 @@ class Gemma4AssistantAttention(nn.Module):
 class Gemma4AssistantDecoderLayer(nn.Module):
     """One Gemma4-Assistant transformer block.
 
-    Pre-norm pattern matching upstream
-    ``Gemma4TextDecoderLayer`` for the parts the assistant uses
-    (no per-layer input gating, no double-wide MLP, no MoE — those are
-    rejected by :meth:`Gemma4AssistantConfig.validate`).
+    Mirrors upstream ``Gemma4TextDecoderLayer.forward`` (lines 1398-1455
+    of transformers/models/gemma4/modeling_gemma4.py): the Gemma4 layer
+    is **4-norm + layer_scalar**, not the standard 2-norm pre-norm
+    pattern.  Algorithmically::
+
+        # Attention block
+        h_in  = x
+        h     = input_layernorm(x)
+        h     = self_attn(h)
+        h     = post_attention_layernorm(h)     # NORM BEFORE RESIDUAL
+        h     = h_in + h
+
+        # MLP block
+        h_in  = h
+        h     = pre_feedforward_layernorm(h)
+        h     = mlp(h)
+        h     = post_feedforward_layernorm(h)   # NORM BEFORE RESIDUAL
+        h     = h_in + h
+
+        # Per-layer scalar multiplier (saved as a tied buffer in HF state dict).
+        return h * layer_scalar
+
+    The assistant has no per-layer input gating and no MoE (validated by
+    :meth:`Gemma4AssistantConfig.validate`), so we skip those branches
+    that the standard Gemma4 layer carries.
     """
 
     def __init__(
@@ -185,8 +206,6 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         self.self_attn = Gemma4AssistantAttention(
             config, layer_type=layer_type, rotary_embedding_dim=rotary_embedding_dim
         )
-        # SwiGLU MLP with standard intermediate_size (no double-wide; assistant
-        # config validates that use_double_wide_mlp is False).
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -197,6 +216,18 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        # ``layer_scalar`` is a tied (persistent) buffer in HF
+        # (``register_buffer("layer_scalar", torch.ones(1))``).  In mobius
+        # we declare it as a Parameter so the weight loader populates it
+        # from the HF state dict; at runtime it's applied as the last op
+        # in this layer.
+        self.layer_scalar = nn.Parameter([1])
 
     def forward(
         self,
@@ -206,6 +237,7 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         shared_value: ir.Value,
         position_embeddings: tuple,
     ) -> ir.Value:
+        # --- Attention block: pre-norm -> attn -> post-norm -> residual ---
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_output = self.self_attn(
@@ -215,12 +247,19 @@ class Gemma4AssistantDecoderLayer(nn.Module):
             shared_value=shared_value,
             position_embeddings=position_embeddings,
         )
-        hidden_states = op.Add(residual, attn_output)
+        hidden_states = self.post_attention_layernorm(op, attn_output)
+        hidden_states = op.Add(residual, hidden_states)
 
+        # --- MLP block: pre-norm -> mlp -> post-norm -> residual ---
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(op, hidden_states)
+        hidden_states = self.pre_feedforward_layernorm(op, hidden_states)
         hidden_states = self.mlp(op, hidden_states)
-        return op.Add(residual, hidden_states)
+        hidden_states = self.post_feedforward_layernorm(op, hidden_states)
+        hidden_states = op.Add(residual, hidden_states)
+
+        # --- Final per-layer scalar multiplier ---
+        hidden_states = op.Mul(hidden_states, self.layer_scalar)
+        return hidden_states
 
 
 class Gemma4AssistantMaskedEmbedder(nn.Module):
