@@ -238,6 +238,20 @@ class TestGemma4AssistantRegistry:
     def test_registry_config_class_is_assistant_config(self):
         assert registry.get_config_class("gemma4_assistant") is Gemma4AssistantConfig
 
+    def test_unified_model_type_routes_to_assistant(self):
+        # gemma4_unified_assistant is structurally identical; register both.
+        assert "gemma4_unified_assistant" in registry
+        cls = registry.get("gemma4_unified_assistant")
+        assert cls is Gemma4AssistantCausalLMModel
+
+    def test_unified_architecture_routes_to_assistant(self):
+        assert "Gemma4UnifiedAssistantForCausalLM" in registry
+        cls = registry.get("Gemma4UnifiedAssistantForCausalLM")
+        assert cls is Gemma4AssistantCausalLMModel
+
+    def test_unified_task_is_gemma4_assistant(self):
+        assert registry.get_task("gemma4_unified_assistant") == "gemma4-assistant"
+
     def test_task_name_resolves_to_instance(self):
         task = get_task("gemma4-assistant")
         assert isinstance(task, Gemma4AssistantTask)

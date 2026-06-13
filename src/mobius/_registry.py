@@ -405,7 +405,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     # Gemma4-Assistant ships ``model_type="gemma4_assistant"`` plus
     # ``architectures=["Gemma4AssistantForCausalLM"]``.  Both keys point
-    # at the assistant drafter so build() can dispatch via either.
+    # at the assistant drafter so build() can dispatch via either.  The
+    # ``gemma4_unified_assistant`` family is structurally identical (same
+    # 4-layer Gemma4 decoder, KV-shared with target, optional ordered-
+    # embeddings head) but ships under a different ``model_type``;
+    # register all four keys at the same class.
     "gemma4_assistant": ModelRegistration(
         Gemma4AssistantCausalLMModel,
         task="gemma4-assistant",
@@ -417,6 +421,20 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="gemma4-assistant",
         config_class=Gemma4AssistantConfig,
         family="gemma4_assistant",
+    ),
+    "gemma4_unified_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
+    "Gemma4UnifiedAssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
     ),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),

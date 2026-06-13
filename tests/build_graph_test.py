@@ -4664,6 +4664,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # src/mobius/models/_gemma4_assistant_test.py.
     "gemma4_assistant",
     "Gemma4AssistantForCausalLM",
+    "gemma4_unified_assistant",
+    "Gemma4UnifiedAssistantForCausalLM",
 }
 
 # Registered model types that truly have no test coverage yet.
