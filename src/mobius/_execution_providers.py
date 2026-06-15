@@ -247,7 +247,7 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             default_int4_accuracy_level=4,
-            provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
             cap_kv_buffer_max_length=True,
         ),
