@@ -55,11 +55,21 @@ def make_provider_options(
     caps = ep_registry.get(ep)
     options = dict(caps.provider_options) if caps else {}
 
-    if ep == "cuda" and enable_cuda_graph:
-        options["enable_cuda_graph"] = "1"
-    elif ep == "webgpu" and enable_webgpu_graph:
-        options["enableGraphCapture"] = "1"
-        options["validationMode"] = "disabled"
+    # Graph capture is enabled when the EP's registered capability flag is set
+    # (the registry is the source of truth) or when the caller explicitly
+    # requests it. Translate that intent into the EP-specific provider option.
+    graph_capture = bool(caps and caps.enable_graph_capture)
+    if ep == "cuda":
+        graph_capture = graph_capture or enable_cuda_graph
+    elif ep == "webgpu":
+        graph_capture = graph_capture or enable_webgpu_graph
+
+    if ep == "webgpu":
+        options["enableGraphCapture"] = "1" if graph_capture else "0"
+        options["validationMode"] = "disabled" if graph_capture else "basic"
+    elif ep in ("cuda", "trt-rtx"):
+        # CUDA and TRT-RTX (NvTensorRtRtx) use the CUDA-graph option key.
+        options["enable_cuda_graph"] = "1" if graph_capture else "0"
 
     return [{ep_name: options}]
 

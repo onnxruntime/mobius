@@ -33,9 +33,11 @@ class TestMakeProviderOptions:
         assert "dml" in result[0]
 
     def test_webgpu_default(self):
+        # WebGPU registers enable_graph_capture=True, so graph capture is on by
+        # default and propagates to the genai_config provider options.
         result = make_provider_options("webgpu")
-        assert result[0]["webgpu"]["enableGraphCapture"] == "0"
-        assert result[0]["webgpu"]["validationMode"] == "basic"
+        assert result[0]["webgpu"]["enableGraphCapture"] == "1"
+        assert result[0]["webgpu"]["validationMode"] == "disabled"
 
     def test_webgpu_with_graph(self):
         result = make_provider_options("webgpu", enable_webgpu_graph=True)
