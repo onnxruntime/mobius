@@ -243,9 +243,9 @@ class Qwen3VLVisionAttention(nn.Module):
         # PackedMHA supports float32 and float16 only; cast bfloat16 builds to
         # float16 and leave float32/float16 native to preserve precision.
         if get_build_dtype() == ir.DataType.BFLOAT16:
-            query_mha = op.Cast(query, to=10)  # FLOAT16
-            key_mha = op.Cast(key, to=10)
-            value_mha = op.Cast(value, to=10)
+            query_mha = op.Cast(query, to=ir.DataType.FLOAT16)
+            key_mha = op.Cast(key, to=ir.DataType.FLOAT16)
+            value_mha = op.Cast(value, to=ir.DataType.FLOAT16)
         else:
             query_mha, key_mha, value_mha = query, key, value
 
