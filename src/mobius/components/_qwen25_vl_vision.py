@@ -26,8 +26,8 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities
-from mobius.components._common import LayerNorm, Linear
+from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
 from mobius.components._mlp import FCMLP, GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._scan_utils import (
@@ -189,10 +189,13 @@ class Qwen25VLVisionAttention(nn.Module):
         """Emit com.microsoft.PackedMultiHeadAttention.
 
         Uses cu_seqlens natively, avoiding the O(N^2) block-diagonal bias.
+        The block-diagonal masking is expressed through the packed varlen
+        contract: each sub-sequence delimited by ``cu_seqlens`` (a window or
+        a frame) is one batch element, and attention is computed within it.
 
         Args:
             q, k, v: (N, num_heads, head_dim) after rotary embedding
-            cu_seqlens: (num_sub_seqs + 1,) INT32
+            cu_seqlens: (num_sub_seqs + 1,) cumulative sequence lengths
             seq_len_val: (1,) shape tensor with N
         """
         hidden_size = self.num_heads * self.head_dim
@@ -201,25 +204,25 @@ class Qwen25VLVisionAttention(nn.Module):
         key = op.Reshape(k, op.Concat(seq_len_val, [hidden_size], axis=0))
         value = op.Reshape(v, op.Concat(seq_len_val, [hidden_size], axis=0))
 
-        # token_offset: identity mapping for packed (no-padding) input.
-        # Shape: (1, token_count) — single batch, positions [0..N-1].
-        token_count_scalar = op.Squeeze(seq_len_val, [0])
-        token_offset = op.Unsqueeze(
-            op.Range(
-                op.Constant(value_int=0),
-                token_count_scalar,
-                op.Constant(value_int=1),
-            ),
-            [0],
-        )
-        token_offset = op.Cast(token_offset, to=6)  # INT32
+        # token_offset: (num_sub_seqs, max_seq_len) mapping the packed tokens to
+        # their padded (batch, seq) layout. ORT derives batch_size from
+        # token_offset.shape[0] and requires cumulative_sequence_length to have
+        # length batch_size + 1, so this MUST encode every sub-sequence (window
+        # or frame), not a single (1, N) batch — otherwise the kernel rejects
+        # windowed cu_seqlens and computes full instead of block-diagonal
+        # attention.
+        token_offset = build_packed_token_offset(op, cu_seqlens)
 
         cu_seqlens_int32 = op.Cast(cu_seqlens, to=6)  # INT32
 
-        # PackedMHA doesn't support bfloat16; cast to float16 if needed
-        query_mha = op.Cast(query, to=10)  # FLOAT16
-        key_mha = op.Cast(key, to=10)
-        value_mha = op.Cast(value, to=10)
+        # PackedMHA supports float32 and float16 only; cast bfloat16 builds to
+        # float16 and leave float32/float16 native to preserve precision.
+        if get_build_dtype() == ir.DataType.BFLOAT16:
+            query_mha = op.Cast(query, to=10)  # FLOAT16
+            key_mha = op.Cast(key, to=10)
+            value_mha = op.Cast(value, to=10)
+        else:
+            query_mha, key_mha, value_mha = query, key, value
 
         # Emit PackedMultiHeadAttention
         attn_out = op.PackedMultiHeadAttention(
