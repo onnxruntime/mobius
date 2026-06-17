@@ -55,6 +55,8 @@ def build_from_nemo(
         FileNotFoundError: If the ``.nemo`` file does not exist.
         KeyError: If the NeMo ``target`` is not supported / registered.
     """
+    import dataclasses
+
     from mobius._builder import build_from_module, resolve_dtype
     from mobius._config_resolver import _default_task_for_model
     from mobius._registry import registry
@@ -70,12 +72,11 @@ def build_from_nemo(
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None and resolved != config.dtype:
-            # The FastConformer-RNNT graph emits float32 constants (positional
-            # encodings, attention scale, masks). Mixing them with non-fp32
-            # weights produces ONNX type mismatches, so only fp32 is supported.
-            raise NotImplementedError(
-                f"FastConformer-RNNT only supports float32 export; got dtype={dtype!r}."
-            )
+            # f16/bf16: float32-only ops (positional-encoding Sin/Cos) stay in
+            # f32 and are cast to the compute dtype inside the model; all other
+            # tensors follow config.dtype.
+            config = dataclasses.replace(config, dtype=resolved)
+            config._nemo_model_type = model_type
 
     module_class = registry.get(model_type)
     if task is None:

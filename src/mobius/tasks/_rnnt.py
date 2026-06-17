@@ -4,7 +4,8 @@
 """RNN-T (transducer) task — builds three ONNX graphs for FastConformer-RNNT.
 
 Produces three models:
-  - ``"encoder"``: mel features ``(B, feat_in, T)`` → encoded ``(B, d_model, T')``
+  - ``"encoder"``: mel features ``(B, feat_in, T)`` + ``length`` ``(B,)`` →
+                   encoded ``(B, d_model, T')`` + ``encoder_length`` ``(B,)``
   - ``"decoder"``: token ids ``(B, U)`` + LSTM state → prediction ``(B, d_pred, U)``
                    + next LSTM state
   - ``"joint"``:   encoder + prediction → logits ``(B, T', U, vocab+1)``
@@ -17,9 +18,9 @@ Contract / current limitations:
     sequence and uses causal convolutions with zero left-padding; it does not
     expose NeMo's cache-aware streaming state, so chunk-by-chunk streaming is
     not supported by this export.
-  - **batch=1 / equal-length.** There is no ``audio_signal_length`` input or
-    encoded-length output, so padded frames in a ragged batch would be decoded
-    as real audio. Callers must run per-utterance (or trim externally).
+  - **Ragged batches are supported** via the ``length`` input: padded frames
+    are masked out of attention and zeroed in the output, and ``encoder_length``
+    reports the subsampled valid length per sample.
 """
 
 from __future__ import annotations
@@ -66,8 +67,14 @@ class RNNTTask(ModelTask):
             dtype=config.dtype,
             shape=[batch, config.fastconformer_feat_in, time],
         )
-        encoder_output = encoder(builder.op, audio_signal=audio_signal)
+        # Per-sample valid feature-frame counts; drives padding-aware attention
+        # masking and the returned subsampled lengths.
+        length = builder.input("length", dtype=ir.DataType.INT64, shape=[batch])
+        encoder_output, encoder_length = encoder(
+            builder.op, audio_signal=audio_signal, length=length
+        )
         builder.add_output(encoder_output, "encoder_output")
+        builder.add_output(encoder_length, "encoder_length")
         return _make_model(graph)
 
     def _build_decoder(self, prediction, config: ArchitectureConfig) -> ir.Model:

@@ -51,6 +51,36 @@ def _run(path: str, feeds: dict):
     return sess.run(None, feeds)
 
 
+def _full_length(feats: np.ndarray) -> np.ndarray:
+    """Per-sample length covering all feature frames (no padding)."""
+    return np.full((feats.shape[0],), feats.shape[2], dtype=np.int64)
+
+
+@pytest.mark.integration_slow
+@pytest.mark.skipif(
+    "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="half-precision FastConformer kernels require CUDA",
+)
+def test_fastconformer_rnnt_fp16_encoder_parity():
+    """The f16 encoder (built via dtype='f16') matches the f32 golden on CUDA."""
+    from mobius.integrations.nemo import build_from_nemo
+
+    golden = np.load(_GOLDEN)
+    pkg = build_from_nemo(_MODEL_ID, revision=_REVISION, dtype="f16")
+
+    with tempfile.TemporaryDirectory() as td:
+        pkg.save(td)
+        sess = ort.InferenceSession(
+            _find_onnx(td, "encoder"), providers=["CUDAExecutionProvider"]
+        )
+        feats16 = golden["feats"].astype(np.float16)
+        (enc, _enc_len) = sess.run(
+            None, {"audio_signal": feats16, "length": _full_length(feats16)}
+        )
+        # f16 accumulates more rounding error than f32; allow a looser tolerance.
+        np.testing.assert_allclose(enc.astype(np.float32), golden["enc_out"], atol=5e-2)
+
+
 @pytest.mark.integration_slow
 def test_fastconformer_rnnt_parity():
     from mobius.integrations.nemo import build_from_nemo
@@ -63,9 +93,10 @@ def test_fastconformer_rnnt_parity():
         pkg.save(td)
 
         # Encoder: mel features -> encoded frames
+        feats = golden["feats"].astype(np.float32)
         enc = _run(
             _find_onnx(td, "encoder"),
-            {"audio_signal": golden["feats"].astype(np.float32)},
+            {"audio_signal": feats, "length": _full_length(feats)},
         )[0]
         np.testing.assert_allclose(enc, golden["enc_out"], atol=1e-4)
 
@@ -111,7 +142,8 @@ def test_fastconformer_rnnt_greedy_decode():
             _find_onnx(td, "joint"), providers=["CPUExecutionProvider"]
         )
 
-        enc = enc_sess.run(None, {"audio_signal": golden["feats"].astype(np.float32)})[0]
+        feats = golden["feats"].astype(np.float32)
+        enc = enc_sess.run(None, {"audio_signal": feats, "length": _full_length(feats)})[0]
         n_frames = enc.shape[2]
 
         # Prime the prediction net with the zero start-of-sequence embedding.

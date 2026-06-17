@@ -54,6 +54,16 @@ def _dim(op: OpBuilder, x: ir.Value, axis: int) -> ir.Value:
     return op.Shape(x, start=axis, end=axis + 1)
 
 
+def _scalar_like(op: OpBuilder, value: float, ref: ir.Value) -> ir.Value:
+    """Emit a scalar constant cast to the dtype of *ref*.
+
+    Float scalar Constants are kept at float32 by the builder, so they must be
+    cast to the model's compute dtype (f16/bf16) before combining with
+    dtype-cast tensors; otherwise ONNX rejects the mismatched element types.
+    """
+    return op.CastLike(op.Constant(value=ir.tensor(np.float32(value))), ref)
+
+
 # ---------------------------------------------------------------------------
 # Convolution helpers
 # ---------------------------------------------------------------------------
@@ -299,11 +309,11 @@ class RelPositionMultiHeadAttention(nn.Module):
             op.Constant(value_ints=[3]),
         )
 
-        scale = op.Constant(value=ir.tensor(np.float32(1.0 / math.sqrt(self.d_k))))
+        scale = _scalar_like(op, 1.0 / math.sqrt(self.d_k), matrix_ac)
         scores = op.Mul(op.Add(matrix_ac, matrix_bd), scale)
 
         # Apply keep-mask: where not allowed, set score to -INF_VAL
-        neg_inf = op.Constant(value=ir.tensor(np.float32(_NEG_INF)))
+        neg_inf = _scalar_like(op, _NEG_INF, scores)
         scores = op.Where(att_bias, scores, neg_inf)
         attn = op.Softmax(scores, axis=-1)
 
@@ -394,7 +404,7 @@ class ConformerLayer(nn.Module):
         pos_emb: ir.Value,
         att_bias: ir.Value,
     ) -> ir.Value:
-        fc = op.Constant(value=ir.tensor(np.float32(self._FC_FACTOR)))
+        fc = _scalar_like(op, self._FC_FACTOR, x)
         residual = op.Add(
             x, op.Mul(self.feed_forward1(op, self.norm_feed_forward1(op, x)), fc)
         )
@@ -420,6 +430,7 @@ class FastConformerEncoder(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
+        self._dtype = config.dtype
         self.pre_encode = ConvSubsampling(
             config.fastconformer_feat_in,
             config.fastconformer_subsampling_conv_channels,
@@ -455,9 +466,27 @@ class FastConformerEncoder(nn.Module):
         ll = _dim(op, angles, 0)
         d_full = op.Constant(value_ints=[self.config.hidden_size])
         pe = op.Reshape(pe, op.Concat(ll, d_full, axis=0))  # (L, d)
-        return op.Unsqueeze(pe, op.Constant(value_ints=[0]))  # (1, L, d)
+        pe = op.Unsqueeze(pe, op.Constant(value_ints=[0]))  # (1, L, d)
+        # Sin/Cos run in float32; cast to the compute dtype for f16/bf16 models
+        # so the projection MatMul (linear_pos) sees matching element types.
+        if self._dtype != ir.DataType.FLOAT:
+            pe = op.Cast(pe, to=self._dtype)
+        return pe
 
-    def _att_bias(self, op: OpBuilder, t: ir.Value) -> ir.Value:
+    def _subsampled_length(self, op: OpBuilder, length: ir.Value) -> ir.Value:
+        """Apply the 8x causal subsampling length formula to *length*.
+
+        Each stride-2 causal stage maps ``n -> floor(n / 2) + 1`` (NeMo
+        ``ConvSubsampling.calc_length`` with ``all_paddings == kernel_size``).
+        """
+        x = op.Cast(length, to=ir.DataType.FLOAT)
+        two = op.Constant(value=ir.tensor(np.float32(2.0)))
+        one = op.Constant(value=ir.tensor(np.float32(1.0)))
+        for _ in range(3):
+            x = op.Add(op.Floor(op.Div(x, two)), one)
+        return op.Cast(x, to=ir.DataType.INT64)
+
+    def _att_bias(self, op: OpBuilder, t: ir.Value, valid: ir.Value) -> ir.Value:
         # chunk_idx[i] = floor(i / chunk_size); keep iff
         # 0 <= chunk_idx[i] - chunk_idx[j] <= left_chunks
         t_s = op.Squeeze(t)
@@ -477,17 +506,39 @@ class FastConformerEncoder(nn.Module):
         keep = op.And(ge0, le)  # (T, T) bool, True = attend
         # -> (1, 1, T, T)
         keep = op.Unsqueeze(keep, op.Constant(value_ints=[0, 1]))
-        return keep
+        # Combine with the key-padding mask so queries never attend to padded
+        # frames: valid is (B, T) -> (B, 1, 1, T).
+        valid_key = op.Unsqueeze(valid, op.Constant(value_ints=[1, 2]))
+        return op.And(keep, valid_key)  # (B, 1, T, T)
 
-    def forward(self, op: OpBuilder, audio_signal: ir.Value) -> ir.Value:
+    def forward(
+        self, op: OpBuilder, audio_signal: ir.Value, length: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
         x = self.pre_encode(op, audio_signal)  # (B, T', d)
         t = _dim(op, x, 1)
+        # Subsampled per-sample lengths and the (B, T') validity mask.
+        enc_len = self._subsampled_length(op, length)  # (B,)
+        t_s = op.Squeeze(t)
+        frame_idx = op.Range(
+            op.Constant(value=ir.tensor(np.int64(0))),
+            t_s,
+            op.Constant(value=ir.tensor(np.int64(1))),
+        )  # (T',)
+        # valid[b, i] = i < enc_len[b]
+        valid = op.Less(
+            op.Unsqueeze(frame_idx, op.Constant(value_ints=[0])),  # (1, T')
+            op.Unsqueeze(enc_len, op.Constant(value_ints=[1])),  # (B, 1)
+        )  # (B, T') bool
         pos_emb = self._pos_emb(op, t)
-        att_bias = self._att_bias(op, t)
+        att_bias = self._att_bias(op, t, valid)
         for layer in self.layers:
             x = layer(op, x, pos_emb, att_bias)
+        # Zero padded frames so the padded region carries no garbage (matches
+        # NeMo, which masks padded encoder outputs to zero).
+        zero = _scalar_like(op, 0.0, x)
+        x = op.Where(op.Unsqueeze(valid, op.Constant(value_ints=[2])), x, zero)
         # (B, T', d) -> (B, d, T')
-        return op.Transpose(x, perm=[0, 2, 1])
+        return op.Transpose(x, perm=[0, 2, 1]), enc_len
 
 
 # ---------------------------------------------------------------------------
