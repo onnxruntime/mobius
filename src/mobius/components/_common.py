@@ -264,6 +264,79 @@ def create_attention_bias(
     return op.Unsqueeze(attention_bias, [1])
 
 
+def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
+    """Build ``token_offset`` for ``com.microsoft::PackedMultiHeadAttention``.
+
+    ORT's ``PackedMultiHeadAttention`` treats the packed
+    ``(token_count, hidden)`` query/key/value as ``batch_size``
+    variable-length sub-sequences (delimited by ``cu_seqlens``) with
+    right-padding removed, and computes block-diagonal attention *within*
+    each sub-sequence.  The kernel derives ``batch_size`` from
+    ``token_offset.shape[0]`` and requires ``cumulative_sequence_length``
+    (i.e. ``cu_seqlens``) to have length ``batch_size + 1``.
+
+    ``token_offset`` has shape ``(batch_size, max_seq_len)`` and follows
+    ORT's ``GetPaddingOffset`` convention: the first ``token_count`` entries
+    are the padded-layout indices (``b * max_seq_len + s``) of the valid
+    tokens in packed (sub-sequence-major) order, followed by the
+    padded-layout indices of the padding slots.
+
+    Example: ``cu_seqlens = [0, 1, 3]`` (two sub-sequences of length 1 and
+    2, so ``max_seq_len = 2``) yields ``[[0, 2], [3, 1]]``.
+
+    Args:
+        op: The OpBuilder.
+        cu_seqlens: ``(batch_size + 1,)`` cumulative sequence lengths
+            (INT32 or INT64).
+
+    Returns:
+        ``(batch_size, max_seq_len)`` INT32 ``token_offset`` tensor.
+    """
+    # Index/axis tensors are materialised as explicit Constant nodes (rather
+    # than relying on Python-list auto-conversion) so this helper works under
+    # both the component OpBuilder and the onnxscript rewriter op context.
+    axes_0 = op.Constant(value_ints=[0])
+    axes_1 = op.Constant(value_ints=[1])
+    neg_one = op.Constant(value_ints=[-1])
+    start_1 = op.Constant(value_ints=[1])
+    int_max = op.Constant(value_ints=[INT64_MAX])
+
+    cu_seqlens_i32 = op.Cast(cu_seqlens, to=ir.DataType.INT32)
+
+    # batch_size = len(cu_seqlens) - 1  (number of packed sub-sequences).
+    batch_size = op.Cast(
+        op.Sub(op.Size(cu_seqlens), op.Constant(value_int=1)),
+        to=ir.DataType.INT32,
+    )
+
+    # Per-sub-sequence lengths and the padded sequence dimension.
+    starts = op.Slice(cu_seqlens_i32, axes_0, neg_one, axes_0)  # cu[:-1]
+    ends = op.Slice(cu_seqlens_i32, start_1, int_max, axes_0)  # cu[1:]
+    lengths = op.Sub(ends, starts)  # (batch_size,)
+    max_len = op.Squeeze(op.ReduceMax(lengths), axes_0)  # scalar INT32
+
+    # Padded position grid: pos[b, s] = b * max_len + s.
+    zero_i32 = op.Cast(op.Constant(value_int=0), to=ir.DataType.INT32)
+    one_i32 = op.Cast(op.Constant(value_int=1), to=ir.DataType.INT32)
+    rows = op.Range(zero_i32, batch_size, one_i32)  # (batch_size,)
+    cols = op.Range(zero_i32, max_len, one_i32)  # (max_len,)
+    pos_matrix = op.Add(
+        op.Mul(op.Unsqueeze(rows, axes_1), max_len),
+        op.Unsqueeze(cols, axes_0),
+    )  # (batch_size, max_len) INT32
+    pos_matrix_shape = op.Shape(pos_matrix)
+
+    # Column s is a valid token for row b iff s < lengths[b].
+    valid_mask = op.Less(op.Unsqueeze(cols, axes_0), op.Unsqueeze(lengths, axes_1))
+    valid_mask_1d = op.Reshape(valid_mask, neg_one)
+    pos_1d = op.Reshape(pos_matrix, neg_one)
+
+    # Valid positions first (packed order), then padding-slot positions.
+    valid_indices = op.Compress(pos_1d, valid_mask_1d)
+    padding_indices = op.Compress(pos_1d, op.Not(valid_mask_1d))
+    return op.Reshape(op.Concat(valid_indices, padding_indices, axis=0), pos_matrix_shape)
+
+
 def create_padding_mask(
     op: OpBuilder,
     input_ids,
