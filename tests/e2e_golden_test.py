@@ -15,6 +15,11 @@ Run::
 
     # Run on CUDA GPU:
     MOBIUS_TEST_DEVICE=cuda pytest tests/e2e_golden_test.py -v
+
+    # Build a CUDA-specialized graph (e.g. PackedMultiHeadAttention for
+    # Qwen-VL vision) and run it on CUDA:
+    MOBIUS_TEST_DEVICE=cuda MOBIUS_TEST_BUILD_EP=cuda \
+        pytest tests/e2e_golden_test.py -m golden -k "qwen2_5-vl-3b"
 """
 
 from __future__ import annotations
@@ -46,6 +51,27 @@ from mobius._testing.parity import ParityResult, compare_golden
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+
+
+def _get_test_build_ep() -> str:
+    """Return the ``execution_provider`` to build golden models with.
+
+    Defaults to ``"default"`` (portable ONNX, standard attention), matching
+    how the golden references were generated. Set ``MOBIUS_TEST_BUILD_EP`` to
+    build an EP-specialized graph instead (e.g. ``cuda`` to emit
+    ``PackedMultiHeadAttention`` for the Qwen-VL vision encoders).
+
+    Building a CUDA-specialized graph requires running on CUDA, since ops such
+    as ``PackedMultiHeadAttention`` have no CPU kernel. A build/runtime EP
+    mismatch is therefore rejected as a misconfiguration.
+    """
+    build_ep = os.environ.get("MOBIUS_TEST_BUILD_EP", "default").strip().lower()
+    if build_ep == "cuda" and os.environ.get("MOBIUS_TEST_DEVICE", "").lower() != "cuda":
+        raise pytest.UsageError(
+            "MOBIUS_TEST_BUILD_EP=cuda requires MOBIUS_TEST_DEVICE=cuda so that "
+            "CUDA-specific ops (e.g. PackedMultiHeadAttention) run on CUDA."
+        )
+    return build_ep
 
 
 def _get_test_device_kwargs() -> dict[str, str]:
@@ -301,6 +327,7 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
         dtype=case.dtype,
         load_weights=True,
         trust_remote_code=case.trust_remote_code,
+        execution_provider=_get_test_build_ep(),
     )
 
 

@@ -292,6 +292,15 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     Returns:
         ``(batch_size, max_seq_len)`` INT32 ``token_offset`` tensor.
     """
+    # Index/axis tensors are materialised as explicit Constant nodes (rather
+    # than relying on Python-list auto-conversion) so this helper works under
+    # both the component OpBuilder and the onnxscript rewriter op context.
+    axes_0 = op.Constant(value_ints=[0])
+    axes_1 = op.Constant(value_ints=[1])
+    neg_one = op.Constant(value_ints=[-1])
+    start_1 = op.Constant(value_ints=[1])
+    int_max = op.Constant(value_ints=[INT64_MAX])
+
     cu_seqlens_i32 = op.Cast(cu_seqlens, to=ir.DataType.INT32)
 
     # batch_size = len(cu_seqlens) - 1  (number of packed sub-sequences).
@@ -301,10 +310,10 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     )
 
     # Per-sub-sequence lengths and the padded sequence dimension.
-    starts = op.Slice(cu_seqlens_i32, [0], [-1], [0])  # cu[:-1]
-    ends = op.Slice(cu_seqlens_i32, [1], [INT64_MAX], [0])  # cu[1:]
+    starts = op.Slice(cu_seqlens_i32, axes_0, neg_one, axes_0)  # cu[:-1]
+    ends = op.Slice(cu_seqlens_i32, start_1, int_max, axes_0)  # cu[1:]
     lengths = op.Sub(ends, starts)  # (batch_size,)
-    max_len = op.Squeeze(op.ReduceMax(lengths), [0])  # scalar INT32
+    max_len = op.Squeeze(op.ReduceMax(lengths), axes_0)  # scalar INT32
 
     # Padded position grid: pos[b, s] = b * max_len + s.
     zero_i32 = op.Cast(op.Constant(value_int=0), to=ir.DataType.INT32)
@@ -312,15 +321,15 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     rows = op.Range(zero_i32, batch_size, one_i32)  # (batch_size,)
     cols = op.Range(zero_i32, max_len, one_i32)  # (max_len,)
     pos_matrix = op.Add(
-        op.Mul(op.Unsqueeze(rows, [1]), max_len),
-        op.Unsqueeze(cols, [0]),
+        op.Mul(op.Unsqueeze(rows, axes_1), max_len),
+        op.Unsqueeze(cols, axes_0),
     )  # (batch_size, max_len) INT32
     pos_matrix_shape = op.Shape(pos_matrix)
 
     # Column s is a valid token for row b iff s < lengths[b].
-    valid_mask = op.Less(op.Unsqueeze(cols, [0]), op.Unsqueeze(lengths, [1]))
-    valid_mask_1d = op.Reshape(valid_mask, [-1])
-    pos_1d = op.Reshape(pos_matrix, [-1])
+    valid_mask = op.Less(op.Unsqueeze(cols, axes_0), op.Unsqueeze(lengths, axes_1))
+    valid_mask_1d = op.Reshape(valid_mask, neg_one)
+    pos_1d = op.Reshape(pos_matrix, neg_one)
 
     # Valid positions first (packed order), then padding-slot positions.
     valid_indices = op.Compress(pos_1d, valid_mask_1d)
