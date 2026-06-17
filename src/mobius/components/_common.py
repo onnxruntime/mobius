@@ -292,7 +292,7 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     Returns:
         ``(batch_size, max_seq_len)`` INT32 ``token_offset`` tensor.
     """
-    cu_i32 = op.Cast(cu_seqlens, to=ir.DataType.INT32)
+    cu_seqlens_i32 = op.Cast(cu_seqlens, to=ir.DataType.INT32)
 
     # batch_size = len(cu_seqlens) - 1  (number of packed sub-sequences).
     batch_size = op.Cast(
@@ -301,8 +301,8 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     )
 
     # Per-sub-sequence lengths and the padded sequence dimension.
-    starts = op.Slice(cu_i32, [0], [-1], [0])  # cu[:-1]
-    ends = op.Slice(cu_i32, [1], [INT64_MAX], [0])  # cu[1:]
+    starts = op.Slice(cu_seqlens_i32, [0], [-1], [0])  # cu[:-1]
+    ends = op.Slice(cu_seqlens_i32, [1], [INT64_MAX], [0])  # cu[1:]
     lengths = op.Sub(ends, starts)  # (batch_size,)
     max_len = op.Squeeze(op.ReduceMax(lengths), [0])  # scalar INT32
 
@@ -315,7 +315,7 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
         op.Mul(op.Unsqueeze(rows, [1]), max_len),
         op.Unsqueeze(cols, [0]),
     )  # (batch_size, max_len) INT32
-    pos_shape = op.Shape(pos_matrix)
+    pos_matrix_shape = op.Shape(pos_matrix)
 
     # Column s is a valid token for row b iff s < lengths[b].
     valid_mask = op.Less(op.Unsqueeze(cols, [0]), op.Unsqueeze(lengths, [1]))
@@ -323,9 +323,9 @@ def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     pos_1d = op.Reshape(pos_matrix, [-1])
 
     # Valid positions first (packed order), then padding-slot positions.
-    valid = op.Compress(pos_1d, valid_mask_1d)
-    padding = op.Compress(pos_1d, op.Not(valid_mask_1d))
-    return op.Reshape(op.Concat(valid, padding, axis=0), pos_shape)
+    valid_indices = op.Compress(pos_1d, valid_mask_1d)
+    padding_indices = op.Compress(pos_1d, op.Not(valid_mask_1d))
+    return op.Reshape(op.Concat(valid_indices, padding_indices, axis=0), pos_matrix_shape)
 
 
 def create_padding_mask(

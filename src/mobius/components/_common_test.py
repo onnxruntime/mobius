@@ -226,17 +226,17 @@ class TestBuildPackedTokenOffset:
     """
 
     @staticmethod
-    def _build():
+    def _build(dtype=ir.DataType.INT64):
         b, op, g = create_test_builder()
-        cu = create_test_input(b, "cu_seqlens", ["K"], dtype=ir.DataType.INT64)
+        cu = create_test_input(b, "cu_seqlens", ["K"], dtype=dtype)
         token_offset = build_packed_token_offset(op, cu)
         token_offset.name = "token_offset"
         g.outputs.append(token_offset)
         return ir.Model(g, ir_version=10)
 
-    def _run(self, cu_seqlens):
-        sess = OnnxModelSession(self._build(), device="cpu")
-        return sess.run({"cu_seqlens": np.array(cu_seqlens, dtype=np.int64)})["token_offset"]
+    def _run(self, cu_seqlens, np_dtype=np.int64, ir_dtype=ir.DataType.INT64):
+        sess = OnnxModelSession(self._build(ir_dtype), device="cpu")
+        return sess.run({"cu_seqlens": np.array(cu_seqlens, dtype=np_dtype)})["token_offset"]
 
     def test_ort_reference_example(self):
         # ORT test data: cu=[0,1,3] (lengths 1,2; max_len=2) -> [[0,2],[3,1]].
@@ -265,6 +265,13 @@ class TestBuildPackedTokenOffset:
         out = self._run([0, 2, 4, 6])
         assert out.shape == (3, 2)
         assert np.array_equal(out, np.array([[0, 1], [2, 3], [4, 5]], dtype=np.int32))
+
+    def test_int32_input(self):
+        # The helper documents INT32 or INT64 cu_seqlens; INT32 input must
+        # produce the same result as the INT64 reference example.
+        out = self._run([0, 1, 3], np_dtype=np.int32, ir_dtype=ir.DataType.INT32)
+        assert out.dtype == np.int32
+        assert np.array_equal(out, np.array([[0, 2], [3, 1]], dtype=np.int32))
 
 
 class TestCreatePaddingMask:
