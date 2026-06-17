@@ -432,6 +432,20 @@ class ArchitectureConfig(BaseModelConfig):
     audio_t5_bias_max_distance: int | None = None
     audio_token_id: int | None = None
 
+    # FastConformer-RNNT (NeMo) config — see models/nemo_rnnt.py.
+    # Encoder
+    fastconformer_subsampling_factor: int = 8
+    fastconformer_subsampling_conv_channels: int = 256
+    fastconformer_conv_kernel_size: int = 9
+    fastconformer_pos_emb_max_len: int = 5000
+    fastconformer_xscaling: bool = False
+    # RNN-T prediction network + joint
+    rnnt_pred_hidden: int | None = None
+    rnnt_pred_rnn_layers: int = 1
+    rnnt_joint_hidden: int | None = None
+    # Number of acoustic classes excluding the blank symbol (vocab without blank).
+    rnnt_num_classes: int | None = None
+
     # LoRA config (for multimodal models like Phi4-MM)
     speech_lora: dict | None = None
 
