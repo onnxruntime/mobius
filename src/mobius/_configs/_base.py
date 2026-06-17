@@ -439,6 +439,10 @@ class ArchitectureConfig(BaseModelConfig):
     fastconformer_conv_kernel_size: int = 9
     fastconformer_pos_emb_max_len: int = 5000
     fastconformer_xscaling: bool = False
+    # Number of input mel features to the encoder.
+    fastconformer_feat_in: int = 128
+    # Chunked-limited attention context: [left_context, right_context] in frames.
+    fastconformer_att_context_size: tuple[int, int] = (70, 13)
     # RNN-T prediction network + joint
     rnnt_pred_hidden: int | None = None
     rnnt_pred_rnn_layers: int = 1

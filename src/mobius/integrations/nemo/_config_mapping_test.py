@@ -68,3 +68,24 @@ class TestNemoToConfig:
         del cfg["encoder"]["ff_expansion_factor"]
         config = nemo_to_config(cfg)
         assert config.intermediate_size == 1024 * 4
+
+    def test_unsupported_subsampling_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "subsampling": "striding"},
+        }
+        with pytest.raises(ValueError, match="Unsupported FastConformer"):
+            nemo_to_config(cfg)
+
+    def test_unsupported_self_attention_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "self_attention_model": "abs_pos"},
+        }
+        with pytest.raises(ValueError, match="self_attention_model"):
+            nemo_to_config(cfg)
+
+    def test_xscaling_raises(self):
+        cfg = {**_RNNT_CONFIG, "encoder": {**_RNNT_CONFIG["encoder"], "xscaling": True}}
+        with pytest.raises(ValueError, match="xscaling"):
+            nemo_to_config(cfg)
