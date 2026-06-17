@@ -32,17 +32,13 @@ HuggingFace/NeMo correspondence (state-dict prefixes):
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components._common import Embedding, LayerNorm, Linear
-
-if TYPE_CHECKING:
-    pass
+from mobius.components import Embedding, LayerNorm, Linear
 
 _INF_VAL = 10000.0
 _NEG_INF = -10000.0  # NeMo masks attention scores with -INF_VAL (= -10000.0)

@@ -24,6 +24,9 @@ import pytest
 pytestmark = pytest.mark.integration
 
 _MODEL_ID = "nvidia/nemotron-speech-streaming-en-0.6b"
+# Pin the HF revision so the test always validates against the exact model the
+# committed golden was generated from (see scripts/generate_nemo_rnnt_golden.py).
+_REVISION = "7a9b763e6c5fb103da690219c049fac917aa50b1"
 _GOLDEN = os.path.join(
     os.path.dirname(__file__),
     "..",
@@ -53,7 +56,7 @@ def test_fastconformer_rnnt_parity():
     from mobius.integrations.nemo import build_from_nemo
 
     golden = np.load(_GOLDEN)
-    pkg = build_from_nemo(_MODEL_ID)
+    pkg = build_from_nemo(_MODEL_ID, revision=_REVISION)
     assert set(pkg.keys()) == {"encoder", "decoder", "joint"}
 
     with tempfile.TemporaryDirectory() as td:
@@ -94,7 +97,7 @@ def test_fastconformer_rnnt_greedy_decode():
 
     golden = np.load(_GOLDEN)
     blank_id = 1024  # rnnt_num_classes; vocab index reserved for the blank label
-    pkg = build_from_nemo(_MODEL_ID)
+    pkg = build_from_nemo(_MODEL_ID, revision=_REVISION)
 
     with tempfile.TemporaryDirectory() as td:
         pkg.save(td)

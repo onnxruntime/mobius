@@ -340,6 +340,38 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print(f"Saved {name} to {path}")
 
 
+def _cmd_build_nemo(args: argparse.Namespace) -> None:
+    """Execute the 'build-nemo' subcommand."""
+    from mobius.integrations.nemo import build_from_nemo
+
+    nemo_path = args.nemo_path
+    # Local file: default output beside it; HF repo ref: use the repo basename.
+    if os.path.splitext(nemo_path)[1] == ".nemo" and os.path.exists(nemo_path):
+        default_output = os.path.splitext(nemo_path)[0] + "_onnx"
+    else:
+        default_output = nemo_path.split(":", 1)[0].split("/")[-1] + "_onnx"
+    output_dir = args.output or default_output
+    os.makedirs(output_dir, exist_ok=True)
+
+    pkg = build_from_nemo(
+        nemo_path,
+        dtype=args.dtype,
+        execution_provider=args.execution_provider,
+    )
+
+    pkg.save(
+        output_dir,
+        external_data=args.external_data,
+    )
+    for name in pkg:
+        use_subfolders = len(pkg) > 1
+        if use_subfolders:
+            path = os.path.join(output_dir, name, "model.onnx")
+        else:
+            path = os.path.join(output_dir, "model.onnx")
+        print(f"Saved {name} to {path}")
+
+
 def _cmd_info(args: argparse.Namespace) -> None:
     """Execute the 'info' subcommand."""
     from mobius._diffusers_builder import (
@@ -572,6 +604,49 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
+
+    # --- build-nemo ---
+    nemo_parser = subparsers.add_parser(
+        "build-nemo", help="Build ONNX model(s) from a NeMo .nemo archive."
+    )
+    nemo_parser.add_argument(
+        "nemo_path",
+        help=(
+            "Path to a local .nemo file, or a HuggingFace Hub reference "
+            "('owner/repo' or 'owner/repo:filename.nemo')."
+        ),
+    )
+    nemo_parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        metavar="DIR",
+        help="Output directory (default: <nemo_stem>_onnx/).",
+    )
+    nemo_parser.add_argument(
+        "--dtype",
+        choices=sorted(DTYPE_MAP),
+        default=None,
+        help="Target dtype for model weights (FastConformer-RNNT supports float32 only).",
+    )
+    nemo_parser.add_argument(
+        "--external-data",
+        choices=["onnx", "safetensors"],
+        default="onnx",
+        help="External data format (default: onnx).",
+    )
+    nemo_parser.add_argument(
+        "--ep",
+        "--execution-provider",
+        dest="execution_provider",
+        default="default",
+        metavar="EP",
+        help=(
+            "Target execution provider for EP-aware graph optimisations. "
+            "Defaults to 'default' (portable ONNX, no vendor fusions)."
+        ),
+    )
+    nemo_parser.set_defaults(func=_cmd_build_nemo)
 
     # --- list ---
     list_parser = subparsers.add_parser(

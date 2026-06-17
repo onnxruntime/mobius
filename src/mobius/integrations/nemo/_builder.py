@@ -31,6 +31,7 @@ def build_from_nemo(
     task: str | None = None,
     dtype: str | None = None,
     execution_provider: str = "default",
+    revision: str | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a NeMo ``.nemo`` archive.
 
@@ -44,6 +45,8 @@ def build_from_nemo(
         execution_provider: Target execution provider for EP-aware
             optimisations. Defaults to ``"default"`` (portable, no vendor
             fusions).
+        revision: Optional HuggingFace Hub revision (branch, tag, or commit
+            SHA) to pin downloads. Ignored for local ``.nemo`` paths.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -58,7 +61,7 @@ def build_from_nemo(
     from mobius.integrations.nemo._config_mapping import nemo_to_config
     from mobius.integrations.nemo._reader import NeMoArchive
 
-    archive = NeMoArchive(nemo_path)
+    archive = NeMoArchive(nemo_path, revision=revision)
     logger.info("Loaded NeMo archive: %s (target=%s)", archive.path, archive.target)
 
     config = nemo_to_config(archive.config)

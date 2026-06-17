@@ -43,7 +43,7 @@ def _looks_like_hf_repo_id(value: str) -> bool:
     return len(parts) == 2 and all(p and not p.endswith(".nemo") for p in parts)
 
 
-def _resolve_nemo_path(nemo_path: str | Path) -> str:
+def _resolve_nemo_path(nemo_path: str | Path, revision: str | None = None) -> str:
     """Resolve a ``.nemo`` reference to a local file path.
 
     Accepts:
@@ -52,6 +52,11 @@ def _resolve_nemo_path(nemo_path: str | Path) -> str:
       exactly one ``*.nemo`` file, which is downloaded.
     - A HuggingFace Hub reference ``"owner/repo:filename.nemo"`` to pick a
       specific file from a multi-file repo.
+
+    Args:
+        nemo_path: Local path or HuggingFace Hub reference.
+        revision: Optional HuggingFace Hub revision (branch, tag, or commit
+            SHA) used to pin downloads for reproducibility.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
@@ -64,7 +69,11 @@ def _resolve_nemo_path(nemo_path: str | Path) -> str:
         return raw  # Let NeMoArchive raise FileNotFoundError with the original path.
 
     if not filename:
-        files = [f for f in HfApi().list_repo_files(repo_id) if f.endswith(".nemo")]
+        files = [
+            f
+            for f in HfApi().list_repo_files(repo_id, revision=revision)
+            if f.endswith(".nemo")
+        ]
         if not files:
             raise FileNotFoundError(f"No *.nemo files found in HF repo {repo_id!r}")
         if len(files) > 1:
@@ -74,8 +83,8 @@ def _resolve_nemo_path(nemo_path: str | Path) -> str:
             )
         filename = files[0]
 
-    logger.info("Downloading %s from %s", filename, repo_id)
-    return hf_hub_download(repo_id=repo_id, filename=filename)
+    logger.info("Downloading %s from %s (revision=%s)", filename, repo_id, revision)
+    return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
 
 class NeMoArchive:
@@ -87,10 +96,12 @@ class NeMoArchive:
     Args:
         nemo_path: Path to a local ``.nemo`` file, *or* a HuggingFace Hub
             reference (``"owner/repo"`` or ``"owner/repo:filename.nemo"``).
+        revision: Optional HuggingFace Hub revision (branch, tag, or commit
+            SHA) to pin downloads. Ignored for local paths.
     """
 
-    def __init__(self, nemo_path: str | Path):
-        self.path = _resolve_nemo_path(nemo_path)
+    def __init__(self, nemo_path: str | Path, revision: str | None = None):
+        self.path = _resolve_nemo_path(nemo_path, revision=revision)
         if not Path(self.path).exists():
             raise FileNotFoundError(f"NeMo file not found: {self.path}")
         # Member name (basename) -> full archive member name, for lookups.
@@ -178,8 +189,7 @@ class NeMoArchive:
 
         if _WEIGHTS_NAME not in self._members:
             raise ValueError(
-                f"{self.path!r} does not contain {_WEIGHTS_NAME}; "
-                "is it a valid .nemo archive?"
+                f"{self.path!r} does not contain {_WEIGHTS_NAME}; is it a valid .nemo archive?"
             )
         raw = self.read_file(_WEIGHTS_NAME)
         obj = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
