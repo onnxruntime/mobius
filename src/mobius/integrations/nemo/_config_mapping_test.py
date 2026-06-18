@@ -93,3 +93,22 @@ class TestNemoToConfig:
         cfg = {**_RNNT_CONFIG, "encoder": {**_RNNT_CONFIG["encoder"], "xscaling": True}}
         with pytest.raises(ValueError, match="xscaling"):
             nemo_to_config(cfg)
+
+    def test_list_pre_encode_cache_size(self):
+        # Cache-aware multi-context training stores a list; use the last entry.
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "pre_encode_cache_size": [4, 9]},
+        }
+        config = nemo_to_config(cfg)
+        # drop_extra = 1 + (9 - 1) // 8 = 2.
+        assert config.fastconformer_streaming_drop_extra == 2
+
+    def test_list_att_context_size(self):
+        # NeMo may store att_context_size as a list of [left, right] rows.
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_size": [[70, 13], [140, 27]]},
+        }
+        config = nemo_to_config(cfg)
+        assert config.fastconformer_streaming_cache_size == 70

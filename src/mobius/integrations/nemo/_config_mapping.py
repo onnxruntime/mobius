@@ -106,7 +106,12 @@ def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
     # function of the subsampling pre-encode cache (= 9 for 8x dw_striding).
     subsampling_factor = int(enc.get("subsampling_factor", 8))
     streaming_cache_size = att_context[0] if att_context[0] >= 0 else 70
-    pre_encode_cache = int(enc.get("pre_encode_cache_size", subsampling_factor + 1))
+    # NeMo may store pre_encode_cache_size as a list (cache-aware multi-context
+    # training); use the last (largest) entry, mirroring the GenAI config path.
+    pre_encode_cache = enc.get("pre_encode_cache_size", subsampling_factor + 1)
+    if isinstance(pre_encode_cache, (list, tuple)):
+        pre_encode_cache = pre_encode_cache[-1]
+    pre_encode_cache = int(pre_encode_cache)
     drop_extra = (
         1 + (pre_encode_cache - 1) // subsampling_factor if pre_encode_cache >= 1 else 0
     )
