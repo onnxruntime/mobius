@@ -37,6 +37,7 @@ from mobius._testing.golden import (
     generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
+    load_assistant_inputs,
     load_generation_golden,
     load_golden_ref,
     load_tolerances,
@@ -1529,6 +1530,75 @@ def _run_speech_language_prefill(
 
 
 # ---------------------------------------------------------------------------
+# Gemma4-Assistant drafter helpers (multi-model: replay target-derived tensors)
+# ---------------------------------------------------------------------------
+
+
+def _assistant_feeds_for_step(
+    inputs: dict[str, np.ndarray],
+    input_names: list[str],
+    step: int,
+) -> dict[str, np.ndarray]:
+    """Build the assistant ONNX feeds for one draft step from replay tensors.
+
+    ``inputs`` is the ``*_inputs.npz`` payload: ``inputs_embeds`` is
+    ``[num_steps, 1, 2*backbone_hidden]``; ``position_ids`` / shared KV are
+    fixed across the round (SinglePositionMultiToken). Only inputs present in
+    the ONNX graph are fed (an fp32/CPU build prunes ``attention_mask``).
+    """
+    feeds: dict[str, np.ndarray] = {
+        "inputs_embeds": inputs["inputs_embeds"][step : step + 1].astype(np.float32),
+        "position_ids": inputs["position_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64),
+    }
+    for lt in inputs["layer_types"].tolist():
+        feeds[f"shared_kv.{lt}.key"] = inputs[f"skv_key_{lt}"].astype(np.float32)
+        feeds[f"shared_kv.{lt}.value"] = inputs[f"skv_val_{lt}"].astype(np.float32)
+    return {k: v for k, v in feeds.items() if k in input_names}
+
+
+def _run_gemma4_assistant_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the assistant ONNX on the first draft step and return its outputs."""
+    inputs = load_assistant_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    session = _open_decoder_session(pkg)
+    try:
+        feeds = _assistant_feeds_for_step(inputs, session.input_names, step=0)
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+def _run_gemma4_assistant_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> np.ndarray:
+    """Replay the first draft round through the assistant ONNX (teacher-forced).
+
+    Feeds each captured step's ``inputs_embeds`` (with the fixed shared KV and
+    position) and collects the per-step argmax — the drafted token sequence.
+    """
+    inputs = load_assistant_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    num_steps = inputs["inputs_embeds"].shape[0]
+    session = _open_decoder_session(pkg)
+    try:
+        tokens: list[int] = []
+        for step in range(num_steps):
+            feeds = _assistant_feeds_for_step(inputs, session.input_names, step=step)
+            out = session.run(feeds)
+            tokens.append(int(np.asarray(out["logits"])[0, -1].argmax()))
+    finally:
+        session.close()
+    return np.array(tokens, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
 
@@ -1568,6 +1638,8 @@ class TestL4CheckpointVerified:
             outputs = _run_vision_language_prefill(pkg, case, config)
         elif case.task_type == "phi4mm-multimodal":
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
+        elif case.task_type == "gemma4-assistant":
+            outputs = _run_gemma4_assistant_prefill(pkg, case)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
@@ -1650,6 +1722,7 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
         "seq2seq",
         "speech-to-text",
         "speech-language",
+        "gemma4-assistant",
     }
 )
 
@@ -2264,6 +2337,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type == "gemma4-assistant":
+            new_tokens = _run_gemma4_assistant_generation(pkg, case)
         elif case.task_type == "seq2seq":
             new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
         elif case.task_type == "speech-to-text":

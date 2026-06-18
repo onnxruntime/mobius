@@ -48,6 +48,7 @@
         "depth-estimation",
         "feature-extraction",
         "fun-asr-speech-language",
+        "gemma4-assistant",
         "image-classification",
         "image-segmentation",
         "image-text-to-text",

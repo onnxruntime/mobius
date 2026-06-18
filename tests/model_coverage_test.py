@@ -269,6 +269,14 @@ _COVERAGE_SKIP: dict[str, str] = {
     "youtu": "CausalLM — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
     "zamba2": "HybridCausalLM — YAML not yet created",
+    # --- Speculative-decoding drafters (bespoke IO; generic L1-L3/L2 matrix
+    # cannot drive them — they consume target hidden states / shared KV rather
+    # than input_ids). Covered by dedicated specialized tests + golden. ---
+    "DFlashDraftModel": "Drafter (noise_embedding + target_hidden IO) — covered by src/mobius/models/_dflash_test.py",
+    "gemma4_assistant": "Drafter (target shared KV + hidden state) — covered by _gemma4_assistant_test.py + L4/L5 golden (gemma4-assistant)",
+    "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
 }
 
 

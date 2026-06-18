@@ -436,6 +436,43 @@ def load_generation_golden(
     return [int(t) for t in data["generated_tokens"]]
 
 
+def assistant_inputs_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the companion ``*_inputs.npz`` path for a drafter test case.
+
+    Multi-model drafter tasks (e.g. ``gemma4-assistant``) consume tensors
+    derived from a target model's forward pass (shared KV + hidden state)
+    rather than a tokenized prompt, so the exact input tensors are stored
+    alongside the golden JSON for the test to replay.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_inputs.npz``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_inputs.npz"
+
+
+def save_assistant_inputs(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Save a drafter test case's input tensors to a ``.npz`` archive."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+
+
+def load_assistant_inputs(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> dict[str, np.ndarray] | None:
+    """Load a drafter test case's input tensors, or ``None`` if missing."""
+    path = assistant_inputs_path_for_case(case, golden_dir)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
+
+
 def discover_test_cases(
     task_type: str | None = None,
     level: str | None = None,
