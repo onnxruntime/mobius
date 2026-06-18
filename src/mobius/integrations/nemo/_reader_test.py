@@ -97,7 +97,7 @@ class TestNeMoArchive:
             info = tarfile.TarInfo(name="./random.txt")
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
-        with pytest.raises(ValueError, match="model_config.yaml"):
+        with pytest.raises(ValueError, match=r"model_config\.yaml"):
             NeMoArchive(bad)
 
 
