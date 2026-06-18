@@ -494,7 +494,18 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Do not sleep between chunks when streaming from a file",
     )
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="ORT device")
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        choices=["cpu", "cuda", "webgpu"],
+        help=(
+            "ORT device. 'cuda' needs an NVIDIA GPU. 'webgpu' is EXPERIMENTAL "
+            "and unverified for this model: the encoder uses opset-24 Swish + "
+            "Attention and the decoder uses LSTM, which may lack WebGPU kernels "
+            "(falling back to CPU or erroring). Requires an onnxruntime build "
+            "with the WebGPU EP."
+        ),
+    )
     parser.add_argument(
         "--dtype",
         default=None,
