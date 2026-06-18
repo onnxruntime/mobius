@@ -59,9 +59,20 @@ def _run(path: str, feeds: dict):
     return sess.run(None, feeds)
 
 
-def _full_length(feats: np.ndarray) -> np.ndarray:
-    """Per-sample length covering all feature frames (no padding)."""
-    return np.full((feats.shape[0],), feats.shape[2], dtype=np.int64)
+def _full_length(feats_tm: np.ndarray) -> np.ndarray:
+    """Per-sample length covering all feature frames (no padding).
+
+    ``feats_tm`` is time-major ``(B, T, mel)``; the valid length is the time axis.
+    """
+    return np.full((feats_tm.shape[0],), feats_tm.shape[1], dtype=np.int64)
+
+
+def _time_major(feats: np.ndarray) -> np.ndarray:
+    """Convert golden feature-major ``(B, mel, T)`` features to time-major.
+
+    The encoder graph consumes time-major ``(B, T, mel)``.
+    """
+    return np.ascontiguousarray(feats.transpose(0, 2, 1))
 
 
 @pytest.mark.integration_slow
@@ -81,12 +92,15 @@ def test_fastconformer_rnnt_fp16_encoder_parity():
         sess = ort.InferenceSession(
             _find_onnx(td, "encoder"), providers=["CUDAExecutionProvider"]
         )
-        feats16 = golden["feats"].astype(np.float16)
+        feats16 = _time_major(golden["feats"].astype(np.float16))
         (enc, _enc_len) = sess.run(
             None, {"audio_signal": feats16, "length": _full_length(feats16)}
         )
+        # Encoder output is time-major (B, T', d); golden is feature-major.
         # f16 accumulates more rounding error than f32; allow a looser tolerance.
-        np.testing.assert_allclose(enc.astype(np.float32), golden["enc_out"], atol=5e-2)
+        np.testing.assert_allclose(
+            enc.astype(np.float32), golden["enc_out"].transpose(0, 2, 1), atol=5e-2
+        )
 
 
 @pytest.mark.integration_slow
@@ -100,13 +114,14 @@ def test_fastconformer_rnnt_parity():
     with tempfile.TemporaryDirectory() as td:
         pkg.save(td)
 
-        # Encoder: mel features -> encoded frames
-        feats = golden["feats"].astype(np.float32)
+        # Encoder: mel features -> encoded frames. The graph is time-major
+        # (B, T, mel) -> (B, T', d); the golden tensors are feature-major.
+        feats = _time_major(golden["feats"].astype(np.float32))
         enc = _run(
             _find_onnx(td, "encoder"),
             {"audio_signal": feats, "length": _full_length(feats)},
         )[0]
-        np.testing.assert_allclose(enc, golden["enc_out"], atol=1e-4)
+        np.testing.assert_allclose(enc, golden["enc_out"].transpose(0, 2, 1), atol=1e-4)
 
         # Prediction net: SOS + tokens -> g (matches NeMo add_sos=True)
         sos = np.full((1, 1), _SOS_ID, dtype=np.int64)
@@ -220,9 +235,9 @@ def test_fastconformer_rnnt_greedy_decode():
             _find_onnx(td, "joint"), providers=["CPUExecutionProvider"]
         )
 
-        feats = golden["feats"].astype(np.float32)
+        feats = _time_major(golden["feats"].astype(np.float32))
         enc = enc_sess.run(None, {"audio_signal": feats, "length": _full_length(feats)})[0]
-        n_frames = enc.shape[2]
+        n_frames = enc.shape[1]  # time-major (B, T', d)
 
         # Prime the prediction net with the zero start-of-sequence embedding.
         h = np.zeros((2, 1, 640), dtype=np.float32)
@@ -234,7 +249,8 @@ def test_fastconformer_rnnt_greedy_decode():
         max_symbols = 5
         for t in range(n_frames):
             # GenAI joint consumes time-major frames (B, 1, d) / (B, 1, d_pred).
-            enc_t = np.ascontiguousarray(enc[:, :, t : t + 1].transpose(0, 2, 1))
+            # enc is already time-major, so take one frame directly.
+            enc_t = np.ascontiguousarray(enc[:, t : t + 1, :])
             emitted = 0
             while emitted < max_symbols:
                 logits = joint_sess.run(

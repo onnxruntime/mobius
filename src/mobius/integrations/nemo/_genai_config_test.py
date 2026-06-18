@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from mobius.integrations.nemo._genai_config import _LOG_EPS, _derive_params
 
 _NEMO_CONFIG = {
@@ -59,7 +61,7 @@ def test_derive_params_matches_architecture():
 def test_derive_params_preemph_default():
     # The preprocessor omits preemph; NeMo's default (0.97) must be used.
     p = _derive_params(_NEMO_CONFIG, chunk_seconds=0.56)
-    assert p["preemph"] == 0.97
+    assert p["preemph"] == pytest.approx(0.97)
     assert p["chunk_samples"] == round(0.56 * 16000)
 
 

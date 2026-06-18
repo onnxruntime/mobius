@@ -74,7 +74,7 @@ _JOINER_OUTPUTS = {"logits": "logits"}
 def _preproc_window_samples(value: Any, sample_rate: int, default: int) -> int:
     """Resolve a NeMo window size/stride (seconds or samples) to sample count."""
     if isinstance(value, float) and value < 1.0:
-        return int(round(value * sample_rate))
+        return round(value * sample_rate)
     if isinstance(value, int):
         return value
     return default
@@ -141,7 +141,7 @@ def _derive_params(config: dict[str, Any], chunk_seconds: float) -> dict[str, An
         "left_context": left_context,
         "conv_context": conv_context,
         "pre_encode_cache_size": pre_encode_cache_size,
-        "chunk_samples": int(round(chunk_seconds * sample_rate)),
+        "chunk_samples": round(chunk_seconds * sample_rate),
         "max_symbols_per_step": max_symbols,
         "hidden_size": int(encoder.get("d_model", 1024)),
         "num_hidden_layers": int(encoder.get("n_layers", 24)),
@@ -245,9 +245,10 @@ def _download_silero_vad(dest: Path) -> bool:
 
         cached = hf_hub_download(repo_id=_SILERO_REPO, filename=_SILERO_FILE)
         shutil.copy2(cached, str(dest / "silero_vad.onnx"))
-        return True
     except Exception:  # pragma: no cover - network/availability dependent
         return False
+    else:
+        return True
 
 
 def write_genai_bundle(

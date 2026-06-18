@@ -270,14 +270,13 @@ class FastConformerRnntPipeline:
 
     def transcribe_offline(self, audio: np.ndarray) -> str:
         """Full-context transcription of a complete utterance."""
-        feats = self._features(audio)
+        feats = self._features(audio)  # (1, N_MELS, T_total) feature-major
         length = np.array([feats.shape[2]], dtype=np.int64)
-        enc = self._encoder.run({"audio_signal": feats, "length": length})
+        # The encoder graph is natively time-major (B, T, mel) -> (B, T, d).
+        audio_tm = np.ascontiguousarray(feats.transpose(0, 2, 1))
+        enc = self._encoder.run({"audio_signal": audio_tm, "length": length})
         decoder = RnntGreedyDecoder(self._decoder, self._joint, self._compute_dtype)
-        # The offline encoder emits feature-major (B, d, T); the greedy decoder
-        # consumes the GenAI time-major (B, T, d) layout.
-        enc_tm = np.ascontiguousarray(enc["encoder_output"].transpose(0, 2, 1))
-        tokens = decoder.decode_frames(enc_tm)
+        tokens = decoder.decode_frames(enc["encoder_output"])
         return self._decode_text(tokens)
 
     # -- streaming (real-time) mode ---------------------------------------

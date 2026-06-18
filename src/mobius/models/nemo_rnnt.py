@@ -208,7 +208,7 @@ class ConvSubsampling(nn.Module):
     groups=C) followed by a 1x1 pointwise Conv2d.  All stride-2 convolutions
     use causal padding (left=k-1, right=s-1 on each spatial axis).
 
-    Input:  ``(B, feat_in, T)``
+    Input:  ``(B, T, feat_in)``
     Output: ``(B, T', d_model)`` where ``T' = ceil(T / 8)``
     """
 
@@ -235,8 +235,8 @@ class ConvSubsampling(nn.Module):
         self.out = Linear(conv_channels * freq, d_model)
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        # x: (B, feat_in, T) -> (B, T, feat_in) -> (B, 1, T, feat_in)
-        x = op.Transpose(x, perm=[0, 2, 1])
+        # x: (B, T, feat_in) -> (B, 1, T, feat_in). The encoder works time-major
+        # throughout, so the Conv2d image axes (H=T, W=feat_in) need no transpose.
         x = op.Unsqueeze(x, op.Constant(value_ints=[1]))
         for layer in self.conv:
             x = layer(op, x)
@@ -679,13 +679,17 @@ class FastConformerEncoder(nn.Module):
     ):
         """FastConformer encoder forward.
 
-        Offline (no cache args): consumes the full feature sequence and returns
-        ``(encoder_output (B, d, T'), encoder_length (B,))``.
+        All tensors are time-major (``(B, T, ...)``), matching the encoder's
+        internal representation and the ORT GenAI ``nemotron_speech`` contract.
+
+        Offline (no cache args): consumes the full feature sequence
+        ``audio_signal (B, T, feat_in)`` and returns ``(encoder_output (B, T', d),
+        encoder_length (B,))``.
 
         Cache-aware streaming (cache args given): consumes a single feature
-        chunk plus NeMo's per-layer caches and returns ``(encoder_output,
-        encoder_length, cache_last_channel_next, cache_last_time_next,
-        cache_last_channel_len_next)``.
+        chunk plus NeMo's per-layer batch-first caches and returns
+        ``(encoder_output (B, T', d), encoder_length, cache_last_channel_next,
+        cache_last_time_next, cache_last_channel_len_next)``.
         """
         if cache_last_channel is not None:
             return self._forward_streaming(
@@ -719,8 +723,7 @@ class FastConformerEncoder(nn.Module):
         # NeMo, which masks padded encoder outputs to zero).
         zero = _scalar_like(op, 0.0, x)
         x = op.Where(op.Unsqueeze(valid, op.Constant(value_ints=[2])), x, zero)
-        # (B, T', d) -> (B, d, T')
-        return op.Transpose(x, perm=[0, 2, 1]), enc_len
+        return x, enc_len  # (B, T', d), (B,)
 
     def _forward_streaming(
         self,
@@ -733,17 +736,18 @@ class FastConformerEncoder(nn.Module):
     ) -> tuple[ir.Value, ir.Value, ir.Value, ir.Value, ir.Value]:
         """Cache-aware streaming step over a single feature chunk.
 
-        Inputs (NeMo ``ConformerEncoder.forward`` streaming signature):
+        All tensors are time-major / batch-first (the encoder's internal layout
+        and the ORT GenAI ``nemotron_speech`` contract):
 
-        * ``audio_signal``           ``(B, feat_in, T_chunk)``
+        * ``audio_signal``           ``(B, T_chunk, feat_in)``
         * ``length``                 ``(B,)`` valid feature frames per sample
-        * ``cache_last_channel``     ``(L, B, cache_size, d)`` per-layer attention cache
-        * ``cache_last_time``        ``(L, B, d, k-1)`` per-layer conv cache
+        * ``cache_last_channel``     ``(B, L, cache_size, d)`` per-layer attn cache
+        * ``cache_last_time``        ``(B, L, d, k-1)`` per-layer conv cache
         * ``cache_last_channel_len`` ``(B,)`` populated cache length per sample
 
-        Returns ``(encoder_output (B, d, T_out), encoder_length (B,),
-        cache_last_channel_next, cache_last_time_next,
-        cache_last_channel_len_next)``.
+        Returns ``(encoder_output (B, T_out, d), encoder_length (B,),
+        cache_last_channel_next (B, L, cache_size, d),
+        cache_last_time_next (B, L, d, k-1), cache_last_channel_len_next)``.
         """
         de = self._drop_extra
         cache_size = self._cache_size
@@ -770,23 +774,24 @@ class FastConformerEncoder(nn.Module):
         new_channels = []
         new_times = []
         for i, layer in enumerate(self.layers):
+            # Caches are batch-first ``(B, L, ...)``; slice the layer axis (1).
             ch = op.Squeeze(
                 op.Slice(
                     cache_last_channel,
                     op.Constant(value_ints=[i]),
                     op.Constant(value_ints=[i + 1]),
-                    op.Constant(value_ints=[0]),
+                    op.Constant(value_ints=[1]),
                 ),
-                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
             )  # (B, cache_size, d)
             ct = op.Squeeze(
                 op.Slice(
                     cache_last_time,
                     op.Constant(value_ints=[i]),
                     op.Constant(value_ints=[i + 1]),
-                    op.Constant(value_ints=[0]),
+                    op.Constant(value_ints=[1]),
                 ),
-                op.Constant(value_ints=[0]),
+                op.Constant(value_ints=[1]),
             )  # (B, d, k-1)
             x, nch, nct = layer(
                 op,
@@ -797,17 +802,16 @@ class FastConformerEncoder(nn.Module):
                 cache_time=ct,
                 cache_len=cache_size,
             )
-            new_channels.append(op.Unsqueeze(nch, op.Constant(value_ints=[0])))
-            new_times.append(op.Unsqueeze(nct, op.Constant(value_ints=[0])))
-        cache_channel_next = op.Concat(*new_channels, axis=0)  # (L, B, cache_size, d)
-        cache_time_next = op.Concat(*new_times, axis=0)  # (L, B, d, k-1)
+            new_channels.append(op.Unsqueeze(nch, op.Constant(value_ints=[1])))
+            new_times.append(op.Unsqueeze(nct, op.Constant(value_ints=[1])))
+        cache_channel_next = op.Concat(*new_channels, axis=1)  # (B, L, cache_size, d)
+        cache_time_next = op.Concat(*new_times, axis=1)  # (B, L, d, k-1)
         # Grow the populated cache length by this chunk's frame count, capped.
         new_len = op.Min(
             op.Add(cache_last_channel_len, op.Squeeze(tq)),
             op.Constant(value=ir.tensor(np.int64(cache_size))),
         )
-        out = op.Transpose(x, perm=[0, 2, 1])  # (B, d, T_out)
-        return out, length_sub, cache_channel_next, cache_time_next, new_len
+        return x, length_sub, cache_channel_next, cache_time_next, new_len  # (B, T_out, d)
 
 
 # ---------------------------------------------------------------------------
@@ -920,12 +924,11 @@ class RNNTJoint(nn.Module):
         encoder_outputs: ir.Value,
         decoder_outputs: ir.Value,
     ) -> ir.Value:
-        # encoder_outputs: (B, d_model, T') -> (B, T', d_model)
-        f = op.Transpose(encoder_outputs, perm=[0, 2, 1])
-        f = self.enc(op, f)  # (B, T', d_joint)
-        # decoder_outputs: (B, d_pred, U) -> (B, U, d_pred)
-        g = op.Transpose(decoder_outputs, perm=[0, 2, 1])
-        g = self.pred(op, g)  # (B, U, d_joint)
+        # Inputs are time-major (the encoder/prediction outputs and the ORT
+        # GenAI joiner contract), so the projections apply directly to the last
+        # (feature) axis with no transpose.
+        f = self.enc(op, encoder_outputs)  # (B, T', d_joint)
+        g = self.pred(op, decoder_outputs)  # (B, U, d_joint)
         f = op.Unsqueeze(f, op.Constant(value_ints=[2]))  # (B, T', 1, d_joint)
         g = op.Unsqueeze(g, op.Constant(value_ints=[1]))  # (B, 1, U, d_joint)
         x = op.Relu(op.Add(f, g))  # (B, T', U, d_joint)

@@ -75,16 +75,17 @@ def test_encoder_io_shapes():
     sess = _session(pkg["encoder"])
     assert [i.name for i in sess.get_inputs()] == ["audio_signal", "length"]
     t = 50
-    feats = np.random.randn(1, config.fastconformer_feat_in, t).astype(np.float32)
+    feats = np.random.randn(1, t, config.fastconformer_feat_in).astype(np.float32)
     length = np.array([t], dtype=np.int64)
     out, enc_len = sess.run(None, {"audio_signal": feats, "length": length})
     # 8x causal subsampling: each stride-2 stage maps n -> n // 2 + 1
     expected_t = t
     for _ in range(3):
         expected_t = expected_t // 2 + 1
+    # Time-major output (B, T', d).
     assert out.shape[0] == 1
-    assert out.shape[1] == config.hidden_size
-    assert out.shape[2] == expected_t
+    assert out.shape[1] == expected_t
+    assert out.shape[2] == config.hidden_size
     assert enc_len.tolist() == [expected_t]
 
 
@@ -182,7 +183,7 @@ def test_encoder_supports_batch(batch):
     config, pkg = _build()
     sess = _session(pkg["encoder"])
     t = 40
-    feats = np.random.randn(batch, config.fastconformer_feat_in, t).astype(np.float32)
+    feats = np.random.randn(batch, t, config.fastconformer_feat_in).astype(np.float32)
     length = np.full((batch,), t, dtype=np.int64)
     out, enc_len = sess.run(None, {"audio_signal": feats, "length": length})
     assert out.shape[0] == batch
@@ -200,7 +201,7 @@ def test_encoder_padding_mask_consistency():
     rng = np.random.default_rng(0)
     feat = config.fastconformer_feat_in
     short_t, long_t = 24, 56
-    short = rng.standard_normal((1, feat, short_t)).astype(np.float32)
+    short = rng.standard_normal((1, short_t, feat)).astype(np.float32)
 
     # Run the short sample alone.
     solo, solo_len = sess.run(
@@ -208,9 +209,9 @@ def test_encoder_padding_mask_consistency():
     )
 
     # Pad the short sample into a 2-sample batch and declare its true length.
-    other = rng.standard_normal((1, feat, long_t)).astype(np.float32)
+    other = rng.standard_normal((1, long_t, feat)).astype(np.float32)
     padded_short = np.concatenate(
-        [short, np.zeros((1, feat, long_t - short_t), dtype=np.float32)], axis=2
+        [short, np.zeros((1, long_t - short_t, feat), dtype=np.float32)], axis=1
     )
     batch = np.concatenate([padded_short, other], axis=0)
     lengths = np.array([short_t, long_t], dtype=np.int64)
@@ -218,7 +219,7 @@ def test_encoder_padding_mask_consistency():
 
     valid = int(solo_len[0])
     assert int(batched_len[0]) == valid
-    np.testing.assert_allclose(batched[0, :, :valid], solo[0, :, :valid], atol=1e-4)
+    np.testing.assert_allclose(batched[0, :valid, :], solo[0, :valid, :], atol=1e-4)
 
 
 @pytest.mark.parametrize(
