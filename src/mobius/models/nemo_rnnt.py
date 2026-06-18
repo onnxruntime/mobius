@@ -259,15 +259,21 @@ class ConvSubsampling(nn.Module):
 class RelPositionMultiHeadAttention(nn.Module):
     """Transformer-XL relative-position multi-head attention (NeMo ``rel_pos``).
 
-    Implements the non-SDPA path::
+    Computes NeMo's relative-position scores::
 
         matrix_ac = (q + pos_bias_u) @ k^T
-        matrix_bd = rel_shift((q + pos_bias_v) @ p^T)[..., :T]
+        matrix_bd = rel_shift((q + pos_bias_v) @ p^T)[..., :Tk]
         scores    = (matrix_ac + matrix_bd) / sqrt(d_k)
 
     where ``p = linear_pos(pos_emb)`` are the projected relative position
-    embeddings.  ``att_bias`` is a boolean keep-mask broadcast to
-    ``(1, 1, T, T)`` (True = attend).
+    embeddings.  The ``matrix_ac`` term is evaluated by the fused opset-23
+    ``op.Attention`` op (with ``pos_bias_u`` folded into the query and the
+    ``1/sqrt(d_k)`` scale applied internally); the data-dependent ``matrix_bd``
+    term plus the boolean keep-mask (``att_bias``, broadcast to
+    ``(B, 1, Tq, Tk)``, True = attend) are combined into the additive attention
+    bias passed to that op.  This is standard MHA (equal Q/KV heads), so GQA is
+    not applicable, and the relative-position bias is not expressible by the
+    fused GroupQueryAttention op.
     """
 
     def __init__(self, d_model: int, n_heads: int):
@@ -339,52 +345,61 @@ class RelPositionMultiHeadAttention(nn.Module):
         pos_emb: ir.Value,
         att_bias: ir.Value,
     ) -> ir.Value:
-        q = self._split_heads(op, self.linear_q(op, q_x))  # (B, Tq, h, d_k)
-        k = self._split_heads(op, self.linear_k(op, kv_x))  # (B, Tk, h, d_k)
-        v = self._split_heads(op, self.linear_v(op, kv_x))
-        # to (B, h, Tk, d_k)
-        k = op.Transpose(k, perm=[0, 2, 1, 3])
-        v = op.Transpose(v, perm=[0, 2, 1, 3])
+        scale = 1.0 / math.sqrt(self.d_k)
+        # Q/K/V stay 3-D ``(B, T, d_model)``; op.Attention does the internal
+        # head split, scaled dot-product, softmax and output reshape.
+        q = self.linear_q(op, q_x)  # (B, Tq, d_model)
+        k = self.linear_k(op, kv_x)  # (B, Tk, d_model)
+        v = self.linear_v(op, kv_x)  # (B, Tk, d_model)
 
+        # matrix_ac path: fold the learned content bias ``pos_bias_u`` into the
+        # query so op.Attention's Q @ K^T computes ``(q + pos_bias_u) @ k^T``.
+        # pos_bias_u is per-head ``(h, d_k)``; flattened to ``(d_model,)`` it
+        # aligns with op.Attention's head-major reshape of ``(B, T, h*d_k)``.
+        pos_bias_u_flat = op.Reshape(
+            self.pos_bias_u, op.Constant(value_ints=[self.h * self.d_k])
+        )
+        q_u = op.Add(q, pos_bias_u_flat)  # (B, Tq, d_model)
+
+        # matrix_bd path (Transformer-XL relative position term). This is a
+        # data-dependent additive bias that op.Attention cannot express, so it
+        # is computed head-split here and passed in as the attention bias.
+        q_split = self._split_heads(op, q)  # (B, Tq, h, d_k)
+        bias_v = op.Reshape(self.pos_bias_v, op.Constant(value_ints=[1, 1, self.h, self.d_k]))
+        q_v = op.Transpose(op.Add(q_split, bias_v), perm=[0, 2, 1, 3])  # (B, h, Tq, d_k)
         # p = linear_pos(pos_emb): (1, L, d_model) -> (1, h, L, d_k)
         p = self._split_heads(op, self.linear_pos(op, pos_emb))
         p = op.Transpose(p, perm=[0, 2, 1, 3])
-
-        # pos_bias_* broadcast over (B, T): reshape to (1, 1, h, d_k)
-        bias_u = op.Reshape(self.pos_bias_u, op.Constant(value_ints=[1, 1, self.h, self.d_k]))
-        bias_v = op.Reshape(self.pos_bias_v, op.Constant(value_ints=[1, 1, self.h, self.d_k]))
-        q_u = op.Transpose(op.Add(q, bias_u), perm=[0, 2, 1, 3])  # (B, h, T, d_k)
-        q_v = op.Transpose(op.Add(q, bias_v), perm=[0, 2, 1, 3])
-
-        # matrix_ac: (B, h, T, T)
-        matrix_ac = op.MatMul(q_u, op.Transpose(k, perm=[0, 1, 3, 2]))
-        # matrix_bd: (B, h, T, L) -> rel_shift -> slice to T
-        matrix_bd = op.MatMul(q_v, op.Transpose(p, perm=[0, 1, 3, 2]))
+        matrix_bd = op.MatMul(q_v, op.Transpose(p, perm=[0, 1, 3, 2]))  # (B, h, Tq, L)
         matrix_bd = self._rel_shift(op, matrix_bd)
-        t = _dim(op, matrix_ac, 3)
+        tk = _dim(op, k, 1)
         matrix_bd = op.Slice(
             matrix_bd,
             op.Constant(value_ints=[0]),
-            t,
+            tk,
             op.Constant(value_ints=[3]),
-        )
+        )  # (B, h, Tq, Tk)
+        # op.Attention adds the bias *after* scaling Q @ K^T, so pre-scale the
+        # relative term to live in the same scaled domain as the content scores.
+        bd_scaled = op.Mul(matrix_bd, _scalar_like(op, scale, matrix_bd))
 
-        scale = _scalar_like(op, 1.0 / math.sqrt(self.d_k), matrix_ac)
-        scores = op.Mul(op.Add(matrix_ac, matrix_bd), scale)
+        # Fold the boolean keep-mask into the same additive bias: disallowed
+        # positions get a large negative value so they vanish after softmax
+        # (matching NeMo's -INF_VAL score masking).
+        zero = _scalar_like(op, 0.0, bd_scaled)
+        neg_inf = _scalar_like(op, _NEG_INF, bd_scaled)
+        mask_add = op.Where(att_bias, zero, neg_inf)  # (B, 1, Tq, Tk)
+        attn_bias = op.Add(bd_scaled, mask_add)  # (B, h, Tq, Tk)
 
-        # Apply keep-mask: where not allowed, set score to -INF_VAL
-        neg_inf = _scalar_like(op, _NEG_INF, scores)
-        scores = op.Where(att_bias, scores, neg_inf)
-        attn = op.Softmax(scores, axis=-1)
-
-        out = op.MatMul(attn, v)  # (B, h, T, d_k)
-        out = op.Transpose(out, perm=[0, 2, 1, 3])  # (B, T, h, d_k)
-        b = _dim(op, out, 0)
-        tt = _dim(op, out, 1)
-        out = op.Reshape(
-            out,
-            op.Concat(b, tt, op.Constant(value_ints=[self.h * self.d_k]), axis=0),
-        )
+        out = op.Attention(
+            q_u,
+            k,
+            v,
+            attn_bias,
+            q_num_heads=self.h,
+            kv_num_heads=self.h,
+            scale=scale,
+        )  # (B, Tq, d_model)
         return self.linear_out(op, out)
 
 
