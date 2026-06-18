@@ -8,17 +8,20 @@ Replicates NVIDIA NeMo's ``EncDecRNNTBPEModel`` (e.g.
 FastConformer encoder paired with an RNN-T (transducer) prediction +
 joint network.
 
-The architecture is split into three ONNX sub-models (see
-:class:`mobius.tasks._rnnt.RNNTTask`):
+The architecture is split into ONNX sub-models (see
+:class:`mobius.tasks._rnnt.RNNTTask`). All graph I/O is **time-major /
+batch-first** — the encoder's native internal layout, which is also the layout
+required by the ONNX Runtime GenAI ``nemotron_speech`` pipeline — except the
+``decoder`` prediction output, which stays feature-major per that contract:
 
-* ``encoder`` — mel features ``(B, feat_in, T)`` → encoded ``(B, d_model, T')``.
+* ``encoder`` — mel features ``(B, T, feat_in)`` → encoded ``(B, T', d_model)``.
   A FastConformer encoder: causal depthwise-striding Conv2d subsampling
   (8x time reduction) followed by ``num_hidden_layers`` Conformer blocks with
   Transformer-XL relative-position multi-head attention, Macaron-style
   feed-forwards, and a causal depthwise convolution module.
 * ``decoder`` — token ids ``(B, U)`` + LSTM state → prediction ``(B, d_pred, U)``.
   An embedding followed by a multi-layer LSTM ("prediction network").
-* ``joint`` — encoder ``(B, d_model, T')`` + prediction ``(B, d_pred, U)`` →
+* ``joint`` — encoder ``(B, T', d_model)`` + prediction ``(B, U, d_pred)`` →
   logits ``(B, T', U, vocab+1)``.  Combines the two projections and applies
   the joint network.
 
@@ -209,7 +212,9 @@ class ConvSubsampling(nn.Module):
     use causal padding (left=k-1, right=s-1 on each spatial axis).
 
     Input:  ``(B, T, feat_in)``
-    Output: ``(B, T', d_model)`` where ``T' = ceil(T / 8)``
+    Output: ``(B, T', d_model)`` where ``T'`` follows NeMo's per-stage causal
+            length rule ``n -> n // 2 + 1`` applied three times (not exactly
+            ``ceil(T / 8)``).
     """
 
     def __init__(self, feat_in: int, conv_channels: int, d_model: int):

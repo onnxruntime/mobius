@@ -357,13 +357,14 @@ def _cmd_build_nemo(args: argparse.Namespace) -> None:
         nemo_path,
         dtype=args.dtype,
         execution_provider=args.execution_provider,
+        revision=getattr(args, "revision", None),
     )
 
     if getattr(args, "genai", False):
         from mobius.integrations.nemo import write_genai_bundle
         from mobius.integrations.nemo._reader import NeMoArchive
 
-        archive = NeMoArchive(nemo_path)
+        archive = NeMoArchive(nemo_path, revision=getattr(args, "revision", None))
         out = write_genai_bundle(
             pkg,
             archive,
@@ -642,7 +643,19 @@ def main(argv: list[str] | None = None) -> None:
         "--dtype",
         choices=sorted(DTYPE_MAP),
         default=None,
-        help="Target dtype for model weights (FastConformer-RNNT supports float32 only).",
+        help=(
+            "Target dtype for model weights (f32/f16/bf16). Note: the GenAI "
+            "bundle (--genai) is float32 only, per the nemotron_speech runtime."
+        ),
+    )
+    nemo_parser.add_argument(
+        "--revision",
+        default=None,
+        metavar="REV",
+        help=(
+            "HuggingFace Hub revision (branch, tag, or commit SHA) to pin "
+            "downloads for reproducible builds. Ignored for local .nemo paths."
+        ),
     )
     nemo_parser.add_argument(
         "--external-data",

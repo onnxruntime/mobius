@@ -398,7 +398,7 @@ def test_genai_bundle_layout_and_load():
             assert "\u2581" not in decoded
             assert " " in decoded  # two word-start tokens -> a space between
         except ImportError:
-            pass
+            pytest.skip("tokenizers is not installed; skipping Metaspace decode check")
 
         # Smoke-test loading with onnxruntime_genai when present.
         try:

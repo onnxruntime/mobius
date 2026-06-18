@@ -4573,14 +4573,14 @@ class TestBuildJambaGraph:
 # Model types exercised by non-parametrized test classes above (VLM,
 # whisper, audio, TTS, diffusion, etc.).  Keep sorted for readability.
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
-    # FastConformer-RNNT (co-located src/mobius/models/nemo_rnnt_test.py)
-    "fastconformer_rnnt",
     # VLM alias tests (test_llava_aliases_build)
     "aya_vision",
     "chameleon",
     "cohere2_vision",
     "deepseek_vl",
     "deepseek_vl_hybrid",
+    # FastConformer-RNNT (co-located src/mobius/models/nemo_rnnt_test.py)
+    "fastconformer_rnnt",
     "florence2",
     "fuyu",
     "glm4v",

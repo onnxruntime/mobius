@@ -17,12 +17,9 @@ now.  The relevant NeMo config sub-trees are::
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from mobius._configs import ArchitectureConfig
-
-logger = logging.getLogger(__name__)
 
 # NeMo ``target`` class path → mobius registry model_type.
 NEMO_TARGET_TO_MODEL_TYPE: dict[str, str] = {

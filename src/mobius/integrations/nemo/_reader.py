@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import tarfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -61,8 +62,9 @@ def _resolve_nemo_path(nemo_path: str | Path, revision: str | None = None) -> st
     from huggingface_hub import HfApi, hf_hub_download
 
     raw = str(nemo_path)
-    if Path(raw).exists():
-        return raw
+    expanded = os.path.expanduser(raw)
+    if Path(expanded).exists():
+        return expanded
 
     repo_id, _, filename = raw.partition(":")
     if not _looks_like_hf_repo_id(repo_id):
@@ -191,8 +193,21 @@ class NeMoArchive:
             raise ValueError(
                 f"{self.path!r} does not contain {_WEIGHTS_NAME}; is it a valid .nemo archive?"
             )
-        raw = self.read_file(_WEIGHTS_NAME)
-        obj = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+        # Stream weights straight from the tar member to avoid buffering the
+        # entire (multi-GB) checkpoint in memory. ``torch.load`` needs a
+        # seekable stream for zip-format checkpoints; an uncompressed tar member
+        # is seekable, so fall back to a buffered read only when it is not
+        # (e.g. a compressed ``.tar.gz`` archive).
+        member = self._members[_WEIGHTS_NAME]
+        with tarfile.open(self.path, mode="r:*") as tar:
+            extracted = tar.extractfile(member)
+            assert extracted is not None
+            if extracted.seekable():
+                obj = torch.load(extracted, map_location="cpu", weights_only=True)
+            else:
+                obj = torch.load(
+                    io.BytesIO(extracted.read()), map_location="cpu", weights_only=True
+                )
         # NeMo checkpoints are usually a bare state_dict, but tolerate the
         # Lightning-style {"state_dict": {...}} wrapper too.
         if isinstance(obj, dict) and "state_dict" in obj and "encoder" not in obj:

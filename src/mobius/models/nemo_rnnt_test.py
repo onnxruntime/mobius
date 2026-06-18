@@ -51,7 +51,7 @@ def _build():
 
 def _session(model: ir.Model) -> ort.InferenceSession:
     _fill_random_weights(model)
-    proto = ir.to_proto(model)
+    proto = ir.serde.serialize_model(model)
     return ort.InferenceSession(proto.SerializeToString(), providers=["CPUExecutionProvider"])
 
 
