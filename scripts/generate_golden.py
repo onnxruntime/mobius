@@ -1364,8 +1364,8 @@ def _generate_gemma4_assistant(case: TestCase, json_path: Path, device: str) -> 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from mobius._testing.golden import (
-        assistant_inputs_path_for_case,
-        save_assistant_inputs,
+        drafter_inputs_path_for_case,
+        save_drafter_inputs,
         save_generation_json,
         save_golden_ref,
     )
@@ -1477,7 +1477,128 @@ def _generate_gemma4_assistant(case: TestCase, json_path: Path, device: str) -> 
     for lt, (key, value) in round1[0]["shared_kv"].items():
         arrays[f"skv_key_{lt}"] = key
         arrays[f"skv_val_{lt}"] = value
-    save_assistant_inputs(assistant_inputs_path_for_case(case), arrays)
+    save_drafter_inputs(drafter_inputs_path_for_case(case), arrays)
+
+
+def _generate_dflash_draft(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a DFlash speculative-decoding drafter.
+
+    The drafter consumes ``noise_embedding`` + multi-layer ``target_hidden`` + a
+    KV cache (not ``input_ids``) and outputs ``draft_hidden`` (decoded through the
+    target ``lm_head`` to get draft logits). We capture the first draft block of
+    the reference ``spec_generate`` loop by hooking the drafter, recording its
+    inputs and the reference ``draft_hidden``.
+
+    L4 is a hidden-state parity check: ``draft_hidden``'s last-token vector is
+    treated as the logit vector for the argmax + cosine gate (mirroring the
+    encoder / feature-extraction golden path). No L5 — the drafted token
+    sequence would require the target ``lm_head`` and the block-diffusion loop.
+
+    Artefacts:
+      - ``<name>.json``        L4: top-k of the first block's last-token hidden.
+      - ``<name>_inputs.npz``  replay tensors for the drafter ONNX graph.
+    """
+    import torch
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+    from mobius._testing.golden import (
+        drafter_inputs_path_for_case,
+        save_drafter_inputs,
+        save_golden_ref,
+    )
+
+    drafter_id = case.model_id
+    target_id = case.generation_params.get("target_model_id")
+    if not target_id:
+        raise ValueError(
+            "dflash-draft golden requires generation.target_model_id (the paired "
+            "target that supplies target_hidden)."
+        )
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+
+    tok = AutoTokenizer.from_pretrained(target_id)
+    target = (
+        AutoModelForCausalLM.from_pretrained(
+            target_id, torch_dtype=torch_dtype, attn_implementation="eager"
+        )
+        .to(device)
+        .eval()
+    )
+    drafter = (
+        AutoModel.from_pretrained(
+            drafter_id, trust_remote_code=True, torch_dtype=torch_dtype, attn_implementation="eager"
+        )
+        .to(device)
+        .eval()
+    )
+
+    captured: list[dict] = []
+
+    def _hook(_module, _args, kwargs, output):
+        hidden = (
+            output.last_hidden_state
+            if hasattr(output, "last_hidden_state")
+            else (output[0] if isinstance(output, tuple) else output)
+        )
+        captured.append(
+            {
+                "noise_embedding": kwargs["noise_embedding"].detach().float().cpu().numpy(),
+                "target_hidden": kwargs["target_hidden"].detach().float().cpu().numpy(),
+                "position_ids": kwargs["position_ids"].detach().cpu().numpy().astype(np.int64),
+                "draft_hidden": hidden.detach().float().cpu().numpy(),
+            }
+        )
+
+    handle = drafter.register_forward_hook(_hook, with_kwargs=True)
+    input_ids = tok(case.prompts[0], return_tensors="pt").input_ids.to(device)
+    stop = [tok.eos_token_id] if tok.eos_token_id is not None else None
+    with torch.inference_mode():
+        drafter.spec_generate(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=case.generation_params.get("max_new_tokens", 16),
+            stop_token_ids=stop,
+            temperature=0.0,
+        )
+    handle.remove()
+
+    if not captured:
+        raise RuntimeError("Drafter was never invoked during spec_generate.")
+
+    first = captured[0]
+    draft_hidden = first["draft_hidden"]
+    last_hidden = draft_hidden[0, -1, :].astype(np.float64)
+    golden = _extract_logits_golden(last_hidden)
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids.cpu().numpy(),
+        component_norms={"draft_hidden": float(np.linalg.norm(draft_hidden))},
+        component_shapes={"draft_hidden": tuple(int(x) for x in draft_hidden.shape)},
+    )
+
+    # Replay tensors: the drafter ONNX splits the reference's single position_ids
+    # into position_ids ([ctx + q]) and q_position_ids (last q). The first block
+    # call starts from an empty draft KV cache (the test supplies zero-length past
+    # tensors sized from the config).
+    pos = first["position_ids"]
+    q_len = first["noise_embedding"].shape[1]
+    arrays = {
+        "noise_embedding": first["noise_embedding"],
+        "target_hidden": first["target_hidden"],
+        "position_ids": pos,
+        "q_position_ids": pos[:, -q_len:],
+    }
+    save_drafter_inputs(drafter_inputs_path_for_case(case), arrays)
 
 
 # ---- Dispatcher ----
@@ -1500,6 +1621,7 @@ _GENERATORS = {
     "object-detection": _generate_object_detection,
     "phi4mm-multimodal": _generate_phi4mm_multimodal,
     "gemma4-assistant": _generate_gemma4_assistant,
+    "dflash-draft": _generate_dflash_draft,
 }
 
 

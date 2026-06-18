@@ -46,6 +46,7 @@
         "codec",
         "ctc-asr",
         "depth-estimation",
+        "dflash-draft",
         "feature-extraction",
         "fun-asr-speech-language",
         "gemma4-assistant",
@@ -137,6 +138,10 @@
         "lang": {
           "type": "string",
           "description": "Target language code for multilingual models (e.g. MMS uses ISO-639-3 codes like 'eng' to pick the per-language adapter)."
+        },
+        "target_model_id": {
+          "type": "string",
+          "description": "Paired target model HF ID for speculative-decoding drafter tasks (e.g. dflash-draft): the target supplies the hidden states / shared KV used to build the drafter's golden inputs at generation time. Only read by generate_golden.py; the e2e test replays stored tensors and never loads the target."
         }
       },
       "additionalProperties": false,

@@ -436,7 +436,7 @@ def load_generation_golden(
     return [int(t) for t in data["generated_tokens"]]
 
 
-def assistant_inputs_path_for_case(
+def drafter_inputs_path_for_case(
     case: GoldenTestCase,
     golden_dir: Path = GOLDEN_DIR,
 ) -> Path:
@@ -454,19 +454,19 @@ def assistant_inputs_path_for_case(
     return golden_dir / task_dir / f"{case.case_id}_inputs.npz"
 
 
-def save_assistant_inputs(path: Path, arrays: dict[str, np.ndarray]) -> None:
+def save_drafter_inputs(path: Path, arrays: dict[str, np.ndarray]) -> None:
     """Save a drafter test case's input tensors to a ``.npz`` archive."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **arrays)
 
 
-def load_assistant_inputs(
+def load_drafter_inputs(
     case: GoldenTestCase,
     golden_dir: Path = GOLDEN_DIR,
 ) -> dict[str, np.ndarray] | None:
     """Load a drafter test case's input tensors, or ``None`` if missing."""
-    path = assistant_inputs_path_for_case(case, golden_dir)
+    path = drafter_inputs_path_for_case(case, golden_dir)
     if not path.exists():
         return None
     with np.load(path, allow_pickle=False) as data:

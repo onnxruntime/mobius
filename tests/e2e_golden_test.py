@@ -37,7 +37,7 @@ from mobius._testing.golden import (
     generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
-    load_assistant_inputs,
+    load_drafter_inputs,
     load_generation_golden,
     load_golden_ref,
     load_tolerances,
@@ -472,6 +472,10 @@ def _extract_logits(
     """
     if "logits" in outputs:
         return outputs["logits"]
+    if task_type == "dflash-draft" and "draft_hidden" in outputs:
+        # DFlash outputs draft_hidden (pre-lm_head). Treat it as the logit
+        # vector for the argmax gate (mirrors the hidden-state task handling).
+        return outputs["draft_hidden"]
     if task_type in _HIDDEN_STATE_TASKS and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
@@ -1562,7 +1566,7 @@ def _run_gemma4_assistant_prefill(
     case: GoldenTestCase,
 ) -> dict[str, np.ndarray]:
     """Run the assistant ONNX on the first draft step and return its outputs."""
-    inputs = load_assistant_inputs(case)
+    inputs = load_drafter_inputs(case)
     if inputs is None:
         pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
     session = _open_decoder_session(pkg)
@@ -1582,7 +1586,7 @@ def _run_gemma4_assistant_generation(
     Feeds each captured step's ``inputs_embeds`` (with the fixed shared KV and
     position) and collects the per-step argmax — the drafted token sequence.
     """
-    inputs = load_assistant_inputs(case)
+    inputs = load_drafter_inputs(case)
     if inputs is None:
         pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
     num_steps = inputs["inputs_embeds"].shape[0]
@@ -1596,6 +1600,41 @@ def _run_gemma4_assistant_generation(
     finally:
         session.close()
     return np.array(tokens, dtype=np.int64)
+
+
+def _run_dflash_draft_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the DFlash drafter ONNX on the first block and return its outputs.
+
+    Replay tensors (noise_embedding, target_hidden, position_ids, q_position_ids)
+    are captured from the reference spec_generate loop; the first block starts
+    from an empty draft KV cache (zero-length past tensors sized from the config).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["noise_embedding"].shape[0])
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "noise_embedding": inputs["noise_embedding"].astype(np.float32),
+            "target_hidden": inputs["target_hidden"].astype(np.float32),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+            "q_position_ids": inputs["q_position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1679,8 @@ class TestL4CheckpointVerified:
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
         elif case.task_type == "gemma4-assistant":
             outputs = _run_gemma4_assistant_prefill(pkg, case)
+        elif case.task_type == "dflash-draft":
+            outputs = _run_dflash_draft_prefill(pkg, case)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
