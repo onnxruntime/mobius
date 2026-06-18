@@ -154,10 +154,15 @@ class RnntGreedyDecoder:
         self.reset()
 
     def reset(self) -> None:
-        """Reset LSTM state and prime with the start-of-sequence embedding."""
+        """Reset LSTM state and prime with the start-of-sequence embedding.
+
+        The prediction network is advanced once on the SOS label; both its
+        output and the resulting LSTM state are kept so the first real token
+        is conditioned on the post-SOS state (matching NeMo ``add_sos=True``).
+        """
         self._h = np.zeros((PRED_LAYERS, 1, PRED_HIDDEN), dtype=self._np_dtype)
         self._c = np.zeros((PRED_LAYERS, 1, PRED_HIDDEN), dtype=self._np_dtype)
-        self._g = self._predict(SOS_ID)[0]
+        self._g, self._h, self._c = self._predict(SOS_ID)
 
     def _predict(self, token: int):
         out = self._decoder.run(
@@ -219,7 +224,10 @@ class FastConformerRnntPipeline:
         self._compute_dtype = self._signal_dtype
 
         self._frontend = MelFrontend()
-        self._tokenizer = _load_tokenizer(model_id, revision)
+        # Hold the tokenizer temp dir on the instance so it lives as long as
+        # the pipeline (and is cleaned up when the pipeline is collected).
+        self._tok_tmpdir = tempfile.TemporaryDirectory(prefix="nemo_tok_")
+        self._tokenizer = _load_tokenizer(model_id, revision, self._tok_tmpdir.name)
         # drop_extra_pre_encoded (subsampled frames) governs the left-context
         # overlap a streaming caller must prepend to each chunk.
         self._drop_extra = int(getattr(pkg.config, "fastconformer_streaming_drop_extra", 2))
@@ -320,12 +328,11 @@ class FastConformerRnntPipeline:
 # ---------------------------------------------------------------------------
 
 
-def _load_tokenizer(model_id: str, revision: str):
+def _load_tokenizer(model_id: str, revision: str, dest_dir: str):
     import sentencepiece as spm
 
     archive = NeMoArchive(model_id, revision=revision)
-    tmpdir = tempfile.mkdtemp(prefix="nemo_tok_")
-    written = archive.extract_tokenizer(tmpdir)
+    written = archive.extract_tokenizer(dest_dir)
     model_path = written.get("model_path")
     if model_path is None:
         raise RuntimeError("No SentencePiece tokenizer found in the .nemo archive")
@@ -393,7 +400,9 @@ def _run_microphone(
 
     ch, ct, cl = pipeline._init_caches()
     decoder = RnntGreedyDecoder(pipeline._decoder, pipeline._joint, pipeline._compute_dtype)
-    prev_tail = np.zeros(overlap_samples, dtype=np.float32)
+    # Start with no left context (like the first file-streaming chunk); the
+    # overlap is filled from the previous block on subsequent iterations.
+    prev_tail = np.zeros(0, dtype=np.float32)
     full_tokens: list[int] = []
 
     print("Listening... (Ctrl+C to stop)\n", file=sys.stderr)
@@ -401,8 +410,11 @@ def _run_microphone(
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as stream:
             while True:
                 block, _ = stream.read(chunk_samples)
-                audio = np.concatenate([prev_tail, block[:, 0]])
-                prev_tail = block[-overlap_samples:, 0] if overlap_samples else prev_tail
+                samples = block[:, 0]
+                audio = np.concatenate([prev_tail, samples])
+                # Carry the last ``overlap_samples`` of the running audio as the
+                # next chunk's left context (robust to short blocks).
+                prev_tail = audio[-overlap_samples:] if overlap_samples else prev_tail
                 feats = pipeline._features(audio)
                 length = np.array([feats.shape[2]], dtype=np.int64)
                 out = pipeline._encoder_streaming.run(
@@ -468,6 +480,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--save-to", help="Export ONNX models to this dir and exit")
     args = parser.parse_args(argv)
+
+    if args.chunk_seconds <= 0:
+        parser.error("--chunk-seconds must be positive")
 
     # Export-only fast path: build + save without loading audio/tokenizer.
     if args.save_to and not (args.audio or args.continuous):
