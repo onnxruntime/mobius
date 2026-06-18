@@ -16,5 +16,6 @@ Usage::
 from __future__ import annotations
 
 from mobius.integrations.nemo._builder import build_from_nemo
+from mobius.integrations.nemo._genai_config import write_genai_bundle
 
-__all__ = ["build_from_nemo"]
+__all__ = ["build_from_nemo", "write_genai_bundle"]

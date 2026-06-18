@@ -122,19 +122,19 @@ def test_streaming_encoder_io_and_cache_growth():
             },
         )
 
-    ch0 = np.zeros((layers, 1, cs, d), dtype=np.float32)
-    ct0 = np.zeros((layers, 1, d, conv_cache), dtype=np.float32)
+    ch0 = np.zeros((1, layers, cs, d), dtype=np.float32)
+    ct0 = np.zeros((1, layers, d, conv_cache), dtype=np.float32)
     cl0 = np.zeros((1,), dtype=np.int64)
-    feats = np.random.randn(1, config.fastconformer_feat_in, t).astype(np.float32)
+    feats = np.random.randn(1, t, config.fastconformer_feat_in).astype(np.float32)
     out, enc_len, ch1, ct1, cl1 = step(feats, ch0, ct0, cl0)
-    assert out.shape == (1, d, t_out)
+    assert out.shape == (1, t_out, d)
     assert enc_len.tolist() == [t_out]
-    assert ch1.shape == (layers, 1, cs, d)
-    assert ct1.shape == (layers, 1, d, conv_cache)
+    assert ch1.shape == (1, layers, cs, d)
+    assert ct1.shape == (1, layers, d, conv_cache)
     # Cache length grows by the chunk's frame count, capped at cache_size.
     assert cl1.tolist() == [min(t_out, cs)]
     # Second chunk consumes the updated caches and grows the length again.
-    feats2 = np.random.randn(1, config.fastconformer_feat_in, t).astype(np.float32)
+    feats2 = np.random.randn(1, t, config.fastconformer_feat_in).astype(np.float32)
     _, _, _, _, cl2 = step(feats2, ch1, ct1, cl1)
     assert cl2.tolist() == [min(t_out * 2, cs)]
 
@@ -158,8 +158,9 @@ def test_joint_io_shapes():
     config, pkg = _build()
     sess = _session(pkg["joint"])
     t, u = 6, 4
-    enc = np.random.randn(1, config.hidden_size, t).astype(np.float32)
-    dec = np.random.randn(1, config.rnnt_pred_hidden, u).astype(np.float32)
+    # GenAI layout: time-major frames (B, T, d) / (B, U, d_pred).
+    enc = np.random.randn(1, t, config.hidden_size).astype(np.float32)
+    dec = np.random.randn(1, u, config.rnnt_pred_hidden).astype(np.float32)
     (logits,) = sess.run(None, {"encoder_outputs": enc, "decoder_outputs": dec})
     # (B, T', U, vocab + blank)
     assert logits.shape == (1, t, u, config.rnnt_num_classes + 1)
@@ -168,8 +169,8 @@ def test_joint_io_shapes():
 def test_joint_output_is_log_probs():
     config, pkg = _build()
     sess = _session(pkg["joint"])
-    enc = np.random.randn(1, config.hidden_size, 3).astype(np.float32)
-    dec = np.random.randn(1, config.rnnt_pred_hidden, 2).astype(np.float32)
+    enc = np.random.randn(1, 3, config.hidden_size).astype(np.float32)
+    dec = np.random.randn(1, 2, config.rnnt_pred_hidden).astype(np.float32)
     (logits,) = sess.run(None, {"encoder_outputs": enc, "decoder_outputs": dec})
     # log_softmax over the last axis: exp sums to 1
     probs = np.exp(logits)

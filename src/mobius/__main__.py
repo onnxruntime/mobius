@@ -359,6 +359,21 @@ def _cmd_build_nemo(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
     )
 
+    if getattr(args, "genai", False):
+        from mobius.integrations.nemo import write_genai_bundle
+        from mobius.integrations.nemo._reader import NeMoArchive
+
+        archive = NeMoArchive(nemo_path)
+        out = write_genai_bundle(
+            pkg,
+            archive,
+            output_dir,
+            chunk_seconds=args.chunk_seconds,
+            include_vad=not args.no_vad,
+        )
+        print(f"Saved ONNX Runtime GenAI nemotron_speech bundle to {out}")
+        return
+
     pkg.save(
         output_dir,
         external_data=args.external_data,
@@ -645,6 +660,30 @@ def main(argv: list[str] | None = None) -> None:
             "Target execution provider for EP-aware graph optimisations. "
             "Defaults to 'default' (portable ONNX, no vendor fusions)."
         ),
+    )
+    nemo_parser.add_argument(
+        "--genai",
+        action="store_true",
+        help=(
+            "Write an ONNX Runtime GenAI 'nemotron_speech' bundle (flat "
+            "encoder/decoder/joint ONNX + genai_config.json, "
+            "audio_processor_config.json and tokenizer) instead of the default "
+            "subfolder layout. FastConformer-RNNT only."
+        ),
+    )
+    nemo_parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=1.12,
+        help=(
+            "Streaming chunk length in seconds for the GenAI bundle "
+            "(default: 1.12, the model's native att_context [70, 13] chunk)."
+        ),
+    )
+    nemo_parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        help="Skip the Silero VAD download/config block in the GenAI bundle.",
     )
     nemo_parser.set_defaults(func=_cmd_build_nemo)
 

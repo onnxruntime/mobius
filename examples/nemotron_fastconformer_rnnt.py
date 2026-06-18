@@ -175,15 +175,23 @@ class RnntGreedyDecoder:
         return out["decoder_output"], out["state_h_out"], out["state_c_out"]
 
     def decode_frames(self, encoder_output: np.ndarray) -> list[int]:
-        """Greedily decode an ``(1, d, T)`` encoder chunk into token ids."""
+        """Greedily decode a time-major ``(1, T, d)`` encoder chunk into token ids.
+
+        The encoder frames and the prediction-network output are fed to the
+        joiner in the ONNX Runtime GenAI time-major single-frame layout
+        (``(B, 1, d)`` / ``(B, 1, d_pred)``).
+        """
         tokens: list[int] = []
-        n_frames = encoder_output.shape[2]
+        n_frames = encoder_output.shape[1]
         for t in range(n_frames):
-            enc_t = encoder_output[:, :, t : t + 1]
+            enc_t = encoder_output[:, t : t + 1, :]  # (B, 1, d)
             emitted = 0
             while emitted < MAX_SYMBOLS:
                 logits = self._joint.run(
-                    {"encoder_outputs": enc_t, "decoder_outputs": self._g}
+                    {
+                        "encoder_outputs": enc_t,
+                        "decoder_outputs": np.ascontiguousarray(self._g.transpose(0, 2, 1)),
+                    }
                 )["logits"]
                 k = int(np.argmax(logits.reshape(-1)))
                 if k == BLANK_ID:
@@ -266,7 +274,10 @@ class FastConformerRnntPipeline:
         length = np.array([feats.shape[2]], dtype=np.int64)
         enc = self._encoder.run({"audio_signal": feats, "length": length})
         decoder = RnntGreedyDecoder(self._decoder, self._joint, self._compute_dtype)
-        tokens = decoder.decode_frames(enc["encoder_output"])
+        # The offline encoder emits feature-major (B, d, T); the greedy decoder
+        # consumes the GenAI time-major (B, T, d) layout.
+        enc_tm = np.ascontiguousarray(enc["encoder_output"].transpose(0, 2, 1))
+        tokens = decoder.decode_frames(enc_tm)
         return self._decode_text(tokens)
 
     # -- streaming (real-time) mode ---------------------------------------
@@ -306,9 +317,11 @@ class FastConformerRnntPipeline:
             lo = max(0, start - overlap)
             chunk = feats[:, :, lo:end]
             length = np.array([chunk.shape[2]], dtype=np.int64)
+            # GenAI streaming encoder consumes time-major audio (B, T, mel).
+            audio = np.ascontiguousarray(chunk.transpose(0, 2, 1))
             out = self._encoder_streaming.run(
                 {
-                    "audio_signal": chunk,
+                    "audio_signal": audio,
                     "length": length,
                     "cache_last_channel": ch,
                     "cache_last_time": ct,
@@ -417,9 +430,11 @@ def _run_microphone(
                 prev_tail = audio[-overlap_samples:] if overlap_samples else prev_tail
                 feats = pipeline._features(audio)
                 length = np.array([feats.shape[2]], dtype=np.int64)
+                # GenAI streaming encoder consumes time-major audio (B, T, mel).
+                signal = np.ascontiguousarray(feats.transpose(0, 2, 1))
                 out = pipeline._encoder_streaming.run(
                     {
-                        "audio_signal": feats,
+                        "audio_signal": signal,
                         "length": length,
                         "cache_last_channel": ch,
                         "cache_last_time": ct,

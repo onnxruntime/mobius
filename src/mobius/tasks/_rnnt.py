@@ -10,10 +10,30 @@ Produces these models:
                    chunk encoding + updated caches (cache-aware streaming step)
   - ``"decoder"``: token ids ``(B, U)`` + LSTM state → prediction ``(B, d_pred, U)``
                    + next LSTM state
-  - ``"joint"``:   encoder + prediction → logits ``(B, T', U, vocab+1)``
+  - ``"joint"``:   encoder + prediction frames → logits
 
 The transducer greedy-decode loop (alternating decoder/joint steps with the
 encoder run once) is performed by the runtime, not inside any single graph.
+
+ONNX Runtime GenAI layout
+-------------------------
+The ``"encoder_streaming"``, ``"decoder"`` and ``"joint"`` graphs follow the
+tensor layouts hardcoded by the ONNX Runtime GenAI ``nemotron_speech`` C++
+pipeline so the exported bundle is consumable directly by that runtime:
+
+  - ``"encoder_streaming"`` consumes ``audio_signal`` ``(B, T, feat_in)`` and
+    emits ``encoder_output`` ``(B, T', d_model)`` (time-major), with the running
+    caches in *batch-first* order: ``cache_last_channel`` ``(B, L, cache, d)``
+    and ``cache_last_time`` ``(B, L, d, k-1)``.
+  - ``"joint"`` consumes single encoder/decoder frames ``encoder_outputs``
+    ``(B, 1, d_model)`` and ``decoder_outputs`` ``(B, 1, d_pred)`` and emits
+    ``logits`` ``(B, 1, 1, vocab+1)`` (the runtime flattens for argmax).
+
+The native NeMo-parity layouts (feature-major ``(B, d, T)`` tensors and
+layer-first caches) are kept internally in the model ``forward`` methods; the
+GenAI layouts are applied as transposes at the graph I/O boundary here. The
+offline ``"encoder"`` graph keeps the native feature-major layout (it is not
+part of the GenAI streaming pipeline).
 
 Contract:
   - **Offline full-context** (``"encoder"``): consumes the full mel-feature
@@ -97,11 +117,18 @@ class RNNTTask(ModelTask):
         return _make_model(graph)
 
     def _build_streaming_encoder(self, encoder, config: ArchitectureConfig) -> ir.Model:
-        """Build the cache-aware streaming encoder graph.
+        """Build the cache-aware streaming encoder graph (ORT GenAI layout).
 
         Consumes one feature chunk plus the running attention/conv caches and
         returns the chunk's encoded frames together with the updated caches, so
         a runtime can drive chunk-by-chunk streaming inference.
+
+        I/O follows the ONNX Runtime GenAI ``nemotron_speech`` contract: the
+        ``audio_signal`` is time-major ``(B, T, feat_in)``, the ``encoder_output``
+        is time-major ``(B, T', d_model)``, and the caches are batch-first
+        (``(B, L, cache, d)`` / ``(B, L, d, k-1)``). These are adapted to the
+        model's native feature-major / layer-first layout with transposes at the
+        graph boundary; the model ``forward`` is unchanged.
 
         Streaming contract: like NeMo's cache-aware streaming, the per-layer
         cache update keeps the physical tail of the chunk and grows
@@ -118,26 +145,32 @@ class RNNTTask(ModelTask):
         cache_size = config.fastconformer_streaming_cache_size
         conv_cache = config.fastconformer_conv_kernel_size - 1
         graph, builder = _make_graph(name="encoder_streaming")
+        op = builder.op
+        # GenAI layout: time-major audio and batch-first caches.
         audio_signal = builder.input(
             "audio_signal",
             dtype=config.dtype,
-            shape=[batch, config.fastconformer_feat_in, time],
+            shape=[batch, time, config.fastconformer_feat_in],
         )
         length = builder.input("length", dtype=ir.DataType.INT64, shape=[batch])
-        # Per-layer running caches (NeMo cache-aware streaming state).
+        # Per-layer running caches (NeMo cache-aware streaming state), batch-first.
         cache_last_channel = builder.input(
             "cache_last_channel",
             dtype=config.dtype,
-            shape=[layers, batch, cache_size, d],
+            shape=[batch, layers, cache_size, d],
         )
         cache_last_time = builder.input(
             "cache_last_time",
             dtype=config.dtype,
-            shape=[layers, batch, d, conv_cache],
+            shape=[batch, layers, d, conv_cache],
         )
         cache_last_channel_len = builder.input(
             "cache_last_channel_len", dtype=ir.DataType.INT64, shape=[batch]
         )
+        # Adapt GenAI layout -> native model layout.
+        audio_native = op.Transpose(audio_signal, perm=[0, 2, 1])  # (B, feat_in, T)
+        ch_native = op.Transpose(cache_last_channel, perm=[1, 0, 2, 3])  # (L, B, cache, d)
+        ct_native = op.Transpose(cache_last_time, perm=[1, 0, 2, 3])  # (L, B, d, k-1)
         (
             encoder_output,
             encoder_length,
@@ -145,13 +178,19 @@ class RNNTTask(ModelTask):
             cache_time_next,
             cache_len_next,
         ) = encoder(
-            builder.op,
-            audio_signal=audio_signal,
+            op,
+            audio_signal=audio_native,
             length=length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
+            cache_last_channel=ch_native,
+            cache_last_time=ct_native,
             cache_last_channel_len=cache_last_channel_len,
         )
+        # Adapt native model layout -> GenAI layout.
+        encoder_output = op.Transpose(encoder_output, perm=[0, 2, 1])  # (B, T', d)
+        cache_channel_next = op.Transpose(
+            cache_channel_next, perm=[1, 0, 2, 3]
+        )  # (B, L, cache, d)
+        cache_time_next = op.Transpose(cache_time_next, perm=[1, 0, 2, 3])  # (B, L, d, k-1)
         builder.add_output(encoder_output, "encoder_output")
         builder.add_output(encoder_length, "encoder_length")
         builder.add_output(cache_channel_next, "cache_last_channel_next")
@@ -177,24 +216,36 @@ class RNNTTask(ModelTask):
         return _make_model(graph)
 
     def _build_joint(self, joint, config: ArchitectureConfig) -> ir.Model:
+        """Build the RNN-T joint graph (ORT GenAI single-frame layout).
+
+        The ONNX Runtime GenAI ``nemotron_speech`` pipeline calls the joiner one
+        frame at a time with time-major frames ``encoder_outputs`` ``(B, 1, d)``
+        and ``decoder_outputs`` ``(B, 1, d_pred)`` and flattens the returned
+        ``logits`` for argmax. The single frames are transposed to the joint
+        network's native feature-major layout at the graph boundary.
+        """
         batch = ir.SymbolicDim("batch")
         time = ir.SymbolicDim("time")
         labels = ir.SymbolicDim("labels")
         graph, builder = _make_graph(name="joint")
+        op = builder.op
         encoder_outputs = builder.input(
             "encoder_outputs",
             dtype=config.dtype,
-            shape=[batch, config.hidden_size, time],
+            shape=[batch, time, config.hidden_size],
         )
         decoder_outputs = builder.input(
             "decoder_outputs",
             dtype=config.dtype,
-            shape=[batch, config.rnnt_pred_hidden, labels],
+            shape=[batch, labels, config.rnnt_pred_hidden],
         )
+        # GenAI feeds time-major frames; the joint network consumes feature-major.
+        enc_native = op.Transpose(encoder_outputs, perm=[0, 2, 1])  # (B, d, T)
+        dec_native = op.Transpose(decoder_outputs, perm=[0, 2, 1])  # (B, d_pred, U)
         logits = joint(
-            builder.op,
-            encoder_outputs=encoder_outputs,
-            decoder_outputs=decoder_outputs,
+            op,
+            encoder_outputs=enc_native,
+            decoder_outputs=dec_native,
         )
         builder.add_output(logits, "logits")
         return _make_model(graph)

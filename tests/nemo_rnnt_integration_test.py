@@ -118,12 +118,17 @@ def test_fastconformer_rnnt_parity():
         )[0]
         np.testing.assert_allclose(dec, golden["pred_out"], atol=1e-4)
 
-        # Joint: log-softmaxed logits
+        # Joint: log-softmaxed logits. The GenAI joint graph consumes time-major
+        # frames (B, T, d) / (B, U, d_pred); the golden tensors are feature-major.
         joint = _run(
             _find_onnx(td, "joint"),
             {
-                "encoder_outputs": golden["enc_out"].astype(np.float32),
-                "decoder_outputs": golden["pred_out"].astype(np.float32),
+                "encoder_outputs": np.ascontiguousarray(
+                    golden["enc_out"].astype(np.float32).transpose(0, 2, 1)
+                ),
+                "decoder_outputs": np.ascontiguousarray(
+                    golden["pred_out"].astype(np.float32).transpose(0, 2, 1)
+                ),
             },
         )[0]
         np.testing.assert_allclose(joint, golden["joint_out"], atol=1e-3)
@@ -150,16 +155,23 @@ def test_fastconformer_rnnt_streaming_parity():
         )
 
         def step(feats, ch, ct, cl):
-            return sess.run(
+            # The GenAI streaming encoder consumes time-major audio (B, T, mel)
+            # and emits time-major frames (B, T', d); the golden tensors are
+            # feature-major, so transpose at the graph boundary.
+            length = np.full((feats.shape[0],), feats.shape[2], dtype=np.int64)
+            audio = np.ascontiguousarray(feats.transpose(0, 2, 1)).astype(np.float32)
+            out = sess.run(
                 None,
                 {
-                    "audio_signal": feats.astype(np.float32),
-                    "length": _full_length(feats),
+                    "audio_signal": audio,
+                    "length": length,
                     "cache_last_channel": ch,
                     "cache_last_time": ct,
                     "cache_last_channel_len": cl,
                 },
             )
+            out[0] = np.ascontiguousarray(out[0].transpose(0, 2, 1))  # (B, d, T')
+            return out
 
         f0 = golden["f0"]
         f1 = golden["f1"]
@@ -221,12 +233,16 @@ def test_fastconformer_rnnt_greedy_decode():
         tokens: list[int] = []
         max_symbols = 5
         for t in range(n_frames):
-            enc_t = enc[:, :, t : t + 1]
+            # GenAI joint consumes time-major frames (B, 1, d) / (B, 1, d_pred).
+            enc_t = np.ascontiguousarray(enc[:, :, t : t + 1].transpose(0, 2, 1))
             emitted = 0
             while emitted < max_symbols:
                 logits = joint_sess.run(
                     None,
-                    {"encoder_outputs": enc_t, "decoder_outputs": g},
+                    {
+                        "encoder_outputs": enc_t,
+                        "decoder_outputs": np.ascontiguousarray(g.transpose(0, 2, 1)),
+                    },
                 )[0]
                 k = int(np.argmax(logits.reshape(-1)))
                 if k == blank_id:
@@ -276,3 +292,101 @@ def test_fastconformer_rnnt_greedy_decode():
         np.testing.assert_allclose(incremental, one_shot, atol=1e-4)
         np.testing.assert_allclose(hi, oh, atol=1e-4)
         np.testing.assert_allclose(ci, oc, atol=1e-4)
+
+
+@pytest.mark.integration_slow
+def test_genai_bundle_layout_and_load():
+    """The GenAI nemotron_speech bundle matches the C++ pipeline contract.
+
+    Writes the bundle (flat encoder/decoder/joint ONNX + config + tokenizer),
+    asserts each graph's I/O names match the genai_config.json name mappings and
+    that the GenAI tensor layouts are emitted, then loads it with
+    ``onnxruntime_genai`` if available.
+    """
+    import json
+
+    from mobius.integrations.nemo import build_from_nemo, write_genai_bundle
+    from mobius.integrations.nemo._reader import NeMoArchive
+
+    archive = NeMoArchive(_MODEL_ID, revision=_REVISION)
+    pkg = build_from_nemo(_MODEL_ID, revision=_REVISION)
+
+    with tempfile.TemporaryDirectory() as td:
+        # Skip the VAD download to keep the test network-light.
+        out = write_genai_bundle(pkg, archive, td, include_vad=False)
+
+        expected = {
+            "encoder.onnx",
+            "decoder.onnx",
+            "joint.onnx",
+            "genai_config.json",
+            "audio_processor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        }
+        assert expected <= set(os.listdir(out))
+
+        cfg = json.loads((out / "genai_config.json").read_text())
+        model = cfg["model"]
+        assert model["type"] == "nemotron_speech"
+        assert model["vocab_size"] == 1025
+        assert model["blank_id"] == 1024
+
+        # The exported ONNX I/O names must match the config's name mappings, and
+        # the GenAI tensor layouts (time-major audio/frames, batch-first caches)
+        # must be present.
+        def _io(name):
+            sess = ort.InferenceSession(str(out / name), providers=["CPUExecutionProvider"])
+            ins = {i.name: i.shape for i in sess.get_inputs()}
+            outs = {o.name: o.shape for o in sess.get_outputs()}
+            return ins, outs
+
+        enc_in, enc_out = _io("encoder.onnx")
+        assert set(model["encoder"]["inputs"].values()) <= set(enc_in)
+        assert set(model["encoder"]["outputs"].values()) <= set(enc_out)
+        # audio_signal time-major (B, T, mel); caches batch-first.
+        assert enc_in["audio_signal"][-1] == model["num_mels"]
+        assert enc_in["cache_last_channel"][1] == model["encoder"]["num_hidden_layers"]
+        assert enc_in["cache_last_channel"][2] == model["left_context"]
+        # encoder_output time-major (B, T, d).
+        assert enc_out["encoder_output"][-1] == model["encoder"]["hidden_size"]
+
+        dec_in, dec_out = _io("decoder.onnx")
+        assert set(model["decoder"]["inputs"].values()) <= set(dec_in)
+        assert set(model["decoder"]["outputs"].values()) <= set(dec_out)
+
+        joi_in, joi_out = _io("joint.onnx")
+        assert set(model["joiner"]["inputs"].values()) <= set(joi_in)
+        assert set(model["joiner"]["outputs"].values()) <= set(joi_out)
+        # joiner consumes time-major frames (B, 1, d) / (B, 1, d_pred).
+        assert joi_in["encoder_outputs"][-1] == model["encoder"]["hidden_size"]
+        assert joi_in["decoder_outputs"][-1] == model["decoder"]["hidden_size"]
+
+        tok = json.loads((out / "tokenizer.json").read_text())
+        assert tok["model"]["type"] == "Unigram"
+        assert len(tok["model"]["vocab"]) == model["vocab_size"]
+        assert tok["model"]["vocab"][-1][0] == "<blank>"
+        # The Metaspace decoder must convert ▁ word-boundary marks back to
+        # spaces so transcripts are not garbled.
+        try:
+            from tokenizers import Tokenizer
+
+            hf_tok = Tokenizer.from_str((out / "tokenizer.json").read_text())
+            # Find two tokens that start with ▁ (word starts) and decode them.
+            starts = [
+                i
+                for i, (t, _) in enumerate(tok["model"]["vocab"])
+                if t.startswith("\u2581") and len(t) > 1
+            ][:2]
+            decoded = hf_tok.decode(starts)
+            assert "\u2581" not in decoded
+            assert " " in decoded  # two word-start tokens -> a space between
+        except ImportError:
+            pass
+
+        # Smoke-test loading with onnxruntime_genai when present.
+        try:
+            import onnxruntime_genai as og
+        except ImportError:
+            return
+        og.Model(str(out))
