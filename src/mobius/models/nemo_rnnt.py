@@ -48,8 +48,8 @@ _NEG_INF = -10000.0  # NeMo masks attention scores with -INF_VAL (= -10000.0)
 
 
 def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
-    """Swish / SiLU activation: ``x * sigmoid(x)``."""
-    return op.Mul(x, op.Sigmoid(x))
+    """Swish / SiLU activation ``x * sigmoid(x)`` via the native opset-24 op."""
+    return op.Swish(x)
 
 
 def _dim(op: OpBuilder, x: ir.Value, axis: int) -> ir.Value:
