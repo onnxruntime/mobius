@@ -58,6 +58,10 @@ class TestNemoToConfig:
         assert config.rnnt_pred_rnn_layers == 2
         assert config.rnnt_joint_hidden == 640
         assert config.rnnt_num_classes == 1024
+        # Cache-aware streaming sizes (derived): cache = att_context left (70),
+        # drop_extra = 1 + (pre_encode_cache - 1) // subsampling_factor.
+        assert config.fastconformer_streaming_cache_size == 70
+        assert config.fastconformer_streaming_drop_extra == 2
 
     def test_unsupported_target_raises(self):
         with pytest.raises(KeyError, match="Unsupported NeMo target"):

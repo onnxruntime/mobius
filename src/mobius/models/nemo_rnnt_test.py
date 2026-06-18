@@ -34,6 +34,8 @@ def _tiny_config() -> ArchitectureConfig:
         fastconformer_subsampling_conv_channels=16,
         fastconformer_conv_kernel_size=9,
         fastconformer_att_context_size=(6, 1),
+        fastconformer_streaming_cache_size=6,
+        fastconformer_streaming_drop_extra=2,
         rnnt_pred_hidden=48,
         rnnt_pred_rnn_layers=2,
         rnnt_joint_hidden=48,
@@ -63,9 +65,9 @@ def _fill_random_weights(model: ir.Model) -> None:
         value.const_value = ir.tensor(rng.standard_normal(shape).astype(np.float32) * 0.05)
 
 
-def test_package_has_three_models():
+def test_package_has_models():
     _, pkg = _build()
-    assert set(pkg.keys()) == {"encoder", "decoder", "joint"}
+    assert set(pkg.keys()) == {"encoder", "encoder_streaming", "decoder", "joint"}
 
 
 def test_encoder_io_shapes():
@@ -84,6 +86,57 @@ def test_encoder_io_shapes():
     assert out.shape[1] == config.hidden_size
     assert out.shape[2] == expected_t
     assert enc_len.tolist() == [expected_t]
+
+
+def test_streaming_encoder_io_and_cache_growth():
+    config, pkg = _build()
+    sess = _session(pkg["encoder_streaming"])
+    assert [i.name for i in sess.get_inputs()] == [
+        "audio_signal",
+        "length",
+        "cache_last_channel",
+        "cache_last_time",
+        "cache_last_channel_len",
+    ]
+    layers = config.num_hidden_layers
+    d = config.hidden_size
+    cs = config.fastconformer_streaming_cache_size
+    conv_cache = config.fastconformer_conv_kernel_size - 1
+    drop = config.fastconformer_streaming_drop_extra
+    t = 40
+    # 8x subsampling then drop_extra leading frames.
+    t_sub = t
+    for _ in range(3):
+        t_sub = t_sub // 2 + 1
+    t_out = t_sub - drop
+
+    def step(feats, ch, ct, cl):
+        return sess.run(
+            None,
+            {
+                "audio_signal": feats,
+                "length": np.array([t], dtype=np.int64),
+                "cache_last_channel": ch,
+                "cache_last_time": ct,
+                "cache_last_channel_len": cl,
+            },
+        )
+
+    ch0 = np.zeros((layers, 1, cs, d), dtype=np.float32)
+    ct0 = np.zeros((layers, 1, d, conv_cache), dtype=np.float32)
+    cl0 = np.zeros((1,), dtype=np.int64)
+    feats = np.random.randn(1, config.fastconformer_feat_in, t).astype(np.float32)
+    out, enc_len, ch1, ct1, cl1 = step(feats, ch0, ct0, cl0)
+    assert out.shape == (1, d, t_out)
+    assert enc_len.tolist() == [t_out]
+    assert ch1.shape == (layers, 1, cs, d)
+    assert ct1.shape == (layers, 1, d, conv_cache)
+    # Cache length grows by the chunk's frame count, capped at cache_size.
+    assert cl1.tolist() == [min(t_out, cs)]
+    # Second chunk consumes the updated caches and grows the length again.
+    feats2 = np.random.randn(1, config.fastconformer_feat_in, t).astype(np.float32)
+    _, _, _, _, cl2 = step(feats2, ch1, ct1, cl1)
+    assert cl2.tolist() == [min(t_out * 2, cs)]
 
 
 def test_decoder_io_shapes_and_state():
@@ -180,8 +233,8 @@ def test_builds_in_half_precision(dtype, expected):
     config = _tiny_config()
     config.dtype = dtype
     pkg = build_from_module(EncDecRNNTModel(config), config, task="fastconformer-rnnt")
-    assert set(pkg.keys()) == {"encoder", "decoder", "joint"}
-    for name in ("encoder", "decoder", "joint"):
+    assert set(pkg.keys()) == {"encoder", "encoder_streaming", "decoder", "joint"}
+    for name in ("encoder", "encoder_streaming", "decoder", "joint"):
         model = pkg[name]
         for out in model.graph.outputs:
             assert out.dtype is not None, f"{name} output {out.name} has no dtype"

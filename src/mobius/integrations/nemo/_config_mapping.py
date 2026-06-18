@@ -104,6 +104,16 @@ def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
         att_context_size = att_context_size[0]
     att_context = (int(att_context_size[0]), int(att_context_size[1]))
 
+    # Cache-aware streaming sizes (NeMo ``setup_streaming_params``):
+    # last_channel_cache_size = att_context left; drop_extra_pre_encoded is a
+    # function of the subsampling pre-encode cache (= 9 for 8x dw_striding).
+    subsampling_factor = int(enc.get("subsampling_factor", 8))
+    streaming_cache_size = att_context[0] if att_context[0] >= 0 else 70
+    pre_encode_cache = int(enc.get("pre_encode_cache_size", subsampling_factor + 1))
+    drop_extra = (
+        1 + (pre_encode_cache - 1) // subsampling_factor if pre_encode_cache >= 1 else 0
+    )
+
     config = ArchitectureConfig(
         vocab_size=vocab_with_blank,
         hidden_size=d_model,
@@ -116,6 +126,8 @@ def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
         audio_input_size=int(enc["feat_in"]),
         fastconformer_feat_in=int(enc["feat_in"]),
         fastconformer_att_context_size=att_context,
+        fastconformer_streaming_cache_size=streaming_cache_size,
+        fastconformer_streaming_drop_extra=drop_extra,
         # FastConformer encoder knobs.
         fastconformer_subsampling_factor=int(enc.get("subsampling_factor", 8)),
         fastconformer_subsampling_conv_channels=int(enc.get("subsampling_conv_channels", 256)),

@@ -35,6 +35,14 @@ _GOLDEN = os.path.join(
     "speech",
     "nemotron_fastconformer_rnnt.npz",
 )
+_STREAMING_GOLDEN = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "testdata",
+    "golden",
+    "speech",
+    "nemotron_fastconformer_rnnt_streaming.npz",
+)
 _SOS_ID = 1025  # rnnt_num_classes (1024) + 1; zero start-of-sequence embedding
 
 
@@ -87,7 +95,7 @@ def test_fastconformer_rnnt_parity():
 
     golden = np.load(_GOLDEN)
     pkg = build_from_nemo(_MODEL_ID, revision=_REVISION)
-    assert set(pkg.keys()) == {"encoder", "decoder", "joint"}
+    assert set(pkg.keys()) == {"encoder", "encoder_streaming", "decoder", "joint"}
 
     with tempfile.TemporaryDirectory() as td:
         pkg.save(td)
@@ -119,6 +127,64 @@ def test_fastconformer_rnnt_parity():
             },
         )[0]
         np.testing.assert_allclose(joint, golden["joint_out"], atol=1e-3)
+
+
+@pytest.mark.integration_slow
+def test_fastconformer_rnnt_streaming_parity():
+    """Cache-aware streaming encoder matches NeMo over chained chunks.
+
+    Drives the ``encoder_streaming`` graph chunk-by-chunk: chunk 0 starts from
+    zero caches, and chunk 1 consumes chunk 0's *own* output caches. Both chunk
+    encodings and the running cache-length scalars must match the NeMo
+    reference, validating the per-layer attention/conv cache update logic.
+    """
+    from mobius.integrations.nemo import build_from_nemo
+
+    golden = np.load(_STREAMING_GOLDEN)
+    pkg = build_from_nemo(_MODEL_ID, revision=_REVISION)
+
+    with tempfile.TemporaryDirectory() as td:
+        pkg.save(td)
+        sess = ort.InferenceSession(
+            _find_onnx(td, "encoder_streaming"), providers=["CPUExecutionProvider"]
+        )
+
+        def step(feats, ch, ct, cl):
+            return sess.run(
+                None,
+                {
+                    "audio_signal": feats.astype(np.float32),
+                    "length": _full_length(feats),
+                    "cache_last_channel": ch,
+                    "cache_last_time": ct,
+                    "cache_last_channel_len": cl,
+                },
+            )
+
+        f0 = golden["f0"]
+        f1 = golden["f1"]
+
+        # Initial caches are zeros (NeMo get_initial_cache_state). Concrete
+        # shapes come from the graph's declared cache inputs with the symbolic
+        # batch dim resolved to 1.
+        def _concrete(shape):
+            return [1 if not isinstance(d, int) else d for d in shape]
+
+        shapes = {i.name: _concrete(i.shape) for i in sess.get_inputs()}
+        ch0 = np.zeros(shapes["cache_last_channel"], dtype=np.float32)
+        ct0 = np.zeros(shapes["cache_last_time"], dtype=np.float32)
+        cl0 = np.zeros((1,), dtype=np.int64)
+
+        out0, len0, ch1, ct1, cl1 = step(f0, ch0, ct0, cl0)
+        np.testing.assert_allclose(out0, golden["out0"], atol=1e-4)
+        assert len0.tolist() == golden["len0"].tolist()
+        assert cl1.tolist() == golden["cl1"].tolist()
+
+        # Chunk 1 consumes chunk 0's ONNX-produced caches (self-chaining).
+        out1, len1, _ch2, _ct2, cl2 = step(f1, ch1, ct1, cl1)
+        np.testing.assert_allclose(out1, golden["out1"], atol=1e-4)
+        assert len1.tolist() == golden["len1"].tolist()
+        assert cl2.tolist() == golden["cl2"].tolist()
 
 
 @pytest.mark.integration_slow

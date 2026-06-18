@@ -443,6 +443,12 @@ class ArchitectureConfig(BaseModelConfig):
     fastconformer_feat_in: int = 128
     # Chunked-limited attention context: [left_context, right_context] in frames.
     fastconformer_att_context_size: tuple[int, int] = (70, 13)
+    # Cache-aware streaming: per-layer last-channel (attention) cache length in
+    # subsampled frames (NeMo ``last_channel_cache_size`` = att_context left) and
+    # the number of leading subsampled frames dropped per chunk (NeMo
+    # ``drop_extra_pre_encoded``).
+    fastconformer_streaming_cache_size: int = 70
+    fastconformer_streaming_drop_extra: int = 2
     # RNN-T prediction network + joint
     rnnt_pred_hidden: int | None = None
     rnnt_pred_rnn_layers: int = 1
