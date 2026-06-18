@@ -23,7 +23,7 @@ from mobius._configs import ArchitectureConfig
 
 # NeMo ``target`` class path → mobius registry model_type.
 NEMO_TARGET_TO_MODEL_TYPE: dict[str, str] = {
-    "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel": ("fastconformer_rnnt"),
+    "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel": "fastconformer_rnnt",
     "nemo.collections.asr.models.rnnt_models.EncDecRNNTModel": "fastconformer_rnnt",
 }
 
@@ -59,6 +59,16 @@ def _validate_encoder(enc: dict[str, Any]) -> None:
             str(enc.get("conv_norm_type", "layer_norm")),
         ),
         "xscaling": (False, bool(enc.get("xscaling"))),
+        # The conformer stack hard-codes bias=False (FF / q,k,v,out / conv).
+        # NeMo defaults use_bias=True; a default config would load weights but
+        # silently drop every bias, producing wrong output. Reject it loudly.
+        "use_bias": (False, bool(enc.get("use_bias", True))),
+        # The masks implement NeMo's chunked_limited rule only; other styles
+        # ("regular", "chunked_limited_with_rc") would build a wrong mask.
+        "att_context_style": (
+            "chunked_limited",
+            str(enc.get("att_context_style", "chunked_limited")),
+        ),
     }
     unsupported = {
         key: actual for key, (expected, actual) in checks.items() if actual != expected
@@ -100,6 +110,15 @@ def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
     if att_context_size and isinstance(att_context_size[0], (list, tuple)):
         att_context_size = att_context_size[0]
     att_context = (int(att_context_size[0]), int(att_context_size[1]))
+    # A finite right context is required: chunk_size = right + 1, and the
+    # "unlimited right" sentinel (-1) would make chunk_size 0 → div-by-zero in
+    # the streaming mask. (left == -1 is handled: it clamps to cache_size 70.)
+    if att_context[1] < 0:
+        raise ValueError(
+            "Unsupported FastConformer att_context_size right context "
+            f"{att_context[1]} (must be >= 0); 'unlimited right' streaming is "
+            "not supported."
+        )
 
     # Cache-aware streaming sizes (NeMo ``setup_streaming_params``):
     # last_channel_cache_size = att_context left; drop_extra_pre_encoded is a
@@ -141,7 +160,8 @@ def nemo_to_config(nemo_config: dict[str, Any]) -> ArchitectureConfig:
         rnnt_pred_rnn_layers=int(prednet.get("pred_rnn_layers", 1)),
         rnnt_joint_hidden=int(jointnet["joint_hidden"]),
         rnnt_num_classes=num_classes,
+        # Resolved registry model_type, stored on the native field so it
+        # survives dataclasses.replace() (e.g. the builder's dtype swap).
+        model_type=model_type,
     )
-    # Stash the resolved model_type for the builder/registry lookup.
-    config._nemo_model_type = model_type
     return config

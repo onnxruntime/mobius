@@ -822,9 +822,12 @@ class FastConformerEncoder(nn.Module):
             new_times.append(op.Unsqueeze(nct, op.Constant(value_ints=[1])))
         cache_channel_next = op.Concat(*new_channels, axis=1)  # (B, L, cache_size, d)
         cache_time_next = op.Concat(*new_times, axis=1)  # (B, L, d, k-1)
-        # Grow the populated cache length by this chunk's frame count, capped.
+        # Grow the populated cache length by this chunk's *valid* frame count
+        # (length_sub, not the physical T_out), capped at cache_size. Using the
+        # padded T_out would let a short/final chunk over-increment the length,
+        # so the next step's mask would treat padded cache frames as valid keys.
         new_len = op.Min(
-            op.Add(cache_last_channel_len, op.Squeeze(tq)),
+            op.Add(cache_last_channel_len, length_sub),
             op.Constant(value=ir.tensor(np.int64(cache_size))),
         )
         return x, length_sub, cache_channel_next, cache_time_next, new_len  # (B, T_out, d)

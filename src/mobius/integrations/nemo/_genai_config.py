@@ -37,6 +37,9 @@ from mobius.integrations.nemo._reader import NeMoArchive
 _LOG_EPS = 5.96046448e-08
 _SILERO_REPO = "onnx-community/silero-vad"
 _SILERO_FILE = "onnx/model.onnx"
+# Pin a specific revision so include_vad bundles are reproducible rather than
+# shipping whatever mutable HEAD the repo currently points at.
+_SILERO_REVISION = "e71cae966052b992a7eca6b17738916ce0eca4ec"
 
 # Logical (GenAI) tensor name -> mobius ONNX tensor name, per sub-model. The
 # GenAI ``nemotron_speech`` pipeline reads these mappings from genai_config.json.
@@ -243,7 +246,9 @@ def _download_silero_vad(dest: Path) -> bool:
 
         from huggingface_hub import hf_hub_download
 
-        cached = hf_hub_download(repo_id=_SILERO_REPO, filename=_SILERO_FILE)
+        cached = hf_hub_download(
+            repo_id=_SILERO_REPO, filename=_SILERO_FILE, revision=_SILERO_REVISION
+        )
         shutil.copy2(cached, str(dest / "silero_vad.onnx"))
     except Exception:  # pragma: no cover - network/availability dependent
         return False

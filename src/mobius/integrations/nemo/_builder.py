@@ -67,7 +67,7 @@ def build_from_nemo(
     logger.info("Loaded NeMo archive: %s (target=%s)", archive.path, archive.target)
 
     config = nemo_to_config(archive.config)
-    model_type = config._nemo_model_type
+    model_type = config.model_type
 
     if dtype is not None:
         resolved = resolve_dtype(dtype)
@@ -76,7 +76,6 @@ def build_from_nemo(
             # f32 and are cast to the compute dtype inside the model; all other
             # tensors follow config.dtype.
             config = dataclasses.replace(config, dtype=resolved)
-            config._nemo_model_type = model_type
 
     module_class = registry.get(model_type)
     if task is None:

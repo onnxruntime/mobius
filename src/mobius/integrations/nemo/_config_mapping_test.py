@@ -25,6 +25,7 @@ _RNNT_CONFIG = {
         "conv_kernel_size": 9,
         "pos_emb_max_len": 5000,
         "xscaling": False,
+        "use_bias": False,
     },
     "decoder": {"prednet": {"pred_hidden": 640, "pred_rnn_layers": 2}, "vocab_size": 1024},
     "joint": {
@@ -37,7 +38,7 @@ _RNNT_CONFIG = {
 class TestNemoToConfig:
     def test_maps_core_dimensions(self):
         config = nemo_to_config(_RNNT_CONFIG)
-        assert config._nemo_model_type == "fastconformer_rnnt"
+        assert config.model_type == "fastconformer_rnnt"
         # vocab includes the blank symbol.
         assert config.vocab_size == 1025
         assert config.hidden_size == 1024
@@ -87,6 +88,31 @@ class TestNemoToConfig:
             "encoder": {**_RNNT_CONFIG["encoder"], "self_attention_model": "abs_pos"},
         }
         with pytest.raises(ValueError, match="self_attention_model"):
+            nemo_to_config(cfg)
+
+    def test_use_bias_true_raises(self):
+        # NeMo default use_bias=True is unsupported (the stack hardcodes bias=False).
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "use_bias": True},
+        }
+        with pytest.raises(ValueError, match="use_bias"):
+            nemo_to_config(cfg)
+
+    def test_unsupported_att_context_style_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_style": "regular"},
+        }
+        with pytest.raises(ValueError, match="att_context_style"):
+            nemo_to_config(cfg)
+
+    def test_unlimited_right_context_raises(self):
+        cfg = {
+            **_RNNT_CONFIG,
+            "encoder": {**_RNNT_CONFIG["encoder"], "att_context_size": [70, -1]},
+        }
+        with pytest.raises(ValueError, match="right context"):
             nemo_to_config(cfg)
 
     def test_xscaling_raises(self):

@@ -75,6 +75,10 @@ class RNNTTask(ModelTask):
     components: ClassVar[ComponentSpec] = ComponentSpec(
         encoder="encoder", decoder="prediction", joint="joint"
     )
+    # All four sub-models map to the "encoder" role: none of them use the
+    # decoder/GQA KV-cache fusion path, so the generic "encoder" role (plain
+    # graph export, no cache rewiring) is correct for every RNN-T component,
+    # including the LSTM prediction network we nominally call the "decoder".
     model_roles: ClassVar[dict[str, str]] = {
         "encoder": "encoder",
         "encoder_streaming": "encoder",
