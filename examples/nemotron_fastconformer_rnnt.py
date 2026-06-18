@@ -24,8 +24,17 @@ is *not* required at runtime.
 
 Prerequisites::
 
-    pip install mobius-ai librosa soundfile sentencepiece
+    pip install mobius-ai onnxruntime onnxruntime-easy librosa soundfile sentencepiece
     pip install sounddevice          # only for microphone input
+
+The example runs ONNX models through ``mobius._testing.ort_inference``,
+which depends on ``onnxruntime`` and ``onnxruntime-easy`` (these are not
+pulled in by the ``mobius-ai`` core package). ``torch`` is a core mobius
+dependency and is installed automatically.
+
+Tested on Linux/x86-64 (CPU and CUDA). On Apple Silicon / other platforms
+the CPU path is expected to work (all dependencies ship arm64 wheels) but
+has not been verified; ``--device cuda`` requires an NVIDIA GPU.
 
 Usage::
 
