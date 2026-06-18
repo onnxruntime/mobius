@@ -47,11 +47,6 @@ _INF_VAL = 10000.0
 _NEG_INF = -10000.0  # NeMo masks attention scores with -INF_VAL (= -10000.0)
 
 
-def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
-    """Swish / SiLU activation ``x * sigmoid(x)`` via the native opset-24 op."""
-    return op.Swish(x)
-
-
 def _dim(op: OpBuilder, x: ir.Value, axis: int) -> ir.Value:
     """Return a single dimension of *x* as a 1-D INT64 tensor of length 1."""
     return op.Shape(x, start=axis, end=axis + 1)
@@ -417,7 +412,8 @@ class ConformerFeedForward(nn.Module):
         self.linear2 = Linear(d_ff, d_model, bias=False)
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        return self.linear2(op, _swish(op, self.linear1(op, x)))
+        # Swish / SiLU (x * sigmoid(x)) via the native opset-24 op.
+        return self.linear2(op, op.Swish(self.linear1(op, x)))
 
 
 class ConformerConvolution(nn.Module):
@@ -461,7 +457,7 @@ class ConformerConvolution(nn.Module):
         # LayerNorm over channels: transpose to (B, T, C)
         x = op.Transpose(x, perm=[0, 2, 1])
         x = self.batch_norm(op, x)
-        x = _swish(op, x)
+        x = op.Swish(x)  # Swish / SiLU via the native opset-24 op.
         x = op.Transpose(x, perm=[0, 2, 1])  # (B, C, T)
         x = self.pointwise_conv2(op, x)
         x = op.Transpose(x, perm=[0, 2, 1])  # (B, T, C)
