@@ -84,6 +84,18 @@ CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
 # (``S_q = 1``) over a key tensor of length ``max_seq_len`` reproduces the
 # ``S_q != total_kv`` (no ``past_key``) regime that pre-#28958 ORT rejects, and
 # is also the geometry the known-answer correctness check below relies on.
+#
+# Why ``S_q == 1`` still triggers the pre-#28958 reject (fail-closed preserved):
+# the reject lives in ``Attention<T>::ComputeInternal`` (CUDA llm/attention.cc)
+# behind the guard
+#     causal_cross_no_past = is_causal && (q_seq != total_seq) && (past == 0)
+#     if (causal_cross_no_past && nonpad_kv_seqlen != nullptr) -> NOT_IMPLEMENTED
+# With ``S_q = 1`` and ``total_kv >= 2`` we have ``q_seq != total_seq`` (no
+# special decode fast-path bypasses it — S_q=1 is the case the reject message
+# explicitly calls out), so a pre-fix build RAISES at run from ComputeInternal
+# -> caught as an expected reject -> NEEDS_FIX -> False.  The known-answer value
+# check below is the *second* line of defense, for any build that runs the graph
+# without raising (e.g. a silent CPU fallback) but with wrong values.
 _PROBE_BATCH = 1
 _PROBE_NUM_HEADS = 1
 _PROBE_HEAD_DIM = 64
