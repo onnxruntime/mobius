@@ -118,3 +118,66 @@ def test_probe_output_is_correct_rejects_top_left_value() -> None:
         dtype=cap._PROBE_NP_DTYPE,
     )
     assert cap._probe_output_is_correct(wrong) is False
+
+
+# --------------------------------------------------------------------------- #
+# Fix ② observability, exercised end-to-end (not just at the classifier):     #
+# drive _probe_static_cache_flash with a mocked ORT session so the            #
+# PROBE_ERROR-vs-NEEDS_FIX decision and its WARNING log are covered on CPU,   #
+# proving a genuine failure stays LOUD instead of masquerading as             #
+# 'needs #28958' and silently skipping the suite.                             #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeSession:
+    """Minimal ``ort.InferenceSession`` stand-in whose ``run`` always raises."""
+
+    def __init__(self, run_exc: BaseException) -> None:
+        self._run_exc = run_exc
+
+    def get_providers(self) -> list[str]:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def run(self, output_names, feeds):
+        raise self._run_exc
+
+
+@pytest.fixture
+def probe_on_cuda(monkeypatch: pytest.MonkeyPatch):
+    """Force the probe onto the CUDA path and feed it a session that raises.
+
+    Yields an installer; clears the process-cached probe before and after so a
+    mocked outcome never leaks into another test (or the real GPU probe).
+    """
+
+    def _install(run_exc: BaseException) -> None:
+        monkeypatch.setattr(cap, "CUDA_AVAILABLE", True)
+        cap._probe_static_cache_flash.cache_clear()
+        monkeypatch.setattr(cap.ort, "InferenceSession", lambda *a, **k: _FakeSession(run_exc))
+
+    yield _install
+    cap._probe_static_cache_flash.cache_clear()
+
+
+def test_probe_genuine_fail_is_loud_probe_error(
+    probe_on_cuda, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A signature-less Fail (e.g. CUDA OOM) raised by session.run must map to
+    # PROBE_ERROR and log a WARNING — NOT a silent 'needs #28958' NEEDS_FIX skip.
+    if cap._ort_capi is None:
+        pytest.skip("onnxruntime pybind state unavailable")
+    probe_on_cuda(cap._ort_capi.Fail("CUDA error: out of memory"))
+    with caplog.at_level("WARNING", logger=cap.logger.name):
+        outcome = cap._probe_static_cache_flash()
+    assert outcome is cap._ProbeOutcome.PROBE_ERROR
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_probe_notimplemented_reject_is_needs_fix(probe_on_cuda) -> None:
+    # Contrast: the genuine pre-#28958 NotImplemented reject still maps to
+    # NEEDS_FIX end-to-end — the expected fail-closed skip, kept distinct from
+    # the loud PROBE_ERROR above.
+    if cap._ort_capi is None:
+        pytest.skip("onnxruntime pybind state unavailable")
+    probe_on_cuda(cap._ort_capi.NotImplemented("... is not supported."))
+    assert cap._probe_static_cache_flash() is cap._ProbeOutcome.NEEDS_FIX
