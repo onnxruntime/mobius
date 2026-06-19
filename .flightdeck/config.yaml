@@ -1,5 +1,0 @@
-agents:
-  roles:
-    lead:
-      runtime: copilot
-      model: claude-opus-4.7
