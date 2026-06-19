@@ -44,7 +44,6 @@ import numpy as np
 import onnxruntime as ort
 import pytest
 from _static_cache_support import (
-    CUDA_AVAILABLE,
     DEFAULT_MAX_SEQ_LEN,
     attention_kernels_from_log,
     build_static_cache_model,
@@ -52,7 +51,11 @@ from _static_cache_support import (
     carry_caches,
     empty_caches,
     quick_build_enabled,
-    static_cache_cuda_supported,
+)
+
+from mobius._testing.ort_capabilities import (
+    CUDA_AVAILABLE,
+    supports_static_cache_flash,
 )
 
 pytestmark = [
@@ -62,7 +65,7 @@ pytestmark = [
         reason="static-cache TensorScatter / external-cache Attention are CUDA-only",
     ),
     pytest.mark.skipif(
-        not static_cache_cuda_supported(),
+        not supports_static_cache_flash(),
         reason=(
             "installed ORT lacks microsoft/onnxruntime#28958 "
             "(is_causal=1 + nonpad_kv_seqlen on the CUDA Attention kernel)"

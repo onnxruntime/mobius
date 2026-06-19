@@ -12,15 +12,14 @@ removes the historical ``NOT_IMPLEMENTED`` reject for
 ``is_causal=1 + nonpad_kv_seqlen`` (when ``S_q != total_kv`` with no
 ``past_key``) and makes the combination Flash-eligible.
 
-This module centralises the two gates every static-cache CUDA test needs so the
-e2e Flash-dispatch test and the numerical-parity test share one implementation:
+The *functional capability probe* (does the installed ORT run the static-cache
+graph on CUDA at all?) lives in the shared, importable
+:func:`mobius._testing.ort_capabilities.supports_static_cache_flash`; both the
+e2e Flash-dispatch test and the numerical-parity test import it from there.  This
+module adds the e2e-specific machinery on top of that gate:
 
-* :func:`static_cache_cuda_supported` — a *functional* capability probe.  It
-  builds a tiny static-cache model and actually runs prefill on the CUDA EP.
-  Pre-#28958 ORT raises ``NOT_IMPLEMENTED`` (→ ``False``); post-#28958 ORT runs
-  (→ ``True``).  This is preferred over an ORT version string check because the
-  fix landed on ``main`` before any tagged release, so the exact enabling
-  version is build-dependent.
+* :func:`build_static_cache_model` — builds the tiny fp16 static-cache model the
+  e2e test actually drives through prefill + decode.
 
 * :func:`quick_build_enabled` — guards the Flash-*dispatch* assertion.  Under
   ``onnxruntime_QUICK_BUILD=ON`` the CUDA Flash kernel is compiled for
@@ -47,7 +46,6 @@ parses out which kernel(s) ran.
 from __future__ import annotations
 
 import contextlib
-import functools
 import os
 import tempfile
 from collections.abc import Iterator
@@ -59,7 +57,19 @@ import onnxruntime as ort
 
 from mobius import ArchitectureConfig, build_from_module
 from mobius._registry import registry
+from mobius._testing.ort_capabilities import (
+    CUDA_AVAILABLE as CUDA_AVAILABLE,
+)
+from mobius._testing.ort_capabilities import (
+    supports_static_cache_flash,
+)
 from mobius.tasks import CausalLMTask
+
+# Migration bridge: the functional capability probe was renamed and moved to
+# ``mobius._testing.ort_capabilities.supports_static_cache_flash``.  This alias
+# keeps tests that still import the old name collectable; remove it once every
+# test imports the canonical name directly.
+static_cache_cuda_supported = supports_static_cache_flash
 
 # ---------------------------------------------------------------------------
 # Tiny model geometry
@@ -75,8 +85,6 @@ _FLASH_HEAD_DIM = 64
 _FLASH_NUM_HEADS = 2
 _FLASH_NUM_KV_HEADS = 1
 _FLASH_HIDDEN = _FLASH_HEAD_DIM * _FLASH_NUM_HEADS
-
-CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
 
 # Flash is fp16/bf16 only on every CUDA path; fp32 routes to MEA/unfused.
 FLASH_CACHE_DTYPE = np.float16
@@ -188,54 +196,6 @@ def carry_caches(outputs: dict[str, np.ndarray], num_layers: int) -> dict[str, n
         feeds[f"key_cache.{layer}"] = outputs[f"updated_key_cache.{layer}"]
         feeds[f"value_cache.{layer}"] = outputs[f"updated_value_cache.{layer}"]
     return feeds
-
-
-def _prefill_feeds(
-    config: ArchitectureConfig,
-    *,
-    prefill_len: int = 4,
-    max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
-    seed: int = 1,
-) -> dict[str, np.ndarray]:
-    """A single-batch prefill feed (write from slot 0, ``S_q = prefill_len``)."""
-    rng = np.random.default_rng(seed)
-    feeds: dict[str, np.ndarray] = {
-        "input_ids": rng.integers(0, config.vocab_size, size=(1, prefill_len), dtype=np.int64),
-        "position_ids": np.arange(prefill_len, dtype=np.int64)[None, :],
-        "write_indices": np.array([0], dtype=np.int64),
-        "nonpad_kv_seqlen": np.array([prefill_len], dtype=np.int64),
-    }
-    feeds.update(empty_caches(config, max_seq_len=max_seq_len))
-    return feeds
-
-
-@functools.lru_cache(maxsize=1)
-def static_cache_cuda_supported() -> bool:
-    """Functionally probe whether the installed ORT runs the static-cache graph.
-
-    Builds a tiny static-cache model and runs **prefill** on the CUDA EP.  ORT
-    builds lacking microsoft/onnxruntime#28958 raise ``NOT_IMPLEMENTED`` for the
-    ``is_causal=1 + nonpad_kv_seqlen`` (no ``past_key``) combination → ``False``.
-    Post-fix ORT runs it → ``True``.  Result is cached for the test session.
-
-    Returns ``False`` (rather than raising) on any failure so callers can use it
-    directly as a skip predicate.
-    """
-    if not CUDA_AVAILABLE:
-        return False
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model_path, config = build_static_cache_model(tmp_dir)
-            session = ort.InferenceSession(
-                model_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
-            if "CUDAExecutionProvider" not in session.get_providers():
-                return False
-            session.run(None, _prefill_feeds(config))
-        return True
-    except Exception:
-        return False
 
 
 @contextlib.contextmanager
