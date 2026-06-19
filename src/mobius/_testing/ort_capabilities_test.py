@@ -1,8 +1,9 @@
 """Unit tests for the static-cache Flash capability probe classifiers.
 
 These cover the pure, CPU-only decision logic — the pre-#28958 reject
-classifier and the known-answer output check — without needing a CUDA device
-or running the ONNX probe session.
+classifier, the caught-error → outcome mapping (NEEDS_FIX vs PROBE_ERROR), and
+the known-answer output check — without needing a CUDA device or running the
+ONNX probe session.
 """
 
 from __future__ import annotations
@@ -55,6 +56,44 @@ def test_message_signature_matching_is_case_insensitive(message: str, expected: 
     # The fallback path (RuntimeError) relies purely on the message signature,
     # matched case-insensitively.
     assert cap._is_expected_pre28958_reject(RuntimeError(message)) is expected
+
+
+def test_classify_notimplemented_maps_to_needs_fix() -> None:
+    # The confirmed pre-#28958 reject (NotImplemented) → NEEDS_FIX (fail-closed,
+    # the static-cache suite SKIPs with the 'needs #28958' reason).
+    if cap._ort_capi is None:
+        pytest.skip("onnxruntime pybind state unavailable")
+    exc = cap._ort_capi.NotImplemented("anything at all")
+    assert cap._classify_run_error(exc) is cap._ProbeOutcome.NEEDS_FIX
+
+
+def test_classify_signature_fail_maps_to_needs_fix() -> None:
+    # A Fail carrying the reject signature is still the expected reject → NEEDS_FIX.
+    if cap._ort_capi is None:
+        pytest.skip("onnxruntime pybind state unavailable")
+    exc = cap._ort_capi.Fail(
+        "Causal attention with TensorScatter (nonpad_kv_seqlen) ... is not supported."
+    )
+    assert cap._classify_run_error(exc) is cap._ProbeOutcome.NEEDS_FIX
+
+
+def test_classify_genuine_fail_maps_to_probe_error() -> None:
+    # A real Fail whose message does NOT match the signature (e.g. CUDA OOM) must
+    # map to PROBE_ERROR — NOT NEEDS_FIX — so it stays loud and does not silently
+    # skip the whole suite by masquerading as 'needs #28958'.
+    if cap._ort_capi is None:
+        pytest.skip("onnxruntime pybind state unavailable")
+    exc = cap._ort_capi.Fail("CUDA error: out of memory")
+    assert cap._classify_run_error(exc) is cap._ProbeOutcome.PROBE_ERROR
+
+
+def test_classify_runtimeerror_fallback_maps_to_probe_error() -> None:
+    # The defensive RuntimeError fallback (no pybind types) without the signature
+    # is also a genuine failure → PROBE_ERROR.
+    assert (
+        cap._classify_run_error(RuntimeError("unexpected segfault"))
+        is cap._ProbeOutcome.PROBE_ERROR
+    )
 
 
 def test_probe_output_is_correct_accepts_bottom_right_mean() -> None:

@@ -299,6 +299,36 @@ def _is_expected_pre28958_reject(exc: BaseException) -> bool:
     return any(sig in message for sig in _PRE28958_REJECT_SIGNATURES)
 
 
+def _classify_run_error(exc: BaseException) -> _ProbeOutcome:
+    """Map a caught ``session.run`` error to :attr:`NEEDS_FIX` or :attr:`PROBE_ERROR`.
+
+    The genuine pre-#28958 reject (:func:`_is_expected_pre28958_reject`) maps to
+    :attr:`_ProbeOutcome.NEEDS_FIX` (logged at debug).  Any other error that is
+    an instance of :data:`_EXPECTED_REJECT_ERRORS` but does NOT carry the reject
+    signature is a real failure and maps to :attr:`_ProbeOutcome.PROBE_ERROR`
+    (logged at warning with a traceback) so it stays loud instead of silently
+    skipping the whole suite as "needs #28958".
+    """
+    if _is_expected_pre28958_reject(exc):
+        logger.debug(
+            "Static-cache Flash probe: CUDA Attention kernel rejected the "
+            "maskless is_causal=1 + nonpad_kv_seqlen combination — expected "
+            "without microsoft/onnxruntime#28958 (%s).",
+            exc,
+        )
+        return _ProbeOutcome.NEEDS_FIX
+    logger.warning(
+        "Static-cache Flash probe: session.run raised an ORT error that does NOT "
+        "match the pre-#28958 reject signature (%s) — treating it as an "
+        "unexpected probe failure (PROBE_ERROR) rather than 'needs "
+        "onnxruntime#28958', so a genuine regression (CUDA OOM, kernel bug, "
+        "install drift) stays loud instead of silently skipping the whole suite.",
+        exc,
+        exc_info=True,
+    )
+    return _ProbeOutcome.PROBE_ERROR
+
+
 @functools.lru_cache(maxsize=1)
 def _probe_static_cache_flash() -> _ProbeOutcome:
     """Run the functional capability probe once and classify the outcome.
@@ -352,25 +382,7 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
             try:
                 attn_output = session.run(None, _probe_feeds())[0]
             except _EXPECTED_REJECT_ERRORS as exc:
-                if not _is_expected_pre28958_reject(exc):
-                    logger.warning(
-                        "Static-cache Flash probe: session.run raised an ORT error "
-                        "that does NOT match the pre-#28958 reject signature (%s) — "
-                        "treating it as an unexpected probe failure (PROBE_ERROR) "
-                        "rather than 'needs onnxruntime#28958', so a genuine "
-                        "regression (CUDA OOM, kernel bug, install drift) stays loud "
-                        "instead of silently skipping the whole suite.",
-                        exc,
-                        exc_info=True,
-                    )
-                    return _ProbeOutcome.PROBE_ERROR
-                logger.debug(
-                    "Static-cache Flash probe: CUDA Attention kernel rejected the "
-                    "maskless is_causal=1 + nonpad_kv_seqlen combination — expected "
-                    "without microsoft/onnxruntime#28958 (%s).",
-                    exc,
-                )
-                return _ProbeOutcome.NEEDS_FIX
+                return _classify_run_error(exc)
             if not _probe_output_is_correct(attn_output):
                 logger.debug(
                     "Static-cache Flash probe: graph ran without error but produced "
