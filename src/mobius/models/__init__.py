@@ -97,6 +97,7 @@ __all__ = [
     "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
+    "Qwen35MtpModel",
     "Qwen35MoEVL3ModelCausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
     "Qwen35VLDecoderModel",
@@ -240,6 +241,7 @@ from mobius.models.qwen35 import (
     Qwen35VLDecoderModel,
     Qwen35VLTextModel,
 )
+from mobius.models.qwen35_mtp import Qwen35MtpModel
 from mobius.models.qwen_image import QwenImageTransformer2DModel
 from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
 from mobius.models.qwen_vl import (

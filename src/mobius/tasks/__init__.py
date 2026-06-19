@@ -28,6 +28,7 @@ __all__ = [
     "ComponentSpec",
     "ControlNetTask",
     "DFlashDraftTask",
+    "Qwen35MtpTask",
     "DenoisingTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
@@ -82,6 +83,7 @@ from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
+from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma4 import (
@@ -131,6 +133,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
+    "qwen35-mtp": Qwen35MtpTask,
     "vae": VAETask,
     "qwen-image-vae": QwenImageVAETask,
     "vision-language": VisionLanguageTask,

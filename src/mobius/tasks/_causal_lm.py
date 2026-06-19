@@ -208,8 +208,8 @@ class CausalLMTask(ModelTask):
             )
 
         if intermediate_hidden_states is not None:
-            _register_intermediate_hidden_states(
-                builder, config.output_layer_indices, intermediate_hidden_states
+            _register_extra_hidden_state_outputs(
+                builder, config, intermediate_hidden_states
             )
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
@@ -287,13 +287,41 @@ class HybridCausalLMTask(ModelTask):
         )
 
         if intermediate_hidden_states is not None:
-            _register_intermediate_hidden_states(
-                builder, config.output_layer_indices, intermediate_hidden_states
+            _register_extra_hidden_state_outputs(
+                builder, config, intermediate_hidden_states
             )
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _register_extra_hidden_state_outputs(
+    builder: GraphBuilder,
+    config: ArchitectureConfig,
+    extra_outputs: list[ir.Value],
+) -> None:
+    """Register the model's extra hidden-state outputs.
+
+    ``extra_outputs`` carries, in order, the intermediate per-layer hidden
+    states selected by ``config.output_layer_indices`` followed (when
+    ``config.output_final_hidden_state`` is set) by the post-final-norm
+    hidden state as the LAST entry.  The intermediates are named
+    ``hidden_states.{idx}``; the final hidden state is named
+    ``hidden_states`` (the input consumed by the Qwen3.6 MTP head).
+    """
+    remaining = list(extra_outputs)
+    if getattr(config, "output_final_hidden_state", False):
+        if not remaining:
+            raise ValueError(
+                "output_final_hidden_state is set but the model returned no "
+                "extra hidden-state tensors."
+            )
+        final_hidden = remaining.pop()  # appended last by TextModel.forward
+        builder.add_output(final_hidden, "hidden_states")
+    _register_intermediate_hidden_states(
+        builder, config.output_layer_indices, remaining
+    )
 
 
 def _register_intermediate_hidden_states(

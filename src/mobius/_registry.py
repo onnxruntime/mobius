@@ -84,6 +84,7 @@ from mobius.models import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35MtpModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
@@ -466,6 +467,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # below allows direct lookup by architecture name and exposes the task.
     "DFlashDraftModel": ModelRegistration(
         DFlashDraftModel, task="dflash-draft", family="dflash", variant="qwen3"
+    ),
+    # Qwen3.6 MTP self-speculative head.  Like DFlash, it is an auxiliary
+    # drafter that is NOT auto-routed by ``model_type`` (the main checkpoint
+    # maps to the qwen3_5 VL / text model); it is looked up directly by
+    # architecture name and exposes the ``qwen35-mtp`` task.
+    "Qwen35MtpModel": ModelRegistration(
+        Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
     ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),

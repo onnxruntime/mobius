@@ -485,6 +485,14 @@ class ArchitectureConfig(BaseModelConfig):
     # transformers (where index 0 is the embedding output).
     output_layer_indices: list[int] | None = None
 
+    # Speculative-decoding (MTP) support.  When ``True``, the model also
+    # exposes its final hidden state — the post-final-norm tensor that feeds
+    # the ``lm_head`` — as an extra ONNX output named ``hidden_states``.
+    # This is the input consumed by the Qwen3.6 MTP self-speculative head
+    # (:class:`~mobius.models.Qwen35MtpModel`).  Independent of, and
+    # composable with, ``output_layer_indices``.
+    output_final_hidden_state: bool = False
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
@@ -1155,6 +1163,45 @@ class DFlashConfig(CausalLMConfig):
             num_target_layers=getattr(config, "num_target_layers", None),
         )
 
+
+
+@dataclasses.dataclass
+class Qwen35MtpConfig(CausalLMConfig):
+    """Configuration for the Qwen3.6 multi-token-prediction (MTP) head.
+
+    The MTP head is a self-speculative drafter shipped inside the dense
+    ``Qwen/Qwen3.6-27B`` checkpoint under the ``mtp.*`` weight prefix
+    (HuggingFace ``transformers`` discards these on ``from_pretrained``).
+    Architecturally it is a single ``full_attention`` Qwen3.5 decoder layer
+    preceded by an input projection that fuses the just-emitted token
+    embedding with the target model's last hidden state::
+
+        h' = fc(concat[ pre_fc_norm_embedding(embed(input_ids)),
+                        pre_fc_norm_hidden(hidden_states) ])
+
+    All standard transformer fields (hidden_size, head_dim, mrope_section,
+    partial_rotary_factor, attn_output_gate, …) are read from the parent
+    model's ``text_config`` so the reused :class:`Qwen35DecoderLayer`,
+    :class:`Qwen35Attention` and mRoPE machinery stay bit-compatible with
+    the target.  ``num_hidden_layers`` is forced to ``1`` and
+    ``layer_types`` to ``["full_attention"]`` regardless of the parent's
+    (64-layer, hybrid) stack — the MTP head has exactly one layer.
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Qwen35MtpConfig:
+        hf_config = config
+        if hasattr(config, "text_config"):
+            hf_config = config.text_config
+        base = ArchitectureConfig.from_transformers(
+            hf_config, parent_config=parent_config or config
+        )
+        fields = _shallow_fields(base)
+        # The MTP head is a single full-attention layer no matter how deep /
+        # hybrid the parent decoder stack is.
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(**fields)
 
 
 @dataclasses.dataclass

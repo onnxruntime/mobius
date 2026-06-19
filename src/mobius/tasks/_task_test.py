@@ -131,6 +131,41 @@ class TestCausalLMTask:
         model = pkg["model"]
         assert model.producer_name == "mobius"
 
+    def test_output_final_hidden_state(self):
+        """``output_final_hidden_state`` exposes the post-final-norm hidden as
+        an extra ``hidden_states`` output (the Qwen3.6 MTP head's input)."""
+        import dataclasses
+
+        config = dataclasses.replace(make_config(), output_final_hidden_state=True)
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        output_names = [v.name for v in pkg["model"].graph.outputs]
+        assert "hidden_states" in output_names
+        assert "logits" in output_names
+
+    def test_output_final_hidden_state_with_layer_indices(self):
+        """The final hidden output coexists with intermediate
+        ``hidden_states.{idx}`` outputs without clobbering them."""
+        import dataclasses
+
+        config = dataclasses.replace(
+            make_config(),
+            output_final_hidden_state=True,
+            output_layer_indices=[0],
+        )
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        output_names = [v.name for v in pkg["model"].graph.outputs]
+        assert "hidden_states" in output_names
+        assert "hidden_states.0" in output_names
+
+    def test_no_final_hidden_by_default(self):
+        config = make_config()
+        module = CausalLMModel(config)
+        pkg = CausalLMTask().build(module, config)
+        output_names = [v.name for v in pkg["model"].graph.outputs]
+        assert "hidden_states" not in output_names
+
 
 class TestCustomTask:
     """Test that users can create custom tasks."""
