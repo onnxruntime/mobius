@@ -216,9 +216,9 @@ def build_from_module(
     # Lower default-domain opset from 24 to 23 when the target EP doesn't
     # register opset 24 kernels for standard ops (Reshape, RMSNormalization,
     # etc.). Without this, those ops fall to CPU and produce ~280 memcpy
-    # nodes that destroy performance. The flag defaults to True; set
-    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
-    # opset 24 natively.
+    # nodes that destroy performance. The flag defaults to False; set
+    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=1 to enable it on older ORT builds that
+    # lack opset 24 kernels for standard ops on the target EP.
     #
     # Skip lowering for any sub-model that uses opset-24-only semantics
     # (TensorScatter, or Attention with a non-empty input #6 ``nonpad_kv_seqlen``).
