@@ -13,7 +13,8 @@ Key differences from dynamic cache:
 - No ``attention_mask`` input — causal masking is handled internally.
 - 3-D cache shape ``[batch, max_seq_len, kv_hidden]`` (not 4-D).
 - ``write_indices`` tracks where to write the next token's KV entry.
-- ``nonpad_kv_seqlen`` tracks how many valid KV entries exist.
+- ``nonpad_kv_seqlen`` is the number of valid KV entries after the current
+  chunk is scattered into the cache (``write_indices + cur_seq_len``).
 - Outputs are ``updated_key_cache.{i}`` / ``updated_value_cache.{i}``.
 
 Usage::
