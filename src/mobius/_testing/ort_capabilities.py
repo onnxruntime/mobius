@@ -26,6 +26,14 @@ onnxscript/ORT drift, or a broken install (logged at warning with a traceback).
 Without that distinction a broken probe would silently cache ``False`` and make
 the entire static-cache suite skip with green CI and zero coverage, while
 :func:`static_cache_flash_skip_reason` misreported the cause as "needs #28958".
+
+The probe is also **not fail-open**: ORT always appends the CPU EP as an
+implicit fallback, and the CPU opset-24 ``Attention`` kernel runs this graph
+without raising (just with historically wrong top-left-causal values).  So a
+no-exception check alone would wrongly report SUPPORTED whenever a CUDA build
+declines the node at GetCapability and the run silently falls back to CPU.  The
+probe defends against that with a deterministic known-answer: a wrong (top-left)
+result is rejected and classified as "needs #28958" rather than SUPPORTED.
 """
 
 from __future__ import annotations
@@ -72,19 +80,43 @@ CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
 
 # Minimal probe geometry.  A single attention head with ``head_dim == 64``
 # (in ORT's compiled Flash kernel set) is enough to exercise the external-cache
-# ``is_causal=1`` + ``nonpad_kv_seqlen`` path.  ``query_len < max_seq_len`` with
-# ``write_indices == 0`` reproduces the ``S_q != total_kv`` (no ``past_key``)
-# regime that pre-#28958 ORT rejects — both prefill and decode hit it.
+# ``is_causal=1`` + ``nonpad_kv_seqlen`` path.  A single decode-style query
+# (``S_q = 1``) over a key tensor of length ``max_seq_len`` reproduces the
+# ``S_q != total_kv`` (no ``past_key``) regime that pre-#28958 ORT rejects, and
+# is also the geometry the known-answer correctness check below relies on.
 _PROBE_BATCH = 1
 _PROBE_NUM_HEADS = 1
 _PROBE_HEAD_DIM = 64
 _PROBE_MAX_SEQ_LEN = 8
-_PROBE_QUERY_LEN = 2
+_PROBE_QUERY_LEN = 1  # decode-style single query (S_q = 1)
+_PROBE_KV_LEN = 2  # two valid KV positions, written from slot 0
 _PROBE_HIDDEN = _PROBE_NUM_HEADS * _PROBE_HEAD_DIM
 
 # Flash is fp16/bf16 only on every CUDA path; fp32 routes to MEA/unfused.
 _PROBE_DTYPE = ir.DataType.FLOAT16
 _PROBE_NP_DTYPE = np.float16
+
+# Known-answer construction that closes the *fail-open* hole: ORT always appends
+# the CPU EP as an implicit fallback, and the CPU opset-24 Attention kernel runs
+# this graph WITHOUT raising — so if a CUDA build declines the node at
+# GetCapability (rather than erroring at Compute), ``session.run`` silently
+# succeeds on CPU and a pure no-exception probe would wrongly report SUPPORTED.
+# To detect that, the probe inputs are chosen so the *correct* output is a fixed
+# known value that a wrong (historical TOP-LEFT causal) kernel cannot produce:
+#   * identical keys + query  -> a uniform softmax over the valid KV positions,
+#   * distinct per-position value tags -> the correct bottom-right output is the
+#     mean of all ``_PROBE_KV_LEN`` valid value tags.
+# A top-left kernel would let the single (decode) query attend only KV slot 0,
+# yielding ``_PROBE_VALUE_TAGS[0]`` instead of the mean — caught by the
+# reference check, which then classifies the run as NEEDS_FIX rather than
+# SUPPORTED.
+_PROBE_KEY_FILL = 0.1
+_PROBE_QUERY_FILL = 0.1
+_PROBE_VALUE_TAGS = (1.0, 3.0)  # per-KV-position constant value vectors
+_PROBE_EXPECTED_OUTPUT = sum(_PROBE_VALUE_TAGS) / len(_PROBE_VALUE_TAGS)  # 2.0
+# fp16 represents 2.0 exactly; the wrong (top-left) answer is 1.0, a full unit
+# away, so a tight tolerance cleanly separates correct from silently-wrong.
+_PROBE_OUTPUT_ATOL = 0.1
 
 
 def _build_static_cache_attention_probe() -> ir.Model:
@@ -101,8 +133,8 @@ def _build_static_cache_attention_probe() -> ir.Model:
         return ir.Value(name=name, shape=ir.Shape(dims), type=ir.TensorType(dt))
 
     query = _value("query", [_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN], _PROBE_DTYPE)
-    key = _value("key", [_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN], _PROBE_DTYPE)
-    value = _value("value", [_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN], _PROBE_DTYPE)
+    key = _value("key", [_PROBE_BATCH, _PROBE_KV_LEN, _PROBE_HIDDEN], _PROBE_DTYPE)
+    value = _value("value", [_PROBE_BATCH, _PROBE_KV_LEN, _PROBE_HIDDEN], _PROBE_DTYPE)
     key_cache = _value(
         "key_cache", [_PROBE_BATCH, _PROBE_MAX_SEQ_LEN, _PROBE_HIDDEN], _PROBE_DTYPE
     )
@@ -158,16 +190,28 @@ def _build_static_cache_attention_probe() -> ir.Model:
 
 
 def _probe_feeds() -> dict[str, np.ndarray]:
-    """Concrete inputs for the probe graph (write from slot 0, ``S_q = query_len``)."""
-    rng = np.random.default_rng(0)
+    """Known-answer inputs for the probe graph (write from slot 0, ``S_q = 1``).
 
-    def _rand(shape: tuple[int, ...]) -> np.ndarray:
-        return (rng.standard_normal(shape) * 0.1).astype(_PROBE_NP_DTYPE)
+    Identical keys/query make the softmax uniform over the valid KV positions;
+    distinct per-position value tags make the correct (bottom-right causal)
+    output the mean of the tags (:data:`_PROBE_EXPECTED_OUTPUT`).  See the
+    geometry comments above for why this discriminates a silent CPU fallback.
+    """
+    value_tags = np.array(_PROBE_VALUE_TAGS, dtype=_PROBE_NP_DTYPE)
+    # (1, _PROBE_KV_LEN, _PROBE_HIDDEN): each KV position filled with its own tag.
+    value = np.broadcast_to(
+        value_tags[None, :, None],
+        (_PROBE_BATCH, _PROBE_KV_LEN, _PROBE_HIDDEN),
+    ).astype(_PROBE_NP_DTYPE)
 
     return {
-        "query": _rand((_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN)),
-        "key": _rand((_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN)),
-        "value": _rand((_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN)),
+        "query": np.full(
+            (_PROBE_BATCH, _PROBE_QUERY_LEN, _PROBE_HIDDEN), _PROBE_QUERY_FILL, _PROBE_NP_DTYPE
+        ),
+        "key": np.full(
+            (_PROBE_BATCH, _PROBE_KV_LEN, _PROBE_HIDDEN), _PROBE_KEY_FILL, _PROBE_NP_DTYPE
+        ),
+        "value": value,
         "key_cache": np.zeros(
             (_PROBE_BATCH, _PROBE_MAX_SEQ_LEN, _PROBE_HIDDEN), dtype=_PROBE_NP_DTYPE
         ),
@@ -175,8 +219,23 @@ def _probe_feeds() -> dict[str, np.ndarray]:
             (_PROBE_BATCH, _PROBE_MAX_SEQ_LEN, _PROBE_HIDDEN), dtype=_PROBE_NP_DTYPE
         ),
         "write_indices": np.array([0], dtype=np.int64),
-        "nonpad_kv_seqlen": np.array([_PROBE_QUERY_LEN], dtype=np.int64),
+        "nonpad_kv_seqlen": np.array([_PROBE_KV_LEN], dtype=np.int64),
     }
+
+
+def _probe_output_is_correct(attn_output: np.ndarray) -> bool:
+    """Return ``True`` iff the probe output matches the bottom-right reference.
+
+    The maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` kernel must align the
+    causal mask to the bottom-right corner (onnx/onnx#8068), so the single decode
+    query attends *all* :data:`_PROBE_KV_LEN` valid KV positions and the output
+    equals :data:`_PROBE_EXPECTED_OUTPUT`.  A historical top-left kernel — the
+    silent CPU-fallback failure mode — attends only KV slot 0 and returns
+    :data:`_PROBE_VALUE_TAGS[0]`, which fails this check.
+    """
+    return bool(
+        np.allclose(attn_output, _PROBE_EXPECTED_OUTPUT, atol=_PROBE_OUTPUT_ATOL, rtol=0.0)
+    )
 
 
 class _ProbeOutcome(enum.Enum):
@@ -208,6 +267,12 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
     CUDA EP silently dropping out of the session — is logged at warning with a
     traceback and maps to :attr:`_ProbeOutcome.PROBE_ERROR` so a broken probe
     cannot silently disable the static-cache gate.
+
+    Also closes the *fail-open* hole: because ORT implicitly appends the CPU EP,
+    a CUDA build that declines the node at GetCapability would silently run the
+    graph on CPU with wrong values and never raise.  The known-answer reference
+    check (:func:`_probe_output_is_correct`) detects that — a wrong (top-left)
+    result maps to :attr:`_ProbeOutcome.NEEDS_FIX`, not SUPPORTED.
     """
     if not CUDA_AVAILABLE:
         return _ProbeOutcome.NO_CUDA
@@ -229,13 +294,23 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
                 )
                 return _ProbeOutcome.PROBE_ERROR
             try:
-                session.run(None, _probe_feeds())
+                attn_output = session.run(None, _probe_feeds())[0]
             except _EXPECTED_REJECT_ERRORS as exc:
                 logger.debug(
                     "Static-cache Flash probe: CUDA Attention kernel rejected the "
                     "maskless is_causal=1 + nonpad_kv_seqlen combination — expected "
                     "without microsoft/onnxruntime#28958 (%s).",
                     exc,
+                )
+                return _ProbeOutcome.NEEDS_FIX
+            if not _probe_output_is_correct(attn_output):
+                logger.debug(
+                    "Static-cache Flash probe: graph ran without error but produced "
+                    "incorrect values (expected ~%.1f, got mean %.4f) — the CUDA EP "
+                    "silently fell back to a wrong (top-left causal) kernel, i.e. the "
+                    "build lacks microsoft/onnxruntime#28958.",
+                    _PROBE_EXPECTED_OUTPUT,
+                    float(np.asarray(attn_output).mean()),
                 )
                 return _ProbeOutcome.NEEDS_FIX
     except Exception:
