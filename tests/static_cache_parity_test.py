@@ -68,12 +68,12 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 import transformers
-from mobius._testing.ort_capabilities import static_cache_flash_skip_reason
 
 from mobius import build
 from mobius._configs import ArchitectureConfig
 from mobius._constants import OPSET_VERSION
 from mobius._testing.comparison import assert_logits_close
+from mobius._testing.ort_capabilities import static_cache_flash_skip_reason
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.torch_reference import load_torch_model, torch_forward
 from mobius.tasks import CausalLMTask
@@ -509,10 +509,38 @@ def test_chunked_prefill_structurally_empty_rows_are_zero():
 
     # The surviving rows must have actually attended something (non-zero,
     # finite).  We deliberately do NOT assert their exact values: upstream's
-    # bottom-right numpy parity reference for nonpad < q_seq is deferred.
+    # bottom-right numpy parity reference for nonpad < q_seq is deferred
+    # (ort#28958 §2E).
     valid_rows = attn[0, num_empty:, :]
     assert np.isfinite(valid_rows).all()
     assert np.abs(valid_rows).max() > 0.0, "valid rows unexpectedly all-zero"
+
+    # Authoritative convex-combination invariant — needs NO deferred reference.
+    # Softmax attention output is a convex combination of the attended V rows
+    # (weights ≥ 0, sum to 1), so every output element must lie within the
+    # [min, max] hull of V over the VALID (attended) keys, per head and per
+    # channel.  Whatever causal subset of the valid window [0, nonpad_value) a
+    # surviving row attends is contained in that full window, so the window's
+    # per-channel hull soundly bounds every surviving row.  This catches a
+    # wrong-attention-frontier bug (e.g. attending padded/empty keys, or
+    # mean-of-all-V) that the near-vacuous non-zero check above cannot — while
+    # staying independent of the upstream-deferred exact valid-row reference.
+    #
+    # V is laid out (B, S, num_heads * head_dim); ONNX Attention reshapes the
+    # last dim to (num_heads, head_dim), so reshape both V and the output the
+    # same way to bound per head and per channel.
+    value_heads = value.reshape(batch, query_len, num_heads, head_dim)
+    valid_v = value_heads[0, :nonpad_value]  # (nonpad_value, num_heads, head_dim)
+    v_lo = valid_v.min(axis=0)  # (num_heads, head_dim)
+    v_hi = valid_v.max(axis=0)  # (num_heads, head_dim)
+    surviving = attn[0, num_empty:].reshape(nonpad_value, num_heads, head_dim)
+    hull_tol = 1e-4  # fp32 softmax round-off slack
+    assert (surviving >= v_lo - hull_tol).all() and (surviving <= v_hi + hull_tol).all(), (
+        "valid rows must be a convex combination of the attended V rows "
+        "(each element within the per-head, per-channel hull of the valid "
+        f"V window); max under-shoot={np.min(surviving - v_lo)}, "
+        f"max over-shoot={np.max(surviving - v_hi)}"
+    )
 
 
 def test_prefill_chunk_causal_triangle_matches_reference():
