@@ -542,7 +542,8 @@ def main(argv: list[str] | None = None) -> None:
             "Export the text backbone of a multimodal checkpoint as a "
             "standalone decoder-only LLM. Strips vision/audio routing so the "
             "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
-            "supported for gemma4_unified (google/gemma-4-12B)."
+            "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
+            "with --config (use --model <hf-id>)."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

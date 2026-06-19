@@ -1517,6 +1517,27 @@ class TestBuildGraphVisionLanguage:
         ):
             build("meta-llama/Llama-3.2-1B", load_weights=False, text_only=True)
 
+    def test_build_text_only_diffusers_path_raises(self):
+        """``build(text_only=True)`` errors on the diffusers/unsupported path.
+
+        When AutoConfig fails and the model is not in the registry, ``build``
+        normally falls through to ``build_diffusers_pipeline``. With
+        ``text_only=True`` it must raise instead of silently ignoring the flag.
+        """
+        from unittest import mock
+
+        from mobius._builder import build
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                side_effect=ValueError("no such model_type"),
+            ),
+            mock.patch("mobius._config_resolver._try_load_config_json", return_value=None),
+            pytest.raises(ValueError, match="does not resolve to a registered"),
+        ):
+            build("some/diffusion-pipeline", load_weights=False, text_only=True)
+
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
         When ``config.audio`` is set, Gemma4Model adds a ``speech`` model and a

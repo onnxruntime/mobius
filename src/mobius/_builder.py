@@ -378,6 +378,12 @@ def build(
         # Try loading config.json directly if the model is in our registry.
         hf_config = _try_load_config_json(model_id)
         if hf_config is None or hf_config.model_type not in registry:
+            if text_only:
+                raise ValueError(
+                    f"text_only=True is not supported for '{model_id}': it does "
+                    "not resolve to a registered text-capable model_type (it "
+                    "looks like a diffusers pipeline or an unsupported config)."
+                )
             # Not a model we support — try diffusers pipeline
             return build_diffusers_pipeline(
                 model_id,

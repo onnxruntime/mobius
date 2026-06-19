@@ -94,7 +94,7 @@ def build_and_export(model_id: str, output_dir: str, dtype: str, ep: str) -> Non
         ep: Execution provider. Drives both the build-time fusion (``cuda``
             enables GroupQueryAttention) and the genai ``session_options`` EP.
     """
-    from mobius.integrations.ort_genai import auto_export
+    from mobius.integrations.ort_genai.auto_export import auto_export
 
     print(
         f"Building text-only package for {model_id!r} "
