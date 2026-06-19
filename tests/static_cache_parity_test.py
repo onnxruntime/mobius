@@ -48,7 +48,7 @@ Skip mechanism (documented contract)
 -------------------------------------
 Both tests require the *fixed* ORT kernel.  Rather than pin to an opaque ORT
 version number, we reuse the shared **functional capability probe**
-:func:`tests._static_cache_support.static_cache_cuda_supported` (also used by
+:func:`mobius._testing.ort_capabilities.supports_static_cache_flash` (also used by
 the e2e Flash-dispatch test): it builds a tiny static-cache model and runs
 prefill on the CUDA Execution Provider.  Pre-#28958 ORT raises
 ``NOT_IMPLEMENTED`` (→ skip); post-#28958 ORT runs.  It also short-circuits when
@@ -68,7 +68,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 import transformers
-from _static_cache_support import CUDA_AVAILABLE, static_cache_cuda_supported
+from mobius._testing.ort_capabilities import CUDA_AVAILABLE, supports_static_cache_flash
 
 from mobius import build
 from mobius._configs import ArchitectureConfig
@@ -97,11 +97,11 @@ def _require_static_cache_attention() -> None:
     """Skip the calling test unless the fixed static-cache kernel is present.
 
     Delegates to the shared functional probe
-    :func:`_static_cache_support.static_cache_cuda_supported` (cached), which
+    :func:`mobius._testing.ort_capabilities.supports_static_cache_flash` (cached), which
     runs the maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` + ``TensorScatter``
     combination on the CUDA EP — the exact thing onnxruntime#28958 enables.
     """
-    if not static_cache_cuda_supported():
+    if not supports_static_cache_flash():
         if not CUDA_AVAILABLE:
             pytest.skip(
                 "CUDA Execution Provider not available; static-cache "
