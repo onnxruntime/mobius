@@ -72,6 +72,7 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MimiModel",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
@@ -133,6 +134,7 @@ __all__ = [
     "WhisperForConditionalGeneration",
     "XLMCausalLMModel",
     "Zamba2CausalLMModel",
+    "mimi_default_config",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -187,6 +189,7 @@ from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,

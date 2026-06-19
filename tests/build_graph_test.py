@@ -3688,6 +3688,46 @@ class TestBuildQwenImageGraph:
         assert "sample" in {out.name for out in dec.graph.outputs}
 
 
+class TestBuildMimiCodec:
+    """Verify the Mimi codec (nvidia/personaplex-7b-v1) graph construction."""
+
+    def test_package_builds_2_models(self):
+        """Build the Mimi codec and verify a 2-model (encoder+decoder) package."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        module = MimiModel(config)
+        pkg = build_from_module(module, config, task=CodecTask())
+
+        assert "encoder" in pkg
+        assert "decoder" in pkg
+
+    def test_encoder_io(self):
+        """Verify the Mimi encoder I/O contract: waveform -> codes."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        pkg = build_from_module(MimiModel(config), config, task=CodecTask())
+        encoder = pkg["encoder"]
+
+        assert "waveform" in {inp.name for inp in encoder.graph.inputs}
+        assert "codes" in {out.name for out in encoder.graph.outputs}
+
+    def test_decoder_io(self):
+        """Verify the Mimi decoder I/O contract: codes -> waveform."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        pkg = build_from_module(MimiModel(config), config, task=CodecTask())
+        decoder = pkg["decoder"]
+
+        assert "codes" in {inp.name for inp in decoder.graph.inputs}
+        assert "waveform" in {out.name for out in decoder.graph.outputs}
+
+
 class TestBuildCodecGraph:
     """Verify codec tokenizer (Qwen3-TTS-Tokenizer-12Hz) graph construction."""
 
