@@ -29,6 +29,7 @@ __all__ = [
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
     "DogeCausalLMModel",
+    "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
@@ -196,6 +197,7 @@ from mobius.models.moe import (
     Qwen2MoECausalLMModel,
 )
 from mobius.models.nanochat import NanoChatCausalLMModel
+from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel

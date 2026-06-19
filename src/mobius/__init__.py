@@ -36,6 +36,7 @@ __all__ = [
     "build_diffusers_pipeline",
     "build_from_gguf",
     "build_from_module",
+    "build_from_nemo",
     "components",
     "ep_capabilities",
     "ep_registry",
@@ -89,4 +90,5 @@ from mobius._registry import (
 )
 from mobius._weight_loading import apply_weights
 from mobius.integrations.gguf import build_from_gguf
+from mobius.integrations.nemo import build_from_nemo
 from mobius.tasks import CausalLMTask, ModelTask

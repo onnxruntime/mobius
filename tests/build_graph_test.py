@@ -4579,6 +4579,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "cohere2_vision",
     "deepseek_vl",
     "deepseek_vl_hybrid",
+    # FastConformer-RNNT (co-located src/mobius/models/nemo_rnnt_test.py)
+    "fastconformer_rnnt",
     "florence2",
     "fuyu",
     "glm4v",
