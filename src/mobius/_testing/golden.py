@@ -114,6 +114,12 @@ class GoldenTestCase:
     Use when a model has known float32 precision divergence vs HF (e.g.
     VL 3-model pipeline)."""
 
+    architecture: str | None
+    """Optional registry architecture key (e.g. ``Qwen35MtpModel``) forcing a
+    specific module class + task at build time.  Needed for auxiliary heads
+    (DFlash, MTP) that share a base checkpoint whose ``architectures`` field
+    would otherwise auto-route to the base model.  ``None`` = auto-detect."""
+
     yaml_path: Path
     """Absolute path to the source YAML file."""
 
@@ -236,6 +242,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         skip_reason=data.get("skip_reason"),
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
+        architecture=data.get("architecture"),
         yaml_path=yaml_path,
     )
 

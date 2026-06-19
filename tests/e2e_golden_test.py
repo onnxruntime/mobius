@@ -297,8 +297,21 @@ _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
+    module_class = None
+    task = None
+    if case.architecture:
+        # Force a specific module class + task (auxiliary heads such as the
+        # Qwen3.6 MTP head that share a base checkpoint whose ``architectures``
+        # field would otherwise auto-route to the base model).
+        from mobius._registry import registry
+
+        reg = registry.get_registration(case.architecture)
+        module_class = reg.module_class
+        task = reg.task or getattr(module_class, "default_task", None)
     return build(
         case.model_id,
+        task=task,
+        module_class=module_class,
         dtype=case.dtype,
         load_weights=True,
         trust_remote_code=case.trust_remote_code,
@@ -476,6 +489,10 @@ def _extract_logits(
         # DFlash outputs draft_hidden (pre-lm_head). Treat it as the logit
         # vector for the argmax gate (mirrors the hidden-state task handling).
         return outputs["draft_hidden"]
+    if task_type == "qwen35-mtp" and "mtp_hidden" in outputs:
+        # The Qwen3.6 MTP head outputs mtp_hidden (pre-lm_head, the head borrows
+        # the target's lm_head). Treat it as the logit vector for the argmax gate.
+        return outputs["mtp_hidden"]
     if task_type in _HIDDEN_STATE_TASKS and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
@@ -1637,6 +1654,44 @@ def _run_dflash_draft_prefill(
         session.close()
 
 
+def _run_qwen35_mtp_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the Qwen3.6 MTP head ONNX on the replay block and return its outputs.
+
+    Replay tensors (``inputs_embeds``, ``hidden_states``, ``attention_mask``,
+    ``position_ids``) are the target's shared embedding of the just-emitted
+    tokens plus the target's last hidden state — captured from the reference
+    forward. The MTP head borrows the target's embed / lm_head, so it has a
+    single GQA layer whose KV cache starts empty (zero-length past tensors).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["inputs_embeds"].shape[0])
+    np_dt = np.float16 if case.dtype == "float16" else np.float32
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs["inputs_embeds"].astype(np_dt),
+            "hidden_states": inputs["hidden_states"].astype(np_dt),
+            "attention_mask": inputs["attention_mask"].astype(np.int64),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np_dt
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
@@ -1681,6 +1736,8 @@ class TestL4CheckpointVerified:
             outputs = _run_gemma4_assistant_prefill(pkg, case)
         elif case.task_type == "dflash-draft":
             outputs = _run_dflash_draft_prefill(pkg, case)
+        elif case.task_type == "qwen35-mtp":
+            outputs = _run_qwen35_mtp_prefill(pkg, case)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:

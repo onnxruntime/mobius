@@ -57,6 +57,7 @@
         "image-to-text",
         "object-detection",
         "phi4mm-multimodal",
+        "qwen35-mtp",
         "seq2seq",
         "speech-language",
         "speech-to-text",
@@ -175,6 +176,10 @@
     "notes": {
       "type": "string",
       "description": "Human-readable description of the test case. Not parsed by the test runner."
+    },
+    "architecture": {
+      "type": "string",
+      "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
     }
   }
 }
