@@ -137,6 +137,26 @@ def _resolve_ort_genai_model_type(model_type: str) -> str:
     return _ORT_GENAI_MODEL_TYPE.get(model_type, model_type)
 
 
+def _select_ort_model_type(
+    config_model_type: str | None,
+    hf_model_type: str | None,
+    *,
+    is_decoder_only: bool,
+) -> str:
+    """Choose the ORT-GenAI model type for an exported package.
+
+    Decoder-only packages prefer the built package's ``config.model_type`` so
+    text-only / overridden builds (e.g. ``gemma4_unified -> gemma4_unified_text``)
+    resolve to the decoder-only ORT type. Multimodal packages keep the HF
+    parent ``model_type``: ``build()`` unwraps composite configs to their text
+    sub-config, so ``config.model_type`` would otherwise be the text type even
+    for a full multimodal export.
+    """
+    if is_decoder_only and config_model_type:
+        return _resolve_ort_genai_model_type(config_model_type)
+    return _resolve_ort_genai_model_type(hf_model_type or "unknown")
+
+
 def _graph_input_names(model: ir.Model) -> list[str]:
     """Return non-KV-cache input names from an ONNX model graph.
 
@@ -878,12 +898,29 @@ def write_ort_genai_config(
     pad_token_id: int | None = None
     ort_model_type: str
 
+    # Detect multimodal capabilities from the package keys. Needed before
+    # resolving the ORT model type so decoder-only (text-only) packages can
+    # prefer their own config.model_type (see below).
+    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
+    has_speech = "audio_encoder" in pkg
+    is_decoder_only = not is_vlm and not has_speech
+
     if hf_model_id is not None:
         import transformers
 
         hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
         model_type = hf_config.model_type
-        ort_model_type = _resolve_ort_genai_model_type(model_type)
+        # For decoder-only packages, prefer the built package's model_type so
+        # text-only / overridden builds (e.g. gemma4_unified -> gemma4_unified_text)
+        # resolve to the correct decoder-only ORT-GenAI type rather than the
+        # multimodal one reported by the HuggingFace config. For multimodal
+        # packages keep the HF parent model_type: build() unwraps composite
+        # configs to their text sub-config, so pkg.config.model_type would
+        # otherwise be the text type even for a full multimodal export.
+        cfg_model_type = getattr(config, "model_type", None)
+        ort_model_type = _select_ort_model_type(
+            cfg_model_type, model_type, is_decoder_only=is_decoder_only
+        )
         # Token IDs may live on the parent config or the text sub-config
         # (e.g. Gemma4Config has text_config with bos_token_id=2).
         _tok_cfg = getattr(hf_config, "text_config", hf_config)
@@ -923,10 +960,6 @@ def write_ort_genai_config(
         # "not set" sentinel (negative IDs are never valid token positions).
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
-
-    # Detect multimodal capabilities from the package keys
-    is_vlm = "vision_encoder" in pkg and "embedding" in pkg
-    has_speech = "audio_encoder" in pkg
 
     # Phi4MM quirk: HF reports model_type='phi' but the model package
     # includes an 'audio_encoder' component that distinguishes it from plain Phi.
@@ -1115,6 +1148,7 @@ def auto_export(
     context_length: int = 4096,
     ep: str = "cpu",
     progress_bar: bool = True,
+    text_only: bool = False,
 ) -> dict[str, str]:
     """Build and export a model for onnxruntime-genai.
 
@@ -1137,8 +1171,19 @@ def auto_export(
         trust_remote_code: Trust remote code for HuggingFace config.
         context_length: Minimum context length for genai_config.json.
         ep: Execution provider for ``session_options`` in
-            ``genai_config.json``. Defaults to ``"cpu"``.
+            ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
+            this value also drives build-time ``execution_provider`` so the
+            exported ONNX graph is fused for the same provider the runtime will
+            use (e.g. ``"cuda"`` enables ``GroupQueryAttention`` fusion).
+            ``"cpu"`` builds the portable ``"default"`` graph (unchanged
+            behavior).
         progress_bar: Show progress bar during save.
+        text_only: When ``True``, export the text backbone of a multimodal
+            checkpoint as a standalone decoder-only LLM (see
+            :func:`~mobius._builder.build`). Produces a single ``model.onnx``
+            with a decoder-only ``genai_config.json`` (no vision/audio
+            sections). Currently supported for ``gemma4_unified``
+            (``google/gemma-4-12B``).
 
     Returns:
         Dict mapping output artifact names to file paths, e.g.::
@@ -1153,14 +1198,21 @@ def auto_export(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Build ONNX graph(s) with weights
-    logger.info("Building ONNX model for %s", model_id)
+    # Build ONNX graph(s) with weights. The runtime EP (``ep``) also drives
+    # EP-aware graph construction so fused ops (e.g. GroupQueryAttention on
+    # CUDA) match the provider declared in genai_config.json. ``cpu`` maps to
+    # the portable ``default`` build to preserve historical CPU/f32 output
+    # (the CPU EP would otherwise fuse f32 GroupQueryAttention).
+    build_ep = "default" if ep == "cpu" else ep
+    logger.info("Building ONNX model for %s (build ep=%s)", model_id, build_ep)
     pkg = build(
         model_id,
         task=task,
         dtype=dtype,
         load_weights=True,
         trust_remote_code=trust_remote_code,
+        execution_provider=build_ep,
+        text_only=text_only,
     )
 
     if getattr(pkg, "config", None) is None:

@@ -1414,7 +1414,109 @@ class TestBuildGraphVisionLanguage:
         assert "past_key_values.0.key" in input_names
         assert "past_key_values.1.key" in input_names
 
-    def test_gemma4_any_to_any_graph(self):
+    def test_gemma4_unified_text_only_emits_gqa(self):
+        """text_only build of gemma-4-12B emits GroupQueryAttention on CUDA.
+
+        The multimodal ``gemma4_unified`` decoder uses the bidirectional
+        vision-block overlay (float-bias ``Attention``), but the text-only
+        export strips ``image_token_id`` / ``use_bidirectional_attention`` so
+        the decoder is pure causal and fuses to ``GroupQueryAttention`` on a
+        GQA-capable execution provider. This mirrors what
+        ``build(text_only=True)`` produces, without network access.
+        """
+        from collections import Counter
+
+        from mobius._builder import _strip_to_text_only
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import get_task
+
+        config = Gemma4Config(
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            image_token_id=258880,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+        )
+        config = _strip_to_text_only(config, "gemma4_unified_text")
+        config.dtype = DTYPE_MAP["f16"]
+        assert config.image_token_id is None
+        assert config.use_bidirectional_attention is None
+
+        model_cls = registry.get("gemma4_unified_text")
+        module = model_cls(config)
+        task = get_task(_default_task_for_model("gemma4_unified_text"))
+        pkg = build_from_module(module, config, task=task, execution_provider="cuda")
+
+        counts = Counter(n.op_type for n in pkg["model"].graph)
+        assert counts.get("GroupQueryAttention", 0) == 2, dict(counts)
+        assert counts.get("Attention", 0) == 0, dict(counts)
+
+    def test_strip_to_text_only(self):
+        """``_strip_to_text_only`` nulls multimodal fields and sets model_type."""
+        from mobius._builder import _strip_to_text_only
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config
+
+        config = Gemma4Config(
+            model_type="gemma4_unified",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            hidden_act="gelu_pytorch_tanh",
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            use_bidirectional_attention="vision",
+            image_token_id=258880,
+            boa_token_id=256000,
+            audio=Gemma4AudioConfig(),
+            pad_token_id=0,
+        )
+        out = _strip_to_text_only(config, "gemma4_unified_text")
+
+        assert out.model_type == "gemma4_unified_text"
+        assert out.image_token_id is None
+        assert out.use_bidirectional_attention is None
+        assert out.boa_token_id is None
+        assert out.audio is None
+        assert out.vision is None
+        # Original config is untouched (dataclasses.replace returns a copy).
+        assert config.image_token_id == 258880
+
+    def test_build_text_only_unsupported_model_type_raises(self):
+        """``build(text_only=True)`` rejects model types with no text sibling."""
+        from unittest import mock
+
+        from mobius._builder import build
+
+        fake_hf = type("HF", (), {"model_type": "llama"})()
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            pytest.raises(ValueError, match="text_only=True is not supported"),
+        ):
+            build("meta-llama/Llama-3.2-1B", load_weights=False, text_only=True)
+
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
         When ``config.audio`` is set, Gemma4Model adds a ``speech`` model and a

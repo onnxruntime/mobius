@@ -134,6 +134,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --static-cache."
         )
 
+    # --text-only resolution lives in build() (model_type remap + config
+    # stripping), which is only reached on the HuggingFace model-ID path.
+    if args.text_only and args.config:
+        raise SystemExit(
+            "Error: --text-only is not supported with --config (local "
+            "directory). Use --model <hf-id> --text-only instead."
+        )
+
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
@@ -198,6 +206,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
+            text_only=args.text_only,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -523,6 +532,17 @@ def main(argv: list[str] | None = None) -> None:
             "copies tokenizer files). When used with --model, tokenizer files "
             "are downloaded from HuggingFace. When used with --config (local "
             "directory), tokenizer files are copied from that directory."
+        ),
+    )
+    build_parser.add_argument(
+        "--text-only",
+        dest="text_only",
+        action="store_true",
+        help=(
+            "Export the text backbone of a multimodal checkpoint as a "
+            "standalone decoder-only LLM. Strips vision/audio routing so the "
+            "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
+            "supported for gemma4_unified (google/gemma-4-12B)."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

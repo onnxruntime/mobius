@@ -74,6 +74,11 @@ class TestCLIBuild:
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(["build", tmpdir])  # no --model or --config
 
+    def test_text_only_with_config_errors(self):
+        """--text-only is rejected on the --config (local dir) path."""
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(["build", "--config", tmpdir, tmpdir, "--text-only", "--no-weights"])
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
