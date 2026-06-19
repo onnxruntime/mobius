@@ -99,9 +99,7 @@ def test_graph_requires_opset24_ignores_custom_domain() -> None:
 def test_graph_requires_opset24_detects_nested_subgraph() -> None:
     # An opset-24-only op buried inside an If/Loop/Scan body must still be
     # detected: the scan is recursive (RecursiveGraphIterator).
-    then_branch = _graph_with(
-        [ir.Node("", "TensorScatter", inputs=[_make_value("a")])]
-    )
+    then_branch = _graph_with([ir.Node("", "TensorScatter", inputs=[_make_value("a")])])
     else_branch = _graph_with([ir.Node("", "Identity", inputs=[_make_value("b")])])
     if_node = ir.Node(
         "",
@@ -146,6 +144,20 @@ def test_apply_opset_lowering_skipped_for_default_ep(
     assert pkg["embedding"].graph.opset_imports[""] == 24
 
 
+def test_apply_opset_lowering_skipped_for_cpu_ep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The "cpu" EP gate: the CPU EP already registers opset-24 kernels, so
+    # lowering never fires for it even with the flag enabled (mirrors the
+    # inference-side ort_inference._should_lower_opset CPU skip).
+    monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
+    pkg = ModelPackage({"embedding": _model_with(_standard_nodes())})
+
+    _apply_opset_lowering(pkg, execution_provider="cpu")
+
+    assert pkg["embedding"].graph.opset_imports[""] == 24
+
+
 def test_apply_opset_lowering_skipped_when_flag_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,4 +168,3 @@ def test_apply_opset_lowering_skipped_when_flag_disabled(
     _apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
-

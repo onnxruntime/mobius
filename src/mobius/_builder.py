@@ -230,7 +230,9 @@ def _apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
     ops (Reshape, RMSNormalization, etc.). Without lowering, those ops fall to
     CPU and produce ~280 memcpy nodes that destroy performance. The
     ``MOBIUS_ORT_LOWER_OPSET_FOR_EP`` flag (default False) opts a deployment
-    into the lowering; it is a no-op for the ``"default"`` EP.
+    into the lowering; it is a no-op for the ``"default"`` and ``"cpu"`` EPs
+    (the CPU EP already has opset-24 kernels), matching the inference-side gate
+    ``ort_inference._should_lower_opset``.
 
     Any sub-model that uses opset-24-only semantics (TensorScatter, or
     Attention with a non-empty input #6 ``nonpad_kv_seqlen``) is left at opset
@@ -239,7 +241,12 @@ def _apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
     is made per sub-model, so a mixed package lowers its standard sub-models
     while preserving its static-cache sub-models.
     """
-    if not (flags.ort_lower_opset_for_ep and execution_provider != "default"):
+    if not flags.ort_lower_opset_for_ep:
+        return
+    # Mirror ort_inference._should_lower_opset: the "default" EP is a no-op, and
+    # the CPU EP already registers opset-24 kernels, so lowering there is both
+    # unnecessary and inconsistent with the inference-side gate.
+    if execution_provider in ("default", "cpu"):
         return
     for name, model in pkg.items():
         if "" not in model.graph.opset_imports:

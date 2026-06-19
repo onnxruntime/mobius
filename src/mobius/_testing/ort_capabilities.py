@@ -43,6 +43,7 @@ import functools
 import logging
 import tempfile
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import onnx_ir as ir
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 # session-create failures (the symptoms of a broken probe) loud.  Imported
 # defensively so a pybind layout change cannot break import; falls back to the
 # common base class of every ORT pybind error.
+_ort_capi: ModuleType | None
 try:
     from onnxruntime.capi import onnxruntime_pybind11_state as _ort_capi
 
@@ -68,7 +70,19 @@ try:
         _ort_capi.Fail,
     )
 except Exception:  # pragma: no cover - defensive against pybind layout drift
+    _ort_capi = None
     _EXPECTED_REJECT_ERRORS = (RuntimeError,)
+
+# Distinctive lowercase substrings from the pre-#28958 CUDA reject raised by
+# ``Attention::ComputeInternal`` (NOT_IMPLEMENTED): "Causal attention with
+# TensorScatter (nonpad_kv_seqlen) and S_q != S_kv without past_key is not
+# supported...".  A ``NotImplemented`` from that path is unambiguous, but a
+# generic ORT ``Fail`` (CUDA OOM, kernel bug, install drift) must NOT be
+# mistaken for it — so a ``Fail`` (or the defensive ``RuntimeError`` fallback)
+# is only accepted as the expected reject when its message carries one of these
+# signatures.  Otherwise a real failure would be silently relabelled
+# "needs #28958", skipping the whole suite and masking a true regression.
+_PRE28958_REJECT_SIGNATURES = ("nonpad_kv_seqlen", "tensorscatter")
 
 __all__ = [
     "CUDA_AVAILABLE",
@@ -267,6 +281,24 @@ class _ProbeOutcome(enum.Enum):
     PROBE_ERROR = "probe_error"  # unexpected: must not silently disable the gate
 
 
+def _is_expected_pre28958_reject(exc: BaseException) -> bool:
+    """Return ``True`` only for the genuine pre-#28958 CUDA Attention reject.
+
+    A ``NotImplemented`` pybind error from the probe's ``session.run`` is the
+    confirmed "needs microsoft/onnxruntime#28958" path (raised from
+    ``Attention::ComputeInternal``) and is always accepted.  A generic ``Fail``
+    (or the defensive ``RuntimeError`` fallback) is accepted ONLY when its
+    message carries the reject signature — so a real ``Fail`` (CUDA OOM, kernel
+    bug, install drift) is surfaced as a ``PROBE_ERROR`` instead of being
+    silently misclassified as "needs #28958", which would skip the whole suite
+    and mask a true regression.
+    """
+    if _ort_capi is not None and isinstance(exc, _ort_capi.NotImplemented):
+        return True
+    message = str(exc).lower()
+    return any(sig in message for sig in _PRE28958_REJECT_SIGNATURES)
+
+
 @functools.lru_cache(maxsize=1)
 def _probe_static_cache_flash() -> _ProbeOutcome:
     """Run the functional capability probe once and classify the outcome.
@@ -320,6 +352,18 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
             try:
                 attn_output = session.run(None, _probe_feeds())[0]
             except _EXPECTED_REJECT_ERRORS as exc:
+                if not _is_expected_pre28958_reject(exc):
+                    logger.warning(
+                        "Static-cache Flash probe: session.run raised an ORT error "
+                        "that does NOT match the pre-#28958 reject signature (%s) — "
+                        "treating it as an unexpected probe failure (PROBE_ERROR) "
+                        "rather than 'needs onnxruntime#28958', so a genuine "
+                        "regression (CUDA OOM, kernel bug, install drift) stays loud "
+                        "instead of silently skipping the whole suite.",
+                        exc,
+                        exc_info=True,
+                    )
+                    return _ProbeOutcome.PROBE_ERROR
                 logger.debug(
                     "Static-cache Flash probe: CUDA Attention kernel rejected the "
                     "maskless is_causal=1 + nonpad_kv_seqlen combination — expected "
