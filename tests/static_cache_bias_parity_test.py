@@ -221,8 +221,18 @@ def _dense_reference(
                 mask |= kv_group == block_sequence_ids[b, t]  # bidirectional block
             mask &= kv_slots < npad  # padding validity
             idx = np.nonzero(mask)[0]
-            if idx.size == 0:
-                continue  # structurally empty -> exactly 0 (zero guard)
+            # The bias-MEA contract keeps every query row's own diagonal slot
+            # valid (q_abs[t] == write+t is causal, within any window, and
+            # < nonpad == write+S_q), so a fully-masked row is unreachable by
+            # design — we assert that instead of silently returning 0.  A 0
+            # here would encode the CUDA-Flash zero-guard that the MEA bias
+            # path PRECLUDES (CPU MEA returns a finite mean-of-V for an
+            # all-masked row, not 0), so reference and ORT would diverge if the
+            # boundary were ever reached.
+            assert idx.size > 0, (
+                "fully-masked query row in the dense reference — out-of-contract "
+                f"feed (b={b}, t={t}, nonpad={npad}, write={wi}, S_q={query_len})?"
+            )
             for h in range(num_q_heads):
                 kv_h = h // group  # GQA: query head -> shared kv head
                 kk = k_heads[idx, kv_h]  # (n_valid, head_dim)
@@ -245,6 +255,15 @@ _NUM_KV_HEADS = 2  # GQA: 2 query heads share each kv head
 _HEAD_DIM = 16  # hidden = 4 * 16 = 64
 _MAX_SEQ_LEN = 16
 _SLIDING_WINDOW = 4
+
+# Phase-2 test-coverage TODO (code review M2, deferred):
+# The block-overlay tests here only exercise write_idx==0 (prefill), where the
+# current chunk's block ids occupy slots [0, S_q).  At a non-zero write_idx the
+# scatter-into-(-1)-buffer geometry still only carries the CURRENT chunk's block
+# ids (past-chunk block ids are lost — a documented Phase-1 limitation), so a
+# decode-time block overlay is a no-op.  That path is not wired into base.py
+# until Phase 2 (Gemma-4 re-emission), so a non-zero-write_idx block-overlay
+# parity case is intentionally deferred to that phase rather than added now.
 
 
 def _scatter_into_cache(cache: np.ndarray, chunk: np.ndarray, write_idx: int) -> np.ndarray:
@@ -384,6 +403,86 @@ def test_decode_step_bias_matches_dense_reference():
     assert onnx_attn.shape == (_BATCH, 1, _NUM_Q_HEADS * _HEAD_DIM)
     assert np.isfinite(onnx_attn).all(), "attention output contains NaN/Inf"
     np.testing.assert_allclose(onnx_attn, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_batched_decode_per_row_write_indices_and_nonpad():
+    """B=2 decode: per-row ``write_indices`` / ``nonpad`` broadcast correctly.
+
+    The other cases are all ``B=1``; this exercises the per-batch broadcasting
+    in ``create_static_cache_attention_bias`` (``write_indices``/``nonpad`` enter
+    as ``[B]`` tensors).  Row 0 decodes at absolute position 3 (``nonpad=4``) and
+    row 1 at position 5 (``nonpad=6``), each against its own pre-populated cache
+    prefix, so a broadcasting bug (e.g. using row 0's offsets for row 1) would
+    diverge from the per-row dense reference.
+    """
+    batch, query_len = 2, 1
+    write_idx = np.array([3, 5], dtype=np.int64)
+    nonpad = np.array([4, 6], dtype=np.int64)  # contract: nonpad == write + S_q
+    rng = np.random.default_rng(11)
+    q_hidden = _NUM_Q_HEADS * _HEAD_DIM
+    kv_hidden = _NUM_KV_HEADS * _HEAD_DIM
+
+    query = rng.standard_normal((batch, query_len, q_hidden)).astype(np.float32)
+    key = rng.standard_normal((batch, query_len, kv_hidden)).astype(np.float32)
+    value = rng.standard_normal((batch, query_len, kv_hidden)).astype(np.float32)
+
+    # Pre-populate each row's valid prefix [0, write_idx[b]) with random K/V.
+    key_cache = np.zeros((batch, _MAX_SEQ_LEN, kv_hidden), dtype=np.float32)
+    value_cache = np.zeros((batch, _MAX_SEQ_LEN, kv_hidden), dtype=np.float32)
+    for b in range(batch):
+        wi = int(write_idx[b])
+        key_cache[b, :wi] = rng.standard_normal((wi, kv_hidden)).astype(np.float32)
+        value_cache[b, :wi] = rng.standard_normal((wi, kv_hidden)).astype(np.float32)
+
+    model = _build_static_cache_bias_graph(
+        batch=batch,
+        num_q_heads=_NUM_Q_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        max_seq_len=_MAX_SEQ_LEN,
+        query_len=query_len,
+        sliding_window=_SLIDING_WINDOW,
+        use_block_overlay=False,
+    )
+    session = OnnxModelSession(model)
+    try:
+        out = session.run(
+            {
+                "query": query,
+                "key": key,
+                "value": value,
+                "key_cache": key_cache,
+                "value_cache": value_cache,
+                "write_indices": write_idx,
+                "nonpad_kv_seqlen": nonpad,
+            }
+        )
+    finally:
+        session.close()
+
+    # Per-row scatter of the decode token (mirrors TensorScatter with [B] idx).
+    full_k = key_cache.copy()
+    full_v = value_cache.copy()
+    for b in range(batch):
+        wi = int(write_idx[b])
+        full_k[b, wi : wi + query_len] = key[b]
+        full_v[b, wi : wi + query_len] = value[b]
+    ref = _dense_reference(
+        query,
+        full_k,
+        full_v,
+        write_indices=write_idx,
+        nonpad_kv_seqlen=nonpad,
+        max_seq_len=_MAX_SEQ_LEN,
+        num_q_heads=_NUM_Q_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        sliding_window=_SLIDING_WINDOW,
+        block_sequence_ids=None,
+    )
+    assert out["attn_output"].shape == (batch, query_len, q_hidden)
+    assert np.isfinite(out["attn_output"]).all()
+    np.testing.assert_allclose(out["attn_output"], ref, atol=1e-4, rtol=1e-4)
 
 
 def test_nonpad_padding_clamp_matches_dense_reference():

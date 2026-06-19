@@ -303,7 +303,9 @@ def create_static_cache_attention_bias(
         op: The OpBuilder.
         write_indices: ``[B]`` int64 start slot per batch (where the current
             chunk is scattered — the same tensor fed to ``TensorScatter``).
-        seq_len: Scalar int64 query-chunk length ``S_q``.
+        seq_len: 1-D ``[1]`` int64 tensor holding the query-chunk length ``S_q``
+            (e.g. ``op.Shape(input_ids, start=1, end=2)``); squeezed to a scalar
+            internally.
         nonpad_kv_seqlen: ``[B]`` int64 count of valid cache slots *after* the
             current chunk is scattered (``write_indices + S_q`` under the
             bottom-right contract).

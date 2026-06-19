@@ -169,12 +169,16 @@ def _apply_attention(
         #     the MEA external-cache path (Flash is precluded by any bias).
         #
         # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
-        # KV prefix and, on the Flash path, drives the fully-masked-row zero
-        # guard.  In bias mode the additive bias already encodes the same
-        # ``slot < nonpad`` validity, and with the contract-consistent feed
-        # (nonpad == write_indices + S_q) every query row keeps its own diagonal
-        # slot valid — so no row degenerates to an all-``dtype.min`` (NaN)
-        # softmax in normal operation.
+        # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
+        # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
+        # bias already encodes the same ``slot < nonpad`` validity, and with the
+        # contract-consistent feed (nonpad == write_indices + S_q) every query
+        # row keeps its own diagonal slot valid — so a fully-masked
+        # (all-``dtype.min``) row never arises in normal operation.  Even if one
+        # were forced (an out-of-contract feed), the CPU MEA path this bias mode
+        # uses does NOT apply the Flash zero-guard: it returns a finite
+        # mean-of-V row, not NaN and not exactly 0 (the zero guard is
+        # CUDA-Flash-specific).
         if attn_mask is not None:
             mask_arg, causal = attn_mask, 0
         else:
