@@ -324,7 +324,7 @@ def _classify_run_error(exc: BaseException) -> _ProbeOutcome:
         "onnxruntime#28958', so a genuine regression (CUDA OOM, kernel bug, "
         "install drift) stays loud instead of silently skipping the whole suite.",
         exc,
-        exc_info=True,
+        exc_info=exc,
     )
     return _ProbeOutcome.PROBE_ERROR
 

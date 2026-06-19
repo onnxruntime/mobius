@@ -32,7 +32,7 @@ the current **maskless** graph on ``main``.  It does two things on the CUDA EP:
 
 Both skip when the installed ORT lacks #28958 (functional probe), so the file
 is committed now and self-enables once a fixed ORT is pinned.  The Flash
-assertion additionally skips under ``onnxruntime_QUICK_BUILD`` (Flash compiled
+assertion additionally skips under ``ONNXRUNTIME_QUICK_BUILD`` (Flash compiled
 for head_dim 128 only there → false negatives) and on pre-Ampere GPUs with
 compute capability < 8.0 (:func:`_flash_capable_gpu`), where the kernel routes
 to Memory-Efficient Attention instead of Flash.
@@ -107,12 +107,12 @@ def quick_build_enabled() -> bool:
     """Return ``True`` when ORT was built with ``onnxruntime_QUICK_BUILD=ON``.
 
     There is no runtime API to detect a QUICK_BUILD ORT, so CI that runs against
-    such a build must export ``onnxruntime_QUICK_BUILD=1``.  Under QUICK_BUILD
+    such a build must export ``ONNXRUNTIME_QUICK_BUILD=1``.  Under QUICK_BUILD
     the CUDA Flash kernel is compiled for ``head_dim == 128`` only, so other
     shapes silently route to Memory-Efficient Attention and a Flash-dispatch
     assertion would be a false negative.
     """
-    return os.environ.get("onnxruntime_QUICK_BUILD", "").strip().lower() in {
+    return os.environ.get("ONNXRUNTIME_QUICK_BUILD", "").strip().lower() in {
         "1",
         "true",
         "on",
@@ -265,19 +265,18 @@ def captured_attention_dispatch() -> Iterator[list[str]]:
     # ORT's default logger severity defaults to WARNING (2); restore it after.
     ort.set_default_logger_severity(0)
     saved_stderr_fd = os.dup(2)
-    capture_file = tempfile.TemporaryFile(mode="w+b")
-    try:
-        os.dup2(capture_file.fileno(), 2)
-        yield captured
-    finally:
-        # Flush C++ stderr, restore the real fd, then read back what we caught.
-        os.dup2(saved_stderr_fd, 2)
-        os.close(saved_stderr_fd)
-        ort.set_default_logger_severity(2)
-        capture_file.seek(0)
-        text = capture_file.read().decode("utf-8", errors="replace")
-        capture_file.close()
-        captured.extend(text.splitlines())
+    with tempfile.TemporaryFile(mode="w+b") as capture_file:
+        try:
+            os.dup2(capture_file.fileno(), 2)
+            yield captured
+        finally:
+            # Flush C++ stderr, restore the real fd, then read back what we caught.
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stderr_fd)
+            ort.set_default_logger_severity(2)
+            capture_file.seek(0)
+            text = capture_file.read().decode("utf-8", errors="replace")
+            captured.extend(text.splitlines())
 
 
 def attention_kernels_from_log(log_lines: list[str]) -> set[str]:
