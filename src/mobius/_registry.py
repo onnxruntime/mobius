@@ -462,9 +462,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3": ModelRegistration(Qwen3CausalLMModel),
     "qwen3_5_text": ModelRegistration(Qwen35CausalLMModel),
     # DFlash drafters share ``model_type=qwen3`` with the base Qwen3 family;
-    # build() routes to DFlashDraftModel via the ``architectures`` field
-    # (see _ARCHITECTURE_OVERRIDES in _builder.py).  The registry entry
-    # below allows direct lookup by architecture name and exposes the task.
+    # build() routes to DFlashDraftModel by the ``architectures`` field in the
+    # checkpoint config.  The registry entry below allows direct lookup by
+    # architecture name and exposes the task.
     "DFlashDraftModel": ModelRegistration(
         DFlashDraftModel, task="dflash-draft", family="dflash", variant="qwen3"
     ),

@@ -36,7 +36,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import Gemma4AssistantConfig
 from mobius.components._attention import GQAContext, _apply_attention
-from mobius.components._common import Linear
+from mobius.components._common import Linear, create_attention_bias
 from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
@@ -75,6 +75,12 @@ class Gemma4AssistantAttention(nn.Module):
     ):
         super().__init__()
         is_full = layer_type == "full_attention"
+        self.layer_type = layer_type
+        # Sliding layers limit attention to the most recent ``sliding_window``
+        # keys; full layers attend the whole shared-KV buffer.
+        self.sliding_window = (
+            config.sliding_window if layer_type == "sliding_attention" else None
+        )
         self.head_dim = (
             (config.global_head_dim or config.head_dim) if is_full else config.head_dim
         )
@@ -108,6 +114,7 @@ class Gemma4AssistantAttention(nn.Module):
         shared_value: ir.Value,
         position_embeddings: tuple | None,
         gqa_ctx: GQAContext | None = None,
+        attention_mask: ir.Value | None = None,
     ) -> ir.Value:
         # Q projection + per-head Q norm.
         q = self.q_proj(op, hidden_states)
@@ -188,12 +195,29 @@ class Gemma4AssistantAttention(nn.Module):
         # docstring for why this is correct.  For q_len < kv_len the two EPs
         # disagree on ``is_causal`` alignment; with is_causal=0 + no bias the
         # graph is correct on every EP.
+        #
+        # Sliding layers, however, must constrain attention to the most recent
+        # ``sliding_window`` keys, otherwise they diverge from HF once
+        # ``kv_len > sliding_window``.  When a padding mask is available we
+        # reuse the well-tested causal+sliding bias builder (causal is a no-op
+        # for the q_len==1 draft step this drafter runs).
+        attn_bias = None
+        if self.sliding_window and attention_mask is not None:
+            from mobius._build_context import get_build_dtype
+
+            attn_bias = create_attention_bias(
+                op,
+                input_ids=q,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                dtype=get_build_dtype(),
+            )
         attn_output, _present_k, _present_v = _apply_attention(
             op,
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attn_bias,
             past_key=None,
             past_value=None,
             num_attention_heads=self.num_attention_heads,
@@ -227,7 +251,8 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         h     = post_feedforward_layernorm(h)   # NORM BEFORE RESIDUAL
         h     = h_in + h
 
-        # Per-layer scalar multiplier (saved as a tied buffer in HF state dict).
+        # Per-layer scalar multiplier (a per-layer persistent buffer,
+        # ``register_buffer("layer_scalar", torch.ones(1))``, in HF).
         return h * layer_scalar
 
     The assistant has no per-layer input gating and no MoE (validated by
@@ -256,9 +281,10 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # ``layer_scalar`` is a tied (persistent) buffer in HF
-        # (``register_buffer("layer_scalar", torch.ones(1))``).  In mobius
-        # we declare it as a Parameter so the weight loader populates it
+        # ``layer_scalar`` is a per-layer persistent buffer in HF
+        # (``register_buffer("layer_scalar", torch.ones(1))`` on every layer,
+        # so the state-dict key is ``model.layers.{i}.layer_scalar``).  In
+        # mobius we declare it as a Parameter so the weight loader populates it
         # from the HF state dict; at runtime it's applied as the last op
         # in this layer.
         self.layer_scalar = nn.Parameter([1])
@@ -271,6 +297,7 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         shared_value: ir.Value,
         position_embeddings: tuple | None,
         gqa_ctx: GQAContext | None = None,
+        attention_mask: ir.Value | None = None,
     ) -> ir.Value:
         # --- Attention block: pre-norm -> attn -> post-norm -> residual ---
         residual = hidden_states
@@ -282,6 +309,7 @@ class Gemma4AssistantDecoderLayer(nn.Module):
             shared_value=shared_value,
             position_embeddings=position_embeddings,
             gqa_ctx=gqa_ctx,
+            attention_mask=attention_mask,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)

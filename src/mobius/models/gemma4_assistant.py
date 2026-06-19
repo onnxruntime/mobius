@@ -226,6 +226,7 @@ class _Gemma4AssistantTextModel(nn.Module):
 
         # Two RoPE flavours, exactly matching how Gemma4TextModel sets them up
         # (see mobius/models/gemma4.py:1515-1541).
+        self.sliding_window = config.sliding_window
         local_config = dataclasses.replace(
             config,
             rope_type="default",
@@ -290,6 +291,11 @@ class _Gemma4AssistantTextModel(nn.Module):
             _ = self.rotary_emb_global(op, position_ids)
 
             one_i32 = op.Constant(value_int=1)
+            # NOTE: a single ``seqlens_k`` / ``total_seq_len`` (from one
+            # ``attention_mask``) drives BOTH the sliding and full GQA contexts.
+            # This assumes the orchestrator feeds equal-length sliding and full
+            # shared-KV buffers (it shares one max-cache-len buffer), even
+            # though the task declares them with distinct symbolic dims.
             seqlens_k = op.Cast(
                 op.Sub(
                     op.ReduceSum(attention_mask, [1], keepdims=0),
@@ -307,9 +313,9 @@ class _Gemma4AssistantTextModel(nn.Module):
                     total_seq_len=total_seq_len,
                     cos_cache=self.rotary_emb_local.cos_cache,
                     sin_cache=self.rotary_emb_local.sin_cache,
-                    local_window_size=(
-                        getattr(self.layers[0].self_attn, "sliding_window", -1) or -1
-                    ),
+                    # Source the window from the config (not layer 0, which is
+                    # not guaranteed to be a sliding layer in the interleave).
+                    local_window_size=self.sliding_window or -1,
                 ),
                 "full_attention": GQAContext(
                     seqlens_k=seqlens_k,
@@ -346,5 +352,6 @@ class _Gemma4AssistantTextModel(nn.Module):
                 shared_value=shared_v,
                 position_embeddings=pos_emb_by_type[layer.layer_type],
                 gqa_ctx=None,
+                attention_mask=attention_mask,
             )
         return self.norm(op, hidden_states)
