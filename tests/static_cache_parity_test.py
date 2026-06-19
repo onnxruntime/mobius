@@ -68,7 +68,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 import transformers
-from mobius._testing.ort_capabilities import CUDA_AVAILABLE, supports_static_cache_flash
+from mobius._testing.ort_capabilities import static_cache_flash_skip_reason
 
 from mobius import build
 from mobius._configs import ArchitectureConfig
@@ -97,20 +97,15 @@ def _require_static_cache_attention() -> None:
     """Skip the calling test unless the fixed static-cache kernel is present.
 
     Delegates to the shared functional probe
-    :func:`mobius._testing.ort_capabilities.supports_static_cache_flash` (cached), which
-    runs the maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` + ``TensorScatter``
-    combination on the CUDA EP — the exact thing onnxruntime#28958 enables.
+    :func:`mobius._testing.ort_capabilities.static_cache_flash_skip_reason`
+    (cached), which runs the maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` +
+    ``TensorScatter`` combination on the CUDA EP — the exact thing
+    onnxruntime#28958 enables — and returns a human-readable reason string when
+    that path cannot run here (``None`` when it can).
     """
-    if not supports_static_cache_flash():
-        if not CUDA_AVAILABLE:
-            pytest.skip(
-                "CUDA Execution Provider not available; static-cache "
-                "TensorScatter + external-cache Attention is CUDA-only."
-            )
-        pytest.skip(
-            "Installed ORT cannot run maskless is_causal=1 + nonpad_kv_seqlen "
-            "+ TensorScatter on CUDA (needs onnxruntime#28958)."
-        )
+    reason = static_cache_flash_skip_reason()
+    if reason:
+        pytest.skip(reason)
 
 
 # ---------------------------------------------------------------------------
