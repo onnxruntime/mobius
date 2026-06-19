@@ -264,6 +264,138 @@ def create_attention_bias(
     return op.Unsqueeze(attention_bias, [1])
 
 
+def create_static_cache_attention_bias(
+    op: OpBuilder,
+    *,
+    write_indices: ir.Value,
+    seq_len: ir.Value,
+    nonpad_kv_seqlen: ir.Value,
+    max_seq_len: int,
+    sliding_window: int | None = None,
+    block_sequence_ids: ir.Value | None = None,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> ir.Value:
+    """Build a float additive attention bias for the external-KV static cache.
+
+    Sibling to :func:`create_attention_bias`.  That function masks against a
+    *dense* ``[batch, total_length]`` ``attention_mask`` whose width grows with
+    the sequence; this one masks against the *pre-allocated* static cache whose
+    KV axis has a fixed width ``max_seq_len`` and whose valid prefix length is
+    given per batch by ``nonpad_kv_seqlen``.  It reuses the same masking rules
+    (causal, sliding window, Gemma4 bidirectional block overlay, padding), only
+    re-keyed onto the static-cache geometry:
+
+    * **KV axis width** is ``max_seq_len`` (every cache slot), not the running
+      ``total_length``.
+    * **KV positions** are dense slot ids ``0 .. max_seq_len - 1`` (the absolute
+      cache position each slot holds), so the causal/sliding comparisons use
+      absolute positions directly instead of cumsum indices.
+    * **Q positions** are absolute: ``write_indices[b] + arange(S_q)`` — the
+      cache slots the current chunk is being scattered into.
+    * **KV validity** is ``slot < nonpad_kv_seqlen[b]`` (replaces the cumsum
+      padding term): a slot is real iff it lies inside the valid prefix.
+
+    The result is meant to be passed as the ``attn_mask`` of the static-cache
+    ``Attention`` op with ``is_causal=0`` (see
+    :func:`~mobius.components._attention._apply_attention`).
+
+    Args:
+        op: The OpBuilder.
+        write_indices: ``[B]`` int64 start slot per batch (where the current
+            chunk is scattered — the same tensor fed to ``TensorScatter``).
+        seq_len: Scalar int64 query-chunk length ``S_q``.
+        nonpad_kv_seqlen: ``[B]`` int64 count of valid cache slots *after* the
+            current chunk is scattered (``write_indices + S_q`` under the
+            bottom-right contract).
+        max_seq_len: Static width of the pre-allocated cache KV axis.
+        sliding_window: Optional local-attention window; when set, a query at
+            absolute position ``q`` attends slot ``k`` only if ``q - k < w``.
+        block_sequence_ids: Optional ``[B, S_q]`` int64 block id per *current*
+            query position (``>= 0`` for vision tokens sharing a block, ``-1``
+            for text).  When set, a bidirectional overlay is OR-ed onto the
+            causal/sliding mask: two positions in the same block may attend to
+            each other regardless of causal order — mirroring HuggingFace
+            ``blockwise_overlay`` for Gemma4.  The per-slot KV block ids are
+            built by scattering ``block_sequence_ids`` into a ``-1``-filled
+            ``[B, max_seq_len]`` buffer at ``write_indices`` (the same scatter
+            geometry as K/V), so within a single forward only the current
+            chunk's block ids participate; cross-step persistence of past block
+            ids is a caller concern (out of scope for this primitive).
+        dtype: Output dtype; masked entries use ``dtype.min``.
+
+    Returns:
+        Additive bias of shape ``(B, 1, S_q, max_seq_len)``: ``0`` where the
+        query may attend the slot, ``dtype.min`` where masked.
+    """
+    zero_scalar = op.Constant(value_int=0)
+    one_scalar = op.Constant(value_int=1)
+
+    # Q absolute positions: write_indices[b] + arange(S_q) -> (B, S_q, 1).
+    seq_scalar = op.Squeeze(seq_len, op.Constant(value_ints=[0]))
+    q_offsets = op.Range(zero_scalar, seq_scalar, one_scalar)  # (S_q,)
+    q_abs_2d = op.Add(
+        op.Unsqueeze(write_indices, [1]),  # (B, 1)
+        op.Unsqueeze(q_offsets, [0]),  # (1, S_q)
+    )  # (B, S_q)
+    q_abs = op.Unsqueeze(q_abs_2d, [2])  # (B, S_q, 1)
+
+    # KV positions: dense cache slot ids 0 .. max_seq_len - 1 -> (max_seq_len,).
+    kv_slots = op.Range(
+        zero_scalar, op.Constant(value_int=max_seq_len), one_scalar
+    )  # (max_seq_len,)
+
+    # Causal: a query at absolute position q may attend slot k iff q >= k.
+    # Broadcasting (B, S_q, 1) >= (max_seq_len,) -> (B, S_q, max_seq_len).
+    full_mask = op.GreaterOrEqual(q_abs, kv_slots)
+
+    if sliding_window is not None:
+        # Local window: keep slots within `sliding_window` of the query.
+        dist = op.Sub(q_abs, kv_slots)  # (B, S_q, max_seq_len)
+        within_window = op.Less(dist, op.Constant(value_int=sliding_window))
+        full_mask = op.And(full_mask, within_window)
+
+    if block_sequence_ids is not None:
+        # Bidirectional vision-block overlay (OR-ed BEFORE the padding AND,
+        # matching create_attention_bias / HF blockwise_overlay ordering).
+        #
+        # q_group: block id per current query position -> (B, S_q, 1).
+        q_group = op.Unsqueeze(block_sequence_ids, [2])  # (B, S_q, 1)
+        # kv_group: block id per cache slot -> (B, 1, max_seq_len).  Built by
+        # scattering the current chunk's block ids into a -1 buffer at
+        # write_indices, exactly as K/V are scattered into the cache.
+        batch_dim = op.Shape(write_indices, start=0, end=1)  # (1,) == [B]
+        cache_shape = op.Concat(
+            batch_dim, op.Constant(value_ints=[max_seq_len]), axis=0
+        )  # (2,) == [B, max_seq_len]
+        neg1_buffer = op.ConstantOfShape(
+            cache_shape, value=ir.tensor(np.array([-1], dtype=np.int64))
+        )  # (B, max_seq_len) of -1
+        kv_group_2d = op.TensorScatter(
+            neg1_buffer, block_sequence_ids, write_indices, axis=1
+        )  # (B, max_seq_len)
+        kv_group = op.Unsqueeze(kv_group_2d, [1])  # (B, 1, max_seq_len)
+        same_block = op.And(
+            op.Equal(q_group, kv_group),
+            op.GreaterOrEqual(q_group, op.Constant(value_int=0)),
+        )
+        full_mask = op.Or(full_mask, same_block)
+
+    # KV validity (padding): a slot is real iff it lies inside the valid
+    # prefix, slot < nonpad_kv_seqlen[b].  Broadcasting (max_seq_len,) <
+    # (B, 1) -> (B, max_seq_len) -> (B, 1, max_seq_len).
+    valid_kv = op.Less(kv_slots, op.Unsqueeze(nonpad_kv_seqlen, [1]))
+    valid_kv = op.Unsqueeze(valid_kv, [1])  # (B, 1, max_seq_len)
+    full_mask = op.And(full_mask, valid_kv)
+
+    # Convert to float bias: 0 where attended, dtype.min where masked.
+    mask_value = float(dtype.min)
+    attention_bias = op.Where(full_mask, 0.0, mask_value)  # (B, S_q, max_seq_len)
+    attention_bias = op.Cast(attention_bias, to=dtype)
+
+    # Unsqueeze to (B, 1, S_q, max_seq_len).
+    return op.Unsqueeze(attention_bias, [1])
+
+
 def build_packed_token_offset(op: OpBuilder, cu_seqlens) -> ir.Value:
     """Build ``token_offset`` for ``com.microsoft::PackedMultiHeadAttention``.
 

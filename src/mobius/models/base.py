@@ -19,6 +19,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._flags import flags
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -32,10 +33,11 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_padding_mask,
+    create_static_cache_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
 )
-from mobius.components._attention import GQAContext
+from mobius.components._attention import GQAContext, StaticCacheState
 from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 
 
@@ -72,6 +74,54 @@ class TextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+
+        # Sliding-window models declare a local-attention span; it drives the
+        # optional static-cache float bias (flags.static_cache_bias). Standard
+        # full-attention models leave this None, so the bias path is a no-op
+        # for them even when the flag is set.
+        self._sliding_window: int | None = getattr(config, "sliding_window", None)
+
+    def _maybe_static_cache_bias(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value | None,
+        past_key_values: list | None,
+    ) -> ir.Value | None:
+        """Optionally build the static-cache float additive attention bias.
+
+        Returns ``None`` (maskless ``is_causal=1`` default) unless ALL hold:
+          * ``flags.static_cache_bias`` is set, AND
+          * the model declares a bias need (``self._sliding_window`` is set), AND
+          * the cache is the opset-24 external cache (``StaticCacheState``).
+
+        When emitted, the bias is a ``(B, 1, S_q, max_seq)`` additive mask keyed
+        on absolute query positions with KV validity ``slot < nonpad_kv_seqlen``;
+        ``_apply_attention`` then pairs it with ``is_causal=0``. The
+        ``write_indices`` / ``nonpad_kv_seqlen`` graph inputs are shared across
+        all layers, so the first layer's cache state carries them.
+        """
+        if not flags.static_cache_bias or self._sliding_window is None:
+            return None
+        if not past_key_values:
+            return None
+        first = past_key_values[0]
+        if not isinstance(first, StaticCacheState):
+            return None
+        if input_ids is None:
+            return None
+
+        # Static cache KV axis width is a concrete int: [B, max_seq, kv_hidden].
+        max_seq_len = int(first.key_cache.shape[1])
+        seq_len = op.Shape(input_ids, start=1, end=2)  # (1,) int64 == [S_q]
+        return create_static_cache_attention_bias(
+            op,
+            write_indices=first.write_indices,
+            seq_len=seq_len,
+            nonpad_kv_seqlen=first.nonpad_kv_seqlen,
+            max_seq_len=max_seq_len,
+            sliding_window=self._sliding_window,
+            dtype=self._dtype,
+        )
 
     def forward(
         self,
@@ -166,7 +216,7 @@ class TextModel(nn.Module):
                     attention_mask=attention_mask,
                 )
             else:
-                attention_bias = None
+                attention_bias = self._maybe_static_cache_bias(op, input_ids, past_key_values)
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)

@@ -101,7 +101,12 @@ def _apply_attention(
     Static cache mode (``static_cache is not None``):
         Scatters new key/value into the static cache via TensorScatter,
         then attends over the full cache using ``nonpad_kv_seqlen``.
-        Also uses ``is_causal=1``.
+        Uses ``is_causal=1`` when ``attn_mask`` is ``None`` (maskless
+        default), or ``is_causal=0`` when ``attn_mask`` is a float additive
+        bias (the bias then carries the full causal + sliding + block +
+        padding mask).  The incoming ``is_causal`` argument is ignored in
+        this mode; causality is derived from ``attn_mask`` presence so the
+        two can never disagree.
         Returns ``(attn_output, updated_key_cache, updated_value_cache)``.
 
     Args:
@@ -149,28 +154,36 @@ def _apply_attention(
             axis=1,
         )  # [B, max_seq, kv_hidden]
 
-        # Attend over the full cache.  We pass None for attn_mask and use
-        # is_causal=1 instead — the Attention op handles causal + padding
-        # masking internally via is_causal + nonpad_kv_seqlen.  Using
-        # create_attention_bias() here would produce incorrect causality
-        # during prefill because it cannot represent the relationship
-        # between query positions and the full cache length.
+        # External-cache masking.  Two modes, selected by whether the caller
+        # supplied a float additive bias:
         #
-        # NOTE: The ONNX Attention spec supports attn_mask alongside
-        # nonpad_kv_seqlen for custom masking (e.g., user-defined masks
-        # beyond causal + padding).  Currently we rely on is_causal=1 +
-        # nonpad_kv_seqlen for standard LLM causal + padding masking.
-        # TODO(titaiwang): Support user-provided attn_mask in external
-        # cache mode for advanced use cases (e.g., prefix masking,
-        # document boundaries in batched inference).
-        # TODO(titaiwang): Support sliding window (circular cache mode)
-        # with static cache for long-context models that use local
-        # attention windows.
+        #   * attn_mask is None (default, maskless): pass None and use
+        #     is_causal=1 — the Attention op derives causal + padding masking
+        #     internally from is_causal + nonpad_kv_seqlen.  This is the
+        #     Flash-eligible form (onnx#8068 / onnxruntime#28958).
+        #   * attn_mask is not None (float-bias decoders): pass the bias and
+        #     STRICTLY pair it with is_causal=0.  The bias already bakes in the
+        #     FULL mask (causal + sliding + Gemma4 block overlay + padding), so
+        #     leaving is_causal=1 would double-apply causality and cancel any
+        #     bidirectional unmasking encoded in the bias.  This routes ORT to
+        #     the MEA external-cache path (Flash is precluded by any bias).
+        #
+        # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
+        # KV prefix and, on the Flash path, drives the fully-masked-row zero
+        # guard.  In bias mode the additive bias already encodes the same
+        # ``slot < nonpad`` validity, and with the contract-consistent feed
+        # (nonpad == write_indices + S_q) every query row keeps its own diagonal
+        # slot valid — so no row degenerates to an all-``dtype.min`` (NaN)
+        # softmax in normal operation.
+        if attn_mask is not None:
+            mask_arg, causal = attn_mask, 0
+        else:
+            mask_arg, causal = None, 1
         attn_output, _, _ = op.Attention(
             query,
             updated_k,
             updated_v,
-            None,  # no attn_mask — is_causal handles masking
+            mask_arg,
             None,  # no past_key (full cache is already provided)
             None,  # no past_value
             static_cache.nonpad_kv_seqlen,
@@ -178,7 +191,7 @@ def _apply_attention(
             kv_num_heads=num_key_value_heads,
             scale=scale,
             softcap=softcap,
-            is_causal=is_causal,
+            is_causal=causal,
             _outputs=3,
         )
         return attn_output, updated_k, updated_v

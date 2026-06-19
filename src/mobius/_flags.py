@@ -90,6 +90,13 @@ class _Flags:
          - Use native ``MatMulNBits bits=2`` for Tencent SEQ Q1_0
            (smaller, semantically faithful, but ~20x slower on CPU EP
            pending an MLAS fast path).
+       * - ``static_cache_bias``
+         - ``MOBIUS_STATIC_CACHE_BIAS``
+         - ``False``
+         - Emit a float additive attention bias (causal + sliding window +
+           block overlay + padding) on the external-KV static-cache
+           ``Attention`` path (``is_causal=0``) for float-bias decoders,
+           instead of the maskless ``is_causal=1`` default.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -148,6 +155,27 @@ class _Flags:
     dequant gives the same SEQ codebook values, just at twice the
     weight storage. Set ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT=1`` to
     opt in to the smaller native form once kernel performance lands.
+    """
+
+    static_cache_bias: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_STATIC_CACHE_BIAS", False)
+    )
+    """Emit a float additive attention bias on the external-KV static-cache
+    ``Attention`` path instead of the maskless ``is_causal=1`` default.
+
+    When ``True`` (and the model declares a bias need, e.g. a sliding window
+    or a block-overlay hook), :class:`~mobius.models.base.TextModel` builds a
+    ``(B, 1, S_q, max_seq)`` additive bias via
+    :func:`~mobius.components.create_static_cache_attention_bias` (causal +
+    sliding window + block overlay + padding, keyed on absolute query
+    positions with KV validity ``slot < nonpad_kv_seqlen``) and threads it
+    into the static-cache ``Attention`` op with ``is_causal=0``. This lets a
+    single standard-``Attention`` graph carry an arbitrary additive bias that
+    ``com.microsoft.GroupQueryAttention`` cannot express, while still using the
+    opset-24 external KV cache (``TensorScatter`` + ``nonpad_kv_seqlen``).
+
+    Default ``False``: the maskless ``is_causal=1`` static-cache emission is
+    unchanged, so no shipped model's graph changes unless this flag is set.
     """
 
 
