@@ -80,6 +80,10 @@ pytestmark = [
 # num_heads exercises the external-cache *GQA* Flash path.
 _MODEL_TYPE = "qwen2"
 DEFAULT_MAX_SEQ_LEN = 16
+# Prefill writes this many tokens from slot 0, so ``S_q = _PREFILL_LEN !=
+# total_kv`` (no ``past_key``) — the regime the static-cache Flash path targets.
+# Decode then writes single tokens into the tail slots that follow.
+_PREFILL_LEN = 4
 _FLASH_HEAD_DIM = 64
 _FLASH_NUM_HEADS = 2
 _FLASH_NUM_KV_HEADS = 1
@@ -112,6 +116,36 @@ def quick_build_enabled() -> bool:
         "on",
         "yes",
     }
+
+
+def _cuda_compute_capability() -> tuple[int, int] | None:
+    """Return the active CUDA device's ``(major, minor)`` compute capability.
+
+    Returns ``None`` when it cannot be determined (torch missing, no CUDA device
+    visible, or a query error) so callers treat "unknown" as "not Flash-capable"
+    and skip conservatively.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability(0)
+    except Exception:
+        return None
+
+
+def _flash_capable_gpu() -> bool:
+    """``True`` only on Ampere+ (SM >= 8.0), where the CUDA Flash kernel exists.
+
+    The ONNX-domain Attention Flash kernel requires compute capability >= 8.0;
+    on pre-SM80 GPUs (e.g. T4/Volta, SM 7.x) the same graph routes to
+    Memory-Efficient Attention, so a Flash-dispatch assertion would hard-fail
+    rather than skip.  Used to guard
+    :func:`test_static_cache_attention_dispatches_flash_on_cuda`.
+    """
+    capability = _cuda_compute_capability()
+    return capability is not None and capability >= (8, 0)
 
 
 def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
@@ -256,7 +290,7 @@ def attention_kernels_from_log(log_lines: list[str]) -> set[str]:
     return {kernel for kernel, marker in _KERNEL_LOG_MARKERS.items() if marker in text}
 
 
-def _build_session(tmp_dir: str) -> tuple[ort.InferenceSession, object]:
+def _build_session(tmp_dir: str) -> tuple[ort.InferenceSession, ArchitectureConfig]:
     """Build the tiny fp16 static-cache graph and load it on CUDA."""
     model_path, config = build_static_cache_model(tmp_dir)
     session = ort.InferenceSession(
@@ -269,7 +303,7 @@ def _build_session(tmp_dir: str) -> tuple[ort.InferenceSession, object]:
     return session, config
 
 
-def _prefill(session: ort.InferenceSession, config: object, prefill_len: int):
+def _prefill(session: ort.InferenceSession, config: ArchitectureConfig, prefill_len: int):
     """Run prefill (write from slot 0, ``S_q = prefill_len``) and return outputs."""
     output_names = [out.name for out in session.get_outputs()]
     rng = np.random.default_rng(1)
@@ -283,10 +317,9 @@ def _prefill(session: ort.InferenceSession, config: object, prefill_len: int):
     return output_names, dict(zip(output_names, session.run(output_names, feeds)))
 
 
-def _decode_feeds(config: object, prefill_out: dict[str, np.ndarray], step: int):
-    """Single-token decode feed at slot ``prefill_len + step`` carrying the cache."""
-    prefill_len = 4
-    write_index = prefill_len + step
+def _decode_feeds(config: ArchitectureConfig, prefill_out: dict[str, np.ndarray], step: int):
+    """Single-token decode feed at slot ``_PREFILL_LEN + step`` carrying the cache."""
+    write_index = _PREFILL_LEN + step
     rng = np.random.default_rng(100 + step)
     feeds: dict[str, np.ndarray] = {
         "input_ids": rng.integers(0, config.vocab_size, size=(1, 1), dtype=np.int64),
@@ -311,7 +344,7 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
         vocab = config.vocab_size
 
         # --- Prefill: write N tokens from slot 0 (S_q = N != max_seq). ---
-        prefill_len = 4
+        prefill_len = _PREFILL_LEN
         output_names, prefill_out = _prefill(session, config, prefill_len)
         prefill_logits = prefill_out["logits"]
         assert prefill_logits.shape == (1, prefill_len, vocab)
@@ -346,6 +379,14 @@ def test_static_cache_prefill_and_decode_run_on_cuda():
         "only; the tiny head_dim 64 geometry would route to MEA (false negative)"
     ),
 )
+@pytest.mark.skipif(
+    not _flash_capable_gpu(),
+    reason=(
+        "CUDA Flash attention requires compute capability >= 8.0 (Ampere+); "
+        "pre-SM80 GPUs (e.g. T4/Volta) route to Memory-Efficient Attention, so "
+        "the Flash-dispatch assertion is only meaningful on Ampere or newer"
+    ),
+)
 def test_static_cache_attention_dispatches_flash_on_cuda():
     """The fp16 maskless static-cache Attention must run on the **Flash** kernel.
 
@@ -359,14 +400,15 @@ def test_static_cache_attention_dispatches_flash_on_cuda():
 
     Eligibility (and therefore Flash selection) holds because the fp16 graph
     has ``head_size = 64`` (<= 256, multiple of 8), ``head_size == v_head_size``,
-    ``attn_mask == nullptr``, no ``past_key`` (full cache supplied), and the
-    test requires an Ampere+ (SM >= 8.0) device implicitly — on pre-SM80 the
-    kernel falls back and this assertion correctly fails, flagging that Flash is
-    unavailable on that hardware.
+    ``attn_mask == nullptr``, and no ``past_key`` (full cache supplied).  Flash
+    additionally requires an Ampere+ (SM >= 8.0) device; on pre-SM80 hardware the
+    kernel routes to Memory-Efficient Attention, so the ``_flash_capable_gpu``
+    guard above skips this test there rather than letting the dispatch assertion
+    hard-fail.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         session, config = _build_session(tmp_dir)
-        prefill_len = 4
+        prefill_len = _PREFILL_LEN
 
         # Prefill (q_seq = prefill_len) under dispatch capture.
         with captured_attention_dispatch() as prefill_log:

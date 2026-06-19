@@ -18,15 +18,21 @@ static-cache CUDA test shares.  It is a *functional* probe — it builds a minim
 rather than an ORT version-string check, because the fix landed on ``main``
 before any tagged release, so the exact enabling version is build-dependent.
 
-The probe is **fail-closed**: any unexpected failure (no CUDA EP registered,
-``NOT_IMPLEMENTED`` on a pre-#28958 build, a serialization or session error,
-anything else) returns ``False`` so callers can use it directly as a
-``pytest.skip`` predicate and the suite stays green on arbitrary infrastructure.
+The probe is **fail-closed but not fail-silent**: it never raises, so callers
+can use it directly as a ``pytest.skip`` predicate and the suite stays green on
+arbitrary infrastructure.  But it distinguishes the *expected* pre-#28958 kernel
+reject (logged at debug) from an *unexpected* failure — a transient CUDA OOM,
+onnxscript/ORT drift, or a broken install (logged at warning with a traceback).
+Without that distinction a broken probe would silently cache ``False`` and make
+the entire static-cache suite skip with green CI and zero coverage, while
+:func:`static_cache_flash_skip_reason` misreported the cause as "needs #28958".
 """
 
 from __future__ import annotations
 
+import enum
 import functools
+import logging
 import tempfile
 from pathlib import Path
 
@@ -35,6 +41,26 @@ import onnx_ir as ir
 import onnxruntime as ort
 
 from mobius._constants import OPSET_VERSION
+
+logger = logging.getLogger(__name__)
+
+# ORT raises one of these from ``session.run`` when the CUDA Attention kernel
+# rejects the maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` (no ``past_key``)
+# combination on a build predating microsoft/onnxruntime#28958 — the *expected*
+# "needs the fix" signal, raised from ``ComputeInternal`` (proven by ORT's own
+# deleted reject test).  Treating only these as expected keeps build/serialize/
+# session-create failures (the symptoms of a broken probe) loud.  Imported
+# defensively so a pybind layout change cannot break import; falls back to the
+# common base class of every ORT pybind error.
+try:
+    from onnxruntime.capi import onnxruntime_pybind11_state as _ort_capi
+
+    _EXPECTED_REJECT_ERRORS: tuple[type[BaseException], ...] = (
+        _ort_capi.NotImplemented,
+        _ort_capi.Fail,
+    )
+except Exception:  # pragma: no cover - defensive against pybind layout drift
+    _EXPECTED_REJECT_ERRORS = (RuntimeError,)
 
 __all__ = [
     "CUDA_AVAILABLE",
@@ -153,22 +179,38 @@ def _probe_feeds() -> dict[str, np.ndarray]:
     }
 
 
+class _ProbeOutcome(enum.Enum):
+    """Classification of the static-cache Flash probe — drives the skip reason.
+
+    Separating ``NEEDS_FIX`` (the expected pre-#28958 kernel reject) from
+    ``PROBE_ERROR`` (an unexpected failure) is what lets the probe stay
+    fail-closed without being fail-silent.
+    """
+
+    SUPPORTED = "supported"
+    NO_CUDA = "no_cuda"
+    NEEDS_FIX = "needs_fix"  # expected: ORT lacks microsoft/onnxruntime#28958
+    PROBE_ERROR = "probe_error"  # unexpected: must not silently disable the gate
+
+
 @functools.lru_cache(maxsize=1)
-def supports_static_cache_flash() -> bool:
-    """Return ``True`` when the installed ORT runs the static-cache graph on CUDA.
+def _probe_static_cache_flash() -> _ProbeOutcome:
+    """Run the functional capability probe once and classify the outcome.
 
     Builds the minimal ``TensorScatter`` + maskless ``Attention`` (``is_causal=1``
-    + ``nonpad_kv_seqlen``) graph and runs it on the CUDA EP.  ORT builds lacking
-    microsoft/onnxruntime#28958 raise ``NOT_IMPLEMENTED`` for the combination →
-    ``False``; post-fix ORT runs it → ``True``.  The result is cached for the
-    test session (the probe runs at most once per process).
+    + ``nonpad_kv_seqlen``) graph and runs it on the CUDA EP.  The result is
+    cached for the process (the probe runs at most once).
 
-    **Fail-closed:** returns ``False`` rather than raising on *any* failure — no
-    CUDA EP, ``NOT_IMPLEMENTED``, or any other exception — so it is safe to call
-    directly as a skip predicate on arbitrary infrastructure.
+    Fail-closed (never raises) but NOT fail-silent: an *expected* kernel reject
+    (:data:`_EXPECTED_REJECT_ERRORS` from ``session.run``) is logged at debug and
+    maps to :attr:`_ProbeOutcome.NEEDS_FIX`, while any *unexpected* failure — a
+    build/serialize/session error, a non-reject ``session.run`` error, or the
+    CUDA EP silently dropping out of the session — is logged at warning with a
+    traceback and maps to :attr:`_ProbeOutcome.PROBE_ERROR` so a broken probe
+    cannot silently disable the static-cache gate.
     """
     if not CUDA_AVAILABLE:
-        return False
+        return _ProbeOutcome.NO_CUDA
     try:
         model = _build_static_cache_attention_probe()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -179,36 +221,81 @@ def supports_static_cache_flash() -> bool:
                 providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
             if "CUDAExecutionProvider" not in session.get_providers():
-                return False
-            session.run(None, _probe_feeds())
-        return True
+                logger.warning(
+                    "Static-cache Flash probe: CUDA EP is registered globally but "
+                    "absent from the probe session providers (%s); treating the "
+                    "static-cache CUDA path as unsupported.",
+                    session.get_providers(),
+                )
+                return _ProbeOutcome.PROBE_ERROR
+            try:
+                session.run(None, _probe_feeds())
+            except _EXPECTED_REJECT_ERRORS as exc:
+                logger.debug(
+                    "Static-cache Flash probe: CUDA Attention kernel rejected the "
+                    "maskless is_causal=1 + nonpad_kv_seqlen combination — expected "
+                    "without microsoft/onnxruntime#28958 (%s).",
+                    exc,
+                )
+                return _ProbeOutcome.NEEDS_FIX
     except Exception:
-        return False
+        logger.warning(
+            "Static-cache Flash capability probe failed unexpectedly; treating the "
+            "static-cache CUDA path as unsupported so dependent tests SKIP rather "
+            "than error. This is fail-closed but may mask a real regression "
+            "(transient CUDA OOM, onnxscript/ORT drift, broken install) — "
+            "investigate if this GPU is expected to support the path.",
+            exc_info=True,
+        )
+        return _ProbeOutcome.PROBE_ERROR
+    return _ProbeOutcome.SUPPORTED
+
+
+def supports_static_cache_flash() -> bool:
+    """Return ``True`` when the installed ORT runs the static-cache graph on CUDA.
+
+    Thin boolean view over :func:`_probe_static_cache_flash` (which is cached and
+    handles all logging).  ORT builds lacking microsoft/onnxruntime#28958 reject
+    the maskless ``is_causal=1`` + ``nonpad_kv_seqlen`` combination → ``False``;
+    post-fix ORT runs it → ``True``.
+
+    **Fail-closed:** returns ``False`` rather than raising on *any* failure — no
+    CUDA EP, an expected kernel reject, or an unexpected probe error — so it is
+    safe to call directly as a skip predicate on arbitrary infrastructure.  Use
+    :func:`static_cache_flash_skip_reason` when the *cause* matters.
+    """
+    return _probe_static_cache_flash() is _ProbeOutcome.SUPPORTED
 
 
 def static_cache_flash_skip_reason() -> str | None:
     """Return ``None`` when the static-cache Flash path runs here, else a reason.
 
-    A convenience wrapper over :func:`supports_static_cache_flash` for tests that
-    skip via ``pytest.skip(...)`` inside a fixture/helper rather than a
-    module-level ``skipif`` marker::
+    A convenience wrapper for tests that skip via ``pytest.skip(...)`` inside a
+    fixture/helper rather than a module-level ``skipif`` marker::
 
         reason = static_cache_flash_skip_reason()
         if reason:
             pytest.skip(reason)
 
-    The returned string distinguishes the two skip causes — no CUDA Execution
-    Provider registered vs. a CUDA build that predates microsoft/onnxruntime#28958
-    — so failures-to-run are self-explanatory in the test report.
+    The returned string names the *true* cause — no CUDA EP, a build predating
+    microsoft/onnxruntime#28958, or an unexpected probe failure — so a broken
+    probe is never misattributed to the missing fix (the message points at the
+    logged warning instead).
     """
-    if supports_static_cache_flash():
+    outcome = _probe_static_cache_flash()
+    if outcome is _ProbeOutcome.SUPPORTED:
         return None
-    if not CUDA_AVAILABLE:
+    if outcome is _ProbeOutcome.NO_CUDA:
         return (
             "CUDA Execution Provider not available; static-cache TensorScatter "
             "+ external-cache Attention is CUDA-only."
         )
+    if outcome is _ProbeOutcome.NEEDS_FIX:
+        return (
+            "installed ORT cannot run maskless is_causal=1 + nonpad_kv_seqlen "
+            "+ TensorScatter on CUDA (needs microsoft/onnxruntime#28958)."
+        )
     return (
-        "installed ORT cannot run maskless is_causal=1 + nonpad_kv_seqlen "
-        "+ TensorScatter on CUDA (needs microsoft/onnxruntime#28958)."
+        "static-cache Flash capability probe failed unexpectedly (see the logged "
+        "warning for the traceback); treating the path as unsupported."
     )
