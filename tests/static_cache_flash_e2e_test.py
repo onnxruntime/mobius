@@ -33,7 +33,9 @@ the current **maskless** graph on ``main``.  It does two things on the CUDA EP:
 Both skip when the installed ORT lacks #28958 (functional probe), so the file
 is committed now and self-enables once a fixed ORT is pinned.  The Flash
 assertion additionally skips under ``onnxruntime_QUICK_BUILD`` (Flash compiled
-for head_dim 128 only there → false negatives).
+for head_dim 128 only there → false negatives) and on pre-Ampere GPUs with
+compute capability < 8.0 (:func:`_flash_capable_gpu`), where the kernel routes
+to Memory-Efficient Attention instead of Flash.
 """
 
 from __future__ import annotations

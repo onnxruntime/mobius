@@ -123,6 +123,9 @@ _PROBE_NP_DTYPE = np.float16
 # reference check, which then classifies the run as NEEDS_FIX rather than
 # SUPPORTED.
 _PROBE_KEY_FILL = 0.1
+# Intentionally EQUAL to _PROBE_KEY_FILL: identical K and Q give every valid KV
+# position the same attention logit -> a uniform softmax, which is what makes the
+# known-answer output exactly the mean of the value tags.
 _PROBE_QUERY_FILL = 0.1
 _PROBE_VALUE_TAGS = (1.0, 3.0)  # per-KV-position constant value vectors
 _PROBE_EXPECTED_OUTPUT = sum(_PROBE_VALUE_TAGS) / len(_PROBE_VALUE_TAGS)  # 2.0
@@ -285,6 +288,15 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
     graph on CPU with wrong values and never raise.  The known-answer reference
     check (:func:`_probe_output_is_correct`) detects that — a wrong (top-left)
     result maps to :attr:`_ProbeOutcome.NEEDS_FIX`, not SUPPORTED.
+
+    Residual assumption: the probe confirms a CUDA EP is in the session and
+    validates output correctness, but does NOT explicitly assert the ``Attention``
+    node was *placed* on the CUDA EP.  That is safe today because the only
+    silent-fallback kernel (the pre-#28958 CPU one) produces the wrong top-left
+    value, which the value check rejects.  It would mis-pass only in a speculative
+    future where a CPU kernel becomes bottom-right-correct *and* the CUDA EP
+    declines the node — at which point an explicit node-placement check would be
+    needed.
     """
     if not CUDA_AVAILABLE:
         return _ProbeOutcome.NO_CUDA
