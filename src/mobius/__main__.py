@@ -142,6 +142,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "directory). Use --model <hf-id> --text-only instead."
         )
 
+    # --component selects one component of a diffusers pipeline; --text-only
+    # produces a single decoder-only model. Combining them would silently
+    # filter that model away unless --component happens to be 'model'.
+    if args.text_only and args.component:
+        raise SystemExit(
+            "Error: --text-only is not supported with --component. "
+            "--text-only produces a single decoder-only model, while "
+            "--component selects a component of a diffusers pipeline."
+        )
+
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
@@ -558,7 +568,7 @@ def main(argv: list[str] | None = None) -> None:
             "standalone decoder-only LLM. Strips vision/audio routing so the "
             "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
             "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
-            "with --config (use --model <hf-id>)."
+            "with --config or --component (use --model <hf-id>)."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)

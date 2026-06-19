@@ -206,7 +206,7 @@ mobius build --model meta-llama/Llama-3.2-1B output/ --static-cache --max-seq-le
 | `--max-shard-size SIZE` | Maximum shard size for safetensors external data (e.g. `5GB`). Only used with `--external-data safetensors`. |
 | `--trust-remote-code` | Trust remote code when loading the HuggingFace model config. |
 | `--component NAME` | Build only one component from a diffusers pipeline (e.g. `--component vae_decoder`). |
-| `--text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config`. |
+| `--text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM. Strips vision/audio routing so the decoder uses `GroupQueryAttention` on GQA-capable EPs (build with `--ep cuda`/`dml`). Currently supported for `gemma4_unified` (`google/gemma-4-12B`). Not compatible with `--config` or `--component`. |
 
 #### Text-only example
 
