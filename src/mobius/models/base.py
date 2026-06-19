@@ -53,12 +53,6 @@ class TextModel(nn.Module):
         self.output_layer_indices: list[int] | None = (
             list(getattr(config, "output_layer_indices", None) or []) or None
         )
-        # When True, ``forward`` additionally returns the post-final-norm
-        # hidden state (the ``lm_head`` input) as the LAST entry of the
-        # extra-outputs list — see ``ArchitectureConfig.output_final_hidden_state``.
-        self.output_final_hidden_state: bool = bool(
-            getattr(config, "output_final_hidden_state", False)
-        )
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
@@ -200,7 +194,6 @@ class TextModel(nn.Module):
                 captured_hidden_states.append(hidden_states)
 
         hidden_states = self.norm(op, hidden_states)
-        extra_outputs: list[ir.Value] = []
         if output_layer_indices is not None:
             # Preserve the user-supplied order so caller can rely on
             # ``zip(config.output_layer_indices, intermediate_hidden_states)``.
@@ -208,13 +201,7 @@ class TextModel(nn.Module):
             ordered = [None] * len(output_layer_indices)
             for idx, hs in zip(sorted(capture_set), captured_hidden_states):
                 ordered[order[idx]] = hs
-            extra_outputs = ordered
-        if self.output_final_hidden_state:
-            # Final hidden state is appended LAST so the task can split it off
-            # regardless of how many intermediate layers were captured.
-            extra_outputs = [*extra_outputs, hidden_states]
-        if output_layer_indices is not None or self.output_final_hidden_state:
-            return hidden_states, present_key_values, extra_outputs
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 

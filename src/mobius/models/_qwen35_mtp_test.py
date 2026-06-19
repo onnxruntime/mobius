@@ -8,6 +8,10 @@ Asserts graph structure (inputs/outputs declared by
 :class:`mobius.models.Qwen35MtpModel`, the ``mtp.*`` weight remapping, the
 single-full-attention-layer ``from_transformers`` contract, and registry
 routing — all with tiny random configs (no checkpoint download).
+
+Like the DFlash drafter, the head borrows the target's shared
+``embed_tokens`` / ``lm_head``: it consumes ``inputs_embeds`` and emits
+``mtp_hidden`` (no embedding table, no LM head, no ``logits``).
 """
 
 from __future__ import annotations
@@ -52,35 +56,39 @@ class TestQwen35MtpModelParams:
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
         names = [n for n, _ in model.named_parameters()]
-        assert any("model.fc.weight" in n for n in names)
-        assert any("model.pre_fc_norm_embedding.weight" in n for n in names)
-        assert any("model.pre_fc_norm_hidden.weight" in n for n in names)
-        assert any("model.norm.weight" in n for n in names)
-        # The MTP head owns the shared embed_tokens and lm_head.
-        assert any("model.embed_tokens.weight" in n for n in names)
-        assert any("lm_head.weight" in n for n in names)
+        assert any("fc.weight" in n for n in names)
+        assert any("pre_fc_norm_embedding.weight" in n for n in names)
+        assert any("pre_fc_norm_hidden.weight" in n for n in names)
+        assert any("norm.weight" in n for n in names)
+
+    def test_head_borrows_embed_and_lm_head(self):
+        """The MTP head must NOT own an embedding table or LM head — those
+        are borrowed from the target (mtp_use_dedicated_embeddings=False)."""
+        cfg = _mtp_config()
+        model = Qwen35MtpModel(cfg)
+        names = [n for n, _ in model.named_parameters()]
+        assert not any("embed_tokens" in n for n in names)
+        assert not any("lm_head" in n for n in names)
 
     def test_single_full_attention_layer(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
-        assert len(model.model.layers) == 1
-        # The lone layer is a full-attention block (has self_attn, not
-        # linear_attn).
-        layer = model.model.layers[0]
+        assert len(model.layers) == 1
+        layer = model.layers[0]
         assert hasattr(layer, "self_attn")
         assert not hasattr(layer, "linear_attn")
 
     def test_fc_input_is_double_hidden(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
-        out_features, in_features = model.model.fc.weight.shape
+        out_features, in_features = model.fc.weight.shape
         assert out_features == cfg.hidden_size
         assert in_features == 2 * cfg.hidden_size
 
     def test_attention_projection_shapes(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
-        attn = model.model.layers[0].self_attn
+        attn = model.layers[0].self_attn
         # Qwen3.5 doubles the Q projection (query + output gate).
         assert attn.q_proj.weight.shape == (
             cfg.num_attention_heads * cfg.head_dim * 2,
@@ -95,7 +103,7 @@ class TestQwen35MtpModelParams:
 
 
 class TestQwen35MtpPreprocessWeights:
-    def test_remaps_mtp_prefix_and_shared_heads(self):
+    def test_strips_mtp_prefix_and_drops_rest(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
         h, two_h, vocab = cfg.hidden_size, 2 * cfg.hidden_size, cfg.vocab_size
@@ -105,35 +113,37 @@ class TestQwen35MtpPreprocessWeights:
             "mtp.pre_fc_norm_hidden.weight": torch.zeros(h),
             "mtp.norm.weight": torch.zeros(h),
             "mtp.layers.0.input_layernorm.weight": torch.zeros(h),
+            # Shared / main-model weights that must be dropped (the head
+            # borrows embed + lm_head; it does not own them).
             "model.language_model.embed_tokens.weight": torch.zeros(vocab, h),
             "lm_head.weight": torch.zeros(vocab, h),
-            # Main-model weights that must be dropped.
             "model.layers.0.input_layernorm.weight": torch.zeros(h),
             "model.norm.weight": torch.zeros(h),
             "model.visual.patch_embed.weight": torch.zeros(4, 4),
         }
         out = model.preprocess_weights(state)
-        assert "model.fc.weight" in out
-        assert "model.pre_fc_norm_embedding.weight" in out
-        assert "model.pre_fc_norm_hidden.weight" in out
-        assert "model.norm.weight" in out
-        assert "model.layers.0.input_layernorm.weight" in out
-        assert "model.embed_tokens.weight" in out
-        assert "lm_head.weight" in out
-        # The main decoder layer / visual tower must NOT leak in.
-        assert "model.visual.patch_embed.weight" not in out
-        # The shared embedding came from the language_model-nested key, not a
-        # spurious extra.
-        assert out["model.embed_tokens.weight"].shape == (vocab, h)
+        assert out.keys() == {
+            "fc.weight",
+            "pre_fc_norm_embedding.weight",
+            "pre_fc_norm_hidden.weight",
+            "norm.weight",
+            "layers.0.input_layernorm.weight",
+        }
 
-    def test_accepts_plain_embed_key(self):
+    def test_remapped_keys_load_into_module(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
-        h, vocab = cfg.hidden_size, cfg.vocab_size
-        out = model.preprocess_weights(
-            {"model.embed_tokens.weight": torch.zeros(vocab, h)}
+        # The remapped keys must be a subset of the module's own parameter
+        # names so weight application can route them.
+        param_names = {n for n, _ in model.named_parameters()}
+        remapped = model.preprocess_weights(
+            {
+                "mtp.fc.weight": torch.zeros(cfg.hidden_size, 2 * cfg.hidden_size),
+                "mtp.norm.weight": torch.zeros(cfg.hidden_size),
+            }
         )
-        assert "model.embed_tokens.weight" in out
+        assert set(remapped) == {"fc.weight", "norm.weight"}
+        assert set(remapped).issubset(param_names)
 
 
 class TestQwen35MtpTaskGraph:
@@ -150,24 +160,29 @@ class TestQwen35MtpTaskGraph:
     def test_inputs(self):
         _cfg, model = self._build()
         names = [v.name for v in model.graph.inputs]
-        assert "input_ids" in names
+        assert "inputs_embeds" in names
         assert "hidden_states" in names
         assert "attention_mask" in names
         assert "position_ids" in names
         assert "past_key_values.0.key" in names
         assert "past_key_values.0.value" in names
+        # The head borrows the target embedding — no token-id input.
+        assert "input_ids" not in names
 
     def test_outputs(self):
         _cfg, model = self._build()
         names = [v.name for v in model.graph.outputs]
-        assert "logits" in names
+        assert "mtp_hidden" in names
+        # No LM head of its own.
+        assert "logits" not in names
         assert "present.0.key" in names
         assert "present.0.value" in names
 
-    def test_hidden_states_input_shape(self):
+    def test_inputs_embeds_and_hidden_shapes(self):
         cfg, model = self._build()
-        hs = next(v for v in model.graph.inputs if v.name == "hidden_states")
-        assert hs.shape[-1] == cfg.hidden_size
+        for name in ("inputs_embeds", "hidden_states"):
+            v = next(v for v in model.graph.inputs if v.name == name)
+            assert v.shape[-1] == cfg.hidden_size
 
     def test_task_registered_by_name(self):
         task = get_task("qwen35-mtp")

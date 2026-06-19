@@ -4,12 +4,15 @@
 """Graph-IO contract for the Qwen3.6 MTP self-speculative head.
 
 The MTP head is a single ``full_attention`` decoder layer with a standard
-GQA KV cache, plus an extra ``hidden_states`` input carrying the target
-model's last hidden state (the tensor the target feeds to its ``lm_head``).
+GQA KV cache.  Like the DFlash drafter it borrows the target's shared
+``embed_tokens`` / ``lm_head``: it takes the target's ``inputs_embeds`` plus
+the target's last hidden state, and emits ``mtp_hidden`` (decoded through
+the target's lm_head by the orchestrator).
 
 Graph inputs:
-    - ``input_ids``      : ``[batch, seq_len]`` INT64 — the just-emitted
-      token(s) ``t_{i+1}`` the head conditions on.
+    - ``inputs_embeds``  : ``[batch, seq_len, hidden]`` (model dtype) — the
+      target's ``embed_tokens(t_{i+1})`` for the token(s) the head
+      conditions on.
     - ``hidden_states``  : ``[batch, seq_len, hidden]`` (model dtype) — the
       target's last hidden state ``h_i`` (post-final-norm).
     - ``attention_mask`` : ``[batch, past_seq_len + seq_len]`` INT64.
@@ -19,9 +22,12 @@ Graph inputs:
       ``[batch, num_kv_heads, past_seq_len, head_dim]``.
 
 Graph outputs:
-    - ``logits``         : ``[batch, seq_len, vocab_size]`` — draft logits
-      for ``t_{i+2}``.
+    - ``mtp_hidden``     : ``[batch, seq_len, hidden]`` (model dtype) — the
+      head's final hidden states (decode through the target lm_head to get
+      the draft logits for ``t_{i+2}``).
     - ``present.0.key`` / ``.value`` : updated KV cache.
+
+No ``logits`` output — the head has no LM head of its own.
 """
 
 from __future__ import annotations
@@ -50,8 +56,10 @@ class Qwen35MtpTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
         )
         hidden_states = builder.input(
             "hidden_states",
@@ -77,16 +85,16 @@ class Qwen35MtpTask(ModelTask):
             past_seq_len,
         )
 
-        logits, present_key_values = module(
+        mtp_hidden, present_key_values = module(
             op,
-            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
 
-        builder.add_output(logits, "logits")
+        builder.add_output(mtp_hidden, "mtp_hidden")
         _register_kv_cache_outputs(
             builder,
             present_key_values,

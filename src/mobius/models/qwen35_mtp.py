@@ -8,22 +8,32 @@ the ``mtp.*`` weight prefix.  HuggingFace ``transformers`` discards those
 weights on ``from_pretrained`` (the base model has no MTP module), so the
 head is built here directly from the checkpoint tensors.
 
-Architecturally the head predicts token ``t_{i+2}`` from the main model's
-last hidden state ``h_i`` (post-final-norm — the same tensor that feeds the
-target's ``lm_head``) and the just-emitted token ``t_{i+1}``::
+Like the DFlash and Gemma4-Assistant mobius drafters, this head has **no
+embedding table and no LM head** — it shares the target's
+(``mtp_use_dedicated_embeddings = False``), which the speculative-decoding
+orchestrator splits out of the target and applies on either side of the
+head.  It therefore consumes ``inputs_embeds`` (the target's
+``embed_tokens(t_{i+1})``) and emits ``mtp_hidden`` (decoded through the
+target's shared ``lm_head`` by the orchestrator to obtain the draft logits
+for ``t_{i+2}``).
 
-    h'_i   = fc(concat[ pre_fc_norm_embedding(embed(t_{i+1})),
-                        pre_fc_norm_hidden(h_i) ])          # fc: 2H -> H
-    h''_i  = Qwen35DecoderLayer(full_attention)(h'_i)       # one layer
-    logits = lm_head(norm(h''_i))
+Architecturally::
+
+    h'_i       = fc(concat[ pre_fc_norm_embedding(inputs_embeds),
+                            pre_fc_norm_hidden(hidden_states) ])    # fc: 2H -> H
+    h''_i      = Qwen35DecoderLayer(full_attention)(h'_i)          # one layer
+    mtp_hidden = norm(h''_i)
+
+where ``hidden_states`` is the target model's last hidden state ``h_i``
+(post-final-norm — the tensor that feeds the target's ``lm_head``, exposed
+by splitting the target's lm_head off the decoder body).
 
 The single decoder layer is a ``full_attention`` :class:`Qwen35Attention`
 block (doubled-Q output gating + per-head Q/K :class:`OffsetRMSNorm` +
 partial mRoPE), identical to the target's full-attention layers — so it
 reuses :class:`~mobius.models.qwen35.Qwen35DecoderLayer` unchanged.  The
 three pre/post-fc norms are :class:`OffsetRMSNorm` (the ``1 + weight``
-variant) and ``embed_tokens`` / ``lm_head`` are shared with the target
-(``mtp_use_dedicated_embeddings = False``).
+variant).
 
 References:
 - GenAI builder ``Qwen35MtpHead`` (microsoft/onnxruntime-genai#2218).
@@ -40,7 +50,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import Qwen35MtpConfig
 from mobius.components import Linear, initialize_rope
-from mobius.components._common import Embedding, create_attention_bias
+from mobius.components._common import create_attention_bias
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.models.qwen35 import Qwen35DecoderLayer
 
@@ -48,19 +58,37 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-class _Qwen35MtpTextModel(nn.Module):
-    """Inner MTP layer stack — kept as ``self.model`` so weight names match
-    the checkpoint after :meth:`Qwen35MtpModel.preprocess_weights` maps the
-    ``mtp.*`` prefix onto ``model.*`` (e.g. ``mtp.layers.0.*`` ->
-    ``model.layers.0.*``, ``mtp.norm`` -> ``model.norm``)."""
+class Qwen35MtpModel(nn.Module):
+    """Qwen3.6 MTP self-speculative head — a single cross-conditioned
+    full-attention Qwen3.5 block.
+
+    Inputs (graph-level, set up by :class:`~mobius.tasks.Qwen35MtpTask`):
+        inputs_embeds: ``[batch, seq_len, hidden]`` (model dtype) — the
+            target's ``embed_tokens(t_{i+1})`` for the just-emitted token(s)
+            the head conditions on (the head borrows the target's shared
+            embedding table).
+        hidden_states: ``[batch, seq_len, hidden]`` (model dtype) — the
+            target model's last hidden state ``h_i`` (post-final-norm).
+        attention_mask: ``[batch, total_seq_len]`` INT64.
+        position_ids: ``[batch, seq_len]`` INT64.
+        past_key_values: standard GQA KV cache for the single MTP layer.
+
+    Outputs:
+        mtp_hidden: ``[batch, seq_len, hidden]`` (model dtype) — the head's
+            final hidden states.  The orchestrator decodes them through the
+            target's shared ``lm_head`` to obtain the draft token logits.
+        present_key_values: updated KV cache for the single MTP layer.
+    """
+
+    config_class: type = Qwen35MtpConfig
+    default_task: str = "qwen35-mtp"
+    category: str = "Text Generation"
 
     def __init__(self, config: Qwen35MtpConfig):
         super().__init__()
+        self.config = config
         self._dtype = config.dtype
 
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
         # Input projection: fuse the token embedding with the target hidden.
         self.pre_fc_norm_embedding = OffsetRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -71,25 +99,46 @@ class _Qwen35MtpTextModel(nn.Module):
         self.fc = Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         # The single full-attention MTP decoder layer.
-        self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(config, layer_idx=0)]
-        )
+        self.layers = nn.ModuleList([Qwen35DecoderLayer(config, layer_idx=0)])
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Strip the ``mtp.`` prefix and drop everything else.
+
+        The MTP head borrows the target's ``embed_tokens`` / ``lm_head`` (it
+        has none of its own), so only the ``mtp.*`` weights are consumed;
+        the main decoder layers, the visual tower and the shared
+        embedding / lm_head are dropped here.
+
+        Mapping::
+
+            mtp.fc.weight                     -> fc.weight
+            mtp.pre_fc_norm_embedding.weight  -> pre_fc_norm_embedding.weight
+            mtp.pre_fc_norm_hidden.weight     -> pre_fc_norm_hidden.weight
+            mtp.norm.weight                   -> norm.weight
+            mtp.layers.0.*                    -> layers.0.*
+        """
+        return {
+            key[len("mtp."):]: value
+            for key, value in state_dict.items()
+            if key.startswith("mtp.")
+        }
 
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        inputs_embeds: ir.Value,
         hidden_states: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        # h'_i = fc(concat[pre_fc_norm_embedding(embed(t)),
+        # h'_i = fc(concat[pre_fc_norm_embedding(inputs_embeds),
         #                  pre_fc_norm_hidden(h_i)])
-        embeds = self.embed_tokens(op, input_ids)
-        embeds = self.pre_fc_norm_embedding(op, embeds)
+        embeds = self.pre_fc_norm_embedding(op, inputs_embeds)
         target_hidden = self.pre_fc_norm_hidden(op, hidden_states)
         fused = op.Concat(embeds, target_hidden, axis=-1)
         hs = self.fc(op, fused)
@@ -97,7 +146,7 @@ class _Qwen35MtpTextModel(nn.Module):
         position_embeddings = self.rotary_emb(op, position_ids)
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=inputs_embeds,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
@@ -114,89 +163,5 @@ class _Qwen35MtpTextModel(nn.Module):
             )
             present_key_values.append(present_kv)
 
-        hs = self.norm(op, hs)
-        return hs, present_key_values
-
-
-class Qwen35MtpModel(nn.Module):
-    """Qwen3.6 MTP self-speculative head.
-
-    Inputs (graph-level, set up by
-    :class:`~mobius.tasks.Qwen35MtpTask`):
-        input_ids: ``[batch, seq_len]`` INT64 — the just-emitted token(s)
-            ``t_{i+1}`` the head conditions on.
-        hidden_states: ``[batch, seq_len, hidden]`` (model dtype) — the
-            target model's last hidden state ``h_i`` (post-final-norm, i.e.
-            the tensor the target feeds to its ``lm_head``).
-        attention_mask: ``[batch, total_seq_len]`` INT64.
-        position_ids: ``[batch, seq_len]`` INT64.
-        past_key_values: standard GQA KV cache for the single MTP layer.
-
-    Outputs:
-        logits: ``[batch, seq_len, vocab_size]``.
-        present_key_values: updated KV cache for the single MTP layer.
-    """
-
-    config_class: type = Qwen35MtpConfig
-    default_task: str = "qwen35-mtp"
-    category: str = "Text Generation"
-
-    def __init__(self, config: Qwen35MtpConfig):
-        super().__init__()
-        self.config = config
-        self.model = _Qwen35MtpTextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Map the checkpoint's ``mtp.*`` (and shared embed / lm_head) keys
-        onto this module's layout, dropping everything else (the 64 main
-        decoder layers, the vision tower, etc.).
-
-        Mapping::
-
-            mtp.fc.weight                     -> model.fc.weight
-            mtp.pre_fc_norm_embedding.weight  -> model.pre_fc_norm_embedding.weight
-            mtp.pre_fc_norm_hidden.weight     -> model.pre_fc_norm_hidden.weight
-            mtp.norm.weight                   -> model.norm.weight
-            mtp.layers.0.*                    -> model.layers.0.*
-            (model.)?(language_model.)?embed_tokens.weight -> model.embed_tokens.weight
-            lm_head.weight                    -> lm_head.weight
-        """
-        cleaned: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith("mtp."):
-                cleaned[f"model.{key[len('mtp.'):]}"] = value
-            elif key == "lm_head.weight":
-                cleaned["lm_head.weight"] = value
-            elif key.endswith("embed_tokens.weight") and (
-                key == "embed_tokens.weight"
-                or key == "model.embed_tokens.weight"
-                or key == "model.language_model.embed_tokens.weight"
-                or key == "language_model.embed_tokens.weight"
-            ):
-                cleaned["model.embed_tokens.weight"] = value
-            # Everything else (main decoder layers, visual tower, main norm)
-            # is not consumed by the MTP head — drop it.
-        return cleaned
-
-    def forward(
-        self,
-        op: OpBuilder,
-        input_ids: ir.Value,
-        hidden_states: ir.Value,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
-        past_key_values: list | None = None,
-    ):
-        hs, present_key_values = self.model(
-            op,
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
-        logits = self.lm_head(op, hs)
-        return logits, present_key_values
+        mtp_hidden = self.norm(op, hs)
+        return mtp_hidden, present_key_values

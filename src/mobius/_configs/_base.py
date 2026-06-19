@@ -485,14 +485,6 @@ class ArchitectureConfig(BaseModelConfig):
     # transformers (where index 0 is the embedding output).
     output_layer_indices: list[int] | None = None
 
-    # Speculative-decoding (MTP) support.  When ``True``, the model also
-    # exposes its final hidden state — the post-final-norm tensor that feeds
-    # the ``lm_head`` — as an extra ONNX output named ``hidden_states``.
-    # This is the input consumed by the Qwen3.6 MTP self-speculative head
-    # (:class:`~mobius.models.Qwen35MtpModel`).  Independent of, and
-    # composable with, ``output_layer_indices``.
-    output_final_hidden_state: bool = False
-
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type

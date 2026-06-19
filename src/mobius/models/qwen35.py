@@ -115,9 +115,6 @@ class Qwen35TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.output_final_hidden_state: bool = bool(
-            getattr(config, "output_final_hidden_state", False)
-        )
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -165,10 +162,6 @@ class Qwen35TextModel(nn.Module):
             present_key_values.append(present_kv)
 
         hidden_states = self.norm(op, hidden_states)
-        if self.output_final_hidden_state:
-            # Expose the post-final-norm hidden (the lm_head input) as the
-            # last extra output — consumed by the Qwen3.6 MTP head.
-            return hidden_states, present_key_values, [hidden_states]
         return hidden_states, present_key_values
 
 
@@ -267,9 +260,6 @@ class Qwen35MoETextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.output_final_hidden_state: bool = bool(
-            getattr(config, "output_final_hidden_state", False)
-        )
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -320,8 +310,6 @@ class Qwen35MoETextModel(nn.Module):
             present_key_values.append(present_kv)
 
         hidden_states = self.norm(op, hidden_states)
-        if self.output_final_hidden_state:
-            return hidden_states, present_key_values, [hidden_states]
         return hidden_states, present_key_values
 
 
