@@ -177,9 +177,20 @@ class TextModel(nn.Module):
                 attention_bias = None
 
         present_key_values = []
-        captured_hidden_states: list[ir.Value] = []
         output_layer_indices = getattr(self, "output_layer_indices", None)
+        if output_layer_indices is not None:
+            num_layers = len(self.layers)
+            if len(set(output_layer_indices)) != len(output_layer_indices):
+                raise ValueError(
+                    f"output_layer_indices must not contain duplicates: {output_layer_indices}"
+                )
+            out_of_range = [i for i in output_layer_indices if not 0 <= i < num_layers]
+            if out_of_range:
+                raise ValueError(
+                    f"output_layer_indices {out_of_range} out of range [0, {num_layers})"
+                )
         capture_set = set(output_layer_indices or ())
+        captured_by_index: dict[int, ir.Value] = {}
         past_kvs = past_key_values or [None] * len(self.layers)
         for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
@@ -191,16 +202,14 @@ class TextModel(nn.Module):
             )
             present_key_values.append(present_kv)
             if layer_idx in capture_set:
-                captured_hidden_states.append(hidden_states)
+                captured_by_index[layer_idx] = hidden_states
 
         hidden_states = self.norm(op, hidden_states)
         if output_layer_indices is not None:
-            # Preserve the user-supplied order so caller can rely on
+            # Build in the user-supplied order so the caller can rely on
             # ``zip(config.output_layer_indices, intermediate_hidden_states)``.
-            order = {idx: pos for pos, idx in enumerate(output_layer_indices)}
-            ordered = [None] * len(output_layer_indices)
-            for idx, hs in zip(sorted(capture_set), captured_hidden_states):
-                ordered[order[idx]] = hs
+            # Indices are validated above, so every requested layer is present.
+            ordered = [captured_by_index[idx] for idx in output_layer_indices]
             return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 

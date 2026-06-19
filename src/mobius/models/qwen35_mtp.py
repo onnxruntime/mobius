@@ -49,8 +49,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Qwen35MtpConfig
-from mobius.components import Linear, initialize_rope
-from mobius.components._common import create_attention_bias
+from mobius.components import Linear, create_attention_bias, initialize_rope
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.models.qwen35 import Qwen35DecoderLayer
 

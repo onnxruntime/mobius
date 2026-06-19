@@ -1498,8 +1498,8 @@ class Gemma4AssistantConfig(Gemma4Config):
             input/output dims for the shared hidden state).
         use_ordered_embeddings: When True, the assistant routes its
             output through a centroid-based ordered-embedding LM head
-            (``Gemma4AssistantMaskedEmbedder``).  Currently unsupported
-            in mobius — see ``Gemma4AssistantCausalLMModel``.
+            (``Gemma4AssistantMaskedEmbedder``), built by
+            ``Gemma4AssistantCausalLMModel``.
         num_centroids: Number of centroids used by the ordered-embedding
             head when ``use_ordered_embeddings`` is True.
         centroid_intermediate_top_k: Top-K centroid count for the

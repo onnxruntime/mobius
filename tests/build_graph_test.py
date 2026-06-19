@@ -4659,13 +4659,20 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # input_ids; the generic ALL_CAUSAL_LM_CONFIGS matrix can't drive it).
     # Covered by src/mobius/models/_dflash_test.py.
     "DFlashDraftModel",
-    # Gemma4-Assistant: scaffolding only — forward stub raises
-    # NotImplementedError; covered by
+    # Gemma4-Assistant: bespoke IO contract (consumes inputs_embeds +
+    # the target's shared KV instead of input_ids), so the generic
+    # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
     # src/mobius/models/_gemma4_assistant_test.py.
     "gemma4_assistant",
     "Gemma4AssistantForCausalLM",
     "gemma4_unified_assistant",
     "Gemma4UnifiedAssistantForCausalLM",
+    # Qwen3.6 MTP self-speculative head: bespoke IO contract (consumes
+    # inputs_embeds + the target's hidden_states instead of input_ids;
+    # borrows the target's embed/lm_head), so the generic
+    # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
+    # src/mobius/models/_qwen35_mtp_test.py.
+    "Qwen35MtpModel",
 }
 
 # Registered model types that truly have no test coverage yet.

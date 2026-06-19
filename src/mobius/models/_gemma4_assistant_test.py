@@ -1,9 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Scaffolding tests for the Gemma4-Assistant draft model.
+"""Build tests for the Gemma4-Assistant draft model.
 
-Verifies the parts implemented in autonomous Phase 2 (gemma4):
+Verifies:
 - ``Gemma4AssistantConfig.from_transformers`` lifts the nested
   ``text_config`` plus assistant-specific fields onto the top level.
 - ``Gemma4AssistantConfig.validate`` rejects unsupported feature
@@ -15,12 +15,10 @@ Verifies the parts implemented in autonomous Phase 2 (gemma4):
   ``architectures=["Gemma4AssistantForCausalLM"]`` to the same class +
   task.
 - Task name resolves to a ``Gemma4AssistantTask``.
-
-The end-to-end build path (``Gemma4AssistantTask.build`` →
-``Gemma4AssistantCausalLMModel.forward`` → ONNX) is intentionally **not**
-covered here — both raise ``NotImplementedError`` until the model
-forward is implemented; see the checklist in
-``mobius/models/gemma4_assistant.py``.
+- The end-to-end build path (``Gemma4AssistantTask.build`` →
+  ``Gemma4AssistantCausalLMModel.forward`` → ONNX) produces a valid graph
+  with the expected inputs/outputs (``TestGemma4AssistantBuildGraph``),
+  including the ordered-embeddings sparse LM head.
 """
 
 from __future__ import annotations
