@@ -36,7 +36,11 @@ import onnxruntime as ort
 
 from mobius._constants import OPSET_VERSION
 
-__all__ = ["CUDA_AVAILABLE", "supports_static_cache_flash"]
+__all__ = [
+    "CUDA_AVAILABLE",
+    "static_cache_flash_skip_reason",
+    "supports_static_cache_flash",
+]
 
 CUDA_AVAILABLE = "CUDAExecutionProvider" in ort.get_available_providers()
 
@@ -180,3 +184,31 @@ def supports_static_cache_flash() -> bool:
         return True
     except Exception:
         return False
+
+
+def static_cache_flash_skip_reason() -> str | None:
+    """Return ``None`` when the static-cache Flash path runs here, else a reason.
+
+    A convenience wrapper over :func:`supports_static_cache_flash` for tests that
+    skip via ``pytest.skip(...)`` inside a fixture/helper rather than a
+    module-level ``skipif`` marker::
+
+        reason = static_cache_flash_skip_reason()
+        if reason:
+            pytest.skip(reason)
+
+    The returned string distinguishes the two skip causes — no CUDA Execution
+    Provider registered vs. a CUDA build that predates microsoft/onnxruntime#28958
+    — so failures-to-run are self-explanatory in the test report.
+    """
+    if supports_static_cache_flash():
+        return None
+    if not CUDA_AVAILABLE:
+        return (
+            "CUDA Execution Provider not available; static-cache TensorScatter "
+            "+ external-cache Attention is CUDA-only."
+        )
+    return (
+        "installed ORT cannot run maskless is_causal=1 + nonpad_kv_seqlen "
+        "+ TensorScatter on CUDA (needs microsoft/onnxruntime#28958)."
+    )
