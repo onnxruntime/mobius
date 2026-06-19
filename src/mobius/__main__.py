@@ -161,6 +161,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
 
+    # Auto-detect NeMo .nemo archives (local file or HF ref like
+    # 'owner/repo:model.nemo'). Routes to the NeMo import path; reuses the
+    # standard build args (--dtype, --ep, --external-data) and save logic.
+    if args.model and args.model.endswith(".nemo"):
+        from mobius.integrations.nemo import build_from_nemo
+
+        print(f"Detected NeMo archive: {args.model}")
+        pkg = build_from_nemo(
+            args.model,
+            dtype=dtype_override,
+            execution_provider=execution_provider,
+        )
+        _save_package(pkg, output_dir, args, optimize, component_filter)
+        return
+
     # Build from HuggingFace model ID or local config
     if args.config:
         import transformers
@@ -326,54 +341,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         keep_quantized=args.keep_quantized,
         execution_provider=args.execution_provider,
     )
-
-    pkg.save(
-        output_dir,
-        external_data=args.external_data,
-    )
-    for name in pkg:
-        use_subfolders = len(pkg) > 1
-        if use_subfolders:
-            path = os.path.join(output_dir, name, "model.onnx")
-        else:
-            path = os.path.join(output_dir, "model.onnx")
-        print(f"Saved {name} to {path}")
-
-
-def _cmd_build_nemo(args: argparse.Namespace) -> None:
-    """Execute the 'build-nemo' subcommand."""
-    from mobius.integrations.nemo import build_from_nemo
-
-    nemo_path = args.nemo_path
-    # Local file: default output beside it; HF repo ref: use the repo basename.
-    if os.path.splitext(nemo_path)[1] == ".nemo" and os.path.exists(nemo_path):
-        default_output = os.path.splitext(nemo_path)[0] + "_onnx"
-    else:
-        default_output = nemo_path.split(":", 1)[0].split("/")[-1] + "_onnx"
-    output_dir = args.output or default_output
-    os.makedirs(output_dir, exist_ok=True)
-
-    pkg = build_from_nemo(
-        nemo_path,
-        dtype=args.dtype,
-        execution_provider=args.execution_provider,
-        revision=getattr(args, "revision", None),
-    )
-
-    if getattr(args, "genai", False):
-        from mobius.integrations.nemo import write_genai_bundle
-        from mobius.integrations.nemo._reader import NeMoArchive
-
-        archive = NeMoArchive(nemo_path, revision=getattr(args, "revision", None))
-        out = write_genai_bundle(
-            pkg,
-            archive,
-            output_dir,
-            chunk_seconds=args.chunk_seconds,
-            include_vad=not args.no_vad,
-        )
-        print(f"Saved ONNX Runtime GenAI nemotron_speech bundle to {out}")
-        return
 
     pkg.save(
         output_dir,
@@ -620,85 +587,6 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
-
-    # --- build-nemo ---
-    nemo_parser = subparsers.add_parser(
-        "build-nemo", help="Build ONNX model(s) from a NeMo .nemo archive."
-    )
-    nemo_parser.add_argument(
-        "nemo_path",
-        help=(
-            "Path to a local .nemo file, or a HuggingFace Hub reference "
-            "('owner/repo' or 'owner/repo:filename.nemo')."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        metavar="DIR",
-        help="Output directory (default: <nemo_stem>_onnx/).",
-    )
-    nemo_parser.add_argument(
-        "--dtype",
-        choices=sorted(DTYPE_MAP),
-        default=None,
-        help=(
-            "Target dtype for model weights (f32/f16/bf16). Note: the GenAI "
-            "bundle (--genai) is float32 only, per the nemotron_speech runtime."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--revision",
-        default=None,
-        metavar="REV",
-        help=(
-            "HuggingFace Hub revision (branch, tag, or commit SHA) to pin "
-            "downloads for reproducible builds. Ignored for local .nemo paths."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--external-data",
-        choices=["onnx", "safetensors"],
-        default="onnx",
-        help="External data format (default: onnx).",
-    )
-    nemo_parser.add_argument(
-        "--ep",
-        "--execution-provider",
-        dest="execution_provider",
-        default="default",
-        metavar="EP",
-        help=(
-            "Target execution provider for EP-aware graph optimisations. "
-            "Defaults to 'default' (portable ONNX, no vendor fusions)."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--genai",
-        action="store_true",
-        help=(
-            "Write an ONNX Runtime GenAI 'nemotron_speech' bundle (flat "
-            "encoder/decoder/joint ONNX + genai_config.json, "
-            "audio_processor_config.json and tokenizer) instead of the default "
-            "subfolder layout. FastConformer-RNNT only."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=1.12,
-        help=(
-            "Streaming chunk length in seconds for the GenAI bundle "
-            "(default: 1.12, the model's native att_context [70, 13] chunk)."
-        ),
-    )
-    nemo_parser.add_argument(
-        "--no-vad",
-        action="store_true",
-        help="Skip the Silero VAD download/config block in the GenAI bundle.",
-    )
-    nemo_parser.set_defaults(func=_cmd_build_nemo)
 
     # --- list ---
     list_parser = subparsers.add_parser(
