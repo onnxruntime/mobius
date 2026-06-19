@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Unit tests for the static-cache Flash capability probe classifiers.
 
 These cover the pure, CPU-only decision logic — the pre-#28958 reject
