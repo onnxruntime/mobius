@@ -27,8 +27,8 @@ from mobius._configs._base import (
     BambaConfig,
     BaseModelConfig,
     CausalLMConfig,
-    DFlashConfig,
     DepthAnythingConfig,
+    DFlashConfig,
     EncoderConfig,
     Gemma2Config,
     Gemma3nConfig,
@@ -131,4 +131,6 @@ __all__ = [
     "_resolve_hidden_act",
     "_shallow_fields",
     "_shared_expert_size",
+    "DFlashConfig",
+    "Gemma4AssistantConfig",
 ]

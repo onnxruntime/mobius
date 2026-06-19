@@ -59,8 +59,7 @@ if TYPE_CHECKING:
 
 
 class Qwen35MtpModel(nn.Module):
-    """Qwen3.6 MTP self-speculative head — a single cross-conditioned
-    full-attention Qwen3.5 block.
+    """Qwen3.6 MTP self-speculative head (a single cross-conditioned full-attention block).
 
     Inputs (graph-level, set up by :class:`~mobius.tasks.Qwen35MtpTask`):
         inputs_embeds: ``[batch, seq_len, hidden]`` (model dtype) — the
@@ -90,12 +89,8 @@ class Qwen35MtpModel(nn.Module):
         self._dtype = config.dtype
 
         # Input projection: fuse the token embedding with the target hidden.
-        self.pre_fc_norm_embedding = OffsetRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_fc_norm_hidden = OffsetRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.pre_fc_norm_embedding = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc = Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         # The single full-attention MTP decoder layer.
@@ -122,7 +117,7 @@ class Qwen35MtpModel(nn.Module):
             mtp.layers.0.*                    -> layers.0.*
         """
         return {
-            key[len("mtp."):]: value
+            key[len("mtp.") :]: value
             for key, value in state_dict.items()
             if key.startswith("mtp.")
         }

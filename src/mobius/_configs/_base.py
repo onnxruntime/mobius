@@ -1156,7 +1156,6 @@ class DFlashConfig(CausalLMConfig):
         )
 
 
-
 @dataclasses.dataclass
 class Qwen35MtpConfig(CausalLMConfig):
     """Configuration for the Qwen3.6 multi-token-prediction (MTP) head.
@@ -1542,9 +1541,7 @@ class Gemma4AssistantConfig(Gemma4Config):
             backbone_hidden_size=int(_resolve("backbone_hidden_size", 1536)),
             use_ordered_embeddings=bool(_resolve("use_ordered_embeddings", False)),
             num_centroids=int(_resolve("num_centroids", 2048)),
-            centroid_intermediate_top_k=int(
-                _resolve("centroid_intermediate_top_k", 32)
-            ),
+            centroid_intermediate_top_k=int(_resolve("centroid_intermediate_top_k", 32)),
         )
 
     def validate(self) -> None:
@@ -1579,6 +1576,7 @@ class Gemma4AssistantConfig(Gemma4Config):
             raise ValueError(
                 "Invalid Gemma4AssistantConfig:\n" + "\n".join(f"  - {e}" for e in errors)
             )
+
 
 @dataclasses.dataclass
 class YolosConfig(EncoderConfig):

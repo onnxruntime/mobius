@@ -138,9 +138,7 @@ class TestDFlashDraftTaskGraph:
 
     def test_target_hidden_shape_scales_with_target_layer_ids(self):
         cfg, model = self._build(target_layer_ids=[2, 7, 11, 15])
-        target_hidden_input = next(
-            v for v in model.graph.inputs if v.name == "target_hidden"
-        )
+        target_hidden_input = next(v for v in model.graph.inputs if v.name == "target_hidden")
         # Last dim must be len(target_layer_ids) * hidden_size.
         last_dim = target_hidden_input.shape[-1]
         assert last_dim == len(cfg.target_layer_ids) * cfg.hidden_size

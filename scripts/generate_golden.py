@@ -1382,7 +1382,9 @@ def _generate_gemma4_assistant(case: TestCase, json_path: Path, device: str) -> 
     torch_dtype = dtype_map.get(case.dtype, torch.float32)
 
     tok = AutoTokenizer.from_pretrained(target_id)
-    target = AutoModelForCausalLM.from_pretrained(target_id, dtype=torch_dtype).to(device).eval()
+    target = (
+        AutoModelForCausalLM.from_pretrained(target_id, dtype=torch_dtype).to(device).eval()
+    )
     assistant = (
         AutoModelForCausalLM.from_pretrained(assistant_id, dtype=torch_dtype).to(device).eval()
     )
@@ -1395,7 +1397,11 @@ def _generate_gemma4_assistant(case: TestCase, json_path: Path, device: str) -> 
             {
                 "inputs_embeds": kwargs["inputs_embeds"].detach().float().cpu().numpy(),
                 "position_ids": kwargs["position_ids"].detach().cpu().numpy().astype(np.int64),
-                "attention_mask": kwargs["attention_mask"].detach().cpu().numpy().astype(np.int64),
+                "attention_mask": kwargs["attention_mask"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64),
                 "shared_kv": {
                     lt: (
                         kv[0].detach().float().cpu().numpy(),
@@ -1531,7 +1537,10 @@ def _generate_dflash_draft(case: TestCase, json_path: Path, device: str) -> None
     )
     drafter = (
         AutoModel.from_pretrained(
-            drafter_id, trust_remote_code=True, torch_dtype=torch_dtype, attn_implementation="eager"
+            drafter_id,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            attn_implementation="eager",
         )
         .to(device)
         .eval()

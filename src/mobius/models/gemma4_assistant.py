@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import Gemma4AssistantConfig, Gemma4Config
+from mobius._configs import Gemma4AssistantConfig
 from mobius.components import Linear, RMSNorm, initialize_rope
 from mobius.components._gemma4_assistant import (
     Gemma4AssistantDecoderLayer,
@@ -130,10 +130,7 @@ class Gemma4AssistantCausalLMModel(nn.Module):
         keys (if present in the state dict) are dropped because no mobius
         module would consume them.
         """
-        if (
-            "lm_head.weight" not in state_dict
-            and "model.embed_tokens.weight" in state_dict
-        ):
+        if "lm_head.weight" not in state_dict and "model.embed_tokens.weight" in state_dict:
             state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
         # The HF Gemma4TextModel's embed_tokens table is never consumed by
         # the mobius assistant — drop it after the alias.
@@ -271,8 +268,9 @@ class _Gemma4AssistantTextModel(nn.Module):
         shared_kv: dict[str, tuple[ir.Value, ir.Value]],
         attention_mask: ir.Value | None = None,
     ) -> ir.Value:
-        from mobius._build_context import ep_capabilities, get_build_dtype
         import onnx_ir as ir_mod
+
+        from mobius._build_context import ep_capabilities, get_build_dtype
         from mobius.components._attention import GQAContext
 
         caps = ep_capabilities()
@@ -310,8 +308,7 @@ class _Gemma4AssistantTextModel(nn.Module):
                     cos_cache=self.rotary_emb_local.cos_cache,
                     sin_cache=self.rotary_emb_local.sin_cache,
                     local_window_size=(
-                        getattr(self.layers[0].self_attn, "sliding_window", -1)
-                        or -1
+                        getattr(self.layers[0].self_attn, "sliding_window", -1) or -1
                     ),
                 ),
                 "full_attention": GQAContext(

@@ -35,12 +35,11 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Gemma4AssistantConfig
-from mobius.components._attention import _apply_attention
+from mobius.components._attention import GQAContext, _apply_attention
 from mobius.components._common import Linear
 from mobius.components._mlp import GatedMLP
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
-from mobius.components._attention import GQAContext
 
 if TYPE_CHECKING:
     pass
@@ -76,7 +75,9 @@ class Gemma4AssistantAttention(nn.Module):
     ):
         super().__init__()
         is_full = layer_type == "full_attention"
-        self.head_dim = (config.global_head_dim or config.head_dim) if is_full else config.head_dim
+        self.head_dim = (
+            (config.global_head_dim or config.head_dim) if is_full else config.head_dim
+        )
         self.num_attention_heads = config.num_attention_heads
         # Full-attention layers may use a distinct kv-head count; sliding always
         # uses the standard num_key_value_heads.  Mirrors Gemma4TextAttention.
@@ -252,15 +253,9 @@ class Gemma4AssistantDecoderLayer(nn.Module):
             bias=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # ``layer_scalar`` is a tied (persistent) buffer in HF
         # (``register_buffer("layer_scalar", torch.ones(1))``).  In mobius
         # we declare it as a Parameter so the weight loader populates it
@@ -346,9 +341,7 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         self.vocab_size_per_centroid = config.vocab_size // config.num_centroids
         self.hidden_size = config.hidden_size
 
-        self.centroids = Linear(
-            config.hidden_size, config.num_centroids, bias=False
-        )
+        self.centroids = Linear(config.hidden_size, config.num_centroids, bias=False)
         # token_ordering is a learnable INT64 buffer in upstream (registered
         # via register_buffer); in mobius we declare it as an INT64 Parameter
         # so the weight loader populates it from the HF state_dict key
@@ -369,8 +362,8 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         # we score per token; everything else gets ``mask_value`` (effectively
         # -inf for argmax / softmax).
         top_k = self.centroid_intermediate_top_k
-        K = self.vocab_size_per_centroid
-        top_kK = top_k * K
+        K = self.vocab_size_per_centroid  # noqa: N806 — matrix-dim convention
+        top_kK = top_k * K  # noqa: N806
 
         # centroid_logits: [B, L, num_centroids]
         centroid_logits = self.centroids(op, hidden_states)
@@ -396,9 +389,7 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         # Gather canonical vocab positions for each selected centroid.
         # canonical_per_cluster: [C, K], top_k_indices: [B, L, top_k]
         # axis=0 → [B, L, top_k, K] INT64
-        selected_canonical = op.Gather(
-            canonical_per_cluster, top_k_indices, axis=0
-        )
+        selected_canonical = op.Gather(canonical_per_cluster, top_k_indices, axis=0)
 
         # Gather LM-head rows at those canonical positions.
         # lm_head_weight: [vocab, hidden], selected_canonical: [B, L, top_k, K]

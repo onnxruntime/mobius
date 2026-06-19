@@ -102,7 +102,10 @@ class TestGemma4AssistantConfigFromTransformers:
         assert cfg.head_dim == 256
         assert cfg.global_head_dim == 512
         assert cfg.layer_types == [
-            "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
         ]
         assert cfg.sliding_window == 512
         assert cfg.vocab_size == 262144
@@ -269,17 +272,19 @@ class TestGemma4AssistantBuildGraph:
         cfg = self._cfg()
         module = Gemma4AssistantCausalLMModel(cfg)
         from mobius._builder import build_from_module
+
         pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
         return cfg, pkg["model"]
 
     def test_build_returns_valid_model(self):
         import onnx_ir as ir
+
         _cfg, model = self._build()
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
     def test_graph_inputs(self):
-        cfg, model = self._build()
+        _cfg, model = self._build()
         names = [v.name for v in model.graph.inputs]
         assert "inputs_embeds" in names
         assert "position_ids" in names
@@ -292,7 +297,7 @@ class TestGemma4AssistantBuildGraph:
         assert not any(n.startswith("past_key_values.") for n in names)
 
     def test_graph_outputs(self):
-        cfg, model = self._build()
+        _cfg, model = self._build()
         names = [v.name for v in model.graph.outputs]
         assert "logits" in names
         assert "projected_state" in names
@@ -307,7 +312,9 @@ class TestGemma4AssistantBuildGraph:
 
     def test_shared_kv_full_shape_uses_global_head_dim(self):
         cfg, model = self._build()
-        full_k = next(v for v in model.graph.inputs if v.name == "shared_kv.full_attention.key")
+        full_k = next(
+            v for v in model.graph.inputs if v.name == "shared_kv.full_attention.key"
+        )
         assert full_k.shape[-1] == (cfg.global_head_dim or cfg.head_dim)
 
     def test_shared_kv_sliding_shape_uses_local_head_dim(self):
@@ -319,6 +326,7 @@ class TestGemma4AssistantBuildGraph:
 
     def test_logits_last_dim_is_vocab(self):
         import onnx_ir as ir
+
         cfg, model = self._build()
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         last = logits.shape[-1]
@@ -326,9 +334,9 @@ class TestGemma4AssistantBuildGraph:
         # in the test fixture), the scatter-built output may carry a
         # symbolic last dim through shape inference even though at runtime
         # the values have shape vocab_size.  Accept either form.
-        assert (
-            last == cfg.vocab_size or isinstance(last, ir.SymbolicDim)
-        ), f"expected vocab_size ({cfg.vocab_size}) or a symbolic dim, got {last!r}"
+        assert last == cfg.vocab_size or isinstance(last, ir.SymbolicDim), (
+            f"expected vocab_size ({cfg.vocab_size}) or a symbolic dim, got {last!r}"
+        )
 
     def test_projected_state_last_dim_is_backbone(self):
         cfg, model = self._build()
@@ -414,8 +422,11 @@ class TestGemma4AssistantPreprocessWeights:
 
 
 class TestGemma4AssistantOrderedEmbeddings:
-    """When use_ordered_embeddings=True, the assistant must build the
-    centroid-routed sparse LM head and route logits through it."""
+    """Ordered-embeddings (sparse LM head) build behaviour.
+
+    When use_ordered_embeddings=True, the assistant must build the
+    centroid-routed sparse LM head and route logits through it.
+    """
 
     def _model(self, **cfg_over):
         cfg = Gemma4AssistantConfig.from_transformers(
@@ -442,6 +453,7 @@ class TestGemma4AssistantOrderedEmbeddings:
 
     def test_build_with_ordered_embeddings_produces_logits(self):
         from mobius._builder import build_from_module
+
         cfg, module = self._model()
         pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
         names = [v.name for v in pkg["model"].graph.outputs]
@@ -452,6 +464,7 @@ class TestGemma4AssistantOrderedEmbeddings:
 
     def test_build_with_ordered_embeddings_has_centroid_weights(self):
         from mobius._builder import build_from_module
+
         cfg, module = self._model()
         pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
         init_names = list(pkg["model"].graph.initializers.keys())
@@ -466,6 +479,7 @@ class TestGemma4AssistantOrderedEmbeddings:
         # graph has a dangling reference and the lm_head.weight initializer
         # never appears in the file.
         from mobius._builder import build_from_module
+
         cfg, module = self._model()
         pkg = build_from_module(module, cfg, task=Gemma4AssistantTask())
         init_names = list(pkg["model"].graph.initializers.keys())

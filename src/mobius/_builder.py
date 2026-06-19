@@ -436,9 +436,7 @@ def build(
         # listed decoder layer index.  Used by speculative-decoding draft
         # models (e.g. DFlash) that condition on intermediate target hidden
         # states.  See ``ArchitectureConfig.output_layer_indices``.
-        config = dataclasses.replace(
-            config, output_layer_indices=list(output_layer_indices)
-        )
+        config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
 
     if task is None:
         task = _default_task_for_model(model_type)

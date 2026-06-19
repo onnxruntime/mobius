@@ -20,6 +20,7 @@ import dataclasses
 from types import SimpleNamespace
 
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._builder import build_from_module
@@ -62,8 +63,10 @@ class TestQwen35MtpModelParams:
         assert any("norm.weight" in n for n in names)
 
     def test_head_borrows_embed_and_lm_head(self):
-        """The MTP head must NOT own an embedding table or LM head — those
-        are borrowed from the target (mtp_use_dedicated_embeddings=False)."""
+        """The MTP head must not own an embedding table or LM head.
+
+        Those are borrowed from the target (mtp_use_dedicated_embeddings=False).
+        """
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
         names = [n for n, _ in model.named_parameters()]
@@ -236,7 +239,7 @@ class TestQwen35MtpConfigFromTransformers:
         assert cfg.num_key_value_heads == 2
         assert cfg.head_dim == 16
         assert cfg.vocab_size == 248320
-        assert cfg.partial_rotary_factor == 0.25
+        assert cfg.partial_rotary_factor == pytest.approx(0.25)
         assert cfg.mrope_section == [11, 11, 10]
         assert cfg.mrope_interleaved is True
 
