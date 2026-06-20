@@ -36,7 +36,6 @@ convention used by mobius's RoPE.
 from __future__ import annotations
 
 
-
 import numpy as np
 import onnx_ir as ir
 import torch
@@ -63,11 +62,11 @@ _TR_FFN = 2048
 _TR_THETA = 10000.0
 _TR_CONTEXT = 250
 
-_CODEBOOK_DIM = 512   # quantizer in/out projection dimension
-_VQ_DIM = 256         # internal codebook dimension
+_CODEBOOK_DIM = 512  # quantizer in/out projection dimension
+_VQ_DIM = 256  # internal codebook dimension
 _BINS = 2048
 _N_SEMANTIC = 1
-_N_ACTIVE = 8         # active codebooks (1 semantic + 7 acoustic)
+_N_ACTIVE = 8  # active codebooks (1 semantic + 7 acoustic)
 
 _RESAMPLE_STRIDE = 2  # 25 Hz <-> 12.5 Hz
 
@@ -147,9 +146,7 @@ class _Conv(nn.Module):
         super().__init__()
         self._pad_left = kernel - stride
         self._pad_mode = pad_mode
-        self.conv = _NormConv(
-            in_ch, out_ch, kernel, stride=stride, groups=groups, bias=bias
-        )
+        self.conv = _NormConv(in_ch, out_ch, kernel, stride=stride, groups=groups, bias=bias)
 
     def forward(self, op: OpBuilder, x: ir.Value):
         if self._pad_left > 0:
@@ -224,9 +221,7 @@ class _ConvTr(nn.Module):
     ):
         super().__init__()
         self._trim_right = kernel - stride
-        self.convtr = _NormConvTr(
-            in_ch, out_ch, kernel, stride, groups=groups, bias=bias
-        )
+        self.convtr = _NormConvTr(in_ch, out_ch, kernel, stride, groups=groups, bias=bias)
 
     def forward(self, op: OpBuilder, x: ir.Value):
         y = self.convtr(op, x)
@@ -291,8 +286,8 @@ class _SEANetEncoder(nn.Module):
         layers.append(_Conv(1, _N_FILTERS, 7))  # model.0
         for ratio in reversed(_RATIOS):  # [4, 5, 6, 8]
             ch = mult * _N_FILTERS
-            layers.append(_ResnetBlock(ch))            # resnet
-            layers.append(_ELU())                      # ELU
+            layers.append(_ResnetBlock(ch))  # resnet
+            layers.append(_ELU())  # ELU
             layers.append(_Conv(ch, ch * 2, ratio * 2, stride=ratio))  # downsample
             mult *= 2
         layers.append(_ELU())
@@ -486,7 +481,7 @@ class _EncVQ(nn.Module):
         diff = op.Sub(x_b, e_b)  # (B, T, codebook, dim)
         distances = op.ReduceSumSquare(diff, [-1], keepdims=0)  # (B, T, codebook)
         codes = op.ArgMin(distances, axis=-1, keepdims=0)  # (B, T)
-        quantized = op.Gather(embedding, codes, axis=0)     # (B, T, dim)
+        quantized = op.Gather(embedding, codes, axis=0)  # (B, T, dim)
         quantized = op.Transpose(quantized, perm=[0, 2, 1])  # (B, dim, T)
         return codes, quantized
 
@@ -579,10 +574,10 @@ class MimiEncoderModel(nn.Module):
         self.quantizer = _EncSplitRVQ()
 
     def forward(self, op: OpBuilder, waveform: ir.Value):
-        emb = self.encoder(op, waveform)            # (B, 512, T@25Hz)
-        emb = self.encoder_transformer(op, emb)     # causal transformer
-        emb = self.downsample(op, emb)              # (B, 512, T@12.5Hz)
-        codes = self.quantizer(op, emb)             # (B, 8, T)
+        emb = self.encoder(op, waveform)  # (B, 512, T@25Hz)
+        emb = self.encoder_transformer(op, emb)  # causal transformer
+        emb = self.downsample(op, emb)  # (B, 512, T@12.5Hz)
+        codes = self.quantizer(op, emb)  # (B, 8, T)
         return codes
 
 
@@ -601,10 +596,10 @@ class MimiDecoderModel(nn.Module):
         self.decoder = _SEANetDecoder()
 
     def forward(self, op: OpBuilder, codes: ir.Value):
-        emb = self.quantizer(op, codes)             # (B, 512, T@12.5Hz)
-        emb = self.upsample(op, emb)                # (B, 512, T@25Hz)
-        emb = self.decoder_transformer(op, emb)     # causal transformer
-        waveform = self.decoder(op, emb)            # (B, 1, samples)
+        emb = self.quantizer(op, codes)  # (B, 512, T@12.5Hz)
+        emb = self.upsample(op, emb)  # (B, 512, T@25Hz)
+        emb = self.decoder_transformer(op, emb)  # causal transformer
+        waveform = self.decoder(op, emb)  # (B, 1, samples)
         return waveform
 
 
@@ -714,9 +709,7 @@ def _codebook_embedding(sd: dict, prefix: str) -> torch.Tensor:
     return embedding_sum / denom
 
 
-def _preprocess_mimi_weights(
-    sd: dict[str, torch.Tensor]
-) -> dict[str, torch.Tensor]:
+def _preprocess_mimi_weights(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Map native Kyutai Mimi weights to mobius module parameter names.
 
     Names are fully qualified with the ``encoder.``/``decoder.`` component

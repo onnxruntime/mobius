@@ -19,6 +19,6 @@ Usage::
 
 from __future__ import annotations
 
-from mobius.integrations.moshi._builder import build_mimi
+from mobius.integrations.moshi._builder import build_mimi, build_moshi_lm
 
-__all__ = ["build_mimi"]
+__all__ = ["build_mimi", "build_moshi_lm"]

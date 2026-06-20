@@ -73,6 +73,8 @@ __all__ = [
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
     "MimiModel",
+    "MoshiDepformerModel",
+    "MoshiTemporalModel",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
@@ -135,6 +137,8 @@ __all__ = [
     "XLMCausalLMModel",
     "Zamba2CausalLMModel",
     "mimi_default_config",
+    "moshi_depformer_config",
+    "moshi_temporal_config",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -198,6 +202,12 @@ from mobius.models.moe import (
     MoECausalLMModel,
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
+)
+from mobius.models.moshi import (
+    MoshiDepformerModel,
+    MoshiTemporalModel,
+    moshi_depformer_config,
+    moshi_temporal_config,
 )
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel

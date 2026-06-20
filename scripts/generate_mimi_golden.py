@@ -68,9 +68,7 @@ def _resolve_mimi(model: str) -> str:
         )
     )
     if not snaps:
-        raise FileNotFoundError(
-            f"No local HF snapshot for {model!r}; download it first."
-        )
+        raise FileNotFoundError(f"No local HF snapshot for {model!r}; download it first.")
     files = glob.glob(os.path.join(snaps[0], "tokenizer-*.safetensors"))
     if not files:
         raise FileNotFoundError(f"No Mimi tokenizer checkpoint under {snaps[0]!r}")
@@ -80,9 +78,7 @@ def _resolve_mimi(model: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="nvidia/personaplex-7b-v1")
-    parser.add_argument(
-        "--out", default="testdata/golden/audio/mimi-personaplex.json"
-    )
+    parser.add_argument("--out", default="testdata/golden/audio/mimi-personaplex.json")
     args = parser.parse_args()
 
     from moshi.models.loaders import get_mimi
