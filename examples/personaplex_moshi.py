@@ -45,6 +45,19 @@ Usage::
 
     # Reuse already-exported ONNX models (skip the build step)
     python examples/personaplex_moshi.py --model-dir out/personaplex/onnx
+
+    # Simulated real-time stream (reports RTF / per-frame budget). Build the
+    # models with an fp16 LM on CUDA first for real-time speed:
+    python examples/personaplex_moshi.py --device cuda --lm-dtype f16 \
+        --stream --audio user.wav --save-to out/personaplex
+
+    # Live full-duplex mic -> speaker (needs sounddevice + audio hardware)
+    python examples/personaplex_moshi.py --skip-build --device cuda --mic
+
+Real-time note: each 12.5 Hz frame must finish within 80 ms. On an fp16 LM +
+CUDA the Moshi LM is ~27 ms/frame (~3x headroom); CPU fp32 (~1.8 s/frame) is
+far too slow for ``--stream``/``--mic``. The Mimi codec stays fp32 (its fp16
+export currently hits a Conv dtype mismatch).
 """
 
 from __future__ import annotations
@@ -136,6 +149,20 @@ class MoshiORT:
     def decode(self, codes: np.ndarray) -> np.ndarray:
         """Codes (1, 8, Tf) int64 -> waveform (1,1,T) float32."""
         return self.dec.run(["waveform"], {"codes": codes.astype(np.int64)})[0]
+
+    def warmup(self, frames: int = 3) -> None:
+        """Run a few full frames to trigger CUDA/codec autotune, then reset.
+
+        Avoids a multi-100ms stall (audio glitch) on the first real frame.
+        """
+        enc = StreamingMimiEncoder(self.enc)
+        dec = StreamingMimiDecoder(self.dec)
+        silence = np.zeros(FRAME_SIZE, np.float32)
+        for _ in range(frames):
+            out = self.step(enc.push(silence))
+            if out is not None:
+                dec.push(out)
+        self._reset_lm_state()
 
     # --- LM state (ring cache + delays), mirrors LMGen ------------------
     def _reset_lm_state(self):
@@ -297,13 +324,18 @@ class MoshiORT:
         return out[1 : 1 + MIMI_CB]
 
 
-def _build_models(model_dir: str, device: str):
-    """Export the four ONNX models from the native checkpoints (once)."""
+def _build_models(model_dir: str, device: str, lm_dtype: str = "f32"):
+    """Export the four ONNX models from the native checkpoints (once).
+
+    The Mimi codec is always built in float32 (its fp16 export currently hits a
+    Conv dtype mismatch); the Moshi LM honours ``lm_dtype`` (use ``"f16"`` on
+    CUDA for real-time streaming).
+    """
     from mobius.integrations.moshi import build_mimi, build_moshi_lm
 
     os.makedirs(model_dir, exist_ok=True)
     ep = "cuda" if device == "cuda" else "default"
-    print(f"[build] Mimi codec from {_MODEL_ID} ...")
+    print(f"[build] Mimi codec (f32) from {_MODEL_ID} ...")
     mimi = build_mimi(_MODEL_ID, execution_provider=ep)
     mimi.save(os.path.join(model_dir, "mimi"))
     # Mimi saves encoder/ and decoder/ subdirs; flatten the names we load.
@@ -313,8 +345,9 @@ def _build_models(model_dir: str, device: str):
         if os.path.isdir(src) and not os.path.isdir(dst):
             os.rename(src, dst)
 
-    print(f"[build] Moshi LM (temporal + depformer) from {_MODEL_ID} ...")
-    lm = build_moshi_lm(_MODEL_ID, execution_provider=ep)
+    print(f"[build] Moshi LM ({lm_dtype}, temporal + depformer) from {_MODEL_ID} ...")
+    dtype = None if lm_dtype == "f32" else lm_dtype
+    lm = build_moshi_lm(_MODEL_ID, dtype=dtype, execution_provider=ep)
     lm["temporal"].save(os.path.join(model_dir, "temporal"))
     lm["depformer"].save(os.path.join(model_dir, "depformer"))
     print(f"[build] saved ONNX models under {model_dir}")
@@ -341,21 +374,205 @@ def _load_user_codes(moshi: MoshiORT, audio_path: str | None, frames: int):
     return [codes[:, t] for t in range(codes.shape[1])]
 
 
+# --- Streaming (rolling-window) Mimi codec --------------------------------
+#
+# The exported Mimi encoder/decoder are whole-utterance graphs, but their
+# convolutions are causal. To run frame-by-frame in real time we keep a short
+# ring buffer of the most recent ``window`` frames, (re)run the codec on that
+# window each step, and keep only the newest frame's output. ``window`` must
+# cover the codec receptive field (~0.6 s is ample at 12.5 Hz).
+
+
+class StreamingMimiEncoder:
+    """Encode one 12.5 Hz frame at a time with rolling left context."""
+
+    def __init__(self, session, window: int = 8):
+        self.s = session
+        self.win = window
+        self.buf = np.zeros((1, 1, window * FRAME_SIZE), np.float32)
+
+    def push(self, frame: np.ndarray) -> np.ndarray:
+        """Frame (FRAME_SIZE,) float32 -> (8,) int64 codes for that frame."""
+        self.buf = np.roll(self.buf, -FRAME_SIZE, axis=2)
+        self.buf[0, 0, -FRAME_SIZE:] = frame
+        codes = self.s.run(["codes"], {"waveform": self.buf})[0]  # (1, 8, win)
+        return codes[0, :, -1]
+
+
+class StreamingMimiDecoder:
+    """Decode one frame at a time (8 codebooks) with rolling left context."""
+
+    def __init__(self, session, window: int = 8):
+        self.s = session
+        self.win = window
+        self.buf = np.zeros((1, MIMI_CB, window), np.int64)
+
+    def push(self, codes: np.ndarray) -> np.ndarray:
+        """Codes (8,) int64 -> (FRAME_SIZE,) float32 waveform for that frame."""
+        self.buf = np.roll(self.buf, -1, axis=2)
+        self.buf[0, :, -1] = codes
+        wav = self.s.run(["waveform"], {"codes": self.buf})[0]  # (1, 1, win*1920)
+        return wav[0, 0, -FRAME_SIZE:]
+
+
+def _stream_frames(audio_path: str | None, max_frames: int):
+    """Yield (FRAME_SIZE,) float32 user-stream frames from a wav (or silence)."""
+    if audio_path is None:
+        for _ in range(max_frames):
+            yield np.zeros(FRAME_SIZE, np.float32)
+        return
+    import soundfile as sf
+
+    wav, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        raise SystemExit(f"Input audio must be {SAMPLE_RATE} Hz mono (got {sr} Hz).")
+    n = (len(wav) // FRAME_SIZE) * FRAME_SIZE
+    for t in range(0, min(n, max_frames * FRAME_SIZE), FRAME_SIZE):
+        yield wav[t : t + FRAME_SIZE]
+
+
+def run_stream_file(moshi, args) -> None:
+    """Simulated real-time stream from a wav (or silence): measure RTF + save."""
+    enc = StreamingMimiEncoder(moshi.enc)
+    dec = StreamingMimiDecoder(moshi.dec)
+    out_chunks: list[np.ndarray] = []
+    per_frame_ms: list[float] = []
+    pace = 1.0 / FRAME_RATE  # 80 ms wall-clock budget per frame
+
+    print(f"[stream] simulated real-time ({FRAME_RATE} Hz, {pace * 1000:.0f} ms/frame)")
+    moshi.warmup()
+    wall0 = time.perf_counter()
+    for frame in _stream_frames(args.audio, args.frames):
+        t0 = time.perf_counter()
+        codes = enc.push(frame)
+        out = moshi.step(codes)
+        if out is not None:
+            out_chunks.append(dec.push(out))
+        dt = time.perf_counter() - t0
+        per_frame_ms.append(dt * 1000)
+        if args.pace:
+            # Sleep to emulate a live 12.5 Hz source (skip if we overran).
+            slack = pace - (time.perf_counter() - t0)
+            if slack > 0:
+                time.sleep(slack)
+    n = len(per_frame_ms)
+    wall = time.perf_counter() - wall0
+    audio_s = n / FRAME_RATE
+    import statistics as st
+
+    mean_ms = st.mean(per_frame_ms)
+    p90 = sorted(per_frame_ms)[int(0.9 * (n - 1))]
+    over = sum(ms > pace * 1000 for ms in per_frame_ms)
+    print(
+        f"[stream] {n} frames | compute mean={mean_ms:.1f}ms p90={p90:.1f}ms "
+        f"max={max(per_frame_ms):.1f}ms | budget={pace * 1000:.0f}ms"
+    )
+    rtf = (mean_ms / 1000) / pace
+    verdict = "REAL-TIME OK" if rtf < 1.0 else "OVER BUDGET"
+    print(
+        f"[stream] compute RTF={rtf:.2f} ({verdict}); {over}/{n} frames over budget; "
+        f"wall={wall:.2f}s for {audio_s:.2f}s audio"
+    )
+    if out_chunks and args.save_to:
+        import soundfile as sf
+
+        os.makedirs(args.save_to, exist_ok=True)
+        wav = np.concatenate(out_chunks)
+        out_path = os.path.join(args.save_to, "assistant_stream.wav")
+        sf.write(out_path, wav, SAMPLE_RATE)
+        print(f"[stream] wrote {out_path} ({len(wav) / SAMPLE_RATE:.2f}s)")
+
+
+def run_stream_mic(moshi, args) -> None:
+    """Live full-duplex from microphone to speaker (requires audio hardware)."""
+    import queue
+
+    try:
+        import sounddevice as sd
+    except Exception as exc:  # pragma: no cover - hardware/dep dependent
+        raise SystemExit(
+            f"--mic needs the 'sounddevice' package and audio hardware (import failed: {exc})."
+        ) from exc
+
+    enc = StreamingMimiEncoder(moshi.enc)
+    dec = StreamingMimiDecoder(moshi.dec)
+    in_q: queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+
+    def in_cb(indata, frames, t, status):  # pragma: no cover - hardware
+        in_q.put(indata[:, 0].copy())
+
+    def out_cb(outdata, frames, t, status):  # pragma: no cover - hardware
+        try:
+            outdata[:, 0] = out_q.get_nowait()
+        except queue.Empty:
+            outdata[:, 0] = 0.0
+
+    print("[mic] live full-duplex; press Ctrl-C to stop.")
+    moshi.warmup()
+    with (
+        sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, blocksize=FRAME_SIZE, callback=in_cb
+        ),
+        sd.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1, blocksize=FRAME_SIZE, callback=out_cb
+        ),
+    ):
+        try:
+            while True:  # pragma: no cover - hardware
+                frame = in_q.get()
+                codes = enc.push(frame.astype(np.float32))
+                out = moshi.step(codes)
+                if out is not None:
+                    out_q.put(dec.push(out).astype(np.float32))
+        except KeyboardInterrupt:
+            print("\n[mic] stopped.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", default="output/personaplex/onnx")
     parser.add_argument("--audio", default=None, help="24kHz mono user-stream wav")
     parser.add_argument("--frames", type=int, default=25, help="frames if no --audio")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument(
+        "--lm-dtype",
+        choices=["f32", "f16"],
+        default="f32",
+        help="Moshi LM dtype (use f16 on cuda for real-time)",
+    )
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--save-to", default=None, help="dir to write assistant.wav")
     parser.add_argument("--skip-build", action="store_true", help="reuse existing --model-dir")
+    parser.add_argument(
+        "--stream", action="store_true", help="simulated real-time stream (measures RTF)"
+    )
+    parser.add_argument(
+        "--mic", action="store_true", help="live full-duplex mic->speaker (needs sounddevice)"
+    )
+    parser.add_argument(
+        "--no-pace",
+        dest="pace",
+        action="store_false",
+        help="don't sleep to 12.5Hz in --stream (max-throughput RTF)",
+    )
+    parser.set_defaults(pace=True)
     args = parser.parse_args()
 
     if not args.skip_build and not os.path.isdir(os.path.join(args.model_dir, "temporal")):
-        _build_models(args.model_dir, args.device)
+        _build_models(args.model_dir, args.device, args.lm_dtype)
 
     moshi = MoshiORT(args.model_dir, args.device, args.allow_tf32)
+
+    if args.mic:
+        run_stream_mic(moshi, args)
+        return
+    if args.stream:
+        run_stream_file(moshi, args)
+        return
+
     user_frames = _load_user_codes(moshi, args.audio, args.frames)
     print(f"[run] {len(user_frames)} input frames on {args.device}")
 
