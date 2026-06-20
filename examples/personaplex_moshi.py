@@ -115,6 +115,17 @@ class MoshiORT:
         self.dec = _load("mimi_decoder")
         self.temporal = _load("temporal")
         self.depformer = _load("depformer")
+
+        # The graph optimizer may prune unused inputs (e.g. position_ids when
+        # RoPE derives its offset from the KV-cache length), and the KV cache
+        # dtype follows the exported model dtype (fp32 / fp16). Read both from
+        # the session so this loop works for any build.
+        self._t_inputs = {i.name for i in self.temporal.get_inputs()}
+        _ort_to_np = {"tensor(float)": np.float32, "tensor(float16)": np.float16}
+        self._kv_dtype = _ort_to_np.get(
+            next(i.type for i in self.temporal.get_inputs() if i.name.endswith(".key")),
+            np.float32,
+        )
         self._reset_lm_state()
 
     # --- Mimi codec ------------------------------------------------------
@@ -140,8 +151,8 @@ class MoshiORT:
         # persistent temporal KV cache (grows one frame per step)
         self._tkv = [
             (
-                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), np.float32),
-                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), np.float32),
+                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
+                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
             )
             for _ in range(T_LAYERS)
         ]
@@ -154,8 +165,9 @@ class MoshiORT:
         feeds = {
             "input_frame": frame,
             "attention_mask": np.ones((1, self._tpos + s), np.int64),
-            "position_ids": np.arange(self._tpos, self._tpos + s, dtype=np.int64)[None],
         }
+        if "position_ids" in self._t_inputs:
+            feeds["position_ids"] = np.arange(self._tpos, self._tpos + s, dtype=np.int64)[None]
         for i in range(T_LAYERS):
             feeds[f"past_key_values.{i}.key"] = self._tkv[i][0]
             feeds[f"past_key_values.{i}.value"] = self._tkv[i][1]
@@ -179,8 +191,8 @@ class MoshiORT:
         """
         past = [
             (
-                np.zeros((1, D_HEADS, 0, D_HEAD_DIM), np.float32),
-                np.zeros((1, D_HEADS, 0, D_HEAD_DIM), np.float32),
+                np.zeros((1, D_HEADS, 0, D_HEAD_DIM), self._kv_dtype),
+                np.zeros((1, D_HEADS, 0, D_HEAD_DIM), self._kv_dtype),
             )
             for _ in range(D_LAYERS)
         ]
