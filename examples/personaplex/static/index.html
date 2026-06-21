@@ -83,6 +83,10 @@
       </div>
       <div class="hint" id="voiceHint">No voice sample — using the model's default voice.</div>
 
+      <label for="latency">Playback buffer: <span id="latVal">180</span> ms
+        (lower = less delay, higher = smoother)</label>
+      <input id="latency" type="range" min="60" max="400" step="20" value="180" style="width:100%;" />
+
       <div class="row">
         <button id="apply" disabled>Connecting…</button>
       </div>
@@ -116,6 +120,8 @@
     const preset = document.getElementById("preset");
     const persona = document.getElementById("persona");
     const voiceHint = document.getElementById("voiceHint");
+    const latency = document.getElementById("latency");
+    const latVal = document.getElementById("latVal");
     const dot = document.getElementById("dot");
     const msg = document.getElementById("msg");
     const level = document.getElementById("level");
@@ -133,13 +139,76 @@
     let primed = false;
     // capture buffer: accumulate mic samples into exact 1920-sample frames.
     let capBuf = new Float32Array(0);
-    // playback scheduling: keep a contiguous schedule head and a jitter buffer.
-    // The server processes each 80 ms frame in a variable time (occasionally
-    // >200 ms under GPU/network jitter), so a too-small buffer underruns and
-    // clicks. ~250 ms of slack keeps playback smooth at the cost of latency.
-    let playHead = 0;
-    const TARGET_LATENCY = 0.25;   // seconds of audio to stay buffered
+    // playback: an AudioWorklet ring buffer (see PLAYER_WORKLET) pulls samples
+    // continuously and fills silence on underrun, which is far smoother than
+    // scheduling one BufferSource per frame (no per-frame scheduling jitter).
+    let playerNode = null;
     let underruns = 0;
+    // Seconds of audio to pre-buffer before playback starts / after an underrun.
+    // Smaller = lower latency but more sensitive to network/compute jitter.
+    let targetLatency = 0.18;
+
+    // AudioWorklet processor: a single-channel ring buffer fed from the main
+    // thread. It pre-buffers `prime` seconds, then streams gaplessly; on a full
+    // drain it outputs silence and re-primes (occasional silence beats clicks).
+    const PLAYER_WORKLET = `
+      class PCMPlayer extends AudioWorkletProcessor {
+        constructor(opts) {
+          super();
+          this.buf = new Float32Array(sampleRate * 4); // 4 s capacity
+          this.r = 0; this.w = 0; this.filled = 0;
+          this.underruns = 0; this.started = false;
+          this.prime = Math.round(sampleRate * (opts.processorOptions.prime || 0.18));
+          this._t = 0;
+          this.port.onmessage = (e) => {
+            const d = e.data;
+            if (d && d.cmd === 'reset') {
+              this.r = this.w = this.filled = 0; this.started = false;
+              this.underruns = 0;
+              if (d.prime) this.prime = Math.round(sampleRate * d.prime);
+              return;
+            }
+            if (d && d.cmd === 'setPrime') {
+              this.prime = Math.round(sampleRate * d.prime); // no buffer clear
+              return;
+            }
+            const s = d; // Float32Array of 24 kHz samples
+            for (let i = 0; i < s.length; i++) {
+              this.buf[this.w] = s[i];
+              this.w = (this.w + 1) % this.buf.length;
+              if (this.filled < this.buf.length) this.filled++;
+              else this.r = (this.r + 1) % this.buf.length; // overflow: drop oldest
+            }
+          };
+        }
+        process(inputs, outputs) {
+          const out = outputs[0][0];
+          if (!this.started) {
+            if (this.filled >= this.prime) this.started = true;
+            else { out.fill(0); this.report(out.length); return true; }
+          }
+          for (let i = 0; i < out.length; i++) {
+            if (this.filled > 0) {
+              out[i] = this.buf[this.r];
+              this.r = (this.r + 1) % this.buf.length; this.filled--;
+            } else {
+              out[i] = 0; this.underruns++; this.started = false; // re-prime
+            }
+          }
+          this.report(out.length);
+          return true;
+        }
+        report(n) {
+          this._t += n;
+          if (this._t >= sampleRate / 10) { // ~10 Hz
+            this._t = 0;
+            this.port.postMessage({ filled: this.filled, underruns: this.underruns });
+          }
+        }
+      }
+      registerProcessor('pcm-player', PCMPlayer);
+    `;
+    let playerModuleUrl = null;
 
     let pendingApply = false;
     let reconnecting = false;
@@ -154,6 +223,27 @@
     async function ensureAudio() {
       if (!audioCtx) audioCtx = new AudioContext({ sampleRate: RATE });
       await audioCtx.resume();
+      if (!playerNode) {
+        if (!playerModuleUrl) {
+          playerModuleUrl = URL.createObjectURL(
+            new Blob([PLAYER_WORKLET], { type: "application/javascript" })
+          );
+        }
+        await audioCtx.audioWorklet.addModule(playerModuleUrl);
+        playerNode = new AudioWorkletNode(audioCtx, "pcm-player", {
+          numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: { prime: targetLatency },
+        });
+        playerNode.port.onmessage = (e) => {
+          const d = e.data;
+          underruns = d.underruns;
+          sBuf.textContent = `${((d.filled / RATE) * 1000) | 0} ms`;
+          sBuf.className = "v" + ((d.filled / RATE) < 0.05 ? " warn" : "");
+          sReb.textContent = underruns;
+          sReb.className = "v" + (underruns ? " warn" : "");
+        };
+        playerNode.connect(audioCtx.destination);
+      }
       return audioCtx;
     }
 
@@ -205,7 +295,11 @@
           }
           return;
         }
-        enqueuePlayback(new Float32Array(ev.data));
+        // Push assistant PCM straight into the worklet ring buffer.
+        if (playerNode) {
+          const f = new Float32Array(ev.data);
+          playerNode.port.postMessage(f, [f.buffer]);
+        }
       };
     }
 
@@ -316,32 +410,6 @@
       } catch (_) { /* no presets available */ }
     }
 
-    function enqueuePlayback(samples) {
-      if (!audioCtx) return;
-      const buf = audioCtx.createBuffer(1, samples.length, RATE);
-      buf.copyToChannel(samples, 0);
-      const src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(audioCtx.destination);
-      const now = audioCtx.currentTime;
-      // If we fell behind (buffer drained), rebuild the jitter buffer instead
-      // of scheduling in the past (which would click / overlap).
-      if (playHead < now + 0.005) {
-        if (playHead !== 0) underruns++;
-        playHead = now + TARGET_LATENCY;
-      }
-      src.start(playHead);
-      playHead += buf.duration;
-      const buffered = Math.max(0, playHead - now);
-      sBuf.textContent = `${(buffered * 1000) | 0} ms`;
-      sBuf.className = "v" + (buffered * 1000 < 60 ? " warn" : "");
-      sReb.textContent = underruns;
-      sReb.className = "v" + (underruns ? " warn" : "");
-      if (running) {
-        setStatus("live — talk to Moshi", true);
-      }
-    }
-
     // Linear resampler: src samples at srcRate -> dstRate. Keeps a fractional
     // read position across calls so streaming chunks join seamlessly.
     function makeResampler(srcRate, dstRate) {
@@ -369,7 +437,9 @@
     async function start() {
       const ctx = await ensureAudio();
       audioCtx = ctx;
-      playHead = 0; underruns = 0;   // first frame (re)builds the jitter buffer
+      underruns = 0;
+      // Reset the playback ring buffer so it re-primes from empty.
+      if (playerNode) playerNode.port.postMessage({ cmd: "reset", prime: targetLatency });
       const ctxRate = audioCtx.sampleRate;
       console.log(`[moshi] AudioContext sampleRate = ${ctxRate} (target ${RATE})`);
       if (ctxRate !== RATE) {
@@ -471,6 +541,13 @@
       } else {
         applySession();
       }
+    };
+
+    latency.oninput = () => {
+      targetLatency = latency.value / 1000;
+      latVal.textContent = latency.value;
+      // Apply immediately to the running player (no buffer clear -> no gap).
+      if (playerNode) playerNode.port.postMessage({ cmd: "setPrime", prime: targetLatency });
     };
 
     connect();
