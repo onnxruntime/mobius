@@ -38,21 +38,21 @@ parity; pass ``--allow-tf32`` to keep the (faster, lower-precision) default.
 Usage::
 
     # Smoke test: generate a few frames from silence, save assistant audio
-    python examples/personaplex_moshi.py --frames 25 --save-to out/personaplex
+    python examples/personaplex/moshi_ort.py --frames 25 --save-to out/personaplex
 
     # Use a real input wav as the user stream
-    python examples/personaplex_moshi.py --audio user.wav --save-to out/personaplex
+    python examples/personaplex/moshi_ort.py --audio user.wav --save-to out/personaplex
 
     # Reuse already-exported ONNX models (skip the build step)
-    python examples/personaplex_moshi.py --model-dir out/personaplex/onnx
+    python examples/personaplex/moshi_ort.py --model-dir out/personaplex/onnx
 
     # Simulated real-time stream (reports RTF / per-frame budget). Build the
     # models with an fp16 LM on CUDA first for real-time speed:
-    python examples/personaplex_moshi.py --device cuda --lm-dtype f16 \
+    python examples/personaplex/moshi_ort.py --device cuda --lm-dtype f16 \
         --stream --audio user.wav --save-to out/personaplex
 
     # Live full-duplex mic -> speaker (needs sounddevice + audio hardware)
-    python examples/personaplex_moshi.py --skip-build --device cuda --mic
+    python examples/personaplex/moshi_ort.py --skip-build --device cuda --mic
 
 Real-time note: each 12.5 Hz frame must finish within 80 ms. On an fp16 LM +
 CUDA the Moshi LM is ~27 ms/frame (~3x headroom); CPU fp32 (~1.8 s/frame) is
@@ -163,6 +163,25 @@ class MoshiORT:
             if out is not None:
                 dec.push(out)
         self._reset_lm_state()
+
+    # --- Streaming front-door (shared sessions, per-conversation state) --
+    def reset_stream(self) -> None:
+        """Reset conversation state for a fresh stream (e.g. new client)."""
+        self._senc = StreamingMimiEncoder(self.enc)
+        self._sdec = StreamingMimiDecoder(self.dec)
+        self._reset_lm_state()
+
+    def process_frame(self, frame: np.ndarray) -> np.ndarray | None:
+        """Process one 12.5Hz user frame, return the assistant frame.
+
+        ``frame`` is (FRAME_SIZE,) float32; returns (FRAME_SIZE,) float32, or
+        None during the initial warm-up frames.
+        """
+        if not hasattr(self, "_senc"):
+            self.reset_stream()
+        codes = self._senc.push(frame.astype(np.float32, copy=False))
+        out = self.step(codes)
+        return None if out is None else self._sdec.push(out)
 
     # --- LM state (ring cache + delays), mirrors LMGen ------------------
     def _reset_lm_state(self):
@@ -435,21 +454,19 @@ def _stream_frames(audio_path: str | None, max_frames: int):
 
 def run_stream_file(moshi, args) -> None:
     """Simulated real-time stream from a wav (or silence): measure RTF + save."""
-    enc = StreamingMimiEncoder(moshi.enc)
-    dec = StreamingMimiDecoder(moshi.dec)
     out_chunks: list[np.ndarray] = []
     per_frame_ms: list[float] = []
     pace = 1.0 / FRAME_RATE  # 80 ms wall-clock budget per frame
 
     print(f"[stream] simulated real-time ({FRAME_RATE} Hz, {pace * 1000:.0f} ms/frame)")
     moshi.warmup()
+    moshi.reset_stream()
     wall0 = time.perf_counter()
     for frame in _stream_frames(args.audio, args.frames):
         t0 = time.perf_counter()
-        codes = enc.push(frame)
-        out = moshi.step(codes)
+        out = moshi.process_frame(frame)
         if out is not None:
-            out_chunks.append(dec.push(out))
+            out_chunks.append(out)
         dt = time.perf_counter() - t0
         per_frame_ms.append(dt * 1000)
         if args.pace:
@@ -496,8 +513,6 @@ def run_stream_mic(moshi, args) -> None:
             f"--mic needs the 'sounddevice' package and audio hardware (import failed: {exc})."
         ) from exc
 
-    enc = StreamingMimiEncoder(moshi.enc)
-    dec = StreamingMimiDecoder(moshi.dec)
     in_q: queue.Queue = queue.Queue()
     out_q: queue.Queue = queue.Queue()
 
@@ -512,6 +527,7 @@ def run_stream_mic(moshi, args) -> None:
 
     print("[mic] live full-duplex; press Ctrl-C to stop.")
     moshi.warmup()
+    moshi.reset_stream()
     with (
         sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, blocksize=FRAME_SIZE, callback=in_cb
@@ -523,10 +539,9 @@ def run_stream_mic(moshi, args) -> None:
         try:
             while True:  # pragma: no cover - hardware
                 frame = in_q.get()
-                codes = enc.push(frame.astype(np.float32))
-                out = moshi.step(codes)
+                out = moshi.process_frame(frame)
                 if out is not None:
-                    out_q.put(dec.push(out).astype(np.float32))
+                    out_q.put(out.astype(np.float32))
         except KeyboardInterrupt:
             print("\n[mic] stopped.")
 

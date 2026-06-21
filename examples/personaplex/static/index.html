@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<!--
+  Copyright (c) Microsoft Corporation.
+  Licensed under the MIT License.
+
+  Real-time full-duplex voice chat client for Moshi (personaplex-7b-v1).
+  Captures mic at 24 kHz mono, streams 1920-sample float32 frames to the
+  WebSocket server, and plays back the assistant frames it returns.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Moshi · real-time voice chat</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0d1117; color: #e6edf3; margin: 0;
+      display: flex; min-height: 100vh; align-items: center; justify-content: center;
+    }
+    .card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 14px;
+      padding: 32px 40px; width: 420px; box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 24px; color: #8b949e; font-size: 13px; }
+    button {
+      font-size: 15px; font-weight: 600; padding: 12px 22px; border-radius: 8px;
+      border: none; cursor: pointer; transition: background .15s;
+    }
+    #toggle { background: #238636; color: #fff; width: 100%; }
+    #toggle.stop { background: #da3633; }
+    #toggle:disabled { background: #30363d; color: #8b949e; cursor: default; }
+    .status { margin-top: 20px; font-size: 13px; color: #8b949e; min-height: 18px; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+           background: #6e7681; margin-right: 7px; vertical-align: middle; }
+    .dot.live { background: #2ea043; box-shadow: 0 0 8px #2ea043; }
+    .meter { height: 6px; background: #21262d; border-radius: 3px; margin-top: 14px; overflow: hidden; }
+    .meter > div { height: 100%; width: 0; background: #2ea043; transition: width .05s; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Moshi · real-time voice chat</h1>
+    <p class="sub">personaplex-7b-v1 · full-duplex speech-to-speech · 24 kHz</p>
+    <button id="toggle" disabled>Connecting…</button>
+    <div class="meter"><div id="level"></div></div>
+    <div class="status"><span class="dot" id="dot"></span><span id="msg">initialising…</span></div>
+  </div>
+
+  <script>
+    const FRAME = 1920;          // samples per 12.5 Hz frame
+    const RATE = 24000;          // Mimi sample rate
+    const toggle = document.getElementById("toggle");
+    const dot = document.getElementById("dot");
+    const msg = document.getElementById("msg");
+    const level = document.getElementById("level");
+
+    let ws, audioCtx, micStream, micNode, running = false;
+    // capture buffer: accumulate mic samples into exact 1920-sample frames.
+    let capBuf = new Float32Array(0);
+    // playback queue: float32 chunks the model returned, scheduled back-to-back.
+    let playHead = 0;
+
+    function setStatus(text, live) {
+      msg.textContent = text;
+      dot.classList.toggle("live", !!live);
+    }
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => setStatus("connected — press Start", false);
+      ws.onclose = () => { setStatus("disconnected", false); stop(); toggle.disabled = true; };
+      ws.onerror = () => setStatus("connection error", false);
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          if (ev.data === "ready") { toggle.disabled = false; setStatus("ready — press Start", false); }
+          else if (ev.data.startsWith("busy")) setStatus("server busy (another tab is connected)", false);
+          else setStatus(ev.data, false);
+          return;
+        }
+        enqueuePlayback(new Float32Array(ev.data));
+      };
+    }
+
+    function enqueuePlayback(samples) {
+      if (!audioCtx) return;
+      const buf = audioCtx.createBuffer(1, samples.length, RATE);
+      buf.copyToChannel(samples, 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (playHead < now) playHead = now + 0.05;   // small jitter buffer
+      src.start(playHead);
+      playHead += buf.duration;
+    }
+
+    async function start() {
+      audioCtx = new AudioContext({ sampleRate: RATE });
+      await audioCtx.resume();
+      playHead = audioCtx.currentTime + 0.1;
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
+                 autoGainControl: true, sampleRate: RATE }
+      });
+      const source = audioCtx.createMediaStreamSource(micStream);
+      // ScriptProcessor is deprecated but universally available and fine for a demo.
+      micNode = audioCtx.createScriptProcessor(2048, 1, 1);
+      micNode.onaudioprocess = (e) => {
+        if (!running) return;
+        const inp = e.inputBuffer.getChannelData(0);
+        // VU meter
+        let peak = 0; for (let i = 0; i < inp.length; i++) peak = Math.max(peak, Math.abs(inp[i]));
+        level.style.width = Math.min(100, peak * 200) + "%";
+        // accumulate into 1920-sample frames
+        const merged = new Float32Array(capBuf.length + inp.length);
+        merged.set(capBuf); merged.set(inp, capBuf.length);
+        let off = 0;
+        while (merged.length - off >= FRAME) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(merged.slice(off, off + FRAME).buffer);
+          }
+          off += FRAME;
+        }
+        capBuf = merged.slice(off);
+      };
+      source.connect(micNode);
+      micNode.connect(audioCtx.destination);  // keep node alive (muted output)
+      // mute the raw mic monitor by routing through a zero-gain node instead:
+      // (connecting to destination above would echo the mic; use a gain of 0)
+      micNode.disconnect(audioCtx.destination);
+      const sink = audioCtx.createGain(); sink.gain.value = 0;
+      micNode.connect(sink); sink.connect(audioCtx.destination);
+
+      running = true;
+      toggle.textContent = "Stop";
+      toggle.classList.add("stop");
+      setStatus("live — talk to Moshi", true);
+    }
+
+    function stop() {
+      running = false;
+      capBuf = new Float32Array(0);
+      level.style.width = "0%";
+      if (micNode) { micNode.onaudioprocess = null; micNode.disconnect(); micNode = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      toggle.textContent = "Start";
+      toggle.classList.remove("stop");
+      if (ws && ws.readyState === WebSocket.OPEN) setStatus("stopped — press Start", false);
+    }
+
+    toggle.onclick = async () => {
+      if (running) { stop(); return; }
+      try { await start(); }
+      catch (err) { setStatus("mic error: " + err.message, false); }
+    };
+
+    connect();
+  </script>
+</body>
+</html>
