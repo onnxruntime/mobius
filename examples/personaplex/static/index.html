@@ -62,9 +62,16 @@
       <label for="persona">Persona (system prompt)</label>
       <textarea id="persona">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
 
-      <label>Voice sample (optional) — record ~6 s to clone the assistant's voice</label>
+      <label>Voice sample (optional) — clone the assistant's voice</label>
       <div class="row">
-        <button id="record">● Record voice</button>
+        <button id="record">● Record ~6 s</button>
+        <button id="upload">⬆ Upload audio</button>
+      </div>
+      <input id="file" type="file" accept="audio/*" style="display:none" />
+      <div class="row" id="presetRow" style="display:none">
+        <select id="preset" style="flex:1; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:8px;">
+          <option value="">Preset voice…</option>
+        </select>
       </div>
       <div class="hint" id="voiceHint">No voice sample — using the model's default voice.</div>
 
@@ -84,6 +91,10 @@
     const toggle = document.getElementById("toggle");
     const apply = document.getElementById("apply");
     const record = document.getElementById("record");
+    const upload = document.getElementById("upload");
+    const fileInput = document.getElementById("file");
+    const presetRow = document.getElementById("presetRow");
+    const preset = document.getElementById("preset");
     const persona = document.getElementById("persona");
     const voiceHint = document.getElementById("voiceHint");
     const dot = document.getElementById("dot");
@@ -91,7 +102,7 @@
     const level = document.getElementById("level");
 
     let ws, audioCtx, micStream, micNode, running = false;
-    let recordedVoice = null;   // Float32Array @ 24 kHz, or null
+    let voicePcm = null;   // Float32Array @ 24 kHz, or null
     let primed = false;
     // capture buffer: accumulate mic samples into exact 1920-sample frames.
     let capBuf = new Float32Array(0);
@@ -155,9 +166,9 @@
     // Send persona + optional voice, then wait for "ready".
     function applySession() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const hasVoice = !!(recordedVoice && recordedVoice.length >= FRAME);
+      const hasVoice = !!(voicePcm && voicePcm.length >= FRAME);
       ws.send(JSON.stringify({ persona: persona.value, hasVoice }));
-      if (hasVoice) ws.send(recordedVoice.buffer.slice(0));
+      if (hasVoice) ws.send(voicePcm.buffer.slice(0));
       apply.disabled = true;
       apply.textContent = "Priming…";
       toggle.disabled = true;
@@ -165,7 +176,7 @@
       setStatus("priming voice + persona… (a few seconds)", false);
     }
 
-    // Record ~`seconds` of mic audio, resampled to 24 kHz, into recordedVoice.
+    // Record ~`seconds` of mic audio, resampled to 24 kHz, into voicePcm.
     async function recordVoice(seconds = 6) {
       const ctx = await ensureAudio();
       const resample = ctx.sampleRate === RATE ? null : makeResampler(ctx.sampleRate, RATE);
@@ -192,16 +203,58 @@
             stream.getTracks().forEach(t => t.stop());
             const buf = new Float32Array(total); let o = 0;
             for (const c of chunks) { buf.set(c, o); o += c.length; }
-            recordedVoice = buf.slice(0, need);
             record.classList.remove("recording");
             level.style.width = "0%";
-            voiceHint.textContent = `Voice sample recorded (${seconds}s). Click "Start session" to apply.`;
-            setStatus("voice recorded — press Start session", false);
+            setVoice(buf.slice(0, need), `recorded (${seconds}s)`);
             resolve();
           }
         };
         source.connect(node); node.connect(ctx.destination);
       });
+    }
+
+    // Store a 24 kHz voice sample and update the UI hint.
+    function setVoice(pcm, label) {
+      voicePcm = pcm && pcm.length >= FRAME ? pcm : null;
+      if (voicePcm) {
+        const secs = (voicePcm.length / RATE).toFixed(1);
+        voiceHint.textContent = `Voice: ${label}, ${secs}s — click Start session to apply.`;
+        setStatus("voice ready — press Start session", false);
+      } else {
+        voiceHint.textContent = "No voice sample — using the model's default voice.";
+      }
+    }
+
+    // Decode an arbitrary audio file (wav/mp3/…) -> mono 24 kHz Float32Array.
+    async function decodeToVoice(arrayBuffer, label) {
+      const ctx = await ensureAudio();
+      const audio = await ctx.decodeAudioData(arrayBuffer);
+      const ch = audio.getChannelData(0);  // first channel (mono)
+      let pcm;
+      if (audio.sampleRate === RATE) {
+        pcm = Float32Array.from(ch);
+      } else {
+        const rs = makeResampler(audio.sampleRate, RATE);
+        pcm = rs(ch);
+      }
+      // Cap to ~10 s to keep priming snappy.
+      if (pcm.length > RATE * 10) pcm = pcm.slice(0, RATE * 10);
+      setVoice(pcm, label);
+    }
+
+    // Populate the preset dropdown from server-provided reference clips.
+    async function loadPresets() {
+      try {
+        const res = await fetch("/voices");
+        const names = await res.json();
+        if (!Array.isArray(names) || names.length === 0) return;
+        for (const n of names) {
+          const o = document.createElement("option");
+          o.value = n; o.textContent = n;
+          preset.appendChild(o);
+        }
+        presetRow.style.display = "flex";
+      } catch (_) { /* no presets available */ }
     }
 
     function enqueuePlayback(samples) {
@@ -325,6 +378,26 @@
       catch (err) { record.classList.remove("recording"); setStatus("mic error: " + err.message, false); }
     };
 
+    upload.onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      try {
+        setStatus("decoding audio…", false);
+        await decodeToVoice(await f.arrayBuffer(), f.name);
+      } catch (err) { setStatus("audio decode error: " + err.message, false); }
+    };
+
+    preset.onchange = async () => {
+      const name = preset.value;
+      if (!name) { setVoice(null); return; }
+      try {
+        setStatus("loading preset voice…", false);
+        const res = await fetch(`/static/voices/${encodeURIComponent(name)}`);
+        await decodeToVoice(await res.arrayBuffer(), name);
+      } catch (err) { setStatus("preset load error: " + err.message, false); }
+    };
+
     apply.onclick = () => {
       if (running) stop();
       if (primed) {
@@ -339,6 +412,7 @@
     };
 
     connect();
+    loadPresets();
   </script>
 </body>
 </html>

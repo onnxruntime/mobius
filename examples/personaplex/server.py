@@ -75,10 +75,20 @@ except ImportError as exc:  # pragma: no cover - dependency hint
     ) from exc
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+VOICES_DIR = os.path.join(STATIC_DIR, "voices")
+_VOICE_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")
 
 
 async def index(request: web.Request) -> web.StreamResponse:  # noqa: RUF029
     return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+async def voices(request: web.Request) -> web.StreamResponse:  # noqa: RUF029
+    """List preset voice clips under ``static/voices/`` for the browser."""
+    names: list[str] = []
+    if os.path.isdir(VOICES_DIR):
+        names = sorted(f for f in os.listdir(VOICES_DIR) if f.lower().endswith(_VOICE_EXTS))
+    return web.json_response(names)
 
 
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
@@ -205,6 +215,7 @@ def build_app(
     app["tokenizer"] = tokenizer
     app["lock"] = asyncio.Lock()
     app.router.add_get("/", index)
+    app.router.add_get("/voices", voices)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_static("/static/", STATIC_DIR)
     return app
