@@ -38,6 +38,14 @@
     .dot.live { background: #2ea043; box-shadow: 0 0 8px #2ea043; }
     .meter { height: 6px; background: #21262d; border-radius: 3px; margin-top: 14px; overflow: hidden; }
     .meter > div { height: 100%; width: 0; background: #2ea043; transition: width .05s; }
+    .stats {
+      margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6px 14px; font-size: 12px; color: #8b949e;
+    }
+    .stats .k { color: #6e7681; }
+    .stats .v { color: #e6edf3; font-variant-numeric: tabular-nums; text-align: right; }
+    .stats .v.warn { color: #d29922; }
+    .stats .v.bad { color: #f85149; }
     label { display: block; font-size: 12px; color: #8b949e; margin: 18px 0 6px; }
     textarea {
       width: 100%; box-sizing: border-box; background: #0d1117; color: #e6edf3;
@@ -83,6 +91,17 @@
     <button id="toggle" disabled style="margin-top:16px;">Start</button>
     <div class="meter"><div id="level"></div></div>
     <div class="status"><span class="dot" id="dot"></span><span id="msg">initialising…</span></div>
+
+    <div class="stats">
+      <span class="k">Jitter buffer</span><span class="v" id="sBuf">– ms</span>
+      <span class="k">Rebuffers</span><span class="v" id="sReb">0</span>
+      <span class="k">Compute / frame</span><span class="v" id="sFrame">– ms</span>
+      <span class="k">Compute RTF</span><span class="v" id="sRtf">–</span>
+      <span class="k">Mic level (RMS)</span><span class="v" id="sIn">–</span>
+      <span class="k">Out level (RMS)</span><span class="v" id="sOut">–</span>
+      <span class="k">Frames</span><span class="v" id="sFrames">0</span>
+      <span class="k">Over budget</span><span class="v" id="sOver">0</span>
+    </div>
   </div>
 
   <script>
@@ -100,6 +119,14 @@
     const dot = document.getElementById("dot");
     const msg = document.getElementById("msg");
     const level = document.getElementById("level");
+    const sBuf = document.getElementById("sBuf");
+    const sReb = document.getElementById("sReb");
+    const sFrame = document.getElementById("sFrame");
+    const sRtf = document.getElementById("sRtf");
+    const sIn = document.getElementById("sIn");
+    const sOut = document.getElementById("sOut");
+    const sFrames = document.getElementById("sFrames");
+    const sOver = document.getElementById("sOver");
 
     let ws, audioCtx, micStream, micNode, running = false;
     let voicePcm = null;   // Float32Array @ 24 kHz, or null
@@ -169,6 +196,8 @@
             apply.textContent = "Restart session";
             toggle.disabled = false;
             setStatus("ready — press Start to talk", false);
+          } else if (ev.data.startsWith("stats ")) {
+            updateServerStats(JSON.parse(ev.data.slice(6)));
           } else if (ev.data.startsWith("busy")) {
             gotBusy = true;  // onclose will retry
           } else {
@@ -178,6 +207,19 @@
         }
         enqueuePlayback(new Float32Array(ev.data));
       };
+    }
+
+    // Update the server-side perf rows (compute time, RTF, RMS, frame counts).
+    function updateServerStats(s) {
+      sFrame.textContent = `${s.frame_ms} ms`;
+      sRtf.textContent = `${s.rtf}× (budget 80 ms)`;
+      sFrame.className = "v" + (s.frame_ms > 80 ? " bad" : s.frame_ms > 64 ? " warn" : "");
+      sRtf.className = "v" + (s.rtf > 1 ? " bad" : s.rtf > 0.8 ? " warn" : "");
+      sIn.textContent = s.in_rms.toFixed(4);
+      sOut.textContent = s.out_rms.toFixed(4);
+      sFrames.textContent = s.frames;
+      sOver.textContent = s.over;
+      sOver.className = "v" + (s.over > 0 ? " warn" : "");
     }
 
     // Send persona + optional voice, then wait for "ready".
@@ -290,10 +332,13 @@
       }
       src.start(playHead);
       playHead += buf.duration;
+      const buffered = Math.max(0, playHead - now);
+      sBuf.textContent = `${(buffered * 1000) | 0} ms`;
+      sBuf.className = "v" + (buffered * 1000 < 60 ? " warn" : "");
+      sReb.textContent = underruns;
+      sReb.className = "v" + (underruns ? " warn" : "");
       if (running) {
-        const buffered = Math.max(0, playHead - now);
-        setStatus(`live — buffered ${(buffered * 1000) | 0} ms` +
-                  (underruns ? ` · ${underruns} rebuffer` : ""), true);
+        setStatus("live — talk to Moshi", true);
       }
     }
 

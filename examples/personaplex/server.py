@@ -157,6 +157,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         in_rms_acc = 0.0
         out_rms_acc = 0.0
         out_count = 0
+        dt_acc = 0.0
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -168,6 +169,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     t0 = time.perf_counter()
                     out = await asyncio.to_thread(moshi.process_frame, frame)
                     dt_ms = (time.perf_counter() - t0) * 1000.0
+                    dt_acc += dt_ms
                     n_frames += 1
                     if dt_ms > budget_ms:
                         over_budget += 1
@@ -182,11 +184,26 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     if n_frames % 12 == 0:
                         in_rms = in_rms_acc / 12
                         out_rms = out_rms_acc / max(out_count, 1)
+                        frame_ms = dt_acc / 12
                         print(
                             f"[ws] {n_frames} frames | in_rms={in_rms:.4f} "
                             f"out_rms={out_rms:.4f} | last_frame={dt_ms:.0f}ms"
                         )
-                        in_rms_acc = out_rms_acc = 0.0
+                        # Push live perf stats to the browser for the stats panel.
+                        await ws.send_str(
+                            "stats "
+                            + json.dumps(
+                                {
+                                    "frame_ms": round(frame_ms, 1),
+                                    "rtf": round(frame_ms / budget_ms, 2),
+                                    "in_rms": round(in_rms, 4),
+                                    "out_rms": round(out_rms, 4),
+                                    "frames": n_frames,
+                                    "over": over_budget,
+                                }
+                            )
+                        )
+                        in_rms_acc = out_rms_acc = dt_acc = 0.0
                         out_count = 0
                 elif msg.type == WSMsgType.TEXT:
                     if msg.data == "reset":
