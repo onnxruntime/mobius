@@ -116,6 +116,8 @@
 
     let pendingApply = false;
     let reconnecting = false;
+    let gotBusy = false;
+    let busyRetries = 0;
 
     function setStatus(text, live) {
       msg.textContent = text;
@@ -135,6 +137,20 @@
       ws.onopen = () => setStatus("connected", false);
       ws.onclose = () => {
         if (reconnecting) { reconnecting = false; connect(); return; }
+        // The server closes us with "busy" when another tab holds the session;
+        // on a page refresh this is usually just the old connection still
+        // releasing — retry a few times before giving up.
+        if (gotBusy) {
+          gotBusy = false;
+          if (busyRetries++ < 10) {
+            setStatus(`server busy — retrying (${busyRetries})…`, false);
+            setTimeout(connect, 1000);
+            return;
+          }
+          setStatus("server busy — another tab is connected. Close it and reload.", false);
+          toggle.disabled = true; apply.disabled = true;
+          return;
+        }
         setStatus("disconnected", false); stop(); toggle.disabled = true; apply.disabled = true;
       };
       ws.onerror = () => setStatus("connection error", false);
@@ -142,6 +158,7 @@
         if (typeof ev.data === "string") {
           if (ev.data === "config") {
             // Server is ready for our persona/voice config.
+            busyRetries = 0;
             if (pendingApply) { pendingApply = false; applySession(); return; }
             apply.disabled = false;
             apply.textContent = "Start session";
@@ -153,7 +170,7 @@
             toggle.disabled = false;
             setStatus("ready — press Start to talk", false);
           } else if (ev.data.startsWith("busy")) {
-            setStatus("server busy (another tab is connected)", false);
+            gotBusy = true;  // onclose will retry
           } else {
             setStatus(ev.data, false);
           }

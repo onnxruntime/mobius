@@ -107,18 +107,21 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
 
     async with lock:
         print(f"[ws] client connected: {request.remote}")
-        # warm up + reset on a worker thread to keep the event loop responsive.
-        await asyncio.to_thread(moshi.warmup)
-        await asyncio.to_thread(moshi.reset_stream)
 
         # --- Handshake: voice + persona system prompt --------------------
-        # Ask the client for its config, then prime the model before streaming.
+        # Tell the client we're ready for config immediately so the UI unlocks
+        # without waiting for warmup; warm up + reset in the background while the
+        # user picks a persona/voice, then join before priming.
         await ws.send_str("config")
+        warm_task = asyncio.create_task(
+            asyncio.to_thread(lambda: (moshi.warmup(), moshi.reset_stream()))
+        )
         persona = DEFAULT_PERSONA
         expect_voice = False
         try:
-            cfg = await asyncio.wait_for(ws.receive(), timeout=120.0)
+            cfg = await asyncio.wait_for(ws.receive(), timeout=300.0)
         except asyncio.TimeoutError:
+            warm_task.cancel()
             await ws.close()
             return ws
         if cfg.type == WSMsgType.TEXT:
@@ -141,6 +144,8 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             text_tokens = encode_persona(tokenizer, persona)
         n_voice = 0 if voice_pcm is None else voice_pcm.size // FRAME_SIZE
         print(f"[ws] priming: persona={len(text_tokens or [])} toks, voice={n_voice} frames")
+        # Make sure warmup + reset finished before we prime / generate.
+        await warm_task
         t0 = time.perf_counter()
         await asyncio.to_thread(moshi.prime, voice_pcm, text_tokens)
         print(f"[ws] primed in {time.perf_counter() - t0:.1f}s")
