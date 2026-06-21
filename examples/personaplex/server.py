@@ -147,7 +147,7 @@ def main() -> None:
         help="keep CUDA TF32 (faster, lower precision) for fp32 matmuls",
     )
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=7681)
     args = parser.parse_args()
 
     if not os.path.isdir(os.path.join(args.model_dir, "temporal")):

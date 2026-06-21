@@ -54,7 +54,7 @@ The server only loads ONNX models, so it can run in a lightweight
 pip install aiohttp onnxruntime-gpu numpy
 python examples/personaplex/server.py \
     --model-dir output/personaplex/onnx --device cuda \
-    --host 0.0.0.0 --port 8080
+    --host 0.0.0.0 --port 7681
 ```
 
 On Ampere+/H200 GPUs ORT defaults to TF32 for fp32 matmuls, which can flip
@@ -67,8 +67,8 @@ If the GPU box is remote, forward the port to your laptop and open the page
 locally (browsers only grant microphone access on `localhost`/HTTPS):
 
 ```bash
-ssh -L 8080:localhost:8080 <user>@<gpu-host>
-# then open http://localhost:8080 and click "Start"
+ssh -L 7681:localhost:7681 <user>@<gpu-host>
+# then open http://localhost:7681 and click "Start"
 ```
 
 Click **Start**, allow microphone access, and talk — you should hear Moshi
