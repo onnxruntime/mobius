@@ -39,13 +39,22 @@
     .meter { height: 6px; background: #21262d; border-radius: 3px; margin-top: 14px; overflow: hidden; }
     .meter > div { height: 100%; width: 0; background: #2ea043; transition: width .05s; }
     .stats {
-      margin-top: 14px; display: grid; grid-template-columns: 1fr 1fr;
+      margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr;
       gap: 6px 14px; font-size: 12px; color: #8b949e;
     }
     .stats .k { color: #6e7681; }
     .stats .v { color: #e6edf3; font-variant-numeric: tabular-nums; text-align: right; }
     .stats .v.warn { color: #d29922; }
     .stats .v.bad { color: #f85149; }
+    .panel {
+      margin-top: 18px; border: 1px solid #30363d; border-radius: 8px;
+      padding: 10px 14px; background: #0d1117;
+    }
+    .panel > summary {
+      cursor: pointer; font-size: 12px; font-weight: 600; color: #8b949e;
+      list-style: none; user-select: none;
+    }
+    .panel > summary::-webkit-details-marker { display: none; }
     label { display: block; font-size: 12px; color: #8b949e; margin: 18px 0 6px; }
     textarea {
       width: 100%; box-sizing: border-box; background: #0d1117; color: #e6edf3;
@@ -96,16 +105,19 @@
     <div class="meter"><div id="level"></div></div>
     <div class="status"><span class="dot" id="dot"></span><span id="msg">initialising…</span></div>
 
-    <div class="stats">
-      <span class="k">Jitter buffer</span><span class="v" id="sBuf">– ms</span>
-      <span class="k">Rebuffers</span><span class="v" id="sReb">0</span>
-      <span class="k">Compute / frame</span><span class="v" id="sFrame">– ms</span>
-      <span class="k">Compute RTF</span><span class="v" id="sRtf">–</span>
-      <span class="k">Mic level (RMS)</span><span class="v" id="sIn">–</span>
-      <span class="k">Out level (RMS)</span><span class="v" id="sOut">–</span>
-      <span class="k">Frames</span><span class="v" id="sFrames">0</span>
-      <span class="k">Over budget</span><span class="v" id="sOver">0</span>
-    </div>
+    <details class="panel" id="statsPanel" open>
+      <summary>Live metrics</summary>
+      <div class="stats">
+        <span class="k">Jitter buffer</span><span class="v" id="sBuf">– ms</span>
+        <span class="k">Rebuffers</span><span class="v" id="sReb">0</span>
+        <span class="k">Compute / frame</span><span class="v" id="sFrame">– ms</span>
+        <span class="k">Compute RTF</span><span class="v" id="sRtf">–</span>
+        <span class="k">Mic level (RMS)</span><span class="v" id="sIn">–</span>
+        <span class="k">Out level (RMS)</span><span class="v" id="sOut">–</span>
+        <span class="k">Frames</span><span class="v" id="sFrames">0</span>
+        <span class="k">Over budget</span><span class="v" id="sOver">0</span>
+      </div>
+    </details>
   </div>
 
   <script>
