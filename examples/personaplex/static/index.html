@@ -60,8 +60,13 @@
     let ws, audioCtx, micStream, micNode, running = false;
     // capture buffer: accumulate mic samples into exact 1920-sample frames.
     let capBuf = new Float32Array(0);
-    // playback queue: float32 chunks the model returned, scheduled back-to-back.
+    // playback scheduling: keep a contiguous schedule head and a jitter buffer.
+    // The server processes each 80 ms frame in a variable time (occasionally
+    // >200 ms under GPU/network jitter), so a too-small buffer underruns and
+    // clicks. ~250 ms of slack keeps playback smooth at the cost of latency.
     let playHead = 0;
+    const TARGET_LATENCY = 0.25;   // seconds of audio to stay buffered
+    let underruns = 0;
 
     function setStatus(text, live) {
       msg.textContent = text;
@@ -94,9 +99,19 @@
       src.buffer = buf;
       src.connect(audioCtx.destination);
       const now = audioCtx.currentTime;
-      if (playHead < now) playHead = now + 0.05;   // small jitter buffer
+      // If we fell behind (buffer drained), rebuild the jitter buffer instead
+      // of scheduling in the past (which would click / overlap).
+      if (playHead < now + 0.005) {
+        if (playHead !== 0) underruns++;
+        playHead = now + TARGET_LATENCY;
+      }
       src.start(playHead);
       playHead += buf.duration;
+      if (running) {
+        const buffered = Math.max(0, playHead - now);
+        setStatus(`live — buffered ${(buffered * 1000) | 0} ms` +
+                  (underruns ? ` · ${underruns} rebuffer` : ""), true);
+      }
     }
 
     // Linear resampler: src samples at srcRate -> dstRate. Keeps a fractional
@@ -126,7 +141,7 @@
     async function start() {
       audioCtx = new AudioContext({ sampleRate: RATE });
       await audioCtx.resume();
-      playHead = audioCtx.currentTime + 0.1;
+      playHead = 0; underruns = 0;   // first frame (re)builds the jitter buffer
       const ctxRate = audioCtx.sampleRate;
       console.log(`[moshi] AudioContext sampleRate = ${ctxRate} (target ${RATE})`);
       if (ctxRate !== RATE) {
