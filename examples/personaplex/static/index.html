@@ -38,13 +38,42 @@
     .dot.live { background: #2ea043; box-shadow: 0 0 8px #2ea043; }
     .meter { height: 6px; background: #21262d; border-radius: 3px; margin-top: 14px; overflow: hidden; }
     .meter > div { height: 100%; width: 0; background: #2ea043; transition: width .05s; }
+    label { display: block; font-size: 12px; color: #8b949e; margin: 18px 0 6px; }
+    textarea {
+      width: 100%; box-sizing: border-box; background: #0d1117; color: #e6edf3;
+      border: 1px solid #30363d; border-radius: 8px; padding: 8px 10px;
+      font: inherit; font-size: 13px; resize: vertical; min-height: 60px;
+    }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    .row button { flex: 1; font-size: 13px; padding: 9px 12px; }
+    #record { background: #30363d; color: #e6edf3; }
+    #record.recording { background: #da3633; color: #fff; }
+    #apply { background: #1f6feb; color: #fff; }
+    button:disabled { background: #30363d; color: #8b949e; cursor: default; }
+    .hint { font-size: 11px; color: #6e7681; margin-top: 6px; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Moshi · real-time voice chat</h1>
     <p class="sub">personaplex-7b-v1 · full-duplex speech-to-speech · 24 kHz</p>
-    <button id="toggle" disabled>Connecting…</button>
+
+    <div id="setup">
+      <label for="persona">Persona (system prompt)</label>
+      <textarea id="persona">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
+
+      <label>Voice sample (optional) — record ~6 s to clone the assistant's voice</label>
+      <div class="row">
+        <button id="record">● Record voice</button>
+      </div>
+      <div class="hint" id="voiceHint">No voice sample — using the model's default voice.</div>
+
+      <div class="row">
+        <button id="apply" disabled>Connecting…</button>
+      </div>
+    </div>
+
+    <button id="toggle" disabled style="margin-top:16px;">Start</button>
     <div class="meter"><div id="level"></div></div>
     <div class="status"><span class="dot" id="dot"></span><span id="msg">initialising…</span></div>
   </div>
@@ -53,11 +82,17 @@
     const FRAME = 1920;          // samples per 12.5 Hz frame
     const RATE = 24000;          // Mimi sample rate
     const toggle = document.getElementById("toggle");
+    const apply = document.getElementById("apply");
+    const record = document.getElementById("record");
+    const persona = document.getElementById("persona");
+    const voiceHint = document.getElementById("voiceHint");
     const dot = document.getElementById("dot");
     const msg = document.getElementById("msg");
     const level = document.getElementById("level");
 
     let ws, audioCtx, micStream, micNode, running = false;
+    let recordedVoice = null;   // Float32Array @ 24 kHz, or null
+    let primed = false;
     // capture buffer: accumulate mic samples into exact 1920-sample frames.
     let capBuf = new Float32Array(0);
     // playback scheduling: keep a contiguous schedule head and a jitter buffer.
@@ -68,27 +103,105 @@
     const TARGET_LATENCY = 0.25;   // seconds of audio to stay buffered
     let underruns = 0;
 
+    let pendingApply = false;
+    let reconnecting = false;
+
     function setStatus(text, live) {
       msg.textContent = text;
       dot.classList.toggle("live", !!live);
+    }
+
+    async function ensureAudio() {
+      if (!audioCtx) audioCtx = new AudioContext({ sampleRate: RATE });
+      await audioCtx.resume();
+      return audioCtx;
     }
 
     function connect() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws`);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => setStatus("connected — press Start", false);
-      ws.onclose = () => { setStatus("disconnected", false); stop(); toggle.disabled = true; };
+      ws.onopen = () => setStatus("connected", false);
+      ws.onclose = () => {
+        if (reconnecting) { reconnecting = false; connect(); return; }
+        setStatus("disconnected", false); stop(); toggle.disabled = true; apply.disabled = true;
+      };
       ws.onerror = () => setStatus("connection error", false);
       ws.onmessage = (ev) => {
         if (typeof ev.data === "string") {
-          if (ev.data === "ready") { toggle.disabled = false; setStatus("ready — press Start", false); }
-          else if (ev.data.startsWith("busy")) setStatus("server busy (another tab is connected)", false);
-          else setStatus(ev.data, false);
+          if (ev.data === "config") {
+            // Server is ready for our persona/voice config.
+            if (pendingApply) { pendingApply = false; applySession(); return; }
+            apply.disabled = false;
+            apply.textContent = "Start session";
+            setStatus("set a persona / voice, then Start session", false);
+          } else if (ev.data === "ready") {
+            primed = true;
+            apply.disabled = false;
+            apply.textContent = "Restart session";
+            toggle.disabled = false;
+            setStatus("ready — press Start to talk", false);
+          } else if (ev.data.startsWith("busy")) {
+            setStatus("server busy (another tab is connected)", false);
+          } else {
+            setStatus(ev.data, false);
+          }
           return;
         }
         enqueuePlayback(new Float32Array(ev.data));
       };
+    }
+
+    // Send persona + optional voice, then wait for "ready".
+    function applySession() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const hasVoice = !!(recordedVoice && recordedVoice.length >= FRAME);
+      ws.send(JSON.stringify({ persona: persona.value, hasVoice }));
+      if (hasVoice) ws.send(recordedVoice.buffer.slice(0));
+      apply.disabled = true;
+      apply.textContent = "Priming…";
+      toggle.disabled = true;
+      primed = false;
+      setStatus("priming voice + persona… (a few seconds)", false);
+    }
+
+    // Record ~`seconds` of mic audio, resampled to 24 kHz, into recordedVoice.
+    async function recordVoice(seconds = 6) {
+      const ctx = await ensureAudio();
+      const resample = ctx.sampleRate === RATE ? null : makeResampler(ctx.sampleRate, RATE);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: RATE }
+      });
+      const source = ctx.createMediaStreamSource(stream);
+      const node = ctx.createScriptProcessor(2048, 1, 1);
+      const chunks = [];
+      let total = 0;
+      const need = RATE * seconds;
+      record.classList.add("recording");
+      return new Promise((resolve) => {
+        node.onaudioprocess = (e) => {
+          const raw = e.inputBuffer.getChannelData(0);
+          let peak = 0; for (let i = 0; i < raw.length; i++) peak = Math.max(peak, Math.abs(raw[i]));
+          level.style.width = Math.min(100, peak * 200) + "%";
+          const out = resample ? resample(raw) : Float32Array.from(raw);
+          chunks.push(out); total += out.length;
+          const remain = Math.max(0, (need - total) / RATE);
+          setStatus(`recording voice… ${remain.toFixed(1)} s left`, true);
+          if (total >= need) {
+            node.onaudioprocess = null; node.disconnect(); source.disconnect();
+            stream.getTracks().forEach(t => t.stop());
+            const buf = new Float32Array(total); let o = 0;
+            for (const c of chunks) { buf.set(c, o); o += c.length; }
+            recordedVoice = buf.slice(0, need);
+            record.classList.remove("recording");
+            level.style.width = "0%";
+            voiceHint.textContent = `Voice sample recorded (${seconds}s). Click "Start session" to apply.`;
+            setStatus("voice recorded — press Start session", false);
+            resolve();
+          }
+        };
+        source.connect(node); node.connect(ctx.destination);
+      });
     }
 
     function enqueuePlayback(samples) {
@@ -139,8 +252,8 @@
     }
 
     async function start() {
-      audioCtx = new AudioContext({ sampleRate: RATE });
-      await audioCtx.resume();
+      const ctx = await ensureAudio();
+      audioCtx = ctx;
       playHead = 0; underruns = 0;   // first frame (re)builds the jitter buffer
       const ctxRate = audioCtx.sampleRate;
       console.log(`[moshi] AudioContext sampleRate = ${ctxRate} (target ${RATE})`);
@@ -201,8 +314,28 @@
 
     toggle.onclick = async () => {
       if (running) { stop(); return; }
+      if (!primed) { setStatus("start a session first (Start session)", false); return; }
       try { await start(); }
       catch (err) { setStatus("mic error: " + err.message, false); }
+    };
+
+    record.onclick = async () => {
+      if (record.classList.contains("recording")) return;
+      try { await recordVoice(6); }
+      catch (err) { record.classList.remove("recording"); setStatus("mic error: " + err.message, false); }
+    };
+
+    apply.onclick = () => {
+      if (running) stop();
+      if (primed) {
+        // Restart with a fresh state: reconnect, then auto-apply on "config".
+        pendingApply = true; reconnecting = true; primed = false;
+        apply.disabled = true; apply.textContent = "Restarting…";
+        setStatus("restarting session…", false);
+        ws.close();
+      } else {
+        applySession();
+      }
     };
 
     connect();

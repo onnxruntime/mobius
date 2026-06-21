@@ -27,13 +27,20 @@ that has ``mobius`` installed)::
 
 Then run this server (CUDA recommended for real-time speed)::
 
-    pip install aiohttp
+    pip install aiohttp sentencepiece huggingface_hub
     python examples/personaplex/server.py \
         --model-dir output/personaplex/onnx --device cuda \
-        --host 0.0.0.0 --port 8080
+        --host 0.0.0.0 --port 7681
 
-Open ``http://localhost:8080`` (or port-forward the remote port over SSH:
-``ssh -L 8080:localhost:8080 <host>``) and click **Start**.
+Open ``http://localhost:7681`` (or port-forward the remote port over SSH:
+``ssh -L 7681:localhost:7681 <host>``), set a persona / optional voice sample,
+click **Start session**, then **Start**.
+
+On connect the server replies ``config``; the browser sends a JSON
+``{"persona": ..., "hasVoice": ...}`` line plus an optional binary float32
+24 kHz PCM voice blob. The server tokenizes the persona, Mimi-encodes the voice,
+runs the 4-phase PersonaPlex system-prompt priming, replies ``ready``, then
+streams live frames.
 
 Single-user demo: the model keeps one conversation state, so only one browser
 tab should be connected at a time. Each new connection resets the state.
@@ -43,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import time
@@ -51,7 +59,13 @@ import numpy as np
 
 # Import the ORT runtime helper that lives next to this file.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from moshi_ort import FRAME_SIZE, MoshiORT
+from moshi_ort import (
+    DEFAULT_PERSONA,
+    FRAME_SIZE,
+    MoshiORT,
+    encode_persona,
+    load_persona_tokenizer,
+)
 
 try:
     from aiohttp import WSMsgType, web
@@ -86,6 +100,40 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         # warm up + reset on a worker thread to keep the event loop responsive.
         await asyncio.to_thread(moshi.warmup)
         await asyncio.to_thread(moshi.reset_stream)
+
+        # --- Handshake: voice + persona system prompt --------------------
+        # Ask the client for its config, then prime the model before streaming.
+        await ws.send_str("config")
+        persona = DEFAULT_PERSONA
+        expect_voice = False
+        try:
+            cfg = await asyncio.wait_for(ws.receive(), timeout=120.0)
+        except asyncio.TimeoutError:
+            await ws.close()
+            return ws
+        if cfg.type == WSMsgType.TEXT:
+            try:
+                d = json.loads(cfg.data)
+                persona = (d.get("persona") or "").strip() or DEFAULT_PERSONA
+                expect_voice = bool(d.get("hasVoice"))
+            except (ValueError, TypeError):
+                pass
+
+        voice_pcm = None
+        if expect_voice:
+            vmsg = await asyncio.wait_for(ws.receive(), timeout=120.0)
+            if vmsg.type == WSMsgType.BINARY:
+                voice_pcm = np.frombuffer(vmsg.data, dtype=np.float32).copy()
+
+        tokenizer = request.app.get("tokenizer")
+        text_tokens = None
+        if tokenizer is not None and persona:
+            text_tokens = encode_persona(tokenizer, persona)
+        n_voice = 0 if voice_pcm is None else voice_pcm.size // FRAME_SIZE
+        print(f"[ws] priming: persona={len(text_tokens or [])} toks, voice={n_voice} frames")
+        t0 = time.perf_counter()
+        await asyncio.to_thread(moshi.prime, voice_pcm, text_tokens)
+        print(f"[ws] primed in {time.perf_counter() - t0:.1f}s")
         await ws.send_str("ready")
 
         n_frames = 0
@@ -138,13 +186,23 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-def build_app(model_dir: str, device: str, allow_tf32: bool) -> web.Application:
+def build_app(
+    model_dir: str, device: str, allow_tf32: bool, tokenizer_path: str | None = None
+) -> web.Application:
     print(f"[server] loading Moshi ONNX models from {model_dir} on {device}...")
     moshi = MoshiORT(model_dir, device, allow_tf32)
     print("[server] models loaded.")
 
+    tokenizer = None
+    try:
+        tokenizer = load_persona_tokenizer(tokenizer_path)
+        print("[server] persona tokenizer loaded.")
+    except Exception as exc:
+        print(f"[server] persona tokenizer unavailable ({exc}); text prompts disabled.")
+
     app = web.Application()
     app["moshi"] = moshi
+    app["tokenizer"] = tokenizer
     app["lock"] = asyncio.Lock()
     app.router.add_get("/", index)
     app.router.add_get("/ws", websocket_handler)
@@ -165,6 +223,11 @@ def main() -> None:
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7681)
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="path to tokenizer_spm_32k_3.model (default: download from HF)",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(os.path.join(args.model_dir, "temporal")):
@@ -173,7 +236,7 @@ def main() -> None:
             "(see this file's module docstring)."
         )
 
-    app = build_app(args.model_dir, args.device, args.allow_tf32)
+    app = build_app(args.model_dir, args.device, args.allow_tf32, args.tokenizer)
     print(f"[server] listening on http://{args.host}:{args.port}  (open / in a browser)")
     web.run_app(app, host=args.host, port=args.port, print=None)
 

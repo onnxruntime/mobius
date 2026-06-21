@@ -51,7 +51,7 @@ The server only loads ONNX models, so it can run in a lightweight
 `onnxruntime-gpu` environment without `mobius`:
 
 ```bash
-pip install aiohttp onnxruntime-gpu numpy
+pip install aiohttp onnxruntime-gpu numpy sentencepiece huggingface_hub
 python examples/personaplex/server.py \
     --model-dir output/personaplex/onnx --device cuda \
     --host 0.0.0.0 --port 7681
@@ -71,9 +71,38 @@ ssh -L 7681:localhost:7681 <user>@<gpu-host>
 # then open http://localhost:7681 and click "Start"
 ```
 
-Click **Start**, allow microphone access, and talk — you should hear Moshi
-respond in real time. Only one tab can connect at a time (single-user demo);
-a second connection receives a `busy` message.
+Click **Start session**, then **Start**, allow microphone access, and talk —
+you should hear Moshi respond in real time. Only one tab can connect at a time
+(single-user demo); a second connection receives a `busy` message.
+
+### Persona + voice customization
+
+Before talking, the page lets you condition the assistant (PersonaPlex
+"system prompt" priming, ported from `LMGen.step_system_prompts`):
+
+* **Persona (system prompt):** a text box (defaults to a friendly-teacher
+  persona). The text is wrapped as `<system> … <system>`, tokenized with the
+  model's SentencePiece tokenizer (`tokenizer_spm_32k_3.model`, downloaded from
+  the HF repo on first run), and force-fed on the text stream.
+* **Voice sample (optional):** record ~6 s of speech to clone the assistant's
+  voice. The recording is Mimi-encoded and force-fed on the assistant audio
+  stream so the model continues in that voice.
+
+Click **Start session** to prime (a couple of seconds), wait for *ready*, then
+**Start** to converse. **Restart session** re-primes with new settings.
+
+The server pass-through is:
+
+1. browser connects → server replies `config`
+2. browser sends `{"persona": "...", "hasVoice": true|false}` (+ a binary
+   float32 24 kHz PCM blob if `hasVoice`)
+3. server tokenizes the persona, Mimi-encodes the voice, runs the 4-phase
+   priming, replies `ready`
+4. live 1920-sample float32 frames stream both ways
+
+Persona priming is optional: if the tokenizer can't be loaded the server logs a
+warning and disables text prompts (voice still works). Point `--tokenizer` at a
+local `tokenizer_spm_32k_3.model` to avoid the HF download.
 
 ## 3. Offline / terminal modes (no browser)
 

@@ -89,6 +89,9 @@ MAX_DELAY = max(DELAYS)
 AUDIO_TOKENS_PER_STREAM = 8
 # Mimi tokens that decode to a near-silent frame (from the Kyutai reference).
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], np.int64)
+# Mimi tokens for the reference sine fed on the user stream during prompting
+# (PersonaPlex feeds a sine on the user channel while priming voice/persona).
+SINE_TOKENS = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], np.int64)
 
 # Temporal / depformer head geometry.
 T_LAYERS, T_HEADS, T_HEAD_DIM = 32, 32, 128
@@ -125,6 +128,41 @@ def _sample_token(logits: np.ndarray, temp: float, top_k: int, rng) -> int:
     probs = np.exp(sub / temp)
     probs /= probs.sum()
     return int(keep[rng.choice(len(keep), p=probs)])
+
+
+# --- Persona text tokenizer (SentencePiece) ----------------------------------
+_MODEL_ID = "nvidia/personaplex-7b-v1"
+TEXT_TOKENIZER_NAME = "tokenizer_spm_32k_3.model"
+DEFAULT_PERSONA = (
+    "You are a wise and friendly teacher. Answer questions or provide advice "
+    "in a clear and engaging way."
+)
+
+
+def load_persona_tokenizer(path: str | None = None):
+    """Load the PersonaPlex SentencePiece tokenizer for the persona text stream.
+
+    ``path`` points at ``tokenizer_spm_32k_3.model``; when None it is downloaded
+    from the ``nvidia/personaplex-7b-v1`` HuggingFace repo (cached).
+    """
+    import sentencepiece
+
+    if path is None:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(_MODEL_ID, TEXT_TOKENIZER_NAME)
+    return sentencepiece.SentencePieceProcessor(model_file=path)
+
+
+def encode_persona(tokenizer, persona_text: str) -> list[int]:
+    """Wrap the persona in ``<system> ... <system>`` tags and tokenize it.
+
+    Mirrors PersonaPlex ``wrap_with_system_tags`` (both ends use ``<system>``).
+    """
+    text = persona_text.strip()
+    if not (text.startswith("<system>") and text.endswith("<system>")):
+        text = f"<system> {text} <system>"
+    return list(tokenizer.encode(text))
 
 
 class MoshiORT:
@@ -220,6 +258,45 @@ class MoshiORT:
         out = self.step(codes)
         return None if out is None else self._sdec.push(out)
 
+    # --- System-prompt priming (voice + persona) -----------------------
+    def prime(
+        self,
+        voice_pcm: np.ndarray | None = None,
+        text_tokens: list[int] | None = None,
+        silence_frames: int = 6,
+    ) -> None:
+        """Prime the model with a voice prompt and a persona text prompt.
+
+        Mirrors PersonaPlex ``LMGen.step_system_prompts``: before the
+        conversation, the assistant audio stream is force-fed a reference voice
+        (so the model continues in that voice) and the text stream is force-fed
+        the persona tokens (role / scenario). A sine is fed on the user stream
+        throughout, with ~0.5 s silence spacers between phases.
+
+        Call this right after :meth:`reset_stream`. ``voice_pcm`` is mono float32
+        at 24 kHz (any length; encoded with Mimi). ``text_tokens`` is the
+        SentencePiece-encoded persona wrapped in ``<system> ... <system>``.
+        ``silence_frames`` defaults to 0.5 s at 12.5 Hz.
+        """
+        # Phase 1: voice prompt -> force assistant audio = reference voice codes.
+        if voice_pcm is not None and voice_pcm.size >= FRAME_SIZE:
+            n = (len(voice_pcm) // FRAME_SIZE) * FRAME_SIZE
+            wav = voice_pcm[:n].reshape(1, 1, n).astype(np.float32)
+            codes = self.encode(wav)[0]  # (8, Tf)
+            for t in range(codes.shape[1]):
+                self.step(SINE_TOKENS, text_token=ZERO_TEXT_CODE, moshi_tokens=codes[:, t])
+            # Phase 2: silence spacer after the voice prompt.
+            for _ in range(silence_frames):
+                self.step(SINE_TOKENS, text_token=ZERO_TEXT_CODE, moshi_tokens=SILENCE_TOKENS)
+
+        # Phase 3: text prompt -> force the text stream with the persona tokens.
+        if text_tokens:
+            for tok in text_tokens:
+                self.step(SINE_TOKENS, text_token=int(tok), moshi_tokens=SILENCE_TOKENS)
+            # Phase 4: silence spacer after the text prompt.
+            for _ in range(silence_frames):
+                self.step(SINE_TOKENS, text_token=ZERO_TEXT_CODE, moshi_tokens=SILENCE_TOKENS)
+
     # --- LM state (ring cache + delays), mirrors LMGen ------------------
     def _reset_lm_state(self):
         ct = MAX_DELAY + 3
@@ -307,12 +384,17 @@ class MoshiORT:
         return sampled
 
     # --- One full-duplex step (port of LMGen.step) ----------------------
-    def step(self, user_codes_frame, text_token=None):
+    def step(self, user_codes_frame, text_token=None, moshi_tokens=None):
         """Advance one 12.5 Hz frame.
 
         ``user_codes_frame``: (8,) int64 user-stream Mimi codes, or None for
         silence. Returns the assistant audio codes (8,) for this frame once
         the pipeline has filled (``None`` during the initial warm-up frames).
+
+        ``text_token`` / ``moshi_tokens`` teacher-force the text codebook (k=0)
+        and the assistant audio codebooks (k=1..8) respectively. These are used
+        during system-prompt priming (voice + persona), where the model is fed
+        a fixed voice and persona instead of generating them.
         """
         ct = self.ct
 
@@ -330,6 +412,13 @@ class MoshiORT:
             wp = (self.offset + DELAYS[0]) % ct
             self.cache[0, 0, wp] = text_token
             self.provided[0, 0, wp] = True
+        # Teacher-force the assistant audio stream (k = 1..8) during priming.
+        if moshi_tokens is not None:
+            for q in range(AUDIO_TOKENS_PER_STREAM):
+                k = 1 + q  # k = 1..8
+                wp = (self.offset + DELAYS[k]) % ct
+                self.cache[0, k, wp] = moshi_tokens[q]
+                self.provided[0, k, wp] = True
 
         # Seed delayed codebooks with the initial token at the very start.
         for k, delay in enumerate(DELAYS):
