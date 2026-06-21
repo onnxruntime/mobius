@@ -99,10 +99,41 @@
       playHead += buf.duration;
     }
 
+    // Linear resampler: src samples at srcRate -> dstRate. Keeps a fractional
+    // read position across calls so streaming chunks join seamlessly.
+    function makeResampler(srcRate, dstRate) {
+      const ratio = srcRate / dstRate;
+      let pos = 0;          // fractional read index into the *virtual* stream
+      let tail = new Float32Array(0);  // leftover src samples from prev call
+      return (chunk) => {
+        const src = new Float32Array(tail.length + chunk.length);
+        src.set(tail); src.set(chunk, tail.length);
+        const out = [];
+        while (pos + 1 < src.length) {
+          const i = Math.floor(pos);
+          const frac = pos - i;
+          out.push(src[i] * (1 - frac) + src[i + 1] * frac);
+          pos += ratio;
+        }
+        // keep the last whole sample we still need for interpolation
+        const consumed = Math.floor(pos);
+        tail = src.slice(consumed);
+        pos -= consumed;
+        return Float32Array.from(out);
+      };
+    }
+
     async function start() {
       audioCtx = new AudioContext({ sampleRate: RATE });
       await audioCtx.resume();
       playHead = audioCtx.currentTime + 0.1;
+      const ctxRate = audioCtx.sampleRate;
+      console.log(`[moshi] AudioContext sampleRate = ${ctxRate} (target ${RATE})`);
+      if (ctxRate !== RATE) {
+        setStatus(`resampling ${ctxRate}->${RATE} Hz`, false);
+      }
+      // Resample mic (ctxRate) -> 24 kHz so the model gets correct-rate audio.
+      const resample = ctxRate === RATE ? null : makeResampler(ctxRate, RATE);
 
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
@@ -113,11 +144,12 @@
       micNode = audioCtx.createScriptProcessor(2048, 1, 1);
       micNode.onaudioprocess = (e) => {
         if (!running) return;
-        const inp = e.inputBuffer.getChannelData(0);
+        const raw = e.inputBuffer.getChannelData(0);
         // VU meter
-        let peak = 0; for (let i = 0; i < inp.length; i++) peak = Math.max(peak, Math.abs(inp[i]));
+        let peak = 0; for (let i = 0; i < raw.length; i++) peak = Math.max(peak, Math.abs(raw[i]));
         level.style.width = Math.min(100, peak * 200) + "%";
-        // accumulate into 1920-sample frames
+        const inp = resample ? resample(raw) : raw;
+        // accumulate into 1920-sample (24 kHz) frames
         const merged = new Float32Array(capBuf.length + inp.length);
         merged.set(capBuf); merged.set(inp, capBuf.length);
         let off = 0;
@@ -130,10 +162,8 @@
         capBuf = merged.slice(off);
       };
       source.connect(micNode);
-      micNode.connect(audioCtx.destination);  // keep node alive (muted output)
-      // mute the raw mic monitor by routing through a zero-gain node instead:
-      // (connecting to destination above would echo the mic; use a gain of 0)
-      micNode.disconnect(audioCtx.destination);
+      // Route the capture node through a zero-gain sink so it stays alive
+      // without echoing the raw mic to the speakers.
       const sink = audioCtx.createGain(); sink.gain.value = 0;
       micNode.connect(sink); sink.connect(audioCtx.destination);
 

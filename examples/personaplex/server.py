@@ -91,6 +91,9 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         n_frames = 0
         budget_ms = 1000.0 / 12.5  # 80 ms per frame
         over_budget = 0
+        in_rms_acc = 0.0
+        out_rms_acc = 0.0
+        out_count = 0
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -98,6 +101,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     if frame.size != FRAME_SIZE:
                         # Pad/trim defensively to one frame.
                         frame = np.resize(frame, FRAME_SIZE).astype(np.float32)
+                    in_rms_acc += float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
                     t0 = time.perf_counter()
                     out = await asyncio.to_thread(moshi.process_frame, frame)
                     dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -105,9 +109,22 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     if dt_ms > budget_ms:
                         over_budget += 1
                     if out is not None:
+                        out_rms_acc += float(np.sqrt(np.mean(out.astype(np.float64) ** 2)))
+                        out_count += 1
                         await ws.send_bytes(
                             np.ascontiguousarray(out, dtype=np.float32).tobytes()
                         )
+                    # Report ~once per second so we can see whether the model
+                    # is receiving non-silent mic audio and producing audio out.
+                    if n_frames % 12 == 0:
+                        in_rms = in_rms_acc / 12
+                        out_rms = out_rms_acc / max(out_count, 1)
+                        print(
+                            f"[ws] {n_frames} frames | in_rms={in_rms:.4f} "
+                            f"out_rms={out_rms:.4f} | last_frame={dt_ms:.0f}ms"
+                        )
+                        in_rms_acc = out_rms_acc = 0.0
+                        out_count = 0
                 elif msg.type == WSMsgType.TEXT:
                     if msg.data == "reset":
                         await asyncio.to_thread(moshi.reset_stream)
