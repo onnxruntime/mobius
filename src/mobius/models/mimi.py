@@ -566,14 +566,19 @@ class _EncSplitRVQ(nn.Module):
 class MimiEncoderModel(nn.Module):
     """Waveform -> codes. Mirrors ``MimiModel.encode``."""
 
-    def __init__(self):
+    def __init__(self, dtype: ir.DataType = ir.DataType.FLOAT):
         super().__init__()
+        self._dtype = dtype
         self.encoder = _SEANetEncoder()
         self.encoder_transformer = _Transformer()
         self.downsample = _Downsample()
         self.quantizer = _EncSplitRVQ()
 
     def forward(self, op: OpBuilder, waveform: ir.Value):
+        # The ONNX input is always float32 PCM; cast to the compute dtype so
+        # fp16 builds don't mix float32 input with float16 conv weights.
+        if self._dtype != ir.DataType.FLOAT:
+            waveform = op.Cast(waveform, to=self._dtype)
         emb = self.encoder(op, waveform)  # (B, 512, T@25Hz)
         emb = self.encoder_transformer(op, emb)  # causal transformer
         emb = self.downsample(op, emb)  # (B, 512, T@12.5Hz)
@@ -584,8 +589,9 @@ class MimiEncoderModel(nn.Module):
 class MimiDecoderModel(nn.Module):
     """Codes -> waveform. Mirrors ``MimiModel.decode``."""
 
-    def __init__(self):
+    def __init__(self, dtype: ir.DataType = ir.DataType.FLOAT):
         super().__init__()
+        self._dtype = dtype
         self.quantizer = SplitResidualVectorQuantizer(
             num_quantizers=_N_ACTIVE,
             codebook_size=_BINS,
@@ -600,6 +606,9 @@ class MimiDecoderModel(nn.Module):
         emb = self.upsample(op, emb)  # (B, 512, T@25Hz)
         emb = self.decoder_transformer(op, emb)  # causal transformer
         waveform = self.decoder(op, emb)  # (B, 1, samples)
+        # Emit float32 PCM regardless of compute dtype (stable ONNX contract).
+        if self._dtype != ir.DataType.FLOAT:
+            waveform = op.Cast(waveform, to=ir.DataType.FLOAT)
         return waveform
 
 
@@ -616,8 +625,9 @@ class MimiModel(nn.Module):
     def __init__(self, config: ArchitectureConfig | None = None):
         super().__init__()
         self.config = config
-        self.encoder = MimiEncoderModel()
-        self.decoder = MimiDecoderModel()
+        dtype = config.dtype if config is not None else ir.DataType.FLOAT
+        self.encoder = MimiEncoderModel(dtype)
+        self.decoder = MimiDecoderModel(dtype)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
