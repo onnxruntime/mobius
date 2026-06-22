@@ -1539,12 +1539,13 @@ class TestBuildGraphVisionLanguage:
             mock.patch.object(
                 _builder.registry, "get", return_value=fake_module_cls
             ) as mock_get,
-            mock.patch("mobius._builder._config_from_hf", return_value=raw_config),
+            mock.patch("mobius._config_resolver._config_from_hf", return_value=raw_config),
             mock.patch(
                 "mobius._builder._strip_to_text_only", return_value=stripped_config
             ) as mock_strip,
             mock.patch(
-                "mobius._builder._default_task_for_model", return_value="text-generation"
+                "mobius._config_resolver._default_task_for_model",
+                return_value="text-generation",
             ),
             mock.patch(
                 "mobius._builder.build_from_module", return_value=fake_pkg
