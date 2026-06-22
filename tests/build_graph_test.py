@@ -3811,6 +3811,100 @@ class TestBuildQwenImageGraph:
         assert "sample" in {out.name for out in dec.graph.outputs}
 
 
+class TestBuildMimiCodec:
+    """Verify the Mimi codec (nvidia/personaplex-7b-v1) graph construction."""
+
+    def test_package_builds_2_models(self):
+        """Build the Mimi codec and verify a 2-model (encoder+decoder) package."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        module = MimiModel(config)
+        pkg = build_from_module(module, config, task=CodecTask())
+
+        assert "encoder" in pkg
+        assert "decoder" in pkg
+
+    def test_encoder_io(self):
+        """Verify the Mimi encoder I/O contract: waveform -> codes."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        pkg = build_from_module(MimiModel(config), config, task=CodecTask())
+        encoder = pkg["encoder"]
+
+        assert "waveform" in {inp.name for inp in encoder.graph.inputs}
+        assert "codes" in {out.name for out in encoder.graph.outputs}
+
+    def test_decoder_io(self):
+        """Verify the Mimi decoder I/O contract: codes -> waveform."""
+        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.tasks import CodecTask
+
+        config = mimi_default_config()
+        pkg = build_from_module(MimiModel(config), config, task=CodecTask())
+        decoder = pkg["decoder"]
+
+        assert "codes" in {inp.name for inp in decoder.graph.inputs}
+        assert "waveform" in {out.name for out in decoder.graph.outputs}
+
+
+class TestBuildMoshiLM:
+    """Verify the Moshi LM (nvidia/personaplex-7b-v1) graph construction."""
+
+    @staticmethod
+    def _temporal_tiny_config():
+        import dataclasses
+
+        from mobius.models.moshi import moshi_temporal_config
+
+        cfg = moshi_temporal_config()
+        return dataclasses.replace(
+            cfg,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            intermediate_size=128,
+            max_position_embeddings=256,
+        )
+
+    def test_temporal_io(self):
+        """Temporal model I/O: 17-channel frame -> hidden + text_logits + KV."""
+        from mobius.models.moshi import MoshiTemporalModel
+        from mobius.tasks import MoshiTemporalTask
+
+        config = self._temporal_tiny_config()
+        pkg = build_from_module(MoshiTemporalModel(config), config, task=MoshiTemporalTask())
+        model = pkg["model"]
+        inputs = {inp.name for inp in model.graph.inputs}
+        outputs = {out.name for out in model.graph.outputs}
+        assert "input_frame" in inputs
+        assert "position_ids" in inputs
+        assert "hidden" in outputs
+        assert "text_logits" in outputs
+        assert "present.0.key" in outputs
+
+    def test_depformer_io(self):
+        """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
+        from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
+        from mobius.tasks import MoshiDepformerTask
+
+        config = moshi_depformer_config()
+        pkg = build_from_module(MoshiDepformerModel(config), config, task=MoshiDepformerTask())
+        model = pkg["model"]
+        inputs = {inp.name for inp in model.graph.inputs}
+        outputs = {out.name for out in model.graph.outputs}
+        assert "hidden" in inputs
+        assert "prev_token" in inputs
+        assert "substep_index" in inputs
+        assert "logits" in outputs
+        assert "present.0.key" in outputs
+
+
 class TestBuildCodecGraph:
     """Verify codec tokenizer (Qwen3-TTS-Tokenizer-12Hz) graph construction."""
 
