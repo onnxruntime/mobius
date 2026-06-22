@@ -1517,6 +1517,49 @@ class TestBuildGraphVisionLanguage:
         ):
             build("meta-llama/Llama-3.2-1B", load_weights=False, text_only=True)
 
+    def test_build_text_only_remaps_and_strips(self):
+        """``build(text_only=True)`` remaps to the text sibling and strips config.
+
+        Happy path: the model_type is remapped to its text-only registry
+        sibling and the multimodal config is stripped before building.
+        """
+        from unittest import mock
+
+        from mobius import _builder
+
+        fake_hf = type("HF", (), {"model_type": "gemma4_unified"})()
+        raw_config = mock.MagicMock(name="raw_config")
+        stripped_config = mock.MagicMock(name="stripped_config")
+        fake_pkg = mock.MagicMock()
+        fake_pkg.items.return_value = []
+        fake_module_cls = mock.MagicMock(name="Gemma4CausalLMModel")
+
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            mock.patch.object(
+                _builder.registry, "get", return_value=fake_module_cls
+            ) as mock_get,
+            mock.patch("mobius._builder._config_from_hf", return_value=raw_config),
+            mock.patch(
+                "mobius._builder._strip_to_text_only", return_value=stripped_config
+            ) as mock_strip,
+            mock.patch(
+                "mobius._builder._default_task_for_model", return_value="text-generation"
+            ),
+            mock.patch(
+                "mobius._builder.build_from_module", return_value=fake_pkg
+            ) as mock_build_mod,
+        ):
+            pkg = _builder.build("google/gemma-4-12B", load_weights=False, text_only=True)
+
+        # model_type was remapped to the text sibling before module lookup
+        mock_get.assert_called_once_with("gemma4_unified_text")
+        # config stripping invoked with the remapped (text) model_type
+        mock_strip.assert_called_once_with(raw_config, "gemma4_unified_text")
+        # the stripped config (not the raw multimodal one) is what gets built
+        assert mock_build_mod.call_args.args[1] is stripped_config
+        assert pkg is fake_pkg
+
     def test_build_text_only_diffusers_path_raises(self):
         """``build(text_only=True)`` errors on the diffusers/unsupported path.
 
@@ -1538,6 +1581,7 @@ class TestBuildGraphVisionLanguage:
         ):
             build("some/diffusion-pipeline", load_weights=False, text_only=True)
 
+    def test_gemma4_any_to_any_graph(self):
         """Build Gemma4 Any-to-Any model (4-model split: decoder+vision+speech+embedding).
 
         When ``config.audio`` is set, Gemma4Model adds a ``speech`` model and a

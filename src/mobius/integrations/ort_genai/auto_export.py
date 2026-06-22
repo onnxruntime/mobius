@@ -151,9 +151,15 @@ def _select_ort_model_type(
     parent ``model_type``: ``build()`` unwraps composite configs to their text
     sub-config, so ``config.model_type`` would otherwise be the text type even
     for a full multimodal export.
+
+    The ``config.model_type`` preference only applies when it resolves to a
+    *known* ORT-GenAI type (a key in :data:`_ORT_GENAI_MODEL_TYPE`). An
+    unrecognised ``config.model_type`` would otherwise pass straight through as
+    an invalid ORT type and mask a valid HF-derived mapping, so in that case we
+    fall back to ``hf_model_type``.
     """
-    if is_decoder_only and config_model_type:
-        return _resolve_ort_genai_model_type(config_model_type)
+    if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
+        return _ORT_GENAI_MODEL_TYPE[config_model_type]
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
 
 
@@ -910,14 +916,9 @@ def write_ort_genai_config(
 
         hf_config = transformers.AutoConfig.from_pretrained(hf_model_id)
         model_type = hf_config.model_type
-        # For decoder-only packages, prefer the built package's model_type so
-        # text-only / overridden builds (e.g. gemma4_unified -> gemma4_unified_text)
-        # resolve to the correct decoder-only ORT-GenAI type rather than the
-        # multimodal one reported by the HuggingFace config. For multimodal
-        # packages keep the HF parent model_type: build() unwraps composite
-        # configs to their text sub-config, so pkg.config.model_type would
-        # otherwise be the text type even for a full multimodal export.
         cfg_model_type = getattr(config, "model_type", None)
+        # See _select_ort_model_type: decoder-only packages prefer the package's
+        # own config.model_type; multimodal packages keep the HF parent type.
         ort_model_type = _select_ort_model_type(
             cfg_model_type, model_type, is_decoder_only=is_decoder_only
         )

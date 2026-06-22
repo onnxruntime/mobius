@@ -126,6 +126,14 @@ class TestSelectOrtModelType:
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
         assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
 
+    def test_decoder_only_unknown_config_falls_back_to_hf(self):
+        # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
+        # not pass straight through as an invalid ORT type; fall back to the
+        # known HF-derived mapping instead.
+        assert (
+            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True) == "qwen2"
+        )
+
 
 class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):

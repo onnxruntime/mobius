@@ -26,10 +26,13 @@ attention + KV cache), and the resulting ORT-GenAI package is a single
 ``model.onnx`` with a decoder-only ``genai_config.json`` (no vision/audio
 sections).
 
-Compared to the full multimodal package this is a drop-in **text** LLM: smaller,
-faster decode, and loadable by a stock onnxruntime-genai build (it has the same
-mixed KV shapes as the multimodal decoder, so a per-layer-KV-aware genai build
-is still required — see the multimodal example's caveat 1).
+Compared to the full multimodal package this is a drop-in **text** LLM: smaller
+and faster to decode.  Note it keeps the same mixed per-layer KV shapes as the
+multimodal decoder (sliding ``num_key_value_heads``/``head_dim`` vs global
+``num_global_key_value_heads``/``global_head_dim``), so loading it still
+requires a **per-layer-KV-aware** onnxruntime-genai build — a stock build
+allocates KV uniformly and mis-shapes the global-attention layers (see the
+multimodal example's caveat 1).
 
 ``google/gemma-4-12B`` is a **base** (non-instruction-tuned) checkpoint, so
 completion-style leads work better than instructions (e.g. "The capital of

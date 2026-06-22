@@ -164,8 +164,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines
-    if args.model and not args.config:
+    # Auto-detect diffusers pipelines.  Skipped when --text-only is set:
+    # that flag only applies to transformers decoder exports, so we let the
+    # central build() validation reject a diffusers/unsupported repo rather
+    # than silently exporting a diffusion pipeline and ignoring the flag.
+    if args.model and not args.config and not args.text_only:
         pipeline_index = _load_diffusers_pipeline_index(args.model)
         if pipeline_index is not None:
             print(
@@ -249,7 +252,7 @@ def _save_package(
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
-    if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
+    if args.external_data == "safetensors" and args.execution_provider == "cuda":
         logging.getLogger(__name__).warning(
             "Safetensors external data does not guarantee 256-byte offset "
             "alignment, which can cause CUBLAS misaligned address errors on "

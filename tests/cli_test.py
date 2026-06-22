@@ -95,6 +95,35 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_text_only_skips_diffusers_autodetect(self):
+        """--text-only bypasses diffusers autodetect so build() validates it.
+
+        Without this, a diffusers repo + --text-only would hit the autodetect
+        branch and silently export a diffusion pipeline, ignoring the flag.
+        """
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index"
+            ) as mock_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/diffusion-repo",
+                    tmpdir,
+                    "--text-only",
+                    "--no-weights",
+                ]
+            )
+
+        mock_diffusers.assert_not_called()
+        mock_build.assert_called_once()
+        assert mock_build.call_args.kwargs.get("text_only") is True
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
