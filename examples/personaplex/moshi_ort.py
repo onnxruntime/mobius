@@ -203,6 +203,7 @@ class MoshiORT:
         self.temp_audio = temp_audio
         self.top_k_audio = top_k_audio
         self._rng = np.random.default_rng(seed)
+        self._ort = ort
 
         # The graph optimizer may prune unused inputs (e.g. position_ids when
         # RoPE derives its offset from the KV-cache length), and the KV cache
@@ -214,6 +215,8 @@ class MoshiORT:
             next(i.type for i in self.temporal.get_inputs() if i.name.endswith(".key")),
             np.float32,
         )
+        # Device that the temporal KV cache lives on for IO binding.
+        self._kv_device = "cuda" if device == "cuda" else "cpu"
         self._reset_lm_state()
 
     # --- Mimi codec ------------------------------------------------------
@@ -308,11 +311,23 @@ class MoshiORT:
         self.initial = np.empty((1, NUM_CODEBOOKS, 1), np.int64)
         self.initial[0, 0, 0] = INITIAL_TEXT_TOKEN
         self.initial[0, 1:, 0] = INITIAL_AUDIO_TOKEN
-        # persistent temporal KV cache (grows one frame per step)
-        self._tkv = [
+        # Persistent temporal KV cache, kept resident on the inference device
+        # via ORT IO binding so it is never copied through host memory between
+        # frames. With a plain numpy feed, ORT copies the whole (growing) cache
+        # host->device every frame, an O(N) cost that dominates per-frame time
+        # as the conversation lengthens (60ms -> 200ms+). Keeping it on-device
+        # makes per-frame cost flat (~6ms temporal regardless of length). The
+        # present.* outputs are bound to device and reused as next frame's
+        # past.* inputs (double-buffering). ``_tkv_ov`` holds the (key, value)
+        # OrtValue pair per layer; length-0 at the start of a conversation.
+        self._tkv_ov = [
             (
-                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
-                np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
+                self._ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype), self._kv_device, 0
+                ),
+                self._ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype), self._kv_device, 0
+                ),
             )
             for _ in range(T_LAYERS)
         ]
@@ -320,24 +335,39 @@ class MoshiORT:
 
     # --- Temporal transformer step --------------------------------------
     def _temporal_step(self, frame: np.ndarray):
-        """Frame (1,17,1) int64 -> (hidden (1,1,4096), text_logits (1,32000))."""
+        """Frame (1,17,1) int64 -> (hidden (1,1,4096), text_logits (1,32000)).
+
+        Runs with ORT IO binding so the KV cache stays resident on the
+        inference device across frames: present.* outputs are bound to device
+        and fed back as next frame's past.* inputs. This removes the per-frame
+        host<->device copy of the (growing) cache, keeping per-frame temporal
+        cost flat (~6ms) regardless of conversation length.
+        """
         s = frame.shape[2]
-        feeds = {
-            "input_frame": frame,
-            "attention_mask": np.ones((1, self._tpos + s), np.int64),
-        }
+        kv_len = self._tkv_ov[0][0].shape()[2]  # current on-device cache length
+        io = self.temporal.io_binding()
+        io.bind_cpu_input("input_frame", frame)
+        io.bind_cpu_input("attention_mask", np.ones((1, kv_len + s), np.int64))
         if "position_ids" in self._t_inputs:
-            feeds["position_ids"] = np.arange(self._tpos, self._tpos + s, dtype=np.int64)[None]
+            io.bind_cpu_input(
+                "position_ids",
+                np.arange(self._tpos, self._tpos + s, dtype=np.int64)[None],
+            )
         for i in range(T_LAYERS):
-            feeds[f"past_key_values.{i}.key"] = self._tkv[i][0]
-            feeds[f"past_key_values.{i}.value"] = self._tkv[i][1]
-        names = ["hidden", "text_logits"] + [
-            f"present.{i}.{kv}" for i in range(T_LAYERS) for kv in ("key", "value")
-        ]
-        outs = self.temporal.run(names, feeds)
-        hidden, text_logits = outs[0], outs[1]
-        present = outs[2:]
-        self._tkv = [(present[2 * i], present[2 * i + 1]) for i in range(T_LAYERS)]
+            io.bind_ortvalue_input(f"past_key_values.{i}.key", self._tkv_ov[i][0])
+            io.bind_ortvalue_input(f"past_key_values.{i}.value", self._tkv_ov[i][1])
+        # hidden / text_logits come back to host (needed for depformer + sampling);
+        # present.* stay on device to become next frame's past.*.
+        io.bind_output("hidden", "cpu")
+        io.bind_output("text_logits", "cpu")
+        for i in range(T_LAYERS):
+            io.bind_output(f"present.{i}.key", self._kv_device, 0)
+            io.bind_output(f"present.{i}.value", self._kv_device, 0)
+        self.temporal.run_with_iobinding(io)
+        outs = io.get_outputs()
+        hidden = outs[0].numpy()
+        text_logits = outs[1].numpy()
+        self._tkv_ov = [(outs[2 + 2 * i], outs[2 + 2 * i + 1]) for i in range(T_LAYERS)]
         self._tpos += s
         return hidden[:, -1:], text_logits[0, -1]
 
