@@ -26,6 +26,7 @@ _ORT_PROVIDER_NAMES: dict[str, str] = {
     "dml": "dml",
     "webgpu": "webgpu",
     "trt-rtx": "NvTensorRtRtx",
+    "qnn": "QNN",
 }
 
 
