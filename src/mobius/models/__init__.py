@@ -72,6 +72,9 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MimiModel",
+    "MoshiDepformerModel",
+    "MoshiTemporalModel",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
@@ -133,6 +136,9 @@ __all__ = [
     "WhisperForConditionalGeneration",
     "XLMCausalLMModel",
     "Zamba2CausalLMModel",
+    "mimi_default_config",
+    "moshi_depformer_config",
+    "moshi_temporal_config",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -187,6 +193,7 @@ from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
@@ -195,6 +202,12 @@ from mobius.models.moe import (
     MoECausalLMModel,
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
+)
+from mobius.models.moshi import (
+    MoshiDepformerModel,
+    MoshiTemporalModel,
+    moshi_depformer_config,
+    moshi_temporal_config,
 )
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel
