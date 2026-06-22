@@ -39,6 +39,8 @@ __all__ = [
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MoshiDepformerTask",
+    "MoshiTemporalTask",
     "MultiModalTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
@@ -89,6 +91,7 @@ from mobius.tasks._gemma4 import (
 )
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
@@ -126,6 +129,8 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
+    "moshi-depformer": MoshiDepformerTask,
+    "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
     "vae": VAETask,

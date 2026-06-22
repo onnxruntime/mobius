@@ -267,6 +267,28 @@ def _register_builtins() -> None:
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
         ),
+        # Qualcomm Hexagon NPU via the QNN EP (onnxruntime-qnn QAIRT plugin),
+        # HTP backend. The HTP runs a static-shaped, QDQ-quantized QNN context
+        # binary with no kernels for ORT contrib fused ops, so everything is
+        # decomposed to standard ONNX. The gemma4 multimodal decoder forgoes GQA
+        # (bidirectional-vision overlay), so standard Attention is emitted and
+        # static-shaped downstream. provider_options are the HTP launch defaults;
+        # soc_model and the EP-context binary path are set per-device at build time.
+        EpCapabilities(
+            name="qnn",
+            gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
+            qkv_pack_dtypes=frozenset(),  # no PackQKV
+            supports_fused_rope=False,  # SeparateRoPE + UnpackQKV
+            supports_skip_layer_norm=False,  # inline Skip[Simplified]LayerNorm
+            supports_packed_multi_head_attention=False,  # inline PackedMHA
+            provider_options={
+                "backend_path": "QnnHtp.dll",
+                "htp_performance_mode": "burst",
+                "htp_graph_finalization_optimization_mode": "3",
+                "enable_htp_shared_memory_allocator": "1",
+            },
+            supports_past_present_share_buffer=False,  # standard-Attention KV concat
+        ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
         # InlinePass to their standard-ONNX function bodies. No GQA or QKV
