@@ -188,8 +188,11 @@ def _dense_reference(
     written).  For each (batch, query, head) we build the boolean mask in the
     exact rule order ``create_static_cache_attention_bias`` uses — causal,
     AND sliding window, OR block overlay, AND padding validity — gather the
-    valid cache slots (with GQA head sharing) and softmax over them.  A query
-    row with no valid slot yields exactly ``0`` (the kernel's zero guard).
+    valid cache slots (with GQA head sharing) and softmax over them.  Every
+    query row keeps its own diagonal slot valid (``q_abs[t] == write+t`` is
+    causal, within any window, and ``< nonpad``), so a fully-masked row is
+    unreachable by the bias-MEA contract — the gather is asserted non-empty
+    rather than returning ``0`` (see the ``idx.size > 0`` guard below).
     """
     batch, query_len, q_hidden = query.shape
     scale = 1.0 / np.sqrt(head_dim)
@@ -626,7 +629,9 @@ def test_flag_off_emits_maskless_static_cache():
     attns = _attention_nodes(model)
     assert attns, "no Attention nodes found in static-cache graph"
     for node in attns:
-        assert node.attributes.get("is_causal").value == 1
+        is_causal = node.attributes.get("is_causal")
+        assert is_causal is not None, f"Attention node {node.name} missing is_causal"
+        assert is_causal.as_int() == 1
         # Attention input #3 (attn_mask) must be absent (None).
         assert node.inputs[3] is None
 
@@ -644,10 +649,15 @@ def test_flag_on_threads_bias_for_sliding_window_model():
     attns = _attention_nodes(model)
     assert attns, "no Attention nodes found in static-cache graph"
     for node in attns:
-        assert node.attributes.get("is_causal").value == 0, (
+        is_causal = node.attributes.get("is_causal")
+        assert is_causal is not None, f"Attention node {node.name} missing is_causal"
+        assert is_causal.as_int() == 0, (
             "bias-present Attention must use is_causal=0 (risk iii double-causal)"
         )
-        assert node.inputs[3] is not None, "additive bias must be Attention input #3"
+        bias = node.inputs[3]
+        assert bias is not None and bias.name != "", (
+            "additive bias must be a wired (non-None, non-empty) Attention input #3"
+        )
         # nonpad_kv_seqlen preserved as input #6.
         assert len(node.inputs) >= 7 and node.inputs[6] is not None
 
@@ -664,5 +674,7 @@ def test_flag_on_non_sliding_model_stays_maskless():
     attns = _attention_nodes(model)
     assert attns, "no Attention nodes found in static-cache graph"
     for node in attns:
-        assert node.attributes.get("is_causal").value == 1
+        is_causal = node.attributes.get("is_causal")
+        assert is_causal is not None, f"Attention node {node.name} missing is_causal"
+        assert is_causal.as_int() == 1
         assert node.inputs[3] is None
