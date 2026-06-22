@@ -44,6 +44,7 @@ class TextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
+        self.config = config
         self._dtype = config.dtype
 
         # If the config has quantization, swap Linear for QuantizedLinear
@@ -138,6 +139,7 @@ class TextModel(nn.Module):
                 total_seq_len=total_seq_len,
                 cos_cache=self.rotary_emb.cos_cache,  # [max_seq, rotary_dim]
                 sin_cache=self.rotary_emb.sin_cache,  # [max_seq, rotary_dim]
+                local_window_size=self._gqa_local_window_size(),
             )
             # position_embeddings not needed: GroupQueryAttention handles RoPE
             # internally via do_rotary=1. Passing None skips apply_rotary_pos_emb
@@ -182,6 +184,27 @@ class TextModel(nn.Module):
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
+
+    def _gqa_local_window_size(self) -> int:
+        """Sliding-window size to pass to GroupQueryAttention, or -1 if unused.
+
+        GQA's ``local_window_size=W`` masks each query to the most recent ``W``
+        keys (positions ``[i-W+1, i]``), which matches HuggingFace's
+        ``sliding_window=W`` semantics exactly. The global GQAContext built here
+        is shared by every layer, so this only applies when the model uses a
+        *uniform* sliding window across all layers. Models with alternating
+        full/sliding layers (Gemma2/3/4, gpt-oss) use custom model classes with
+        per-layer masks and do not take this path.
+        """
+        sliding_window = getattr(self.config, "sliding_window", None)
+        if sliding_window is None or sliding_window <= 0:
+            return -1
+        # Mixed schedules (some "full_attention", some "sliding_attention")
+        # cannot be expressed by one global window — leave it disabled.
+        layer_types = getattr(self.config, "layer_types", None)
+        if layer_types is not None and any(t != "sliding_attention" for t in layer_types):
+            return -1
+        return int(sliding_window)
 
 
 class CausalLMModel(nn.Module):

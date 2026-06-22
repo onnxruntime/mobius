@@ -5105,3 +5105,73 @@ class TestBuildSpeechGraph:
         task = get_task(_default_task_for_model(model_type))
         pkg = task.build(module, config)
         _assert_outputs_have_shapes_and_dtypes(pkg, model_type)
+
+
+class TestGQASlidingWindow:
+    """Wire ``config.sliding_window`` into GQA's ``local_window_size``.
+
+    On the direct GQA path (``TextModel.forward``), GQA
+    ``local_window_size=W`` masks each query to the most recent ``W`` keys
+    (positions ``[i-W+1, i]``), matching HuggingFace ``sliding_window=W``.
+    Because the global GQAContext is shared by every layer, the window is only
+    emitted for models with a *uniform* sliding window across all layers.
+    """
+
+    @staticmethod
+    def _build_gqa_decoder(**overrides):
+        from mobius.models.base import CausalLMModel
+
+        config = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            dtype=ir.DataType.FLOAT16,
+            **overrides,
+        )
+        module = CausalLMModel(config)
+        # execution_provider="cuda" + fp16 activates the direct GQA path.
+        pkg = build_from_module(module, config, execution_provider="cuda")
+        model = pkg["model"]
+        gqa_nodes = [n for n in model.graph if n.op_type == "GroupQueryAttention"]
+        assert gqa_nodes, "expected GroupQueryAttention nodes on the cuda/fp16 path"
+        return gqa_nodes
+
+    def test_uniform_sliding_window_sets_local_window_size(self):
+        """A uniform sliding window is forwarded to every GQA node verbatim."""
+        gqa_nodes = self._build_gqa_decoder(sliding_window=3000)
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == 3000
+
+    def test_no_sliding_window_omits_local_window_size(self):
+        """Full-attention models must not carry a local_window_size attribute."""
+        gqa_nodes = self._build_gqa_decoder(sliding_window=None)
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_mixed_layer_types_omits_local_window_size(self):
+        """A per-layer schedule cannot be expressed by one global window."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_all_sliding_layer_types_sets_local_window_size(self):
+        """An explicit all-sliding schedule is uniform, so window is emitted."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention", "sliding_attention"],
+        )
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == 8

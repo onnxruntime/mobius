@@ -23,8 +23,8 @@ Use this skill when:
 | Scenario | Recommended | Why |
 |----------|------------|-----|
 | Causal only | `attn_mask=None` + `is_causal=1` | Enables Flash (fastest for prefill) |
-| Padding (batch>1) | `nonpad_kv_seqlens` (best) or bool mask | `nonpad_kv_seqlens` enables Flash + shared buffer with no mask |
-| Sliding window (simple) | Bool mask | Equally precise as float, uses less memory |
+| Padding (batch>1) | `nonpad_kv_seqlens` (prefill) or bool mask | `nonpad_kv_seqlens` enables Flash with no mask, but is rejected with past KV (decode) |
+| Sliding window (simple) | GQA `local_window_size` or bool mask | `local_window_size` keeps the fast GQA path; bool mask if you need ONNX Attention |
 | Complex (sliding+KV-shared+dual head_dim) | Float additive bias | Avoids mask construction bugs in multi-constraint patterns |
 | Custom pattern | Float additive bias | Arbitrary values |
 
@@ -116,7 +116,7 @@ single-token decode (memory-bandwidth bound regardless of kernel):
 | Symmetric heads | `head_size == v_head_size` |
 | GPU | SM≥8.0 (Ampere or newer) |
 
-### `nonpad_kv_seqlens` — the best padding solution
+### `nonpad_kv_seqlens` — a **prefill-only** padding solution
 
 ONNX Attention opset 24 adds `nonpad_kv_seqlens` input, which tells
 the kernel the actual (non-padded) KV sequence length per batch item.
@@ -124,18 +124,31 @@ This enables Flash Attention with variable-length sequences **without
 providing an explicit mask** — the kernel applies causal masking
 internally using the sequence length info.
 
+> ⚠️ **Prefill only.** ORT *rejects* `nonpad_kv_seqlens` when `past_key` /
+> `past_value` are also supplied: *"nonpad_kv_seqlens should not be used
+> together with past_key and past_value inputs."* So it only helps the
+> first (prefill) pass, not autoregressive decode steps that feed a KV
+> cache. For batched decode with padding, fall back to a bool/float mask
+> or the GQA contrib op (which takes `seqlens_k` alongside past KV).
+
+> ⚠️ **No in-place KV buffer.** The opset-24 ONNX `Attention` schema has
+> **no `past_present_share_buffer` attribute**. `present = concat(past,
+> new)` is materialised every step (an O(N) copy), and `past`/`present`
+> are distinct tensors. Only the contrib **GroupQueryAttention** op
+> writes new tokens into a shared, pre-allocated KV buffer in place. This
+> is the main residual reason GQA out-paces ONNX `Attention` during
+> decode even after IO-binding the cache (see "GQA vs ONNX Attention").
+
 ```python
-# Enables Flash + past_present_share_buffer for efficient KV cache
+# Prefill only: NO past_key/past_value, NO past_present_share_buffer
+# (that attribute does not exist on the opset-24 Attention schema).
 attn_out = op.Attention(
     query, key, value,
-    attn_mask=None,           # nullptr → Flash eligible
-    past_key=past_k,
-    past_value=past_v,
-    nonpad_kv_seqlens=seqlens_k,  # opset 24
+    attn_mask=None,                # nullptr → Flash eligible
+    nonpad_kv_seqlens=seqlens_k,   # opset 24, prefill pass only
     q_num_heads=num_heads,
     kv_num_heads=kv_heads,
     is_causal=1,
-    past_present_share_buffer=1,
 )
 ```
 
@@ -214,24 +227,51 @@ borrow K/V from a layer with different `head_size`, creating
 | Attention bias | ❌ Rejected | ✅ Supported |
 | Flash Attention | ✅ (no mask) | ✅ (no mask) |
 | XQA kernel | ✅ | ❌ |
-| KV cache management | Built-in (`past_present_share_buffer`) | Manual (separate past/present) |
-| Variable-length | Via `seqlens_k` | Via `nonpad_kv_seqlens` (opset 24) |
+| In-place KV buffer | ✅ `past_present_share_buffer` (writes 1 token in place) | ❌ none — `present=concat(past,new)`, O(N) copy/step |
+| Sliding window | ✅ `local_window_size` attribute | Via float/bool bias only |
+| Variable-length | Via `seqlens_k` (works with past KV) | Via `nonpad_kv_seqlens` (prefill only) |
 
 **Guideline:** Use Contrib GQA when you don't need attention bias
-(simple causal models). Use ONNX Attention when you need float bias
-(sliding window, KV-shared, padding).
+(simple causal models, sliding-window via `local_window_size`). Use ONNX
+Attention when you need a float bias (KV-shared, dual head_dim, or
+mixed/alternating per-layer windows that one global window can't express).
+
+### GQA sliding window via `local_window_size`
+
+GroupQueryAttention takes a `local_window_size` attribute that masks each
+query to the most recent `W` keys (positions `[i-W+1, i]`) — exactly
+matching HuggingFace `sliding_window=W`. This keeps a uniform-window model
+on the fast GQA path instead of forcing it onto ONNX `Attention` with a
+baked float window mask. In mobius this is wired in `TextModel.forward`
+from `config.sliding_window` (see `GQAContext.local_window_size`), guarded
+to uniformly-sliding models — mixed `layer_types` (Gemma2/3/4, gpt-oss)
+use custom per-layer `GQAContext`s instead.
+
+> Note: `local_window_size` only *masks* attention; it does not shrink the
+> physical KV buffer, so bounding memory still needs a circular/static
+> cache. Also, the post-hoc GQA rewrite (`RotaryAttentionToGQA`) cannot
+> recover a window from an already-baked float mask, so sliding windows
+> must be set on the **direct** GQA path (GQAContext), not via the rewrite.
 
 ## Key takeaways for model builders
 
 1. **Flash requires `attn_mask == nullptr`** — any explicit mask
    disables Flash. Use `is_causal=1` instead.
 2. **`nonpad_kv_seqlens`** enables Flash with variable-length sequences
-   without an explicit mask.
+   without an explicit mask — but **prefill only** (rejected when
+   `past_key`/`past_value` are present).
 3. **GQA contrib op rejects `attention_bias`** — use standard ONNX
    `Attention` if you need bias with GQA.
 4. **SM≥8.0** (Ampere+) required for Flash on all paths.
 5. **Float bias is safer** than bool mask for complex attention patterns.
 6. **MEA requires alignment** — `total_kv % 4 == 0` for bias tensors.
+7. **Only GQA has an in-place KV buffer** (`past_present_share_buffer`).
+   ONNX `Attention` (opset 24) has no such attribute and re-concats the
+   cache each step — the main reason GQA wins during decode even after
+   IO-binding the cache.
+8. **Sliding window on the fast path:** set GQA `local_window_size` (=
+   `config.sliding_window`) for uniform-window models instead of baking a
+   float window mask into ONNX `Attention`.
 
 ## Cross-references
 
