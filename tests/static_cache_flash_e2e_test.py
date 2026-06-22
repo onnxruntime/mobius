@@ -53,23 +53,24 @@ import pytest
 
 from mobius import ArchitectureConfig, build_from_module
 from mobius._registry import registry
-from mobius._testing.ort_capabilities import CUDA_AVAILABLE, supports_static_cache_flash
+from mobius._testing.ort_capabilities import static_cache_flash_skip_reason
 from mobius.tasks import CausalLMTask
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not CUDA_AVAILABLE,
-        reason="static-cache TensorScatter / external-cache Attention are CUDA-only",
-    ),
-    pytest.mark.skipif(
-        not supports_static_cache_flash(),
-        reason=(
-            "installed ORT lacks microsoft/onnxruntime#28958 "
-            "(is_causal=1 + nonpad_kv_seqlen on the CUDA Attention kernel)"
-        ),
-    ),
-]
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def _require_static_cache_flash():
+    # Deferred to test setup rather than a module-level ``skipif``: the
+    # capability check runs a CUDA build + serialize + session.run, so evaluating
+    # it eagerly would execute that probe at import/collection time (slowing
+    # ``--collect-only`` and adding an import-time CUDA side effect). The probe is
+    # lru-cached, so gating every test here still runs it at most once, and
+    # ``static_cache_flash_skip_reason`` reports the true cause (no CUDA EP,
+    # missing microsoft/onnxruntime#28958, or an unexpected probe failure).
+    reason = static_cache_flash_skip_reason()
+    if reason:
+        pytest.skip(reason)
 
 
 # ---------------------------------------------------------------------------
