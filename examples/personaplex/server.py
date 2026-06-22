@@ -30,7 +30,7 @@ Then run this server (CUDA recommended for real-time speed)::
     pip install aiohttp sentencepiece huggingface_hub
     python examples/personaplex/server.py \
         --model-dir output/personaplex/onnx --device cuda \
-        --host 0.0.0.0 --port 7681
+        --host 127.0.0.1 --port 7681
 
 Open ``http://localhost:7681`` (or port-forward the remote port over SSH:
 ``ssh -L 7681:localhost:7681 <host>``), set a persona / optional voice sample,
@@ -254,7 +254,7 @@ def main() -> None:
         action="store_true",
         help="keep CUDA TF32 (faster, lower precision) for fp32 matmuls",
     )
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7681)
     parser.add_argument(
         "--tokenizer",

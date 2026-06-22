@@ -57,7 +57,7 @@ def make_prev_tokens() -> list[int]:
     rng = np.random.RandomState(7)
     text_prev = int(rng.randint(0, TEXT_CARD))
     audio_prev = rng.randint(0, AUDIO_CARD, size=DEP_Q - 1).tolist()
-    return [text_prev] + audio_prev
+    return [text_prev, *audio_prev]
 
 
 def _resolve_lm(model: str) -> str:

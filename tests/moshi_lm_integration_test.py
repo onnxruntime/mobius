@@ -64,7 +64,7 @@ def _make_prev_tokens() -> list[int]:
     rng = np.random.RandomState(7)
     text_prev = int(rng.randint(0, _TEXT_CARD))
     audio_prev = rng.randint(0, _AUDIO_CARD, size=_DEP_Q - 1).tolist()
-    return [text_prev] + audio_prev
+    return [text_prev, *audio_prev]
 
 
 def _find_onnx(root: str) -> str:

@@ -54,7 +54,7 @@ The server only loads ONNX models, so it can run in a lightweight
 pip install aiohttp onnxruntime-gpu numpy sentencepiece huggingface_hub
 python examples/personaplex/server.py \
     --model-dir output/personaplex/onnx --device cuda \
-    --host 0.0.0.0 --port 7681
+    --host 127.0.0.1 --port 7681
 ```
 
 On Ampere+/H200 GPUs ORT defaults to TF32 for fp32 matmuls, which can flip

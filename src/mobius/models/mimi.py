@@ -35,7 +35,6 @@ convention used by mobius's RoPE.
 
 from __future__ import annotations
 
-
 import numpy as np
 import onnx_ir as ir
 import torch
@@ -236,8 +235,10 @@ class _ConvTr(nn.Module):
 
 
 class _ELU(nn.Module):
-    """ELU activation (alpha=1.0); paramless, kept in the module list to
-    preserve Kyutai ``model.<i>`` indexing."""
+    """ELU activation (alpha=1.0).
+
+    Paramless; kept in the module list to preserve Kyutai ``model.<i>`` indexing.
+    """
 
     def forward(self, op: OpBuilder, x: ir.Value):
         return op.Elu(x, alpha=1.0)
@@ -687,8 +688,11 @@ def _interleaved_to_halfsplit(w: torch.Tensor, head_dim: int) -> torch.Tensor:
 def _convert_transformer_layer(
     out: dict[str, torch.Tensor], prefix: str, lprefix: str, sd: dict
 ) -> None:
-    """Convert one Kyutai transformer layer (``lprefix``) into mobius names
-    under ``prefix`` (the fully-qualified ``<enc|dec>oder.<...>.layers.<i>``)."""
+    """Convert one Kyutai transformer layer into mobius parameter names.
+
+    ``lprefix`` is the Kyutai source prefix; ``prefix`` is the fully-qualified
+    destination (``<enc|dec>oder.<...>.layers.<i>``).
+    """
     # Norms
     out[f"{prefix}.input_layernorm.weight"] = sd[f"{lprefix}.norm1.weight"]
     out[f"{prefix}.input_layernorm.bias"] = sd[f"{lprefix}.norm1.bias"]
@@ -711,8 +715,11 @@ def _convert_transformer_layer(
 
 
 def _codebook_embedding(sd: dict, prefix: str) -> torch.Tensor:
-    """Reconstruct a codebook embedding table from ``embedding_sum`` and
-    ``cluster_usage`` (Kyutai stores running statistics, not the table)."""
+    """Reconstruct a codebook embedding table from running statistics.
+
+    Kyutai stores ``embedding_sum`` and ``cluster_usage`` (running statistics),
+    not the embedding table itself.
+    """
     embedding_sum = sd[f"{prefix}.embedding_sum"].float()  # (bins, dim)
     cluster_usage = sd[f"{prefix}.cluster_usage"].float()  # (bins,)
     denom = cluster_usage.clamp(min=1e-8).unsqueeze(-1)
