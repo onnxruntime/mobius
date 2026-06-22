@@ -146,6 +146,11 @@ _PROBE_EXPECTED_OUTPUT = sum(_PROBE_VALUE_TAGS) / len(_PROBE_VALUE_TAGS)  # 2.0
 # fp16 represents 2.0 exactly; the wrong (top-left) answer is 1.0, a full unit
 # away, so a tight tolerance cleanly separates correct from silently-wrong.
 _PROBE_OUTPUT_ATOL = 0.1
+# The signature of the known pre-#28958 silent fallback: a top-left causal kernel
+# lets the single decode query attend only KV slot 0, yielding the first value tag
+# (1.0) instead of the mean. Used to tell that *expected* historical fallback apart
+# from an *unexpected* wrong value (a genuine post-#28958 regression).
+_PROBE_TOPLEFT_OUTPUT = _PROBE_VALUE_TAGS[0]  # 1.0
 
 
 def _build_static_cache_attention_probe() -> ir.Model:
@@ -384,14 +389,37 @@ def _probe_static_cache_flash() -> _ProbeOutcome:
             except _EXPECTED_REJECT_ERRORS as exc:
                 return _classify_run_error(exc)
             if not _probe_output_is_correct(attn_output):
-                logger.debug(
-                    "Static-cache Flash probe: graph ran without error but produced "
-                    "incorrect values (expected ~%.1f, got mean %.4f) — the CUDA EP "
-                    "silently fell back to a wrong (top-left causal) kernel, i.e. the "
-                    "build lacks microsoft/onnxruntime#28958.",
-                    _PROBE_EXPECTED_OUTPUT,
-                    float(np.asarray(attn_output).mean()),
-                )
+                mean_output = float(np.asarray(attn_output).mean())
+                if abs(mean_output - _PROBE_TOPLEFT_OUTPUT) <= _PROBE_OUTPUT_ATOL:
+                    # The *expected* historical fallback: a build predating
+                    # microsoft/onnxruntime#28958 silently runs the wrong
+                    # (top-left causal) kernel, yielding ~1.0. Well-understood, so
+                    # log at debug.
+                    logger.debug(
+                        "Static-cache Flash probe: graph ran without error but "
+                        "produced the known pre-#28958 top-left value (expected "
+                        "~%.1f, got mean %.4f) — the CUDA EP silently fell back to "
+                        "a wrong (top-left causal) kernel; the build lacks "
+                        "microsoft/onnxruntime#28958.",
+                        _PROBE_EXPECTED_OUTPUT,
+                        mean_output,
+                    )
+                else:
+                    # NOT the known top-left signature and NOT correct: an
+                    # unexpected wrong value (a genuine post-#28958 regression, an
+                    # ORT/onnxscript drift, or a new silent-fallback kernel). Surface
+                    # it at warning instead of silently bucketing it as the known
+                    # fallback, so a real regression isn't hidden at debug.
+                    logger.warning(
+                        "Static-cache Flash probe: graph ran without error but "
+                        "produced an UNEXPECTED wrong value (expected ~%.1f, got "
+                        "mean %.4f) that matches neither the correct output nor the "
+                        "known pre-#28958 top-left fallback (~%.1f) — possible "
+                        "post-#28958 regression or ORT drift; investigate.",
+                        _PROBE_EXPECTED_OUTPUT,
+                        mean_output,
+                        _PROBE_TOPLEFT_OUTPUT,
+                    )
                 return _ProbeOutcome.NEEDS_FIX
     except Exception:
         logger.warning(

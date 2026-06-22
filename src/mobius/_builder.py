@@ -213,7 +213,7 @@ def build_from_module(
             trace=trace_optimization,
         )
 
-    _apply_opset_lowering(pkg, execution_provider)
+    _maybe_apply_opset_lowering(pkg, execution_provider)
     return pkg
 
 
@@ -223,7 +223,7 @@ def build_from_module(
 _ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX = 6
 
 
-def _apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
+def _maybe_apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
     """Lower the default-domain opset from 24 to 23 where it is safe to do so.
 
     Some EPs (older ORT builds) don't register opset 24 kernels for standard

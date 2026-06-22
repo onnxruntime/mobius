@@ -233,6 +233,24 @@ def carry_caches(outputs: dict[str, np.ndarray], num_layers: int) -> dict[str, n
     return feeds
 
 
+_ORT_DEFAULT_LOGGER_SEVERITY = 2  # ORT's documented default == WARNING
+# ORT exposes set_default_logger_severity but no getter, so we shadow the value we
+# last set (seeded to ORT's default) to let captured_attention_dispatch() restore the
+# *prior* severity instead of a hardcoded constant. Accurate as long as severity is
+# only changed via _set_ort_logger_severity; an external ort.set_default_logger_severity
+# call is invisible to the shadow (an unavoidable consequence of the missing getter).
+_ort_logger_severity = _ORT_DEFAULT_LOGGER_SEVERITY
+
+
+def _set_ort_logger_severity(severity: int) -> int:
+    """Set ORT's global default logger severity, returning the previous value."""
+    global _ort_logger_severity
+    prior = _ort_logger_severity
+    ort.set_default_logger_severity(severity)
+    _ort_logger_severity = severity
+    return prior
+
+
 @contextlib.contextmanager
 def captured_attention_dispatch() -> Iterator[list[str]]:
     """Capture the ONNX-domain Attention kernel's ``VERBOSE`` dispatch log.
@@ -262,8 +280,9 @@ def captured_attention_dispatch() -> Iterator[list[str]]:
         assert kernels == {"flash"}
     """
     captured: list[str] = []
-    # ORT's default logger severity defaults to WARNING (2); restore it after.
-    ort.set_default_logger_severity(0)
+    # Raise the global default logger to VERBOSE for the capture; save the prior
+    # severity so we can restore exactly what was set before (not a hardcoded 2).
+    prior_severity = _set_ort_logger_severity(0)
     saved_stderr_fd = os.dup(2)
     with tempfile.TemporaryFile(mode="w+b") as capture_file:
         try:
@@ -273,7 +292,7 @@ def captured_attention_dispatch() -> Iterator[list[str]]:
             # Flush C++ stderr, restore the real fd, then read back what we caught.
             os.dup2(saved_stderr_fd, 2)
             os.close(saved_stderr_fd)
-            ort.set_default_logger_severity(2)
+            _set_ort_logger_severity(prior_severity)
             capture_file.seek(0)
             text = capture_file.read().decode("utf-8", errors="replace")
             captured.extend(text.splitlines())

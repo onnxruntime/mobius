@@ -13,7 +13,7 @@ from __future__ import annotations
 import onnx_ir as ir
 import pytest
 
-from mobius._builder import _apply_opset_lowering, _graph_requires_opset24, flags
+from mobius._builder import _graph_requires_opset24, _maybe_apply_opset_lowering, flags
 from mobius._model_package import ModelPackage
 
 
@@ -114,8 +114,8 @@ def test_graph_requires_opset24_detects_nested_subgraph() -> None:
     assert _graph_requires_opset24(outer) is True
 
 
-def test_apply_opset_lowering_mixed_package(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Drive the REAL lowering branch in build_from_module via _apply_opset_lowering.
+def test_maybe_apply_opset_lowering_mixed_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Drive the REAL lowering branch in build_from_module via _maybe_apply_opset_lowering.
     # A mixed package must be handled per sub-model: the static-cache sub-model
     # keeps opset 24, the standard sub-model is lowered to 23.
     monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
@@ -126,25 +126,25 @@ def test_apply_opset_lowering_mixed_package(monkeypatch: pytest.MonkeyPatch) -> 
         }
     )
 
-    _apply_opset_lowering(pkg, execution_provider="cuda")
+    _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["model"].graph.opset_imports[""] == 24
     assert pkg["embedding"].graph.opset_imports[""] == 23
 
 
-def test_apply_opset_lowering_skipped_for_default_ep(
+def test_maybe_apply_opset_lowering_skipped_for_default_ep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The "default" EP gate: lowering never fires even with the flag enabled.
     monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
     pkg = ModelPackage({"embedding": _model_with(_standard_nodes())})
 
-    _apply_opset_lowering(pkg, execution_provider="default")
+    _maybe_apply_opset_lowering(pkg, execution_provider="default")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
 
 
-def test_apply_opset_lowering_skipped_for_cpu_ep(
+def test_maybe_apply_opset_lowering_skipped_for_cpu_ep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The "cpu" EP gate: the CPU EP already registers opset-24 kernels, so
@@ -153,18 +153,18 @@ def test_apply_opset_lowering_skipped_for_cpu_ep(
     monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
     pkg = ModelPackage({"embedding": _model_with(_standard_nodes())})
 
-    _apply_opset_lowering(pkg, execution_provider="cpu")
+    _maybe_apply_opset_lowering(pkg, execution_provider="cpu")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
 
 
-def test_apply_opset_lowering_skipped_when_flag_disabled(
+def test_maybe_apply_opset_lowering_skipped_when_flag_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The flag gate: lowering never fires when the flag is off (the default).
     monkeypatch.setattr(flags, "ort_lower_opset_for_ep", False)
     pkg = ModelPackage({"embedding": _model_with(_standard_nodes())})
 
-    _apply_opset_lowering(pkg, execution_provider="cuda")
+    _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
