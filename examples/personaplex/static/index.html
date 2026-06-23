@@ -79,6 +79,11 @@
       <label for="persona">Persona (system prompt)</label>
       <textarea id="persona">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
 
+      <label for="seed">Voice seed (optional) — fixes the sampled voice/accent</label>
+      <input id="seed" type="number" placeholder="leave blank for a random voice each time"
+        style="width:100%; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:8px;" />
+      <div class="hint">Same seed → same voice every session. Try different integers to find one you like.</div>
+
       <label>Voice sample (optional) — clone the assistant's voice</label>
       <div class="row">
         <button id="record">● Record ~6 s</button>
@@ -131,6 +136,7 @@
     const presetRow = document.getElementById("presetRow");
     const preset = document.getElementById("preset");
     const persona = document.getElementById("persona");
+    const seedInput = document.getElementById("seed");
     const voiceHint = document.getElementById("voiceHint");
     const latency = document.getElementById("latency");
     const latVal = document.getElementById("latVal");
@@ -332,7 +338,9 @@
     function applySession() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const hasVoice = !!(voicePcm && voicePcm.length >= FRAME);
-      ws.send(JSON.stringify({ persona: persona.value, hasVoice }));
+      const seedRaw = seedInput.value.trim();
+      const seed = seedRaw === "" ? null : Number(seedRaw);
+      ws.send(JSON.stringify({ persona: persona.value, hasVoice, seed }));
       if (hasVoice) ws.send(voicePcm.buffer.slice(0));
       apply.disabled = true;
       apply.textContent = "Priming…";
