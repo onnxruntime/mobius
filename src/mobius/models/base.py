@@ -84,7 +84,7 @@ class TextModel(nn.Module):
     def _maybe_static_cache_bias(
         self,
         op: OpBuilder,
-        input_ids: ir.Value | None,
+        seq_len_source: ir.Value,
         past_key_values: list | None,
     ) -> ir.Value | None:
         """Optionally build the static-cache float additive attention bias.
@@ -94,11 +94,18 @@ class TextModel(nn.Module):
           * the model declares a bias need (``self._sliding_window`` is set), AND
           * the cache is the opset-24 external cache (``StaticCacheState``).
 
-        When emitted, the bias is a ``(B, 1, S_q, max_seq)`` additive mask keyed
-        on absolute query positions with KV validity ``slot < nonpad_kv_seqlen``;
-        ``_apply_attention`` then pairs it with ``is_causal=0``. The
-        ``write_indices`` / ``nonpad_kv_seqlen`` graph inputs are shared across
-        all layers, so the first layer's cache state carries them.
+        When emitted, the bias is a ``(B, 1, S_q, max_seq_len)`` additive mask
+        keyed on absolute query positions with KV validity
+        ``slot < nonpad_kv_seqlen``; ``_apply_attention`` then pairs it with
+        ``is_causal=0``. The ``write_indices`` / ``nonpad_kv_seqlen`` graph
+        inputs are shared across all layers, so the first layer's cache state
+        carries them.
+
+        Args:
+            seq_len_source: An always-present ``[B, S_q, ...]`` tensor (e.g.
+                ``hidden_states``) whose dim 1 is the query length ``S_q``. Using
+                this instead of ``input_ids`` keeps the bias enabled for
+                ``inputs_embeds``-driven forwards (where ``input_ids`` is None).
         """
         if not flags.static_cache_bias or self._sliding_window is None:
             return None
@@ -107,12 +114,20 @@ class TextModel(nn.Module):
         first = past_key_values[0]
         if not isinstance(first, StaticCacheState):
             return None
-        if input_ids is None:
-            return None
 
-        # Static cache KV axis width is a concrete int: [B, max_seq, kv_hidden].
-        max_seq_len = int(first.key_cache.shape[1])
-        seq_len = op.Shape(input_ids, start=1, end=2)  # (1,) int64 == [S_q]
+        # Static cache KV axis width is a concrete int: [B, max_seq_len, kv_hidden].
+        # Guard against a symbolic dim, which would otherwise raise an opaque
+        # TypeError downstream. Static-cache always allocates a fixed width today.
+        max_seq_len = first.key_cache.shape[1]
+        if not isinstance(max_seq_len, int):
+            raise TypeError(
+                "static-cache bias requires a concrete key_cache KV dimension "
+                f"(axis 1), but got symbolic dim {max_seq_len!r}. The static "
+                "cache must be allocated with a fixed max_seq_len."
+            )
+        # S_q lives at dim 1 of both input_ids ([B, S_q]) and hidden_states
+        # ([B, S_q, hidden]), so the bias works for either forward entry point.
+        seq_len = op.Shape(seq_len_source, start=1, end=2)  # (1,) int64 == [S_q]
         return create_static_cache_attention_bias(
             op,
             write_indices=first.write_indices,
@@ -216,7 +231,9 @@ class TextModel(nn.Module):
                     attention_mask=attention_mask,
                 )
             else:
-                attention_bias = self._maybe_static_cache_bias(op, input_ids, past_key_values)
+                attention_bias = self._maybe_static_cache_bias(
+                    op, hidden_states, past_key_values
+                )
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)

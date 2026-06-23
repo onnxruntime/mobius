@@ -307,8 +307,14 @@ def create_static_cache_attention_bias(
             (e.g. ``op.Shape(input_ids, start=1, end=2)``); squeezed to a scalar
             internally.
         nonpad_kv_seqlen: ``[B]`` int64 count of valid cache slots *after* the
-            current chunk is scattered (``write_indices + S_q`` under the
-            bottom-right contract).
+            current chunk is scattered. The cross-repo invariant is
+            ``nonpad_kv_seqlen == write_indices + valid_token_count``, where
+            ``valid_token_count`` is the number of *unpadded* query tokens in the
+            chunk. This equals ``write_indices + S_q`` only when the chunk is
+            **unpadded** (``S_q`` is the padded chunk width). With intra-prompt
+            padding plus a sliding window, pad-token query rows can fall outside
+            every valid slot and become fully masked — see the fully-masked-row
+            behavior note in ``_apply_attention``.
         max_seq_len: Static width of the pre-allocated cache KV axis.
         sliding_window: Optional local-attention window; when set, a query at
             absolute position ``q`` attends slot ``k`` only if ``q - k < w``.

@@ -519,6 +519,115 @@ def test_nonpad_padding_clamp_matches_dense_reference():
     np.testing.assert_allclose(onnx_attn, ref, atol=1e-4, rtol=1e-4)
 
 
+def _fully_masked_query_rows(
+    *,
+    query_len: int,
+    write_idx: int,
+    nonpad: int,
+    sliding_window: int,
+    max_seq_len: int,
+) -> list[int]:
+    """Return the query-row indices that are fully masked (zero valid slots).
+
+    Mirrors ``_dense_reference``'s rule order (causal AND sliding window AND
+    padding validity, no block overlay) so a test can prove it genuinely
+    exercises the all-masked-row boundary instead of silently skipping it.
+    """
+    kv_slots = np.arange(max_seq_len)
+    empty_rows: list[int] = []
+    for t in range(query_len):
+        q_abs = write_idx + t
+        mask = q_abs >= kv_slots  # causal
+        mask &= (q_abs - kv_slots) < sliding_window  # local window
+        mask &= kv_slots < nonpad  # padding validity
+        if not mask.any():
+            empty_rows.append(t)
+    return empty_rows
+
+
+def test_fully_masked_row_stays_finite():
+    """Intra-prompt padding + sliding window can fully mask a pad-token row.
+
+    Counters the ``nonpad == write + S_q`` framing: ``S_q`` is the PADDED chunk
+    width, while ``nonpad == write + valid_token_count`` uses the UNPADDED count.
+    When the chunk carries trailing pad tokens (``nonpad < write + S_q``) AND a
+    sliding window is active, the high pad-token query rows can fall outside
+    every valid slot and become fully masked (all-``dtype.min`` bias row).
+
+    Unlike the other parity tests (which assert ``idx.size > 0`` via
+    ``_dense_reference`` and never reach this boundary), this test deliberately
+    drives the empty-row case and asserts the CPU MEA external-cache path keeps
+    the output FINITE (a finite mean-of-V row, not NaN, not exactly 0).
+
+    Scenario reproduces the reviewer's ORT 1.27 finding (``S_q=8, nonpad=3,
+    window=4`` → rows 6-7 have zero valid slots and stay finite). This is an
+    observed ORT-version behavior (verified on 1.27), not a permanent op-spec
+    guarantee — see the note in ``_apply_attention``.
+    """
+    query_len, write_idx, nonpad = 8, 0, 3
+
+    # Prove the config genuinely produces fully-masked rows (else the test would
+    # silently pass without exercising the boundary it claims to cover).
+    empty_rows = _fully_masked_query_rows(
+        query_len=query_len,
+        write_idx=write_idx,
+        nonpad=nonpad,
+        sliding_window=_SLIDING_WINDOW,
+        max_seq_len=_MAX_SEQ_LEN,
+    )
+    assert empty_rows == [6, 7], (
+        f"expected rows 6-7 fully masked for the reviewer's scenario, got {empty_rows}"
+    )
+
+    rng = np.random.default_rng(11)
+    q_hidden = _NUM_Q_HEADS * _HEAD_DIM
+    kv_hidden = _NUM_KV_HEADS * _HEAD_DIM
+    query = rng.standard_normal((_BATCH, query_len, q_hidden)).astype(np.float32)
+    key = rng.standard_normal((_BATCH, query_len, kv_hidden)).astype(np.float32)
+    value = rng.standard_normal((_BATCH, query_len, kv_hidden)).astype(np.float32)
+    key_cache = np.zeros((_BATCH, _MAX_SEQ_LEN, kv_hidden), dtype=np.float32)
+    value_cache = np.zeros((_BATCH, _MAX_SEQ_LEN, kv_hidden), dtype=np.float32)
+    write_indices = np.full((_BATCH,), write_idx, dtype=np.int64)
+    nonpad_kv_seqlen = np.full((_BATCH,), nonpad, dtype=np.int64)
+
+    model = _build_static_cache_bias_graph(
+        batch=_BATCH,
+        num_q_heads=_NUM_Q_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        max_seq_len=_MAX_SEQ_LEN,
+        query_len=query_len,
+        sliding_window=_SLIDING_WINDOW,
+        use_block_overlay=False,
+    )
+    session = OnnxModelSession(model)  # CPU EP (MEA external-cache path)
+    try:
+        out = session.run(
+            {
+                "query": query,
+                "key": key,
+                "value": value,
+                "key_cache": key_cache,
+                "value_cache": value_cache,
+                "write_indices": write_indices,
+                "nonpad_kv_seqlen": nonpad_kv_seqlen,
+            }
+        )
+    finally:
+        session.close()
+
+    attn_output = out["attn_output"]
+    # The core empirically-verified claim: even fully-masked rows stay finite
+    # (no NaN/Inf) on the CPU MEA path — the Flash zero-guard is not applied.
+    assert np.isfinite(attn_output).all(), (
+        "fully-masked query row produced NaN/Inf on the CPU MEA external-cache path"
+    )
+    for t in empty_rows:
+        assert np.isfinite(attn_output[:, t, :]).all(), (
+            f"fully-masked query row {t} is not finite"
+        )
+
+
 @pytest.mark.parametrize("sliding_window", [None, 2, 4])
 def test_prefill_sliding_window_variants(sliding_window):
     """Prefill parity across no-window and tight/loose sliding windows.

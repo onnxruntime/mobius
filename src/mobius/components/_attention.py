@@ -62,8 +62,8 @@ class StaticCacheState(NamedTuple):
     ``nonpad_kv_seqlen`` to indicate valid token counts.
 
     Fields:
-        key_cache: Pre-allocated key cache [B, max_seq, kv_hidden] 3D.
-        value_cache: Pre-allocated value cache [B, max_seq, kv_hidden] 3D.
+        key_cache: Pre-allocated key cache [B, max_seq_len, kv_hidden] 3D.
+        value_cache: Pre-allocated value cache [B, max_seq_len, kv_hidden] 3D.
         write_indices: Position to write new tokens [B] int64.
         nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
     """
@@ -119,10 +119,12 @@ def _apply_attention(
             unmasking encoded in the bias.
 
     Note:
-        Both paths default to ``is_causal=1`` on the Attention op, which
-        enables built-in causal masking. This means ``attn_mask`` should
-        encode only padding information (as a bool mask), not causality,
-        unless ``is_causal=0`` is passed explicitly.
+        This applies to the DYNAMIC cache path only. There, the Attention op
+        defaults to ``is_causal=1`` for built-in causal masking, so
+        ``attn_mask`` should encode only padding information (as a bool mask),
+        not causality, unless ``is_causal=0`` is passed explicitly. In STATIC
+        cache mode the incoming ``is_causal`` argument is ignored — causality
+        is derived from ``attn_mask`` presence (see above).
 
     Note:
         ``nonpad_kv_seqlen`` (input #6) is only valid in static cache mode
@@ -171,14 +173,19 @@ def _apply_attention(
         # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
         # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
         # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
-        # bias already encodes the same ``slot < nonpad`` validity, and with the
-        # contract-consistent feed (nonpad == write_indices + S_q) every query
-        # row keeps its own diagonal slot valid — so a fully-masked
-        # (all-``dtype.min``) row never arises in normal operation.  Even if one
-        # were forced (an out-of-contract feed), the CPU MEA path this bias mode
-        # uses does NOT apply the Flash zero-guard: it returns a finite
-        # mean-of-V row, not NaN and not exactly 0 (the zero guard is
-        # CUDA-Flash-specific).
+        # bias already encodes the same ``slot < nonpad`` validity.  The
+        # cross-repo invariant is ``nonpad == write_indices + valid_token_count``
+        # (the count of UNPADDED query tokens), which equals
+        # ``write_indices + S_q`` only when the chunk is unpadded — S_q is the
+        # PADDED chunk width.  When the chunk is unpadded, every query row keeps
+        # its own diagonal slot valid, so a fully-masked (all-``dtype.min``) row
+        # never arises.  With intra-prompt padding plus a sliding window,
+        # however, a pad-token query row CAN fall outside every valid slot and
+        # become fully masked.  In that case the CPU MEA path this bias mode uses
+        # does NOT apply the Flash zero-guard: it returns a finite mean-of-V row
+        # (not NaN, not exactly 0).  This finite-row behavior was empirically
+        # verified on ORT 1.27 CPU MEA; it is an observed ORT-version behavior,
+        # not a permanent op-spec invariant — see test_fully_masked_row_stays_finite.
         if attn_mask is not None:
             mask_arg, causal = attn_mask, 0
         else:
