@@ -35,7 +35,7 @@ Use this skill when:
 | Pattern | Recommended mask type |
 |---------|----------------------|
 | Simple causal-only | No mask — use `is_causal=1` (enables Flash) |
-| Sliding window (simple model) | Bool mask (precise, less memory) |
+| Sliding window (simple, GQA path) | GQA `local_window_size` (fast path); bool mask only if you must use ONNX Attention |
 | KV-shared layers | Float additive bias |
 | Mixed head_dim (e.g. Gemma4) | Float additive bias |
 | Padding + causal | `nonpad_kv_seqlens` or bool mask |
@@ -280,6 +280,13 @@ use custom per-layer `GQAContext`s instead.
 > cache. Also, the post-hoc GQA rewrite (`RotaryAttentionToGQA`) cannot
 > recover a window from an already-baked float mask, so sliding windows
 > must be set on the **direct** GQA path (GQAContext), not via the rewrite.
+>
+> Decode trade-off: a non-default `local_window_size != -1` disqualifies the
+> dedicated `seq==1` **XQA** decode kernel (which requires `local_window==-1`,
+> see the CUDA cascade table above), so windowed GQA decode falls back to
+> Flash-decode/MEA. This is still on the fast GQA path and is the correct
+> trade for models that genuinely need the window; do not set it on
+> full-attention models.
 
 ## Key takeaways for model builders
 

@@ -71,6 +71,25 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
     )
 
 
+def _resolve_sliding_window(config) -> int | None:
+    """Resolve the effective sliding-window size, honoring HF's enable gate.
+
+    Qwen2/Qwen3 keep a non-null ``sliding_window`` in the config even when the
+    window is disabled, signalling activation through the separate
+    ``use_sliding_window`` flag (HF's ``__post_init__`` nulls ``sliding_window``
+    when it is ``False``). A raw ``config.json`` fallback that bypasses
+    ``__post_init__`` would otherwise leak a window onto a model that does not
+    use one, so the gate must be re-applied here. ``use_sliding_window`` defaults
+    to ``True`` so models without the flag (e.g. Mistral) are unaffected.
+    """
+    window = getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
+    if window is None:
+        return None
+    if getattr(config, "use_sliding_window", True) is False:
+        return None
+    return window
+
+
 def _nested_rope_theta(rope_scaling: dict, key: str) -> float | None:
     """Extract rope_theta from a nested rope_scaling dict (e.g. Gemma3)."""
     sub = rope_scaling.get(key)
@@ -575,9 +594,7 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             no_rope_layers=getattr(config, "no_rope_layers", None),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(
-                getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
-            ),
+            sliding_window=_resolve_sliding_window(config),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),

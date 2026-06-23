@@ -5270,3 +5270,116 @@ class TestGQASlidingWindow:
         assert np.abs(f_a - f_b).max() > 1e-2, (
             "full-attention twin should be sensitive to the first token"
         )
+
+    def test_empty_layer_types_omits_local_window_size(self):
+        """An empty ``layer_types`` is not a valid uniform schedule.
+
+        ``all(... for t in [])`` is vacuously True, so an unhardened guard
+        would wrongly treat ``[]`` as uniform-sliding. The length check against
+        ``num_hidden_layers`` rejects it, leaving the window disabled.
+        """
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=[],
+            num_hidden_layers=2,
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+    def test_non_gqa_path_warns_on_uniform_window(self, caplog):
+        """Non-GQA (static-cache) export of a uniform-sliding model warns.
+
+        That path cannot represent the window, so the warning flags the
+        divergence from HuggingFace for sequences longer than the window.
+        """
+        import logging
+
+        from mobius.models.base import CausalLMModel
+
+        config = ArchitectureConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_type="default",
+            rope_theta=10000.0,
+            pad_token_id=0,
+            num_hidden_layers=2,
+            sliding_window=8,
+            dtype=ir.DataType.FLOAT,
+        )
+        module = CausalLMModel(config)
+        # Static cache feeds attention_mask=None, taking the non-GQA else
+        # branch that cannot express the window.
+        from mobius.tasks import CausalLMTask
+
+        task = CausalLMTask(static_cache=True, max_seq_len=128)
+        with caplog.at_level(logging.WARNING, logger="mobius.models.base"):
+            build_from_module(module, config, task=task, execution_provider="cpu")
+        assert "sliding window" in caplog.text
+
+    def test_partial_layer_types_omits_local_window_size(self):
+        """A ``layer_types`` shorter than the layer count is not uniform."""
+        gqa_nodes = self._build_gqa_decoder(
+            sliding_window=8,
+            layer_types=["sliding_attention"],
+            num_hidden_layers=2,
+        )
+        for node in gqa_nodes:
+            assert "local_window_size" not in node.attributes
+
+
+class TestResolveSlidingWindow:
+    """``from_transformers`` must honor HF's ``use_sliding_window`` gate.
+
+    Qwen2/Qwen3 keep a non-null ``sliding_window`` in the config even when the
+    window is disabled and signal activation via ``use_sliding_window``. A raw
+    ``config.json`` fallback bypasses HF's ``__post_init__`` (which would null
+    the field), so the gate is re-applied in ``_resolve_sliding_window``.
+    """
+
+    @staticmethod
+    def _cfg(**attrs):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            model_type="qwen2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+        )
+        defaults.update(attrs)
+        return SimpleNamespace(**defaults)
+
+    def test_disabled_window_is_nulled(self):
+        """``use_sliding_window=False`` drops a non-null ``sliding_window``."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(sliding_window=4096, use_sliding_window=False), "qwen2"
+        )
+        assert cfg.sliding_window is None
+
+    def test_enabled_window_is_kept(self):
+        """``use_sliding_window=True`` keeps the window."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(sliding_window=4096, use_sliding_window=True), "qwen2"
+        )
+        assert cfg.sliding_window == 4096
+
+    def test_window_without_flag_is_kept(self):
+        """Models without ``use_sliding_window`` (e.g. Mistral) are unaffected."""
+        cfg = ArchitectureConfig.from_transformers(
+            self._cfg(model_type="mistral", sliding_window=4096), "mistral"
+        )
+        assert cfg.sliding_window == 4096

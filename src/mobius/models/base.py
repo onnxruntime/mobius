@@ -13,6 +13,8 @@ Qwen2ForCausalLM structure.
 
 from __future__ import annotations
 
+import logging
+
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
@@ -37,6 +39,8 @@ from mobius.components import (
 )
 from mobius.components._attention import GQAContext
 from mobius.components._rotary_embedding import BaseRope, _MRopeBase
+
+logger = logging.getLogger(__name__)
 
 
 class TextModel(nn.Module):
@@ -146,6 +150,23 @@ class TextModel(nn.Module):
             # in Attention.forward() (which checks `if position_embeddings is not None`).
             position_embeddings = None
         else:
+            # This path (CPU fp32, DML, non-fused RoPE, mRoPE, static cache)
+            # builds at most a bool padding mask; it has no way to express a
+            # sliding window. Warn if the model expects one so the divergence
+            # from HuggingFace for sequences longer than the window is not
+            # silent. (For seq <= window the result is identical regardless.)
+            if self._gqa_local_window_size() > 0:
+                logger.warning(
+                    "Model declares a uniform sliding window "
+                    "(sliding_window=%s) but is being built through a non-GQA "
+                    "attention path (build dtype=%s); the exported graph uses "
+                    "full causal attention and will diverge from HuggingFace "
+                    "for sequences longer than the window. Build with a "
+                    "GQA-capable execution provider/dtype (e.g. CUDA or DML "
+                    "with float16/bfloat16) to apply the window.",
+                    getattr(self.config, "sliding_window", None),
+                    dtype,
+                )
             # NoPE models (e.g. NemotronH, GraniteMoeHybrid) have
             # ``rotary_emb = None`` because ``initialize_rope`` returned
             # ``None`` for ``config.rope_type is None``. Skip building
@@ -195,15 +216,25 @@ class TextModel(nn.Module):
         *uniform* sliding window across all layers. Models with alternating
         full/sliding layers (Gemma2/3/4, gpt-oss) use custom model classes with
         per-layer masks and do not take this path.
+
+        ``-1`` is ORT's documented sentinel for "no local window" (full causal
+        attention); it is returned whenever the window is absent, non-positive,
+        or cannot be represented by a single global window.
         """
         sliding_window = getattr(self.config, "sliding_window", None)
-        if sliding_window is None or sliding_window <= 0:
+        if not sliding_window or sliding_window <= 0:
             return -1
-        # Mixed schedules (some "full_attention", some "sliding_attention")
-        # cannot be expressed by one global window — leave it disabled.
+        # A single global window can only stand in for the per-layer schedule
+        # when every layer slides. Treat an empty, partial, or mixed
+        # ``layer_types`` (some "full_attention", some "sliding_attention") as
+        # non-uniform and leave the window disabled.
         layer_types = getattr(self.config, "layer_types", None)
-        if layer_types is not None and any(t != "sliding_attention" for t in layer_types):
-            return -1
+        if layer_types is not None:
+            num_layers = getattr(self.config, "num_hidden_layers", None)
+            if len(layer_types) != num_layers or any(
+                t != "sliding_attention" for t in layer_types
+            ):
+                return -1
         return int(sliding_window)
 
 
