@@ -18,6 +18,7 @@ import onnx_ir as ir
 import onnxruntime as ort
 import onnxruntime_easy as ort_easy
 
+from mobius._builder import _graph_requires_opset24
 from mobius._flags import flags
 from mobius._model_package import ModelPackage
 
@@ -106,10 +107,13 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
     target device is non-CPU with a default-domain opset exceeding
     ``_MAX_EP_OPSET``.
 
-    Lowering is *not* safe when the graph contains ops that were first
-    introduced in a post-23 opset (e.g. ``TensorScatter``).  In that
-    case the model requires genuine opset 24+ support and lowering
-    would produce an invalid model.
+    Lowering is *not* safe when the graph uses opset-24-only semantics that
+    have no opset 23 equivalent — a ``TensorScatter`` node, or an ``Attention``
+    node consuming a non-empty ``nonpad_kv_seqlen`` input (the static-cache
+    Flash path).  In that case the model genuinely requires opset 24+ and
+    lowering would produce an invalid model.  Detection is delegated to
+    :func:`mobius._builder._graph_requires_opset24`, which scans recursively
+    (including control-flow subgraphs) so both opset-24 gates agree.
     """
     if not flags.ort_lower_opset_for_ep:
         return False
@@ -119,12 +123,8 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
     if current_opset <= _MAX_EP_OPSET:
         return False
 
-    # Ops that were *introduced* in opset 24 and have no opset 23
-    # equivalent.  If any appear in the graph, lowering is unsafe.
-    opset_24_only_ops = {"TensorScatter"}
-    for node in model.graph:
-        if node.domain == "" and node.op_type in opset_24_only_ops:
-            return False
+    if _graph_requires_opset24(model.graph):
+        return False
     return True
 
 
