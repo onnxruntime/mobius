@@ -3765,6 +3765,36 @@ class TestBuildMoshiLM:
         assert "text_logits" in outputs
         assert "present.0.key" in outputs
 
+    def test_temporal_gqa_emits_sliding_window(self):
+        """Temporal GQA nodes carry Moshi's sliding window as local_window_size.
+
+        On the GQA (fp16/cuda) path, the temporal transformer's uniform sliding
+        window (Moshi ``context``) must reach every GroupQueryAttention node as
+        ``local_window_size``.  PersonaPlex deploys this fp16 path, so without it
+        long streams would silently run full causal attention.
+        """
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius.models.moshi import MoshiTemporalModel, moshi_temporal_config
+        from mobius.tasks import MoshiTemporalTask
+
+        full_window = moshi_temporal_config().sliding_window
+        assert full_window and full_window > 0, "Moshi temporal must be sliding"
+
+        config = dataclasses.replace(self._temporal_tiny_config(), dtype=ir.DataType.FLOAT16)
+        pkg = build_from_module(
+            MoshiTemporalModel(config),
+            config,
+            task=MoshiTemporalTask(),
+            execution_provider="cuda",
+        )
+        gqa_nodes = [n for n in pkg["model"].graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+        for node in gqa_nodes:
+            assert node.attributes["local_window_size"].value == full_window
+
     def test_depformer_io(self):
         """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
         from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
@@ -5118,16 +5148,16 @@ class TestGQASlidingWindow:
     """
 
     @staticmethod
-    def _build_gqa_decoder(**overrides):
+    def _build_gqa_model(**overrides):
         from mobius.models.base import CausalLMModel
 
+        overrides.setdefault("num_hidden_layers", 2)
         config = ArchitectureConfig(
             hidden_size=64,
             intermediate_size=128,
             num_attention_heads=4,
             num_key_value_heads=2,
             head_dim=16,
-            num_hidden_layers=2,
             vocab_size=256,
             max_position_embeddings=128,
             hidden_act="silu",
@@ -5140,11 +5170,27 @@ class TestGQASlidingWindow:
         )
         module = CausalLMModel(config)
         # execution_provider="cuda" + fp16 activates the direct GQA path.
-        pkg = build_from_module(module, config, execution_provider="cuda")
-        model = pkg["model"]
+        return build_from_module(module, config, execution_provider="cuda")["model"]
+
+    @classmethod
+    def _build_gqa_decoder(cls, **overrides):
+        model = cls._build_gqa_model(**overrides)
         gqa_nodes = [n for n in model.graph if n.op_type == "GroupQueryAttention"]
         assert gqa_nodes, "expected GroupQueryAttention nodes on the cuda/fp16 path"
         return gqa_nodes
+
+    @staticmethod
+    def _fill_fp16_weights(model, seed):
+        """Deterministically fill uninitialised params, honouring fp16 dtype."""
+        rng = np.random.default_rng(seed)
+        npdt = {ir.DataType.FLOAT16: np.float16, ir.DataType.FLOAT: np.float32}
+        for init in model.graph.initializers.values():
+            if init.const_value is None:
+                shape = [int(d) for d in init.shape]
+                arr = (rng.standard_normal(shape) * 0.1).astype(
+                    npdt.get(init.dtype, np.float32)
+                )
+                init.const_value = ir.Tensor(arr)
 
     def test_uniform_sliding_window_sets_local_window_size(self):
         """A uniform sliding window is forwarded to every GQA node verbatim."""
@@ -5175,3 +5221,52 @@ class TestGQASlidingWindow:
         )
         for node in gqa_nodes:
             assert node.attributes["local_window_size"].value == 8
+
+    def test_window_confines_receptive_field(self):
+        """The sliding window must actually bound each query's receptive field.
+
+        Property test (no golden, weight-agnostic): with window ``W`` over
+        ``L`` layers, the last position can only be influenced by inputs within
+        ``L*(W-1)`` steps. Perturbing an out-of-window token must leave the
+        windowed model's last-position logits unchanged, while the same
+        perturbation *does* change the full-attention twin's logits — proving
+        the window is genuinely applied (and exercising seq > window, unlike
+        the short-sequence Moshi parity golden). Runs the fp16 GQA op on CPU.
+        """
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        window, seq, layers = 4, 24, 2
+        # Pos 0 is well outside the last position's receptive field
+        # (layers*(window-1) = 6 << seq-1 = 23).
+        windowed = self._build_gqa_model(sliding_window=window, num_hidden_layers=layers)
+        full = self._build_gqa_model(sliding_window=None, num_hidden_layers=layers)
+        # Same seed + identical structure (only the GQA attr differs) => same weights.
+        self._fill_fp16_weights(windowed, seed=1234)
+        self._fill_fp16_weights(full, seed=1234)
+
+        def feeds(first_token):
+            ids = np.arange(1, seq + 1, dtype=np.int64).reshape(1, seq)
+            ids[0, 0] = first_token
+            f = {"input_ids": ids, "attention_mask": np.ones((1, seq), np.int64)}
+            for i in range(layers):
+                f[f"past_key_values.{i}.key"] = np.zeros((1, 2, 0, 16), np.float16)
+                f[f"past_key_values.{i}.value"] = np.zeros((1, 2, 0, 16), np.float16)
+            return f
+
+        def last_logits(model, first_token):
+            sess = OnnxModelSession(model)
+            out = sess.run(feeds(first_token))
+            return out["logits"][0, -1].astype(np.float32)
+
+        # Windowed: perturbing the out-of-window first token leaves the last
+        # position's logits unchanged.
+        w_a = last_logits(windowed, first_token=5)
+        w_b = last_logits(windowed, first_token=200)
+        np.testing.assert_allclose(w_a, w_b, atol=1e-3)
+
+        # Full attention: the same perturbation DOES reach the last position.
+        f_a = last_logits(full, first_token=5)
+        f_b = last_logits(full, first_token=200)
+        assert np.abs(f_a - f_b).max() > 1e-2, (
+            "full-attention twin should be sensitive to the first token"
+        )
