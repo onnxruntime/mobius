@@ -215,9 +215,17 @@ class TextModel(nn.Module):
             #
             # seqlens_k[b] = sum(attention_mask[b]) - 1 = last valid KV index.
             # total_seq_len = attention_mask.shape[1] = past + current len.
+            #
+            # For WebGPU EP with graph capture, cast attention_mask to INT32
+            # before ReduceSum to avoid INT64 ops which are not natively
+            # supported and may cause CPU fallback.
+            if caps.enable_graph_capture:
+                attention_mask_for_gqa = op.Cast(attention_mask, to=ir.DataType.INT32)
+            else:
+                attention_mask_for_gqa = attention_mask
             one_i32 = op.Constant(value_int=1)
             seqlens_k = op.Cast(
-                op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i32),
+                op.Sub(op.ReduceSum(attention_mask_for_gqa, [1], keepdims=0), one_i32),
                 to=ir.DataType.INT32,
             )  # [batch] INT32
             total_seq_len = op.Cast(
