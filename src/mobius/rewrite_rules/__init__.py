@@ -35,6 +35,7 @@ __all__ = [
     "layer_norm_fusion_rules",
     "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
+    "reshape_rank4_rmsnorm_rules",
     "separate_rope_rules",
     "skip_layer_norm_rules",
     "skip_norm_rules",
@@ -51,6 +52,7 @@ from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
 from mobius.rewrite_rules._packed_attention import packed_attention_rules
+from mobius.rewrite_rules._reshape_rmsnorm import reshape_rank4_rmsnorm_rules
 from mobius.rewrite_rules._separate_rope import separate_rope_rules
 from mobius.rewrite_rules._skip_layer_norm import skip_layer_norm_rules
 from mobius.rewrite_rules._skip_norm import skip_norm_rules
