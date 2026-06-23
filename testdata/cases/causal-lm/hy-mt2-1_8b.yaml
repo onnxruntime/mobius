@@ -1,0 +1,28 @@
+model_id: "tencent/Hy-MT2-1.8B"
+model_type: "hunyuan_v1_dense"
+revision: "9a341cd1b679d3efd23b46e847b01745a71ed792"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "<｜hy_begin▁of▁sentence｜><｜hy_User｜>Translate the following Chinese text to English: 黄河之水天上来<｜hy_Assistant｜>"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 16
+  do_sample: false
+  eos_token_id: 120020  # <｜hy_place▁holder▁no▁2｜>, the HF generation_config EOS
+
+notes: |
+  Tencent Hy-MT2 1.8B multilingual translation model (HunYuanDenseV1
+  architecture: GQA 16/4 heads, head_dim 128, QK-norm, tied embeddings,
+  dynamic-NTK RoPE with alpha=1000). Same architecture family as the
+  hy-mt1_5-1_8b case but the newer (2026.5) Hy-MT2 weights, so L4 prefill
+  logits and L5 greedy generation are meaningful end-to-end checks.
+
+  The prompt is pre-formatted with the Hy-MT chat template
+  (<｜hy_begin▁of▁sentence｜><｜hy_User｜>...<｜hy_Assistant｜>) because
+  generate_golden.py does not apply chat templates for causal-lm cases —
+  feeding the raw instruction directly causes the model to hallucinate.
