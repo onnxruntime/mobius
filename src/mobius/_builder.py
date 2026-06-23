@@ -213,27 +213,93 @@ def build_from_module(
             trace=trace_optimization,
         )
 
-    # Lower default-domain opset from 24 to 23 when the target EP doesn't
-    # register opset 24 kernels for standard ops (Reshape, RMSNormalization,
-    # etc.). Without this, those ops fall to CPU and produce ~280 memcpy
-    # nodes that destroy performance. The flag defaults to True; set
-    # MOBIUS_ORT_LOWER_OPSET_FOR_EP=0 to disable for EPs that support
-    # opset 24 natively.
-    if flags.ort_lower_opset_for_ep and execution_provider != "default":
-        for name, model in pkg.items():
-            if "" in model.graph.opset_imports:
-                original = model.graph.opset_imports[""]
-                model.graph.opset_imports[""] = 23
-                logger.warning(
-                    "Lowered opset %d→23 for '%s' (EP=%s). "
-                    "ORT does not yet register opset %d kernels for this EP. "
-                    "Track https://github.com/microsoft/onnxruntime/issues/27729",
-                    original,
-                    name,
-                    execution_provider,
-                    original,
-                )
+    _maybe_apply_opset_lowering(pkg, execution_provider)
     return pkg
+
+
+# Attention input index for the optional ``nonpad_kv_seqlen`` operand. This
+# operand (external/static KV cache length) and the TensorScatter op are
+# defined only in opset 24, so a graph using either must not declare opset 23.
+_ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX = 6
+
+
+def _maybe_apply_opset_lowering(pkg: ModelPackage, execution_provider: str) -> None:
+    """Lower the default-domain opset from 24 to 23 where it is safe to do so.
+
+    Some EPs (older ORT builds) don't register opset 24 kernels for standard
+    ops (Reshape, RMSNormalization, etc.). Without lowering, those ops fall to
+    CPU and produce ~280 memcpy nodes that destroy performance. The
+    ``MOBIUS_ORT_LOWER_OPSET_FOR_EP`` flag (default False) opts a deployment
+    into the lowering; it is a no-op for the ``"default"`` and ``"cpu"`` EPs
+    (the CPU EP already has opset-24 kernels), matching the inference-side gate
+    ``ort_inference._should_lower_opset``.
+
+    Any sub-model that uses opset-24-only semantics (TensorScatter, or
+    Attention with a non-empty input #6 ``nonpad_kv_seqlen``) is left at opset
+    24: declaring opset 23 on such a graph is invalid and would strip the
+    static-cache Flash path. See :func:`_graph_requires_opset24`. The decision
+    is made per sub-model, so a mixed package lowers its standard sub-models
+    while preserving its static-cache sub-models.
+    """
+    if not flags.ort_lower_opset_for_ep:
+        return
+    # Mirror ort_inference._should_lower_opset: the "default" EP is a no-op, and
+    # the CPU EP already registers opset-24 kernels, so lowering there is both
+    # unnecessary and inconsistent with the inference-side gate.
+    if execution_provider in ("default", "cpu"):
+        return
+    for name, model in pkg.items():
+        if "" not in model.graph.opset_imports:
+            continue
+        if _graph_requires_opset24(model.graph):
+            logger.info(
+                "Skipped opset→23 lowering for '%s' (EP=%s): graph uses "
+                "opset-24-only ops (TensorScatter / Attention nonpad_kv_seqlen). "
+                "Preserving opset 24 to keep the static-cache Flash path valid.",
+                name,
+                execution_provider,
+            )
+            continue
+        original = model.graph.opset_imports[""]
+        model.graph.opset_imports[""] = 23
+        logger.warning(
+            "Lowered opset %d→23 for '%s' (EP=%s). "
+            "ORT does not yet register opset %d kernels for this EP. "
+            "Track https://github.com/microsoft/onnxruntime/issues/27729",
+            original,
+            name,
+            execution_provider,
+            original,
+        )
+
+
+def _graph_requires_opset24(graph: ir.Graph) -> bool:
+    """Return True if the graph uses opset-24-only default-domain semantics.
+
+    Lowering the default-domain opset import to 23 on such a graph is invalid
+    and would silently break the static-cache Flash-attention path. A graph
+    requires opset 24 when it contains:
+
+    - a ``TensorScatter`` node (default domain), or
+    - an ``Attention`` node consuming a non-empty input #6 (``nonpad_kv_seqlen``).
+
+    The scan is recursive: nodes nested inside ``If``/``Loop``/``Scan``
+    subgraphs are inspected too, so a future graph that buries one of these ops
+    in a control-flow body is still detected.
+    """
+    for node in ir.traversal.RecursiveGraphIterator(graph):
+        if node.domain not in ("", "ai.onnx"):
+            continue
+        if node.op_type == "TensorScatter":
+            return True
+        if node.op_type == "Attention":
+            inputs = node.inputs
+            if (
+                len(inputs) > _ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX
+                and inputs[_ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX] is not None
+            ):
+                return True
+    return False
 
 
 def build(
