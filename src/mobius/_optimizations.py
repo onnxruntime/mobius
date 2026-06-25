@@ -63,8 +63,8 @@ from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     gelu_fusion_rules,
     group_query_attention_rules,
+    htp_rank4_rmsnorm_rules,
     pack_qkv_for_gqa_rules,
-    reshape_rank4_rmsnorm_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
@@ -313,9 +313,9 @@ def _get_optimization_passes(
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
 
-    # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for EPs that miscompute it (QNN).
+    # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
     if not caps.supports_rank4_rmsnorm:
-        lower.append(("ReshapeRank4RMSNorm", list(reshape_rank4_rmsnorm_rules())))
+        lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
 
     return fuse, lower
 

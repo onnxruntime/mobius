@@ -69,7 +69,7 @@ class EpCapabilities:
             Leave ``True`` for CUDA / DML EPs that ship the native kernel.
         supports_rank4_rmsnorm: ``False`` reshapes rank-4 ``RMSNormalization``
             (query/key norm over the head dimension) to rank-3 and back via
-            ReshapeRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
+            HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).

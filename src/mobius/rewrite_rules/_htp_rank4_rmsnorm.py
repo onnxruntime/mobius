@@ -1,7 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Rewrite rule for lowering rank-4 RMSNormalization to rank-3.
+"""Qualcomm Hexagon HTP rewrite rule for lowering rank-4 RMSNormalization to rank-3.
+
+This is an HTP-hardware workaround, not a generic transform: it is only applied
+for the QNN HTP (``supports_rank4_rmsnorm=False``), which miscomputes rank-4
+RMSNormalization. Other EPs compute it correctly and leave the op unchanged.
 
 Models with query/key normalization (e.g. Gemma-4, Qwen3) apply
 ``RMSNormalization`` over the head dimension of a rank-4 tensor shaped
@@ -22,11 +26,11 @@ These rules are applied automatically by
 RMSNormalization (``supports_rank4_rmsnorm=False``; QNN). They can also be
 applied manually::
 
-    from mobius.rewrite_rules import reshape_rank4_rmsnorm_rules
+    from mobius.rewrite_rules import htp_rank4_rmsnorm_rules
     from onnxscript.rewriter import rewrite
 
     model = build("google/gemma-4-12B-it", execution_provider="qnn")
-    rewrite(model, pattern_rewrite_rules=reshape_rank4_rmsnorm_rules())
+    rewrite(model, pattern_rewrite_rules=htp_rank4_rmsnorm_rules())
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from onnxscript.rewriter._basics import MatchResult
 from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleSet
 
 
-class Rank4RMSNormToRank3(RewriteRuleClassBase):
+class HtpRank4RMSNormToRank3(RewriteRuleClassBase):
     """Reshape a rank-4 RMSNormalization (norm over the last axis) to rank-3.
 
     **Matched pattern:**
@@ -90,7 +94,7 @@ class Rank4RMSNormToRank3(RewriteRuleClassBase):
         return op.Reshape(normed, op.Constant(value_ints=[0, -1, heads, head_dim]))
 
 
-def reshape_rank4_rmsnorm_rules() -> RewriteRuleSet:
+def htp_rank4_rmsnorm_rules() -> RewriteRuleSet:
     """Return rules that reshape rank-4 RMSNormalization to rank-3.
 
     Used for the QNN HTP, which miscomputes RMSNormalization over the last
@@ -98,6 +102,6 @@ def reshape_rank4_rmsnorm_rules() -> RewriteRuleSet:
     exact.
 
     Returns:
-        :class:`RewriteRuleSet` containing the :class:`Rank4RMSNormToRank3` rule.
+        :class:`RewriteRuleSet` containing the :class:`HtpRank4RMSNormToRank3` rule.
     """
-    return RewriteRuleSet([Rank4RMSNormToRank3().rule()])
+    return RewriteRuleSet([HtpRank4RMSNormToRank3().rule()])

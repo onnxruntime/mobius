@@ -11,7 +11,7 @@ from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
 from mobius._constants import OPSET_VERSION
-from mobius.rewrite_rules import reshape_rank4_rmsnorm_rules
+from mobius.rewrite_rules import htp_rank4_rmsnorm_rules
 from mobius.rewrite_rules._testing_utils import count_ops
 
 
@@ -39,9 +39,9 @@ def _run(model: ir.Model, x: np.ndarray) -> np.ndarray:
     return sess.run(["y"], {"x": x})[0]
 
 
-class TestReshapeRank4RMSNorm:
+class TestHtpRank4RMSNorm:
     def test_rules_returns_rule_set(self):
-        assert isinstance(reshape_rank4_rmsnorm_rules(), RewriteRuleSet)
+        assert isinstance(htp_rank4_rmsnorm_rules(), RewriteRuleSet)
 
     def test_reshapes_rank4_and_is_numerically_exact(self):
         # (batch, seq, heads, head_dim) — the query/key-norm shape.
@@ -49,7 +49,7 @@ class TestReshapeRank4RMSNorm:
         x = np.random.default_rng(1).standard_normal((1, 3, 4, 8)).astype(np.float32)
         before = _run(model, x)
 
-        rewrite(model, pattern_rewrite_rules=reshape_rank4_rmsnorm_rules())
+        rewrite(model, pattern_rewrite_rules=htp_rank4_rmsnorm_rules())
 
         counts = count_ops(model)
         assert counts["RMSNormalization"] == 1  # still one norm, now over a rank-3 tensor
@@ -61,7 +61,7 @@ class TestReshapeRank4RMSNorm:
     def test_rank3_rmsnorm_untouched(self):
         # A hidden-state RMSNorm is rank-3 and must not be rewritten.
         model = _rmsnorm_model([1, 3, 8])
-        rewrite(model, pattern_rewrite_rules=reshape_rank4_rmsnorm_rules())
+        rewrite(model, pattern_rewrite_rules=htp_rank4_rmsnorm_rules())
         counts = count_ops(model)
         assert counts.get("Reshape", 0) == 0
         assert counts["RMSNormalization"] == 1
