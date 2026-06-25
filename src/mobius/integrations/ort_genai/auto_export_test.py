@@ -489,6 +489,36 @@ class TestWriteOrtGenaiConfigLocalDir:
         mock_hf.assert_called_once()
         mock_local.assert_not_called()
 
+    def test_local_hf_model_id_uses_local_tokenizer_copy(self, tmp_path):
+        """A local hf_model_id should copy tokenizer files locally, not call the Hub."""
+        src = tmp_path / "local_model"
+        src.mkdir()
+        (src / "config.json").write_text(
+            '{"model_type": "llama", "bos_token_id": 1, "eos_token_id": 2}'
+        )
+        (src / "tokenizer.json").write_text('{"local": true}')
+
+        out = tmp_path / "output"
+        out.mkdir()
+        pkg = self._make_pkg()
+
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_hub_copy,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files_from_local",
+                wraps=_copy_tokenizer_files_from_local,
+            ) as mock_local_copy,
+        ):
+            result = write_ort_genai_config(pkg, str(out), hf_model_id=str(src))
+
+        mock_hub_copy.assert_not_called()
+        mock_local_copy.assert_called_once_with(str(src), str(out))
+        assert "tokenizer.json" in result
+        assert (out / "tokenizer.json").read_text() == '{"local": true}'
+
 
 class TestExportForOrtGenai:
     """Unit tests for write_ort_genai_config()."""
@@ -543,7 +573,7 @@ class TestExportForOrtGenai:
             },
             config=FakeConfig(),
         )
-        result = write_ort_genai_config(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
 
         assert "processor_config" in result
         assert os.path.isfile(result["processor_config"])
@@ -556,6 +586,57 @@ class TestExportForOrtGenai:
         # Verify resize uses config values
         resize = transforms[2]["operation"]["attrs"]
         assert resize["patch_size"] == 14
+
+    def test_qwen3_vl_writes_qwen3_vl_model_type_and_vision_fields(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 64
+            model_type: str | None = None
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_vl"
+            vocab_size: int = 151936
+            hidden_size: int = 2048
+            num_hidden_layers: int = 1
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 151655
+            vision_start_token_id: int = 151652
+            video_token_id: int = 151656
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": mock.MagicMock(),
+                "vision_encoder": mock.MagicMock(),
+                "embedding": mock.MagicMock(),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        model = data["model"]
+        assert model["type"] == "qwen3_vl"
+        assert model["vision_start_token_id"] == 151652
+        assert model["video_token_id"] == 151656
+        assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
+        assert model["vision"]["patch_size"] == 16
+        assert model["vision"]["window_size"] == 64
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
