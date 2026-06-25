@@ -1,7 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Quantized linear layer using MatMulNBits (com.microsoft domain)."""
+"""Quantized linear and embedding layers (com.microsoft domain).
+
+``QuantizedLinear`` uses ``MatMulNBits``; ``QuantizedEmbedding`` uses
+``GatherBlockQuantized``.
+"""
 
 from __future__ import annotations
 
@@ -126,6 +130,102 @@ class QuantizedLinear(nn.Module):
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result
+
+
+class QuantizedEmbedding(nn.Module):
+    """Embedding backed by the GatherBlockQuantized custom op.
+
+    Looks up rows of a block-wise quantized embedding table and dequantizes
+    the gathered rows inside a single fused kernel.  Replaces a standard
+    :class:`~mobius.components.Embedding` for weight-only quantized models
+    whose embedding table is quantized (e.g. Olive RTN exports with
+    ``embeds: true``).
+
+    Uses the uint8-packed layout shared with Olive/ORT exports
+    (``gather_axis=0``)::
+
+        qweight:     [num_embeddings, embedding_dim * bits // 8]  uint8
+        scales:      [num_embeddings, embedding_dim // block_size]
+        zero_points: [num_embeddings, ceil(n_blocks * bits / 8)]  uint8 (optional)
+
+    The op dequantizes each gathered row block-wise as
+    ``(q - zero_point) * scale``.  The output dtype matches ``scales``
+    (the model compute dtype), so the gathered embeddings drop straight
+    into the decoder.
+
+    Args:
+        num_embeddings: Vocabulary size (gather axis).
+        embedding_dim: Embedding dimension (quantized axis).
+        bits: Quantization bit-width (2, 4, or 8).
+        block_size: Number of elements per quantization group.
+        has_zero_point: Whether asymmetric zero-points are used.
+        padding_idx: Optional padding index (stored for parity; the Gather
+            does not special-case it, matching ``Embedding``).
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+        padding_idx: int | None = None,
+    ):
+        super().__init__()
+        if bits not in (2, 4, 8):
+            raise ValueError(f"bits must be 2, 4, or 8, got {bits}")
+        if block_size < 16 or (block_size & (block_size - 1)):
+            raise ValueError(f"block_size must be a power of 2 >= 16, got {block_size}")
+        if embedding_dim % block_size != 0:
+            raise ValueError(
+                f"embedding_dim ({embedding_dim}) must be divisible by "
+                f"block_size ({block_size})"
+            )
+
+        self._bits = bits
+        self._block_size = block_size
+        self.padding_idx = padding_idx
+
+        n_blocks = embedding_dim // block_size
+        packed = embedding_dim * bits // 8
+
+        # Packed quantized embedding table (uint8); rows gathered by token id.
+        self.qweight = nn.Parameter([num_embeddings, packed], dtype=ir.DataType.UINT8)
+        # Per-block scales (FLOAT here; cast to the model dtype before build).
+        self.scales = nn.Parameter([num_embeddings, n_blocks])
+        # Optional bit-packed uint8 zero-points (same packing as the weights).
+        if has_zero_point:
+            self.zero_points = nn.Parameter(
+                [num_embeddings, math.ceil(n_blocks * bits / 8)],
+                dtype=ir.DataType.UINT8,
+            )
+        else:
+            self.zero_points = None
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        """Gather and dequantize embedding rows for ``input_ids``.
+
+        Args:
+            op: ONNX op builder.
+            input_ids: Integer indices of any shape ``[*]``.
+
+        Returns:
+            Dequantized embeddings of shape ``[*, embedding_dim]`` with the
+            same dtype as ``scales``.
+        """
+        inputs: list[ir.Value | None] = [self.qweight, input_ids, self.scales]
+        if self.zero_points is not None:
+            inputs.append(self.zero_points)
+
+        return op.GatherBlockQuantized(
+            *inputs,
+            bits=self._bits,
+            block_size=self._block_size,
+            gather_axis=0,
+            quantize_axis=1,
+            _domain=_MICROSOFT_DOMAIN,
+        )
 
 
 def make_quantized_linear_factory(

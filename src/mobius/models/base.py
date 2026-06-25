@@ -23,6 +23,7 @@ from mobius._flags import flags
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    preprocess_olive_weights,
     tie_word_embeddings,
 )
 from mobius.components import (
@@ -31,6 +32,7 @@ from mobius.components import (
     FusedGateUpMLP,
     LayerNorm,
     Linear,
+    QuantizedEmbedding,
     RMSNorm,
     create_padding_mask,
     create_static_cache_attention_bias,
@@ -66,6 +68,17 @@ class TextModel(nn.Module):
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
+        if qc is not None and getattr(qc, "quantize_embeddings", False):
+            # Olive RTN (embeds: true) quantizes the embedding table; look it
+            # up with GatherBlockQuantized instead of a plain Gather.
+            self.embed_tokens = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                padding_idx=config.pad_token_id,
+            )
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
@@ -272,10 +285,31 @@ class CausalLMModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        qc = getattr(config, "quantization", None)
+        quantize_lm_head = qc is not None and getattr(qc, "quantize_lm_head", False)
+        if quantize_lm_head:
+            # Olive RTN (lm_head: true) quantizes the LM head projection.
+            zp_dtype = (
+                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+            )
+            lm_head_class = make_quantized_linear_factory(
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                zero_point_dtype=zp_dtype,
+            )
+            self.lm_head = lm_head_class(config.hidden_size, config.vocab_size, bias=False)
+        else:
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
         # Share a single ONNX initializer: lm_head and embed_tokens point to
         # the same nn.Parameter so only one ir.Value appears in the graph.
-        if config.tie_word_embeddings:
+        # Only valid when both are unquantized (plain float weight tensors);
+        # quantized embed/head use different packed layouts and are tied at
+        # weight-loading time instead (see preprocess_olive_weights).
+        embed_quantized = qc is not None and getattr(qc, "quantize_embeddings", False)
+        if config.tie_word_embeddings and not quantize_lm_head and not embed_quantized:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -308,6 +342,17 @@ class CausalLMModel(nn.Module):
         elif qc is not None and qc.quant_method == "awq":
             state_dict = preprocess_awq_weights(
                 state_dict, bits=qc.bits, group_size=qc.group_size
+            )
+        elif qc is not None and qc.quant_method == "olive":
+            # Olive-packed weights: also handles quantized embed/lm_head and
+            # the tied-head synthesis, so return directly.
+            return preprocess_olive_weights(
+                state_dict,
+                bits=qc.bits,
+                group_size=qc.group_size,
+                quantize_embeddings=getattr(qc, "quantize_embeddings", False),
+                quantize_lm_head=getattr(qc, "quantize_lm_head", False),
+                tie_word_embeddings=self.config.tie_word_embeddings,
             )
         if self.config.tie_word_embeddings:
             # Ensure both embed_tokens.weight and lm_head.weight are present so

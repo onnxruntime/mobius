@@ -662,22 +662,77 @@ def preprocess_olive_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
     group_size: int = 128,
+    quantize_embeddings: bool = False,
+    quantize_lm_head: bool = False,
+    tie_word_embeddings: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Rename and reshape Olive-packed quantized weights for MatMulNBits.
+    """Rename and reshape Olive-packed quantized weights.
 
-    Olive stores quantized linear weights with uint8 packing:
+    Olive stores quantized weights with uint8 packing:
       - ``*.qweight``: [N, packed_K] uint8
       - ``*.scales``: [N, n_blocks]
-      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, for asymmetric quantization
+      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, asymmetric only
 
-    MatMulNBits expects ``weight`` as [N, n_blocks, blob_size], while scales and
-    zero-points already match the expected orientation.
+    Linear projections target ``MatMulNBits``, which expects ``weight`` as
+    [N, n_blocks, blob_size]; scales and zero-points already match the
+    expected orientation, so they are renamed but not transposed.
+
+    The input embedding table (``*.embed_tokens.qweight``) instead targets
+    ``GatherBlockQuantized``, which consumes the **2-D** uint8 ``qweight``
+    directly — so it is kept as-is (only ``qzeros`` is renamed to
+    ``zero_points``).
+
+    Tied LM head: Olive RTN drops ``lm_head.*`` when
+    ``tie_word_embeddings`` is set. When ``quantize_lm_head`` is requested,
+    the MatMulNBits ``lm_head`` weights are synthesised from the quantized
+    embedding table (same packed bytes, reshaped to 3-D). Otherwise, when
+    the embedding stays float, the standard float tie is applied.
+
+    Args:
+        state_dict: Model state dict with Olive quantization keys.
+        bits: Quantization bit-width (typically 4).
+        group_size: Number of elements per quantization group.
+        quantize_embeddings: Whether the embedding table is quantized.
+        quantize_lm_head: Whether the LM head is quantized.
+        tie_word_embeddings: Whether embedding and LM head share weights.
+
+    Returns:
+        State dict with renamed, reshaped (and, for tied heads, synthesised)
+        weights.
     """
     blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
 
+    # Captured quantized-embedding tensors, used to synthesise a tied head.
+    embed_qweight: torch.Tensor | None = None
+    embed_scales: torch.Tensor | None = None
+    embed_zero_points: torch.Tensor | None = None
+
     for key, value in state_dict.items():
-        if key.endswith(".qweight"):
+        if key.endswith("embed_tokens.qweight"):
+            # GatherBlockQuantized consumes the 2-D uint8 table directly.
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qweight must be uint8 for {key}, got {value.dtype}"
+                )
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive embedding qweight packed dimension for {key} "
+                    f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
+                )
+            embed_qweight = value
+            result[key] = value.contiguous()
+        elif key.endswith("embed_tokens.qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
+                )
+            embed_zero_points = value
+            result[key.replace(".qzeros", ".zero_points")] = value.contiguous()
+        elif key.endswith("embed_tokens.scales"):
+            embed_scales = value
+            result[key] = value
+        elif key.endswith(".qweight"):
             if value.dtype != torch.uint8:
                 raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
             if value.shape[-1] % blob_size != 0:
@@ -688,10 +743,29 @@ def preprocess_olive_weights(
             new_key = key.replace(".qweight", ".weight")
             result[new_key] = value.reshape(value.shape[0], -1, blob_size).contiguous()
         elif key.endswith(".qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qzeros must be uint8 for {key}, got {value.dtype}")
             new_key = key.replace(".qzeros", ".zero_points")
             result[new_key] = value.contiguous()
         else:
             result[key] = value
+
+    if "lm_head.weight" not in result:
+        if quantize_lm_head and embed_qweight is not None:
+            # Tied quantized head: Olive RTN drops lm_head.* and records the
+            # tie in its own config (top-level tie_word_embeddings may be
+            # cleared). Reshape the shared packed table to the 3-D MatMulNBits
+            # layout and reuse the embedding scales/zeros.
+            result["lm_head.weight"] = embed_qweight.reshape(
+                embed_qweight.shape[0], -1, blob_size
+            ).contiguous()
+            if embed_scales is not None:
+                result["lm_head.scales"] = embed_scales
+            if embed_zero_points is not None:
+                result["lm_head.zero_points"] = embed_zero_points.contiguous()
+        elif tie_word_embeddings and "model.embed_tokens.weight" in result:
+            # Tied float head: share the (unquantized) embedding table.
+            result["lm_head.weight"] = result["model.embed_tokens.weight"]
 
     return result
 

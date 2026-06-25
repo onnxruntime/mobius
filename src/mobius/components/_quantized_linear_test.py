@@ -239,3 +239,103 @@ class TestMakeQuantizedLinearFactory:
         assert instance._k == 32
         assert instance._n == 64
         assert instance.bias is None
+
+
+class TestQuantizedEmbeddingInit:
+    VOCAB = 64
+    DIM = 64
+
+    def test_creates_packed_qweight_2d(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        packed = self.DIM * 4 // 8  # 32
+        assert qe.qweight.shape == [self.VOCAB, packed]
+
+    def test_creates_scales(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        n_blocks = self.DIM // 32
+        assert qe.scales.shape == [self.VOCAB, n_blocks]
+
+    def test_zero_points_by_default(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM)
+        assert qe.zero_points is not None
+
+    def test_no_zero_points_when_symmetric(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, has_zero_point=False)
+        assert qe.zero_points is None
+
+    def test_rejects_invalid_bits(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        with pytest.raises(ValueError, match="bits must be 2, 4, or 8"):
+            QuantizedEmbedding(self.VOCAB, self.DIM, bits=3)
+
+    def test_rejects_indivisible_dim(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        with pytest.raises(ValueError, match="must be divisible by"):
+            QuantizedEmbedding(self.VOCAB, 48, block_size=32)
+
+
+class TestQuantizedEmbeddingForward:
+    VOCAB = 64
+    DIM = 64
+
+    def test_graph_has_gather_block_quantized_node(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result])
+        assert count_op_type(graph, "GatherBlockQuantized") == 1
+
+    def test_node_domain_and_attributes(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result])
+        for node in graph:
+            if node.op_type == "GatherBlockQuantized":
+                assert node.domain == "com.microsoft"
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["bits"] == 4
+                assert attrs["block_size"] == 32
+                assert attrs["gather_axis"] == 0
+                assert attrs["quantize_axis"] == 1
+                assert len(node.inputs) == 4  # qweight, ids, scales, zero_points
+                break
+        else:
+            pytest.fail("GatherBlockQuantized node not found")
+
+    def test_3_inputs_without_zero_points(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, has_zero_point=False)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result])
+        for node in graph:
+            if node.op_type == "GatherBlockQuantized":
+                assert len(node.inputs) == 3
+                break
+        else:
+            pytest.fail("GatherBlockQuantized node not found")

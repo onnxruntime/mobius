@@ -52,6 +52,7 @@ __all__ = [
     "PatchEmbedding",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
+    "QuantizedEmbedding",
     "QuantizedLinear",
     "RMSNorm",
     "SelectiveScan",
@@ -190,6 +191,7 @@ from mobius.components._qformer import (
     QFormerLayer as QFormerLayer,
 )
 from mobius.components._quantized_linear import (
+    QuantizedEmbedding,
     QuantizedLinear,
     make_quantized_linear_factory,
 )
