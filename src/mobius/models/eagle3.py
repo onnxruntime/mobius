@@ -54,6 +54,19 @@ class Eagle3DraftModel(nn.Module):
         self._norm_before_residual = bool(getattr(config, "norm_before_residual", False))
         if config.draft_vocab_size is None:
             raise ValueError("Eagle3Config.draft_vocab_size must be set")
+        # Guard vLLM EAGLE-3 options we do not model. They are false/absent in the
+        # AngelSlim and speculators (RedHat) checkpoints; fail loudly rather than
+        # silently produce wrong outputs if a future checkpoint enables them.
+        if getattr(config, "norm_before_fc", False):
+            raise NotImplementedError("Eagle3: norm_before_fc is not supported")
+        if getattr(config, "fc_norm", False):
+            raise NotImplementedError("Eagle3: fc_norm is not supported")
+        target_hidden = getattr(config, "target_hidden_size", None)
+        if target_hidden is not None and target_hidden != config.hidden_size:
+            raise NotImplementedError(
+                f"Eagle3: target_hidden_size ({target_hidden}) != hidden_size "
+                f"({config.hidden_size}) is not supported"
+            )
 
         self.fc = Linear(3 * config.hidden_size, config.hidden_size, bias=False)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

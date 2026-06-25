@@ -1228,6 +1228,7 @@ class Eagle3Config(CausalLMConfig):
     draft_vocab_size: int | None = None
     norm_before_residual: bool = False
     norm_before_fc: bool = False
+    fc_norm: bool = False
     target_hidden_size: int | None = None
     eagle_aux_hidden_state_layer_ids: list[int] | None = None
 
@@ -1249,6 +1250,7 @@ class Eagle3Config(CausalLMConfig):
             draft_vocab_size=getattr(config, "draft_vocab_size", None),
             norm_before_residual=bool(getattr(config, "norm_before_residual", False)),
             norm_before_fc=bool(getattr(config, "norm_before_fc", False)),
+            fc_norm=bool(getattr(config, "fc_norm", False)),
             target_hidden_size=getattr(config, "target_hidden_size", None),
             eagle_aux_hidden_state_layer_ids=getattr(
                 config, "eagle_aux_hidden_state_layer_ids", None
