@@ -1,7 +1,21 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""EAGLE-3 speculative-decoding draft model."""
+"""EAGLE-3 speculative-decoding draft model.
+
+The drafter emits logits over a compressed *draft* vocabulary; a consumer maps
+each draft id back to the target vocabulary via
+``target_id = draft_id + d2t[draft_id]``. The ``d2t`` / ``t2d`` buffers are
+dropped from the ONNX graph (see :meth:`Eagle3DraftModel.preprocess_weights`)
+and applied by the speculative-decoding orchestrator.
+
+TODO(genai): there is no ORT-GenAI integration for the drafters yet. When one is
+added, emit a ``draft_to_target.json`` sidecar from
+``mobius.integrations.ort_genai`` (alongside ``genai_config.json`` /
+``processor_config.json``) holding the resolved draft->target map, read from the
+checkpoint's ``d2t`` tensor, so the artifact is self-contained for downstream
+consumers.
+"""
 
 from __future__ import annotations
 
