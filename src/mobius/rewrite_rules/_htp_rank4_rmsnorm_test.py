@@ -20,7 +20,10 @@ def _rmsnorm_model(shape: list[int]) -> ir.Model:
     rng = np.random.default_rng(0)
     x = ir.Value(name="x", shape=ir.Shape(shape), type=ir.TensorType(ir.DataType.FLOAT))
     graph = ir.Graph(
-        inputs=[x], outputs=[], nodes=[], name="rmsnorm",
+        inputs=[x],
+        outputs=[],
+        nodes=[],
+        name="rmsnorm",
         opset_imports={"": OPSET_VERSION},
     )
     op = GraphBuilder(graph).op
