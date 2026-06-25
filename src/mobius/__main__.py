@@ -161,6 +161,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
 
+    # Auto-detect NeMo .nemo archives (local file or HF ref like
+    # 'owner/repo:model.nemo'). Routes to the NeMo import path; reuses the
+    # standard build args (--dtype, --ep, --external-data) and save logic.
+    if args.model and args.model.endswith(".nemo"):
+        from mobius.integrations.nemo import build_from_nemo
+
+        print(f"Detected NeMo archive: {args.model}")
+        pkg = build_from_nemo(
+            args.model,
+            dtype=dtype_override,
+            execution_provider=execution_provider,
+        )
+        _save_package(pkg, output_dir, args, optimize, component_filter)
+        return
+
     # Build from HuggingFace model ID or local config
     if args.config:
         import transformers

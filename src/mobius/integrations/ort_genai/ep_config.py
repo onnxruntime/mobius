@@ -26,22 +26,21 @@ _ORT_PROVIDER_NAMES: dict[str, str] = {
     "dml": "dml",
     "webgpu": "webgpu",
     "trt-rtx": "NvTensorRtRtx",
+    "qnn": "QNN",
 }
 
 
 def make_provider_options(
     ep: str,
-    *,
-    enable_cuda_graph: bool = False,
-    enable_webgpu_graph: bool = False,
 ) -> list[dict[str, dict[str, str]]]:
     """Build the ``provider_options`` list for genai_config.json.
+
+    Graph capture is driven entirely by the EP's registered
+    ``EpCapabilities.enable_graph_capture`` flag (the single source of truth).
 
     Args:
         ep: Execution provider name (``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"webgpu"``, ``"trt-rtx"``).
-        enable_cuda_graph: Enable CUDA graph capture for CUDA EP.
-        enable_webgpu_graph: Enable graph capture for WebGPU EP.
 
     Returns:
         A list with a single dict mapping the EP name to its options.
@@ -55,11 +54,16 @@ def make_provider_options(
     caps = ep_registry.get(ep)
     options = dict(caps.provider_options) if caps else {}
 
-    if ep == "cuda" and enable_cuda_graph:
-        options["enable_cuda_graph"] = "1"
-    elif ep == "webgpu" and enable_webgpu_graph:
-        options["enableGraphCapture"] = "1"
-        options["validationMode"] = "disabled"
+    # Graph capture comes from the EP's registered capability flag (the registry
+    # is the single source of truth). Translate it into the EP-specific option.
+    graph_capture = bool(caps and caps.enable_graph_capture)
+
+    if ep == "webgpu":
+        options["enableGraphCapture"] = "1" if graph_capture else "0"
+        options["validationMode"] = "disabled" if graph_capture else "basic"
+    elif ep in ("cuda", "trt-rtx"):
+        # CUDA and TRT-RTX (NvTensorRtRtx) use the CUDA-graph option key.
+        options["enable_cuda_graph"] = "1" if graph_capture else "0"
 
     return [{ep_name: options}]
 
@@ -134,8 +138,6 @@ def make_genai_decoder_config(
     num_attention_heads: int,
     num_hidden_layers: int,
     num_key_value_heads: int,
-    enable_cuda_graph: bool = False,
-    enable_webgpu_graph: bool = False,
     sliding_window_size: int = 0,
     is_local_fn: Any | None = None,
 ) -> dict[str, Any]:
@@ -153,19 +155,13 @@ def make_genai_decoder_config(
         num_attention_heads: Number of attention heads.
         num_hidden_layers: Number of decoder layers.
         num_key_value_heads: Number of KV heads.
-        enable_cuda_graph: Enable CUDA graph for CUDA EP.
-        enable_webgpu_graph: Enable graph capture for WebGPU EP.
         sliding_window_size: Sliding window size for TRT-RTX (0 = disabled).
         is_local_fn: Per-layer sliding window predicate for TRT-RTX.
 
     Returns:
         Dict for ``genai_config["model"]["decoder"]``.
     """
-    provider_options = make_provider_options(
-        ep,
-        enable_cuda_graph=enable_cuda_graph,
-        enable_webgpu_graph=enable_webgpu_graph,
-    )
+    provider_options = make_provider_options(ep)
 
     decoder: dict[str, Any] = {
         "session_options": {

@@ -213,6 +213,22 @@ class TestCLIBuildRuntime:
 
         mock_export.assert_not_called()
 
+    def test_build_dot_nemo_model_routes_to_nemo(self):
+        """A ``.nemo`` --model argument is auto-detected and routed to NeMo."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.nemo.build_from_nemo",
+                return_value=mock.MagicMock(),
+            ) as mock_build_nemo,
+            mock.patch("mobius.__main__._save_package") as mock_save,
+        ):
+            main(["build", "--model", "/some/model.nemo", tmpdir])
+
+        mock_build_nemo.assert_called_once()
+        assert mock_build_nemo.call_args.args[0] == "/some/model.nemo"
+        mock_save.assert_called_once()
+
     def test_invalid_runtime_value_errors(self):
         """An unrecognised --runtime value causes argparse to exit with an error."""
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):

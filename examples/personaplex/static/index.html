@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<!--
+  Copyright (c) Microsoft Corporation.
+  Licensed under the MIT License.
+
+  Real-time full-duplex voice chat client for Moshi (personaplex-7b-v1).
+  Captures mic at 24 kHz mono, streams 1920-sample float32 frames to the
+  WebSocket server, and plays back the assistant frames it returns.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Moshi · real-time voice chat</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0d1117; color: #e6edf3; margin: 0;
+      display: flex; min-height: 100vh; align-items: center; justify-content: center;
+    }
+    .card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 14px;
+      padding: 32px 40px; width: 420px; box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.sub { margin: 0 0 24px; color: #8b949e; font-size: 13px; }
+    button {
+      font-size: 15px; font-weight: 600; padding: 12px 22px; border-radius: 8px;
+      border: none; cursor: pointer; transition: background .15s;
+    }
+    #toggle { background: #238636; color: #fff; width: 100%; }
+    #toggle.stop { background: #da3633; }
+    #toggle:disabled { background: #30363d; color: #8b949e; cursor: default; }
+    .status { margin-top: 20px; font-size: 13px; color: #8b949e; min-height: 18px; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+           background: #6e7681; margin-right: 7px; vertical-align: middle; }
+    .dot.live { background: #2ea043; box-shadow: 0 0 8px #2ea043; }
+    .meter { height: 6px; background: #21262d; border-radius: 3px; margin-top: 14px; overflow: hidden; }
+    .meter > div { height: 100%; width: 0; background: #2ea043; transition: width .05s; }
+    .stats {
+      margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6px 14px; font-size: 12px; color: #8b949e;
+    }
+    .stats .k { color: #6e7681; }
+    .stats .v { color: #e6edf3; font-variant-numeric: tabular-nums; text-align: right; }
+    .stats .v.warn { color: #d29922; }
+    .stats .v.bad { color: #f85149; }
+    .panel {
+      margin-top: 18px; border: 1px solid #30363d; border-radius: 8px;
+      padding: 10px 14px; background: #0d1117;
+    }
+    .panel > summary {
+      cursor: pointer; font-size: 12px; font-weight: 600; color: #8b949e;
+      list-style: none; user-select: none;
+    }
+    .panel > summary::-webkit-details-marker { display: none; }
+    label { display: block; font-size: 12px; color: #8b949e; margin: 18px 0 6px; }
+    textarea {
+      width: 100%; box-sizing: border-box; background: #0d1117; color: #e6edf3;
+      border: 1px solid #30363d; border-radius: 8px; padding: 8px 10px;
+      font: inherit; font-size: 13px; resize: vertical; min-height: 60px;
+    }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    .row button { flex: 1; font-size: 13px; padding: 9px 12px; }
+    #record { background: #30363d; color: #e6edf3; }
+    #record.recording { background: #da3633; color: #fff; }
+    #apply { background: #1f6feb; color: #fff; }
+    button:disabled { background: #30363d; color: #8b949e; cursor: default; }
+    .hint { font-size: 11px; color: #6e7681; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Moshi · real-time voice chat</h1>
+    <p class="sub">personaplex-7b-v1 · full-duplex speech-to-speech · 24 kHz</p>
+
+    <div id="setup">
+      <label for="persona">Persona (system prompt)</label>
+      <textarea id="persona">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
+
+      <label>Voice sample (optional) — clone the assistant's voice</label>
+      <div class="row">
+        <button id="record">● Record ~6 s</button>
+        <button id="upload">⬆ Upload audio</button>
+      </div>
+      <input id="file" type="file" accept="audio/*" style="display:none" />
+      <div class="row" id="presetRow" style="display:none">
+        <select id="preset" style="flex:1; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:8px;">
+          <option value="">Preset voice…</option>
+        </select>
+      </div>
+      <div class="hint" id="voiceHint">No voice sample — using the model's default voice.</div>
+
+      <label for="latency">Playback buffer: <span id="latVal">180</span> ms
+        (lower = less delay, higher = smoother)</label>
+      <input id="latency" type="range" min="60" max="400" step="20" value="180" style="width:100%;" />
+
+      <div class="row">
+        <button id="apply" disabled>Connecting…</button>
+      </div>
+    </div>
+
+    <button id="toggle" disabled style="margin-top:16px;">Start</button>
+    <div class="meter"><div id="level"></div></div>
+    <div class="status"><span class="dot" id="dot"></span><span id="msg">initialising…</span></div>
+
+    <details class="panel" id="statsPanel" open>
+      <summary>Live metrics</summary>
+      <div class="stats">
+        <span class="k">Jitter buffer</span><span class="v" id="sBuf">– ms</span>
+        <span class="k">Rebuffers</span><span class="v" id="sReb">0</span>
+        <span class="k">Compute / frame</span><span class="v" id="sFrame">– ms</span>
+        <span class="k">Compute RTF</span><span class="v" id="sRtf">–</span>
+        <span class="k">Mic level (RMS)</span><span class="v" id="sIn">–</span>
+        <span class="k">Out level (RMS)</span><span class="v" id="sOut">–</span>
+        <span class="k">Frames</span><span class="v" id="sFrames">0</span>
+        <span class="k">Over budget</span><span class="v" id="sOver">0</span>
+      </div>
+    </details>
+  </div>
+
+  <script>
+    const FRAME = 1920;          // samples per 12.5 Hz frame
+    const RATE = 24000;          // Mimi sample rate
+    const toggle = document.getElementById("toggle");
+    const apply = document.getElementById("apply");
+    const record = document.getElementById("record");
+    const upload = document.getElementById("upload");
+    const fileInput = document.getElementById("file");
+    const presetRow = document.getElementById("presetRow");
+    const preset = document.getElementById("preset");
+    const persona = document.getElementById("persona");
+    const voiceHint = document.getElementById("voiceHint");
+    const latency = document.getElementById("latency");
+    const latVal = document.getElementById("latVal");
+    const dot = document.getElementById("dot");
+    const msg = document.getElementById("msg");
+    const level = document.getElementById("level");
+    const sBuf = document.getElementById("sBuf");
+    const sReb = document.getElementById("sReb");
+    const sFrame = document.getElementById("sFrame");
+    const sRtf = document.getElementById("sRtf");
+    const sIn = document.getElementById("sIn");
+    const sOut = document.getElementById("sOut");
+    const sFrames = document.getElementById("sFrames");
+    const sOver = document.getElementById("sOver");
+
+    let ws, audioCtx, micStream, micNode, running = false;
+    let voicePcm = null;   // Float32Array @ 24 kHz, or null
+    let primed = false;
+    // capture buffer: accumulate mic samples into exact 1920-sample frames.
+    let capBuf = new Float32Array(0);
+    // playback: an AudioWorklet ring buffer (see PLAYER_WORKLET) pulls samples
+    // continuously and fills silence on underrun, which is far smoother than
+    // scheduling one BufferSource per frame (no per-frame scheduling jitter).
+    let playerNode = null;
+    let underruns = 0;
+    // Seconds of audio to pre-buffer before playback starts / after an underrun.
+    // Smaller = lower latency but more sensitive to network/compute jitter.
+    let targetLatency = 0.18;
+
+    // AudioWorklet processor: a single-channel ring buffer fed from the main
+    // thread. It pre-buffers `prime` seconds, then streams gaplessly; on a full
+    // drain it outputs silence and re-primes (occasional silence beats clicks).
+    const PLAYER_WORKLET = `
+      class PCMPlayer extends AudioWorkletProcessor {
+        constructor(opts) {
+          super();
+          this.buf = new Float32Array(sampleRate * 4); // 4 s capacity
+          this.r = 0; this.w = 0; this.filled = 0;
+          this.underruns = 0; this.started = false;
+          this.prime = Math.round(sampleRate * (opts.processorOptions.prime || 0.18));
+          this._t = 0;
+          this.port.onmessage = (e) => {
+            const d = e.data;
+            if (d && d.cmd === 'reset') {
+              this.r = this.w = this.filled = 0; this.started = false;
+              this.underruns = 0;
+              if (d.prime) this.prime = Math.round(sampleRate * d.prime);
+              return;
+            }
+            if (d && d.cmd === 'setPrime') {
+              this.prime = Math.round(sampleRate * d.prime); // no buffer clear
+              return;
+            }
+            const s = d; // Float32Array of 24 kHz samples
+            for (let i = 0; i < s.length; i++) {
+              this.buf[this.w] = s[i];
+              this.w = (this.w + 1) % this.buf.length;
+              if (this.filled < this.buf.length) this.filled++;
+              else this.r = (this.r + 1) % this.buf.length; // overflow: drop oldest
+            }
+          };
+        }
+        process(inputs, outputs) {
+          const out = outputs[0][0];
+          if (!this.started) {
+            if (this.filled >= this.prime) this.started = true;
+            else { out.fill(0); this.report(out.length); return true; }
+          }
+          for (let i = 0; i < out.length; i++) {
+            if (this.filled > 0) {
+              out[i] = this.buf[this.r];
+              this.r = (this.r + 1) % this.buf.length; this.filled--;
+            } else {
+              out[i] = 0; this.underruns++; this.started = false; // re-prime
+            }
+          }
+          this.report(out.length);
+          return true;
+        }
+        report(n) {
+          this._t += n;
+          if (this._t >= sampleRate / 10) { // ~10 Hz
+            this._t = 0;
+            this.port.postMessage({ filled: this.filled, underruns: this.underruns });
+          }
+        }
+      }
+      registerProcessor('pcm-player', PCMPlayer);
+    `;
+    let playerModuleUrl = null;
+
+    let pendingApply = false;
+    let reconnecting = false;
+    let gotBusy = false;
+    let busyRetries = 0;
+
+    function setStatus(text, live) {
+      msg.textContent = text;
+      dot.classList.toggle("live", !!live);
+    }
+
+    async function ensureAudio() {
+      if (!audioCtx) audioCtx = new AudioContext({ sampleRate: RATE });
+      await audioCtx.resume();
+      if (!playerNode) {
+        if (!playerModuleUrl) {
+          playerModuleUrl = URL.createObjectURL(
+            new Blob([PLAYER_WORKLET], { type: "application/javascript" })
+          );
+        }
+        await audioCtx.audioWorklet.addModule(playerModuleUrl);
+        playerNode = new AudioWorkletNode(audioCtx, "pcm-player", {
+          numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: { prime: targetLatency },
+        });
+        playerNode.port.onmessage = (e) => {
+          const d = e.data;
+          underruns = d.underruns;
+          sBuf.textContent = `${((d.filled / RATE) * 1000) | 0} ms`;
+          sBuf.className = "v" + ((d.filled / RATE) < 0.05 ? " warn" : "");
+          sReb.textContent = underruns;
+          sReb.className = "v" + (underruns ? " warn" : "");
+        };
+        playerNode.connect(audioCtx.destination);
+      }
+      return audioCtx;
+    }
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => setStatus("connected", false);
+      ws.onclose = () => {
+        if (reconnecting) { reconnecting = false; connect(); return; }
+        // The server closes us with "busy" when another tab holds the session;
+        // on a page refresh this is usually just the old connection still
+        // releasing — retry a few times before giving up.
+        if (gotBusy) {
+          gotBusy = false;
+          if (busyRetries++ < 10) {
+            setStatus(`server busy — retrying (${busyRetries})…`, false);
+            setTimeout(connect, 1000);
+            return;
+          }
+          setStatus("server busy — another tab is connected. Close it and reload.", false);
+          toggle.disabled = true; apply.disabled = true;
+          return;
+        }
+        setStatus("disconnected", false); stop(); toggle.disabled = true; apply.disabled = true;
+      };
+      ws.onerror = () => setStatus("connection error", false);
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          if (ev.data === "config") {
+            // Server is ready for our persona/voice config.
+            busyRetries = 0;
+            if (pendingApply) { pendingApply = false; applySession(); return; }
+            apply.disabled = false;
+            apply.textContent = "Start session";
+            setStatus("set a persona / voice, then Start session", false);
+          } else if (ev.data === "ready") {
+            primed = true;
+            apply.disabled = false;
+            apply.textContent = "Restart session";
+            toggle.disabled = false;
+            setStatus("ready — press Start to talk", false);
+          } else if (ev.data.startsWith("stats ")) {
+            updateServerStats(JSON.parse(ev.data.slice(6)));
+          } else if (ev.data.startsWith("busy")) {
+            gotBusy = true;  // onclose will retry
+          } else {
+            setStatus(ev.data, false);
+          }
+          return;
+        }
+        // Push assistant PCM straight into the worklet ring buffer.
+        if (playerNode) {
+          const f = new Float32Array(ev.data);
+          playerNode.port.postMessage(f, [f.buffer]);
+        }
+      };
+    }
+
+    // Update the server-side perf rows (compute time, RTF, RMS, frame counts).
+    function updateServerStats(s) {
+      sFrame.textContent = `${s.frame_ms} ms`;
+      sRtf.textContent = `${s.rtf}× (budget 80 ms)`;
+      sFrame.className = "v" + (s.frame_ms > 80 ? " bad" : s.frame_ms > 64 ? " warn" : "");
+      sRtf.className = "v" + (s.rtf > 1 ? " bad" : s.rtf > 0.8 ? " warn" : "");
+      sIn.textContent = s.in_rms.toFixed(4);
+      sOut.textContent = s.out_rms.toFixed(4);
+      sFrames.textContent = s.frames;
+      sOver.textContent = s.over;
+      sOver.className = "v" + (s.over > 0 ? " warn" : "");
+    }
+
+    // Send persona + optional voice, then wait for "ready".
+    function applySession() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const hasVoice = !!(voicePcm && voicePcm.length >= FRAME);
+      ws.send(JSON.stringify({ persona: persona.value, hasVoice }));
+      if (hasVoice) ws.send(voicePcm.buffer.slice(0));
+      apply.disabled = true;
+      apply.textContent = "Priming…";
+      toggle.disabled = true;
+      primed = false;
+      setStatus("priming voice + persona… (a few seconds)", false);
+    }
+
+    // Record ~`seconds` of mic audio, resampled to 24 kHz, into voicePcm.
+    async function recordVoice(seconds = 6) {
+      const ctx = await ensureAudio();
+      const resample = ctx.sampleRate === RATE ? null : makeResampler(ctx.sampleRate, RATE);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: RATE }
+      });
+      const source = ctx.createMediaStreamSource(stream);
+      const node = ctx.createScriptProcessor(2048, 1, 1);
+      const chunks = [];
+      let total = 0;
+      const need = RATE * seconds;
+      record.classList.add("recording");
+      return new Promise((resolve) => {
+        node.onaudioprocess = (e) => {
+          const raw = e.inputBuffer.getChannelData(0);
+          let peak = 0; for (let i = 0; i < raw.length; i++) peak = Math.max(peak, Math.abs(raw[i]));
+          level.style.width = Math.min(100, peak * 200) + "%";
+          const out = resample ? resample(raw) : Float32Array.from(raw);
+          chunks.push(out); total += out.length;
+          const remain = Math.max(0, (need - total) / RATE);
+          setStatus(`recording voice… ${remain.toFixed(1)} s left`, true);
+          if (total >= need) {
+            node.onaudioprocess = null; node.disconnect(); source.disconnect();
+            stream.getTracks().forEach(t => t.stop());
+            const buf = new Float32Array(total); let o = 0;
+            for (const c of chunks) { buf.set(c, o); o += c.length; }
+            record.classList.remove("recording");
+            level.style.width = "0%";
+            setVoice(buf.slice(0, need), `recorded (${seconds}s)`);
+            resolve();
+          }
+        };
+        source.connect(node); node.connect(ctx.destination);
+      });
+    }
+
+    // Store a 24 kHz voice sample and update the UI hint.
+    function setVoice(pcm, label) {
+      voicePcm = pcm && pcm.length >= FRAME ? pcm : null;
+      if (voicePcm) {
+        const secs = (voicePcm.length / RATE).toFixed(1);
+        voiceHint.textContent = `Voice: ${label}, ${secs}s — click Start session to apply.`;
+        setStatus("voice ready — press Start session", false);
+      } else {
+        voiceHint.textContent = "No voice sample — using the model's default voice.";
+      }
+    }
+
+    // Decode an arbitrary audio file (wav/mp3/…) -> mono 24 kHz Float32Array.
+    async function decodeToVoice(arrayBuffer, label) {
+      const ctx = await ensureAudio();
+      const audio = await ctx.decodeAudioData(arrayBuffer);
+      const ch = audio.getChannelData(0);  // first channel (mono)
+      let pcm;
+      if (audio.sampleRate === RATE) {
+        pcm = Float32Array.from(ch);
+      } else {
+        const rs = makeResampler(audio.sampleRate, RATE);
+        pcm = rs(ch);
+      }
+      // Cap to ~10 s to keep priming snappy.
+      if (pcm.length > RATE * 10) pcm = pcm.slice(0, RATE * 10);
+      setVoice(pcm, label);
+    }
+
+    // Populate the preset dropdown from server-provided reference clips.
+    async function loadPresets() {
+      try {
+        const res = await fetch("/voices");
+        const names = await res.json();
+        if (!Array.isArray(names) || names.length === 0) return;
+        for (const n of names) {
+          const o = document.createElement("option");
+          o.value = n; o.textContent = n;
+          preset.appendChild(o);
+        }
+        presetRow.style.display = "flex";
+      } catch (_) { /* no presets available */ }
+    }
+
+    // Linear resampler: src samples at srcRate -> dstRate. Keeps a fractional
+    // read position across calls so streaming chunks join seamlessly.
+    function makeResampler(srcRate, dstRate) {
+      const ratio = srcRate / dstRate;
+      let pos = 0;          // fractional read index into the *virtual* stream
+      let tail = new Float32Array(0);  // leftover src samples from prev call
+      return (chunk) => {
+        const src = new Float32Array(tail.length + chunk.length);
+        src.set(tail); src.set(chunk, tail.length);
+        const out = [];
+        while (pos + 1 < src.length) {
+          const i = Math.floor(pos);
+          const frac = pos - i;
+          out.push(src[i] * (1 - frac) + src[i + 1] * frac);
+          pos += ratio;
+        }
+        // keep the last whole sample we still need for interpolation
+        const consumed = Math.floor(pos);
+        tail = src.slice(consumed);
+        pos -= consumed;
+        return Float32Array.from(out);
+      };
+    }
+
+    async function start() {
+      const ctx = await ensureAudio();
+      audioCtx = ctx;
+      underruns = 0;
+      // Reset the playback ring buffer so it re-primes from empty.
+      if (playerNode) playerNode.port.postMessage({ cmd: "reset", prime: targetLatency });
+      const ctxRate = audioCtx.sampleRate;
+      console.log(`[moshi] AudioContext sampleRate = ${ctxRate} (target ${RATE})`);
+      if (ctxRate !== RATE) {
+        setStatus(`resampling ${ctxRate}->${RATE} Hz`, false);
+      }
+      // Resample mic (ctxRate) -> 24 kHz so the model gets correct-rate audio.
+      const resample = ctxRate === RATE ? null : makeResampler(ctxRate, RATE);
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
+                 autoGainControl: true, sampleRate: RATE }
+      });
+      const source = audioCtx.createMediaStreamSource(micStream);
+      // ScriptProcessor is deprecated but universally available and fine for a demo.
+      micNode = audioCtx.createScriptProcessor(2048, 1, 1);
+      micNode.onaudioprocess = (e) => {
+        if (!running) return;
+        const raw = e.inputBuffer.getChannelData(0);
+        // VU meter
+        let peak = 0; for (let i = 0; i < raw.length; i++) peak = Math.max(peak, Math.abs(raw[i]));
+        level.style.width = Math.min(100, peak * 200) + "%";
+        const inp = resample ? resample(raw) : raw;
+        // accumulate into 1920-sample (24 kHz) frames
+        const merged = new Float32Array(capBuf.length + inp.length);
+        merged.set(capBuf); merged.set(inp, capBuf.length);
+        let off = 0;
+        while (merged.length - off >= FRAME) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(merged.slice(off, off + FRAME).buffer);
+          }
+          off += FRAME;
+        }
+        capBuf = merged.slice(off);
+      };
+      source.connect(micNode);
+      // Route the capture node through a zero-gain sink so it stays alive
+      // without echoing the raw mic to the speakers.
+      const sink = audioCtx.createGain(); sink.gain.value = 0;
+      micNode.connect(sink); sink.connect(audioCtx.destination);
+
+      running = true;
+      toggle.textContent = "Stop";
+      toggle.classList.add("stop");
+      setStatus("live — talk to Moshi", true);
+    }
+
+    function stop() {
+      running = false;
+      capBuf = new Float32Array(0);
+      level.style.width = "0%";
+      if (micNode) { micNode.onaudioprocess = null; micNode.disconnect(); micNode = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      toggle.textContent = "Start";
+      toggle.classList.remove("stop");
+      if (ws && ws.readyState === WebSocket.OPEN) setStatus("stopped — press Start", false);
+    }
+
+    toggle.onclick = async () => {
+      if (running) { stop(); return; }
+      if (!primed) { setStatus("start a session first (Start session)", false); return; }
+      try { await start(); }
+      catch (err) { setStatus("mic error: " + err.message, false); }
+    };
+
+    record.onclick = async () => {
+      if (record.classList.contains("recording")) return;
+      try { await recordVoice(6); }
+      catch (err) { record.classList.remove("recording"); setStatus("mic error: " + err.message, false); }
+    };
+
+    upload.onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      try {
+        setStatus("decoding audio…", false);
+        await decodeToVoice(await f.arrayBuffer(), f.name);
+      } catch (err) { setStatus("audio decode error: " + err.message, false); }
+    };
+
+    preset.onchange = async () => {
+      const name = preset.value;
+      if (!name) { setVoice(null); return; }
+      try {
+        setStatus("loading preset voice…", false);
+        const res = await fetch(`/static/voices/${encodeURIComponent(name)}`);
+        await decodeToVoice(await res.arrayBuffer(), name);
+      } catch (err) { setStatus("preset load error: " + err.message, false); }
+    };
+
+    apply.onclick = () => {
+      if (running) stop();
+      if (primed) {
+        // Restart with a fresh state: reconnect, then auto-apply on "config".
+        pendingApply = true; reconnecting = true; primed = false;
+        apply.disabled = true; apply.textContent = "Restarting…";
+        setStatus("restarting session…", false);
+        ws.close();
+      } else {
+        applySession();
+      }
+    };
+
+    latency.oninput = () => {
+      targetLatency = latency.value / 1000;
+      latVal.textContent = latency.value;
+      // Apply immediately to the running player (no buffer clear -> no gap).
+      if (playerNode) playerNode.port.postMessage({ cmd: "setPrime", prime: targetLatency });
+    };
+
+    connect();
+    loadPresets();
+  </script>
+</body>
+</html>

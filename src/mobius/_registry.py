@@ -41,6 +41,7 @@ from mobius.models import (
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
     Eagle3DraftModel,
+    EncDecRNNTModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
     ExaOne4CausalLMModel,
@@ -755,6 +756,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
+    "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
 }
 
 

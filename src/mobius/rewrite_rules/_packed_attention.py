@@ -25,7 +25,7 @@ import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchResult
 from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleSet
 
-from mobius.components._common import INT64_MAX
+from mobius.components._common import build_packed_token_offset
 
 
 class BlockDiagonalToPackedMHA(RewriteRuleClassBase):
@@ -161,45 +161,9 @@ class BlockDiagonalToPackedMHA(RewriteRuleClassBase):
         cu_seqlens = self._trace_cu_seqlens(attn_bias_2d)
         cu_seqlens_i32 = op.Cast(cu_seqlens, to=6)  # INT32
 
-        # Reusable constant tensors (rewrite context needs ir.Value, not lists)
-        axes_0 = op.Constant(value_ints=[0])
-        axes_1 = op.Constant(value_ints=[1])
-        neg_one = op.Constant(value_ints=[-1])
-        int_max = op.Constant(value_ints=[INT64_MAX])
-        slice_start_0 = op.Constant(value_ints=[0])
-        slice_start_1 = op.Constant(value_ints=[1])
-
-        # ---- token_offset computation ----
-        # num_patches = len(cu_seqlens) - 1
-        num_patches = op.Cast(
-            op.Sub(op.Size(cu_seqlens), op.Constant(value_int=1)),
-            to=6,
-        )
-
-        # Sub-sequence lengths and maximum length
-        starts = op.Slice(cu_seqlens_i32, slice_start_0, neg_one, axes_0)
-        ends = op.Slice(cu_seqlens_i32, slice_start_1, int_max, axes_0)
-        lengths = op.Sub(ends, starts)
-        max_length = op.Squeeze(op.ReduceMax(lengths), axes_0)
-
-        # Position matrix (num_patches x max_length) in int32
-        zero_i32 = op.Cast(op.Constant(value_int=0), to=6)
-        one_i32 = op.Cast(op.Constant(value_int=1), to=6)
-        rows = op.Range(zero_i32, num_patches, one_i32)
-        cols = op.Range(zero_i32, max_length, one_i32)
-        pos_matrix = op.Add(
-            op.Mul(op.Unsqueeze(rows, axes_1), max_length),
-            op.Unsqueeze(cols, axes_0),
-        )
-        pos_shape = op.Shape(pos_matrix)
-
-        # Build token_offset: valid positions first, then padding
-        mask_2d = op.Less(op.Unsqueeze(cols, axes_0), op.Unsqueeze(lengths, axes_1))
-        mask_1d = op.Reshape(mask_2d, neg_one)
-        pos_1d = op.Reshape(pos_matrix, neg_one)
-        valid = op.Compress(pos_1d, mask_1d)
-        padded = op.Compress(pos_1d, op.Not(mask_1d))
-        token_offset = op.Reshape(op.Concat(valid, padded, axis=0), pos_shape)
+        # token_offset follows ORT's GetPaddingOffset convention; build it with
+        # the shared helper so this rule and the vision encoders stay in sync.
+        token_offset = build_packed_token_offset(op, cu_seqlens)
 
         # com.microsoft::PackedMultiHeadAttention
         return op.op(

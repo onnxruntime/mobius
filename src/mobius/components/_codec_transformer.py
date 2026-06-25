@@ -318,13 +318,14 @@ class CodecEncoderTransformerLayer(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         intermediate_size: int,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
-        self.input_layernorm = LayerNorm(hidden_size)
+        self.input_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
         self.self_attn = _CodecDecoderAttention(hidden_size, num_heads, num_kv_heads, head_dim)
         self.self_attn_layer_scale = LayerScale(hidden_size)
 
-        self.post_attention_layernorm = LayerNorm(hidden_size)
+        self.post_attention_layernorm = LayerNorm(hidden_size, eps=layer_norm_eps)
         # GELU fc1/fc2 MLP (no bias, matches Mimi encoder)
         self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu", bias=False)
         self.mlp_layer_scale = LayerScale(hidden_size)
@@ -391,6 +392,7 @@ class CodecEncoderTransformerModel(nn.Module):
         head_dim: int = 64,
         rope_theta: float = 10000.0,
         max_position_embeddings: int = 4096,
+        layer_norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -401,6 +403,7 @@ class CodecEncoderTransformerModel(nn.Module):
                     num_kv_heads=num_key_value_heads,
                     head_dim=head_dim,
                     intermediate_size=intermediate_size,
+                    layer_norm_eps=layer_norm_eps,
                 )
                 for _ in range(num_hidden_layers)
             ]

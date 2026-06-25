@@ -23,9 +23,21 @@ class TestMakeProviderOptions:
         assert "cuda" in result[0]
         assert result[0]["cuda"]["enable_cuda_graph"] == "0"
 
-    def test_cuda_with_graph(self):
-        result = make_provider_options("cuda", enable_cuda_graph=True)
-        assert result[0]["cuda"]["enable_cuda_graph"] == "1"
+    def test_cuda_graph_capture_from_capability_flag(self):
+        # A CUDA-like EP registered with enable_graph_capture=True emits
+        # enable_cuda_graph="1"; the flag is the single source of truth.
+        from mobius._execution_providers import EpCapabilities, ep_registry
+
+        original = ep_registry.get("cuda")
+        ep_registry.register(
+            EpCapabilities(name="cuda", enable_graph_capture=True),
+            overwrite=True,
+        )
+        try:
+            result = make_provider_options("cuda")
+            assert result[0]["cuda"]["enable_cuda_graph"] == "1"
+        finally:
+            ep_registry.register(original, overwrite=True)
 
     def test_dml(self):
         result = make_provider_options("dml")
@@ -33,15 +45,27 @@ class TestMakeProviderOptions:
         assert "dml" in result[0]
 
     def test_webgpu_default(self):
+        # WebGPU registers enable_graph_capture=True, so graph capture is on by
+        # default and propagates to the genai_config provider options.
         result = make_provider_options("webgpu")
-        assert result[0]["webgpu"]["enableGraphCapture"] == "0"
-        assert result[0]["webgpu"]["validationMode"] == "basic"
+        assert result[0]["webgpu"]["enableGraphCapture"] == "1"
+        assert result[0]["webgpu"]["validationMode"] == "disabled"
 
-    def test_webgpu_with_graph(self):
-        result = make_provider_options("webgpu", enable_webgpu_graph=True)
-        opts = result[0]["webgpu"]
-        assert opts["enableGraphCapture"] == "1"
-        assert opts["validationMode"] == "disabled"
+    def test_webgpu_graph_capture_disabled_when_flag_false(self):
+        # When the capability flag is False, WebGPU emits the disabled defaults.
+        from mobius._execution_providers import EpCapabilities, ep_registry
+
+        original = ep_registry.get("webgpu")
+        ep_registry.register(
+            EpCapabilities(name="webgpu", enable_graph_capture=False),
+            overwrite=True,
+        )
+        try:
+            result = make_provider_options("webgpu")
+            assert result[0]["webgpu"]["enableGraphCapture"] == "0"
+            assert result[0]["webgpu"]["validationMode"] == "basic"
+        finally:
+            ep_registry.register(original, overwrite=True)
 
     def test_trt_rtx(self):
         result = make_provider_options("trt-rtx")

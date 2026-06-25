@@ -13,6 +13,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components._common import (
     Embedding,
     Linear,
+    build_packed_token_offset,
     create_attention_bias,
     create_padding_mask,
     create_sliding_window_mask,
@@ -212,6 +213,65 @@ class TestBlockwiseAttentionBias:
         assert out.shape == (1, 1, 1, 8)
         # Text decode token attends to all past positions (pure causal row).
         assert bool((out[0, 0, 0] > -1.0).all())
+
+
+class TestBuildPackedTokenOffset:
+    """``build_packed_token_offset`` must reproduce ORT's GetPaddingOffset.
+
+    ORT's ``PackedMultiHeadAttention`` derives ``batch_size`` from
+    ``token_offset.shape[0]`` and requires ``cumulative_sequence_length`` to
+    have length ``batch_size + 1``.  ``token_offset`` lists the padded-layout
+    indices (``b * max_len + s``) of valid tokens (packed order) first, then
+    the padding slots.  We run the helper through ORT and compare exact values.
+    """
+
+    @staticmethod
+    def _build(dtype=ir.DataType.INT64):
+        b, op, g = create_test_builder()
+        cu = create_test_input(b, "cu_seqlens", ["K"], dtype=dtype)
+        token_offset = build_packed_token_offset(op, cu)
+        token_offset.name = "token_offset"
+        g.outputs.append(token_offset)
+        return ir.Model(g, ir_version=10)
+
+    def _run(self, cu_seqlens, np_dtype=np.int64, ir_dtype=ir.DataType.INT64):
+        sess = OnnxModelSession(self._build(ir_dtype), device="cpu")
+        return sess.run({"cu_seqlens": np.array(cu_seqlens, dtype=np_dtype)})["token_offset"]
+
+    def test_ort_reference_example(self):
+        # ORT test data: cu=[0,1,3] (lengths 1,2; max_len=2) -> [[0,2],[3,1]].
+        out = self._run([0, 1, 3])
+        assert out.dtype == np.int32
+        assert np.array_equal(out, np.array([[0, 2], [3, 1]], dtype=np.int32))
+
+    def test_padding_indices_exceed_token_count(self):
+        # cu=[0,2,5]: lengths [2,3], max_len=3, token_count=5.
+        # Padded grid pos = b*3 + s -> row0 valid cols {0,1} pad col {2};
+        # row1 valid cols {3,4,5}. valid (packed order) = [0,1,3,4,5];
+        # padding slot = [2]. token_offset = [[0,1,3],[4,5,2]].
+        out = self._run([0, 2, 5])
+        assert np.array_equal(out, np.array([[0, 1, 3], [4, 5, 2]], dtype=np.int32))
+        # Padding value (2) is a padded-layout index, here < token_count, but
+        # the construction may yield values >= token_count for other shapes.
+
+    def test_single_subsequence_is_identity(self):
+        # cu=[0,4]: one sub-sequence -> shape (1,4), identity [0,1,2,3].
+        out = self._run([0, 4])
+        assert out.shape == (1, 4)
+        assert np.array_equal(out, np.array([[0, 1, 2, 3]], dtype=np.int32))
+
+    def test_uniform_windows(self):
+        # Three windows of equal length 2: max_len=2, no padding.
+        out = self._run([0, 2, 4, 6])
+        assert out.shape == (3, 2)
+        assert np.array_equal(out, np.array([[0, 1], [2, 3], [4, 5]], dtype=np.int32))
+
+    def test_int32_input(self):
+        # The helper documents INT32 or INT64 cu_seqlens; INT32 input must
+        # produce the same result as the INT64 reference example.
+        out = self._run([0, 1, 3], np_dtype=np.int32, ir_dtype=ir.DataType.INT32)
+        assert out.dtype == np.int32
+        assert np.array_equal(out, np.array([[0, 2], [3, 1]], dtype=np.int32))
 
 
 class TestCreatePaddingMask:

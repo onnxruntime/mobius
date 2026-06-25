@@ -70,7 +70,14 @@ class EpCapabilities:
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
+            Should not include graph-capture keys (``enable_cuda_graph`` /
+            ``enableGraphCapture``); those are derived from
+            ``enable_graph_capture`` so the flag is the single source of truth.
         enable_graph_capture: Whether this EP defaults to GPU graph capture.
+            When ``True`` the generated genai_config provider options enable the
+            EP-specific graph-capture option (``enable_cuda_graph`` for CUDA /
+            TRT-RTX, ``enableGraphCapture`` + ``validationMode=disabled`` for
+            WebGPU).
         supports_past_present_share_buffer: Whether past and present KV-cache
             tensors alias the same pre-allocated buffer.  When ``True``, the
             ORT GenAI runtime allocates a single KV-cache buffer at model load
@@ -226,7 +233,6 @@ def _register_builtins() -> None:
             ),
             supports_packed_multi_head_attention=True,
             provider_options={
-                "enable_cuda_graph": "0",
                 "enable_skip_layer_norm_strict_mode": "1",
             },
             supports_past_present_share_buffer=True,
@@ -247,7 +253,7 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             default_int4_accuracy_level=4,
-            provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
             cap_kv_buffer_max_length=True,
         ),
@@ -259,8 +265,29 @@ def _register_builtins() -> None:
             ),
             supports_skip_layer_norm=False,
             enable_graph_capture=True,
-            provider_options={"enable_cuda_graph": "1"},
             supports_past_present_share_buffer=True,
+        ),
+        # Qualcomm Hexagon NPU via the QNN EP (onnxruntime-qnn QAIRT plugin),
+        # HTP backend. The HTP runs a static-shaped, QDQ-quantized QNN context
+        # binary with no kernels for ORT contrib fused ops, so everything is
+        # decomposed to standard ONNX. The gemma4 multimodal decoder forgoes GQA
+        # (bidirectional-vision overlay), so standard Attention is emitted and
+        # static-shaped downstream. provider_options are the HTP launch defaults;
+        # soc_model and the EP-context binary path are set per-device at build time.
+        EpCapabilities(
+            name="qnn",
+            gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
+            qkv_pack_dtypes=frozenset(),  # no PackQKV
+            supports_fused_rope=False,  # SeparateRoPE + UnpackQKV
+            supports_skip_layer_norm=False,  # inline Skip[Simplified]LayerNorm
+            supports_packed_multi_head_attention=False,  # inline PackedMHA
+            provider_options={
+                "backend_path": "QnnHtp.dll",
+                "htp_performance_mode": "burst",
+                "htp_graph_finalization_optimization_mode": "3",
+                "enable_htp_shared_memory_allocator": "1",
+            },
+            supports_past_present_share_buffer=False,  # standard-Attention KV concat
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via

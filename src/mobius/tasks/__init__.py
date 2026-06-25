@@ -24,6 +24,7 @@ __all__ = [
     "AudioFeatureExtractionTask",
     "CausalLMTask",
     "CTCAsrTask",
+    "RNNTTask",
     "CodecTask",
     "ComponentSpec",
     "ControlNetTask",
@@ -42,6 +43,8 @@ __all__ = [
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MoshiDepformerTask",
+    "MoshiTemporalTask",
     "MultiModalTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
@@ -95,11 +98,13 @@ from mobius.tasks._gemma4 import (
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image_vae import QwenImageVAETask
+from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
@@ -132,6 +137,8 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
+    "moshi-depformer": MoshiDepformerTask,
+    "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
@@ -153,6 +160,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
+    "fastconformer-rnnt": RNNTTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

@@ -74,6 +74,7 @@ __all__ = [
     "create_decoder_layer",
     "create_padding_mask",
     "create_sliding_window_mask",
+    "create_static_cache_attention_bias",
     "get_activation",
     "initialize_rope",
     "make_quantized_linear_factory",
@@ -118,6 +119,7 @@ from mobius.components._common import (
     create_attention_bias,
     create_padding_mask,
     create_sliding_window_mask,
+    create_static_cache_attention_bias,
 )
 from mobius.components._conv import (
     BatchNorm2d,
