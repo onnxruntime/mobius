@@ -1,0 +1,22 @@
+model_id: "google/gemma-4-e2b-it-assistant"
+model_type: "gemma4_assistant"
+revision: "main"
+task_type: "gemma4-assistant"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 16
+  do_sample: false
+
+notes: >
+  Gemma4-Assistant MTP drafter (paired with google/gemma-4-e2b-it). Consumes the
+  target's shared KV + hidden state via inputs_embeds rather than input_ids, so
+  the golden stores the exact replay tensors in a companion *_inputs.npz. L4
+  checks the first draft step's argmax; L5 checks the SinglePositionMultiToken
+  draft sequence (all steps share one position with fixed shared KV).

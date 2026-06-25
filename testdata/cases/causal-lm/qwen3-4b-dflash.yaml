@@ -1,0 +1,28 @@
+model_id: "z-lab/Qwen3-4B-DFlash-b16"
+model_type: "qwen3"
+revision: "main"
+task_type: "dflash-draft"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "The capital of France is"
+
+level: "L4"
+
+generation:
+  max_new_tokens: 16
+  do_sample: false
+  target_model_id: "Qwen/Qwen3-4B"
+
+notes: >
+  DFlash speculative-decoding drafter (block diffusion, block_size=16) for the
+  Qwen3-4B target. The drafter consumes noise_embedding + multi-layer
+  target_hidden + a KV cache (not input_ids) and outputs draft_hidden (decoded
+  through the target lm_head to get draft logits). L4 is a hidden-state parity
+  check on draft_hidden (argmax over the hidden dim + cosine), captured from the
+  reference spec_generate loop. The golden stores the exact replay tensors in a
+  companion *_inputs.npz; the test builds only the drafter ONNX (no target / no
+  trust_remote_code reference at test time). dtype is float32: the fp16 drafter
+  overflows in its fc projection of the target hidden state.
