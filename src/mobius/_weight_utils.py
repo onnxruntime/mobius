@@ -658,6 +658,44 @@ def preprocess_gptq_weights(
     return result
 
 
+def preprocess_olive_weights(
+    state_dict: dict[str, torch.Tensor],
+    bits: int = 4,
+    group_size: int = 128,
+) -> dict[str, torch.Tensor]:
+    """Rename and reshape Olive-packed quantized weights for MatMulNBits.
+
+    Olive stores quantized linear weights with uint8 packing:
+      - ``*.qweight``: [N, packed_K] uint8
+      - ``*.scales``: [N, n_blocks]
+      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, for asymmetric quantization
+
+    MatMulNBits expects ``weight`` as [N, n_blocks, blob_size], while scales and
+    zero-points already match the expected orientation.
+    """
+    blob_size = group_size * bits // 8
+    result: dict[str, torch.Tensor] = {}
+
+    for key, value in state_dict.items():
+        if key.endswith(".qweight"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive qweight packed dimension for {key} ({value.shape[-1]}) "
+                    f"must be divisible by blob_size ({blob_size})"
+                )
+            new_key = key.replace(".qweight", ".weight")
+            result[new_key] = value.reshape(value.shape[0], -1, blob_size).contiguous()
+        elif key.endswith(".qzeros"):
+            new_key = key.replace(".qzeros", ".zero_points")
+            result[new_key] = value.contiguous()
+        else:
+            result[key] = value
+
+    return result
+
+
 def preprocess_awq_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,

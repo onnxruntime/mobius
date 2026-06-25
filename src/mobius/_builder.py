@@ -42,6 +42,7 @@ from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
+from mobius._weight_utils import preprocess_olive_weights
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
@@ -490,6 +491,11 @@ def build(
         state_dict = _download_weights(model_id)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
+        qc = getattr(config, "quantization", None)
+        if qc is not None and qc.quant_method == "olive":
+            state_dict = preprocess_olive_weights(
+                state_dict, bits=qc.bits, group_size=qc.group_size
+            )
         prefix_map = getattr(model_module, "weight_prefix_map", None)
         pkg.apply_weights(state_dict, prefix_map=prefix_map)
 

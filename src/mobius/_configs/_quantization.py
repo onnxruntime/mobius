@@ -53,5 +53,5 @@ class QuantizationConfig:
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
             quant_method=method,
-            sym=qc.get("sym", True),
+            sym=qc.get("sym", qc.get("symmetric", True)),
         )

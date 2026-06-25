@@ -12,6 +12,7 @@ from mobius._weight_utils import (
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
+    preprocess_olive_weights,
     rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
@@ -522,6 +523,67 @@ class TestPreprocessGptqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessOliveWeights:
+    """Tests for Olive uint8-packed weight preprocessing."""
+
+    K = 256
+    N = 128
+    BITS = 4
+    GROUP_SIZE = 32
+    PACKED_K = K * BITS // 8
+    N_BLOCKS = K // GROUP_SIZE
+    BLOB_SIZE = GROUP_SIZE * BITS // 8
+
+    def test_qweight_renamed_and_reshaped_to_matmulnbits_weight(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.uint8)
+        }
+
+        result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert "q_proj.weight" in result
+        assert "q_proj.qweight" not in result
+        assert result["q_proj.weight"].shape == (self.N, self.N_BLOCKS, self.BLOB_SIZE)
+        assert result["q_proj.weight"].dtype == torch.uint8
+
+    def test_scales_orientation_is_preserved(self):
+        scales = torch.randn(self.N, self.N_BLOCKS)
+
+        result = preprocess_olive_weights(
+            {"q_proj.scales": scales}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["q_proj.scales"] is scales
+
+    def test_qzeros_renamed_to_zero_points_without_reshape(self):
+        qzeros = torch.randint(0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.uint8)
+
+        result = preprocess_olive_weights(
+            {"q_proj.qzeros": qzeros}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert "q_proj.zero_points" in result
+        assert "q_proj.qzeros" not in result
+        assert torch.equal(result["q_proj.zero_points"], qzeros)
+
+    def test_non_quantized_keys_pass_through(self):
+        weight = torch.randn(4, 8)
+
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight": weight}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["model.embed_tokens.weight"] is weight
+
+    def test_non_uint8_qweight_raises(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.int32)
+        }
+
+        with pytest.raises(ValueError, match="Olive qweight must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
 
 
 class TestPreprocessAwqWeights:
