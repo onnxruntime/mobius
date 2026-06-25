@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
@@ -224,6 +225,85 @@ class QuantizedEmbedding(nn.Module):
             block_size=self._block_size,
             gather_axis=0,
             quantize_axis=1,
+            _domain=_MICROSOFT_DOMAIN,
+        )
+
+
+class TiedQuantizedLMHead(nn.Module):
+    """LM head tied to a :class:`QuantizedEmbedding`, sharing one packed table.
+
+    When the input embedding and the LM head are tied **and** both are
+    block-wise quantized, the two ops want different layouts of the *same*
+    bytes: the embedding uses ``GatherBlockQuantized`` with a **2-D**
+    ``[vocab, dim*bits//8]`` table, while the head uses ``MatMulNBits`` with a
+    **3-D** ``[vocab, n_blocks, blob_size]`` weight.
+
+    Rather than store a second copy of the table (~the embedding size again),
+    this head **shares the embedding's** ``qweight``/``scales``/``zero_points``
+    Parameters — yielding a single ONNX initializer for each — and reshapes the
+    shared 2-D packed table to the MatMulNBits layout at graph-build time.  The
+    ``Reshape`` is a no-op view over identical bytes and is left in the graph
+    (mobius does not constant-fold inputs this large); ONNX Runtime folds it at
+    session creation.  Net effect: one copy of the tied table on disk.
+
+    Args:
+        embedding: The quantized input embedding to tie to.
+        hidden_size: Input feature size (MatMulNBits ``K``).
+        vocab_size: Output size / vocabulary (MatMulNBits ``N``).
+    """
+
+    def __init__(
+        self,
+        embedding: QuantizedEmbedding,
+        hidden_size: int,
+        vocab_size: int,
+    ):
+        super().__init__()
+        bits = embedding._bits
+        block_size = embedding._block_size
+        if hidden_size % block_size != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by block_size ({block_size})"
+            )
+
+        self._bits = bits
+        self._block_size = block_size
+        self._k = hidden_size
+        self._n = vocab_size
+
+        n_blocks = hidden_size // block_size
+        blob_size = block_size * bits // 8
+        # MatMulNBits weight layout for the shared packed table.
+        self._weight_shape = np.array([vocab_size, n_blocks, blob_size], dtype=np.int64)
+
+        # Share the embedding's Parameters (same objects -> one initializer
+        # each). The embedding's 2-D qweight is reshaped in forward().
+        self.qweight = embedding.qweight
+        self.scales = embedding.scales
+        self.zero_points = embedding.zero_points
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        """Project hidden states to logits with the shared quantized table.
+
+        Args:
+            op: ONNX op builder.
+            x: Hidden states of shape ``[*, hidden_size]``.
+
+        Returns:
+            Logits of shape ``[*, vocab_size]``.
+        """
+        # Reshape the shared 2-D packed table to the 3-D MatMulNBits layout.
+        weight = op.Reshape(self.qweight, op.Constant(value=ir.tensor(self._weight_shape)))
+        inputs: list[ir.Value | None] = [x, weight, self.scales]
+        if self.zero_points is not None:
+            inputs.append(self.zero_points)
+
+        return op.MatMulNBits(
+            *inputs,
+            K=self._k,
+            N=self._n,
+            bits=self._bits,
+            block_size=self._block_size,
             _domain=_MICROSOFT_DOMAIN,
         )
 

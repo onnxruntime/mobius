@@ -682,11 +682,11 @@ def preprocess_olive_weights(
     directly — so it is kept as-is (only ``qzeros`` is renamed to
     ``zero_points``).
 
-    Tied LM head: Olive RTN drops ``lm_head.*`` when
-    ``tie_word_embeddings`` is set. When ``quantize_lm_head`` is requested,
-    the MatMulNBits ``lm_head`` weights are synthesised from the quantized
-    embedding table (same packed bytes, reshaped to 3-D). Otherwise, when
-    the embedding stays float, the standard float tie is applied.
+    Tied LM head: Olive RTN drops ``lm_head.*`` when the head is tied. When the
+    head is **quantized**, no ``lm_head`` weights are produced here — the model
+    shares the embedding's packed table via :class:`TiedQuantizedLMHead` (one
+    initializer). When the head stays **float** (unquantized embedding), the
+    standard float tie is applied so ``lm_head.weight`` aliases the embedding.
 
     Args:
         state_dict: Model state dict with Olive quantization keys.
@@ -697,16 +697,11 @@ def preprocess_olive_weights(
         tie_word_embeddings: Whether embedding and LM head share weights.
 
     Returns:
-        State dict with renamed, reshaped (and, for tied heads, synthesised)
-        weights.
+        State dict with renamed and reshaped weights (and, for a float tied
+        head, the aliased ``lm_head.weight``).
     """
     blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
-
-    # Captured quantized-embedding tensors, used to synthesise a tied head.
-    embed_qweight: torch.Tensor | None = None
-    embed_scales: torch.Tensor | None = None
-    embed_zero_points: torch.Tensor | None = None
 
     for key, value in state_dict.items():
         if key.endswith("embed_tokens.qweight"):
@@ -720,17 +715,14 @@ def preprocess_olive_weights(
                     f"Olive embedding qweight packed dimension for {key} "
                     f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
                 )
-            embed_qweight = value
             result[key] = value.contiguous()
         elif key.endswith("embed_tokens.qzeros"):
             if value.dtype != torch.uint8:
                 raise ValueError(
                     f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
                 )
-            embed_zero_points = value
             result[key.replace(".qzeros", ".zero_points")] = value.contiguous()
         elif key.endswith("embed_tokens.scales"):
-            embed_scales = value
             result[key] = value
         elif key.endswith(".qweight"):
             if value.dtype != torch.uint8:
@@ -750,22 +742,16 @@ def preprocess_olive_weights(
         else:
             result[key] = value
 
-    if "lm_head.weight" not in result:
-        if quantize_lm_head and embed_qweight is not None:
-            # Tied quantized head: Olive RTN drops lm_head.* and records the
-            # tie in its own config (top-level tie_word_embeddings may be
-            # cleared). Reshape the shared packed table to the 3-D MatMulNBits
-            # layout and reuse the embedding scales/zeros.
-            result["lm_head.weight"] = embed_qweight.reshape(
-                embed_qweight.shape[0], -1, blob_size
-            ).contiguous()
-            if embed_scales is not None:
-                result["lm_head.scales"] = embed_scales
-            if embed_zero_points is not None:
-                result["lm_head.zero_points"] = embed_zero_points.contiguous()
-        elif tie_word_embeddings and "model.embed_tokens.weight" in result:
-            # Tied float head: share the (unquantized) embedding table.
-            result["lm_head.weight"] = result["model.embed_tokens.weight"]
+    # A tied quantized head shares the embedding's Parameters in the module
+    # (TiedQuantizedLMHead), so no lm_head initializers exist to fill here.
+    # Only a tied *float* head needs an explicit weight alias.
+    if (
+        tie_word_embeddings
+        and not quantize_lm_head
+        and "lm_head.weight" not in result
+        and "model.embed_tokens.weight" in result
+    ):
+        result["lm_head.weight"] = result["model.embed_tokens.weight"]
 
     return result
 

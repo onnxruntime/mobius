@@ -339,3 +339,76 @@ class TestQuantizedEmbeddingForward:
                 break
         else:
             pytest.fail("GatherBlockQuantized node not found")
+
+
+class TestTiedQuantizedLMHead:
+    VOCAB = 64
+    DIM = 64
+
+    def _make(self, **kw):
+        from mobius.components._quantized_linear import (
+            QuantizedEmbedding,
+            TiedQuantizedLMHead,
+        )
+
+        emb = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32, **kw)
+        return emb, TiedQuantizedLMHead(emb, self.DIM, self.VOCAB)
+
+    def test_shares_embedding_parameters(self):
+        emb, head = self._make()
+        # Same Parameter objects -> a single ONNX initializer each.
+        assert head.qweight is emb.qweight
+        assert head.scales is emb.scales
+        assert head.zero_points is emb.zero_points
+
+    def test_rejects_indivisible_hidden(self):
+        from mobius.components._quantized_linear import (
+            QuantizedEmbedding,
+            TiedQuantizedLMHead,
+        )
+
+        emb = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        with pytest.raises(ValueError, match="must be divisible by"):
+            TiedQuantizedLMHead(emb, 48, self.VOCAB)
+
+    def test_graph_has_reshape_and_matmulnbits(self):
+        _, head = self._make()
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result])
+        assert count_op_type(graph, "MatMulNBits") == 1
+        # Reshape rewrites the shared 2-D table to the 3-D MatMulNBits layout.
+        assert count_op_type(graph, "Reshape") == 1
+
+    def test_matmulnbits_attributes(self):
+        _, head = self._make()
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result])
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["K"] == self.DIM
+                assert attrs["N"] == self.VOCAB
+                assert attrs["bits"] == 4
+                assert attrs["block_size"] == 32
+                assert node.domain == "com.microsoft"
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_no_zero_points_when_symmetric(self):
+        _, head = self._make(has_zero_point=False)
+        assert head.zero_points is None
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result])
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                assert len(node.inputs) == 3  # x, weight, scales
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")

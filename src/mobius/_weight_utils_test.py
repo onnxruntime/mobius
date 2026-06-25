@@ -642,8 +642,10 @@ class TestPreprocessOliveWeights:
 
     # --- Tied LM head synthesis ---
 
-    def test_tied_quantized_lm_head_synthesised_from_embed(self):
-        """Olive drops lm_head.* when tied; synthesise 3-D MatMulNBits head."""
+    def test_tied_quantized_head_produces_no_lm_head_keys(self):
+        """A tied *quantized* head shares the embed Parameters in the module,
+        so preprocessing must NOT emit duplicate lm_head.* initializers.
+        """
         qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
         scales = torch.randn(self.V, self.N_BLOCKS)
         qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
@@ -659,10 +661,9 @@ class TestPreprocessOliveWeights:
             quantize_lm_head=True,
             tie_word_embeddings=True,
         )
-        assert result["lm_head.weight"].shape == (self.V, self.N_BLOCKS, self.BLOB_SIZE)
-        assert result["lm_head.weight"].dtype == torch.uint8
-        assert result["lm_head.scales"] is scales
-        assert result["lm_head.zero_points"].shape == qzeros.shape
+        assert not any(k.startswith("lm_head.") for k in result)
+        assert "model.embed_tokens.qweight" in result
+        assert "model.embed_tokens.zero_points" in result
 
     def test_float_tie_fallback(self):
         """Unquantized embed + tie -> lm_head shares the float embedding table."""

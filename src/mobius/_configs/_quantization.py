@@ -33,6 +33,10 @@ class QuantizationConfig:
     # When True, the LM head projection is block-wise quantized (MatMulNBits).
     # Set by Olive RTN exports that pass ``lm_head: true``.
     quantize_lm_head: bool = False
+    # When True, the input embedding and LM head share one weight table. Olive
+    # RTN records this in its own config (``tie_word_embeddings``) and may clear
+    # the model's top-level flag, so it is tracked here independently.
+    tie_word_embeddings: bool = False
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -63,4 +67,5 @@ class QuantizationConfig:
             sym=qc.get("sym", qc.get("symmetric", True)),
             quantize_embeddings=bool(qc.get("embeds", False)),
             quantize_lm_head=bool(qc.get("lm_head", False)),
+            tie_word_embeddings=bool(qc.get("tie_word_embeddings", False)),
         )
