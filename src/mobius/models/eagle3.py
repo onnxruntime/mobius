@@ -52,23 +52,33 @@ class Eagle3DraftModel(nn.Module):
         self.config = config
         self._dtype = config.dtype
         self._norm_before_residual = bool(getattr(config, "norm_before_residual", False))
+        self._norm_before_fc = bool(getattr(config, "norm_before_fc", False))
+        self._fc_norm = bool(getattr(config, "fc_norm", False))
         if config.draft_vocab_size is None:
             raise ValueError("Eagle3Config.draft_vocab_size must be set")
-        # Guard vLLM EAGLE-3 options we do not model. They are false/absent in the
-        # AngelSlim and speculators (RedHat) checkpoints; fail loudly rather than
-        # silently produce wrong outputs if a future checkpoint enables them.
-        if getattr(config, "norm_before_fc", False):
-            raise NotImplementedError("Eagle3: norm_before_fc is not supported")
-        if getattr(config, "fc_norm", False):
-            raise NotImplementedError("Eagle3: fc_norm is not supported")
         target_hidden = getattr(config, "target_hidden_size", None)
         if target_hidden is not None and target_hidden != config.hidden_size:
             raise NotImplementedError(
                 f"Eagle3: target_hidden_size ({target_hidden}) != hidden_size "
                 f"({config.hidden_size}) is not supported"
             )
+        # Number of target aux hidden states fused by fc (3 in every EAGLE-3
+        # checkpoint; the fc input is target_hidden_size * num_aux = 3 * hidden).
+        self._num_aux = 3
 
         self.fc = Linear(3 * config.hidden_size, config.hidden_size, bias=False)
+        # Optional pre-fc norms (vLLM EAGLE-3): a single RMSNorm over the full
+        # fused 3H input (norm_before_fc) and/or a per-aux RMSNorm on each H chunk
+        # (fc_norm). Both are absent in the AngelSlim / speculators checkpoints.
+        if self._norm_before_fc:
+            self.input_norm = RMSNorm(3 * config.hidden_size, eps=config.rms_norm_eps)
+        if self._fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self._num_aux)
+                ]
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = Eagle3Attention(config)
@@ -77,6 +87,22 @@ class Eagle3DraftModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(config.hidden_size, config.draft_vocab_size, bias=False)
         self.rotary_emb = initialize_rope(config)
+
+    def _project_fused(self, op: OpBuilder, fused_hidden: ir.Value) -> ir.Value:
+        """Apply the optional pre-fc norms then fc to the fused 3H aux input.
+
+        norm(zeros) == zeros and fc has no bias, so on chain steps (fused = 0)
+        this stays zero and the recycled hidden passes through unchanged.
+        """
+        x = fused_hidden
+        if self._norm_before_fc:
+            x = self.input_norm(op, x)
+        if self._fc_norm:
+            chunks = op.Split(x, num_outputs=self._num_aux, axis=-1, _outputs=self._num_aux)
+            x = op.Concat(
+                *(self.fc_norm[i](op, chunks[i]) for i in range(self._num_aux)), axis=-1
+            )
+        return self.fc(op, x)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -111,7 +137,7 @@ class Eagle3DraftModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        combined = op.Add(self.fc(op, fused_hidden), recycled_hidden)
+        combined = op.Add(self._project_fused(op, fused_hidden), recycled_hidden)
         embeds = self.input_layernorm(op, inputs_embeds)
         hidden = self.hidden_norm(op, combined)
         # norm_before_residual: residual is the normalized hidden; otherwise it is

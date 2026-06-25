@@ -183,11 +183,18 @@ class TestEagle3SpeculatorsConfig:
         names = [v.name for v in pkg["model"].graph.outputs]
         assert "draft_logits" in names and "next_hidden" in names
 
+    def test_norm_before_fc_and_fc_norm_build(self):
+        """The optional pre-fc norms add their params and still build."""
+        cfg = _eagle3_config(norm_before_fc=True, fc_norm=True)
+        model = Eagle3DraftModel(cfg)
+        names = [n for n, _ in model.named_parameters()]
+        assert "input_norm.weight" in names
+        assert sum(n.startswith("fc_norm.") for n in names) == 3
+        pkg = build_from_module(model, cfg, task=Eagle3DraftTask())
+        out_names = [v.name for v in pkg["model"].graph.outputs]
+        assert "draft_logits" in out_names and "next_hidden" in out_names
+
     def test_unsupported_options_raise(self):
-        with pytest.raises(NotImplementedError):
-            Eagle3DraftModel(_eagle3_config(norm_before_fc=True))
-        with pytest.raises(NotImplementedError):
-            Eagle3DraftModel(_eagle3_config(fc_norm=True))
         with pytest.raises(NotImplementedError):
             Eagle3DraftModel(_eagle3_config(target_hidden_size=128))
 
