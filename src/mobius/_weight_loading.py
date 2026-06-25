@@ -22,6 +22,7 @@ __all__ = [
 import concurrent.futures
 import json
 import logging
+from pathlib import Path, PurePosixPath
 
 import onnx_ir as ir
 import safetensors.torch
@@ -33,6 +34,9 @@ from onnx_ir import tensor_adapters
 from mobius._optimizations import fold_initializers_after_weights
 
 logger = logging.getLogger(__name__)
+
+_WEIGHT_INDEX_NAME = "model.safetensors.index.json"
+_SINGLE_WEIGHT_NAME = "model.safetensors"
 
 
 def _assign_weight(
@@ -182,6 +186,59 @@ def _parallel_download(
     return [path_map[f] for f in filenames]
 
 
+def _validate_weight_filenames(filenames: list[str]) -> list[str]:
+    """Validate safetensors filenames from a weight index.
+
+    The HuggingFace index is model data, so reject absolute paths and path traversal
+    before using entries as local filesystem paths or Hub filenames.
+    """
+    validated = []
+    for filename in filenames:
+        normalized = filename.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"Unsafe weight filename in safetensors index: {filename!r}")
+        validated.append(normalized)
+    return validated
+
+
+def _weight_filenames_from_index(index_path: Path) -> list[str]:
+    with index_path.open() as f:
+        index = json.load(f)
+    return _validate_weight_filenames(sorted(set(index["weight_map"].values())))
+
+
+def _local_weight_paths(model_dir: Path) -> list[str] | None:
+    """Return local safetensors paths for a HuggingFace checkpoint directory."""
+    if not model_dir.is_dir():
+        return None
+
+    index_path = model_dir / _WEIGHT_INDEX_NAME
+    if index_path.is_file():
+        filenames = _weight_filenames_from_index(index_path)
+    elif (model_dir / _SINGLE_WEIGHT_NAME).is_file():
+        filenames = [_SINGLE_WEIGHT_NAME]
+    else:
+        return None
+
+    root = model_dir.resolve()
+    paths = []
+    for filename in filenames:
+        path = (model_dir / filename).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsafe weight filename in safetensors index: {filename!r}"
+            ) from exc
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Weight file referenced by safetensors index not found: {path}"
+            )
+        paths.append(str(path))
+    return paths
+
+
 def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Dequantize FP8 weights and return a new dict with float tensors.
 
@@ -237,23 +294,27 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
 def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     """Download weights from HuggingFace and return as a state dict.
 
-    Uses parallel downloads when multiple safetensors shards exist.
+    Uses local safetensors files when *model_id* is a directory, otherwise
+    downloads from HuggingFace Hub. Uses parallel downloads when multiple
+    safetensors shards exist.
     """
-    try:
-        index_path = hf_hub_download(
-            repo_id=model_id,
-            filename="model.safetensors.index.json",
-        )
-        with open(index_path) as f:
-            index = json.load(f)
-        all_files = sorted(set(index["weight_map"].values()))
-    except Exception as e:
-        if "Entry Not Found" in str(e):
-            all_files = ["model.safetensors"]
-        else:
-            raise
+    paths = _local_weight_paths(Path(model_id))
+    if paths is None:
+        try:
+            index_path = Path(
+                hf_hub_download(
+                    repo_id=model_id,
+                    filename=_WEIGHT_INDEX_NAME,
+                )
+            )
+            all_files = _weight_filenames_from_index(index_path)
+        except Exception as e:
+            if "Entry Not Found" in str(e):
+                all_files = [_SINGLE_WEIGHT_NAME]
+            else:
+                raise
 
-    paths = _parallel_download(model_id, all_files, desc="safetensors")
+        paths = _parallel_download(model_id, all_files, desc="safetensors")
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
