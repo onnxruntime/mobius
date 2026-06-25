@@ -1195,21 +1195,64 @@ class Qwen35MtpConfig(CausalLMConfig):
         return cls(**fields)
 
 
+def _speculators_layer_namespace(layer_cfg: dict):
+    """Build a config-like namespace from a speculators ``transformer_layer_config``.
+
+    Normalizes the rope fields: speculators checkpoints store either a flat
+    ``rope_theta`` (Qwen3) or a nested ``rope_parameters = {rope_theta, ...}``
+    (Gemma4), so flatten the latter to ``rope_theta`` for ArchitectureConfig.
+    """
+    import types
+
+    cfg = dict(layer_cfg)
+    if "rope_theta" not in cfg:
+        rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
+        if isinstance(rope, dict) and rope.get("rope_theta") is not None:
+            cfg["rope_theta"] = rope["rope_theta"]
+    return types.SimpleNamespace(**cfg)
+
+
 @dataclasses.dataclass
 class Eagle3Config(CausalLMConfig):
-    """Configuration for AngelSlim Qwen3 EAGLE-3 draft checkpoints."""
+    """Configuration for EAGLE-3 draft checkpoints.
+
+    Two on-disk formats are supported:
+      * AngelSlim: a flat llama config with ``draft_vocab_size`` at top level
+        (Qwen3-4B/8B); ``norm_before_residual`` absent -> False.
+      * speculators (RedHat): the architecture config is nested under
+        ``transformer_layer_config``; eagle fields (``draft_vocab_size``,
+        ``norm_before_residual``, ``norm_before_fc``, ``target_hidden_size``,
+        ``eagle_aux_hidden_state_layer_ids``) sit at the top level.
+    """
 
     draft_vocab_size: int | None = None
+    norm_before_residual: bool = False
+    norm_before_fc: bool = False
+    target_hidden_size: int | None = None
+    eagle_aux_hidden_state_layer_ids: list[int] | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
-        base = ArchitectureConfig.from_transformers(config, parent_config)
+        layer_cfg = getattr(config, "transformer_layer_config", None)
+        if layer_cfg is not None:
+            # speculators format: arch config nested under transformer_layer_config.
+            if isinstance(layer_cfg, dict):
+                layer_cfg = _speculators_layer_namespace(layer_cfg)
+            base = ArchitectureConfig.from_transformers(layer_cfg, parent_config=config)
+        else:
+            base = ArchitectureConfig.from_transformers(config, parent_config)
         fields = _shallow_fields(base)
         fields["num_hidden_layers"] = 1
         fields["layer_types"] = ["full_attention"]
         return cls(
             **fields,
             draft_vocab_size=getattr(config, "draft_vocab_size", None),
+            norm_before_residual=bool(getattr(config, "norm_before_residual", False)),
+            norm_before_fc=bool(getattr(config, "norm_before_fc", False)),
+            target_hidden_size=getattr(config, "target_hidden_size", None),
+            eagle_aux_hidden_state_layer_ids=getattr(
+                config, "eagle_aux_hidden_state_layer_ids", None
+            ),
         )
 
 

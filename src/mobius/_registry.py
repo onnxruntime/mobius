@@ -493,6 +493,23 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         family="eagle3",
         variant="qwen3",
     ),
+    # speculators-format EAGLE-3 checkpoints (RedHat): the Qwen3 checkpoint
+    # declares "Eagle3Speculator", the Gemma4 one "Eagle3DraftModel". Both nest
+    # the arch config under transformer_layer_config and set norm_before_residual.
+    "Eagle3Speculator": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
+    "Eagle3DraftModel": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),

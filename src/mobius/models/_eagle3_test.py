@@ -123,6 +123,66 @@ class TestEagle3PreprocessWeights:
         assert set(remapped) == {"hidden_norm.weight", "norm.weight"}
         assert set(remapped).issubset(param_names)
 
+    def test_speculators_layout_strips_layers0_and_drops_embed(self):
+        """Strip ``layers.0.`` and drop the borrowed ``embed_tokens`` copy."""
+        cfg = _eagle3_config()
+        model = Eagle3DraftModel(cfg)
+        h, dv = cfg.hidden_size, cfg.draft_vocab_size
+        state = {
+            "fc.weight": torch.zeros(h, 3 * h),
+            "lm_head.weight": torch.zeros(dv, h),
+            "norm.weight": torch.zeros(h),
+            "embed_tokens.weight": torch.zeros(151936, h),
+            "d2t": torch.zeros(dv, dtype=torch.long),
+            "t2d": torch.zeros(151936, dtype=torch.bool),
+            "layers.0.hidden_norm.weight": torch.zeros(h),
+            "layers.0.self_attn.q_proj.weight": torch.zeros(4 * 16, 2 * h),
+        }
+        out = model.preprocess_weights(state)
+        assert out.keys() == {
+            "fc.weight",
+            "lm_head.weight",
+            "norm.weight",
+            "hidden_norm.weight",
+            "self_attn.q_proj.weight",
+        }
+
+
+class TestEagle3SpeculatorsConfig:
+    def test_nested_transformer_layer_config(self):
+        """Parse the nested speculators arch config + top-level eagle fields."""
+        hf = SimpleNamespace(
+            draft_vocab_size=32000,
+            norm_before_residual=True,
+            target_hidden_size=None,
+            transformer_layer_config={
+                "model_type": "llama",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_hidden_layers": 1,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1_000_000,
+                "vocab_size": 151936,
+            },
+        )
+        cfg = Eagle3Config.from_transformers(hf)
+        assert cfg.draft_vocab_size == 32000
+        assert cfg.norm_before_residual is True
+        assert cfg.hidden_size == 64
+        assert cfg.num_hidden_layers == 1
+        assert cfg.rope_theta == 1_000_000
+
+    def test_norm_before_residual_builds(self):
+        cfg = _eagle3_config(norm_before_residual=True)
+        model = Eagle3DraftModel(cfg)
+        assert model._norm_before_residual is True
+        pkg = build_from_module(model, cfg, task=Eagle3DraftTask())
+        names = [v.name for v in pkg["model"].graph.outputs]
+        assert "draft_logits" in names and "next_hidden" in names
+
 
 class TestEagle3TaskGraph:
     def _build(self, **overrides):

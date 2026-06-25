@@ -51,6 +51,7 @@ class Eagle3DraftModel(nn.Module):
         super().__init__()
         self.config = config
         self._dtype = config.dtype
+        self._norm_before_residual = bool(getattr(config, "norm_before_residual", False))
         if config.draft_vocab_size is None:
             raise ValueError("Eagle3Config.draft_vocab_size must be set")
 
@@ -67,13 +68,23 @@ class Eagle3DraftModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Strip ``midlayer.`` and drop orchestrator remap buffers."""
+        """Strip the layer prefix and drop borrowed / orchestrator-side weights.
+
+        Handles both checkpoint layouts: AngelSlim names the single layer
+        ``midlayer.*``; speculators (RedHat) names it ``layers.0.*`` and also
+        ships an ``embed_tokens`` copy of the target's embedding (we borrow the
+        target's, so drop it). ``d2t`` / ``t2d`` are orchestrator-side remap
+        buffers and are dropped from the graph.
+        """
+        drop = {"d2t", "t2d", "embed_tokens.weight"}
         out = {}
         for key, value in state_dict.items():
-            if key in {"d2t", "t2d"}:
+            if key in drop:
                 continue
             if key.startswith("midlayer."):
                 key = key[len("midlayer.") :]
+            elif key.startswith("layers.0."):
+                key = key[len("layers.0.") :]
             out[key] = value
         return out
 
@@ -90,6 +101,9 @@ class Eagle3DraftModel(nn.Module):
         combined = op.Add(self.fc(op, fused_hidden), recycled_hidden)
         embeds = self.input_layernorm(op, inputs_embeds)
         hidden = self.hidden_norm(op, combined)
+        # norm_before_residual: residual is the normalized hidden; otherwise it is
+        # the raw fused feature (combined). Matches vllm llama_eagle3.py.
+        residual_base = hidden if self._norm_before_residual else combined
         attn_input = op.Concat(embeds, hidden, axis=-1)
 
         position_embeddings = self.rotary_emb(op, position_ids)
@@ -108,7 +122,7 @@ class Eagle3DraftModel(nn.Module):
             position_embeddings=position_embeddings,
             past_key_value=past_kv,
         )
-        residual = op.Add(attn_output, combined)
+        residual = op.Add(attn_output, residual_base)
         hidden = self.post_attention_layernorm(op, residual)
         hidden = self.mlp(op, hidden)
         h_prenorm = op.Add(hidden, residual)

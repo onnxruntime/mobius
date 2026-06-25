@@ -4677,6 +4677,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.
     "Eagle3LlamaForCausalLM",
     "LlamaForCausalLMEagle3",
+    "Eagle3Speculator",
+    "Eagle3DraftModel",
 }
 
 # Registered model types that truly have no test coverage yet.
