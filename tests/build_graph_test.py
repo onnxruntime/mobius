@@ -4673,6 +4673,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
     # src/mobius/models/_qwen35_mtp_test.py.
     "Qwen35MtpModel",
+    # EAGLE-3 drafter: bespoke IO contract (inputs_embeds, fused_hidden,
+    # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.
+    "Eagle3LlamaForCausalLM",
+    "LlamaForCausalLMEagle3",
 }
 
 # Registered model types that truly have no test coverage yet.

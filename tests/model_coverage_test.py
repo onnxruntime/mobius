@@ -278,6 +278,8 @@ _COVERAGE_SKIP: dict[str, str] = {
     "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
+    "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
 }
 
 

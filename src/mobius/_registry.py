@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Eagle3Config,
     Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
@@ -39,6 +40,7 @@ from mobius.models import (
     DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
+    Eagle3DraftModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
     ExaOne4CausalLMModel,
@@ -475,6 +477,22 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "Qwen35MtpModel": ModelRegistration(
         Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
     ),
+    "Eagle3LlamaForCausalLM": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # AngelSlim ships two equivalent EAGLE-3 architecture strings: Qwen3-4B uses
+    # "Eagle3LlamaForCausalLM", Qwen3-8B uses "LlamaForCausalLMEagle3".
+    "LlamaForCausalLMEagle3": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
@@ -805,6 +823,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen": "Qwen/Qwen-1_8B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "qwen3_5_text": "Qwen/Qwen3.5-2B",
+    "Eagle3LlamaForCausalLM": "AngelSlim/Qwen3-4B_eagle3",
+    "LlamaForCausalLMEagle3": "AngelSlim/Qwen3-8B_eagle3",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
     "gpt2": "openai-community/gpt2",
     "opt": "facebook/opt-125m",

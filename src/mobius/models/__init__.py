@@ -26,6 +26,7 @@ __all__ = [
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "DFlashDraftModel",
+    "Eagle3DraftModel",
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
@@ -158,6 +159,7 @@ from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
+from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel

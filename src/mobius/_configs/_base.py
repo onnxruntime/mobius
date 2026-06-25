@@ -1196,6 +1196,24 @@ class Qwen35MtpConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Eagle3Config(CausalLMConfig):
+    """Configuration for AngelSlim Qwen3 EAGLE-3 draft checkpoints."""
+
+    draft_vocab_size: int | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(
+            **fields,
+            draft_vocab_size=getattr(config, "draft_vocab_size", None),
+        )
+
+
+@dataclasses.dataclass
 class Gemma2Config(CausalLMConfig):
     """Configuration for Gemma2 models with attention soft-capping.
 
