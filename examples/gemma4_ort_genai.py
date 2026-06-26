@@ -23,6 +23,9 @@ Usage::
     # Text-only generation (text-decoder ONNX):
     python examples/gemma4_ort_genai.py
 
+    # Export for WebGPU with graph capture (fp16):
+    python examples/gemma4_ort_genai.py --ep webgpu --dtype f16 --save-to output/gemma4_webgpu/
+
     # VLM generation (decoder + vision encoder + embedding):
     python examples/gemma4_ort_genai.py --mode vlm
 
@@ -73,6 +76,7 @@ def _write_genai_config(
     bos_token_id: int | None,
     eos_token_id: int | list[int] | None,
     pad_token_id: int | None,
+    ep: str = "cpu",
 ) -> None:
     """Write genai_config.json, deriving all values from the ArchitectureConfig.
 
@@ -83,6 +87,7 @@ def _write_genai_config(
         bos_token_id: BOS token ID (from HuggingFace config).
         eos_token_id: EOS token ID(s) (from HuggingFace config).
         pad_token_id: PAD token ID (from HuggingFace config).
+        ep: Execution provider (e.g. ``"cpu"``, ``"cuda"``, ``"webgpu"``).
 
     NOTE: Uses model type ``gemma4_text`` (text) or ``gemma4`` (VLM).  These
     types are not yet in a released ORT GenAI build.  Until support lands,
@@ -108,6 +113,7 @@ def _write_genai_config(
         num_key_value_heads=getattr(config, "num_key_value_heads", 0),
         head_dim=getattr(config, "head_dim", 0),
         context_length=getattr(config, "max_position_embeddings", 4096),
+        ep=ep,
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
@@ -191,7 +197,7 @@ def _write_processor_config(config: object, output_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
+def build_and_export(model_id: str, output_dir: str, mode: str, ep: str = "cpu", dtype: str = "f32") -> None:
     """Build the ONNX model package and write ORT GenAI config files.
 
     Derives all architecture constants from the Gemma4Config returned by
@@ -202,14 +208,16 @@ def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
         model_id: HuggingFace model ID.
         output_dir: Directory to write all outputs.
         mode: ``"text"`` for text-only decoder, ``"vlm"`` for 3-model VLM.
+        ep: Execution provider (e.g. ``"cpu"``, ``"cuda"``, ``"webgpu"``).
+        dtype: Model dtype (e.g. ``"f32"``, ``"f16"``).
     """
     import transformers
 
     from mobius import build
     from mobius.integrations.ort_genai.auto_export import _copy_tokenizer_files
 
-    print(f"Building {model_id!r} (mode={mode}) ...")
-    pkg = build(model_id, dtype="f32", load_weights=True)
+    print(f"Building {model_id!r} (mode={mode}, ep={ep}, dtype={dtype}) ...")
+    pkg = build(model_id, dtype=dtype, load_weights=True, execution_provider=ep)
     print(f"Package components: {list(pkg.keys())}")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -231,6 +239,7 @@ def build_and_export(model_id: str, output_dir: str, mode: str) -> None:
         bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
+        ep=ep,
     )
 
     if mode == "vlm":
@@ -454,6 +463,18 @@ def main() -> None:
         help="Export/run mode: 'text' (decoder only) or 'vlm' (3-model VLM). Default: text.",
     )
     parser.add_argument(
+        "--ep",
+        default="cpu",
+        choices=["cpu", "cuda", "webgpu"],
+        help="Execution provider (default: cpu). Use 'webgpu' for graph capture export.",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="f32",
+        choices=["f32", "f16"],
+        help="Model dtype (default: f32). Use 'f16' for WebGPU.",
+    )
+    parser.add_argument(
         "--model-dir",
         default=None,
         help="Pre-built model directory. Skips export when provided.",
@@ -497,17 +518,17 @@ def main() -> None:
 
     # ----- Export-only path -----
     if args.save_to:
-        build_and_export(args.model_id, args.save_to, mode=args.mode)
+        build_and_export(args.model_id, args.save_to, mode=args.mode, ep=args.ep, dtype=args.dtype)
         return
 
     # ----- Resolve model directory -----
     if args.model_dir:
         model_dir = args.model_dir
     else:
-        default_dir = os.path.join("output", f"gemma4_{args.mode}")
+        default_dir = os.path.join("output", f"gemma4_{args.mode}_{args.ep}")
         model_dir = default_dir
         if not os.path.isfile(os.path.join(model_dir, "genai_config.json")):
-            build_and_export(args.model_id, model_dir, mode=args.mode)
+            build_and_export(args.model_id, model_dir, mode=args.mode, ep=args.ep, dtype=args.dtype)
 
     # ----- Inference -----
     prompt = args.prompt or (DEFAULT_IMAGE_PROMPT if args.image else DEFAULT_PROMPT)
