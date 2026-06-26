@@ -1575,8 +1575,8 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Use separate per-layer tables so each weight stays under WebGPU's
-            # 2 GB buffer limit (each [V, D] table is ~128 MB vs 4.4 GB fused).
+            # Use separate per-layer tables so each weight stays within WebGPU's
+            # per-buffer size limit (each [V, D] table is ~128 MB vs 4.4 GB fused).
             self.embed_tokens_per_layer = nn.ModuleList([
                 Gemma3TextScaledWordEmbedding(
                     vocab_per_layer,
@@ -1946,7 +1946,7 @@ class Gemma4CausalLMModel(CausalLMModel):
             elif "vision_tower" in key or "embed_vision" in key:
                 state_dict.pop(key, None)
         # Split fused per-layer embedding [V, L*D] into L separate [V, D] tables
-        # so each weight stays under WebGPU's 2 GB buffer limit.
+        # so each weight stays within WebGPU's per-buffer size limit.
         fused_key = "model.embed_tokens_per_layer.weight"
         if self.model._per_layer_dim and fused_key in state_dict:
             fused = state_dict.pop(fused_key)
@@ -2781,7 +2781,7 @@ class Gemma4Model(nn.Module):
                 elif any(suffix.startswith(p) for p in per_layer_prefixes):
                     # Per-layer embedding weights → both decoder and embedding.
                     # Split fused embed_tokens_per_layer [V, L*D] into L separate
-                    # [V, D] tables for the decoder (WebGPU 2 GB buffer limit).
+                    # [V, D] tables for the decoder (WebGPU per-buffer size limit).
                     if suffix == "embed_tokens_per_layer.weight":
                         num_layers = self.config.num_hidden_layers
                         per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
