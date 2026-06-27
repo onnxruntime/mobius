@@ -47,6 +47,14 @@ class TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
         self._dtype = config.dtype
+        # When non-empty, the forward pass additionally returns the
+        # post-residual outputs of the listed decoder layers (before the
+        # final ``self.norm``).  See ``ArchitectureConfig.output_layer_indices``
+        # for the index convention. ``None``/empty preserves the legacy
+        # 2-tuple return.
+        self.output_layer_indices: list[int] | None = (
+            list(getattr(config, "output_layer_indices", None) or []) or None
+        )
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
@@ -236,8 +244,22 @@ class TextModel(nn.Module):
                 )
 
         present_key_values = []
+        output_layer_indices = getattr(self, "output_layer_indices", None)
+        if output_layer_indices is not None:
+            num_layers = len(self.layers)
+            if len(set(output_layer_indices)) != len(output_layer_indices):
+                raise ValueError(
+                    f"output_layer_indices must not contain duplicates: {output_layer_indices}"
+                )
+            out_of_range = [i for i in output_layer_indices if not 0 <= i < num_layers]
+            if out_of_range:
+                raise ValueError(
+                    f"output_layer_indices {out_of_range} out of range [0, {num_layers})"
+                )
+        capture_set = set(output_layer_indices or ())
+        captured_by_index: dict[int, ir.Value] = {}
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -246,8 +268,16 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            if layer_idx in capture_set:
+                captured_by_index[layer_idx] = hidden_states
 
         hidden_states = self.norm(op, hidden_states)
+        if output_layer_indices is not None:
+            # Build in the user-supplied order so the caller can rely on
+            # ``zip(config.output_layer_indices, intermediate_hidden_states)``.
+            # Indices are validated above, so every requested layer is present.
+            ordered = [captured_by_index[idx] for idx in output_layer_indices]
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 
@@ -286,13 +316,18 @@ class CausalLMModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        hidden_states, present_key_values = self.model(
+        result = self.model(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if len(result) == 3:
+            hidden_states, present_key_values, intermediate_hidden_states = result
+            logits = self.lm_head(op, hidden_states)
+            return logits, present_key_values, intermediate_hidden_states
+        hidden_states, present_key_values = result
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

@@ -67,6 +67,10 @@ class EpCapabilities:
             ``PackedMultiHeadAttention`` via InlinePass to a
             block-diagonal attention bias + standard ``Attention``.
             Leave ``True`` for CUDA / DML EPs that ship the native kernel.
+        supports_rank4_rmsnorm: ``False`` reshapes rank-4 ``RMSNormalization``
+            (query/key norm over the head dimension) to rank-3 and back via
+            HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
+            only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -102,6 +106,7 @@ class EpCapabilities:
     supports_skip_layer_norm: bool = True
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
+    supports_rank4_rmsnorm: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -288,6 +293,7 @@ def _register_builtins() -> None:
                 "enable_htp_shared_memory_allocator": "1",
             },
             supports_past_present_share_buffer=False,  # standard-Attention KV concat
+            supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
