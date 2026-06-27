@@ -80,7 +80,7 @@
       <textarea id="persona">You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.</textarea>
 
       <label for="seed">Voice seed (optional) — fixes the sampled voice/accent</label>
-      <input id="seed" type="number" placeholder="leave blank for a random voice each time"
+      <input id="seed" type="number" min="0" step="1" placeholder="leave blank for a random voice each time"
         style="width:100%; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:8px;" />
       <div class="hint">Same seed → same voice every session. Try different integers to find one you like.</div>
 
@@ -339,7 +339,11 @@
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const hasVoice = !!(voicePcm && voicePcm.length >= FRAME);
       const seedRaw = seedInput.value.trim();
-      const seed = seedRaw === "" ? null : Number(seedRaw);
+      let seed = null;
+      if (seedRaw !== "") {
+        const n = Number(seedRaw);
+        seed = Number.isInteger(n) && n >= 0 ? n : null;
+      }
       ws.send(JSON.stringify({ persona: persona.value, hasVoice, seed }));
       if (hasVoice) ws.send(voicePcm.buffer.slice(0));
       apply.disabled = true;
