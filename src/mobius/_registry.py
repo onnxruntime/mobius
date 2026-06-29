@@ -772,6 +772,20 @@ def _create_default_registry() -> ModelRegistry:
     return reg
 
 
+# -- Text-only export overrides --
+# Maps a multimodal ``model_type`` to its text-only registry sibling, used by
+# ``build(..., text_only=True)`` to export the text backbone of a multimodal
+# checkpoint as a standalone decoder-only LLM (e.g. so it can use
+# GroupQueryAttention instead of the multimodal bidirectional float-bias path).
+# Entries must point at a registered text-only model_type. The mapping is
+# idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
+# no-op when the resolved type is already text-only.
+_TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "gemma4_unified": "gemma4_unified_text",
+    "gemma4_unified_text": "gemma4_unified_text",
+}
+
+
 # fmt: off
 # -- Test model IDs for L2 architecture validation --
 # Each maps a registered model_type to a public HuggingFace model.

@@ -26,6 +26,7 @@ __all__ = [
 
 import dataclasses
 import logging
+from typing import Any
 
 import onnx_ir as ir
 import torch
@@ -217,6 +218,45 @@ def build_from_module(
     return pkg
 
 
+def _strip_to_text_only(config: Any, model_type: str) -> Any:
+    """Return a copy of *config* reduced to a pure text-only decoder.
+
+    Used by :func:`build` when ``text_only=True``. Overrides ``model_type``
+    to the text-only registry sibling and nulls multimodal fields so the text
+    backbone builds as a plain causal LM (no vision-block bidirectional
+    overlay, no image/audio token routing). This lets the decoder use
+    ``GroupQueryAttention`` on GQA-capable execution providers instead of the
+    multimodal float-bias ``Attention`` path.
+
+    Only fields that exist on the config dataclass are overridden, so the helper is
+    safe across different config dataclasses. Raises :class:`TypeError` if *config*
+    is not a dataclass instance.
+    """
+    if not dataclasses.is_dataclass(config):
+        raise TypeError(
+            f"_strip_to_text_only expects a dataclass config instance, got {type(config)!r}"
+        )
+    field_names = {f.name for f in dataclasses.fields(config)}
+    # model_type drives downstream ORT-GenAI type selection and task defaults.
+    overrides: dict[str, Any] = {"model_type": model_type}
+    # Vision/audio routing fields: nulling them removes the bidirectional
+    # image-block overlay and the per-layer image/audio token masking, leaving
+    # a pure causal decoder. ``None`` is the "absent" value for each of these.
+    for name in (
+        "image_token_id",
+        "use_bidirectional_attention",
+        "audio_token_id",
+        "boa_token_id",
+        "vision",
+        "audio",
+    ):
+        if name in field_names:
+            overrides[name] = None
+    return dataclasses.replace(
+        config, **{k: v for k, v in overrides.items() if k in field_names}
+    )
+
+
 # Attention input index for the optional ``nonpad_kv_seqlen`` operand. This
 # operand (external/static KV cache length) and the TensorScatter op are
 # defined only in opset 24, so a graph using either must not declare opset 23.
@@ -313,6 +353,7 @@ def build(
     trust_remote_code: bool = False,
     execution_provider: str = "default",
     trace_optimization: bool = False,
+    text_only: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -366,6 +407,16 @@ def build(
         trace_optimization: When ``True``, log step-by-step diagnostic
             output at INFO level for each optimization stage. See
             :func:`build_from_module` for details.
+        text_only: When ``True``, export the text backbone of a multimodal
+            checkpoint as a standalone decoder-only LLM. The resolved
+            ``model_type`` is remapped to its text-only registry sibling (see
+            ``_TEXT_ONLY_MODEL_TYPE``) and vision/audio config fields
+            (``image_token_id``, ``use_bidirectional_attention``, ``vision``,
+            ``audio``, ...) are stripped, yielding a pure-causal decoder that
+            can use ``GroupQueryAttention`` on GQA-capable execution providers.
+            Raises :class:`ValueError` if the resolved ``model_type`` has no
+            text-only sibling. Currently supported for ``gemma4_unified``
+            (``google/gemma-4-12B``).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -409,6 +460,12 @@ def build(
         # Try loading config.json directly if the model is in our registry.
         hf_config = _try_load_config_json(model_id)
         if hf_config is None or hf_config.model_type not in registry:
+            if text_only:
+                raise ValueError(
+                    f"text_only=True is not supported for '{model_id}': it does "
+                    "not resolve to a registered text-capable model_type (it "
+                    "looks like a diffusers pipeline or an unsupported config)."
+                )
             # Not a model we support — try diffusers pipeline
             return build_diffusers_pipeline(
                 model_id,
@@ -456,6 +513,18 @@ def build(
         if any("ForCTC" in arch for arch in architectures):
             model_type = "mms"
 
+    if text_only:
+        from mobius._registry import _TEXT_ONLY_MODEL_TYPE
+
+        text_type = _TEXT_ONLY_MODEL_TYPE.get(model_type)
+        if text_type is None:
+            raise ValueError(
+                f"text_only=True is not supported for model_type '{model_type}'. "
+                "It is only available for multimodal checkpoints with a text-only "
+                f"registry sibling: {sorted(_TEXT_ONLY_MODEL_TYPE)}."
+            )
+        model_type = text_type
+
     # DFlash speculative-decoding drafters ship ``model_type="qwen3"`` (the
     # base Qwen3 family) but declare ``architectures=["DFlashDraftModel"]``.
     # Re-route via the architectures field so build() picks the cross-
@@ -492,6 +561,9 @@ def build(
                 registry.get(model_type)  # raises KeyError
 
     config = _config_from_hf(hf_config, parent_config=parent_config, module_class=module_class)
+
+    if text_only:
+        config = _strip_to_text_only(config, model_type)
 
     if dtype is not None:
         dtype = resolve_dtype(dtype)
