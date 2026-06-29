@@ -249,6 +249,16 @@ class MoshiORT:
         self._sdec = StreamingMimiDecoder(self.dec)
         self._reset_lm_state()
 
+    def set_seed(self, seed: int | None) -> None:
+        """Reseed the sampling RNG so a conversation's voice is reproducible.
+
+        The assistant's voice/accent is determined entirely by the temperature
+        + top-k sampling trajectory (the ONNX models are deterministic), so a
+        fixed ``seed`` yields the same voice every session; ``None`` reseeds
+        from entropy for a fresh random voice.
+        """
+        self._rng = np.random.default_rng(seed)
+
     def process_frame(self, frame: np.ndarray) -> np.ndarray | None:
         """Process one 12.5Hz user frame, return the assistant frame.
 
