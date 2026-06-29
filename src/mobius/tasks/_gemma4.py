@@ -24,7 +24,6 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import ep_capabilities
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
@@ -131,24 +130,19 @@ class Gemma4TextCausalLMTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        # For WebGPU EP with graph capture, use INT32 types to avoid Cast ops
-        # that fall back to CPU (WebGPU doesn't support INT64 casts)
-        caps = ep_capabilities()
-        int_dtype = ir.DataType.INT32 if caps.enable_graph_capture else ir.DataType.INT64
-
         input_ids = builder.input(
             "input_ids",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
         attention_mask = builder.input(
             "attention_mask",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         position_ids = builder.input(
             "position_ids",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
 
@@ -241,11 +235,6 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="decoder")
         op = builder.op
 
-        # For WebGPU EP with graph capture, use INT32 types to avoid Cast ops
-        # that fall back to CPU (WebGPU doesn't support INT64 casts)
-        caps = ep_capabilities()
-        int_dtype = ir.DataType.INT32 if caps.enable_graph_capture else ir.DataType.INT64
-
         inputs_embeds = builder.input(
             "inputs_embeds",
             dtype=config.dtype,
@@ -253,12 +242,12 @@ class Gemma4Task(ModelTask):
         )
         attention_mask = builder.input(
             "attention_mask",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, "past_seq_len + seq_len"],
         )
         position_ids = builder.input(
             "position_ids",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
 
@@ -275,7 +264,7 @@ class Gemma4Task(ModelTask):
         if per_layer_dim or config.use_bidirectional_attention == "vision":
             input_ids_val = builder.input(
                 "input_ids",
-                dtype=int_dtype,
+                dtype=ir.DataType.INT64,
                 shape=[batch, seq_len],
             )
 
@@ -410,14 +399,9 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="embedding")
         op = builder.op
 
-        # For WebGPU EP with graph capture, use INT32 input_ids since WebGPU
-        # doesn't support INT64 Cast ops or INT64 Equal/CumSum/etc.
-        caps = ep_capabilities()
-        int_dtype = ir.DataType.INT32 if caps.enable_graph_capture else ir.DataType.INT64
-
         input_ids = builder.input(
             "input_ids",
-            dtype=int_dtype,
+            dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
         image_features = builder.input(

@@ -1593,46 +1593,21 @@ class Gemma4TextModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
-        # For WebGPU EP with graph capture, use INT32 constants to match input_ids dtype
-        caps = ep_capabilities()
-        if caps.enable_graph_capture:
-            import numpy as np
-
-            pad = op.Constant(value=ir.tensor(np.array(0, dtype=np.int32)))
-            masked_ids = input_ids
-            if self._image_token_id:
-                masked_ids = op.Where(
-                    op.Equal(
-                        masked_ids,
-                        op.Constant(value=ir.tensor(np.array(self._image_token_id, dtype=np.int32))),
-                    ),
-                    pad,
-                    masked_ids,
-                )
-            if self._audio_token_id is not None:
-                masked_ids = op.Where(
-                    op.Equal(
-                        masked_ids,
-                        op.Constant(value=ir.tensor(np.array(self._audio_token_id, dtype=np.int32))),
-                    ),
-                    pad,
-                    masked_ids,
-                )
-        else:
-            pad = op.Constant(value_int=0)
-            masked_ids = input_ids
-            if self._image_token_id:
-                masked_ids = op.Where(
-                    op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
-                    pad,
-                    masked_ids,
-                )
-            if self._audio_token_id is not None:
-                masked_ids = op.Where(
-                    op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
-                    pad,
-                    masked_ids,
-                )
+        # Mask multimodal token IDs → pad before per-layer embedding lookup
+        pad = op.Constant(value_int=0)
+        masked_ids = input_ids
+        if self._image_token_id:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self._image_token_id)),
+                pad,
+                masked_ids,
+            )
+        if self._audio_token_id is not None:
+            masked_ids = op.Where(
+                op.Equal(masked_ids, op.Constant(value_int=self._audio_token_id)),
+                pad,
+                masked_ids,
+            )
 
         per_layer_embs = [
             op.Unsqueeze(self.embed_tokens_per_layer[i](op, masked_ids), [2])
@@ -1644,7 +1619,7 @@ class Gemma4TextModel(nn.Module):
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Gather(combined, op.Constant(value=ir.tensor(np.array(i, dtype=np.int32))), axis=2)
+            op.Gather(combined, op.Constant(value_int=i), axis=2)
             for i in range(self._num_layers)
         ]
 
@@ -1675,7 +1650,7 @@ class Gemma4TextModel(nn.Module):
                 op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
             )
             per_layer_list = [
-                op.Gather(per_layer_4d, op.Constant(value=ir.tensor(np.array(i, dtype=np.int32))), axis=2)
+                op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
                 for i in range(num_layers)
             ]
         elif self._per_layer_dim and input_ids is not None:
@@ -1749,17 +1724,12 @@ class Gemma4TextModel(nn.Module):
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = sum(attention_mask[b])      (works with static mask for graph capture)
-            if caps.enable_graph_capture:
-                one_const = op.Constant(value=ir.tensor(np.array(1, dtype=np.int32)))
-                total_seq_len = op.ReduceSum(attention_mask, [1], keepdims=0)
-                seqlens_k = op.Sub(total_seq_len, one_const)
-            else:
-                one_const = op.Constant(value_int=1)
-                total_seq_len = op.Cast(
-                    op.ReduceSum(attention_mask, [1], keepdims=0),
-                    to=ir.DataType.INT32,
-                )
-                seqlens_k = op.Sub(total_seq_len, one_const)
+            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)  # INT64
+            total_seq_len = op.Cast(reduce_sum, to=ir.DataType.INT32)
+            seqlens_k = op.Cast(
+                op.Sub(reduce_sum, op.Constant(value_int=1)),
+                to=ir.DataType.INT32,
+            )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -2163,34 +2133,13 @@ class Gemma4EmbeddingModel(nn.Module):
         eager evaluation of the Where branches never faults on an empty tensor
         during text-only / decode steps.
         """
-        caps = ep_capabilities()
+        mask = op.Equal(input_ids, op.Constant(value_int=token_id))
+        mask_3d = op.Unsqueeze(mask, [-1])
 
-        if caps.enable_graph_capture:
-            # WebGPU graph capture path: use FLOAT for all arithmetic to avoid
-            # ops falling back to CPU (CumSum/Clip/Sub with INT32 cause device lost).
-            # input_ids is INT32, convert token_id to INT32 for Equal.
-            token_const = op.Constant(value=ir.tensor(np.array(token_id, dtype=np.int32)))
-            mask = op.Equal(input_ids, token_const)  # BOOL
-            mask_3d = op.Unsqueeze(mask, [-1])
-
-            # Do cumsum in FLOAT to stay on WebGPU EP
-            mask_float = op.Cast(mask, to=ir.DataType.FLOAT)
-            cumsum_float = op.CumSum(mask_float, op.Constant(value=ir.tensor(np.array(1, dtype=np.int32))))
-            # sub-1 and clip to 0 in float
-            indices_float = op.Clip(
-                op.Sub(cumsum_float, op.Constant(value=ir.tensor(np.array(1.0, dtype=np.float32)))),
-                op.Constant(value=ir.tensor(np.array(0.0, dtype=np.float32))),
-            )
-            # Cast back to INT32 for Gather
-            indices = op.Cast(indices_float, to=ir.DataType.INT32)
-        else:
-            mask = op.Equal(input_ids, op.Constant(value_int=token_id))
-            mask_3d = op.Unsqueeze(mask, [-1])
-
-            # CumSum → sub-1 → clip gives 0-based index into features for each token
-            mask_int = op.Cast(mask, to=7)  # INT64
-            cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
-            indices = op.Clip(op.Sub(cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
+        # CumSum → sub-1 → clip gives 0-based index into features for each token
+        mask_int = op.Cast(mask, to=7)  # INT64
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        indices = op.Clip(op.Sub(cumsum, op.Constant(value_int=1)), op.Constant(value_int=0))
 
         # One-row dummy prevents empty-tensor Gather faults during decode steps.
         # Use Constant (static) + Unsqueeze to avoid ConstantOfShape, whose
@@ -2261,56 +2210,28 @@ class Gemma4EmbeddingModel(nn.Module):
         proj = self.per_layer_projection_norm(op, proj)
 
         # 2. Mask multimodal token IDs → configured pad_token_id before per-layer lookup
-        # For WebGPU graph capture, input_ids is INT32, so use INT32 constants.
-        caps = ep_capabilities()
-        if caps.enable_graph_capture:
-            pad = op.Constant(value=ir.tensor(np.array(self.config.pad_token_id, dtype=np.int32)))
-        else:
-            pad = op.Constant(value_int=self.config.pad_token_id)
+        pad = op.Constant(value_int=self.config.pad_token_id)
         masked_ids = input_ids
         if self.image_token_id:
-            if caps.enable_graph_capture:
-                img_const = op.Constant(value=ir.tensor(np.array(self.image_token_id, dtype=np.int32)))
-            else:
-                img_const = op.Constant(value_int=self.image_token_id)
             masked_ids = op.Where(
-                op.Equal(masked_ids, img_const),
+                op.Equal(masked_ids, op.Constant(value_int=self.image_token_id)),
                 pad,
                 masked_ids,
             )
         if self.audio_token_id is not None:
-            if caps.enable_graph_capture:
-                aud_const = op.Constant(value=ir.tensor(np.array(self.audio_token_id, dtype=np.int32)))
-            else:
-                aud_const = op.Constant(value_int=self.audio_token_id)
             masked_ids = op.Where(
-                op.Equal(masked_ids, aud_const),
+                op.Equal(masked_ids, op.Constant(value_int=self.audio_token_id)),
                 pad,
                 masked_ids,
             )
 
         # 3. Per-layer embedding lookup
-        # Check EP at forward time (build context is active now)
-        caps = ep_capabilities()
-        if caps.enable_graph_capture:
-            # WebGPU path: Do a single Gather on the fused table, then slice
-            # the result into L pieces. This avoids the 4GB+ single-buffer issue
-            # because the large weight is never fully materialized at once -
-            # ORT will constant-fold the Slices into smaller weight tensors.
-            fused_emb_raw = self.embed_tokens_per_layer(op, masked_ids)
-            # fused_emb_raw: [B, S, L*D] → reshape to [B, S, L, D]
-            fused_emb = op.Reshape(
-                fused_emb_raw,
-                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-            )
-        else:
-            # Default path: single Gather on fused [V, L*D] table → reshape
-            fused_emb = self.embed_tokens_per_layer(op, masked_ids)
-            # fused_emb: [B, S, L*D] → [B, S, L, D]
-            fused_emb = op.Reshape(
-                fused_emb,
-                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-            )
+        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+        # fused_emb: [B, S, L*D] → [B, S, L, D]
+        fused_emb = op.Reshape(
+            fused_emb,
+            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+        )
 
         # 4. Combine: (proj + emb) * 0.707 per layer, then flatten back
         combined = op.Add(proj, fused_emb)  # [B, S, L, D]
