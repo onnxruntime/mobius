@@ -228,9 +228,14 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
     ``GroupQueryAttention`` on GQA-capable execution providers instead of the
     multimodal float-bias ``Attention`` path.
 
-    Only fields that exist on the config dataclass are overridden, so the
-    helper is safe to call on any config type registered for ``text_only``.
+    Only fields that exist on the config dataclass are overridden, so the helper is
+    safe across different config dataclasses. Raises :class:`TypeError` if *config*
+    is not a dataclass instance.
     """
+    if not dataclasses.is_dataclass(config):
+        raise TypeError(
+            f"_strip_to_text_only expects a dataclass config instance, got {type(config)!r}"
+        )
     field_names = {f.name for f in dataclasses.fields(config)}
     # model_type drives downstream ORT-GenAI type selection and task defaults.
     overrides: dict[str, Any] = {"model_type": model_type}
