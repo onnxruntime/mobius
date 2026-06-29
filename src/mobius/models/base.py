@@ -19,6 +19,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._flags import flags
 from mobius._weight_utils import (
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -32,10 +33,11 @@ from mobius.components import (
     Linear,
     RMSNorm,
     create_padding_mask,
+    create_static_cache_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
 )
-from mobius.components._attention import GQAContext
+from mobius.components._attention import GQAContext, StaticCacheState
 from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 
 
@@ -45,6 +47,14 @@ class TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig, mlp_class: type | None = None):
         super().__init__()
         self._dtype = config.dtype
+        # When non-empty, the forward pass additionally returns the
+        # post-residual outputs of the listed decoder layers (before the
+        # final ``self.norm``).  See ``ArchitectureConfig.output_layer_indices``
+        # for the index convention. ``None``/empty preserves the legacy
+        # 2-tuple return.
+        self.output_layer_indices: list[int] | None = (
+            list(getattr(config, "output_layer_indices", None) or []) or None
+        )
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
@@ -72,6 +82,69 @@ class TextModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+
+        # Sliding-window models declare a local-attention span; it drives the
+        # optional static-cache float bias (flags.static_cache_bias). Standard
+        # full-attention models leave this None, so the bias path is a no-op
+        # for them even when the flag is set.
+        self._sliding_window: int | None = getattr(config, "sliding_window", None)
+
+    def _maybe_static_cache_bias(
+        self,
+        op: OpBuilder,
+        seq_len_source: ir.Value,
+        past_key_values: list | None,
+    ) -> ir.Value | None:
+        """Optionally build the static-cache float additive attention bias.
+
+        Returns ``None`` (maskless ``is_causal=1`` default) unless ALL hold:
+          * ``flags.static_cache_bias`` is set, AND
+          * the model declares a bias need (``self._sliding_window`` is set), AND
+          * the cache is the opset-24 external cache (``StaticCacheState``).
+
+        When emitted, the bias is a ``(B, 1, S_q, max_seq_len)`` additive mask
+        keyed on absolute query positions with KV validity
+        ``slot < nonpad_kv_seqlen``; ``_apply_attention`` then pairs it with
+        ``is_causal=0``. The ``write_indices`` / ``nonpad_kv_seqlen`` graph
+        inputs are shared across all layers, so the first layer's cache state
+        carries them.
+
+        Args:
+            seq_len_source: An always-present ``[B, S_q, ...]`` tensor (e.g.
+                ``hidden_states``) whose dim 1 is the query length ``S_q``. Using
+                this instead of ``input_ids`` keeps the bias enabled for
+                ``inputs_embeds``-driven forwards (where ``input_ids`` is None).
+        """
+        if not flags.static_cache_bias or self._sliding_window is None:
+            return None
+        if not past_key_values:
+            return None
+        first = past_key_values[0]
+        if not isinstance(first, StaticCacheState):
+            return None
+
+        # Static cache KV axis width is a concrete int: [B, max_seq_len, kv_hidden].
+        # Guard against a symbolic dim, which would otherwise raise an opaque
+        # TypeError downstream. Static-cache always allocates a fixed width today.
+        max_seq_len = first.key_cache.shape[1]
+        if not isinstance(max_seq_len, int):
+            raise TypeError(
+                "static-cache bias requires a concrete key_cache KV dimension "
+                f"(axis 1), but got symbolic dim {max_seq_len!r}. The static "
+                "cache must be allocated with a fixed max_seq_len."
+            )
+        # S_q lives at dim 1 of both input_ids ([B, S_q]) and hidden_states
+        # ([B, S_q, hidden]), so the bias works for either forward entry point.
+        seq_len = op.Shape(seq_len_source, start=1, end=2)  # (1,) int64 == [S_q]
+        return create_static_cache_attention_bias(
+            op,
+            write_indices=first.write_indices,
+            seq_len=seq_len,
+            nonpad_kv_seqlen=first.nonpad_kv_seqlen,
+            max_seq_len=max_seq_len,
+            sliding_window=self._sliding_window,
+            dtype=self._dtype,
+        )
 
     def forward(
         self,
@@ -166,11 +239,27 @@ class TextModel(nn.Module):
                     attention_mask=attention_mask,
                 )
             else:
-                attention_bias = None
+                attention_bias = self._maybe_static_cache_bias(
+                    op, hidden_states, past_key_values
+                )
 
         present_key_values = []
+        output_layer_indices = getattr(self, "output_layer_indices", None)
+        if output_layer_indices is not None:
+            num_layers = len(self.layers)
+            if len(set(output_layer_indices)) != len(output_layer_indices):
+                raise ValueError(
+                    f"output_layer_indices must not contain duplicates: {output_layer_indices}"
+                )
+            out_of_range = [i for i in output_layer_indices if not 0 <= i < num_layers]
+            if out_of_range:
+                raise ValueError(
+                    f"output_layer_indices {out_of_range} out of range [0, {num_layers})"
+                )
+        capture_set = set(output_layer_indices or ())
+        captured_by_index: dict[int, ir.Value] = {}
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
@@ -179,8 +268,16 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+            if layer_idx in capture_set:
+                captured_by_index[layer_idx] = hidden_states
 
         hidden_states = self.norm(op, hidden_states)
+        if output_layer_indices is not None:
+            # Build in the user-supplied order so the caller can rely on
+            # ``zip(config.output_layer_indices, intermediate_hidden_states)``.
+            # Indices are validated above, so every requested layer is present.
+            ordered = [captured_by_index[idx] for idx in output_layer_indices]
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 
@@ -219,13 +316,18 @@ class CausalLMModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        hidden_states, present_key_values = self.model(
+        result = self.model(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if len(result) == 3:
+            hidden_states, present_key_values, intermediate_hidden_states = result
+            logits = self.lm_head(op, hidden_states)
+            return logits, present_key_values, intermediate_hidden_states
+        hidden_states, present_key_values = result
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

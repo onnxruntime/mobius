@@ -270,6 +270,19 @@ _COVERAGE_SKIP: dict[str, str] = {
     "youtu": "CausalLM — YAML not yet created",
     "zamba": "CausalLM — YAML not yet created",
     "zamba2": "HybridCausalLM — YAML not yet created",
+    # --- Speculative-decoding drafters (bespoke IO; generic L1-L3/L2 matrix
+    # cannot drive them — they consume target hidden states / shared KV rather
+    # than input_ids). Covered by dedicated specialized tests + golden. ---
+    "DFlashDraftModel": "Drafter (noise_embedding + target_hidden IO) — covered by src/mobius/models/_dflash_test.py + L4 golden (dflash-draft)",
+    "gemma4_assistant": "Drafter (target shared KV + hidden state) — covered by _gemma4_assistant_test.py + L4/L5 golden (gemma4-assistant)",
+    "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
+    "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
+    "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3Speculator": "Drafter (speculators-format EAGLE-3, RedHat Qwen3) — covered by src/mobius/models/_eagle3_test.py",
+    "Eagle3DraftModel": "Drafter (speculators-format EAGLE-3, RedHat Gemma4) — covered by src/mobius/models/_eagle3_test.py",
 }
 
 
