@@ -189,6 +189,15 @@ class TestLocalSafetensorsLoading:
         assert torch.equal(state_dict["a.weight"], shard_a["a.weight"])
         assert torch.equal(state_dict["b.weight"], shard_b["b.weight"])
 
+    def test_local_directory_without_safetensors_raises_without_hub(self, tmp_path, monkeypatch):
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        with pytest.raises(FileNotFoundError, match="Local checkpoint directory has no"):
+            _download_weights(str(tmp_path))
+
     @pytest.mark.parametrize(
         "malicious_filename",
         ["../../../etc/passwd", "..\\..\\secret.safetensors", "/absolute/model.safetensors"],

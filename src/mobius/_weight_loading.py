@@ -29,6 +29,7 @@ import safetensors.torch
 import torch
 import tqdm
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 from onnx_ir import tensor_adapters
 
 from mobius._optimizations import fold_initializers_after_weights
@@ -219,7 +220,10 @@ def _local_weight_paths(model_dir: Path) -> list[str] | None:
     elif (model_dir / _SINGLE_WEIGHT_NAME).is_file():
         filenames = [_SINGLE_WEIGHT_NAME]
     else:
-        return None
+        raise FileNotFoundError(
+            f"Local checkpoint directory has no '{_WEIGHT_INDEX_NAME}' or "
+            f"'{_SINGLE_WEIGHT_NAME}': {model_dir}"
+        )
 
     root = model_dir.resolve()
     paths = []
@@ -308,11 +312,8 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
                 )
             )
             all_files = _weight_filenames_from_index(index_path)
-        except Exception as e:
-            if "Entry Not Found" in str(e):
-                all_files = [_SINGLE_WEIGHT_NAME]
-            else:
-                raise
+        except EntryNotFoundError:
+            all_files = [_SINGLE_WEIGHT_NAME]
 
         paths = _parallel_download(model_id, all_files, desc="safetensors")
 
