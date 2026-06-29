@@ -764,30 +764,14 @@ class Gemma4TextAttention(nn.Module):
 
                 # Create empty K/V tensors with kv_sequence_length=0.
                 # Shape: [batch, 0, kv_heads * head_dim]
-                # For WebGPU EP with graph capture enabled, use static batch=1
-                # and create empty tensor directly as Constant to avoid:
-                # 1. Shape op which outputs to CPU and breaks graph capture
-                # 2. ConstantOfShape which is not supported by WebGPU EP
-                caps = ep_capabilities()
                 kv_hidden = self.num_key_value_heads * self.head_dim
-                if caps.enable_graph_capture:
-                    import numpy as np
-
-                    from mobius._build_context import get_build_dtype
-
-                    dtype = get_build_dtype()
-                    np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
-                    empty_kv = op.Constant(
-                        value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=np_dtype))
-                    )
-                else:
-                    batch_dim = op.Shape(query_states, start=0, end=1)
-                    empty_shape = op.Concat(
-                        batch_dim,
-                        op.Constant(value_ints=[0, kv_hidden]),
-                        axis=0,
-                    )
-                    empty_kv = op.CastLike(op.ConstantOfShape(empty_shape), query_states)
+                batch_dim = op.Shape(query_states, start=0, end=1)
+                empty_shape = op.Concat(
+                    batch_dim,
+                    op.Constant(value_ints=[0, kv_hidden]),
+                    axis=0,
+                )
+                empty_kv = op.CastLike(op.ConstantOfShape(empty_shape), query_states)
 
                 gqa_attrs: dict = {
                     "num_heads": self.num_attention_heads,
@@ -1660,7 +1644,7 @@ class Gemma4TextModel(nn.Module):
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Gather(combined, op.Constant(value_int=i), axis=2)
+            op.Gather(combined, op.Constant(value=ir.tensor(np.array(i, dtype=np.int32))), axis=2)
             for i in range(self._num_layers)
         ]
 
@@ -1691,7 +1675,7 @@ class Gemma4TextModel(nn.Module):
                 op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
             )
             per_layer_list = [
-                op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
+                op.Gather(per_layer_4d, op.Constant(value=ir.tensor(np.array(i, dtype=np.int32))), axis=2)
                 for i in range(num_layers)
             ]
         elif self._per_layer_dim and input_ids is not None:

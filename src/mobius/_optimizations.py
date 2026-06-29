@@ -68,6 +68,7 @@ from mobius.rewrite_rules import (
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
+    static_empty_kv_rules,
     unpack_qkv_rules,
 )
 
@@ -316,6 +317,14 @@ def _get_optimization_passes(
     # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
+    
+    # --- Graph-capture lowering ---
+    # Shape + ConstantOfShape are incompatible with GPU graph capture:
+    # Shape outputs to CPU (breaking the capture boundary) and ConstantOfShape
+    # is unsupported by the WebGPU EP. Replace the dynamic empty-KV pattern
+    # with a static Constant so the full decoder graph stays on-device.
+    if caps.enable_graph_capture:
+        lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
     return fuse, lower
 

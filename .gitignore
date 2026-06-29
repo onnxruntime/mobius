@@ -228,3 +228,4 @@ docs/feature-flags.md
 *.m4a
 *.wav
 .olive-cache/
+.claude/skills/build-ort-genai.md
