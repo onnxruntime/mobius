@@ -285,6 +285,7 @@ class _LoRATextModel(TextModel):
         self, config: ArchitectureConfig, lora_adapters: list[tuple[str, int, float]]
     ):
         nn.Module.__init__(self)
+        self.config = config
         lora_factory = _make_lora_linear_factory(lora_adapters)
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
