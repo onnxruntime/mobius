@@ -7,7 +7,7 @@ audio, and diffusion) built directly as ONNX graphs using
 automatic weight downloading and conversion, including bfloat16 models via
 `ir.LazyTensor`-based dtype casting.
 
-📦 [GitHub Repository](https://github.com/microsoft/mobius)
+📦 [GitHub Repository](https://github.com/onnxruntime/mobius)
 
 ## Installation
 
