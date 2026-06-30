@@ -134,6 +134,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --static-cache."
         )
 
+    # --text-only resolution lives in build() (model_type remap + config
+    # stripping), which is only reached on the HuggingFace model-ID path.
+    if args.text_only and args.config:
+        raise SystemExit(
+            "Error: --text-only is not supported with --config (local "
+            "directory). Use --model <hf-id> --text-only instead."
+        )
+
+    # --component selects one component of a diffusers pipeline; --text-only
+    # produces a single decoder-only model. Combining them would silently
+    # filter that model away unless --component happens to be 'model'.
+    if args.text_only and args.component:
+        raise SystemExit(
+            "Error: --text-only is not supported with --component. "
+            "--text-only produces a single decoder-only model, while "
+            "--component selects a component of a diffusers pipeline."
+        )
+
     load_weights = not args.no_weights
     task: str | ModelTask | None = args.task
     if args.static_cache:
@@ -146,8 +164,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines
-    if args.model and not args.config:
+    # Auto-detect diffusers pipelines.  Skipped when --text-only is set:
+    # that flag only applies to transformers decoder exports, so we let the
+    # central build() validation reject a diffusers/unsupported repo rather
+    # than silently exporting a diffusion pipeline and ignoring the flag.
+    if args.model and not args.config and not args.text_only:
         pipeline_index = _load_diffusers_pipeline_index(args.model)
         if pipeline_index is not None:
             print(
@@ -213,6 +234,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             load_weights=load_weights,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
+            text_only=args.text_only,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -230,7 +252,7 @@ def _save_package(
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
 
-    if args.external_data == "safetensors" and getattr(args, "ep", "default") == "cuda":
+    if args.external_data == "safetensors" and args.execution_provider == "cuda":
         logging.getLogger(__name__).warning(
             "Safetensors external data does not guarantee 256-byte offset "
             "alignment, which can cause CUBLAS misaligned address errors on "
@@ -538,6 +560,18 @@ def main(argv: list[str] | None = None) -> None:
             "copies tokenizer files). When used with --model, tokenizer files "
             "are downloaded from HuggingFace. When used with --config (local "
             "directory), tokenizer files are copied from that directory."
+        ),
+    )
+    build_parser.add_argument(
+        "--text-only",
+        dest="text_only",
+        action="store_true",
+        help=(
+            "Export the text backbone of a multimodal checkpoint as a "
+            "standalone decoder-only LLM. Strips vision/audio routing so the "
+            "decoder uses GroupQueryAttention on GQA-capable EPs. Currently "
+            "supported for gemma4_unified (google/gemma-4-12B). Not compatible "
+            "with --config or --component (use --model <hf-id>)."
         ),
     )
     build_parser.set_defaults(func=_cmd_build)
