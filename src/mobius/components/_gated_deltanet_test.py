@@ -78,7 +78,7 @@ class TestGatedDeltaNet:
         rec_state = create_test_input(builder, "rec_state", [1, 4, 16, 16])
 
         output, new_conv, new_rec = dn(op, hidden, conv_state, rec_state)
-        builder._adapt_outputs([output, new_conv, new_rec])
+        builder._adapt_outputs([output, new_conv, new_rec], "")
         assert graph.num_nodes() > 0
         # Function ops called by name
         assert count_op_type(graph, "CausalConvWithState") >= 1
@@ -144,7 +144,7 @@ class TestGatedDeltaNet:
         rec_state = create_test_input(builder, "rec_state", [1, 8, 16, 16])
 
         output, new_conv, new_rec = dn(op, hidden, conv_state, rec_state)
-        builder._adapt_outputs([output, new_conv, new_rec])
+        builder._adapt_outputs([output, new_conv, new_rec], "")
         # No Tile in parent — GQA is inside the function
         assert count_op_type(graph, "Tile") == 0
         assert count_op_type(graph, "LinearAttention") >= 1

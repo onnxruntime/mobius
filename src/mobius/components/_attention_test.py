@@ -77,7 +77,7 @@ class TestAttention:
         bias = create_test_input(builder, "bias", [1, 4, 8, 8])
 
         output, (present_key, present_value) = attn(op, hidden, attention_bias=bias)
-        builder._adapt_outputs([output, present_key, present_value])
+        builder._adapt_outputs([output, present_key, present_value], "")
         assert graph.num_nodes() > 0
         assert count_op_type(graph, "Attention") >= 1
 
@@ -96,7 +96,7 @@ class TestAttention:
             attention_bias=bias,
             past_key_value=(past_key, past_value),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_forward_with_rope(self):
@@ -114,7 +114,7 @@ class TestAttention:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
         assert graph.num_nodes() > 0
 
     def test_forward_with_qk_norm_builds_graph(self):
@@ -125,7 +125,7 @@ class TestAttention:
         bias = create_test_input(builder, "bias", [1, 4, 8, 8])
 
         output, _ = attn(op, hidden, attention_bias=bias)
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
         assert count_op_type(graph, "RMSNormalization") >= 2
 
     def test_gqa_head_counts(self):
@@ -183,7 +183,7 @@ class TestQwen35Attention:
             attention_bias=bias,
             position_embeddings=(cos, sin),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         # Should have Attention op + Sigmoid (for gate) + Mul (output gating)
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "Sigmoid") >= 1
@@ -221,7 +221,7 @@ class TestGQAContextDispatch:
         output, (pk, pv) = attn(
             op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
 
         # Direct path: GroupQueryAttention instead of ONNX Attention
         assert count_op_type(graph, "GroupQueryAttention") >= 1
@@ -250,7 +250,7 @@ class TestGQAContextDispatch:
         output, _ = attn(
             op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
         )
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
 
         gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
         assert gqa_node.attributes["rotary_interleaved"].value == 1
@@ -280,7 +280,7 @@ class TestGQAContextDispatch:
         output, _ = attn(
             op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
         )
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
 
         gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
         assert gqa_node.attributes["local_window_size"].value == 512
@@ -308,7 +308,7 @@ class TestGQAContextDispatch:
         output, _ = attn(
             op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
         )
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
 
         gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
         assert "local_window_size" not in gqa_node.attributes
@@ -323,7 +323,7 @@ class TestGQAContextDispatch:
         bias = create_test_input(builder, "bias", [1, 4, 8, 8])
 
         output, _ = attn(op, hidden, attention_bias=bias)
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
 
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "GroupQueryAttention") == 0

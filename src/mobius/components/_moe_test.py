@@ -31,7 +31,7 @@ class TestTopKGate:
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
         routing_weights, selected_experts = gate(op, hidden)
-        builder._adapt_outputs([routing_weights, selected_experts])
+        builder._adapt_outputs([routing_weights, selected_experts], "")
         assert graph.num_nodes() > 0
 
 
@@ -50,7 +50,7 @@ class TestSparseMixerGate:
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
         routing_weights, selected_experts = gate(op, hidden)
-        builder._adapt_outputs([routing_weights, selected_experts])
+        builder._adapt_outputs([routing_weights, selected_experts], "")
         assert graph.num_nodes() > 0
 
     def test_gate_custom_jitter_eps(self):
@@ -62,7 +62,7 @@ class TestSparseMixerGate:
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
         routing_weights, selected_experts = gate(op, hidden)
-        builder._adapt_outputs([routing_weights, selected_experts])
+        builder._adapt_outputs([routing_weights, selected_experts], "")
         assert graph.num_nodes() > 0
 
 
@@ -91,7 +91,7 @@ class TestMoELayer:
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
         result = layer(op, hidden)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_moe_layer_requires_expert_config(self):
@@ -116,5 +116,5 @@ class TestMoELayer:
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
         result = layer(op, hidden)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0

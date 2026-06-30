@@ -96,7 +96,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "MatMulNBits") == 1
 
     def test_matmulnbits_domain_is_microsoft(self):
@@ -104,7 +104,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert node.domain == "com.microsoft"
@@ -117,7 +117,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -132,7 +132,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert len(node.inputs) == 3
@@ -143,7 +143,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert len(node.inputs) == 4
@@ -154,7 +154,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "MatMulNBits") == 1
         assert count_op_type(graph, "Add") == 1
 
@@ -163,7 +163,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Add") == 0
 
     def test_8bit_forward(self):
@@ -171,7 +171,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -185,7 +185,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -297,7 +297,7 @@ class TestQuantizedEmbeddingForward:
         b, op, graph = create_test_builder()
         ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
         result = qe(op, ids)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "GatherBlockQuantized") == 1
 
     def test_node_domain_and_attributes(self):
@@ -309,7 +309,7 @@ class TestQuantizedEmbeddingForward:
         b, op, graph = create_test_builder()
         ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
         result = qe(op, ids)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "GatherBlockQuantized":
                 assert node.domain == "com.microsoft"
@@ -332,7 +332,7 @@ class TestQuantizedEmbeddingForward:
         b, op, graph = create_test_builder()
         ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
         result = qe(op, ids)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "GatherBlockQuantized":
                 assert len(node.inputs) == 3
@@ -376,7 +376,7 @@ class TestTiedQuantizedLMHead:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, self.DIM])
         result = head(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "MatMulNBits") == 1
         # Reshape rewrites the shared 2-D table to the 3-D MatMulNBits layout.
         assert count_op_type(graph, "Reshape") == 1
@@ -386,7 +386,7 @@ class TestTiedQuantizedLMHead:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, self.DIM])
         result = head(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -405,7 +405,7 @@ class TestTiedQuantizedLMHead:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, self.DIM])
         result = head(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert len(node.inputs) == 3  # x, weight, scales
