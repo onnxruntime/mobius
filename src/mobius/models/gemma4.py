@@ -535,18 +535,21 @@ class Gemma4VisionPooler(nn.Module):
     Replicates HF ``Gemma4VisionPooler._avg_pool_by_positions``:
 
     1. Mask padding patches (``pixel_position_ids == (-1,-1)``) to zero.
-    2. Compute ``w_out = (max_x+1) // k``, ``h_out = (max_y+1) // k``,
-       ``valid_depth = w_out * h_out`` — only occupied pool bins.
-    3. For each patch at position ``(x, y)``, assign it to output bucket
-       ``floor(x/k) + w_out * floor(y/k)``.
-    4. Build a ``[B, T, valid_depth]`` one-hot weight matrix scaled by ``1/k²``.
-    5. Left-multiply: ``[B, valid_depth, T] @ [B, T, D]`` → ``[B, valid_depth, D]``.
-    6. Scale output by ``sqrt(hidden_size)``.
+    2. For each patch at position ``(x, y)``, assign it to output bucket
+       ``floor(x/k) + w_out * floor(y/k)`` where ``w_out = (max_x+1) // k``.
+    3. One-hot the bucket indices to a FIXED ``length = T // k²`` grid and
+       average-pool (``1/k²`` weights) via ``[B, length, T] @ [B, T, D]``.
+    4. Return the pooled ``[B, length, D]`` features (scaled by
+       ``sqrt(hidden_size)``) plus a ``[B, length]`` validity mask marking the
+       occupied bins (bucket index ``< w_out * h_out``).
 
-    Unlike using ``T // k²`` as the output length, using ``w_out * h_out``
-    avoids creating empty trailing pool bins that HF strips after pooling.
-    For a 57x42 image (2520 patches, k=3): ``valid_depth = 19x14 = 266``
-    rather than ``2520 // 9 = 280``.
+    Pooling to a fixed ``length`` (HF's ``output_length``) — rather than a
+    per-image ``w_out * h_out`` — keeps the OneHot depth independent of the
+    image content, so a batch of images with different aspect ratios can be
+    pooled in a single forward pass.  The caller drops the empty trailing bins
+    using the mask so the soft-token count equals the per-image placeholder
+    count.  For a 57x42 image (2520 patches, k=3): ``length = 2520 // 9 = 280``
+    with ``19 * 14 = 266`` valid bins.
     """
 
     def __init__(self, hidden_size: int, kernel_size: int = 3):
@@ -559,7 +562,7 @@ class Gemma4VisionPooler(nn.Module):
         op: OpBuilder,
         vision_features: ir.Value,
         pixel_position_ids: ir.Value,
-    ) -> ir.Value:
+    ) -> tuple[ir.Value, ir.Value]:
         # vision_features:      [B, T, D]
         # pixel_position_ids:   [B, T, 2]  — (x, y); (-1,-1) marks padding/CLS patches
         k = self._kernel_size
@@ -583,52 +586,64 @@ class Gemma4VisionPooler(nn.Module):
         clamped_x = op.Max(x_pos, op.Constant(value_int=0))  # [B, T]
         clamped_y = op.Max(y_pos, op.Constant(value_int=0))  # [B, T]
 
-        # max valid coords (padding patches are clamped to 0 but are zeroed out above)
+        # max valid x coord (padding patches are clamped to 0 but zeroed above).
+        # Only max_x is needed: HF derives the bucket row stride from
+        # ``max_x // k`` (= w_out); max_y is not used by the bucket index.
         # max_x = max(x_coord for non-padding) + 1 → [B, 1]
         max_x = op.Add(
             op.ReduceMax(clamped_x, op.Constant(value_ints=[1]), keepdims=1),
             op.Constant(value_int=1),
         )  # [B, 1]
-        max_y = op.Add(
-            op.ReduceMax(clamped_y, op.Constant(value_ints=[1]), keepdims=1),
-            op.Constant(value_int=1),
-        )  # [B, 1]
 
-        # --- 3. valid_depth = w_out * h_out (only occupied pool bins) --------
-        # HF strips empty trailing pool bins; using w_out*h_out as the OneHot
-        # depth avoids creating those empty bins in the first place.
-        # For a 57x42 image with k=3: w_out=19, h_out=14, valid_depth=266
-        # (vs T//k²=280 which includes 14 empty bins that would need stripping).
+        # --- 3. Fixed pooled length = T // k² (HF VisionPooler output_length) -
+        # HF pools every image to a FIXED ``length = input_seq_len // k²`` grid
+        # and returns a validity mask; using the fixed length (rather than a
+        # per-image ``w_out * h_out``) keeps the OneHot depth independent of the
+        # batch, so images of different aspect ratios pool together in one pass.
+        # ``length`` is derived at runtime from the (padded) patch count T, so
+        # it needs no static config value and stays a single scalar for any B.
         k_c = op.Constant(value_ints=[k])
-        w_out = op.Div(max_x, k_c)  # [B, 1]  pooled width
-        h_out = op.Div(max_y, k_c)  # [B, 1]  pooled height
-        # Squeeze batch dim (B=1 for inference) to get scalar valid_depth
-        valid_depth_2d = op.Mul(w_out, h_out)  # [B, 1]
-        valid_depth = op.Squeeze(valid_depth_2d, op.Constant(value_ints=[0, 1]))  # scalar
+        k2_c = op.Constant(value_ints=[k2])
+        num_patches = op.Shape(vision_features, start=1, end=2)  # [1] = T
+        length = op.Squeeze(
+            op.Div(num_patches, k2_c), op.Constant(value_ints=[0])
+        )  # scalar = T // k²
+
+        # w_out is still per-image; it only feeds the bucket index below, never
+        # the OneHot depth, so no scalar Squeeze (and no B=1 assumption) is needed.
+        w_out = op.Div(max_x, k_c)  # [B, 1]  pooled width per image
 
         # --- 4. Kernel bucket index per patch --------------------------------
-        # floor(x/k) + w_out * floor(y/k)  in range [0, valid_depth)
+        # floor(x/k) + w_out * floor(y/k)  in range [0, w_out*h_out) ⊆ [0, length)
         kx = op.Div(clamped_x, k_c)  # [B, T]
         ky = op.Div(clamped_y, k_c)  # [B, T]
         kernel_idxs = op.Add(kx, op.Mul(w_out, ky))  # [B, T]
 
-        # --- 5. One-hot weight matrix ----------------------------------------
-        # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0
-        # ONNX OneHot: (indices [B,T], depth scalar, values [off, on])
+        # --- 5. One-hot weight matrix [B, T, length] -------------------------
+        # weights[b, t, j] = 1/k² if patch t maps to bucket j, else 0.
         # Keep values as float32 — OneHot doesn't support bfloat16.
         on_val = 1.0 / float(k2)
         one_hot_vals = op.Constant(value_floats=[0.0, on_val])
-        weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth] f32
-        # Cast to model dtype for the subsequent MatMul
-        weights = op.CastLike(weights, vision_features)
+        weights = op.OneHot(kernel_idxs, length, one_hot_vals)  # [B, T, length] f32
 
-        # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
-        weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, valid_depth, T]
-        output = op.MatMul(weights_t, vision_features)  # [B, valid_depth, D]
+        # --- 6. Validity mask: a bin is valid iff some patch maps to it ------
+        # HF: ``mask = logical_not((weights == 0).all(dim=1))`` over the patch
+        # axis.  Empty trailing bins (index ≥ w_out*h_out for that image) get no
+        # patch; the caller drops them so the soft-token count matches the
+        # per-image placeholder count.  Computed on the float32 one-hot.
+        valid_mask = op.Greater(
+            op.ReduceMax(weights, op.Constant(value_ints=[1]), keepdims=0),  # [B, length]
+            op.Constant(value_float=0.0),
+        )  # [B, length] bool
 
-        # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
+        # --- 7. Weighted sum: [B, length, T] @ [B, T, D] -> [B, length, D] ---
+        weights = op.CastLike(weights, vision_features)  # cast to model dtype
+        weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, length, T]
+        output = op.MatMul(weights_t, vision_features)  # [B, length, D]
+
+        # --- 8. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
         scale = op.CastLike(op.Constant(value_float=self._pooler_scale), output)
-        return op.Mul(output, scale)
+        return op.Mul(output, scale), valid_mask
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
@@ -2373,6 +2388,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
         self._text_hidden_size = config.hidden_size
+        self._vision_hidden_size = vc.hidden_size
         self.encoder = _Gemma4VisionEncoderCore(config)
         # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
@@ -2389,21 +2405,29 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # [B, N, 3*P^2] -> [B, N, vision_hidden]
         vision_features = self.encoder(op, pixel_values, pixel_position_ids)
 
-        # Position-based pooling: [B, N, D] -> [B, N/9, D], scales by sqrt(D).
-        # Passes pixel_position_ids so the pooler can assign patches to spatial buckets.
-        vision_features = self.pooler(op, vision_features, pixel_position_ids)
+        # Position-based pooling to a FIXED [B, length, D] grid (length = N // k²)
+        # plus a [B, length] validity mask marking the occupied soft-token bins
+        # of each image.  Pooling at a fixed length keeps the op batch-independent
+        # so a batch of images with different aspect ratios pools in one pass.
+        pooled, valid_mask = self.pooler(op, vision_features, pixel_position_ids)
 
-        # Scale-free norm + linear projection -> [B, N/9, text_hidden]
+        # Flatten batch+token dims and drop the empty trailing bins so the number
+        # of soft tokens equals the per-image placeholder count (sum of
+        # w_out*h_out over the batch).  [B, length, D] -> [B*length, D]
+        # --Compress--> [num_valid, D].  For a single image this yields exactly
+        # the same valid tokens as before; for a multi-image batch it produces
+        # the concatenation of each image's (variable-length) pooled tokens.
+        pooled = op.Reshape(
+            pooled, op.Constant(value_ints=[-1, self._vision_hidden_size])
+        )  # [B*length, vision_hidden]
+        valid_mask = op.Reshape(valid_mask, op.Constant(value_ints=[-1]))  # [B*length]
+        vision_features = op.Compress(pooled, valid_mask, axis=0)  # [num_valid, vision_hidden]
+
+        # Scale-free norm + linear projection -> [num_valid, text_hidden]
         vision_features = self.projector_norm(op, vision_features)
         vision_features = self.projector(op, vision_features)
 
-        # Flatten batch and token dims: [B, N/9, text_hidden] -> [B*(N/9), text_hidden]
-        # Use static hidden_size from config to avoid Shape op (CPU Memcpy).
-        vision_features = op.Reshape(
-            vision_features,
-            op.Constant(value_ints=[-1, self._text_hidden_size]),
-        )
-        return vision_features  # [B*(N/9), text_hidden]
+        return vision_features  # [num_valid, text_hidden]
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
