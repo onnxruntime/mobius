@@ -643,8 +643,9 @@ class TestPreprocessOliveWeights:
     # --- Tied LM head synthesis ---
 
     def test_tied_quantized_head_produces_no_lm_head_keys(self):
-        """A tied *quantized* head shares the embed Parameters in the module,
-        so preprocessing must NOT emit duplicate lm_head.* initializers.
+        """A tied *quantized* head shares the embed Parameters in the module.
+
+        So preprocessing must NOT emit duplicate lm_head.* initializers.
         """
         qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
         scales = torch.randn(self.V, self.N_BLOCKS)
