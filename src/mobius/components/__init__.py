@@ -52,6 +52,7 @@ __all__ = [
     "PatchEmbedding",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
+    "QuantizedEmbedding",
     "QuantizedLinear",
     "RMSNorm",
     "SelectiveScan",
@@ -64,6 +65,7 @@ __all__ = [
     "SplitResidualVectorQuantizer",
     "StaticCacheState",
     "TimestepEmbedding",
+    "TiedQuantizedLMHead",
     "TopKGate",
     "VisionAttention",
     "VisionEncoder",
@@ -190,7 +192,9 @@ from mobius.components._qformer import (
     QFormerLayer as QFormerLayer,
 )
 from mobius.components._quantized_linear import (
+    QuantizedEmbedding,
     QuantizedLinear,
+    TiedQuantizedLMHead,
     make_quantized_linear_factory,
 )
 from mobius.components._qwen3_asr_audio import (
