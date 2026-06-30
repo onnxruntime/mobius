@@ -110,7 +110,9 @@ _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
     {
         "qwen2_vl",
+        "qwen2_vl_text",
         "qwen2_5_vl",
+        "qwen2_5_vl_text",
         "qwen3_vl",
         "qwen3_vl_text",
         "qwen3_5",
