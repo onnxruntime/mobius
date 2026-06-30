@@ -32,6 +32,7 @@ __all__ = [
     "bias_gelu_rules",
     "gelu_fusion_rules",
     "group_query_attention_rules",
+    "htp_rank4_rmsnorm_rules",
     "layer_norm_fusion_rules",
     "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
@@ -47,6 +48,7 @@ from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
     pack_qkv_for_gqa_rules,
 )
+from mobius.rewrite_rules._htp_rank4_rmsnorm import htp_rank4_rmsnorm_rules
 from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )

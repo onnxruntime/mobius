@@ -71,6 +71,25 @@ def _resolve_hidden_act(config, model_type: str) -> str | None:
     )
 
 
+def _resolve_sliding_window(config) -> int | None:
+    """Resolve the effective sliding-window size, honoring HF's enable gate.
+
+    Qwen2/Qwen3 keep a non-null ``sliding_window`` in the config even when the
+    window is disabled, signalling activation through the separate
+    ``use_sliding_window`` flag (HF's ``__post_init__`` nulls ``sliding_window``
+    when it is ``False``). A raw ``config.json`` fallback that bypasses
+    ``__post_init__`` would otherwise leak a window onto a model that does not
+    use one, so the gate must be re-applied here. ``use_sliding_window`` defaults
+    to ``True`` so models without the flag (e.g. Mistral) are unaffected.
+    """
+    window = getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
+    if window is None:
+        return None
+    if getattr(config, "use_sliding_window", True) is False:
+        return None
+    return window
+
+
 def _nested_rope_theta(rope_scaling: dict, key: str) -> float | None:
     """Extract rope_theta from a nested rope_scaling dict (e.g. Gemma3)."""
     sub = rope_scaling.get(key)
@@ -498,6 +517,17 @@ class ArchitectureConfig(BaseModelConfig):
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
 
+    # Speculative-decoding draft-target support.
+    # When set to a non-empty list, ``TextModel`` captures the post-residual
+    # output of ``self.layers[k]`` for each ``k`` in the list (before the
+    # final norm), and ``CausalLMTask`` registers them as additional ONNX
+    # outputs named ``hidden_states.{k}``.  Indices follow the HF
+    # convention used by drafters such as DFlash: ``k`` refers to the
+    # 0-based decoder layer whose output you want — equivalent to
+    # ``model(..., output_hidden_states=True).hidden_states[k + 1]`` in
+    # transformers (where index 0 is the embedding output).
+    output_layer_indices: list[int] | None = None
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
         model_type = config.model_type
@@ -575,9 +605,7 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             no_rope_layers=getattr(config, "no_rope_layers", None),
             full_attention_interval=(getattr(config, "full_attention_interval", None)),
-            sliding_window=(
-                getattr(config, "sliding_window", None) or getattr(config, "window_size", None)
-            ),
+            sliding_window=_resolve_sliding_window(config),
             # Linear attention (DeltaNet) parameters
             linear_conv_kernel_dim=(getattr(config, "linear_conv_kernel_dim", 4)),
             linear_key_head_dim=(getattr(config, "linear_key_head_dim", None)),
@@ -1120,6 +1148,158 @@ class VisionLanguageConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class DFlashConfig(CausalLMConfig):
+    """Configuration for the DFlash speculative-decoding draft model.
+
+    DFlash drafters (z-lab/dflash) condition on intermediate target hidden
+    states fused into every draft layer.  The HuggingFace ``config.json``
+    of a DFlash checkpoint stores DFlash-specific fields under a nested
+    ``dflash_config`` dict; we lift them onto the top-level mobius config
+    so the rest of the build pipeline (component init, task graph wiring,
+    weight loading) can read them through standard attribute access.
+
+    Fields:
+        target_layer_ids: 0-based decoder layer indices on the *target*
+            model whose post-residual hidden states feed each draft layer.
+            Same convention as
+            :class:`ArchitectureConfig.output_layer_indices`.
+        block_size: Number of mask/draft tokens the drafter consumes per
+            speculative step (``b16`` in checkpoint names means 16).
+        mask_token_id: Token id used to embed the masked draft positions
+            via the target's ``embed_tokens``; ``None`` is allowed and
+            indicates a pure noise embedding.
+        num_target_layers: Total number of decoder layers on the target
+            model.  Used together with ``target_layer_ids`` for runtime
+            consistency checks.
+    """
+
+    target_layer_ids: list[int] | None = None
+    block_size: int | None = None
+    mask_token_id: int | None = None
+    num_target_layers: int | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> DFlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        dflash_cfg = getattr(config, "dflash_config", None) or {}
+        if not isinstance(dflash_cfg, dict):
+            # Some checkpoints expose ``dflash_config`` as a nested config object.
+            dflash_cfg = {
+                "target_layer_ids": getattr(dflash_cfg, "target_layer_ids", None),
+                "mask_token_id": getattr(dflash_cfg, "mask_token_id", None),
+            }
+        return cls(
+            **_shallow_fields(base),
+            target_layer_ids=dflash_cfg.get("target_layer_ids"),
+            block_size=getattr(config, "block_size", None),
+            mask_token_id=dflash_cfg.get("mask_token_id"),
+            num_target_layers=getattr(config, "num_target_layers", None),
+        )
+
+
+@dataclasses.dataclass
+class Qwen35MtpConfig(CausalLMConfig):
+    """Configuration for the Qwen3.6 multi-token-prediction (MTP) head.
+
+    The MTP head is a self-speculative drafter shipped inside the dense
+    ``Qwen/Qwen3.6-27B`` checkpoint under the ``mtp.*`` weight prefix
+    (HuggingFace ``transformers`` discards these on ``from_pretrained``).
+    Architecturally it is a single ``full_attention`` Qwen3.5 decoder layer
+    preceded by an input projection that fuses the just-emitted token
+    embedding with the target model's last hidden state::
+
+        h' = fc(concat[ pre_fc_norm_embedding(embed(input_ids)),
+                        pre_fc_norm_hidden(hidden_states) ])
+
+    All standard transformer fields (hidden_size, head_dim, mrope_section,
+    partial_rotary_factor, attn_output_gate, …) are read from the parent
+    model's ``text_config`` so the reused :class:`Qwen35DecoderLayer`,
+    :class:`Qwen35Attention` and mRoPE machinery stay bit-compatible with
+    the target.  ``num_hidden_layers`` is forced to ``1`` and
+    ``layer_types`` to ``["full_attention"]`` regardless of the parent's
+    (64-layer, hybrid) stack — the MTP head has exactly one layer.
+    """
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Qwen35MtpConfig:
+        hf_config = config
+        if hasattr(config, "text_config"):
+            hf_config = config.text_config
+        base = ArchitectureConfig.from_transformers(
+            hf_config, parent_config=parent_config or config
+        )
+        fields = _shallow_fields(base)
+        # The MTP head is a single full-attention layer no matter how deep /
+        # hybrid the parent decoder stack is.
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(**fields)
+
+
+def _speculators_layer_namespace(layer_cfg: dict):
+    """Build a config-like namespace from a speculators ``transformer_layer_config``.
+
+    Normalizes the rope fields: speculators checkpoints store either a flat
+    ``rope_theta`` (Qwen3) or a nested ``rope_parameters = {rope_theta, ...}``
+    (Gemma4), so flatten the latter to ``rope_theta`` for ArchitectureConfig.
+    """
+    import types
+
+    cfg = dict(layer_cfg)
+    if "rope_theta" not in cfg:
+        rope = cfg.get("rope_parameters") or cfg.get("rope_scaling")
+        if isinstance(rope, dict) and rope.get("rope_theta") is not None:
+            cfg["rope_theta"] = rope["rope_theta"]
+    return types.SimpleNamespace(**cfg)
+
+
+@dataclasses.dataclass
+class Eagle3Config(CausalLMConfig):
+    """Configuration for EAGLE-3 draft checkpoints.
+
+    Two on-disk formats are supported:
+      * AngelSlim: a flat llama config with ``draft_vocab_size`` at top level
+        (Qwen3-4B/8B); ``norm_before_residual`` absent -> False.
+      * speculators (RedHat): the architecture config is nested under
+        ``transformer_layer_config``; eagle fields (``draft_vocab_size``,
+        ``norm_before_residual``, ``norm_before_fc``, ``target_hidden_size``,
+        ``eagle_aux_hidden_state_layer_ids``) sit at the top level.
+    """
+
+    draft_vocab_size: int | None = None
+    norm_before_residual: bool = False
+    norm_before_fc: bool = False
+    fc_norm: bool = False
+    target_hidden_size: int | None = None
+    eagle_aux_hidden_state_layer_ids: list[int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
+        layer_cfg = getattr(config, "transformer_layer_config", None)
+        if layer_cfg is not None:
+            # speculators format: arch config nested under transformer_layer_config.
+            if isinstance(layer_cfg, dict):
+                layer_cfg = _speculators_layer_namespace(layer_cfg)
+            base = ArchitectureConfig.from_transformers(layer_cfg, parent_config=config)
+        else:
+            base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields["num_hidden_layers"] = 1
+        fields["layer_types"] = ["full_attention"]
+        return cls(
+            **fields,
+            draft_vocab_size=getattr(config, "draft_vocab_size", None),
+            norm_before_residual=bool(getattr(config, "norm_before_residual", False)),
+            norm_before_fc=bool(getattr(config, "norm_before_fc", False)),
+            fc_norm=bool(getattr(config, "fc_norm", False)),
+            target_hidden_size=getattr(config, "target_hidden_size", None),
+            eagle_aux_hidden_state_layer_ids=getattr(
+                config, "eagle_aux_hidden_state_layer_ids", None
+            ),
+        )
+
+
+@dataclasses.dataclass
 class Gemma2Config(CausalLMConfig):
     """Configuration for Gemma2 models with attention soft-capping.
 
@@ -1382,6 +1562,124 @@ class Gemma4Config(VisionLanguageConfig):
             boa_token_id=getattr(parent_config, "boa_token_id", None),
             use_bidirectional_attention=getattr(config, "use_bidirectional_attention", None),
         )
+
+
+@dataclasses.dataclass
+class Gemma4AssistantConfig(Gemma4Config):
+    """Configuration for the Gemma4-Assistant MTP draft model.
+
+    The HuggingFace Gemma4-Assistant checkpoint
+    (``google/gemma-4-{E2B,E4B,12B,26B,31B}-it-assistant``) is a small
+    Gemma4-style decoder that is hooked up to a target Gemma4 model for
+    speculative decoding.  Its HF config layout is::
+
+        Gemma4AssistantConfig
+        ├── text_config: Gemma4TextConfig   ← all the standard Gemma4 fields
+        ├── backbone_hidden_size: int        ← target model's hidden size
+        ├── use_ordered_embeddings: bool
+        ├── num_centroids: int
+        └── centroid_intermediate_top_k: int
+
+    We flatten this into a single mobius dataclass by extracting the
+    nested ``text_config`` fields onto the top level (via
+    :meth:`Gemma4Config.from_transformers`) and adding the assistant-
+    specific fields below.
+
+    Constraints enforced by the HF config (mirrored here):
+    - All draft layers must be KV-shared with the target — i.e.
+      ``num_kv_shared_layers == num_hidden_layers``.  The drafter has no
+      KV cache of its own; per-layer K/V is fed in from the target's
+      shared K/V buffers at inference time.
+    - ``hidden_size_per_layer_input == 0`` (no per-layer input gating).
+    - ``enable_moe_block == False`` (no MoE).
+    - ``use_double_wide_mlp == False``.
+    - ``vocab_size_per_layer_input == 0``.
+
+    Fields (assistant-specific):
+        backbone_hidden_size: Hidden size of the target model the
+            assistant was trained against (so the assistant's
+            ``pre_projection`` and ``post_projection`` know the right
+            input/output dims for the shared hidden state).
+        use_ordered_embeddings: When True, the assistant routes its
+            output through a centroid-based ordered-embedding LM head
+            (``Gemma4AssistantMaskedEmbedder``), built by
+            ``Gemma4AssistantCausalLMModel``.
+        num_centroids: Number of centroids used by the ordered-embedding
+            head when ``use_ordered_embeddings`` is True.
+        centroid_intermediate_top_k: Top-K centroid count for the
+            ordered-embedding head.
+    """
+
+    backbone_hidden_size: int = 1536
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 2048
+    centroid_intermediate_top_k: int = 32
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Gemma4AssistantConfig:
+        # The HF Gemma4AssistantConfig nests the Gemma4 text config under
+        # ``text_config``.  Drive Gemma4Config.from_transformers on that
+        # nested config to lift all the standard text-decoder fields onto
+        # the top level, then layer on the assistant-specific knobs.
+        #
+        # NOTE: ``build()`` unwraps ``config.text_config`` BEFORE calling
+        # us when the wrapper has a ``text_config`` attribute (see
+        # _builder.py:370-382).  In that case ``config`` is the unwrapped
+        # Gemma4TextConfig and the assistant-specific fields
+        # (use_ordered_embeddings, backbone_hidden_size, num_centroids,
+        # centroid_intermediate_top_k) live on ``parent_config`` instead.
+        # Resolve from whichever object has them.
+        text_cfg = getattr(config, "text_config", None) or config
+        base = Gemma4Config.from_transformers(text_cfg, parent_config=parent_config)
+
+        def _resolve(name, default):
+            for src in (config, parent_config):
+                if src is not None and hasattr(src, name):
+                    val = getattr(src, name)
+                    if val is not None:
+                        return val
+            return default
+
+        return cls(
+            **_shallow_fields(base),
+            backbone_hidden_size=int(_resolve("backbone_hidden_size", 1536)),
+            use_ordered_embeddings=bool(_resolve("use_ordered_embeddings", False)),
+            num_centroids=int(_resolve("num_centroids", 2048)),
+            centroid_intermediate_top_k=int(_resolve("centroid_intermediate_top_k", 32)),
+        )
+
+    def validate(self) -> None:
+        super().validate()
+        errors: list[str] = []
+        if self.num_kv_shared_layers != self.num_hidden_layers:
+            errors.append(
+                "Gemma4-Assistant requires every layer to be KV-shared with the "
+                f"target: num_kv_shared_layers ({self.num_kv_shared_layers}) "
+                f"must equal num_hidden_layers ({self.num_hidden_layers})."
+            )
+        if self.hidden_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer input gating; "
+                f"hidden_size_per_layer_input must be 0, got {self.hidden_size_per_layer_input}."
+            )
+        if self.enable_moe_block:
+            errors.append(
+                "Gemma4-Assistant does not support MoE layers; enable_moe_block must be False."
+            )
+        if self.use_double_wide_mlp:
+            errors.append(
+                "Gemma4-Assistant does not support double-wide MLP; "
+                "use_double_wide_mlp must be False."
+            )
+        if self.vocab_size_per_layer_input:
+            errors.append(
+                "Gemma4-Assistant does not support per-layer vocab; "
+                f"vocab_size_per_layer_input must be 0, got {self.vocab_size_per_layer_input}."
+            )
+        if errors:
+            raise ValueError(
+                "Invalid Gemma4AssistantConfig:\n" + "\n".join(f"  - {e}" for e in errors)
+            )
 
 
 @dataclasses.dataclass

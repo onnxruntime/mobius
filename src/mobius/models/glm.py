@@ -149,6 +149,7 @@ class Glm4TextModel(TextModel):
         nn.Module.__init__(self)
         from mobius.components import Embedding, initialize_rope
 
+        self.config = config
         self._dtype = config.dtype
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
