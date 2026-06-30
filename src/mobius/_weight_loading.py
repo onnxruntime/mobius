@@ -22,7 +22,7 @@ __all__ = [
 import concurrent.futures
 import json
 import logging
-from pathlib import Path, PurePosixPath
+import pathlib
 
 import onnx_ir as ir
 import safetensors.torch
@@ -196,20 +196,20 @@ def _validate_weight_filenames(filenames: list[str]) -> list[str]:
     validated = []
     for filename in filenames:
         normalized = filename.replace("\\", "/")
-        path = PurePosixPath(normalized)
+        path = pathlib.PurePosixPath(normalized)
         if path.is_absolute() or ".." in path.parts:
             raise ValueError(f"Unsafe weight filename in safetensors index: {filename!r}")
         validated.append(normalized)
     return validated
 
 
-def _weight_filenames_from_index(index_path: Path) -> list[str]:
+def _weight_filenames_from_index(index_path: pathlib.Path) -> list[str]:
     with index_path.open() as f:
         index = json.load(f)
     return _validate_weight_filenames(sorted(set(index["weight_map"].values())))
 
 
-def _local_weight_paths(model_dir: Path) -> list[str] | None:
+def _local_weight_paths(model_dir: pathlib.Path) -> list[str] | None:
     """Return local safetensors paths for a HuggingFace checkpoint directory."""
     if not model_dir.is_dir():
         return None
@@ -302,10 +302,10 @@ def _download_weights(model_id: str) -> dict[str, torch.Tensor]:
     downloads from HuggingFace Hub. Uses parallel downloads when multiple
     safetensors shards exist.
     """
-    paths = _local_weight_paths(Path(model_id))
+    paths = _local_weight_paths(pathlib.Path(model_id))
     if paths is None:
         try:
-            index_path = Path(
+            index_path = pathlib.Path(
                 hf_hub_download(
                     repo_id=model_id,
                     filename=_WEIGHT_INDEX_NAME,
