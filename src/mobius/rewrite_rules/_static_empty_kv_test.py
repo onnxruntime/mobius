@@ -9,13 +9,10 @@ from collections import Counter
 
 import numpy as np
 import onnx_ir as ir
-import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
 from mobius.rewrite_rules._static_empty_kv import (
-    _DynamicEmptyKVCast,
-    _DynamicEmptyKVCastLike,
     static_empty_kv_rules,
 )
 
@@ -67,7 +64,6 @@ def _make_empty_kv_model(kv_hidden: int, dtype: ir.DataType = ir.DataType.FLOAT1
         outputs=["empty_kv"],
     )
 
-    np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     onnx_dtype = onnx.TensorProto.FLOAT16 if dtype == ir.DataType.FLOAT16 else onnx.TensorProto.FLOAT
 
     graph = onnx.helper.make_graph(

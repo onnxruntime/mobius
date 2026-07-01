@@ -65,6 +65,7 @@ from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleS
 _IR_DTYPE_TO_NP: dict[ir.DataType, np.dtype] = {
     ir.DataType.FLOAT: np.float32,
     ir.DataType.FLOAT16: np.float16,
+    ir.DataType.BFLOAT16: np.float32,  # numpy has no bfloat16; float32 is safe (content never read)
     ir.DataType.DOUBLE: np.float64,
 }
 
@@ -121,10 +122,6 @@ class _DynamicEmptyKVCast(RewriteRuleClassBase):
     Cast with a concrete dtype (e.g. after quantization or ONNX cleanup passes).
     """
 
-    def __init__(self):
-        super().__init__()
-        self._cast_np_dtype = np.float32
-
     def pattern(self, op, query_states, shape_tail):
         batch_dim = op.Shape(query_states, start=0, end=1)
         empty_shape = op.Concat(batch_dim, shape_tail, axis=0)
@@ -135,20 +132,33 @@ class _DynamicEmptyKVCast(RewriteRuleClassBase):
         result = MatchResult()
         if _check_shape_tail(shape_tail) is None:
             return result.fail("shape_tail is not Constant(value_ints=[0, kv_hidden])")
-        # Read the Cast 'to' attribute from the matched nodes and cache it for rewrite().
-        self._cast_np_dtype = np.float32
-        for node in context.nodes:
-            if node.op_type == "Cast":
-                to_attr = node.attributes.get("to")
-                if to_attr is not None:
-                    self._cast_np_dtype = _IR_DTYPE_TO_NP.get(
-                        ir.DataType(to_attr.value), np.float32
-                    )
         return result
 
     def rewrite(self, op, query_states, shape_tail, **_):
         kv_hidden = _check_shape_tail(shape_tail)
-        return _static_zero_constant(op, kv_hidden, self._cast_np_dtype)
+        # Walk Concat → ConstantOfShape → Cast to read the target dtype.
+        # shape_tail feeds Concat; Concat output feeds ConstantOfShape; its output feeds Cast.
+        np_dtype = np.float32
+        for use in shape_tail.uses():
+            concat_node = use.node
+            if concat_node.op_type != "Concat":
+                continue
+            for use2 in concat_node.outputs[0].uses():
+                cos_node = use2.node
+                if cos_node.op_type != "ConstantOfShape":
+                    continue
+                for use3 in cos_node.outputs[0].uses():
+                    cast_node = use3.node
+                    if cast_node.op_type == "Cast":
+                        to_attr = cast_node.attributes.get("to")
+                        if to_attr is not None:
+                            np_dtype = _IR_DTYPE_TO_NP.get(
+                                ir.DataType(to_attr.value), np.float32
+                            )
+                        break
+                break
+            break
+        return _static_zero_constant(op, kv_hidden, np_dtype)
 
 
 def static_empty_kv_rules() -> RewriteRuleSet:

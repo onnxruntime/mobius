@@ -1724,12 +1724,15 @@ class Gemma4TextModel(nn.Module):
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = sum(attention_mask[b])      (works with static mask for graph capture)
-            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)  # INT64
-            total_seq_len = op.Cast(reduce_sum, to=ir.DataType.INT32)
+            # Graph capture requires batch=1, so squeeze the [batch] ReduceSum result to a scalar.
+            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)  # INT64 [batch]
+            total_seq_len = op.Cast(
+                op.Squeeze(reduce_sum, op.Constant(value_ints=[0])), to=ir.DataType.INT32
+            )  # scalar INT32
             seqlens_k = op.Cast(
                 op.Sub(reduce_sum, op.Constant(value_int=1)),
                 to=ir.DataType.INT32,
-            )
+            )  # [batch] INT32
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -1904,6 +1907,10 @@ class Gemma4CausalLMModel(CausalLMModel):
         fused_key = "model.embed_tokens_per_layer.weight"
         if self.model._per_layer_dim and fused_key in state_dict:
             fused = state_dict.pop(fused_key)
+            assert fused.shape[1] == self.model._num_layers * self.model._per_layer_dim, (
+                f"embed_tokens_per_layer weight shape {fused.shape} is not divisible into "
+                f"{self.model._num_layers} layers of dim {self.model._per_layer_dim}"
+            )
             chunks = fused.chunk(self.model._num_layers, dim=1)
             for i, chunk in enumerate(chunks):
                 state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = chunk
@@ -1974,6 +1981,10 @@ class _Gemma4DecoderModel(nn.Module):
         fused_key = "model.embed_tokens_per_layer.weight"
         if self.model._per_layer_dim and fused_key in result:
             fused = result.pop(fused_key)
+            assert fused.shape[1] == self.model._num_layers * self.model._per_layer_dim, (
+                f"embed_tokens_per_layer weight shape {fused.shape} is not divisible into "
+                f"{self.model._num_layers} layers of dim {self.model._per_layer_dim}"
+            )
             chunks = fused.chunk(self.model._num_layers, dim=1)
             for i, chunk in enumerate(chunks):
                 result[f"model.embed_tokens_per_layer.{i}.weight"] = chunk
@@ -2691,6 +2702,10 @@ class Gemma4Model(nn.Module):
                         num_layers = self.config.num_hidden_layers
                         per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
                         if per_layer_dim and num_layers:
+                            assert value.shape[1] == num_layers * per_layer_dim, (
+                                f"embed_tokens_per_layer weight shape {value.shape} is not "
+                                f"divisible into {num_layers} layers of dim {per_layer_dim}"
+                            )
                             chunks = value.chunk(num_layers, dim=1)
                             for i, chunk in enumerate(chunks):
                                 renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = chunk

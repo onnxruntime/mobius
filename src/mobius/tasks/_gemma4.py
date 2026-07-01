@@ -111,7 +111,6 @@ class Gemma4TextCausalLMTask(ModelTask):
         - input_ids: [batch, sequence_len] INT64
         - attention_mask: [batch, past_seq_len + seq_len] INT64
         - position_ids: [batch, sequence_len] INT64
-        - total_sequence_length: [] INT32 (WebGPU EP only, for graph capture)
         - past_key_values.{i}.key / .value for i in 0..num_kv_layers-1
     Outputs:
         - logits: FLOAT
@@ -221,12 +220,13 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds [+ per_layer_inputs] -> logits + KV cache.
+        """Build text decoder: inputs_embeds + input_ids -> logits + KV cache.
 
         When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), the decoder
-        accepts precomputed ``per_layer_inputs`` from the embedding model instead
-        of ``input_ids``.  This moves the per-layer embedding computation to the
-        embedding model, simplifying the decoder graph.
+        computes per-layer embeddings internally via ``input_ids`` and Gather on
+        split per-layer tables.  This is faster than the external
+        ``per_layer_inputs`` approach (~95 tok/s vs ~60 tok/s) because it avoids
+        large tensor transfers between the embedding and decoder sub-models.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
