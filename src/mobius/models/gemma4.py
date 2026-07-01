@@ -764,8 +764,8 @@ class Gemma4TextAttention(nn.Module):
 
                 # Create empty K/V tensors with kv_sequence_length=0.
                 # Shape: [batch, 0, kv_heads * head_dim]
-                kv_hidden = self.num_key_value_heads * self.head_dim
                 batch_dim = op.Shape(query_states, start=0, end=1)
+                kv_hidden = self.num_key_value_heads * self.head_dim
                 empty_shape = op.Concat(
                     batch_dim,
                     op.Constant(value_ints=[0, kv_hidden]),
@@ -1559,18 +1559,13 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Use separate per-layer tables so each weight stays within WebGPU's
-            # per-buffer size limit (each [V, D] table is ~128 MB vs 4.4 GB fused).
-            self.embed_tokens_per_layer = nn.ModuleList(
-                [
-                    Gemma3TextScaledWordEmbedding(
-                        vocab_per_layer,
-                        self._per_layer_dim,
-                        config.pad_token_id,
-                        embed_scale=float(self._per_layer_dim**0.5),
-                    )
-                    for _ in range(self._num_layers)
-                ]
+            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
+            # Gather int64 index support (onnxruntime#28107).
+            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+                vocab_per_layer,
+                self._num_layers * self._per_layer_dim,
+                config.pad_token_id,
+                embed_scale=float(self._per_layer_dim**0.5),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -1595,7 +1590,6 @@ class Gemma4TextModel(nn.Module):
         )
         proj = self.per_layer_projection_norm(op, proj)
 
-        # Mask multimodal token IDs → pad before per-layer embedding lookup
         pad = op.Constant(value_int=0)
         masked_ids = input_ids
         if self._image_token_id:
@@ -1611,17 +1605,17 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        per_layer_embs = [
-            op.Unsqueeze(self.embed_tokens_per_layer[i](op, masked_ids), [2])
-            for i in range(self._num_layers)
-        ]
-        fused_emb = op.Concat(*per_layer_embs, axis=2)
+        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+        fused_emb = op.Reshape(
+            fused_emb,
+            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+        )
 
         combined = op.Add(proj, fused_emb)
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Gather(combined, op.Constant(value_int=i), axis=2)
+            op.Squeeze(op.Slice(combined, starts=[i], ends=[i + 1], axes=[2]), [2])
             for i in range(self._num_layers)
         ]
 
@@ -1652,7 +1646,7 @@ class Gemma4TextModel(nn.Module):
                 op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
             )
             per_layer_list = [
-                op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
+                op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
                 for i in range(num_layers)
             ]
         elif self._per_layer_dim and input_ids is not None:
@@ -1725,16 +1719,18 @@ class Gemma4TextModel(nn.Module):
             _ = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
-            # total_seq_len = sum(attention_mask[b])      (works with static mask for graph capture)
-            # Graph capture requires batch=1, so squeeze the [batch] ReduceSum result to a scalar.
+            # total_seq_len = sum(attention_mask[b])  — derived from ReduceSum so
+            # Shape(attention_mask) is not emitted (Shape breaks WebGPU graph capture).
+            # Graph capture requires batch=1, so squeeze [batch] to a scalar.
             reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)  # INT64 [batch]
-            total_seq_len = op.Cast(
-                op.Squeeze(reduce_sum, op.Constant(value_ints=[0])), to=ir.DataType.INT32
-            )  # scalar INT32
             seqlens_k = op.Cast(
                 op.Sub(reduce_sum, op.Constant(value_int=1)),
                 to=ir.DataType.INT32,
             )  # [batch] INT32
+            total_seq_len = op.Cast(
+                op.Squeeze(reduce_sum, op.Constant(value_ints=[0])),
+                to=ir.DataType.INT32,
+            )  # scalar INT32
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -1904,18 +1900,8 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict[new_key] = state_dict.pop(key)
             elif "vision_tower" in key or "embed_vision" in key:
                 state_dict.pop(key, None)
-        # Split fused per-layer embedding [V, L*D] into L separate [V, D] tables
-        # so each weight stays within WebGPU's per-buffer size limit.
-        fused_key = "model.embed_tokens_per_layer.weight"
-        if self.model._per_layer_dim and fused_key in state_dict:
-            fused = state_dict.pop(fused_key)
-            assert fused.shape[1] == self.model._num_layers * self.model._per_layer_dim, (
-                f"embed_tokens_per_layer weight shape {fused.shape} is not divisible into "
-                f"{self.model._num_layers} layers of dim {self.model._per_layer_dim}"
-            )
-            chunks = fused.chunk(self.model._num_layers, dim=1)
-            for i, chunk in enumerate(chunks):
-                state_dict[f"model.embed_tokens_per_layer.{i}.weight"] = chunk
+        # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
+        # to our fused embedding table — no splitting needed.
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
@@ -1979,18 +1965,7 @@ class _Gemma4DecoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        result = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
-        fused_key = "model.embed_tokens_per_layer.weight"
-        if self.model._per_layer_dim and fused_key in result:
-            fused = result.pop(fused_key)
-            assert fused.shape[1] == self.model._num_layers * self.model._per_layer_dim, (
-                f"embed_tokens_per_layer weight shape {fused.shape} is not divisible into "
-                f"{self.model._num_layers} layers of dim {self.model._per_layer_dim}"
-            )
-            chunks = fused.chunk(self.model._num_layers, dim=1)
-            for i, chunk in enumerate(chunks):
-                result[f"model.embed_tokens_per_layer.{i}.weight"] = chunk
-        return result
+        return vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
 
 
 class _Gemma4VisionEncoderModel(nn.Module):
@@ -2113,15 +2088,14 @@ class Gemma4EmbeddingModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            self._vocab_per_layer = vocab_per_layer
-            embed_scale = float(self._per_layer_dim**0.5)
-            # Always create fused embedding for HF weight compatibility.
-            # In forward(), we decide whether to split based on EP.
+            # Single fused [V, L*D] embedding table matching HuggingFace's
+            # ``embed_tokens_per_layer.weight`` shape.  The ORT CUDA Gather
+            # int32 overflow (onnxruntime#28107) is now fixed.
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 config.pad_token_id,
-                embed_scale=embed_scale,
+                embed_scale=float(self._per_layer_dim**0.5),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -2174,15 +2148,11 @@ class Gemma4EmbeddingModel(nn.Module):
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value | None = None,
-        *,
-        compute_per_layer_inputs: bool = True,
     ) -> dict[str, ir.Value]:
         """Return a dict of named embedding outputs.
 
         Always contains ``inputs_embeds``. Contains ``per_layer_inputs`` when
-        ``hidden_size_per_layer_input > 0`` AND ``compute_per_layer_inputs`` is True.
-        Set ``compute_per_layer_inputs=False`` when the decoder computes per-layer
-        embeddings internally via ``input_ids`` (faster WebGPU path).
+        ``hidden_size_per_layer_input > 0``.
 
         The vision-block bidirectional attention overlay is NOT emitted here:
         the decoder derives it from ``input_ids`` directly (see
@@ -2209,7 +2179,7 @@ class Gemma4EmbeddingModel(nn.Module):
 
         outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
 
-        if not self._per_layer_dim or not compute_per_layer_inputs:
+        if not self._per_layer_dim:
             return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
@@ -2238,7 +2208,7 @@ class Gemma4EmbeddingModel(nn.Module):
                 masked_ids,
             )
 
-        # 3. Per-layer embedding lookup
+        # 3. Single Gather on fused [V, L*D] table → reshape to [B, S, L, D]
         fused_emb = self.embed_tokens_per_layer(op, masked_ids)
         # fused_emb: [B, S, L*D] → [B, S, L, D]
         fused_emb = op.Reshape(
@@ -2682,9 +2652,7 @@ class Gemma4Model(nn.Module):
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}
-        # Per-layer weight prefixes: route to BOTH decoder.model and embedding
-        # (decoder uses them for internal per-layer computation, embedding for
-        # external per-layer inputs mode)
+        # Per-layer weight prefixes that should route to the embedding model
         per_layer_prefixes = (
             "embed_tokens_per_layer.",
             "per_layer_model_projection.",
@@ -2697,26 +2665,7 @@ class Gemma4Model(nn.Module):
                     # lm_head lives directly under decoder (not decoder.model)
                     renamed["decoder." + suffix] = value
                 elif any(suffix.startswith(p) for p in per_layer_prefixes):
-                    # Per-layer embedding weights → both decoder and embedding.
-                    # Split fused embed_tokens_per_layer [V, L*D] into L separate
-                    # [V, D] tables for the decoder (WebGPU per-buffer size limit).
-                    if suffix == "embed_tokens_per_layer.weight":
-                        num_layers = self.config.num_hidden_layers
-                        per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
-                        if per_layer_dim and num_layers:
-                            assert value.shape[1] == num_layers * per_layer_dim, (
-                                f"embed_tokens_per_layer weight shape {value.shape} is not "
-                                f"divisible into {num_layers} layers of dim {per_layer_dim}"
-                            )
-                            chunks = value.chunk(num_layers, dim=1)
-                            for i, chunk in enumerate(chunks):
-                                renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = (
-                                    chunk
-                                )
-                        else:
-                            renamed["decoder.model." + suffix] = value
-                    else:
-                        renamed["decoder.model." + suffix] = value
+                    # Per-layer embedding weights → embedding sub-model
                     renamed["embedding." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
