@@ -35,7 +35,7 @@ def _build(comp, inputs):
     """Build graph and return the last output value."""
     b, op, graph = create_test_builder()
     result = comp(op, *inputs(b))
-    b._adapt_outputs([result])
+    b._adapt_outputs([result], "")
     return result, graph
 
 
@@ -50,7 +50,7 @@ class TestGemma4ConvSubsampling:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 20, 32])
         result, _mask = comp(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_parameter_names(self):
@@ -69,7 +69,7 @@ class TestGemma4ConvSubsampling:
         x = create_test_input(b, "x", [1, 20, 32])
         mask = create_test_input(b, "mask", [1, 20])
         result, out_mask = comp(op, x, input_features_mask=mask)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert out_mask is not None
         op_types = {node.op_type for node in graph}
         assert "Mul" in op_types, "Mask application should produce Mul nodes"
@@ -110,7 +110,7 @@ class TestGemma4FeedForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 10, HIDDEN])
         result = comp(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_parameter_names(self):
@@ -147,7 +147,7 @@ class TestGemma4LightConv1d:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 10, HIDDEN])
         result = comp(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_parameter_names(self):
@@ -191,7 +191,7 @@ class TestGemma4Attention:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 10, HIDDEN])
         result = comp(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_parameter_names(self):
@@ -265,7 +265,7 @@ class TestGemma4AudioLayer:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 10, HIDDEN])
         result = comp(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
 
     def test_parameter_names(self):
@@ -324,7 +324,7 @@ class TestGemma4AudioEncoder:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "input_features", [1, 20, 32])
         result, mask = enc(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         assert mask is None  # No mask provided → no mask returned
 

@@ -17,7 +17,7 @@ dependencies = [
     "numpy>=1.24.0",
     "onnx_ir>=0.1.0",
     "onnx-shape-inference>=0.1.9",
-    "onnxscript>=0.7.0",
+    "onnxscript>=0.7.1",
     "safetensors",
     "torch>=2.1.0",
     "tqdm",

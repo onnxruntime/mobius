@@ -48,7 +48,7 @@ class TestMLP:
         x = create_test_input(builder, "x", [1, 8, 64])
 
         result = mlp(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         # gate_proj + up_proj + down_proj = at least 3 MatMul ops
         assert count_op_type(graph, "MatMul") >= 3
@@ -117,7 +117,7 @@ class TestFCMLP:
         x = create_test_input(builder, "x", [1, 8, 64])
 
         result = mlp(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         # up_proj + down_proj = exactly 2 MatMul ops
         assert count_op_type(graph, "MatMul") == 2
@@ -211,7 +211,7 @@ class TestGatedMLP:
         builder, op, graph = create_test_builder()
         x = create_test_input(builder, "x", [1, 8, 64])
         result = mlp(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         assert count_op_type(graph, "MatMul") == 3
 
@@ -254,7 +254,7 @@ class TestFusedGateUpMLP:
         builder, op, graph = create_test_builder()
         x = create_test_input(builder, "x", [1, 8, 64])
         result = mlp(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
         # gate_up_proj MatMul + down_proj MatMul = 2
         assert count_op_type(graph, "MatMul") == 2
