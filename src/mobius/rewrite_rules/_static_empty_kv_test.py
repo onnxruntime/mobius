@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections import Counter
 
-import numpy as np
 import onnx_ir as ir
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
