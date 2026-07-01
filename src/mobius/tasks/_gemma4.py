@@ -241,6 +241,8 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="decoder")
         op = builder.op
 
+        caps = ep_capabilities()
+
         inputs_embeds = builder.input(
             "inputs_embeds",
             dtype=config.dtype,
@@ -256,8 +258,6 @@ class Gemma4Task(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-
-        caps = ep_capabilities()
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and caps.name != "webgpu":

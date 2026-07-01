@@ -1636,7 +1636,7 @@ class Gemma4TextModel(nn.Module):
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Squeeze(op.Slice(combined, starts=[i], ends=[i + 1], axes=[2]), [2])
+            op.Gather(combined, op.Constant(value_int=i), axis=2)
             for i in range(self._num_layers)
         ]
 
