@@ -220,13 +220,12 @@ class Gemma4Task(ModelTask):
         decoder: nn.Module,
         config: Gemma4Config,
     ) -> ir.Model:
-        """Build text decoder: inputs_embeds + input_ids -> logits + KV cache.
+        """Build text decoder: inputs_embeds [+ per_layer_inputs] -> logits + KV cache.
 
         When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), the decoder
-        computes per-layer embeddings internally via ``input_ids`` and Gather on
-        split per-layer tables.  This is faster than the external
-        ``per_layer_inputs`` approach (~95 tok/s vs ~60 tok/s) because it avoids
-        large tensor transfers between the embedding and decoder sub-models.
+        accepts precomputed ``per_layer_inputs`` from the embedding model instead
+        of ``input_ids``.  This moves the per-layer embedding computation to the
+        embedding model, simplifying the decoder graph.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -251,17 +250,25 @@ class Gemma4Task(ModelTask):
             shape=[batch, seq_len],
         )
 
-        # Per-layer embeddings: when hidden_size_per_layer_input > 0, the decoder
-        # needs per-layer input embeddings. Two approaches:
-        # 1. External (per_layer_inputs): embedding model precomputes, decoder receives
-        # 2. Internal (input_ids): decoder computes per-layer embeddings via Gather
-        #
-        # Internal is faster (~95 tok/s vs ~60 tok/s) because it avoids large
-        # tensor transfers between models. We use internal: pass input_ids and
-        # let the decoder compute per-layer embeddings via _compute_per_layer_inputs.
+        per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        if per_layer_dim:
+            total_per_layer = config.num_hidden_layers * per_layer_dim
+            per_layer_inputs_val = builder.input(
+                "per_layer_inputs",
+                dtype=config.dtype,
+                shape=[batch, seq_len, total_per_layer],
+            )
+
+        # Vision-block bidirectional attention: the decoder receives the raw
+        # ``input_ids`` (alongside ``inputs_embeds``) and derives the block
+        # overlay internally. This avoids a separate cross-model
+        # ``block_sequence_ids`` tensor, which onnxruntime-genai cannot forward
+        # between the embedding and decoder sub-models (it can forward
+        # ``input_ids``). Only models with
+        # ``use_bidirectional_attention == "vision"`` need it.
         input_ids_val: ir.Value | None = None
-        if per_layer_dim or config.use_bidirectional_attention == "vision":
+        if config.use_bidirectional_attention == "vision":
             input_ids_val = builder.input(
                 "input_ids",
                 dtype=ir.DataType.INT64,
@@ -275,7 +282,7 @@ class Gemma4Task(ModelTask):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            per_layer_inputs=None,
+            per_layer_inputs=per_layer_inputs_val,
             past_key_values=past_key_values,
             input_ids=input_ids_val,
         )
@@ -420,23 +427,15 @@ class Gemma4Task(ModelTask):
                 shape=[num_audio_tokens, config.hidden_size],
             )
 
-        # When decoder uses internal per-layer embeddings (has input_ids input),
-        # the embedding model should NOT compute/output per_layer_inputs.
-        # This keeps the embedding model small (~0.75 GB vs ~5.13 GB).
-        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        decoder_uses_internal_per_layer = per_layer_dim > 0
-
         result = embedding(
             op,
             input_ids=input_ids,
             image_features=image_features,
             audio_features=audio_features_val,
-            compute_per_layer_inputs=not decoder_uses_internal_per_layer,
         )
 
         # ``embedding`` returns a dict of named outputs: always
-        # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating,
-        # only when decoder does NOT compute per-layer embeddings internally).
+        # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
         builder.add_output(result["inputs_embeds"], "inputs_embeds")
         if "per_layer_inputs" in result:
             builder.add_output(result["per_layer_inputs"], "per_layer_inputs")
