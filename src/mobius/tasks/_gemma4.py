@@ -231,7 +231,7 @@ class Gemma4Task(ModelTask):
         embedding model, simplifying the decoder graph.
 
         Exception: WebGPU EP uses split per-layer tables in the decoder (to stay
-        within the 2 GiB per-buffer limit), so ``input_ids`` is passed instead
+        within the 256 MiB maxBufferSize limit), so ``input_ids`` is passed instead
         and ``per_layer_inputs`` is omitted.
         """
         batch = ir.SymbolicDim("batch")

@@ -1490,7 +1490,7 @@ class Gemma4Config(VisionLanguageConfig):
 
     # Set to True by Gemma4Task.build() when targeting WebGPU EP, to split the
     # fused [V, L*D] per-layer embedding into L separate [V, D] tables (each
-    # ~134 MB) that stay within WebGPU's 2 GiB per-buffer limit.
+    # ~128 MiB) that stay within WebGPU's 256 MiB maxBufferSize limit.
     split_per_layer_embedding: bool = False
 
     @classmethod

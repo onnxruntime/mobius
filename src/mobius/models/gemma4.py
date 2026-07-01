@@ -1567,8 +1567,8 @@ class Gemma4TextModel(nn.Module):
                 config.pad_token_id,
                 embed_scale=float(self._per_layer_dim**0.5),
             )
-            # Split [V, D] tables — used on WebGPU EP to stay within the 2 GiB
-            # per-buffer limit (~134 MB each vs ~4.7 GB fused).
+            # Split [V, D] tables — used on WebGPU EP to stay within the 256 MiB
+            # maxBufferSize limit (~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
             self.embed_tokens_per_layer_split = nn.ModuleList([
@@ -1619,7 +1619,7 @@ class Gemma4TextModel(nn.Module):
             )
 
         if ep_capabilities().name == "webgpu":
-            # 35 separate Gathers on [V, D] tables — each fits within WebGPU's 2 GiB limit.
+            # 35 separate Gathers on [V, D] tables — each fits within WebGPU's 256 MiB maxBufferSize limit.
             per_layer_embs = [
                 op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
                 for i in range(self._num_layers)
@@ -1750,11 +1750,8 @@ class Gemma4TextModel(nn.Module):
             if caps.enable_graph_capture:
                 # Shape(attention_mask) breaks graph capture (outputs to CPU).
                 # With graph capture, attention_mask is all-ones and batch=1,
-                # so ReduceSum gives the true sequence length.
-                total_seq_len = op.Cast(
-                    op.Squeeze(reduce_sum, op.Constant(value_ints=[0])),
-                    to=ir.DataType.INT32,
-                )
+                # so ReduceSum gives the true sequence length as [batch] INT32.
+                total_seq_len = op.Cast(reduce_sum, to=ir.DataType.INT32)
             else:
                 total_seq_len = op.Cast(
                     op.Gather(op.Shape(attention_mask), 1),
@@ -2223,7 +2220,7 @@ class Gemma4EmbeddingModel(nn.Module):
             return outputs
 
         # On WebGPU the per-layer computation runs inside the decoder using split
-        # [V, D] tables to stay within the 2 GiB buffer limit.  The embedding
+        # [V, D] tables to stay within the 256 MiB maxBufferSize limit.  The embedding
         # model only emits inputs_embeds in that case.
         if ep_capabilities().name == "webgpu":
             return outputs
@@ -2782,7 +2779,7 @@ class Gemma4Model(nn.Module):
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
 
-        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 2 GiB
+        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
         # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
         # The per_layer_projection weights also live in the decoder (not embedding).
         if getattr(self.config, "split_per_layer_embedding", False):
