@@ -43,8 +43,6 @@ They can also be applied manually::
 
 from __future__ import annotations
 
-import numpy as np
-import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchFailureError, MatchResult
 from onnxscript.rewriter._rewrite_rule import (
     RewriteRuleClassBase,
@@ -196,15 +194,10 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
                     break
 
             # seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
-            # Match the 'one' constant dtype to attention_mask dtype to avoid type mismatch
-            # in the Sub operation. WebGPU EP uses INT32 attention_mask; other EPs use INT64.
-            # Note: ReduceSum axes must always be INT64 per ONNX spec.
-            mask_dtype = attention_mask.dtype
+            # ReduceSum axes must always be INT64 per ONNX spec.
+            # attention_mask is INT64 across all EPs (ORT WebGPU supports INT64 Sub/ReduceSum).
             axis = op.Constant(value_ints=[1])  # ReduceSum axes must be INT64
-            if mask_dtype is not None and mask_dtype == ir.DataType.INT32:
-                one = op.Constant(value=ir.tensor(np.array([1], dtype=np.int32)))
-            else:
-                one = op.Constant(value_ints=[1])
+            one = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
             self._seqlens_k = op.Cast(
                 op.Sub(reduce_sum, one),
@@ -608,16 +601,10 @@ class AttentionToGQA(RewriteRuleClassBase):
         if self._seqlens_k is None:
             graph = attn.graph
             attention_mask = next(gi for gi in graph.inputs if gi.name == "attention_mask")
-            # Match the constant dtype to attention_mask dtype to avoid type mismatch.
-            # WebGPU EP uses INT32 attention_mask; other EPs use INT64.
-            mask_dtype = attention_mask.dtype
+            # attention_mask is INT64 across all EPs (ORT WebGPU supports INT64 Sub/ReduceSum).
             # ReduceSum axes must always be INT64 per ONNX spec
             axis = op.Constant(value_ints=[1])
-            # Match 'one' constant dtype to attention_mask dtype for Sub operation
-            if mask_dtype is not None and mask_dtype == ir.DataType.INT32:
-                one = op.Constant(value=ir.tensor(np.array([1], dtype=np.int32)))
-            else:
-                one = op.Constant(value_ints=[1])
+            one = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
             self._seqlens_k = op.Cast(op.Sub(reduce_sum, one), to=6)
             mask_shape = op.Shape(attention_mask)
