@@ -32,15 +32,23 @@ _ORT_PROVIDER_NAMES: dict[str, str] = {
 
 def make_provider_options(
     ep: str,
+    *,
+    enable_graph_capture: bool | None = None,
 ) -> list[dict[str, dict[str, str]]]:
     """Build the ``provider_options`` list for genai_config.json.
 
     Graph capture is driven entirely by the EP's registered
-    ``EpCapabilities.enable_graph_capture`` flag (the single source of truth).
+    ``EpCapabilities.enable_graph_capture`` flag (the single source of truth),
+    but can be overridden per-component via ``enable_graph_capture``.
 
     Args:
         ep: Execution provider name (``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"webgpu"``, ``"trt-rtx"``).
+        enable_graph_capture: Override the EP's registered graph-capture flag.
+            ``None`` (default) uses the EP's registered capability.
+            Pass ``False`` to disable graph capture for a specific component
+            (e.g. vision/embedding/audio encoders that contain ops incompatible
+            with graph capture).
 
     Returns:
         A list with a single dict mapping the EP name to its options.
@@ -54,9 +62,11 @@ def make_provider_options(
     caps = ep_registry.get(ep)
     options = dict(caps.provider_options) if caps else {}
 
-    # Graph capture comes from the EP's registered capability flag (the registry
-    # is the single source of truth). Translate it into the EP-specific option.
-    graph_capture = bool(caps and caps.enable_graph_capture)
+    # Graph capture: use override if given, otherwise fall back to EP registry.
+    if enable_graph_capture is None:
+        graph_capture = bool(caps and caps.enable_graph_capture)
+    else:
+        graph_capture = enable_graph_capture
 
     if ep == "webgpu":
         options["enableGraphCapture"] = "1" if graph_capture else "0"
