@@ -1020,7 +1020,15 @@ def write_ort_genai_config(
 
     # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
     # for --config mode where no HF model ID is available.
-    if hf_model_id is not None:
+    if hf_model_id is not None and os.path.isdir(hf_model_id):
+        # hf_model_id is a local checkpoint directory (e.g. the output of a
+        # prior Olive pass) rather than a Hub repo ID. Copy tokenizer files
+        # straight from disk — a Hub download would reject the local path.
+        logger.info("Copying tokenizer files from local model directory %s", hf_model_id)
+        tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
+        for tf in tokenizer_files:
+            result[tf] = os.path.join(directory, tf)
+    elif hf_model_id is not None:
         logger.info("Copying tokenizer files from %s", hf_model_id)
         tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
         for tf in tokenizer_files:
