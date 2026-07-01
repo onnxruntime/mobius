@@ -2710,7 +2710,9 @@ class Gemma4Model(nn.Module):
                             )
                             chunks = value.chunk(num_layers, dim=1)
                             for i, chunk in enumerate(chunks):
-                                renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = chunk
+                                renamed[f"decoder.model.embed_tokens_per_layer.{i}.weight"] = (
+                                    chunk
+                                )
                         else:
                             renamed["decoder.model." + suffix] = value
                     else:

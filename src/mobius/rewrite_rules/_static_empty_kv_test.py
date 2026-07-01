@@ -63,13 +63,19 @@ def _make_empty_kv_model(kv_hidden: int, dtype: ir.DataType = ir.DataType.FLOAT1
         outputs=["empty_kv"],
     )
 
-    onnx_dtype = onnx.TensorProto.FLOAT16 if dtype == ir.DataType.FLOAT16 else onnx.TensorProto.FLOAT
+    onnx_dtype = (
+        onnx.TensorProto.FLOAT16 if dtype == ir.DataType.FLOAT16 else onnx.TensorProto.FLOAT
+    )
 
     graph = onnx.helper.make_graph(
         [batch_dim_node, tail_const_node, concat_node, cos_node, castlike_node],
         "empty_kv_graph",
-        inputs=[onnx.helper.make_tensor_value_info("query_states", onnx_dtype, [None, None, 64])],
-        outputs=[onnx.helper.make_tensor_value_info("empty_kv", onnx_dtype, [None, 0, kv_hidden])],
+        inputs=[
+            onnx.helper.make_tensor_value_info("query_states", onnx_dtype, [None, None, 64])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("empty_kv", onnx_dtype, [None, 0, kv_hidden])
+        ],
     )
     proto = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
     return ir.serde.deserialize_model(proto)
@@ -133,12 +139,16 @@ class TestStaticEmptyKVRules:
         graph = onnx.helper.make_graph(
             [batch_dim_node, tail_const_node, concat_node, cos_node, castlike_node],
             "non_batch_shape",
-            inputs=[onnx.helper.make_tensor_value_info(
-                "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
-            )],
-            outputs=[onnx.helper.make_tensor_value_info(
-                "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, 256]
-            )],
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, 256]
+                )
+            ],
         )
         proto = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
         model = ir.serde.deserialize_model(proto)
@@ -147,9 +157,12 @@ class TestStaticEmptyKVRules:
         rewrite(model, pattern_rewrite_rules=static_empty_kv_rules())
         counts_after = _count_ops(model)
 
-        assert counts_after.get("Shape", 0) == counts_before.get("Shape", 0), \
+        assert counts_after.get("Shape", 0) == counts_before.get("Shape", 0), (
             "rule should not fire for non-batch Shape slice"
-        assert counts_after.get("ConstantOfShape", 0) == counts_before.get("ConstantOfShape", 0)
+        )
+        assert counts_after.get("ConstantOfShape", 0) == counts_before.get(
+            "ConstantOfShape", 0
+        )
 
 
 class TestStaticEmptyKVCastVariant:
@@ -172,18 +185,20 @@ class TestStaticEmptyKVCastVariant:
             "ConstantOfShape", inputs=["empty_shape"], outputs=["cos"]
         )
         # Cast to FLOAT16 (to=10) — what quantization/cleanup emits instead of CastLike
-        cast_node = onnx.helper.make_node(
-            "Cast", inputs=["cos"], outputs=["empty_kv"], to=10
-        )
+        cast_node = onnx.helper.make_node("Cast", inputs=["cos"], outputs=["empty_kv"], to=10)
         graph = onnx.helper.make_graph(
             [batch_dim_node, tail_const_node, concat_node, cos_node, cast_node],
             "cast_variant",
-            inputs=[onnx.helper.make_tensor_value_info(
-                "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
-            )],
-            outputs=[onnx.helper.make_tensor_value_info(
-                "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, kv_hidden]
-            )],
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, kv_hidden]
+                )
+            ],
         )
         proto = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
         model = ir.serde.deserialize_model(proto)
@@ -216,18 +231,20 @@ class TestStaticEmptyKVCastVariant:
         cos_node = onnx.helper.make_node(
             "ConstantOfShape", inputs=["empty_shape"], outputs=["cos"]
         )
-        cast_node = onnx.helper.make_node(
-            "Cast", inputs=["cos"], outputs=["empty_kv"], to=10
-        )
+        cast_node = onnx.helper.make_node("Cast", inputs=["cos"], outputs=["empty_kv"], to=10)
         graph = onnx.helper.make_graph(
             [batch_dim_node, tail_const_node, concat_node, cos_node, cast_node],
             "cast_shape_test",
-            inputs=[onnx.helper.make_tensor_value_info(
-                "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
-            )],
-            outputs=[onnx.helper.make_tensor_value_info(
-                "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, kv_hidden]
-            )],
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "query_states", onnx.TensorProto.FLOAT16, [None, None, 64]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "empty_kv", onnx.TensorProto.FLOAT16, [None, 0, kv_hidden]
+                )
+            ],
         )
         proto = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 18)])
         model = ir.serde.deserialize_model(proto)

@@ -174,7 +174,9 @@ def static_empty_kv_rules() -> RewriteRuleSet:
         :class:`RewriteRuleSet` containing both :class:`_DynamicEmptyKVCastLike`
         and :class:`_DynamicEmptyKVCast`.
     """
-    return RewriteRuleSet([
-        _DynamicEmptyKVCastLike().rule(),
-        _DynamicEmptyKVCast().rule(),
-    ])
+    return RewriteRuleSet(
+        [
+            _DynamicEmptyKVCastLike().rule(),
+            _DynamicEmptyKVCast().rule(),
+        ]
+    )
