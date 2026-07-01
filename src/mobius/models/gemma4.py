@@ -1561,15 +1561,17 @@ class Gemma4TextModel(nn.Module):
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
             # Use separate per-layer tables so each weight stays within WebGPU's
             # per-buffer size limit (each [V, D] table is ~128 MB vs 4.4 GB fused).
-            self.embed_tokens_per_layer = nn.ModuleList([
-                Gemma3TextScaledWordEmbedding(
-                    vocab_per_layer,
-                    self._per_layer_dim,
-                    config.pad_token_id,
-                    embed_scale=float(self._per_layer_dim**0.5),
-                )
-                for _ in range(self._num_layers)
-            ])
+            self.embed_tokens_per_layer = nn.ModuleList(
+                [
+                    Gemma3TextScaledWordEmbedding(
+                        vocab_per_layer,
+                        self._per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=float(self._per_layer_dim**0.5),
+                    )
+                    for _ in range(self._num_layers)
+                ]
+            )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,

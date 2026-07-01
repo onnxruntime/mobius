@@ -317,7 +317,7 @@ def _get_optimization_passes(
     # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
-    
+
     # --- Graph-capture lowering ---
     # Shape + ConstantOfShape are incompatible with GPU graph capture:
     # Shape outputs to CPU (breaking the capture boundary) and ConstantOfShape
