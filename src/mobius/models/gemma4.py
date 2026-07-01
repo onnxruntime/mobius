@@ -1559,14 +1559,27 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
-            # Gather int64 index support (onnxruntime#28107).
+            # Fused [V, L*D] table — used on CUDA and other non-WebGPU EPs.
+            # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 config.pad_token_id,
                 embed_scale=float(self._per_layer_dim**0.5),
             )
+            # Split [V, D] tables — used on WebGPU EP to stay within the 2 GiB
+            # per-buffer limit (~134 MB each vs ~4.7 GB fused).
+            # Only the table actually called in forward() is realized as an
+            # ONNX initializer, so the unused one adds no graph weight.
+            self.embed_tokens_per_layer_split = nn.ModuleList([
+                Gemma3TextScaledWordEmbedding(
+                    vocab_per_layer,
+                    self._per_layer_dim,
+                    config.pad_token_id,
+                    embed_scale=float(self._per_layer_dim**0.5),
+                )
+                for _ in range(self._num_layers)
+            ])
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
@@ -1605,11 +1618,19 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
-        fused_emb = op.Reshape(
-            fused_emb,
-            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-        )
+        if ep_capabilities().name == "webgpu":
+            # 35 separate Gathers on [V, D] tables — each fits within WebGPU's 2 GiB limit.
+            per_layer_embs = [
+                op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
+                for i in range(self._num_layers)
+            ]
+            fused_emb = op.Concat(*per_layer_embs, axis=2)  # [B, S, L, D]
+        else:
+            fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+            fused_emb = op.Reshape(
+                fused_emb,
+                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+            )
 
         combined = op.Add(proj, fused_emb)
         combined = op.Mul(combined, float(0.5**0.5))
@@ -1910,6 +1931,7 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict.pop(key, None)
         # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
         # to our fused embedding table — no splitting needed.
+        # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
@@ -1973,7 +1995,17 @@ class _Gemma4DecoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
+        per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
+        if per_layer_dim and getattr(self.config, "split_per_layer_embedding", False):
+            fused_key = "model.embed_tokens_per_layer.weight"
+            if fused_key in state_dict:
+                num_layers = self.config.num_hidden_layers
+                chunks = state_dict.pop(fused_key).chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+        return state_dict
 
 
 class _Gemma4VisionEncoderModel(nn.Module):
@@ -2188,6 +2220,12 @@ class Gemma4EmbeddingModel(nn.Module):
         outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
 
         if not self._per_layer_dim:
+            return outputs
+
+        # On WebGPU the per-layer computation runs inside the decoder using split
+        # [V, D] tables to stay within the 2 GiB buffer limit.  The embedding
+        # model only emits inputs_embeds in that case.
+        if ep_capabilities().name == "webgpu":
             return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
@@ -2743,6 +2781,23 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 2 GiB
+        # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
+        # The per_layer_projection weights also live in the decoder (not embedding).
+        if getattr(self.config, "split_per_layer_embedding", False):
+            fused_key = "embedding.embed_tokens_per_layer.weight"
+            if fused_key in renamed:
+                num_layers = self.config.num_hidden_layers
+                chunks = renamed.pop(fused_key).chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+            # Re-route the projection weights from embedding.* → decoder.model.*
+            for k in list(renamed.keys()):
+                if k.startswith("embedding.per_layer_model_projection.") or k.startswith(
+                    "embedding.per_layer_projection_norm."
+                ):
+                    renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
 
         return renamed
 

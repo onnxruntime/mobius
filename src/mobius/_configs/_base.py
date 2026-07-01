@@ -1488,6 +1488,11 @@ class Gemma4Config(VisionLanguageConfig):
       causal attention (only ``None`` and ``"vision"`` are accepted).
     """
 
+    # Set to True by Gemma4Task.build() when targeting WebGPU EP, to split the
+    # fused [V, L*D] per-layer embedding into L separate [V, D] tables (each
+    # ~134 MB) that stay within WebGPU's 2 GiB per-buffer limit.
+    split_per_layer_embedding: bool = False
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)

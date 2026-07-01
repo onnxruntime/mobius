@@ -24,6 +24,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
@@ -207,6 +208,8 @@ class Gemma4Task(ModelTask):
         module: nn.Module,
         config: Gemma4Config,
     ) -> ModelPackage:
+        # Set WebGPU split flag before building — read by __init__ and preprocess_weights.
+        config.split_per_layer_embedding = ep_capabilities().name == "webgpu"
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
@@ -226,6 +229,10 @@ class Gemma4Task(ModelTask):
         accepts precomputed ``per_layer_inputs`` from the embedding model instead
         of ``input_ids``.  This moves the per-layer embedding computation to the
         embedding model, simplifying the decoder graph.
+
+        Exception: WebGPU EP uses split per-layer tables in the decoder (to stay
+        within the 2 GiB per-buffer limit), so ``input_ids`` is passed instead
+        and ``per_layer_inputs`` is omitted.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -250,9 +257,10 @@ class Gemma4Task(ModelTask):
             shape=[batch, seq_len],
         )
 
+        caps = ep_capabilities()
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        if per_layer_dim:
+        if per_layer_dim and caps.name != "webgpu":
             total_per_layer = config.num_hidden_layers * per_layer_dim
             per_layer_inputs_val = builder.input(
                 "per_layer_inputs",
@@ -267,8 +275,9 @@ class Gemma4Task(ModelTask):
         # between the embedding and decoder sub-models (it can forward
         # ``input_ids``). Only models with
         # ``use_bidirectional_attention == "vision"`` need it.
+        # For WebGPU, input_ids is always added (needed for per-layer embeddings).
         input_ids_val: ir.Value | None = None
-        if config.use_bidirectional_attention == "vision":
+        if config.use_bidirectional_attention == "vision" or (per_layer_dim and caps.name == "webgpu"):
             input_ids_val = builder.input(
                 "input_ids",
                 dtype=ir.DataType.INT64,
