@@ -1719,18 +1719,26 @@ class Gemma4TextModel(nn.Module):
             _ = self.rotary_emb_global(op, position_ids)
 
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
-            # total_seq_len = sum(attention_mask[b])  — derived from ReduceSum so
-            # Shape(attention_mask) is not emitted (Shape breaks WebGPU graph capture).
-            # Graph capture requires batch=1, so squeeze [batch] to a scalar.
-            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)  # INT64 [batch]
+            # total_seq_len = attention_mask.shape[1]     (past + current)
+            one_i32 = op.Constant(value_int=1)
+            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)
             seqlens_k = op.Cast(
-                op.Sub(reduce_sum, op.Constant(value_int=1)),
+                op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
-            )  # [batch] INT32
-            total_seq_len = op.Cast(
-                op.Squeeze(reduce_sum, op.Constant(value_ints=[0])),
-                to=ir.DataType.INT32,
-            )  # scalar INT32
+            )
+            if caps.enable_graph_capture:
+                # Shape(attention_mask) breaks graph capture (outputs to CPU).
+                # With graph capture, attention_mask is all-ones and batch=1,
+                # so ReduceSum gives the true sequence length.
+                total_seq_len = op.Cast(
+                    op.Squeeze(reduce_sum, op.Constant(value_ints=[0])),
+                    to=ir.DataType.INT32,
+                )
+            else:
+                total_seq_len = op.Cast(
+                    op.Gather(op.Shape(attention_mask), 1),
+                    to=ir.DataType.INT32,
+                )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
