@@ -194,11 +194,9 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
                     break
 
             # seqlens_k = Cast(ReduceSum(attention_mask, axis=1) - 1, INT32)
-            # ReduceSum axes must always be INT64 per ONNX spec.
-            # attention_mask is INT64 across all EPs (ORT WebGPU supports INT64 Sub/ReduceSum).
-            axis = op.Constant(value_ints=[1])  # ReduceSum axes must be INT64
-            one = op.Constant(value_ints=[1])
+            axis = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
+            one = op.Constant(value_ints=[1])
             self._seqlens_k = op.Cast(
                 op.Sub(reduce_sum, one),
                 to=6,
@@ -601,11 +599,9 @@ class AttentionToGQA(RewriteRuleClassBase):
         if self._seqlens_k is None:
             graph = attn.graph
             attention_mask = next(gi for gi in graph.inputs if gi.name == "attention_mask")
-            # attention_mask is INT64 across all EPs (ORT WebGPU supports INT64 Sub/ReduceSum).
-            # ReduceSum axes must always be INT64 per ONNX spec
             axis = op.Constant(value_ints=[1])
-            one = op.Constant(value_ints=[1])
             reduce_sum = op.ReduceSum(attention_mask, axis)
+            one = op.Constant(value_ints=[1])
             self._seqlens_k = op.Cast(op.Sub(reduce_sum, one), to=6)
             mask_shape = op.Shape(attention_mask)
             idx_1 = op.Constant(value_int=1)
