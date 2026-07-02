@@ -104,26 +104,18 @@ def _default_search_params(
     }
 
 
-def _make_session_options(
-    ep: str, *, enable_graph_capture: bool | None = None
-) -> dict[str, Any]:
+def _make_session_options(ep: str) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
     Args:
         ep: Execution provider name (e.g. ``"cpu"``, ``"cuda"``,
             ``"dml"``, ``"trt-rtx"``).
-        enable_graph_capture: Override the EP's registered graph-capture flag.
-            ``None`` (default) defers to the EP registry.  Pass ``False`` for
-            non-decoder components (vision/embedding/audio) that contain ops
-            incompatible with graph capture.
     """
     from mobius.integrations.ort_genai.ep_config import make_provider_options
 
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(
-            ep, enable_graph_capture=enable_graph_capture
-        ),
+        "provider_options": make_provider_options(ep),
     }
 
 
@@ -324,7 +316,7 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep, enable_graph_capture=False),
+            "session_options": _make_session_options(self.ep),
         }
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
@@ -337,7 +329,7 @@ class GenaiConfigGenerator:
             else {
                 "inputs_embeds": "inputs_embeds",
             },
-            "session_options": _make_session_options(self.ep, enable_graph_capture=False),
+            "session_options": _make_session_options(self.ep),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
         if vision_start_token_id is not None:
@@ -387,7 +379,7 @@ class GenaiConfigGenerator:
             "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
-            "session_options": _make_session_options(self.ep, enable_graph_capture=False),
+            "session_options": _make_session_options(self.ep),
         }
 
         if audio_token_id is not None:
