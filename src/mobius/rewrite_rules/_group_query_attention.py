@@ -147,11 +147,6 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
         if past_value.producer() is not None:
             return result.fail("past_value is not a graph input")
 
-        # attention_mask must be a graph input — needed to build seqlens_k.
-        graph = attn_out.producer().graph
-        if not any(gi.name == "attention_mask" for gi in graph.inputs):
-            return result.fail("No attention_mask graph input — cannot build seqlens_k")
-
         return result
 
     # ------------------------------------------------------------------ rewrite
