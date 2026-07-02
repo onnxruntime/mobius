@@ -1559,7 +1559,7 @@ class Gemma4TextModel(nn.Module):
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Fused [V, L*D] table — used on CUDA and other non-WebGPU EPs.
+            # Fused [V, L*D] table — used when split_per_layer_embedding is False.
             # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
@@ -1567,8 +1567,9 @@ class Gemma4TextModel(nn.Module):
                 config.pad_token_id,
                 embed_scale=float(self._per_layer_dim**0.5),
             )
-            # Split [V, D] tables — used on WebGPU EP to stay within the 256 MiB
-            # maxBufferSize limit (~128 MiB each vs ~4.7 GB fused).
+            # Split [V, D] tables — used when split_per_layer_embedding is True
+            # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
+            # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
             self.embed_tokens_per_layer_split = nn.ModuleList([
@@ -1618,8 +1619,9 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        if ep_capabilities().name == "webgpu":
-            # 35 separate Gathers on [V, D] tables — each fits within WebGPU's 256 MiB maxBufferSize limit.
+        if getattr(self.config, "split_per_layer_embedding", False):
+            # L separate Gathers on [V, D] tables — each fits within the EP's
+            # max_buffer_size (e.g. WebGPU's 256 MiB limit).
             per_layer_embs = [
                 op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
                 for i in range(self._num_layers)
@@ -2219,10 +2221,10 @@ class Gemma4EmbeddingModel(nn.Module):
         if not self._per_layer_dim:
             return outputs
 
-        # On WebGPU the per-layer computation runs inside the decoder using split
-        # [V, D] tables to stay within the 256 MiB maxBufferSize limit.  The embedding
-        # model only emits inputs_embeds in that case.
-        if ep_capabilities().name == "webgpu":
+        # When split_per_layer_embedding is set, the per-layer computation runs
+        # inside the decoder using split [V, D] tables.  The embedding model only
+        # emits inputs_embeds in that case.
+        if getattr(self.config, "split_per_layer_embedding", False):
             return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
