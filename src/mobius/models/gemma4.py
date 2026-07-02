@@ -1754,9 +1754,13 @@ class Gemma4TextModel(nn.Module):
             )
             if caps.enable_graph_capture:
                 # Shape(attention_mask) breaks graph capture (outputs to CPU).
-                # reduce_sum is [batch] INT64 — cast directly to INT32 [batch];
-                # GQA accepts [batch] for total_seq_len (validated against working models).
-                total_seq_len = op.Cast(reduce_sum, to=ir.DataType.INT32)
+                # Cast INT64→INT32 first (WebGPU can't handle INT64 Gather), then
+                # Gather index 0 to produce the scalar GQA expects. Valid because
+                # graph capture requires batch=1.
+                total_seq_len = op.Gather(
+                    op.Cast(reduce_sum, to=ir.DataType.INT32),
+                    op.Constant(value_int=0),
+                )
             else:
                 total_seq_len = op.Cast(
                     op.Gather(op.Shape(attention_mask), 1),
