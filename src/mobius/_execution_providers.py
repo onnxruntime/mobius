@@ -223,6 +223,19 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
         ),
+        # OpenVINO EP (via ORT GenAI). The OpenVINO EP consumes a portable ONNX
+        # graph and compiles it internally for the selected device, so the graph
+        # build mirrors "default" (standard Attention, no GQA/QKV packing). The
+        # graph does not depend on the OpenVINO device, so we emit a sensible
+        # default device_type ("NPU") in the genai_config provider options; a
+        # different device can be selected downstream by editing genai_config
+        # (e.g. by the Olive MobiusBuilder pass or the user) without rebuilding.
+        EpCapabilities(
+            name="openvino",
+            gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
+            qkv_pack_dtypes=frozenset(),  # no QKV packing
+            provider_options={"device_type": "NPU"},
+        ),
         EpCapabilities(
             name="cpu",
             gqa_dtypes=frozenset({ir.DataType.FLOAT}),
