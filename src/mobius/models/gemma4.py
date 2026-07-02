@@ -1754,9 +1754,12 @@ class Gemma4TextModel(nn.Module):
             )
             if caps.enable_graph_capture:
                 # Shape(attention_mask) breaks graph capture (outputs to CPU).
-                # With graph capture, attention_mask is all-ones and batch=1,
-                # so ReduceSum gives the true sequence length as [batch] INT32.
-                total_seq_len = op.Cast(reduce_sum, to=ir.DataType.INT32)
+                # With graph capture, batch=1, so Gather([batch] sum, 0) gives
+                # the scalar sequence length GQA expects without a Shape node.
+                total_seq_len = op.Cast(
+                    op.Gather(reduce_sum, op.Constant(value_int=0)),
+                    to=ir.DataType.INT32,
+                )
             else:
                 total_seq_len = op.Cast(
                     op.Gather(op.Shape(attention_mask), 1),
@@ -2004,7 +2007,13 @@ class _Gemma4DecoderModel(nn.Module):
             fused_key = "model.embed_tokens_per_layer.weight"
             if fused_key in state_dict:
                 num_layers = self.config.num_hidden_layers
-                chunks = state_dict.pop(fused_key).chunk(num_layers, dim=1)
+                fused = state_dict.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
                 for i, chunk in enumerate(chunks):
                     state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
         return state_dict
@@ -2791,7 +2800,14 @@ class Gemma4Model(nn.Module):
             fused_key = "embedding.embed_tokens_per_layer.weight"
             if fused_key in renamed:
                 num_layers = self.config.num_hidden_layers
-                chunks = renamed.pop(fused_key).chunk(num_layers, dim=1)
+                per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
+                fused = renamed.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
                 for i, chunk in enumerate(chunks):
                     renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
             # Re-route the projection weights from embedding.* → decoder.model.*

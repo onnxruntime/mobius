@@ -61,11 +61,11 @@ from onnxscript.rewriter._basics import MatchResult
 from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleSet
 
 # Maps ir.DataType to the numpy dtype used to build the zero tensor.
-# Defaults to float32 for any dtype not listed (safe: content is never read).
+# dtypes not listed here (e.g. BFLOAT16) cannot be expressed natively in numpy;
+# for those we emit a float32 Constant and add an explicit Cast to the target dtype.
 _IR_DTYPE_TO_NP: dict[ir.DataType, np.dtype] = {
     ir.DataType.FLOAT: np.float32,
     ir.DataType.FLOAT16: np.float16,
-    ir.DataType.BFLOAT16: np.float32,  # numpy has no bfloat16; float32 is safe (content never read)
     ir.DataType.DOUBLE: np.float64,
 }
 
@@ -84,11 +84,21 @@ def _check_shape_tail(shape_tail) -> int | None:
     return int(ints[1])
 
 
-def _static_zero_constant(op, kv_hidden: int, np_dtype: type = np.float32):
-    """Return a static [1, 0, kv_hidden] zero Constant in the given numpy dtype."""
-    # batch=1 because graph capture requires static input shapes.
-    # The GQA kernel ignores the content (kv_sequence_length=0).
-    return op.Constant(value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=np_dtype)))
+def _static_zero_constant(op, kv_hidden: int, ir_dtype: ir.DataType):
+    """Return a static [1, 0, kv_hidden] zero tensor in the target dtype.
+
+    When the dtype is natively representable in numpy (float16, float32, float64)
+    emits a single Constant node.  For dtypes numpy cannot express (e.g. bfloat16)
+    emits a float32 Constant followed by a Cast to preserve the output dtype —
+    the content is zeroes so it is never read by the GQA kernel.
+    """
+    np_dtype = _IR_DTYPE_TO_NP.get(ir_dtype)
+    zero = op.Constant(
+        value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=np_dtype or np.float32))
+    )
+    if np_dtype is None:
+        zero = op.Cast(zero, to=ir_dtype)
+    return zero
 
 
 class _DynamicEmptyKVCastLike(RewriteRuleClassBase):
@@ -111,8 +121,7 @@ class _DynamicEmptyKVCastLike(RewriteRuleClassBase):
 
     def rewrite(self, op, query_states, shape_tail, **_):
         kv_hidden = _check_shape_tail(shape_tail)
-        np_dtype = _IR_DTYPE_TO_NP.get(query_states.dtype, np.float32)
-        return _static_zero_constant(op, kv_hidden, np_dtype)
+        return _static_zero_constant(op, kv_hidden, query_states.dtype or ir.DataType.FLOAT)
 
 
 class _DynamicEmptyKVCast(RewriteRuleClassBase):
@@ -138,7 +147,7 @@ class _DynamicEmptyKVCast(RewriteRuleClassBase):
         kv_hidden = _check_shape_tail(shape_tail)
         # Walk Concat → ConstantOfShape → Cast to read the target dtype.
         # shape_tail feeds Concat; Concat output feeds ConstantOfShape; its output feeds Cast.
-        np_dtype = np.float32
+        ir_dtype = ir.DataType.FLOAT
         for use in shape_tail.uses():
             concat_node = use.node
             if concat_node.op_type != "Concat":
@@ -152,13 +161,11 @@ class _DynamicEmptyKVCast(RewriteRuleClassBase):
                     if cast_node.op_type == "Cast":
                         to_attr = cast_node.attributes.get("to")
                         if to_attr is not None:
-                            np_dtype = _IR_DTYPE_TO_NP.get(
-                                ir.DataType(to_attr.value), np.float32
-                            )
+                            ir_dtype = ir.DataType(to_attr.value)
                         break
                 break
             break
-        return _static_zero_constant(op, kv_hidden, np_dtype)
+        return _static_zero_constant(op, kv_hidden, ir_dtype)
 
 
 def static_empty_kv_rules() -> RewriteRuleSet:

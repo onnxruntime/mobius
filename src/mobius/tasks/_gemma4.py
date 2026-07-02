@@ -215,7 +215,7 @@ class Gemma4Task(ModelTask):
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
         if caps.max_buffer_size and per_layer_dim and vocab_per_layer:
-            dtype_bytes = 2  # bfloat16 / float16
+            dtype_bytes = int(config.dtype.itemsize)
             fused_bytes = (
                 vocab_per_layer * config.num_hidden_layers * per_layer_dim * dtype_bytes
             )
