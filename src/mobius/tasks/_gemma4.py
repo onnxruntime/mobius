@@ -251,8 +251,6 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="decoder")
         op = builder.op
 
-        caps = ep_capabilities()
-
         inputs_embeds = builder.input(
             "inputs_embeds",
             dtype=config.dtype,
