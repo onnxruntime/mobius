@@ -1478,6 +1478,7 @@ class Gemma4TextModel(nn.Module):
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
+        self.config = config
         self._dtype = config.dtype
 
         embed_scale = math.sqrt(config.hidden_size)
