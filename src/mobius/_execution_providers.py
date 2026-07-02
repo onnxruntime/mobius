@@ -207,7 +207,7 @@ def get_ep(name: str) -> EpCapabilities:
 
 
 def _register_builtins() -> None:
-    """Populate the global registry with the seven built-in EPs.
+    """Populate the global registry with the built-in EPs.
 
     Called once at module import. Adding a new EP = adding one entry here.
     """
