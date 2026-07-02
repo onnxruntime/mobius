@@ -216,7 +216,9 @@ class Gemma4Task(ModelTask):
         vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
         if caps.max_buffer_size and per_layer_dim and vocab_per_layer:
             dtype_bytes = 2  # bfloat16 / float16
-            fused_bytes = vocab_per_layer * config.num_hidden_layers * per_layer_dim * dtype_bytes
+            fused_bytes = (
+                vocab_per_layer * config.num_hidden_layers * per_layer_dim * dtype_bytes
+            )
             config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
         else:
             config.split_per_layer_embedding = False
@@ -286,7 +288,9 @@ class Gemma4Task(ModelTask):
         # When split_per_layer_embedding is set, input_ids is also needed for
         # per-layer embedding lookups inside the decoder.
         input_ids_val: ir.Value | None = None
-        if config.use_bidirectional_attention == "vision" or (per_layer_dim and config.split_per_layer_embedding):
+        if config.use_bidirectional_attention == "vision" or (
+            per_layer_dim and config.split_per_layer_embedding
+        ):
             input_ids_val = builder.input(
                 "input_ids",
                 dtype=ir.DataType.INT64,

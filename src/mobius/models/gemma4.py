@@ -1573,15 +1573,17 @@ class Gemma4TextModel(nn.Module):
             # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
-            self.embed_tokens_per_layer_split = nn.ModuleList([
-                Gemma3TextScaledWordEmbedding(
-                    vocab_per_layer,
-                    self._per_layer_dim,
-                    config.pad_token_id,
-                    embed_scale=float(self._per_layer_dim**0.5),
-                )
-                for _ in range(self._num_layers)
-            ])
+            self.embed_tokens_per_layer_split = nn.ModuleList(
+                [
+                    Gemma3TextScaledWordEmbedding(
+                        vocab_per_layer,
+                        self._per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=float(self._per_layer_dim**0.5),
+                    )
+                    for _ in range(self._num_layers)
+                ]
+            )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
@@ -2794,8 +2796,11 @@ class Gemma4Model(nn.Module):
                     renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
             # Re-route the projection weights from embedding.* → decoder.model.*
             for k in list(renamed.keys()):
-                if k.startswith("embedding.per_layer_model_projection.") or k.startswith(
-                    "embedding.per_layer_projection_norm."
+                if k.startswith(
+                    (
+                        "embedding.per_layer_model_projection.",
+                        "embedding.per_layer_projection_norm.",
+                    )
                 ):
                     renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
 
