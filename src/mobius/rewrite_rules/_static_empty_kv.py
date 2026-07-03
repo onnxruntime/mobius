@@ -7,8 +7,9 @@ When WebGPU graph capture is enabled, the ``Shape`` and ``ConstantOfShape``
 ops used to build the empty ``[batch, 0, kv_hidden]`` KV tensor for shared-KV
 layers (e.g. Gemma4 layers 15-34) are problematic:
 
-- ``Shape`` outputs to CPU, breaking the GPU graph capture boundary.
-- ``ConstantOfShape`` is unsupported by the WebGPU EP.
+- ``Shape`` outputs to CPU, breaking the GPU graph capture boundary (affects
+  all GPU EPs including WebGPU and CUDA).
+- ``ConstantOfShape`` is unsupported by the WebGPU EP (not an issue for CUDA).
 
 Two pattern variants are matched (both are emitted by onnxscript depending on
 the optimization pass that runs first):
@@ -60,15 +61,6 @@ import onnx_ir as ir
 from onnxscript.rewriter._basics import MatchResult
 from onnxscript.rewriter._rewrite_rule import RewriteRuleClassBase, RewriteRuleSet
 
-# Maps ir.DataType to the numpy dtype used to build the zero tensor.
-# dtypes not listed here (e.g. BFLOAT16) cannot be expressed natively in numpy;
-# for those we emit a float32 Constant and add an explicit Cast to the target dtype.
-_IR_DTYPE_TO_NP: dict[ir.DataType, np.dtype] = {
-    ir.DataType.FLOAT: np.float32,
-    ir.DataType.FLOAT16: np.float16,
-    ir.DataType.DOUBLE: np.float64,
-}
-
 
 def _check_shape_tail(shape_tail) -> int | None:
     """Return kv_hidden if shape_tail is Constant(value_ints=[0, kv_hidden]), else None."""
@@ -87,18 +79,13 @@ def _check_shape_tail(shape_tail) -> int | None:
 def _static_zero_constant(op, kv_hidden: int, ir_dtype: ir.DataType):
     """Return a static [1, 0, kv_hidden] zero tensor in the target dtype.
 
-    When the dtype is natively representable in numpy (float16, float32, float64)
-    emits a single Constant node.  For dtypes numpy cannot express (e.g. bfloat16)
-    emits a float32 Constant followed by a Cast to preserve the output dtype —
-    the content is zeroes so it is never read by the GQA kernel.
+    Uses ``ir_dtype.numpy()`` to obtain the numpy dtype, which handles
+    bfloat16 via ``ml_dtypes``.  The content is never read because
+    kv_sequence_length=0.
     """
-    np_dtype = _IR_DTYPE_TO_NP.get(ir_dtype)
-    zero = op.Constant(
-        value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=np_dtype or np.float32))
+    return op.Constant(
+        value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=ir_dtype.numpy()))
     )
-    if np_dtype is None:
-        zero = op.Cast(zero, to=ir_dtype)
-    return zero
 
 
 class _DynamicEmptyKVCastLike(RewriteRuleClassBase):
@@ -171,8 +158,8 @@ class _DynamicEmptyKVCast(RewriteRuleClassBase):
 def static_empty_kv_rules() -> RewriteRuleSet:
     """Return a rule set that replaces dynamic empty-KV construction with a static Constant.
 
-    Applied for EPs with ``enable_graph_capture=True`` (e.g. WebGPU) where
-    ``Shape`` and ``ConstantOfShape`` are incompatible with graph capture.
+    Applied for EPs with ``enable_graph_capture=True`` where ``Shape``
+    (and for WebGPU, ``ConstantOfShape``) are incompatible with graph capture.
 
     Two variants are handled: the ``CastLike`` form (pre-cleanup) and the
     ``Cast`` form (post-cleanup, after quantization or ONNX simplification).

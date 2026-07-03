@@ -320,9 +320,10 @@ def _get_optimization_passes(
 
     # --- Graph-capture lowering ---
     # Shape + ConstantOfShape are incompatible with GPU graph capture:
-    # Shape outputs to CPU (breaking the capture boundary) and ConstantOfShape
-    # is unsupported by the WebGPU EP. Replace the dynamic empty-KV pattern
-    # with a static Constant so the full decoder graph stays on-device.
+    # Shape outputs to CPU, breaking the capture boundary (affects all GPU EPs).
+    # ConstantOfShape is additionally unsupported by the WebGPU EP.
+    # Replace the dynamic empty-KV pattern with a static Constant so the full
+    # decoder graph stays on-device. Applies to any EP with enable_graph_capture.
     if caps.enable_graph_capture:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 

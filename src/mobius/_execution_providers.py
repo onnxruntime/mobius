@@ -117,7 +117,7 @@ class EpCapabilities:
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
-    max_buffer_size: int = 0
+    max_buffer_size: int | None = None
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:

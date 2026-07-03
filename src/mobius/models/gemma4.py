@@ -1622,7 +1622,7 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        if getattr(self.config, "split_per_layer_embedding", False):
+        if self.config.split_per_layer_embedding:
             # L separate Gathers on [V, D] tables — each fits within the EP's
             # max_buffer_size (e.g. WebGPU's 256 MiB limit).
             per_layer_embs = [
@@ -1753,10 +1753,12 @@ class Gemma4TextModel(nn.Module):
                 to=ir.DataType.INT32,
             )
             if caps.enable_graph_capture:
-                # Shape(attention_mask) breaks graph capture (outputs to CPU).
-                # Cast INT64→INT32 first (WebGPU can't handle INT64 Gather), then
-                # Gather index 0 to produce the scalar GQA expects. Valid because
-                # graph capture requires batch=1.
+                # Shape(attention_mask) outputs to CPU, breaking graph capture
+                # on any GPU EP. Use reduce_sum (already computed) to derive
+                # total_seq_len without Shape. Cast to INT32 before Gather
+                # because WebGPU EP does not support INT64 Gather; INT32 is
+                # also correct for CUDA since sequence lengths fit in INT32.
+                # Gather index 0 is valid because graph capture requires batch=1.
                 total_seq_len = op.Gather(
                     op.Cast(reduce_sum, to=ir.DataType.INT32),
                     op.Constant(value_int=0),
@@ -2003,8 +2005,8 @@ class _Gemma4DecoderModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
         # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
-        per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
-        if per_layer_dim and getattr(self.config, "split_per_layer_embedding", False):
+        per_layer_dim = self.config.hidden_size_per_layer_input
+        if per_layer_dim and self.config.split_per_layer_embedding:
             fused_key = "model.embed_tokens_per_layer.weight"
             if fused_key in state_dict:
                 num_layers = self.config.num_hidden_layers
@@ -2237,7 +2239,7 @@ class Gemma4EmbeddingModel(nn.Module):
         # When split_per_layer_embedding is set, the per-layer computation runs
         # inside the decoder using split [V, D] tables.  The embedding model only
         # emits inputs_embeds in that case.
-        if getattr(self.config, "split_per_layer_embedding", False):
+        if self.config.split_per_layer_embedding:
             return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
@@ -2797,11 +2799,11 @@ class Gemma4Model(nn.Module):
         # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
         # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
         # The per_layer_projection weights also live in the decoder (not embedding).
-        if getattr(self.config, "split_per_layer_embedding", False):
+        if self.config.split_per_layer_embedding:
             fused_key = "embedding.embed_tokens_per_layer.weight"
             if fused_key in renamed:
                 num_layers = self.config.num_hidden_layers
-                per_layer_dim = getattr(self.config, "hidden_size_per_layer_input", 0)
+                per_layer_dim = self.config.hidden_size_per_layer_input
                 fused = renamed.pop(fused_key)
                 assert fused.shape[1] == num_layers * per_layer_dim, (
                     f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
