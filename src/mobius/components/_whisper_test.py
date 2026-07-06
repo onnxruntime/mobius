@@ -40,7 +40,7 @@ class TestConv1d:
         x = create_test_input(builder, "x", [1, 80, 100])
 
         result = conv(op, x)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Conv") >= 1
 
 
@@ -73,7 +73,7 @@ class TestWhisperAttention:
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
 
         output, (pk, pv) = attn(op, hidden)
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_cross_attention_forward(self):
@@ -83,7 +83,7 @@ class TestWhisperAttention:
         encoder_hidden = create_test_input(builder, "enc", [1, 8, 64])
 
         output, _ = attn(op, decoder_hidden, key_value_states=encoder_hidden)
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_forward_with_past_kv(self):
@@ -94,7 +94,7 @@ class TestWhisperAttention:
         past_value = create_test_input(builder, "pv", [1, 8, 4, 16])
 
         output, (pk, pv) = attn(op, hidden, past_key_value=(past_key, past_value))
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_pre_scales_query(self):
@@ -125,7 +125,7 @@ class TestWhisperEncoderLayer:
         hidden = create_test_input(builder, "hidden", [1, 8, 64])
 
         result = layer(op, hidden)
-        builder._adapt_outputs([result])
+        builder._adapt_outputs([result], "")
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "Gelu") >= 1
         assert count_op_type(graph, "LayerNormalization") >= 2
@@ -164,7 +164,7 @@ class TestWhisperDecoderLayer:
         encoder_hidden = create_test_input(builder, "encoder_hidden", [1, 8, 64])
 
         output, present_kv = layer(op, hidden, encoder_hidden)
-        builder._adapt_outputs([output, present_kv[0], present_kv[1]])
+        builder._adapt_outputs([output, present_kv[0], present_kv[1]], "")
         # Self-attention + cross-attention = 2 Attention ops
         assert count_op_type(graph, "Attention") >= 2
         assert count_op_type(graph, "Gelu") >= 1
@@ -184,5 +184,5 @@ class TestWhisperDecoderLayer:
             encoder_hidden,
             past_key_value=(past_key, past_value),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 2

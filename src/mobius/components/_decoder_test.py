@@ -71,7 +71,7 @@ class TestDecoderLayer:
             position_embeddings=(cos, sin),
             past_key_value=None,
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert graph.num_nodes() > 0
         # Pre-norm: RMSNorm for input_layernorm + post_attention_layernorm
         assert count_op_type(graph, "RMSNormalization") >= 2
@@ -95,7 +95,7 @@ class TestDecoderLayer:
             position_embeddings=(cos, sin),
             past_key_value=(past_key, past_value),
         )
-        builder._adapt_outputs([output, pk, pv])
+        builder._adapt_outputs([output, pk, pv], "")
         assert count_op_type(graph, "Attention") >= 1
 
     def test_residual_connections(self):
@@ -152,7 +152,7 @@ class TestPostNormDecoderLayer:
         sin = create_test_input(builder, "sin", [1, 8, 16])
 
         output, _ = layer(op, hidden, bias, (cos, sin), None)
-        builder._adapt_outputs([output])
+        builder._adapt_outputs([output], "")
         assert graph.num_nodes() > 0
 
 

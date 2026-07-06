@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Text-only export for multimodal Gemma 4 (`--text-only`)
+
+#### Added
+
+- `build(text_only=True)` and the `mobius build --text-only` CLI flag export the
+  **text backbone** of a unified multimodal checkpoint as a standalone
+  decoder-only LLM. For `gemma4_unified` (`google/gemma-4-12B`) this remaps the
+  model type to its text sibling (`gemma4_unified_text`) and strips the
+  vision/audio config so the decoder fuses to `GroupQueryAttention` on
+  GQA-capable execution providers (CUDA/DML) instead of the float-bias
+  `Attention` path forced by the multimodal bidirectional vision-block overlay.
+  `--text-only` is rejected with `--config` / `--component` and now also bypasses
+  diffusers autodetect so `build()` validation runs (a diffusers/unsupported repo
+  raises instead of silently exporting a pipeline).
+
+#### Changed
+
+- `auto_export(..., ep="cuda"|"dml")` now forwards the execution provider to
+  `build()` (`ep` → `build_ep`), so exports build the **EP-fused** graph
+  (GQA / packed-QKV) rather than the portable `"default"` graph. Callers that
+  relied on `auto_export` always producing a portable graph should pass
+  `ep="cpu"` (which maps to the `"default"` build EP).
+
+---
+
 ### KV-cache present-shape: fail-closed on partial parameter sets
 
 #### Fixed

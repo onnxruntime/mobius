@@ -19,6 +19,7 @@ Uses MockWeightProvider pattern for test isolation — no network calls needed.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import pathlib
 from unittest import mock
@@ -31,7 +32,7 @@ import torch
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius._weight_loading import apply_weights
+from mobius._weight_loading import _download_weights, apply_weights
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 
@@ -143,6 +144,73 @@ class TestSafetensorsPreference:
                         pytest.fail(
                             f"torch.{func.attr} found in {weight_file.name}:{node.lineno}"
                         )
+
+
+class TestLocalSafetensorsLoading:
+    """Verify local HuggingFace checkpoint directories load without Hub access."""
+
+    def test_local_single_safetensors_loaded_without_hub(self, tmp_path, monkeypatch):
+        data = {"weight": torch.ones(2, 3)}
+        safetensors.torch.save_file(data, str(tmp_path / "model.safetensors"))
+
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        state_dict = _download_weights(str(tmp_path))
+
+        assert torch.equal(state_dict["weight"], data["weight"])
+
+    def test_local_sharded_safetensors_index_loaded_without_hub(self, tmp_path, monkeypatch):
+        shard_a = {"a.weight": torch.ones(1)}
+        shard_b = {"b.weight": torch.zeros(1)}
+        safetensors.torch.save_file(shard_a, str(tmp_path / "shard-a.safetensors"))
+        safetensors.torch.save_file(shard_b, str(tmp_path / "shard-b.safetensors"))
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "a.weight": "shard-a.safetensors",
+                        "b.weight": "shard-b.safetensors",
+                    },
+                }
+            )
+        )
+
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        state_dict = _download_weights(str(tmp_path))
+
+        assert torch.equal(state_dict["a.weight"], shard_a["a.weight"])
+        assert torch.equal(state_dict["b.weight"], shard_b["b.weight"])
+
+    def test_local_directory_without_safetensors_raises_without_hub(
+        self, tmp_path, monkeypatch
+    ):
+        def _unexpected_hub_call(*_args, **_kwargs):
+            raise AssertionError("local checkpoint should not call hf_hub_download")
+
+        monkeypatch.setattr("mobius._weight_loading.hf_hub_download", _unexpected_hub_call)
+
+        with pytest.raises(FileNotFoundError, match="Local checkpoint directory has no"):
+            _download_weights(str(tmp_path))
+
+    @pytest.mark.parametrize(
+        "malicious_filename",
+        ["../../../etc/passwd", "..\\..\\secret.safetensors", "/absolute/model.safetensors"],
+    )
+    def test_local_safetensors_index_rejects_unsafe_paths(self, tmp_path, malicious_filename):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {}, "weight_map": {"weight": malicious_filename}})
+        )
+
+        with pytest.raises(ValueError, match="Unsafe weight filename"):
+            _download_weights(str(tmp_path))
 
 
 # ===========================================================================

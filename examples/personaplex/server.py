@@ -118,6 +118,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         )
         persona = DEFAULT_PERSONA
         expect_voice = False
+        seed = None
         try:
             cfg = await asyncio.wait_for(ws.receive(), timeout=300.0)
         except asyncio.TimeoutError:
@@ -129,6 +130,9 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                 d = json.loads(cfg.data)
                 persona = (d.get("persona") or "").strip() or DEFAULT_PERSONA
                 expect_voice = bool(d.get("hasVoice"))
+                raw_seed = d.get("seed")
+                if raw_seed is not None and str(raw_seed).strip() != "":
+                    seed = int(raw_seed)
             except (ValueError, TypeError):
                 pass
 
@@ -146,6 +150,11 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         print(f"[ws] priming: persona={len(text_tokens or [])} toks, voice={n_voice} frames")
         # Make sure warmup + reset finished before we prime / generate.
         await warm_task
+        # Reseed the sampler AFTER warmup (warmup consumes the RNG) so a fixed
+        # seed makes the conversation's voice/accent fully reproducible; a blank
+        # seed (None) reseeds randomly for a fresh voice each session.
+        moshi.set_seed(seed)
+        print(f"[ws] sampler seed = {seed!r}")
         t0 = time.perf_counter()
         await asyncio.to_thread(moshi.prime, voice_pcm, text_tokens)
         print(f"[ws] primed in {time.perf_counter() - t0:.1f}s")

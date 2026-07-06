@@ -24,6 +24,8 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    Eagle3Config,
+    Gemma4AssistantConfig,
     Gemma4Config,
     MMSConfig,
     WhisperConfig,
@@ -35,8 +37,10 @@ from mobius.models import (
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
+    DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
+    Eagle3DraftModel,
     EncDecRNNTModel,
     Ernie45MoECausalLMModel,
     ErnieCausalLMModel,
@@ -44,6 +48,7 @@ from mobius.models import (
     Gemma2CausalLMModel,
     Gemma3CausalLMModel,
     Gemma3MultiModalModel,
+    Gemma4AssistantCausalLMModel,
     Gemma4CausalLMModel,
     Gemma4Model,
     Gemma4UnifiedModel,
@@ -82,6 +87,7 @@ from mobius.models import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
     Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35MtpModel,
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
@@ -401,6 +407,39 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
+    # Gemma4-Assistant ships ``model_type="gemma4_assistant"`` plus
+    # ``architectures=["Gemma4AssistantForCausalLM"]``.  Both keys point
+    # at the assistant drafter so build() can dispatch via either.  The
+    # ``gemma4_unified_assistant`` family is structurally identical (same
+    # 4-layer Gemma4 decoder, KV-shared with target, optional ordered-
+    # embeddings head) but ships under a different ``model_type``;
+    # register all four keys at the same class.
+    "gemma4_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "Gemma4AssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+    ),
+    "gemma4_unified_assistant": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
+    "Gemma4UnifiedAssistantForCausalLM": ModelRegistration(
+        Gemma4AssistantCausalLMModel,
+        task="gemma4-assistant",
+        config_class=Gemma4AssistantConfig,
+        family="gemma4_assistant",
+        variant="unified",
+    ),
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
@@ -425,6 +464,53 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen": ModelRegistration(QwenCausalLMModel),
     "qwen3": ModelRegistration(Qwen3CausalLMModel),
     "qwen3_5_text": ModelRegistration(Qwen35CausalLMModel),
+    # DFlash drafters share ``model_type=qwen3`` with the base Qwen3 family;
+    # build() routes to DFlashDraftModel by the ``architectures`` field in the
+    # checkpoint config.  The registry entry below allows direct lookup by
+    # architecture name and exposes the task.
+    "DFlashDraftModel": ModelRegistration(
+        DFlashDraftModel, task="dflash-draft", family="dflash", variant="qwen3"
+    ),
+    # Qwen3.6 MTP self-speculative head.  Like DFlash, it is an auxiliary
+    # drafter that is NOT auto-routed by ``model_type`` (the main checkpoint
+    # maps to the qwen3_5 VL / text model); it is looked up directly by
+    # architecture name and exposes the ``qwen35-mtp`` task.
+    "Qwen35MtpModel": ModelRegistration(
+        Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
+    ),
+    "Eagle3LlamaForCausalLM": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # AngelSlim ships two equivalent EAGLE-3 architecture strings: Qwen3-4B uses
+    # "Eagle3LlamaForCausalLM", Qwen3-8B uses "LlamaForCausalLMEagle3".
+    "LlamaForCausalLMEagle3": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="qwen3",
+    ),
+    # speculators-format EAGLE-3 checkpoints (RedHat): the Qwen3 checkpoint
+    # declares "Eagle3Speculator", the Gemma4 one "Eagle3DraftModel". Both nest
+    # the arch config under transformer_layer_config and set norm_before_residual.
+    "Eagle3Speculator": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
+    "Eagle3DraftModel": ModelRegistration(
+        Eagle3DraftModel,
+        task="eagle3-draft",
+        config_class=Eagle3Config,
+        family="eagle3",
+        variant="speculators",
+    ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
@@ -686,6 +772,20 @@ def _create_default_registry() -> ModelRegistry:
     return reg
 
 
+# -- Text-only export overrides --
+# Maps a multimodal ``model_type`` to its text-only registry sibling, used by
+# ``build(..., text_only=True)`` to export the text backbone of a multimodal
+# checkpoint as a standalone decoder-only LLM (e.g. so it can use
+# GroupQueryAttention instead of the multimodal bidirectional float-bias path).
+# Entries must point at a registered text-only model_type. The mapping is
+# idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
+# no-op when the resolved type is already text-only.
+_TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "gemma4_unified": "gemma4_unified_text",
+    "gemma4_unified_text": "gemma4_unified_text",
+}
+
+
 # fmt: off
 # -- Test model IDs for L2 architecture validation --
 # Each maps a registered model_type to a public HuggingFace model.
@@ -756,6 +856,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen": "Qwen/Qwen-1_8B-Chat",
     "qwen3": "Qwen/Qwen3-0.6B",
     "qwen3_5_text": "Qwen/Qwen3.5-2B",
+    "Eagle3LlamaForCausalLM": "AngelSlim/Qwen3-4B_eagle3",
+    "LlamaForCausalLMEagle3": "AngelSlim/Qwen3-8B_eagle3",
     "smollm3": "HuggingFaceTB/SmolLM3-3B",
     "gpt2": "openai-community/gpt2",
     "opt": "facebook/opt-125m",

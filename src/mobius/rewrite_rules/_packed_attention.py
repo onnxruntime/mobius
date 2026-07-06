@@ -168,9 +168,15 @@ class BlockDiagonalToPackedMHA(RewriteRuleClassBase):
         # com.microsoft::PackedMultiHeadAttention
         return op.op(
             "PackedMultiHeadAttention",
-            inputs=[q, k, v, None, token_offset, cu_seqlens_i32],
-            domain="com.microsoft",
-            attributes={"scale": scale, "num_heads": num_heads},
+            q,
+            k,
+            v,
+            None,
+            token_offset,
+            cu_seqlens_i32,
+            _domain="com.microsoft",
+            scale=scale,
+            num_heads=num_heads,
         )
 
 

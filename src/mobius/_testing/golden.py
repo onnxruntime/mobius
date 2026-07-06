@@ -114,6 +114,12 @@ class GoldenTestCase:
     Use when a model has known float32 precision divergence vs HF (e.g.
     VL 3-model pipeline)."""
 
+    architecture: str | None
+    """Optional registry architecture key (e.g. ``Qwen35MtpModel``) forcing a
+    specific module class + task at build time.  Needed for auxiliary heads
+    (DFlash, MTP) that share a base checkpoint whose ``architectures`` field
+    would otherwise auto-route to the base model.  ``None`` = auto-detect."""
+
     yaml_path: Path
     """Absolute path to the source YAML file."""
 
@@ -236,6 +242,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         skip_reason=data.get("skip_reason"),
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
+        architecture=data.get("architecture"),
         yaml_path=yaml_path,
     )
 
@@ -434,6 +441,43 @@ def load_generation_golden(
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return [int(t) for t in data["generated_tokens"]]
+
+
+def drafter_inputs_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the companion ``*_inputs.npz`` path for a drafter test case.
+
+    Multi-model drafter tasks (e.g. ``gemma4-assistant``) consume tensors
+    derived from a target model's forward pass (shared KV + hidden state)
+    rather than a tokenized prompt, so the exact input tensors are stored
+    alongside the golden JSON for the test to replay.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_inputs.npz``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_inputs.npz"
+
+
+def save_drafter_inputs(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Save a drafter test case's input tensors to a ``.npz`` archive."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+
+
+def load_drafter_inputs(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> dict[str, np.ndarray] | None:
+    """Load a drafter test case's input tensors, or ``None`` if missing."""
+    path = drafter_inputs_path_for_case(case, golden_dir)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
 
 
 def discover_test_cases(

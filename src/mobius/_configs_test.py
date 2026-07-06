@@ -810,6 +810,49 @@ class TestQuantizationConfig:
         assert qc.bits == 8
         assert qc.group_size == 32
 
+    def test_from_transformers_symmetric_key_fallback(self):
+        """Olive uses ``symmetric`` rather than GPTQ's ``sym`` key."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "symmetric": False,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.sym is False
+
+    def test_from_transformers_olive_embeds_and_lm_head(self):
+        """Olive RTN exports flag quantized embeddings and LM head."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "embeds": True,
+                    "lm_head": True,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is True
+
+    def test_quantize_embed_lm_head_default_false(self):
+        qc = QuantizationConfig()
+        assert qc.quantize_embeddings is False
+        assert qc.quantize_lm_head is False
+
     def test_architecture_config_has_quantization_field(self):
         config = ArchitectureConfig()
         assert config.quantization is None
