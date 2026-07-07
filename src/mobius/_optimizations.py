@@ -318,12 +318,14 @@ def _get_optimization_passes(
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
 
-    # --- Graph-capture lowering ---
-    # Pattern-based rewrite: only fires on models that emit the dynamic
-    # Shape → ConstantOfShape → Cast empty-KV pattern (currently Gemma4
-    # shared-KV layers). Safe to apply unconditionally for all EPs with
-    # graph capture enabled — no pattern match means no rewrite.
-    if caps.enable_graph_capture:
+    # --- Graph-capture rewrite ---
+    # Supports graph capture for shared-KV layer models on WebGPU EP
+    # (currently Gemma4). Pattern-based: only fires on models that emit the
+    # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
+    # apply_graph_capture_rewrite rather than enable_graph_capture because
+    # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
+    # already graph-capture-safe.
+    if caps.apply_graph_capture_rewrite:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
     return fuse, lower

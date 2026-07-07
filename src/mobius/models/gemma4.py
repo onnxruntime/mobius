@@ -1752,13 +1752,11 @@ class Gemma4TextModel(nn.Module):
                 op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            if caps.enable_graph_capture:
-                # Shape(attention_mask) outputs to CPU, breaking graph capture
-                # on any GPU EP. Use reduce_sum (already computed) to derive
-                # total_seq_len without Shape. Cast to INT32 before Gather
-                # because WebGPU EP does not support INT64 Gather; INT32 is
-                # also correct for CUDA since sequence lengths fit in INT32.
-                # Gather index 0 is valid because graph capture requires batch=1.
+            if caps.apply_graph_capture_rewrite:
+                # Support graph capture for shared-KV layer models on WebGPU EP.
+                # Derive total_seq_len from reduce_sum (already computed) as a
+                # scalar INT32 via Gather index 0 (valid because graph capture
+                # requires batch=1).
                 total_seq_len = op.Gather(
                     op.Cast(reduce_sum, to=ir.DataType.INT32),
                     op.Constant(value_int=0),

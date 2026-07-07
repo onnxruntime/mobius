@@ -102,6 +102,15 @@ class EpCapabilities:
             large weight tensors (e.g. fused per-layer embedding tables) must
             be split into chunks that each fit within this bound.  WebGPU's
             W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        apply_graph_capture_rewrite: Whether to apply graph-capture rewrite
+            rules to support shared-KV layer models (currently Gemma4) under
+            graph capture.  Replaces unsupported ops (``Shape``,
+            ``ConstantOfShape``) with static alternatives.  Not all EPs with
+            ``enable_graph_capture`` need this — e.g. CUDA EP's ``Shape``
+            kernel is already registered inside the CUDA partition and is
+            graph-capture-safe.  Set ``True`` only for EPs that cannot execute
+            ``Shape`` / ``ConstantOfShape`` under graph capture (currently
+            WebGPU).
     """
 
     name: str
@@ -118,6 +127,7 @@ class EpCapabilities:
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
     max_buffer_size: int | None = None
+    apply_graph_capture_rewrite: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -269,6 +279,7 @@ def _register_builtins() -> None:
             cap_kv_buffer_max_length=True,
             # W3C WebGPU spec default maxBufferSize (https://www.w3.org/TR/webgpu/)
             max_buffer_size=268_435_456,  # 256 MiB
+            apply_graph_capture_rewrite=True,
         ),
         EpCapabilities(
             name="trt-rtx",
