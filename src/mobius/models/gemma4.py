@@ -1752,7 +1752,7 @@ class Gemma4TextModel(nn.Module):
                 op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            if caps.apply_graph_capture_rewrite:
+            if caps.requires_graph_capture_rewrite:
                 # Support graph capture for shared-KV layer models on WebGPU EP.
                 # Derive total_seq_len from reduce_sum (already computed) as a
                 # scalar INT32 via Gather index 0 (valid because graph capture

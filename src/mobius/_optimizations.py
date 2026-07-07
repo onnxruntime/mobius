@@ -322,10 +322,10 @@ def _get_optimization_passes(
     # Supports graph capture for shared-KV layer models on WebGPU EP
     # (currently Gemma4). Pattern-based: only fires on models that emit the
     # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
-    # apply_graph_capture_rewrite rather than enable_graph_capture because
+    # requires_graph_capture_rewrite rather than enable_graph_capture because
     # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
     # already graph-capture-safe.
-    if caps.apply_graph_capture_rewrite:
+    if caps.requires_graph_capture_rewrite:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
     return fuse, lower
