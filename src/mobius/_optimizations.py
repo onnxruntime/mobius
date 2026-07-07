@@ -319,11 +319,10 @@ def _get_optimization_passes(
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
 
     # --- Graph-capture lowering ---
-    # Shape + ConstantOfShape are incompatible with GPU graph capture:
-    # Shape outputs to CPU, breaking the capture boundary (affects all GPU EPs).
-    # ConstantOfShape is additionally unsupported by the WebGPU EP.
-    # Replace the dynamic empty-KV pattern with a static Constant so the full
-    # decoder graph stays on-device. Applies to any EP with enable_graph_capture.
+    # Pattern-based rewrite: only fires on models that emit the dynamic
+    # Shape → ConstantOfShape → Cast empty-KV pattern (currently Gemma4
+    # shared-KV layers). Safe to apply unconditionally for all EPs with
+    # graph capture enabled — no pattern match means no rewrite.
     if caps.enable_graph_capture:
         lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
