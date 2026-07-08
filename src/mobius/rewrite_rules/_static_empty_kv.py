@@ -83,9 +83,7 @@ def _static_zero_constant(op, kv_hidden: int, ir_dtype: ir.DataType):
     bfloat16 via ``ml_dtypes``.  The content is never read because
     kv_sequence_length=0.
     """
-    return op.Constant(
-        value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=ir_dtype.numpy()))
-    )
+    return op.Constant(value=ir.tensor(np.zeros((1, 0, kv_hidden), dtype=ir_dtype.numpy())))
 
 
 class _DynamicEmptyKVCastLike(RewriteRuleClassBase):
