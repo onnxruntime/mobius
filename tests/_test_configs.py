@@ -550,6 +550,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v3",
         {
+            # MLA uses full-head K/V (no GQA); num_key_value_heads must equal
+            # num_attention_heads or HF's repeat_kv in SDPA inflates the KV heads.
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -581,6 +584,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2",
         {
+            # MLA uses full-head K/V (no GQA); num_key_value_heads must equal
+            # num_attention_heads or HF's repeat_kv in SDPA inflates the KV heads.
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -604,6 +610,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2_moe",
         {
+            # MLA uses full-head K/V (no GQA); num_key_value_heads must equal
+            # num_attention_heads or HF's repeat_kv in SDPA inflates the KV heads.
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
@@ -774,6 +783,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "longcat_flash",
         {
             "_config_cls": LongcatFlashConfig,
+            # MLA uses full-head K/V (no GQA); num_key_value_heads must equal
+            # num_attention_heads or HF's repeat_kv in SDPA inflates the KV heads.
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 16,
             "kv_lora_rank": 8,
             "qk_nope_head_dim": 8,
@@ -1085,6 +1097,9 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "deepseek_v2",
         {
+            # MLA uses full-head K/V (no GQA); num_key_value_heads must equal
+            # num_attention_heads or HF's repeat_kv in SDPA inflates the KV heads.
+            "num_key_value_heads": TINY_HEADS,
             "q_lora_rank": 32,
             "kv_lora_rank": 16,
             "qk_nope_head_dim": 16,
