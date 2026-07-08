@@ -97,6 +97,20 @@ class EpCapabilities:
             devices.  ``True`` only for WebGPU (consumer GPU); ``False`` for
             CUDA / CPU / DML / TRT-RTX where the runtime can handle large
             pre-allocations.
+        max_buffer_size: Maximum allowed size in bytes for a single model
+            weight buffer on this EP.  ``None`` means no limit.  When non-zero,
+            large weight tensors (e.g. fused per-layer embedding tables) must
+            be split into chunks that each fit within this bound.  WebGPU's
+            W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        requires_graph_capture_rewrite: Whether this EP requires rewrite rules
+            to make models compatible with graph capture (e.g. replacing
+            ``Shape`` / ``ConstantOfShape`` with static alternatives for
+            shared-KV layer models like Gemma4).  Not all EPs with
+            ``enable_graph_capture`` need this — e.g. CUDA EP's ``Shape``
+            kernel is already registered inside the CUDA partition and is
+            graph-capture-safe.  Set ``True`` only for EPs that cannot execute
+            ``Shape`` / ``ConstantOfShape`` under graph capture (currently
+            WebGPU).
     """
 
     name: str
@@ -112,6 +126,8 @@ class EpCapabilities:
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
+    max_buffer_size: int | None = None
+    requires_graph_capture_rewrite: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -281,6 +297,9 @@ def _register_builtins() -> None:
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
             cap_kv_buffer_max_length=True,
+            # W3C WebGPU spec default maxBufferSize (https://www.w3.org/TR/webgpu/)
+            max_buffer_size=268_435_456,  # 256 MiB
+            requires_graph_capture_rewrite=True,
         ),
         EpCapabilities(
             name="trt-rtx",

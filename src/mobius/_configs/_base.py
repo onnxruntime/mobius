@@ -1488,6 +1488,11 @@ class Gemma4Config(VisionLanguageConfig):
       causal attention (only ``None`` and ``"vision"`` are accepted).
     """
 
+    # Set to True by Gemma4Task.build() when the target EP's max_buffer_size
+    # is too small for the fused [V, L*D] per-layer embedding table, to split
+    # it into L separate [V, D] tables that each fit within the EP's buffer limit.
+    split_per_layer_embedding: bool = False
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)

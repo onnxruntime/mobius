@@ -24,6 +24,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import Gemma4Config
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
@@ -207,6 +208,20 @@ class Gemma4Task(ModelTask):
         module: nn.Module,
         config: Gemma4Config,
     ) -> ModelPackage:
+        # Decide whether to split the fused [V, L*D] per-layer embedding table
+        # into L separate [V, D] tables.  Required when the fused table exceeds
+        # the EP's max_buffer_size (e.g. WebGPU's 256 MiB limit).
+        caps = ep_capabilities()
+        per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+        vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
+        if caps.max_buffer_size and per_layer_dim and vocab_per_layer:
+            dtype_bytes = int(config.dtype.itemsize)
+            fused_bytes = (
+                vocab_per_layer * config.num_hidden_layers * per_layer_dim * dtype_bytes
+            )
+            config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
+        else:
+            config.split_per_layer_embedding = False
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
@@ -226,6 +241,10 @@ class Gemma4Task(ModelTask):
         accepts precomputed ``per_layer_inputs`` from the embedding model instead
         of ``input_ids``.  This moves the per-layer embedding computation to the
         embedding model, simplifying the decoder graph.
+
+        Exception: When the EP's ``max_buffer_size`` is set and the fused table
+        would exceed it, split per-layer tables are used in the decoder instead,
+        so ``input_ids`` is passed and ``per_layer_inputs`` is omitted.
         """
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -249,10 +268,9 @@ class Gemma4Task(ModelTask):
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
-        if per_layer_dim:
+        if per_layer_dim and not config.split_per_layer_embedding:
             total_per_layer = config.num_hidden_layers * per_layer_dim
             per_layer_inputs_val = builder.input(
                 "per_layer_inputs",
@@ -267,8 +285,12 @@ class Gemma4Task(ModelTask):
         # between the embedding and decoder sub-models (it can forward
         # ``input_ids``). Only models with
         # ``use_bidirectional_attention == "vision"`` need it.
+        # When split_per_layer_embedding is set, input_ids is also needed for
+        # per-layer embedding lookups inside the decoder.
         input_ids_val: ir.Value | None = None
-        if config.use_bidirectional_attention == "vision":
+        if config.use_bidirectional_attention == "vision" or (
+            per_layer_dim and config.split_per_layer_embedding
+        ):
             input_ids_val = builder.input(
                 "input_ids",
                 dtype=ir.DataType.INT64,
