@@ -98,7 +98,7 @@ class EpCapabilities:
             CUDA / CPU / DML / TRT-RTX where the runtime can handle large
             pre-allocations.
         max_buffer_size: Maximum allowed size in bytes for a single model
-            weight buffer on this EP.  ``0`` means no limit.  When non-zero,
+            weight buffer on this EP.  ``None`` means no limit.  When non-zero,
             large weight tensors (e.g. fused per-layer embedding tables) must
             be split into chunks that each fit within this bound.  WebGPU's
             W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
