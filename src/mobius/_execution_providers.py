@@ -207,7 +207,7 @@ def get_ep(name: str) -> EpCapabilities:
 
 
 def _register_builtins() -> None:
-    """Populate the global registry with the seven built-in EPs.
+    """Populate the global registry with the built-in EPs.
 
     Called once at module import. Adding a new EP = adding one entry here.
     """
@@ -222,6 +222,26 @@ def _register_builtins() -> None:
             name="default",
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
+        ),
+        # OpenVINO EP (via ORT GenAI). The OpenVINO EP consumes a portable ONNX
+        # graph and compiles it internally for the selected device, so the graph
+        # build mirrors "default" (standard Attention, no GQA/QKV packing). The
+        # graph does not depend on the OpenVINO device, so we emit a sensible
+        # default device_type ("NPU") in the genai_config provider options; a
+        # different device can be selected downstream by editing genai_config
+        # (e.g. by the Olive MobiusBuilder pass or the user) without rebuilding.
+        #
+        # supports_skip_layer_norm=False: the OpenVINO ONNX frontend does not
+        # support the com.microsoft SkipSimplifiedLayerNormalization op, so we
+        # keep the residual Add and RMSNormalization separate (no skip-norm
+        # fusion) to stay convertible by OpenVINO. (RMSNormalization itself is
+        # still opset-24; OpenVINO frontend support for it is pending.)
+        EpCapabilities(
+            name="openvino",
+            gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
+            qkv_pack_dtypes=frozenset(),  # no QKV packing
+            supports_skip_layer_norm=False,
+            provider_options={"device_type": "NPU"},
         ),
         EpCapabilities(
             name="cpu",
