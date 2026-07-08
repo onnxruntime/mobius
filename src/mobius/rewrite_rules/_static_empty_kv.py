@@ -7,8 +7,7 @@ When WebGPU graph capture is enabled, the ``Shape`` and ``ConstantOfShape``
 ops used to build the empty ``[batch, 0, kv_hidden]`` KV tensor for shared-KV
 layers (e.g. Gemma4 layers 15-34) are problematic:
 
-- ``Shape`` outputs to CPU, breaking the GPU graph capture boundary (affects
-  all GPU EPs including WebGPU and CUDA).
+- ``Shape`` can fall back to CPU under graph capture on some EPs (currently WebGPU), breaking the GPU graph capture boundary.
 - ``ConstantOfShape`` is unsupported by the WebGPU EP (not an issue for CUDA).
 
 Two pattern variants are matched (both are emitted by onnxscript depending on
@@ -45,7 +44,7 @@ kv_sequence_length=0.
 
 This rule is applied automatically by
 :func:`~mobius._optimizations.optimize_model` for EPs with
-``enable_graph_capture=True``.  It can also be applied manually::
+``requires_graph_capture_rewrite=True`` (currently WebGPU).  It can also be applied manually::
 
     from mobius.rewrite_rules import static_empty_kv_rules
     from onnxscript.rewriter import rewrite

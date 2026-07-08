@@ -192,3 +192,25 @@ class TestStaticEmptyKVCastVariant:
         tensor = value_attr.value
         assert list(tensor.shape) == [1, 0, kv_hidden]
         assert tensor.dtype == ir.DataType.FLOAT16, f"expected FLOAT16, got {tensor.dtype}"
+
+    def test_cast_variant_supports_bfloat16(self):
+        kv_hidden = 64
+        model = _make_cast_model(kv_hidden, dtype=ir.DataType.BFLOAT16)
+        rewrite(model, pattern_rewrite_rules=static_empty_kv_rules())
+
+        counts_after = _count_ops(model)
+        assert counts_after.get("Shape", 0) == 0
+        assert counts_after.get("ConstantOfShape", 0) == 0
+
+        # Accept either a BFLOAT16 Constant directly, or Constant(float32) + Cast(to=BFLOAT16).
+        cast_nodes = [n for n in model.graph if n.op_type == "Cast"]
+        if cast_nodes:
+            to_attr = cast_nodes[-1].attributes.get("to")
+            assert to_attr is not None
+            assert ir.DataType(to_attr.value) == ir.DataType.BFLOAT16
+        else:
+            const_nodes = [n for n in model.graph if n.op_type == "Constant"]
+            assert const_nodes, "no Constant node found after rewrite"
+            value_attr = const_nodes[-1].attributes.get("value")
+            assert value_attr is not None
+            assert value_attr.value.dtype == ir.DataType.BFLOAT16
