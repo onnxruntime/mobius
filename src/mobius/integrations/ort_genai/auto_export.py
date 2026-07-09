@@ -75,11 +75,12 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma2": "gemma",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
-    # gemma-4-12B "unified" (encoder-free) variant reuses the gemma4 ORT GenAI
-    # pipelines: the multimodal package (decoder taking inputs_embeds + vision
-    # embedder + embedding fusion) maps to "gemma4"; the standalone text
-    # backbone maps to "gemma4_text".
-    "gemma4_unified": "gemma4",
+    # gemma-4-12B "unified" (encoder-free) variant. The multimodal package
+    # (decoder taking inputs_embeds + encoder-free vision/audio embedders +
+    # embedding fusion) maps to the dedicated "gemma4_unified" ORT GenAI type,
+    # which drives the unified processor (48px merged patches / raw 640-sample
+    # audio frames). The standalone text backbone maps to "gemma4_text".
+    "gemma4_unified": "gemma4_unified",
     "gemma4_unified_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
@@ -99,12 +100,12 @@ _GEMMA4_MODEL_TYPES = frozenset(
 )
 # Encoder-free gemma-4-12B "unified" variants. Their image/audio inputs are raw
 # merged pixel patches (48px, 6912-dim) / raw waveform frames (640-dim), NOT the
-# SigLIP 16px / 128-dim log-mel contract that the ort-extensions
-# ``Gemma4ImageTransform`` / ``Gemma4LogMel`` ops implement. There is no
-# genai-native transform for the unified contract, so we deliberately do NOT
-# emit image_processor.json / audio_processor.json for these models — callers
-# must preprocess with the HuggingFace processor and feed tensors via
-# ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
+# SigLIP 16px / 128-dim log-mel contract of the standard gemma4 (E2B/E4B) model.
+# These are produced natively by ort-extensions: ``Gemma4ImageTransform`` with
+# patch_size=48 / pooling_kernel_size=1 (the 48px merged patch is identical to a
+# direct 48px patchify) and the ``Gemma4UnifiedAudioFrames`` raw-framing op. The
+# genai ``gemma4_unified`` processor consumes both (see the companion
+# onnxruntime-genai / onnxruntime-extensions support).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
 _PIXTRAL_MODEL_TYPES = frozenset({"mistral3"})
 _QWEN_VL_MODEL_TYPES = frozenset(
@@ -427,9 +428,10 @@ def _write_vision_processor_config(
 
     - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
       with a ``DecodeImage → Gemma4ImageTransform`` pipeline.
-    - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
-      encoder-free model has no matching ort-extensions transform; callers feed
-      HF-preprocessed pixel_values via ``Generator.set_inputs``.
+    - **Gemma4 unified** (``gemma4_unified*``): Writes ``image_processor.json``
+      with a ``DecodeImage → Gemma4ImageTransform`` pipeline configured for the
+      encoder-free 48px merged-patch contract (patch_size=48,
+      pooling_kernel_size=1, patch_dim=6912).
     - **Pixtral / Mistral3**: Writes ``processor_config.json`` with a 7-step
       pipeline (DecodeImage → ConvertRGB → Resize → Rescale → Normalize →
       Permute3D → PixtralImageSizes).
@@ -443,21 +445,52 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
-    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
-        # Encoder-free unified model: no ort-extensions transform matches its
-        # raw merged-patch contract. Emit no image_processor.json; callers feed
-        # HF-preprocessed pixel_values via Generator.set_inputs.
-        logger.info(
-            "Skipping image_processor.json for encoder-free %s "
-            "(no native ort-extensions transform; use HF processor + set_inputs)",
-            model_type,
-        )
-        return None
-
     vision_model_type = getattr(vision, "model_type", None)
     is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
 
-    if model_type in _GEMMA4_MODEL_TYPES:
+    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
+        # Encoder-free unified model: it consumes 48px MERGED patches
+        # (patch_dim = 48*48*3 = 6912) directly, with no SigLIP tower to pool
+        # 3x3 teacher patches. HuggingFace produces these via
+        # (16px patchify -> 3x3 patches_merge), which is provably identical to a
+        # direct 48px patchify. So we reuse the same ort-extensions
+        # ``Gemma4ImageTransform`` op with the merged geometry: patch_size =
+        # patch_size * pooling_kernel_size (48) and pooling_kernel_size = 1.
+        max_soft_tokens = (
+            getattr(vision, "mm_tokens_per_image", None)
+            or getattr(config, "mm_tokens_per_image", None)
+            or 280
+        )
+        patch_size = getattr(vision, "patch_size", None) or 16
+        pooling = getattr(vision, "pooling_kernel_size", None) or 3
+        model_patch_size = patch_size * pooling  # 16 * 3 = 48
+        processor_config: dict[str, Any] = {
+            "processor": {
+                "name": "gemma_4_unified_image_processing",
+                "transforms": [
+                    {
+                        "operation": {
+                            "name": "decode_image",
+                            "type": "DecodeImage",
+                            "attrs": {"color_space": "RGB"},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_image_transform",
+                            "type": "Gemma4ImageTransform",
+                            "attrs": {
+                                "patch_size": model_patch_size,
+                                "max_soft_tokens": max_soft_tokens,
+                                "pooling_kernel_size": 1,
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+        path = os.path.join(output_dir, "image_processor.json")
+    elif model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs an onnxruntime-extensions format processor config
         # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
         max_soft_tokens = (
@@ -467,7 +500,7 @@ def _write_vision_processor_config(
         )
         patch_size = getattr(vision, "patch_size", None) or 16
         pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
-        processor_config: dict[str, Any] = {
+        processor_config = {
             "processor": {
                 "name": "gemma_4_image_processing",
                 "transforms": [
@@ -631,17 +664,37 @@ def _write_audio_processor_config(
     model_type = getattr(config, "model_type", "")
 
     if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
-        # Encoder-free unified model: raw 640-dim waveform frames, not the
-        # 128-dim log-mel Gemma4LogMel contract. Emit no audio_processor.json;
-        # callers feed HF-preprocessed input_features via Generator.set_inputs.
-        logger.info(
-            "Skipping audio_processor.json for encoder-free %s "
-            "(no native ort-extensions transform; use HF processor + set_inputs)",
-            model_type,
-        )
-        return None
-
-    if model_type in _GEMMA4_MODEL_TYPES:
+        # Encoder-free unified model: each audio soft token is a raw chunk of the
+        # 16 kHz waveform (audio_samples_per_token = audio_embed_dim, 640), not a
+        # 128-dim log-mel frame. Reproduced natively by the ort-extensions
+        # ``Gemma4UnifiedAudioFrames`` op (pad to a whole number of frames,
+        # reshape to (num_tokens, 640)).
+        samples_per_token = getattr(audio, "hidden_size", None) or 640
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_unified_audio_frames",
+                            "type": "Gemma4UnifiedAudioFrames",
+                            "attrs": {
+                                "audio_samples_per_token": samples_per_token,
+                                "sampling_rate": 16000,
+                                "padding_value": 0.0,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 USM-style 128-dim log-mel spectrogram.
         # OrtxCreateSpeechFeatureExtractor requires the feature_extraction.sequence format.
         processor = {
