@@ -354,6 +354,7 @@ def build(
     execution_provider: str = "default",
     trace_optimization: bool = False,
     text_only: bool = False,
+    embedding_bits: int | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a HuggingFace model ID.
 
@@ -575,6 +576,23 @@ def build(
         # models (e.g. DFlash) that condition on intermediate target hidden
         # states.  See ``ArchitectureConfig.output_layer_indices``.
         config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
+
+    if embedding_bits is not None:
+        from mobius._configs import QuantizationConfig
+
+        if config.quantization is None:
+            config = dataclasses.replace(
+                config,
+                quantization=QuantizationConfig(
+                    bits=embedding_bits, group_size=32, quant_method="mobius",
+                    sym=False, quantize_embeddings=True,
+                ),
+            )
+        else:
+            qc = dataclasses.replace(
+                config.quantization, bits=embedding_bits, quantize_embeddings=True,
+            )
+            config = dataclasses.replace(config, quantization=qc)
 
     if task is None:
         task = _default_task_for_model(model_type)

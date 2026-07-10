@@ -222,16 +222,23 @@ class Gemma4Task(ModelTask):
             config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
         else:
             config.split_per_layer_embedding = False
-        # When splitting per-layer embeddings, also quantize them to INT4 to
-        # reduce the 4.5 GB FP16 tables to ~560 MB.
+        # When splitting per-layer embeddings, quantize them to reduce size.
+        # Bits default to 4 (INT4) but can be overridden via embedding_bits
+        # in mobius.build() / the MobiusBuilder Olive pass config.
         if config.split_per_layer_embedding:
-            if config.quantization is None:
+            qc = config.quantization
+            if qc is not None and qc.quantize_embeddings:
+                # embedding_bits was set by the caller — use its bits value
+                pass
+            elif qc is not None:
+                # Existing quantization config without embedding quantization —
+                # enable it, defaulting to INT4
+                config.quantization.quantize_embeddings = True
+            else:
                 config.quantization = QuantizationConfig(
                     bits=4, group_size=32, quant_method="mobius", sym=False,
                     quantize_embeddings=True,
                 )
-            else:
-                config.quantization.quantize_embeddings = True
             # The module was already constructed before build() runs, so the
             # per-layer embeddings are plain Embedding (Gather).  Replace them
             # with QuantizedScaledWordEmbedding (GatherBlockQuantized).
