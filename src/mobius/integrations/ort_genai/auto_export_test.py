@@ -357,7 +357,8 @@ class TestFixChatTemplate:
         seq = data["feature_extraction"]["sequence"]
         assert seq[0]["operation"]["type"] == "AudioDecoder"
         op = seq[1]["operation"]
-        assert op["type"] == "Gemma4UnifiedAudioFrames"
+        assert op["type"] == "Gemma4Audio"
+        assert op["attrs"]["type"] == "raw_frames"
         assert op["attrs"]["audio_samples_per_token"] == 640
 
     def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):
@@ -376,8 +377,9 @@ class TestFixChatTemplate:
         seq = data["feature_extraction"]["sequence"]
         assert len(seq) == 2
         assert seq[0]["operation"]["type"] == "AudioDecoder"
-        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
+        assert seq[1]["operation"]["type"] == "Gemma4Audio"
         attrs = seq[1]["operation"]["attrs"]
+        assert attrs["type"] == "log_mel"
         assert attrs["feature_size"] == 128
         assert attrs["sampling_rate"] == 16000
         assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
@@ -747,9 +749,10 @@ class TestExportForOrtGenai:
         op0 = seq[0]["operation"]
         assert op0["type"] == "AudioDecoder"
 
-        # Second op: Gemma4LogMel with expected attrs
+        # Second op: Gemma4Audio (type=log_mel) with expected attrs
         op1 = seq[1]["operation"]
-        assert op1["type"] == "Gemma4LogMel"
+        assert op1["type"] == "Gemma4Audio"
+        assert op1["attrs"]["type"] == "log_mel"
         assert op1["attrs"]["feature_size"] == 128
         assert op1["attrs"]["sampling_rate"] == 16000
         assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069

@@ -667,8 +667,8 @@ def _write_audio_processor_config(
         # Encoder-free unified model: each audio soft token is a raw chunk of the
         # 16 kHz waveform (audio_samples_per_token = audio_embed_dim, 640), not a
         # 128-dim log-mel frame. Reproduced natively by the ort-extensions
-        # ``Gemma4UnifiedAudioFrames`` op (pad to a whole number of frames,
-        # reshape to (num_tokens, 640)).
+        # ``Gemma4Audio`` op with ``type="raw_frames"`` (pad to a whole number of
+        # frames, reshape to (num_tokens, 640)).
         samples_per_token = getattr(audio, "hidden_size", None) or 640
         processor = {
             "feature_extraction": {
@@ -681,9 +681,10 @@ def _write_audio_processor_config(
                     },
                     {
                         "operation": {
-                            "name": "gemma4_unified_audio_frames",
-                            "type": "Gemma4UnifiedAudioFrames",
+                            "name": "gemma4_audio",
+                            "type": "Gemma4Audio",
                             "attrs": {
+                                "type": "raw_frames",
                                 "audio_samples_per_token": samples_per_token,
                                 "sampling_rate": 16000,
                                 "padding_value": 0.0,
@@ -695,7 +696,8 @@ def _write_audio_processor_config(
         }
         proc_filename = "audio_feature_extraction.json"
     elif model_type in _GEMMA4_MODEL_TYPES:
-        # Gemma4 USM-style 128-dim log-mel spectrogram.
+        # Gemma4 USM-style 128-dim log-mel spectrogram via the ort-extensions
+        # ``Gemma4Audio`` op with ``type="log_mel"``.
         # OrtxCreateSpeechFeatureExtractor requires the feature_extraction.sequence format.
         processor = {
             "feature_extraction": {
@@ -708,9 +710,10 @@ def _write_audio_processor_config(
                     },
                     {
                         "operation": {
-                            "name": "gemma4_log_mel",
-                            "type": "Gemma4LogMel",
+                            "name": "gemma4_audio",
+                            "type": "Gemma4Audio",
                             "attrs": {
+                                "type": "log_mel",
                                 "feature_size": 128,
                                 "sampling_rate": 16000,
                                 "frame_length_ms": 20.0,
