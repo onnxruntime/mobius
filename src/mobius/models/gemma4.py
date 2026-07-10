@@ -41,6 +41,7 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
+    QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -53,6 +54,27 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
+
+
+class QuantizedScaledWordEmbedding(QuantizedEmbedding):
+    """Quantized embedding with scaling — INT4 GatherBlockQuantized + scale multiply."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: float = 1.0,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(num_embeddings, embedding_dim, bits, block_size, has_zero_point, padding_idx)
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
+        embeddings = super().forward(op, input_ids)
+        return op.Mul(embeddings, self.embed_scale)
 
 
 def _dtype_safe_compress(
@@ -1573,17 +1595,34 @@ class Gemma4TextModel(nn.Module):
             # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
             # Only the table actually called in forward() is realized as an
             # ONNX initializer, so the unused one adds no graph weight.
-            self.embed_tokens_per_layer_split = nn.ModuleList(
-                [
-                    Gemma3TextScaledWordEmbedding(
-                        vocab_per_layer,
-                        self._per_layer_dim,
-                        config.pad_token_id,
-                        embed_scale=float(self._per_layer_dim**0.5),
-                    )
-                    for _ in range(self._num_layers)
-                ]
-            )
+            qc = getattr(config, "quantization", None)
+            if qc is not None and getattr(qc, "quantize_embeddings", False):
+                self.embed_tokens_per_layer_split = nn.ModuleList(
+                    [
+                        QuantizedScaledWordEmbedding(
+                            vocab_per_layer,
+                            self._per_layer_dim,
+                            config.pad_token_id,
+                            embed_scale=float(self._per_layer_dim**0.5),
+                            bits=qc.bits,
+                            block_size=qc.group_size,
+                            has_zero_point=not qc.sym,
+                        )
+                        for _ in range(self._num_layers)
+                    ]
+                )
+            else:
+                self.embed_tokens_per_layer_split = nn.ModuleList(
+                    [
+                        Gemma3TextScaledWordEmbedding(
+                            vocab_per_layer,
+                            self._per_layer_dim,
+                            config.pad_token_id,
+                            embed_scale=float(self._per_layer_dim**0.5),
+                        )
+                        for _ in range(self._num_layers)
+                    ]
+                )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
@@ -2015,8 +2054,25 @@ class _Gemma4DecoderModel(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                for i, chunk in enumerate(chunks):
-                    state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+                qc = getattr(self.config, "quantization", None)
+                quantize_per_layer = qc is not None and getattr(qc, "quantize_embeddings", False)
+                if quantize_per_layer:
+                    from mobius._weight_utils import quantize_embedding_rtn
+
+                    for i, chunk in enumerate(chunks):
+                        qweight, scales, zero_points = quantize_embedding_rtn(
+                            chunk.contiguous(),
+                            bits=qc.bits,
+                            block_size=qc.group_size,
+                            symmetric=qc.sym,
+                        )
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.qweight"] = qweight
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.scales"] = scales
+                        if zero_points is not None:
+                            state_dict[f"model.embed_tokens_per_layer_split.{i}.zero_points"] = zero_points
+                else:
+                    for i, chunk in enumerate(chunks):
+                        state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
         return state_dict
 
 
@@ -2809,8 +2865,25 @@ class Gemma4Model(nn.Module):
                     f"got {fused.shape[1]}"
                 )
                 chunks = fused.chunk(num_layers, dim=1)
-                for i, chunk in enumerate(chunks):
-                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+                qc = getattr(self.config, "quantization", None)
+                quantize_per_layer = qc is not None and getattr(qc, "quantize_embeddings", False)
+                if quantize_per_layer:
+                    from mobius._weight_utils import quantize_embedding_rtn
+
+                    for i, chunk in enumerate(chunks):
+                        qweight, scales, zero_points = quantize_embedding_rtn(
+                            chunk.contiguous(),
+                            bits=qc.bits,
+                            block_size=qc.group_size,
+                            symmetric=qc.sym,
+                        )
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.qweight"] = qweight
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.scales"] = scales
+                        if zero_points is not None:
+                            renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.zero_points"] = zero_points
+                else:
+                    for i, chunk in enumerate(chunks):
+                        renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
             # Re-route the projection weights from embedding.* → decoder.model.*
             for k in list(renamed.keys()):
                 if k.startswith(

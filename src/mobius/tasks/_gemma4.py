@@ -25,7 +25,7 @@ import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
 from mobius._build_context import ep_capabilities
-from mobius._configs import Gemma4Config
+from mobius._configs import Gemma4Config, QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
     ModelTask,
@@ -222,6 +222,45 @@ class Gemma4Task(ModelTask):
             config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
         else:
             config.split_per_layer_embedding = False
+        # When splitting per-layer embeddings, also quantize them to INT4 to
+        # reduce the 4.5 GB FP16 tables to ~560 MB.
+        if config.split_per_layer_embedding:
+            if config.quantization is None:
+                config.quantization = QuantizationConfig(
+                    bits=4, group_size=32, quant_method="mobius", sym=False,
+                    quantize_embeddings=True,
+                )
+            else:
+                config.quantization.quantize_embeddings = True
+            # The module was already constructed before build() runs, so the
+            # per-layer embeddings are plain Embedding (Gather).  Replace them
+            # with QuantizedScaledWordEmbedding (GatherBlockQuantized).
+            from mobius.models.gemma4 import QuantizedScaledWordEmbedding
+
+            qc = config.quantization
+            per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
+            vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
+            import numpy as np
+
+            embed_scale = float(np.float16(per_layer_dim**0.5))
+            module.decoder.model.embed_tokens_per_layer_split = nn.ModuleList(
+                [
+                    QuantizedScaledWordEmbedding(
+                        vocab_per_layer,
+                        per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=embed_scale,
+                        bits=qc.bits,
+                        block_size=qc.group_size,
+                        has_zero_point=not qc.sym,
+                    )
+                    for _ in range(config.num_hidden_layers)
+                ]
+            )
+            # Cast scales to model dtype (modules created after _cast_module_dtype)
+            from mobius._builder import _cast_module_dtype
+
+            _cast_module_dtype(module.decoder.model.embed_tokens_per_layer_split, config.dtype)
         models: dict[str, ir.Model] = {}
         models["decoder"] = self._build_decoder(module.decoder, config)
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
