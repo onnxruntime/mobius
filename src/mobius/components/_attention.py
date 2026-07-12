@@ -74,6 +74,139 @@ class StaticCacheState(NamedTuple):
     nonpad_kv_seqlen: ir.Value
 
 
+class PagedCacheState(NamedTuple):
+    """Paged (block-table) KV cache state for opset-24 attention.
+
+    Implements the paged / block-table KV cache described in onnx-genai
+    ``docs/DESIGN.md`` §39.4 Option C ("ONNX Scatter/GatherElements in
+    Graph").  The KV for the whole batch lives in a shared *page pool* of
+    fixed-size pages that are NOT contiguous per sequence.  A per-sequence
+    ``block_table`` maps logical page slots to physical page indices, and a
+    ``slot_mapping`` gives the flat physical slot for each newly written
+    token.  This is the format used by vLLM PagedAttention and, because
+    multiple sequences can list the *same* physical page in their
+    ``block_table``, it also supports SGLang RadixAttention (shared prefix
+    pages) with no graph change — the sharing lives entirely in the runtime's
+    ``block_table`` / ``slot_mapping`` bookkeeping.
+
+    The paged attention body is (per layer):
+
+        1. ``ScatterND(pool_flat, slot_mapping, new_kv)`` — write the new
+           tokens' K/V into their physical slots in the pool.
+        2. ``Gather(updated_pool, block_table, axis=0)`` — assemble this
+           sequence's pages into a contiguous ``[num_blocks, page_size, ...]``
+           tensor, reshaped to ``[1, num_blocks * page_size, kv_hidden]``.
+        3. ``Attention(query, K_gathered, V_gathered, nonpad_kv_seqlen,
+           is_causal=1)`` — attend over the contiguous KV, bounded to the
+           valid prefix by ``nonpad_kv_seqlen`` (same op contract as the
+           static cache).
+
+    Only standard ONNX ops are used (``Reshape``/``Shape``/``Unsqueeze``/
+    ``ScatterND``/``Gather``/``Attention``); no custom op is required.
+
+    .. note::
+        The current implementation targets a single active sequence per
+        forward (``batch == 1``), so ``block_table`` and ``slot_mapping`` are
+        1-D.  Multi-sequence batching (2-D block tables + per-row gather) is a
+        documented TODO.
+
+    Fields:
+        key_pool: Physical key page pool ``[num_pages, page_size, kv_hidden]``.
+        value_pool: Physical value page pool ``[num_pages, page_size, kv_hidden]``.
+        block_table: Physical page indices for the active sequence in logical
+            order ``[num_blocks]`` int64.
+        slot_mapping: Flat physical slot (``page_id * page_size + offset``) for
+            each newly written token ``[seq_len]`` int64.
+        nonpad_kv_seqlen: Valid KV length for the active sequence ``[batch]``
+            int64 (``write_start + valid_token_count``).
+    """
+
+    key_pool: ir.Value
+    value_pool: ir.Value
+    block_table: ir.Value
+    slot_mapping: ir.Value
+    nonpad_kv_seqlen: ir.Value
+
+
+def _apply_paged_attention(
+    op: OpBuilder,
+    query: ir.Value,
+    key: ir.Value,
+    value: ir.Value,
+    paged_cache: PagedCacheState,
+    *,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    scale: float,
+    softcap: float = 0.0,
+) -> tuple[ir.Value, ir.Value, ir.Value]:
+    """Apply attention against a paged (block-table) KV cache.
+
+    See :class:`PagedCacheState` for the I/O contract and op sequence.  RoPE
+    must already be baked into ``key`` (applied by the caller) so cached page
+    entries carry the rotated keys, exactly as in the static cache path.
+
+    Args:
+        query/key/value: 3-D ``[1, seq_len, heads * head_dim]`` projections.
+        head_dim: Per-head dim; used to recover ``kv_hidden`` for the pool
+            reshape.
+
+    Returns:
+        ``(attn_output, updated_key_pool, updated_value_pool)`` where the
+        updated pools have the same ``[num_pages, page_size, kv_hidden]`` shape
+        as the inputs and are registered as graph outputs by the task.
+    """
+    kv_hidden = num_key_value_heads * head_dim
+
+    # Original 3-D pool shapes [num_pages, page_size, kv_hidden]; we scatter on
+    # a 2-D flattened view then restore the pool shape for the graph output.
+    key_pool_shape = op.Shape(paged_cache.key_pool)
+    value_pool_shape = op.Shape(paged_cache.value_pool)
+
+    key_pool_flat = op.Reshape(paged_cache.key_pool, [-1, kv_hidden])
+    value_pool_flat = op.Reshape(paged_cache.value_pool, [-1, kv_hidden])
+
+    # New tokens' K/V as [seq_len, kv_hidden] (batch == 1).
+    key_rows = op.Reshape(key, [-1, kv_hidden])
+    value_rows = op.Reshape(value, [-1, kv_hidden])
+
+    # ScatterND row-writes: pool_flat[slot_mapping[t]] = new_kv[t].
+    slot_indices = op.Unsqueeze(paged_cache.slot_mapping, [-1])  # [seq_len, 1]
+    updated_key_flat = op.ScatterND(key_pool_flat, slot_indices, key_rows)
+    updated_value_flat = op.ScatterND(value_pool_flat, slot_indices, value_rows)
+
+    updated_key_pool = op.Reshape(updated_key_flat, key_pool_shape)
+    updated_value_pool = op.Reshape(updated_value_flat, value_pool_shape)
+
+    # Gather this sequence's physical pages into logical order, then flatten the
+    # (num_blocks, page_size) axes into a contiguous KV sequence for Attention.
+    gathered_key = op.Gather(updated_key_pool, paged_cache.block_table, axis=0)
+    gathered_value = op.Gather(updated_value_pool, paged_cache.block_table, axis=0)
+    gathered_key = op.Reshape(gathered_key, [1, -1, kv_hidden])
+    gathered_value = op.Reshape(gathered_value, [1, -1, kv_hidden])
+
+    # Maskless is_causal=1 + nonpad_kv_seqlen (Attention input #6): identical op
+    # contract to the static cache path — causal + padding masking is derived
+    # internally, bounding attention to the valid prefix of the gathered pages.
+    attn_output, _, _ = op.Attention(
+        query,
+        gathered_key,
+        gathered_value,
+        None,  # no attn_mask — is_causal handles masking
+        None,  # no past_key (full gathered KV is provided)
+        None,  # no past_value
+        paged_cache.nonpad_kv_seqlen,
+        q_num_heads=num_attention_heads,
+        kv_num_heads=num_key_value_heads,
+        scale=scale,
+        softcap=softcap,
+        is_causal=1,
+        _outputs=3,
+    )
+    return attn_output, updated_key_pool, updated_value_pool
+
+
 def _apply_attention(
     op: OpBuilder,
     query: ir.Value,
@@ -321,6 +454,7 @@ class Attention(nn.Module):
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
+        paged_cache: PagedCacheState | None = None,
     ):
         query_states = self.q_proj(op, hidden_states)
         key_states = self.k_proj(op, hidden_states)
@@ -381,20 +515,37 @@ class Attention(nn.Module):
                 interleaved=self._rope_interleave,
             )
 
-        attn_output, present_key, present_value = _apply_attention(
-            op,
-            query_states,
-            key_states,
-            value_states,
-            attention_bias,
-            past_key_value[0] if past_key_value is not None else None,
-            past_key_value[1] if past_key_value is not None else None,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            scale=self.scaling,
-            softcap=self._softcap,
-            static_cache=static_cache,
-        )
+        if paged_cache is not None:
+            # Paged (block-table) KV cache: scatter new K/V into the physical
+            # page pool, gather this sequence's pages contiguously, then attend.
+            # present_* here are the UPDATED page pools (registered as outputs).
+            attn_output, present_key, present_value = _apply_paged_attention(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                paged_cache,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                scale=self.scaling,
+                softcap=self._softcap,
+            )
+        else:
+            attn_output, present_key, present_value = _apply_attention(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                attention_bias,
+                past_key_value[0] if past_key_value is not None else None,
+                past_key_value[1] if past_key_value is not None else None,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                scale=self.scaling,
+                softcap=self._softcap,
+                static_cache=static_cache,
+            )
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)

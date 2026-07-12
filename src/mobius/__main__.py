@@ -134,6 +134,26 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Remove --task to use --static-cache."
         )
 
+    # Validate --paged-cache combinations
+    if args.paged_cache and args.static_cache:
+        raise SystemExit(
+            "Error: --paged-cache cannot be combined with --static-cache; "
+            "choose one KV cache layout."
+        )
+    if args.paged_cache and args.task is not None:
+        raise SystemExit(
+            "Error: --paged-cache cannot be combined with --task. "
+            "Remove --task to use --paged-cache."
+        )
+    if args.page_size is not None and not args.paged_cache:
+        raise SystemExit("Error: --page-size can only be used with --paged-cache.")
+    if args.page_size is not None and args.page_size <= 0:
+        raise SystemExit("Error: --page-size must be a positive integer.")
+    if args.num_pages is not None and not args.paged_cache:
+        raise SystemExit("Error: --num-pages can only be used with --paged-cache.")
+    if args.num_pages is not None and args.num_pages <= 0:
+        raise SystemExit("Error: --num-pages must be a positive integer.")
+
     # --text-only resolution lives in build() (model_type remap + config
     # stripping), which is only reached on the HuggingFace model-ID path.
     if args.text_only and args.config:
@@ -156,6 +176,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
     task: str | ModelTask | None = args.task
     if args.static_cache:
         task = CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
+    elif args.paged_cache:
+        task = CausalLMTask(
+            paged_cache=True,
+            page_size=args.page_size if args.page_size is not None else 16,
+            num_pages=args.num_pages,
+        )
     trust_remote_code = args.trust_remote_code
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -535,6 +561,30 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="Maximum sequence length for static cache buffers. "
         "Only used with --static-cache. Defaults to max_position_embeddings from config.",
+    )
+    build_parser.add_argument(
+        "--paged-cache",
+        action="store_true",
+        help="Use a paged / block-table KV cache (vLLM PagedAttention / SGLang "
+        "RadixAttention layout): a page pool + block_table + slot_mapping, with "
+        "GatherElements-style page assembly and ScatterND writes (onnx-genai "
+        "DESIGN §39.4 Option C). Requires DecoderLayer or MoEDecoderLayer models.",
+    )
+    build_parser.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Tokens per page for the paged KV cache. Only used with "
+        "--paged-cache. Defaults to 16.",
+    )
+    build_parser.add_argument(
+        "--num-pages",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of physical pages in the pool for the paged KV cache. "
+        "Only used with --paged-cache. Left dynamic (symbolic) when omitted.",
     )
     build_parser.add_argument(
         "--ep",

@@ -10,7 +10,7 @@ from onnxscript import GraphBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
-from mobius.components._attention import StaticCacheState
+from mobius.components._attention import PagedCacheState, StaticCacheState
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -63,28 +63,73 @@ class CausalLMTask(ModelTask):
 
         No ``attention_mask`` input — causal masking uses ``is_causal=1``.
 
+    **Paged cache** (``paged_cache=True``):
+        Block-table / paged KV cache (onnx-genai ``docs/DESIGN.md`` §39.4
+        Option C).  KV lives in a shared *page pool* of fixed-size pages that
+        are non-contiguous per sequence.  New tokens are written to physical
+        slots via ``ScatterND`` and the sequence's pages are assembled
+        contiguously via ``Gather(pool, block_table)`` before attention.  This
+        is the vLLM PagedAttention layout; because sequences can share physical
+        pages through their ``block_table``, it also supports SGLang
+        RadixAttention (shared prefix pages) with no graph change.
+
+        Inputs:
+            - input_ids: [batch, seq_len] INT64
+            - position_ids: [batch, seq_len] INT64
+            - key_pool.{i}: [num_pages, page_size, kv_hidden] FLOAT per layer
+            - value_pool.{i}: [num_pages, page_size, kv_hidden] FLOAT per layer
+            - block_table: [num_blocks] INT64 (physical page ids, logical order)
+            - slot_mapping: [seq_len] INT64 (flat slot per new token)
+            - nonpad_kv_seqlen: [batch] INT64
+        Outputs:
+            - logits: FLOAT
+            - updated_key_pool.{i} / updated_value_pool.{i}: FLOAT
+
+        No ``attention_mask`` input — causal masking uses ``is_causal=1``.
+        Targets a single active sequence (``batch == 1``); multi-sequence
+        batching is a documented TODO.
+
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
-    and return ``(logits, list_of_(key, value)_tuples)``.  In static cache
-    mode, ``attention_mask`` will be ``None`` and ``past_key_values``
-    entries will be :class:`StaticCacheState` tuples.
+    and return ``(logits, list_of_(key, value)_tuples)``.  In static/paged
+    cache mode, ``attention_mask`` will be ``None`` and ``past_key_values``
+    entries will be :class:`StaticCacheState` / :class:`PagedCacheState`
+    tuples.
 
     Args:
         static_cache: If ``True``, use pre-allocated static KV cache
             buffers instead of dynamic concatenation.
+        paged_cache: If ``True``, use a paged / block-table KV cache (page
+            pool + block_table + slot_mapping).  Mutually exclusive with
+            ``static_cache``.
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
+        page_size: Number of tokens per page for the paged cache.  Only used
+            when ``paged_cache=True``.  Defaults to 16.
+        num_pages: Number of physical pages in the pool.  Only used when
+            ``paged_cache=True``.  Left symbolic (dynamic) when ``None`` so the
+            runtime can size the pool; pass an int to stamp a fixed pool size.
     """
 
     def __init__(
         self,
         *,
         static_cache: bool = False,
+        paged_cache: bool = False,
         max_seq_len: int | None = None,
+        page_size: int = 16,
+        num_pages: int | None = None,
     ):
+        if static_cache and paged_cache:
+            raise ValueError(
+                "static_cache and paged_cache are mutually exclusive; enable at most one."
+            )
         self._static_cache = static_cache
+        self._paged_cache = paged_cache
         self._max_seq_len = max_seq_len
+        self._page_size = page_size
+        self._num_pages = num_pages
 
     def build(
         self,
@@ -92,6 +137,7 @@ class CausalLMTask(ModelTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         static = self._static_cache
+        paged = self._paged_cache
 
         # --- Static-cache pre-validation ---
         if static:
@@ -106,6 +152,16 @@ class CausalLMTask(ModelTask):
                 )
             _validate_static_cache_support(module)
 
+        # --- Paged-cache pre-validation ---
+        if paged:
+            if self._page_size is None or self._page_size <= 0:
+                raise ValueError("page_size must be a positive integer for paged cache.")
+            if self._num_pages is not None and self._num_pages <= 0:
+                raise ValueError("num_pages must be a positive integer when provided.")
+            # Paged cache reuses the same DecoderLayer/MoEDecoderLayer dispatch
+            # as the static cache (both flow their state through past_key_value).
+            _validate_static_cache_support(module)
+
         # --- Graph input dims ---
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
@@ -117,8 +173,22 @@ class CausalLMTask(ModelTask):
         # --- Inputs common to both modes ---
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
-        # --- Cache setup (static vs dynamic) ---
-        if static:
+        # --- Cache setup (paged vs static vs dynamic) ---
+        if paged:
+            attention_mask = None
+            position_ids = builder.input(
+                "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+            )
+            past_key_values = _make_paged_cache_inputs(
+                builder,
+                config.num_hidden_layers,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.dtype,
+                page_size=self._page_size,
+                num_pages=self._num_pages,
+            )
+        elif static:
             attention_mask = None
             position_ids = builder.input(
                 "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
@@ -185,8 +255,13 @@ class CausalLMTask(ModelTask):
 
         builder.add_output(logits, "logits")
 
-        # --- Output registration (static vs dynamic) ---
-        if static:
+        # --- Output registration (paged vs static vs dynamic) ---
+        if paged:
+            _register_paged_cache_outputs(
+                builder,
+                present_key_values,
+            )
+        elif static:
             _register_static_cache_outputs(
                 builder,
                 present_key_values,
@@ -395,6 +470,96 @@ def _register_static_cache_outputs(
     for i, (updated_key, updated_value) in enumerate(present_key_values):
         builder.add_output(updated_key, f"updated_key_cache.{i}")
         builder.add_output(updated_value, f"updated_value_cache.{i}")
+
+
+def _make_paged_cache_inputs(
+    builder: GraphBuilder,
+    num_layers: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    dtype: ir.DataType,
+    *,
+    page_size: int,
+    num_pages: int | None,
+) -> list[PagedCacheState]:
+    """Create paged (block-table) KV cache inputs for ``num_layers`` layers.
+
+    Emits a per-layer page pool ``key_pool.{i}`` / ``value_pool.{i}`` of shape
+    ``[num_pages, page_size, kv_hidden]`` plus the shared ``block_table``,
+    ``slot_mapping`` and ``nonpad_kv_seqlen`` inputs, and packs them into one
+    :class:`PagedCacheState` per layer (shared block/slot/nonpad tensors).
+
+    ``num_pages`` is left symbolic (dynamic dimension ``num_pages``) when
+    ``None`` so the runtime can size the pool; passing an int stamps a fixed
+    pool size.  ``block_table`` (``[num_blocks]``) and ``slot_mapping``
+    (``[seq_len]``) are 1-D — the current implementation targets a single
+    active sequence (``batch == 1``).
+
+    Returns:
+        A list of :class:`PagedCacheState` tuples for passing to the module
+        via ``past_key_values``.
+    """
+    kv_hidden = num_key_value_heads * head_dim
+    pages_dim: int | str = num_pages if num_pages is not None else "num_pages"
+
+    pool_pairs: list[tuple[ir.Value, ir.Value]] = []
+    for i in range(num_layers):
+        key_pool = builder.input(
+            f"key_pool.{i}",
+            dtype=dtype,
+            shape=[pages_dim, page_size, kv_hidden],
+        )
+        value_pool = builder.input(
+            f"value_pool.{i}",
+            dtype=dtype,
+            shape=[pages_dim, page_size, kv_hidden],
+        )
+        pool_pairs.append((key_pool, value_pool))
+
+    # Shared inputs across all layers.
+    block_table = builder.input(
+        "block_table",
+        dtype=ir.DataType.INT64,
+        shape=["num_blocks"],
+    )
+    slot_mapping = builder.input(
+        "slot_mapping",
+        dtype=ir.DataType.INT64,
+        shape=["sequence_len"],
+    )
+    nonpad_kv_seqlen = builder.input(
+        "nonpad_kv_seqlen",
+        dtype=ir.DataType.INT64,
+        shape=["batch"],
+    )
+
+    paged_caches: list[PagedCacheState] = []
+    for key_pool, value_pool in pool_pairs:
+        paged_caches.append(
+            PagedCacheState(
+                key_pool=key_pool,
+                value_pool=value_pool,
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+                nonpad_kv_seqlen=nonpad_kv_seqlen,
+            )
+        )
+    return paged_caches
+
+
+def _register_paged_cache_outputs(
+    builder: GraphBuilder,
+    present_key_values: list[tuple[ir.Value, ir.Value]],
+) -> None:
+    """Name and register paged (block-table) cache outputs on the graph.
+
+    Each layer produces the UPDATED page pools (the ``ScatterND`` result),
+    registered as ``updated_key_pool.{i}`` / ``updated_value_pool.{i}``.
+    Shapes/dtypes are inferred by the shape inference pass.
+    """
+    for i, (updated_key_pool, updated_value_pool) in enumerate(present_key_values):
+        builder.add_output(updated_key_pool, f"updated_key_pool.{i}")
+        builder.add_output(updated_value_pool, f"updated_value_pool.{i}")
 
 
 def _validate_static_cache_support(module: nn.Module) -> None:

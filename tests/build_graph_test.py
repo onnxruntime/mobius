@@ -5193,8 +5193,178 @@ class TestBuildStaticCacheGraph:
         _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-static")
 
 
+class TestBuildPagedCacheGraph:
+    """Verify CausalLMTask(paged_cache=True) builds a valid paged/block-table graph.
+
+    Paged cache = the vLLM PagedAttention / SGLang RadixAttention layout from
+    onnx-genai ``docs/DESIGN.md`` §39.4 Option C: a per-layer page pool +
+    shared ``block_table`` / ``slot_mapping`` / ``nonpad_kv_seqlen``, with
+    ``ScatterND`` writes into the pool and ``Gather`` page assembly before the
+    ``Attention`` op.
+    """
+
+    PAGE_SIZE = 8
+    NUM_PAGES = 32
+
+    def _build_paged_cache_model(
+        self, model_type: str = "qwen2", num_pages=NUM_PAGES, **config_overrides
+    ):
+        """Build a model with CausalLMTask(paged_cache=True); return (model, config)."""
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(**config_overrides)
+        model_cls = registry.get(model_type)
+        module = model_cls(config)
+        task = CausalLMTask(
+            paged_cache=True, page_size=self.PAGE_SIZE, num_pages=num_pages
+        )
+        pkg = task.build(module, config)
+        return pkg["model"], config
+
+    def test_paged_cache_graph_builds(self):
+        """Build a Qwen2 model with a paged cache."""
+        model, _ = self._build_paged_cache_model()
+        assert model.graph is not None
+        assert len(model.graph.inputs) > 0
+        assert len(model.graph.outputs) > 0
+
+    def test_paged_cache_graph_inputs(self):
+        """Verify expected inputs: standard + per-layer pools + shared paging."""
+        model, config = self._build_paged_cache_model()
+        input_names = {inp.name for inp in model.graph.inputs}
+        num_layers = config.num_hidden_layers
+
+        assert "input_ids" in input_names
+        assert "position_ids" in input_names
+        # No attention_mask — causal masking is is_causal=1 on Attention.
+        assert "attention_mask" not in input_names
+
+        for i in range(num_layers):
+            assert f"key_pool.{i}" in input_names, f"Missing key_pool.{i}"
+            assert f"value_pool.{i}" in input_names, f"Missing value_pool.{i}"
+
+        # Shared paging inputs
+        assert "block_table" in input_names
+        assert "slot_mapping" in input_names
+        assert "nonpad_kv_seqlen" in input_names
+
+        # Exact count: 2 standard + 2*num_layers pools + 3 shared paging tensors
+        expected_count = 2 + 2 * num_layers + 3
+        assert len(model.graph.inputs) == expected_count, (
+            f"Expected {expected_count} inputs, got {len(model.graph.inputs)}"
+        )
+
+    def test_paged_cache_pool_shapes(self):
+        """Verify page pools are [num_pages, page_size, kv_hidden]."""
+        model, config = self._build_paged_cache_model()
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        pools = {inp.name: inp for inp in model.graph.inputs if inp.name.startswith("key_pool")}
+        assert pools, "No key_pool inputs found"
+        for inp in pools.values():
+            dims = list(inp.shape)
+            assert dims[0] == self.NUM_PAGES
+            assert dims[1] == self.PAGE_SIZE
+            assert dims[2] == kv_hidden
+
+    def test_paged_cache_num_pages_dynamic_by_default(self):
+        """Omitting num_pages leaves the pool's first dim symbolic."""
+        model, _ = self._build_paged_cache_model(num_pages=None)
+        key_pool0 = next(
+            inp for inp in model.graph.inputs if inp.name == "key_pool.0"
+        )
+        first_dim = next(iter(key_pool0.shape))
+        assert not isinstance(first_dim, int), (
+            f"Expected symbolic num_pages dim, got {first_dim!r}"
+        )
+
+    def test_paged_cache_graph_outputs(self):
+        """Verify outputs: logits + updated page pools per layer."""
+        model, config = self._build_paged_cache_model()
+        output_names = {out.name for out in model.graph.outputs}
+        num_layers = config.num_hidden_layers
+
+        assert "logits" in output_names
+        for i in range(num_layers):
+            assert f"updated_key_pool.{i}" in output_names, f"Missing updated_key_pool.{i}"
+            assert f"updated_value_pool.{i}" in output_names, (
+                f"Missing updated_value_pool.{i}"
+            )
+        # No dynamic/static cache outputs
+        assert not any(n.startswith("present.") for n in output_names)
+        assert not any(n.startswith("updated_key_cache.") for n in output_names)
+
+        # Exact count: 1 logits + 2*num_layers updated pools
+        expected_count = 1 + 2 * num_layers
+        assert len(model.graph.outputs) == expected_count
+
+    def test_paged_cache_has_scatternd_gather_and_attention(self):
+        """Verify graph uses ScatterND (write), Gather (assemble) and Attention."""
+        model, _ = self._build_paged_cache_model()
+        op_types = {n.op_type for n in model.graph}
+        assert "ScatterND" in op_types, "Paged cache should write via ScatterND"
+        assert "Gather" in op_types, "Paged cache should assemble pages via Gather"
+        assert "Attention" in op_types, "Paged cache should use Attention"
+        # Paging uses standard ONNX ops — no custom paged-attention op.
+        assert "TensorScatter" not in op_types
+
+    def test_paged_cache_attention_is_causal(self):
+        """Verify Attention ops use is_causal=1 in paged cache mode."""
+        model, config = self._build_paged_cache_model()
+        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == config.num_hidden_layers
+        for node in attention_nodes:
+            is_causal = node.attributes.get("is_causal")
+            assert is_causal is not None and is_causal.as_int() == 1
+
+    def test_paged_cache_attention_consumes_nonpad_kv_seqlen(self):
+        """Attention input #6 must be nonpad_kv_seqlen (opset-24 external cache)."""
+        model, config = self._build_paged_cache_model()
+        attention_nodes = [n for n in model.graph if n.op_type == "Attention"]
+        assert len(attention_nodes) == config.num_hidden_layers
+        for node in attention_nodes:
+            assert len(node.inputs) > 6
+            nonpad = node.inputs[6]
+            assert nonpad is not None and nonpad.name == "nonpad_kv_seqlen"
+            # attn_mask (input #3) is not connected — masking is is_causal.
+            attn_mask = node.inputs[3]
+            assert attn_mask is None or attn_mask.name == ""
+
+    def test_paged_cache_graph_validates(self):
+        """Verify the paged graph survives a serialization round-trip."""
+        model, _ = self._build_paged_cache_model()
+        proto = ir.serde.serialize_model(model)
+        assert len(proto.SerializeToString()) > 0
+
+    def test_paged_cache_moe_graph_builds(self):
+        """Build a MoE model (qwen2_moe) with a paged cache."""
+        model, _ = self._build_paged_cache_model(
+            model_type="qwen2_moe",
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            attn_qkv_bias=True,
+            shared_expert_intermediate_size=64,
+        )
+        op_types = {n.op_type for n in model.graph}
+        assert "ScatterND" in op_types
+        assert "Gather" in op_types
+        assert "Attention" in op_types
+
+    def test_paged_and_static_cache_mutually_exclusive(self):
+        """CausalLMTask rejects enabling both cache layouts."""
+        from mobius.tasks import CausalLMTask
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            CausalLMTask(static_cache=True, paged_cache=True)
+
+    def test_outputs_have_shapes_and_dtypes(self):
+        """Verify shape inference populates all output shapes and dtypes."""
+        model, _ = self._build_paged_cache_model()
+        _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-paged")
+
+
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
+
 
 # VL models that produce a single "model" key instead of 3-model split
 _VL_SINGLE_MODEL_TASKS = {"qwen3-vl-vision-language"}

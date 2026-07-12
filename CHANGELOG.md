@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Paged / block-table KV cache export (`--paged-cache`)
+
+#### Added
+
+- `CausalLMTask(paged_cache=True)` and the `mobius build --paged-cache` CLI flag
+  export a **paged / block-table KV cache** (onnx-genai `docs/DESIGN.md` §39.4
+  Option C — vLLM PagedAttention / SGLang RadixAttention layout). KV lives in a
+  shared per-layer **page pool** `key_pool.{i}` / `value_pool.{i}`
+  `[num_pages, page_size, kv_hidden]`; a per-sequence `block_table` maps logical
+  page slots to physical pages and a `slot_mapping` gives the flat physical slot
+  for each newly written token. Attention writes new K/V into the pool via
+  `ScatterND`, assembles the sequence's pages contiguously via
+  `Gather(pool, block_table)`, then runs the opset-24 `Attention` op with
+  `nonpad_kv_seqlen` (input #6) — identical op contract to `--static-cache`, but
+  over non-contiguous pages. Because sequences can list the *same* physical page
+  in their `block_table`, the same graph expresses RadixAttention shared-prefix
+  pages with no change. Paging uses only standard ONNX ops (no custom op).
+  New tuning flags `--page-size` (default 16) and `--num-pages` (dynamic when
+  omitted). Requires `DecoderLayer` / `MoEDecoderLayer` models; mutually
+  exclusive with `--static-cache`. Targets a single active sequence
+  (`batch == 1`); multi-sequence batching is a documented TODO.
+
+---
+
 ### Text-only export for multimodal Gemma 4 (`--text-only`)
 
 #### Added

@@ -23,7 +23,7 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._attention import StaticCacheState
+from mobius.components._attention import PagedCacheState, StaticCacheState
 from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
 from mobius.models.base import CausalLMModel
 
@@ -76,15 +76,18 @@ class MoEDecoderLayer(nn.Module):
         hidden_states: ir.Value,
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
-        past_key_value: tuple | StaticCacheState | None,
+        past_key_value: tuple | StaticCacheState | PagedCacheState | None,
     ):
-        # Dispatch StaticCacheState to the static_cache parameter;
-        # custom MoEDecoderLayer subclasses must add this check themselves.
-        if isinstance(past_key_value, StaticCacheState):
+        # Dispatch StaticCacheState / PagedCacheState to their attention
+        # parameters; custom MoEDecoderLayer subclasses must add this too.
+        static_cache = None
+        paged_cache = None
+        if isinstance(past_key_value, PagedCacheState):
+            paged_cache = past_key_value
+            past_key_value = None
+        elif isinstance(past_key_value, StaticCacheState):
             static_cache = past_key_value
             past_key_value = None
-        else:
-            static_cache = None
 
         if self._post_feedforward_norm:
             # Post-norm style (FlexOLMo): norm is applied after each sub-layer output
@@ -97,6 +100,7 @@ class MoEDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 past_key_value=past_key_value,
                 static_cache=static_cache,
+                **({"paged_cache": paged_cache} if paged_cache is not None else {}),
             )
             attn_output = self.post_attention_layernorm(op, attn_output)
             if not math.isclose(self._residual_multiplier, 1.0):
@@ -121,6 +125,7 @@ class MoEDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 past_key_value=past_key_value,
                 static_cache=static_cache,
+                **({"paged_cache": paged_cache} if paged_cache is not None else {}),
             )
             if not math.isclose(self._residual_multiplier, 1.0):
                 attn_output = op.Mul(attn_output, self._residual_multiplier)
