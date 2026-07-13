@@ -93,6 +93,7 @@ __all__ = [
     "Phi4MMMultiModalModel",
     "PhiCausalLMModel",
     "Qwen25VLCausalLMModel",
+    "Qwen25OmniThinkerForConditionalGeneration",
     "Qwen25VLDecoderModel",
     "Qwen25VLEmbeddingModel",
     "Qwen25VLTextModel",
@@ -250,6 +251,7 @@ from mobius.models.qwen3_tts_tokenizer import (
     Qwen3TTSCodecEncoderModel,
     Qwen3TTSTokenizerV2Model,
 )
+from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,

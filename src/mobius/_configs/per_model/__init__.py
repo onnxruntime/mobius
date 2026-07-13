@@ -31,5 +31,6 @@ from mobius._configs.per_model import (  # noqa: F401
     _phi4mm_audio,
     _phi4mm_vision,
     _qwen3_asr_audio,
+    _qwen25_omni_vision,
     _sensevoice_audio,
 )

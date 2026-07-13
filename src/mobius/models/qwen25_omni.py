@@ -1,4 +1,7 @@
-"""Qwen2.5-Omni: Multimodal model with audio + vision + text.
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Qwen2.5-Omni Thinker: audio + vision + text.
 
 Architecture (Thinker only):
   - Audio encoder: Conv1d x2 → sinusoidal PE → 32 encoder layers → AvgPool → proj
@@ -17,8 +20,16 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
-from mobius.components import Qwen25VLVisionModel
+from mobius.components import (
+    GatedMLP,
+    Qwen25OmniAudioEncoderLayer,
+    Qwen25VLPatchMerger,
+    Qwen25VLVisionAttention,
+    Qwen25VLVisionBlock,
+    Qwen25VLVisionModel,
+)
 from mobius.components._common import (
     Embedding,
     LayerNorm,
@@ -27,7 +38,6 @@ from mobius.components._common import (
 )
 from mobius.components._conv import Conv1d
 from mobius.components._decoder import DecoderLayer
-from mobius.components._qwen25_omni_audio import Qwen25OmniAudioEncoderLayer
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 
@@ -73,10 +83,11 @@ class Qwen25OmniAudioEncoder(nn.Module):
         assert audio is not None
 
         d_model = audio.d_model or 1280
+        self._d_model = d_model
         num_mel_bin = audio.num_mel_bins or 128
         encoder_layers = audio.encoder_layers or 32
         encoder_heads = audio.encoder_attention_heads or 20
-        encoder_ffn = audio.encoder_ffn_dim or 3584
+        encoder_ffn = audio.encoder_ffn_dim or 5120
         max_source_positions = audio.max_source_positions or 1500
         output_dim = audio.output_dim or 3584
 
@@ -106,20 +117,39 @@ class Qwen25OmniAudioEncoder(nn.Module):
         # Output projection: d_model -> output_dim
         self.proj = Linear(d_model, output_dim)
 
-    def forward(self, op: OpBuilder, input_features: ir.Value):
-        """Encode mel spectrogram to audio features.
+    def forward(
+        self,
+        op: OpBuilder,
+        input_features: ir.Value,
+        chunk_lengths: ir.Value,
+        pool_indices: ir.Value,
+    ):
+        """Encode pre-chunked mel spectrograms to packed audio features.
 
         Args:
-            input_features: (batch, num_mel_bins, seq_len) mel spectrogram
+            input_features: (num_chunks, num_mel_bins, max_chunk_len)
+            chunk_lengths: Valid mel-frame count for each chunk.
+            pool_indices: Indices of the first token in each stride-2 pooling pair.
 
         Returns:
-            audio_features: (batch, out_seq_len, output_dim)
+            audio_features: (num_audio_tokens, output_dim)
         """
-        # 2X Conv1d with GELU: (batch, mel, seq) -> (batch, d_model, seq//2)
-        hidden_states = op.Gelu(self.conv1(op, input_features))
+        input_features = op.CastLike(input_features, self.conv1.weight)
+
+        # Match HF's chunk padding mask before the stride-2 convolution.
+        chunk_seq_len = op.Shape(input_features, start=2, end=3)
+        chunk_positions = op.Range(0, op.Squeeze(chunk_seq_len, [0]), 1)
+        chunk_mask = op.Less(
+            op.Unsqueeze(chunk_positions, [0]),
+            op.Unsqueeze(chunk_lengths, [1]),
+        )
+        chunk_mask = op.Unsqueeze(op.CastLike(chunk_mask, input_features), [1])
+
+        # (num_chunks, mel, time) -> (num_chunks, d_model, ceil(time / 2))
+        hidden_states = op.Mul(op.Gelu(self.conv1(op, input_features)), chunk_mask)
         hidden_states = op.Gelu(self.conv2(op, hidden_states))
 
-        # Transpose to (batch, seq//2, d_model) for transformer layers
+        # (num_chunks, d_model, time) -> (num_chunks, time, d_model)
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
 
         # Add sinusoidal positional embeddings
@@ -132,29 +162,119 @@ class Qwen25OmniAudioEncoder(nn.Module):
         )
         hidden_states = op.Add(hidden_states, pe_slice)
 
+        # Remove per-chunk padding and derive packed-attention boundaries.
+        after_conv_lengths = op.Add(op.Div(op.Sub(chunk_lengths, 1), 2), 1)
+        valid_mask = op.Less(
+            op.Unsqueeze(op.Range(0, op.Squeeze(seq_len, [0]), 1), [0]),
+            op.Unsqueeze(after_conv_lengths, [1]),
+        )
+        valid_indices = op.Squeeze(op.NonZero(op.Reshape(valid_mask, [-1])), [0])
+        hidden_states = op.Gather(
+            op.Reshape(hidden_states, [-1, self._d_model]),
+            valid_indices,
+            axis=0,
+        )
+        cu_seqlens = op.Concat(
+            op.Constant(value_ints=[0]),
+            op.CumSum(after_conv_lengths, op.Constant(value_int=0)),
+            axis=0,
+        )
+
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states)
+            hidden_states = layer(op, hidden_states, cu_seqlens)
 
-        # AvgPool1d(kernel=2, stride=2): halves sequence length.
-        # Transpose to (batch, d_model, seq) for pooling, then back.
-        hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
-        hidden_states = op.AveragePool(hidden_states, kernel_shape=[2], strides=[2])
-        hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
-
+        # HF pools adjacent valid tokens using indices computed per original audio.
+        pooled_first = op.Gather(hidden_states, pool_indices, axis=0)
+        pooled_second = op.Gather(hidden_states, op.Add(pool_indices, 1), axis=0)
+        hidden_states = op.Mul(
+            op.Add(pooled_first, pooled_second),
+            op.CastLike(0.5, hidden_states),
+        )
         hidden_states = self.ln_post(op, hidden_states)
         hidden_states = self.proj(op, hidden_states)
         return hidden_states
 
 
+class Qwen25OmniVisionAttention(Qwen25VLVisionAttention):
+    """Qwen2.5-Omni vision attention with separate Q/K/V checkpoint weights."""
+
+    def __init__(self, hidden_size: int, num_heads: int):
+        nn.Module.__init__(self)
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q = Linear(hidden_size, hidden_size, bias=True)
+        self.k = Linear(hidden_size, hidden_size, bias=True)
+        self.v = Linear(hidden_size, hidden_size, bias=True)
+        self.proj = Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, op, hidden_states, cu_seqlens, cos, sin):
+        seq_len = op.Shape(hidden_states, start=0, end=1)
+        head_shape = op.Concat(seq_len, [self.num_heads, self.head_dim], axis=0)
+        q = self._apply_rotary(op, op.Reshape(self.q(op, hidden_states), head_shape), cos, sin)
+        k = self._apply_rotary(op, op.Reshape(self.k(op, hidden_states), head_shape), cos, sin)
+        v = op.Reshape(self.v(op, hidden_states), head_shape)
+
+        if ep_capabilities().supports_packed_multi_head_attention:
+            output = self._emit_packed_mha(op, q, k, v, cu_seqlens, seq_len)
+        else:
+            output = self._emit_standard_attention(op, q, k, v, cu_seqlens, seq_len)
+        return self.proj(op, output)
+
+
+class Qwen25OmniVisionBlock(Qwen25VLVisionBlock):
+    """Qwen2.5-Omni vision block with separate attention projections."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+        super().__init__(hidden_size, intermediate_size, num_heads)
+        self.attn = Qwen25OmniVisionAttention(hidden_size, num_heads)
+        self.mlp = GatedMLP(
+            hidden_size,
+            intermediate_size,
+            activation="silu",
+            bias=True,
+        )
+
+
+class Qwen25OmniVisionModel(Qwen25VLVisionModel):
+    """Qwen2.5-Omni vision tower using the Omni checkpoint parameter layout."""
+
+    def __init__(
+        self,
+        depth: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        **kwargs,
+    ):
+        super().__init__(
+            depth,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            **kwargs,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                Qwen25OmniVisionBlock(hidden_size, intermediate_size, num_heads)
+                for _ in range(depth)
+            ]
+        )
+        self.merger = Qwen25VLPatchMerger(
+            out_hidden_size=kwargs.get("out_hidden_size") or hidden_size,
+            hidden_size=hidden_size,
+            spatial_merge_size=kwargs.get("spatial_merge_size", 2),
+        )
+
+
 class Qwen25OmniVisionEncoder(nn.Module):
-    """Qwen2.5-Omni vision encoder — reuses the Qwen2.5-VL ViT."""
+    """Qwen2.5-Omni vision encoder."""
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision
         assert vc is not None
 
-        self.visual = Qwen25VLVisionModel(
+        self.visual = Qwen25OmniVisionModel(
             depth=vc.num_hidden_layers or 32,
             hidden_size=vc.hidden_size or 1280,
             intermediate_size=vc.intermediate_size or 3420,
@@ -175,13 +295,13 @@ class Qwen25OmniVisionEncoder(nn.Module):
 class Qwen25OmniEmbeddingModel(nn.Module):
     """Fuses text embedding with audio and image features.
 
-    Replaces ``audio_token_id`` positions with audio features and
-    ``image_token_id`` positions with image features.
+    Replaces audio, image, and video placeholder tokens with encoder features.
 
     Inputs:
         input_ids: (batch, seq_len)
         audio_features: (num_audio_tokens, hidden_size)
         image_features: (num_image_tokens, hidden_size)
+        video_features: (num_video_tokens, hidden_size)
 
     Output:
         inputs_embeds: (batch, seq_len, hidden_size)
@@ -200,6 +320,7 @@ class Qwen25OmniEmbeddingModel(nn.Module):
         vision = config.vision
         self._audio_token_id = (audio.audio_token_id if audio else None) or 151646
         self._image_token_id = (vision.image_token_id if vision else None) or 151655
+        self._video_token_id = config.video_token_id or 151656
 
     def forward(
         self,
@@ -207,6 +328,7 @@ class Qwen25OmniEmbeddingModel(nn.Module):
         input_ids: ir.Value,
         audio_features: ir.Value,
         image_features: ir.Value,
+        video_features: ir.Value,
     ):
         inputs_embeds = self.embed_tokens(op, input_ids)
 
@@ -219,6 +341,9 @@ class Qwen25OmniEmbeddingModel(nn.Module):
         inputs_embeds = self._replace_tokens(
             op, inputs_embeds, input_ids, image_features, self._image_token_id
         )
+        inputs_embeds = self._replace_tokens(
+            op, inputs_embeds, input_ids, video_features, self._video_token_id
+        )
 
         return inputs_embeds
 
@@ -230,9 +355,7 @@ class Qwen25OmniEmbeddingModel(nn.Module):
         # Pad with a zero row for safety (text-only case: no features).
         feature_dim = op.Shape(features, start=1, end=2)
         zero_shape = op.Concat(op.Constant(value_ints=[1]), feature_dim, axis=0)
-        zero_row = op.ConstantOfShape(
-            zero_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))
-        )
+        zero_row = op.Expand(op.CastLike(0.0, features), zero_shape)
         padded = op.Concat(zero_row, features, axis=0)
 
         # CumSum-based per-position gather index. Mask positions get the
@@ -315,7 +438,7 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
     the Talker / streaming code generation head is out of scope for now).
     """
 
-    default_task: str = "speech-language"
+    default_task: str = "qwen25-omni"
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
@@ -327,20 +450,15 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
         self.vision_encoder: Qwen25OmniVisionEncoder | None = (
             Qwen25OmniVisionEncoder(config) if config.vision is not None else None
         )
-        # Named ``audio_tower`` (not ``audio_encoder``) to match
-        # ``SpeechLanguageTask`` which looks up ``module.audio_tower``.
-        # The vision sub-module is currently not routed through any
-        # task — wiring a dedicated Qwen25OmniTask that builds all four
-        # ONNX sub-models is a follow-up; today the
-        # ``speech-language`` task entry only drives audio + text.
-        self.audio_tower: Qwen25OmniAudioEncoder | None = (
+        self.audio_encoder: Qwen25OmniAudioEncoder | None = (
             Qwen25OmniAudioEncoder(config) if config.audio is not None else None
         )
 
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen25OmniThinkerForConditionalGeneration is a multi-model split; the corresponding "
-            "task class builds each sub-module (decoder, embedding, vision_encoder, audio_encoder) "
+            "Qwen25OmniTask builds each sub-module (decoder, embedding, vision_encoder, "
+            "audio_encoder) "
             "separately."
         )
 
@@ -351,7 +469,7 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
 
         HF Qwen2.5-Omni checkpoints prefix every Thinker key with ``thinker.``:
 
-        - ``thinker.audio_tower.*`` → ``audio_tower.*``
+        - ``thinker.audio_tower.*`` → ``audio_encoder.*``
         - ``thinker.visual.*`` → ``vision_encoder.visual.*``
         - ``thinker.model.embed_tokens.*`` → ``embedding.embed_tokens.*``
         - ``thinker.model.layers.N.*`` and ``model.norm.*`` → ``decoder.*``
@@ -368,15 +486,19 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
                 key = key[len("thinker.") :]
 
             # Drop talker.* and any codec output keys — not part of Thinker.
-            if key.startswith(("talker.", "code_predictor.")):
+            if key.startswith(("talker.", "token2wav.", "code_predictor.")):
                 continue
 
             if key.startswith("audio_tower."):
-                cleaned[key] = value
+                if ".audio_bos_eos_token." not in key:
+                    cleaned["audio_encoder." + key[len("audio_tower.") :]] = value
                 continue
 
             if key.startswith("visual."):
-                cleaned["vision_encoder." + key] = value
+                new_key = "vision_encoder." + key
+                new_key = new_key.replace(".merger.mlp.0.", ".merger.mlp_0.")
+                new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
+                cleaned[new_key] = value
                 continue
 
             if key.startswith("lm_head."):

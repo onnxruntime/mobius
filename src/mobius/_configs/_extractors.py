@@ -156,7 +156,7 @@ def extract_vision_config(config, parent_config, model_type: str) -> dict:
     Either step can populate ``fields`` (which become kwargs for
     :class:`VisionConfig`), or a per-model hook can return a fully-formed
     dict to short-circuit. The dispatcher also lifts a fixed set of
-    "shared" vision fields (``image_token_id``, ``spatial_merge_size``,
+    "shared" vision fields (``image_token_id``, ``video_token_id``, ``spatial_merge_size``,
     ...) up to the top-level of the returned dict so callers can access
     them as ``config.image_token_id`` directly.
     """
@@ -182,6 +182,7 @@ def extract_vision_config(config, parent_config, model_type: str) -> dict:
     for shared in (
         "mm_tokens_per_image",
         "image_token_id",
+        "video_token_id",
         "spatial_merge_size",
         "temporal_patch_size",
         "deepstack_visual_indexes",

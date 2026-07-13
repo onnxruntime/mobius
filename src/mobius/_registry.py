@@ -626,11 +626,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="speech-to-text",
         config_class=WhisperConfig,
     ),
-
     # --- Omni ---
     "qwen2_5_omni": ModelRegistration(
         Qwen25OmniThinkerForConditionalGeneration,
-        task="speech-language",
+        task="qwen25-omni",
     ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),

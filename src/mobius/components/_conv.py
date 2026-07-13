@@ -5,13 +5,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
-
-if TYPE_CHECKING:
-    pass
 
 
 class Conv2d(nn.Module):
@@ -70,16 +65,14 @@ class Conv1d(nn.Module):
         groups: int = 1,
     ):
         super().__init__()
-        self.weight = nn.Parameter(
-            (out_channels, in_channels // groups, kernel_size)
-        )
-        self.bias = nn.Parameter((out_channels))
+        self.weight = nn.Parameter((out_channels, in_channels // groups, kernel_size))
+        self.bias = nn.Parameter((out_channels,))
         self._kernel_size = kernel_size
         self._stride = stride
         self._padding = padding
         self._groups = groups
 
-    def forward(self, op: builder.OpBuilder, x: ir.Value):
+    def forward(self, op: OpBuilder, x: ir.Value):
         p = self._padding
         return op.Conv(
             x,
