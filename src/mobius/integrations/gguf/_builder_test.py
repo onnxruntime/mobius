@@ -21,6 +21,8 @@ def _write_quantized_gguf(
     intermediate_size: int = 128,
     vocab_size: int = 256,
     quantize_embedding: bool = False,
+    projection_quantization: str = "q4_0",
+    output_quantization: str | None = None,
     tie_embeddings: bool = False,
 ) -> None:
     """Write a GGUF file with Q4_0 quantized projection weights.
@@ -66,44 +68,72 @@ def _write_quantized_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
 
+    def _add_q8_0(name: str, n_out: int, k_in: int) -> None:
+        """Write a Q8_0-quantized weight tensor."""
+        block_size = 32
+        block_bytes = 34  # 2B scale + 32B quants
+        n_blocks = k_in // block_size
+        bytes_per_row = n_blocks * block_bytes
+        raw = np.zeros((n_out, bytes_per_row), dtype=np.uint8)
+        for row in range(n_out):
+            for b in range(n_blocks):
+                off = b * block_bytes
+                scale = np.random.uniform(0.01, 1.0)
+                raw[row, off : off + 2] = np.array([scale], dtype=np.float16).view(np.uint8)
+                raw[row, off + 2 : off + 34] = (
+                    np.random.randint(-127, 128, size=32, dtype=np.int16)
+                    .astype(np.int8, copy=False)
+                    .view(np.uint8)
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q8_0)
+
     if quantize_embedding:
         _add_q4_0("token_embd.weight", vocab_size, hidden_size)
     else:
         _add_f32("token_embd.weight", (vocab_size, hidden_size))
 
+    add_projection = {
+        "q4_0": _add_q4_0,
+        "q8_0": _add_q8_0,
+    }[projection_quantization]
+
     for i in range(num_layers):
-        # Projection weights (Q4_0)
-        _add_q4_0(
+        add_projection(
             f"blk.{i}.attn_q.weight",
             num_heads * head_dim,
             hidden_size,
         )
-        _add_q4_0(
+        add_projection(
             f"blk.{i}.attn_k.weight",
             num_kv_heads * head_dim,
             hidden_size,
         )
-        _add_q4_0(
+        add_projection(
             f"blk.{i}.attn_v.weight",
             num_kv_heads * head_dim,
             hidden_size,
         )
-        _add_q4_0(
+        add_projection(
             f"blk.{i}.attn_output.weight",
             hidden_size,
             num_heads * head_dim,
         )
-        _add_q4_0(f"blk.{i}.ffn_gate.weight", intermediate_size, hidden_size)
-        _add_q4_0(f"blk.{i}.ffn_up.weight", intermediate_size, hidden_size)
-        _add_q4_0(f"blk.{i}.ffn_down.weight", hidden_size, intermediate_size)
+        add_projection(f"blk.{i}.ffn_gate.weight", intermediate_size, hidden_size)
+        add_projection(f"blk.{i}.ffn_up.weight", intermediate_size, hidden_size)
+        add_projection(f"blk.{i}.ffn_down.weight", hidden_size, intermediate_size)
         # Norms (float32)
         _add_f32(f"blk.{i}.attn_norm.weight", (hidden_size,))
         _add_f32(f"blk.{i}.ffn_norm.weight", (hidden_size,))
 
-    # Output norm + optional untied lm_head (float32)
+    # Output norm + optional untied lm_head
     _add_f32("output_norm.weight", (hidden_size,))
     if not tie_embeddings:
-        _add_f32("output.weight", (vocab_size, hidden_size))
+        if output_quantization == "q4_0":
+            _add_q4_0("output.weight", vocab_size, hidden_size)
+        elif output_quantization == "q8_0":
+            _add_q8_0("output.weight", vocab_size, hidden_size)
+        else:
+            _add_f32("output.weight", (vocab_size, hidden_size))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -132,6 +162,30 @@ def q4_0_tied_embedding_gguf(tmp_path: Path) -> Path:
     """Create a GGUF with one Q4_0 table shared by embedding and LM head."""
     path = tmp_path / "test_q4_0_tied_embedding.gguf"
     _write_quantized_gguf(path, quantize_embedding=True, tie_embeddings=True)
+    return path
+
+
+@pytest.fixture
+def q4_0_embedding_q8_head_gguf(tmp_path: Path) -> Path:
+    """Create a GGUF with a Q4 embedding and an untied Q8 output head."""
+    path = tmp_path / "test_q4_0_embedding_q8_head.gguf"
+    _write_quantized_gguf(
+        path,
+        quantize_embedding=True,
+        output_quantization="q8_0",
+    )
+    return path
+
+
+@pytest.fixture
+def q8_0_projection_q4_head_gguf(tmp_path: Path) -> Path:
+    """Create a GGUF whose Q4 output head would require Q8 requantization."""
+    path = tmp_path / "test_q8_0_projection_q4_head.gguf"
+    _write_quantized_gguf(
+        path,
+        projection_quantization="q8_0",
+        output_quantization="q4_0",
+    )
     return path
 
 
@@ -190,6 +244,45 @@ class TestBuildQuantizedGguf:
         assert "MatMulNBits" in op_types
         assert "model.embed_tokens.qweight" in model.graph.initializers
         assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+
+    def test_untied_quantized_head_uses_q4_matmulnbits(
+        self, q4_0_embedding_q8_head_gguf: Path
+    ):
+        """An untied quantized output is requantized to the graph's Q4 layout."""
+        import onnx_ir as ir
+
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(q4_0_embedding_q8_head_gguf, keep_quantized=True)["model"]
+        head_nodes = [
+            node
+            for node in model.graph
+            if node.op_type == "MatMulNBits" and node.outputs[0].name == "logits"
+        ]
+        assert len(head_nodes) == 1
+        assert head_nodes[0].attributes["bits"].value == 4
+        assert head_nodes[0].attributes["block_size"].value == 32
+
+        qweight = model.graph.initializers["lm_head.weight"]
+        assert qweight.dtype == ir.DataType.UINT8
+        assert list(qweight.shape) == [256, 2, 16]
+        assert list(model.graph.initializers["lm_head.scales"].shape) == [256, 2]
+        assert "lm_head.weight_t" not in model.graph.initializers
+
+    def test_unsupported_requantization_target_has_clear_error(
+        self, q8_0_projection_q4_head_gguf: Path
+    ):
+        """Mixed targets outside 4-bit/block-32 fail before the Q4 repacker."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "keep_quantized MatMulNBits requantization currently supports only "
+                r"4-bit/block-32 targets; got bits=8 block=32 for tensor lm_head\.weight"
+            ),
+        ):
+            build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)
 
     def test_norms_are_float(self, q4_0_gguf: Path):
         """Norm weights remain float, not quantized."""

@@ -598,8 +598,8 @@ def main(argv: list[str] | None = None) -> None:
         "--keep-quantized",
         action="store_true",
         help=(
-            "Preserve supported projection and embedding quantization via "
-            "MatMulNBits/GatherBlockQuantized."
+            "Preserve supported projection, output-head, and embedding "
+            "quantization via MatMulNBits/GatherBlockQuantized."
         ),
     )
     gguf_parser.add_argument(

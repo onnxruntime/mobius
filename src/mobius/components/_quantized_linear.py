@@ -186,6 +186,7 @@ class QuantizedEmbedding(nn.Module):
 
         self._bits = bits
         self._block_size = block_size
+        self._embedding_dim = embedding_dim
         self.padding_idx = padding_idx
 
         n_blocks = embedding_dim // block_size
@@ -219,7 +220,7 @@ class QuantizedEmbedding(nn.Module):
         if self.zero_points is not None:
             inputs.append(self.zero_points)
 
-        return op.GatherBlockQuantized(
+        result = op.GatherBlockQuantized(
             *inputs,
             bits=self._bits,
             block_size=self._block_size,
@@ -227,6 +228,10 @@ class QuantizedEmbedding(nn.Module):
             quantize_axis=1,
             _domain=_MICROSOFT_DOMAIN,
         )
+        result.dtype = self.scales.dtype
+        if input_ids.shape is not None:
+            result.shape = ir.Shape([*input_ids.shape, self._embedding_dim])
+        return result
 
 
 class TiedQuantizedLMHead(nn.Module):

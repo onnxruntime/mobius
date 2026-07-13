@@ -299,6 +299,8 @@ class TestQuantizedEmbeddingForward:
         result = qe(op, ids)
         b._adapt_outputs([result], "")
         assert count_op_type(graph, "GatherBlockQuantized") == 1
+        assert result.dtype == ir.DataType.FLOAT
+        assert result.shape == ir.Shape([1, 4, self.DIM])
 
     def test_node_domain_and_attributes(self):
         import onnx_ir as ir
