@@ -131,6 +131,8 @@ class TestQuantizedLinearForward:
                 # so the attribute is omitted and ORT keeps its default path.
                 assert "accuracy_level" not in attrs
                 break
+        else:
+            pytest.fail("MatMulNBits node not found")
 
     def test_no_accuracy_level_without_context(self):
         """Default EP omits accuracy_level (ORT default / highest precision)."""
@@ -159,6 +161,23 @@ class TestQuantizedLinearForward:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
                 assert attrs["accuracy_level"] == 4
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_cpu_ep_omits_accuracy_level_for_non_int4(self):
+        """accuracy_level is INT4-specific: 8-bit weights keep ORT's default."""
+        with build_context(ep_registry.require("cpu")):
+            ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=8, block_size=32)
+            b, op, graph = create_test_builder()
+            x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+            result = ql(op, x)
+            b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["bits"] == 8
+                assert "accuracy_level" not in attrs
                 break
         else:
             pytest.fail("MatMulNBits node not found")

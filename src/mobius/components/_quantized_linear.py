@@ -28,8 +28,13 @@ from mobius._build_context import ep_capabilities
 _MICROSOFT_DOMAIN = "com.microsoft"
 
 
-def _accuracy_level_attrs() -> dict[str, int]:
+def _accuracy_level_attrs(bits: int) -> dict[str, int]:
     """Return the ``accuracy_level`` attribute for ``MatMulNBits``, if any.
+
+    Only emitted for 4-bit weights: ``accuracy_level`` is sourced from
+    ``EpCapabilities.default_int4_accuracy_level`` and its int8-accumulation
+    semantics are defined for INT4 ``MatMulNBits``. For 2-bit / 8-bit weights the
+    attribute is omitted so those paths keep ORT's default behavior.
 
     ORT's MLAS CPU ``MatMulNBits`` kernel selects its compute path from the
     ``accuracy_level`` attribute: unset/0 keeps the highest-precision fp32
@@ -40,6 +45,8 @@ def _accuracy_level_attrs() -> dict[str, int]:
     active EP's :attr:`EpCapabilities.default_int4_accuracy_level` (4 for CPU /
     WebGPU). When it is 0 the attribute is omitted so ORT keeps its default.
     """
+    if bits != 4:
+        return {}
     level = ep_capabilities().default_int4_accuracy_level
     return {"accuracy_level": level} if level else {}
 
@@ -144,7 +151,7 @@ class QuantizedLinear(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
-            **_accuracy_level_attrs(),
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
         if self.bias is not None:
@@ -323,7 +330,7 @@ class TiedQuantizedLMHead(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
-            **_accuracy_level_attrs(),
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
 
