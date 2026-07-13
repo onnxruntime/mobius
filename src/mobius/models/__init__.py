@@ -25,10 +25,13 @@ __all__ = [
     "ControlNetModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
+    "DFlashDraftModel",
+    "Eagle3DraftModel",
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
     "DogeCausalLMModel",
+    "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
@@ -44,8 +47,10 @@ __all__ = [
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
     "Gemma3nCausalLMModel",
+    "Gemma4AssistantCausalLMModel",
     "Gemma4CausalLMModel",
     "Gemma4Model",
+    "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
     "Glm4CausalLMModel",
     "Glm4MoECausalLMModel",
@@ -70,6 +75,9 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MimiModel",
+    "MoshiDepformerModel",
+    "MoshiTemporalModel",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
@@ -94,6 +102,7 @@ __all__ = [
     "Qwen2VLVisionEncoderModel",
     "Qwen35CausalLMModel",
     "Qwen35MoECausalLMModel",
+    "Qwen35MtpModel",
     "Qwen35MoEVL3ModelCausalLMModel",
     "Qwen35VL3ModelCausalLMModel",
     "Qwen35VLDecoderModel",
@@ -126,10 +135,14 @@ __all__ = [
     "UNet2DConditionModel",
     "ViTModel",
     "VideoAutoencoderModel",
+    "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
     "XLMCausalLMModel",
     "Zamba2CausalLMModel",
+    "mimi_default_config",
+    "moshi_depformer_config",
+    "moshi_temporal_config",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -148,10 +161,12 @@ from mobius.models.controlnet import ControlNetModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
+from mobius.models.dflash import DFlashDraftModel
 from mobius.models.diffllama import DiffLlamaCausalLMModel
 from mobius.models.distilbert import DistilBertModel
 from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
+from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
@@ -164,7 +179,9 @@ from mobius.models.gemma3n import Gemma3nCausalLMModel
 from mobius.models.gemma4 import (
     Gemma4CausalLMModel,
     Gemma4Model,
+    Gemma4UnifiedModel,
 )
+from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -183,6 +200,7 @@ from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.moe import (
     Ernie45MoECausalLMModel,
@@ -192,7 +210,14 @@ from mobius.models.moe import (
     Phi3MoECausalLMModel,
     Qwen2MoECausalLMModel,
 )
+from mobius.models.moshi import (
+    MoshiDepformerModel,
+    MoshiTemporalModel,
+    moshi_depformer_config,
+    moshi_temporal_config,
+)
 from mobius.models.nanochat import NanoChatCausalLMModel
+from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
@@ -233,6 +258,7 @@ from mobius.models.qwen35 import (
     Qwen35VLDecoderModel,
     Qwen35VLTextModel,
 )
+from mobius.models.qwen35_mtp import Qwen35MtpModel
 from mobius.models.qwen_image import QwenImageTransformer2DModel
 from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
 from mobius.models.qwen_vl import (
@@ -259,6 +285,7 @@ from mobius.models.vae import AutoencoderKLModel
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
+from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.zamba2 import Zamba2CausalLMModel

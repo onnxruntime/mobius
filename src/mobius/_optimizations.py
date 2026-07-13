@@ -63,10 +63,12 @@ from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     gelu_fusion_rules,
     group_query_attention_rules,
+    htp_rank4_rmsnorm_rules,
     pack_qkv_for_gqa_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
+    static_empty_kv_rules,
     unpack_qkv_rules,
 )
 
@@ -284,7 +286,12 @@ def _get_optimization_passes(
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
-        fuse.append(("GQAFusion", list(group_query_attention_rules())))
+        fuse.append(
+            (
+                "GQAFusion",
+                list(group_query_attention_rules()),
+            )
+        )
 
     # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
     if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:
@@ -306,6 +313,20 @@ def _get_optimization_passes(
     if not caps.supports_fused_rope:
         lower.append(("SeparateRoPE", list(separate_rope_rules())))
         lower.append(("UnpackQKV", list(unpack_qkv_rules())))
+
+    # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
+    if not caps.supports_rank4_rmsnorm:
+        lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
+
+    # --- Graph-capture rewrite ---
+    # Supports graph capture for shared-KV layer models on WebGPU EP
+    # (currently Gemma4). Pattern-based: only fires on models that emit the
+    # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
+    # requires_graph_capture_rewrite rather than enable_graph_capture because
+    # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
+    # already graph-capture-safe.
+    if caps.requires_graph_capture_rewrite:
+        lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
 
     return fuse, lower
 

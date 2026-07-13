@@ -67,10 +67,21 @@ class EpCapabilities:
             ``PackedMultiHeadAttention`` via InlinePass to a
             block-diagonal attention bias + standard ``Attention``.
             Leave ``True`` for CUDA / DML EPs that ship the native kernel.
+        supports_rank4_rmsnorm: ``False`` reshapes rank-4 ``RMSNormalization``
+            (query/key norm over the head dimension) to rank-3 and back via
+            HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
+            only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
+            Should not include graph-capture keys (``enable_cuda_graph`` /
+            ``enableGraphCapture``); those are derived from
+            ``enable_graph_capture`` so the flag is the single source of truth.
         enable_graph_capture: Whether this EP defaults to GPU graph capture.
+            When ``True`` the generated genai_config provider options enable the
+            EP-specific graph-capture option (``enable_cuda_graph`` for CUDA /
+            TRT-RTX, ``enableGraphCapture`` + ``validationMode=disabled`` for
+            WebGPU).
         supports_past_present_share_buffer: Whether past and present KV-cache
             tensors alias the same pre-allocated buffer.  When ``True``, the
             ORT GenAI runtime allocates a single KV-cache buffer at model load
@@ -86,6 +97,20 @@ class EpCapabilities:
             devices.  ``True`` only for WebGPU (consumer GPU); ``False`` for
             CUDA / CPU / DML / TRT-RTX where the runtime can handle large
             pre-allocations.
+        max_buffer_size: Maximum allowed size in bytes for a single model
+            weight buffer on this EP.  ``None`` means no limit.  When non-zero,
+            large weight tensors (e.g. fused per-layer embedding tables) must
+            be split into chunks that each fit within this bound.  WebGPU's
+            W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        requires_graph_capture_rewrite: Whether this EP requires rewrite rules
+            to make models compatible with graph capture (e.g. replacing
+            ``Shape`` / ``ConstantOfShape`` with static alternatives for
+            shared-KV layer models like Gemma4).  Not all EPs with
+            ``enable_graph_capture`` need this — e.g. CUDA EP's ``Shape``
+            kernel is already registered inside the CUDA partition and is
+            graph-capture-safe.  Set ``True`` only for EPs that cannot execute
+            ``Shape`` / ``ConstantOfShape`` under graph capture (currently
+            WebGPU).
     """
 
     name: str
@@ -95,11 +120,14 @@ class EpCapabilities:
     supports_skip_layer_norm: bool = True
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
+    supports_rank4_rmsnorm: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
+    max_buffer_size: int | None = None
+    requires_graph_capture_rewrite: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -195,7 +223,7 @@ def get_ep(name: str) -> EpCapabilities:
 
 
 def _register_builtins() -> None:
-    """Populate the global registry with the seven built-in EPs.
+    """Populate the global registry with the built-in EPs.
 
     Called once at module import. Adding a new EP = adding one entry here.
     """
@@ -210,6 +238,26 @@ def _register_builtins() -> None:
             name="default",
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
+        ),
+        # OpenVINO EP (via ORT GenAI). The OpenVINO EP consumes a portable ONNX
+        # graph and compiles it internally for the selected device, so the graph
+        # build mirrors "default" (standard Attention, no GQA/QKV packing). The
+        # graph does not depend on the OpenVINO device, so we emit a sensible
+        # default device_type ("NPU") in the genai_config provider options; a
+        # different device can be selected downstream by editing genai_config
+        # (e.g. by the Olive MobiusBuilder pass or the user) without rebuilding.
+        #
+        # supports_skip_layer_norm=False: the OpenVINO ONNX frontend does not
+        # support the com.microsoft SkipSimplifiedLayerNormalization op, so we
+        # keep the residual Add and RMSNormalization separate (no skip-norm
+        # fusion) to stay convertible by OpenVINO. (RMSNormalization itself is
+        # still opset-24; OpenVINO frontend support for it is pending.)
+        EpCapabilities(
+            name="openvino",
+            gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
+            qkv_pack_dtypes=frozenset(),  # no QKV packing
+            supports_skip_layer_norm=False,
+            provider_options={"device_type": "NPU"},
         ),
         EpCapabilities(
             name="cpu",
@@ -226,7 +274,6 @@ def _register_builtins() -> None:
             ),
             supports_packed_multi_head_attention=True,
             provider_options={
-                "enable_cuda_graph": "0",
                 "enable_skip_layer_norm_strict_mode": "1",
             },
             supports_past_present_share_buffer=True,
@@ -247,9 +294,12 @@ def _register_builtins() -> None:
             gqa_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT, ir.DataType.FLOAT16}),
             default_int4_accuracy_level=4,
-            provider_options={"enableGraphCapture": "0", "validationMode": "basic"},
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
             cap_kv_buffer_max_length=True,
+            # W3C WebGPU spec default maxBufferSize (https://www.w3.org/TR/webgpu/)
+            max_buffer_size=268_435_456,  # 256 MiB
+            requires_graph_capture_rewrite=True,
         ),
         EpCapabilities(
             name="trt-rtx",
@@ -259,8 +309,30 @@ def _register_builtins() -> None:
             ),
             supports_skip_layer_norm=False,
             enable_graph_capture=True,
-            provider_options={"enable_cuda_graph": "1"},
             supports_past_present_share_buffer=True,
+        ),
+        # Qualcomm Hexagon NPU via the QNN EP (onnxruntime-qnn QAIRT plugin),
+        # HTP backend. The HTP runs a static-shaped, QDQ-quantized QNN context
+        # binary with no kernels for ORT contrib fused ops, so everything is
+        # decomposed to standard ONNX. The gemma4 multimodal decoder forgoes GQA
+        # (bidirectional-vision overlay), so standard Attention is emitted and
+        # static-shaped downstream. provider_options are the HTP launch defaults;
+        # soc_model and the EP-context binary path are set per-device at build time.
+        EpCapabilities(
+            name="qnn",
+            gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
+            qkv_pack_dtypes=frozenset(),  # no PackQKV
+            supports_fused_rope=False,  # SeparateRoPE + UnpackQKV
+            supports_skip_layer_norm=False,  # inline Skip[Simplified]LayerNorm
+            supports_packed_multi_head_attention=False,  # inline PackedMHA
+            provider_options={
+                "backend_path": "QnnHtp.dll",
+                "htp_performance_mode": "burst",
+                "htp_graph_finalization_optimization_mode": "3",
+                "enable_htp_shared_memory_allocator": "1",
+            },
+            supports_past_present_share_buffer=False,  # standard-Attention KV concat
+            supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via

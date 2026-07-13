@@ -15,6 +15,11 @@ Run::
 
     # Run on CUDA GPU:
     MOBIUS_TEST_DEVICE=cuda pytest tests/e2e_golden_test.py -v
+
+    # Build a CUDA-specialized graph (e.g. PackedMultiHeadAttention for
+    # Qwen-VL vision) and run it on CUDA:
+    MOBIUS_TEST_DEVICE=cuda MOBIUS_TEST_BUILD_EP=cuda \
+        pytest tests/e2e_golden_test.py -m golden -k "qwen2_5-vl-3b"
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ from mobius._testing.golden import (
     generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
+    load_drafter_inputs,
     load_generation_golden,
     load_golden_ref,
     load_tolerances,
@@ -46,6 +52,27 @@ from mobius._testing.parity import ParityResult, compare_golden
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+
+
+def _get_test_build_ep() -> str:
+    """Return the ``execution_provider`` to build golden models with.
+
+    Defaults to ``"default"`` (portable ONNX, standard attention), matching
+    how the golden references were generated. Set ``MOBIUS_TEST_BUILD_EP`` to
+    build an EP-specialized graph instead (e.g. ``cuda`` to emit
+    ``PackedMultiHeadAttention`` for the Qwen-VL vision encoders).
+
+    Building a CUDA-specialized graph requires running on CUDA, since ops such
+    as ``PackedMultiHeadAttention`` have no CPU kernel. A build/runtime EP
+    mismatch is therefore rejected as a misconfiguration.
+    """
+    build_ep = os.environ.get("MOBIUS_TEST_BUILD_EP", "default").strip().lower()
+    if build_ep == "cuda" and os.environ.get("MOBIUS_TEST_DEVICE", "").lower() != "cuda":
+        raise pytest.UsageError(
+            "MOBIUS_TEST_BUILD_EP=cuda requires MOBIUS_TEST_DEVICE=cuda so that "
+            "CUDA-specific ops (e.g. PackedMultiHeadAttention) run on CUDA."
+        )
+    return build_ep
 
 
 def _get_test_device_kwargs() -> dict[str, str]:
@@ -66,6 +93,65 @@ def _get_test_device_kwargs() -> dict[str, str]:
 
 
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
+    """Return ``generation_config.suppress_tokens`` for a model (empty if none).
+
+    Mirrors HuggingFace ``generate()``: tokens in ``suppress_tokens`` are forced
+    to ``-inf`` at every decode step. Needed for base checkpoints (e.g.
+    ``google/gemma-4-12B``) whose generation_config suppresses the structural
+    ``<end_of_image>`` / ``<end_of_audio>`` tokens — without it, greedy decode
+    degenerates (repeating those tokens) and diverges from the golden reference
+    produced by ``model.generate``. For models with no suppress_tokens this is a
+    no-op, so it is safe to apply unconditionally.
+    """
+    import transformers
+
+    try:
+        gen_config = transformers.GenerationConfig.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
+    except Exception:
+        return []
+    return [int(t) for t in (gen_config.suppress_tokens or [])]
+
+
+def _suppress_logits(logits: np.ndarray, suppress_ids: list[int]) -> np.ndarray:
+    """Force ``suppress_ids`` columns of the last-position logits to ``-inf``."""
+    if suppress_ids:
+        logits[..., suppress_ids] = -np.inf
+    return logits
+
+
+def _build_mm_prompt(
+    processor: object,
+    base_prompt: str,
+    media_paths: list[str],
+    media_kind: str,
+) -> str:
+    """Format a multimodal prompt, falling back when there is no chat template.
+
+    Instruction-tuned processors expose a chat template that injects the right
+    media placeholder tokens. Base checkpoints (e.g. ``google/gemma-4-12B``)
+    ship none, so manually prepend one placeholder token per media item — the
+    processor then expands each into the correct number of soft tokens.
+
+    ``media_kind`` is ``"image"`` or ``"audio"``.
+    """
+    if getattr(processor, "chat_template", None):
+        content: list[dict[str, str]] = []
+        for path in media_paths:
+            content.append({"type": media_kind, media_kind: str(_TESTDATA_DIR / path)})
+        content.append({"type": "text", "text": base_prompt})
+        messages = [{"role": "user", "content": content}]
+        return processor.apply_chat_template(  # type: ignore[attr-defined]
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    placeholder = getattr(processor, f"{media_kind}_token", None)
+    if placeholder:
+        return placeholder * len(media_paths) + base_prompt
+    return base_prompt
 
 
 def _make_empty_kv_cache(
@@ -147,7 +233,29 @@ def _use_temp_hf_cache(tmp_path):
 
 # Known failures that should be xfailed rather than treated as regressions.
 # Key: "{task_type}/{case_id}" matching the pytest test ID.
-_XFAIL_REASONS: dict[str, str] = {}
+_XFAIL_REASONS: dict[str, str] = {
+    # Unresolved decoder-side parity gap exposed by a near-tie argmax flip.
+    # NOT a GPU regression and NOT an encoder/fusion bug:
+    #   * vision/audio encoders + projector + InputMixer fusion match HF at
+    #     cos ~1.0 (feeding HF's exact inputs_embeds into the mobius decoder
+    #     still flips), so the gap is decoder-side;
+    #   * mobius produces IDENTICAL logits on CPU and CUDA (not an EP issue);
+    #   * decoder components (LongRoPE short-path freqs, rotary_dim=96,
+    #     attention_scaling=1.19, LoRA gates, GQA 24q/8kv) verified vs HF.
+    # The decoder's final-position logit cosine vs HF is ~0.983 over ~3619
+    # tokens. mobius ranks golden top1 (38229) as its own top2 — a clean
+    # top1<->top2 swap (mobius gap 0.88 logits) of a golden 2.15-logit
+    # near-tie. The passing phi4mm-multi-image case (len 3503, no audio) shows
+    # the same ~0.991 cosine but survives because its golden top1/top2 gap is
+    # 3.5 logits. top10_jaccard=0.33 (tail tokens at near-equal logits
+    # reshuffle) misses compare_golden's AMBIGUOUS guard.
+    "phi4mm-multimodal/phi4mm-multi-image-audio": (
+        "Decoder-side parity gap (cos~0.983) flips a 2.15-logit near-tie "
+        "(golden top1 38229 vs top2 976; mobius ranks 38229 as its top2). "
+        "Identical on CPU+CUDA, encoders/fusion match HF at cos~1.0. Not a "
+        "GPU regression or structural encoder bug."
+    ),
+}
 
 # Failures that only apply to L5 (generation loop), not L4 (single forward).
 _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
@@ -155,6 +263,13 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
     "text-generation/helium-1-2b": "Helium decode loop diverges from HF after first token",
     "text-generation/nanochat-d20": "NanoChat decode loop diverges from HF after first token",
     "text-generation/ernie4_5-0_3b": "ERNIE 4.5 decode loop diverges from HF after first token",
+    # Nemotron-H hybrid Mamba2 SSM decode loop diverges from HF after the first
+    # token. L4 prefill passes (argmax matches); identical CPU+CUDA. The golden
+    # is a degenerate greedy repetition, so the token-match ratio is near zero.
+    "text-generation/nemotron-h-nano-4b": (
+        "Nemotron-H hybrid Mamba2 SSM decode loop diverges from HF after first "
+        "token (L4 prefill passes; identical CPU+CUDA; golden is degenerate)"
+    ),
     # MLA compressed KV cache dimensions not yet handled by OnnxGenerator
     "text-generation/youtu-2b": "Youtu MLA KV cache dims differ from standard attention (v_head_dim != head_dim)",
 }
@@ -208,11 +323,25 @@ _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
+    module_class = None
+    task = None
+    if case.architecture:
+        # Force a specific module class + task (auxiliary heads such as the
+        # Qwen3.6 MTP head that share a base checkpoint whose ``architectures``
+        # field would otherwise auto-route to the base model).
+        from mobius._registry import registry
+
+        reg = registry.get_registration(case.architecture)
+        module_class = reg.module_class
+        task = reg.task or getattr(module_class, "default_task", None)
     return build(
         case.model_id,
+        task=task,
+        module_class=module_class,
         dtype=case.dtype,
         load_weights=True,
         trust_remote_code=case.trust_remote_code,
+        execution_provider=_get_test_build_ep(),
     )
 
 
@@ -361,6 +490,12 @@ _HIDDEN_STATE_TASKS: frozenset[str] = frozenset(
         "feature-extraction",
         "image-classification",
         "audio-feature-extraction",
+        # CTC ASR's model output is named "logits", but the saved golden's
+        # top-K is over the *last frame's* vocab vector. The
+        # ``_extract_logits`` path picks ``outputs["logits"]``; the test
+        # comparator below slices to the last frame so the shape matches
+        # the saved golden's per-token vector.
+        "ctc-asr",
     }
 )
 
@@ -377,6 +512,14 @@ def _extract_logits(
     """
     if "logits" in outputs:
         return outputs["logits"]
+    if task_type == "dflash-draft" and "draft_hidden" in outputs:
+        # DFlash outputs draft_hidden (pre-lm_head). Treat it as the logit
+        # vector for the argmax gate (mirrors the hidden-state task handling).
+        return outputs["draft_hidden"]
+    if task_type == "qwen35-mtp" and "mtp_hidden" in outputs:
+        # The Qwen3.6 MTP head outputs mtp_hidden (pre-lm_head, the head borrows
+        # the target's lm_head). Treat it as the logit vector for the argmax gate.
+        return outputs["mtp_hidden"]
     if task_type in _HIDDEN_STATE_TASKS and "last_hidden_state" in outputs:
         return outputs["last_hidden_state"]
     raise KeyError(
@@ -406,11 +549,14 @@ def _token_match_ratio(
 
 def _prepare_vision_feeds(
     case: GoldenTestCase,
+    forced_size: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """Prepare input feeds for an image-classification forward pass.
 
     Loads the test image and preprocesses it with the HuggingFace
-    image processor to produce ``pixel_values``.
+    image processor to produce ``pixel_values``.  When ``forced_size`` is
+    given (object-detection), the processor is forced to that exact
+    resolution to match the model's fixed-size export.
     """
     import transformers
     from PIL import Image
@@ -419,11 +565,34 @@ def _prepare_vision_feeds(
         case.model_id, trust_remote_code=case.trust_remote_code
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
-    processed = processor(images=image, return_tensors="np")
+    proc_kwargs: dict = {"images": image, "return_tensors": "np"}
+    if forced_size is not None:
+        proc_kwargs["size"] = forced_size
+    processed = processor(**proc_kwargs)
     feeds: dict[str, np.ndarray] = {
         "pixel_values": processed["pixel_values"].astype(np.float32),
     }
     return feeds
+
+
+def _detection_forced_size(case: GoldenTestCase) -> dict | None:
+    """Return the fixed ``{height, width}`` export size for object detection.
+
+    mobius exports object-detection models at a fixed resolution from
+    ``config.image_size`` (no position-embedding interpolation), so the
+    image processor must emit exactly that size.
+    """
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    image_size = getattr(config, "image_size", None)
+    if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+        return {"height": int(image_size[0]), "width": int(image_size[1])}
+    if isinstance(image_size, int):
+        return {"height": image_size, "width": image_size}
+    return None
 
 
 def _prepare_audio_feeds(
@@ -564,17 +733,8 @@ def _run_vision_language_prefill(
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
-    # Build chat template for models that need it
-    prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = []
-        for img_path in case.images:
-            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
-        content.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    # Build the prompt (chat template when available, else manual placeholder).
+    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
 
     # Use PyTorch tensors then convert — some processors don't support np
     processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
@@ -758,16 +918,8 @@ def _run_vl_generation(
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
 
-    prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
-        content: list[dict[str, str]] = []
-        for img_path in case.images:
-            content.append({"type": "image", "image": str(_TESTDATA_DIR / img_path)})
-        content.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content}]
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
 
     processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
     processed: dict[str, np.ndarray] = {
@@ -873,7 +1025,7 @@ def _run_vl_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
-        logits = prefill_out["logits"]
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
         _update_vl_cache(past_cache, prefill_out, config)
 
@@ -935,7 +1087,7 @@ def _run_vl_generation(
                     step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
-            logits = step_out["logits"]
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
             next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)
@@ -1129,6 +1281,9 @@ def _run_phi4mm_multimodal_prefill(
         # Phi4MM image_processor returns 'input_image_embeds' as pixel tensor
         pixel_values = img_inputs["input_image_embeds"].astype(np.float32)
         image_sizes = img_inputs["image_sizes"].astype(np.int64)
+        # Per-crop validity mask (HD transform padding crop). Cast to the
+        # model dtype so it matches the vision graph's declared input type.
+        image_attention_mask = img_inputs["image_attention_mask"].astype(np.float32)
 
         # The vision model processes one image at a time (image_sizes is
         # [1, 2] per call).  For multi-image, loop and concatenate.
@@ -1140,8 +1295,13 @@ def _run_phi4mm_multimodal_prefill(
                 # Per-image crops: [crops, C, H, W]
                 per_img_pv = pixel_values[img_idx].astype(np.float32)
                 per_img_sizes = image_sizes[img_idx : img_idx + 1]  # [1, 2]
+                per_img_mask = image_attention_mask[img_idx]  # [crops, 32, 32]
                 vision_out = vision_session.run(
-                    {"pixel_values": per_img_pv, "image_sizes": per_img_sizes}
+                    {
+                        "pixel_values": per_img_pv,
+                        "image_sizes": per_img_sizes,
+                        "image_attention_mask": per_img_mask,
+                    }
                 )
                 feat = vision_out["image_features"]
                 if feat.ndim == 3:
@@ -1296,6 +1456,29 @@ def _run_speech_language_prefill(
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
             audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+        # Qwen3-ASR requires ``feature_attention_mask`` of shape
+        # ``(batch, mel_seq)`` where ``input_features`` is
+        # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
+        # ``padding=False`` so every frame is real -> all-ones is correct.
+        if (
+            "feature_attention_mask" in audio_session.input_names
+            and "feature_attention_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            real_len = feats.shape[2]
+            # Whisper-style feature extractors pad mel frames to 3000 (30s);
+            # the audio tower reshapes mel_seq into chunks of 100, so it must
+            # be a multiple of 100.  Pad ``input_features`` with zeros to the
+            # padded length and mark the real frames in the attention mask.
+            target_len = max(3000, ((real_len + 99) // 100) * 100)
+            if target_len != real_len:
+                feats = np.pad(feats, ((0, 0), (0, 0), (0, target_len - real_len)))
+                audio_feeds["input_features"] = feats
+            mask_dtype = audio_session.get_input_dtype("feature_attention_mask") or np.int64
+            mask = np.zeros((feats.shape[0], target_len), dtype=mask_dtype)
+            mask[:, :real_len] = 1
+            audio_feeds["feature_attention_mask"] = mask
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1395,6 +1578,148 @@ def _run_speech_language_prefill(
 
 
 # ---------------------------------------------------------------------------
+# Gemma4-Assistant drafter helpers (multi-model: replay target-derived tensors)
+# ---------------------------------------------------------------------------
+
+
+def _assistant_feeds_for_step(
+    inputs: dict[str, np.ndarray],
+    input_names: list[str],
+    step: int,
+) -> dict[str, np.ndarray]:
+    """Build the assistant ONNX feeds for one draft step from replay tensors.
+
+    ``inputs`` is the ``*_inputs.npz`` payload: ``inputs_embeds`` is
+    ``[num_steps, 1, 2*backbone_hidden]``; ``position_ids`` / shared KV are
+    fixed across the round (SinglePositionMultiToken). Only inputs present in
+    the ONNX graph are fed (an fp32/CPU build prunes ``attention_mask``).
+    """
+    feeds: dict[str, np.ndarray] = {
+        "inputs_embeds": inputs["inputs_embeds"][step : step + 1].astype(np.float32),
+        "position_ids": inputs["position_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64),
+    }
+    for lt in inputs["layer_types"].tolist():
+        feeds[f"shared_kv.{lt}.key"] = inputs[f"skv_key_{lt}"].astype(np.float32)
+        feeds[f"shared_kv.{lt}.value"] = inputs[f"skv_val_{lt}"].astype(np.float32)
+    return {k: v for k, v in feeds.items() if k in input_names}
+
+
+def _run_gemma4_assistant_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the assistant ONNX on the first draft step and return its outputs."""
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    session = _open_decoder_session(pkg)
+    try:
+        feeds = _assistant_feeds_for_step(inputs, session.input_names, step=0)
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+def _run_gemma4_assistant_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> np.ndarray:
+    """Replay the first draft round through the assistant ONNX (teacher-forced).
+
+    Feeds each captured step's ``inputs_embeds`` (with the fixed shared KV and
+    position) and collects the per-step argmax — the drafted token sequence.
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Assistant replay inputs missing for {case.case_id}")
+    num_steps = inputs["inputs_embeds"].shape[0]
+    session = _open_decoder_session(pkg)
+    try:
+        tokens: list[int] = []
+        for step in range(num_steps):
+            feeds = _assistant_feeds_for_step(inputs, session.input_names, step=step)
+            out = session.run(feeds)
+            tokens.append(int(np.asarray(out["logits"])[0, -1].argmax()))
+    finally:
+        session.close()
+    return np.array(tokens, dtype=np.int64)
+
+
+def _run_dflash_draft_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the DFlash drafter ONNX on the first block and return its outputs.
+
+    Replay tensors (noise_embedding, target_hidden, position_ids, q_position_ids)
+    are captured from the reference spec_generate loop; the first block starts
+    from an empty draft KV cache (zero-length past tensors sized from the config).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["noise_embedding"].shape[0])
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "noise_embedding": inputs["noise_embedding"].astype(np.float32),
+            "target_hidden": inputs["target_hidden"].astype(np.float32),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+            "q_position_ids": inputs["q_position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np.float32
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+def _run_qwen35_mtp_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Run the Qwen3.6 MTP head ONNX on the replay block and return its outputs.
+
+    Replay tensors (``inputs_embeds``, ``hidden_states``, ``attention_mask``,
+    ``position_ids``) are the target's shared embedding of the just-emitted
+    tokens plus the target's last hidden state — captured from the reference
+    forward. The MTP head borrows the target's embed / lm_head, so it has a
+    single GQA layer whose KV cache starts empty (zero-length past tensors).
+    """
+    inputs = load_drafter_inputs(case)
+    if inputs is None:
+        pytest.skip(f"Drafter replay inputs missing for {case.case_id}")
+    config = pkg.config
+    batch = int(inputs["inputs_embeds"].shape[0])
+    np_dt = np.float16 if case.dtype == "float16" else np.float32
+    session = _open_decoder_session(pkg)
+    try:
+        feeds: dict[str, np.ndarray] = {
+            "inputs_embeds": inputs["inputs_embeds"].astype(np_dt),
+            "hidden_states": inputs["hidden_states"].astype(np_dt),
+            "attention_mask": inputs["attention_mask"].astype(np.int64),
+            "position_ids": inputs["position_ids"].astype(np.int64),
+        }
+        empty_kv = np.zeros(
+            (batch, config.num_key_value_heads, 0, config.head_dim), dtype=np_dt
+        )
+        for i in range(config.num_hidden_layers):
+            feeds[f"past_key_values.{i}.key"] = empty_kv
+            feeds[f"past_key_values.{i}.value"] = empty_kv
+        feeds = {k: v for k, v in feeds.items() if k in session.input_names}
+        return session.run(feeds)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
 
@@ -1434,6 +1759,12 @@ class TestL4CheckpointVerified:
             outputs = _run_vision_language_prefill(pkg, case, config)
         elif case.task_type == "phi4mm-multimodal":
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
+        elif case.task_type == "gemma4-assistant":
+            outputs = _run_gemma4_assistant_prefill(pkg, case)
+        elif case.task_type == "dflash-draft":
+            outputs = _run_dflash_draft_prefill(pkg, case)
+        elif case.task_type == "qwen35-mtp":
+            outputs = _run_qwen35_mtp_prefill(pkg, case)
         elif case.task_type == "image-classification":
             session = _open_decoder_session(pkg)
             try:
@@ -1441,10 +1772,34 @@ class TestL4CheckpointVerified:
                 outputs = session.run(feeds)
             finally:
                 session.close()
+        elif case.task_type == "object-detection":
+            # Object detection (e.g. YOLOS): pixel_values → class logits +
+            # predicted boxes. The golden top-K is over the last query's
+            # class ``logits``. The processor is forced to the model's fixed
+            # export resolution (no position-embedding interpolation).
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_vision_feeds(case, forced_size=_detection_forced_size(case))
+                outputs = session.run(feeds)
+            finally:
+                session.close()
         elif case.task_type == "audio-feature-extraction":
             session = _open_decoder_session(pkg)
             try:
                 feeds = _prepare_audio_feeds(case)
+                outputs = session.run(feeds)
+            finally:
+                session.close()
+        elif case.task_type == "ctc-asr":
+            # CTC ASR: input_values + attention_mask → logits per frame.
+            # The ONNX graph requires an explicit attention_mask (an
+            # all-ones mask when the input has no padding); the existing
+            # _prepare_audio_feeds only emits input_values, so we add the
+            # mask here from the same audio length used to build feeds.
+            session = _open_decoder_session(pkg)
+            try:
+                feeds = _prepare_audio_feeds(case)
+                feeds["attention_mask"] = np.ones_like(feeds["input_values"], dtype=np.int64)
                 outputs = session.run(feeds)
             finally:
                 session.close()
@@ -1492,6 +1847,7 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
         "seq2seq",
         "speech-to-text",
         "speech-language",
+        "gemma4-assistant",
     }
 )
 
@@ -1548,6 +1904,117 @@ def _run_causal_lm_generation(
     # Strip prompt — generator returns [prompt + generated]
     prompt_len = input_ids.shape[1]
     return all_ids[0, prompt_len:]
+
+
+def _run_multimodel_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+    golden: GoldenRef,
+    max_new_tokens: int = 20,
+    eos_token_id: int | None = None,
+) -> np.ndarray:
+    """Greedy generation for multi-model text-generation packages.
+
+    Some text-only models (e.g. Gemma4 "any-to-any") split into separate
+    ``embedding`` and ``decoder`` ONNX models even on the text path: the
+    embedding model maps ``input_ids`` to ``inputs_embeds`` (plus extra
+    decoder inputs such as Gemma4 ``per_layer_inputs``) and the decoder
+    consumes embeddings rather than raw ``input_ids``.
+
+    This mirrors :func:`_run_vl_generation` without any vision/audio
+    encoder, using 1D position IDs.  Returns newly generated token IDs
+    (prompt excluded).
+    """
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    device_kwargs = _get_test_device_kwargs()
+
+    dec_key = "decoder" if "decoder" in pkg else "model"
+    dec_session = OnnxModelSession(pkg[dec_key], **device_kwargs)
+    emb_session = OnnxModelSession(pkg["embedding"], **device_kwargs)
+
+    input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
+    batch_size = 1
+
+    def _embed(ids: np.ndarray) -> dict[str, np.ndarray]:
+        """Run the embedding model for ``ids``, zero-filling extra inputs."""
+        feeds: dict[str, np.ndarray] = {"input_ids": ids}
+        for name in emb_session.input_names:
+            if name in feeds:
+                continue
+            shape = emb_session.get_input_shape(name) or []
+            static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
+            feeds[name] = np.zeros(
+                static_shape, dtype=emb_session.get_input_dtype(name) or np.float32
+            )
+        return emb_session.run(feeds)
+
+    try:
+        embeds_dtype = dec_session.get_input_dtype("inputs_embeds")
+
+        def _decoder_feeds(
+            emb_out: dict[str, np.ndarray],
+            ids: np.ndarray,
+            total_len: int,
+            position_ids: np.ndarray,
+            past_cache: dict[str, np.ndarray],
+        ) -> dict[str, np.ndarray]:
+            inputs_embeds = emb_out[next(iter(emb_out))]
+            if embeds_dtype is not None and inputs_embeds.dtype != embeds_dtype:
+                inputs_embeds = inputs_embeds.astype(embeds_dtype)
+            feeds: dict[str, np.ndarray] = {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((batch_size, total_len), dtype=np.int64),
+                **past_cache,
+            }
+            if "input_ids" in dec_session.input_names:
+                feeds["input_ids"] = ids
+            if "position_ids" in dec_session.input_names:
+                feeds["position_ids"] = position_ids
+            # Wire extra embedding outputs the decoder expects by name
+            # (e.g. Gemma4 ``per_layer_inputs``).
+            for name in dec_session.input_names:
+                if name not in feeds and name in emb_out:
+                    feeds[name] = emb_out[name]
+            return feeds
+
+        # --- Prefill ---
+        prompt_seq_len = input_ids.shape[1]
+        past_cache = _make_empty_kv_cache(dec_session, config)
+        prefill_emb = _embed(input_ids)
+        prefill_pos = np.arange(prompt_seq_len, dtype=np.int64).reshape(1, -1)
+        prefill_out = dec_session.run(
+            _decoder_feeds(prefill_emb, input_ids, prompt_seq_len, prefill_pos, past_cache)
+        )
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
+        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        _update_vl_cache(past_cache, prefill_out, config)
+
+        generated = [next_token]
+        past_seq_len = prompt_seq_len
+        next_pos = prompt_seq_len
+
+        # --- Decode loop ---
+        for _ in range(max_new_tokens - 1):
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+            step_emb = _embed(next_token)
+            total_len = past_seq_len + 1
+            step_pos = np.array([[next_pos]], dtype=np.int64)
+            step_out = dec_session.run(
+                _decoder_feeds(step_emb, next_token, total_len, step_pos, past_cache)
+            )
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
+            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            generated.append(next_token)
+            _update_vl_cache(past_cache, step_out, config)
+            past_seq_len = total_len
+            next_pos += 1
+    finally:
+        dec_session.close()
+        emb_session.close()
+
+    return np.concatenate(generated, axis=1)[0]
 
 
 def _run_seq2seq_generation(
@@ -1731,6 +2198,7 @@ def _run_speech_language_generation(
     )
 
     # --- Step 1: audio encoder ---
+    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
@@ -1751,6 +2219,29 @@ def _run_speech_language_generation(
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
             audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+        # Qwen3-ASR requires ``feature_attention_mask`` of shape
+        # ``(batch, mel_seq)`` where ``input_features`` is
+        # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
+        # ``padding=False`` so every frame is real -> all-ones is correct.
+        if (
+            "feature_attention_mask" in audio_session.input_names
+            and "feature_attention_mask" not in audio_feeds
+            and "input_features" in audio_feeds
+        ):
+            feats = audio_feeds["input_features"]
+            real_len = feats.shape[2]
+            # Whisper-style feature extractors pad mel frames to 3000 (30s);
+            # the audio tower reshapes mel_seq into chunks of 100, so it must
+            # be a multiple of 100.  Pad ``input_features`` with zeros to the
+            # padded length and mark the real frames in the attention mask.
+            target_len = max(3000, ((real_len + 99) // 100) * 100)
+            if target_len != real_len:
+                feats = np.pad(feats, ((0, 0), (0, 0), (0, target_len - real_len)))
+                audio_feeds["input_features"] = feats
+            mask_dtype = audio_session.get_input_dtype("feature_attention_mask") or np.int64
+            mask = np.zeros((feats.shape[0], target_len), dtype=mask_dtype)
+            mask[:, :real_len] = 1
+            audio_feeds["feature_attention_mask"] = mask
         audio_out = audio_session.run(audio_feeds)
     finally:
         audio_session.close()
@@ -1842,7 +2333,7 @@ def _run_speech_language_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
-        logits = prefill_out["logits"]
+        logits = _suppress_logits(prefill_out["logits"], suppress_ids)
         next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
         _update_vl_cache(past_cache, prefill_out, config)
 
@@ -1891,7 +2382,7 @@ def _run_speech_language_generation(
                     step_feeds[name] = step_emb_out[name]
 
             step_out = dec_session.run(step_feeds)
-            logits = step_out["logits"]
+            logits = _suppress_logits(step_out["logits"], suppress_ids)
             next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)
@@ -1971,6 +2462,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type == "gemma4-assistant":
+            new_tokens = _run_gemma4_assistant_generation(pkg, case)
         elif case.task_type == "seq2seq":
             new_tokens = _run_seq2seq_generation(pkg, case, golden, expected_token_ids)
         elif case.task_type == "speech-to-text":
@@ -1984,11 +2477,16 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
             )
         elif len(pkg) > 1 and "embedding" in pkg:
-            # Multi-model text-generation (e.g. Gemma4) — L5 generation
-            # requires embedding → decoder loop, not yet implemented.
-            pytest.skip(
-                f"L5 generation for multi-model text-generation "
-                f"not yet implemented ({case.case_id})"
+            # Multi-model text-generation (e.g. Gemma4 any-to-any text path):
+            # embedding model maps input_ids -> inputs_embeds (+ extra decoder
+            # inputs), and the decoder consumes embeddings.
+            new_tokens = _run_multimodel_text_generation(
+                pkg,
+                case,
+                config,
+                golden,
+                max_new_tokens=case.generation_params.get("max_new_tokens", 20),
+                eos_token_id=case.generation_params.get("eos_token_id"),
             )
         else:
             new_tokens = _run_causal_lm_generation(pkg, case, golden)

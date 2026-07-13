@@ -38,6 +38,8 @@ from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
 from mobius.components import (
     MLP,
     ClippableLinear,
+    Embedding,
+    LayerNorm,
     Linear,
     RMSNorm,
     create_attention_bias,
@@ -51,6 +53,21 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
+
+
+def _dtype_safe_compress(
+    op: OpBuilder, data: ir.Value, condition: ir.Value, *, axis: int
+) -> ir.Value:
+    """Row-select ``data`` by ``condition`` in a dtype that ORT supports.
+
+    ORT does not register a ``Compress`` kernel for ``bfloat16``, so a bf16
+    package would fail to load. Run the selection in float32 and cast the
+    result back to ``data``'s dtype. The float16/bfloat16 round-trip through
+    float32 is lossless, so this is exact for every supported build dtype.
+    """
+    data_f32 = op.Cast(data, to=ir.DataType.FLOAT)
+    selected = op.Compress(data_f32, condition, axis=axis)
+    return op.CastLike(selected, data)
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +724,7 @@ class Gemma4TextAttention(nn.Module):
         position_embeddings: tuple | None = None,
         shared_kv_states: dict | None = None,
         past_key_value: tuple | None = None,
+        is_causal: int = 1,
     ):
         from mobius.components._attention import (
             GQAContext,
@@ -784,16 +802,32 @@ class Gemma4TextAttention(nn.Module):
                     **gqa_attrs,
                 )
             else:
-                # Fallback Attention path: transpose shared KV from BNSH to 3D.
-                # present_key/value from the ONNX Attention op is 4D:
-                #   [batch, kv_heads, total_seq, head_dim]
-                # The Attention op expects key/value as 3D:
-                #   [batch, total_seq, kv_heads * head_dim]
+                # Fallback Attention path (non-GQA / CPU-style graphs).
+                #
+                # The shared K,V buffer is the source layer's present K/V, 4D
+                # BNSH [batch, kv_heads, kv_len, head_dim], and already contains
+                # the FULL sequence (with RoPE applied).  Transpose it to the 3D
+                # layout the Attention op expects:
+                #   [batch, kv_len, kv_heads * head_dim].
                 src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
                 src_key = op.Reshape(src_key, [0, 0, -1])
                 src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
                 src_value = op.Reshape(src_value, [0, 0, -1])
 
+                # IMPORTANT: pass is_causal=0 here, NOT the caller's is_causal.
+                #
+                # We feed the FULL shared sequence as key/value with no past, so
+                # q_len < kv_len during decode.  ``attention_bias`` from
+                # ``create_attention_bias`` already bakes in the complete
+                # bottom-right causal (+ sliding + padding) mask, so causality is
+                # fully handled by the bias.  If we ALSO set is_causal=1 the
+                # Attention op applies its own built-in causal mask on top — and
+                # for q_len < kv_len the two EPs disagree on its alignment (per
+                # the ONNX spec is_causal is UPPER-LEFT aligned: CUDA follows the
+                # spec and a single decode query attends only to kv[0], while the
+                # CPU EP bottom-right aligns).  That double-masking is what made
+                # gemma4 decode diverge on CUDA.  Relying solely on the float
+                # bias (is_causal=0) is correct and identical on CPU and CUDA.
                 attn_output, present_key, present_value = _apply_attention(
                     op,
                     query_states,
@@ -806,6 +840,7 @@ class Gemma4TextAttention(nn.Module):
                     num_key_value_heads=self.num_key_value_heads,
                     scale=self.scaling,
                     softcap=self.softcap,
+                    is_causal=0,
                 )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
@@ -928,6 +963,7 @@ class Gemma4TextAttention(nn.Module):
                 num_key_value_heads=self.num_key_value_heads,
                 scale=self.scaling,
                 softcap=self.softcap,
+                is_causal=is_causal,
             )
 
             # Source layers store K,V for downstream KV-shared layers.
@@ -1136,6 +1172,7 @@ class Gemma4DecoderLayer(nn.Module):
         shared_kv_states: dict,
         per_layer_input: ir.Value | None,
         past_key_value: tuple | None,
+        is_causal: int = 1,
     ):
         # Attention block: pre-norm -> attn -> post-norm -> residual
         residual = hidden_states
@@ -1147,6 +1184,7 @@ class Gemma4DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             shared_kv_states=shared_kv_states,
             past_key_value=past_key_value,
+            is_causal=is_causal,
         )
         hidden_states = self.post_attention_layernorm(op, attn_output)
         hidden_states = op.Add(residual, hidden_states)
@@ -1367,6 +1405,62 @@ class Gemma4DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _compute_block_sequence_ids(
+    op: OpBuilder,
+    input_ids: ir.Value,
+    *,
+    image_token_id: int,
+) -> ir.Value:
+    """Compute Gemma4 ``block_sequence_ids`` [B, S] from ``input_ids``.
+
+    Mirrors HuggingFace ``get_block_sequence_ids_for_mask``: each contiguous
+    run of image placeholder tokens gets a unique, monotonically increasing
+    block id (``>= 0``); every other position (text **and audio**) gets ``-1``.
+    Tokens within the same block may attend to each other bidirectionally.
+
+    Only image tokens form blocks. HF derives ``is_vision`` from
+    ``mm_token_type_ids`` as ``(== 1) | (== 2)`` (image or video); audio is
+    token-type ``3`` and is deliberately excluded, so audio placeholders keep
+    plain causal attention. gemma4_unified has no video modality, so this
+    reduces to image tokens alone.
+
+    A new block starts only on a non-image -> image transition.
+
+    Returns an INT64 tensor of shape ``[B, S]``.
+    """
+    # is_vision [B, S] BOOL: token is an image placeholder. Audio tokens are
+    # intentionally NOT included (HF block mask covers image/video only).
+    is_vision = op.Equal(input_ids, op.Constant(value_int=image_token_id))
+
+    # is_prev_vision: is_vision shifted right by one along the sequence axis,
+    # with position 0 forced to False. Implemented without ConstantOfShape
+    # (which blocks ONNX shape inference): left-pad the int mask with one
+    # zero column, then drop the last column.
+    is_vision_int = op.Cast(is_vision, to=ir.DataType.INT64)
+    padded = op.Pad(
+        is_vision_int,
+        op.Constant(value_ints=[0, 1, 0, 0]),  # prepend 1 col on axis 1
+        op.Constant(value_int=0),
+    )  # [B, S + 1]
+    prev_int = op.Slice(
+        padded,
+        op.Constant(value_ints=[0]),
+        op.Constant(value_ints=[-1]),
+        op.Constant(value_ints=[1]),
+    )  # [B, S]
+    is_prev_vision = op.Cast(prev_int, to=ir.DataType.BOOL)
+
+    # new_vision_starts = is_vision AND NOT is_prev_vision
+    new_starts = op.And(is_vision, op.Not(is_prev_vision))
+    # vision_group_ids = cumsum(new_starts) - 1  (along sequence axis)
+    group_ids = op.Sub(
+        op.CumSum(op.Cast(new_starts, to=ir.DataType.INT64), op.Constant(value_int=1)),
+        op.Constant(value_int=1),
+    )
+    # block_sequence_ids = where(is_vision, group_ids, -1)
+    return op.Where(is_vision, group_ids, op.Constant(value_int=-1))
+
+
 class Gemma4TextModel(nn.Module):
     """Gemma4 text transformer with hybrid local/global attention.
 
@@ -1384,6 +1478,7 @@ class Gemma4TextModel(nn.Module):
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
+        self.config = config
         self._dtype = config.dtype
 
         embed_scale = math.sqrt(config.hidden_size)
@@ -1402,6 +1497,21 @@ class Gemma4TextModel(nn.Module):
             )
         self.layer_types = layer_types
         self.sliding_window = config.sliding_window
+        # Bidirectional attention mode (None | "vision"). When "vision",
+        # contiguous image-token blocks attend bidirectionally; the overlay is
+        # derived from input_ids at runtime via ``block_sequence_ids`` and forces
+        # the float-bias attention path (``is_causal=0``). HF also defines an
+        # "all" mode (every token bidirectional, no causal mask); it is not used
+        # by any supported Gemma4 checkpoint and not implemented here, so reject
+        # it explicitly rather than silently falling back to causal attention.
+        if config.use_bidirectional_attention not in (None, "vision"):
+            raise NotImplementedError(
+                "Gemma4 use_bidirectional_attention="
+                f"{config.use_bidirectional_attention!r} is not supported; only "
+                "None (fully causal) and 'vision' (image-block bidirectional) "
+                "are implemented."
+            )
+        self._use_bidirectional_attention = config.use_bidirectional_attention
 
         # Local (sliding window) config — full rotation, local rope_theta
         local_config = dataclasses.replace(
@@ -1438,19 +1548,41 @@ class Gemma4TextModel(nn.Module):
         self._per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         self._hidden_size = config.hidden_size
         self._image_token_id: int = config.image_token_id or 0
+        # The vision-block overlay keys on image_token_id. A 0/None id means the
+        # model has no image-placeholder token (e.g. the text-only backbone
+        # split), so no image tokens can appear — keep pure causal attention
+        # (GQA-eligible) and never build the overlay. This also avoids the
+        # footgun of a 0 fallback marking real token-0 positions as vision.
+        self._has_image_token: bool = bool(config.image_token_id)
         self._audio_token_id: int | None = (
             config.audio.audio_token_id if config.audio is not None else None
         )
         if self._per_layer_dim:
             self._num_layers = config.num_hidden_layers
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-            # Single fused [V, L*D] table. Requires ORT >= 1.27 for CUDA
-            # Gather int64 index support (onnxruntime#28107).
+            # Fused [V, L*D] table — used when split_per_layer_embedding is False.
+            # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
             self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 config.pad_token_id,
                 embed_scale=float(self._per_layer_dim**0.5),
+            )
+            # Split [V, D] tables — used when split_per_layer_embedding is True
+            # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
+            # 256 MiB limit; ~128 MiB each vs ~4.7 GB fused).
+            # Only the table actually called in forward() is realized as an
+            # ONNX initializer, so the unused one adds no graph weight.
+            self.embed_tokens_per_layer_split = nn.ModuleList(
+                [
+                    Gemma3TextScaledWordEmbedding(
+                        vocab_per_layer,
+                        self._per_layer_dim,
+                        config.pad_token_id,
+                        embed_scale=float(self._per_layer_dim**0.5),
+                    )
+                    for _ in range(self._num_layers)
+                ]
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -1490,17 +1622,26 @@ class Gemma4TextModel(nn.Module):
                 masked_ids,
             )
 
-        fused_emb = self.embed_tokens_per_layer(op, masked_ids)
-        fused_emb = op.Reshape(
-            fused_emb,
-            op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
-        )
+        if self.config.split_per_layer_embedding:
+            # L separate Gathers on [V, D] tables — each fits within the EP's
+            # max_buffer_size (e.g. WebGPU's 256 MiB limit).
+            per_layer_embs = [
+                op.Unsqueeze(self.embed_tokens_per_layer_split[i](op, masked_ids), [2])
+                for i in range(self._num_layers)
+            ]
+            fused_emb = op.Concat(*per_layer_embs, axis=2)  # [B, S, L, D]
+        else:
+            fused_emb = self.embed_tokens_per_layer(op, masked_ids)
+            fused_emb = op.Reshape(
+                fused_emb,
+                op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
+            )
 
         combined = op.Add(proj, fused_emb)
         combined = op.Mul(combined, float(0.5**0.5))
 
         return [
-            op.Squeeze(op.Slice(combined, starts=[i], ends=[i + 1], axes=[2]), [2])
+            op.Gather(combined, op.Constant(value_int=i), axis=2)
             for i in range(self._num_layers)
         ]
 
@@ -1513,6 +1654,7 @@ class Gemma4TextModel(nn.Module):
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
         per_layer_inputs: ir.Value | None = None,
+        block_sequence_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -1547,11 +1689,52 @@ class Gemma4TextModel(nn.Module):
 
         caps = ep_capabilities()
         dtype = get_build_dtype()
+
+        # Bidirectional vision-block overlay (Gemma4 larger models). When
+        # active, contiguous vision-token blocks attend bidirectionally on
+        # BOTH full and sliding layers. This cannot be expressed by the
+        # GroupQueryAttention op (causal / local-window only), so we force
+        # the float-bias Attention path with ``is_causal=0`` and bake the
+        # full mask (causal + sliding + padding + blockwise OR) into the bias.
+        #
+        # ``block_sequence_ids`` [B, S] identifies contiguous image token
+        # blocks. It is derived from ``input_ids`` (image token spans only;
+        # audio keeps causal attention, matching HF). In the multimodal
+        # 3/4-model split the decoder receives ``input_ids`` alongside
+        # ``inputs_embeds`` and computes the overlay here, so it does not need a
+        # separate cross-model tensor (onnxruntime-genai forwards ``input_ids``
+        # to the decoder but cannot forward an arbitrary int tensor). When a
+        # caller supplies ``block_sequence_ids`` directly it is used as-is.
+        #
+        # Trade-off: the overlay is a *static* graph choice — once a model is
+        # built with ``use_bidirectional_attention == "vision"`` the decoder
+        # always takes the float-bias (``is_causal=0``) path and forgoes GQA,
+        # for text-only prompts and every decode step too. This is unavoidable
+        # in a single static graph: image-token presence is data-dependent at
+        # runtime, and the same graph serves both image prefill and text decode.
+        # It stays numerically correct everywhere — when there are no image
+        # tokens the block ids are all ``-1`` and the ``q_group >= 0`` guard in
+        # ``create_attention_bias`` makes the overlay a pure no-op (plain causal,
+        # matching HuggingFace). Only the fused/GQA fast path is given up.
+        bidirectional = self._use_bidirectional_attention == "vision" and self._has_image_token
+        if bidirectional and block_sequence_ids is None and input_ids is not None:
+            block_sequence_ids = _compute_block_sequence_ids(
+                op,
+                input_ids,
+                image_token_id=self._image_token_id,
+            )
+        use_block_overlay = bidirectional and block_sequence_ids is not None
+
         use_gqa = (
             attention_mask is not None
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
+            and not use_block_overlay
         )
+        # When the blockwise overlay is active the Attention op must NOT
+        # re-apply its built-in causal mask (it would cancel the
+        # future-position unmasking baked into the float bias).
+        attn_is_causal = 0 if use_block_overlay else 1
 
         if use_gqa:
             # Calling forward() on the RoPE modules materializes their
@@ -1564,17 +1747,25 @@ class Gemma4TextModel(nn.Module):
             # seqlens_k[b] = sum(attention_mask[b]) - 1  (last valid KV idx)
             # total_seq_len = attention_mask.shape[1]     (past + current)
             one_i32 = op.Constant(value_int=1)
+            reduce_sum = op.ReduceSum(attention_mask, [1], keepdims=0)
             seqlens_k = op.Cast(
-                op.Sub(
-                    op.ReduceSum(attention_mask, [1], keepdims=0),
-                    one_i32,
-                ),
+                op.Sub(reduce_sum, one_i32),
                 to=ir.DataType.INT32,
             )
-            total_seq_len = op.Cast(
-                op.Gather(op.Shape(attention_mask), 1),
-                to=ir.DataType.INT32,
-            )
+            if caps.requires_graph_capture_rewrite:
+                # Support graph capture for shared-KV layer models on WebGPU EP.
+                # Derive total_seq_len from reduce_sum (already computed) as a
+                # scalar INT32 via Gather index 0 (valid because graph capture
+                # requires batch=1).
+                total_seq_len = op.Gather(
+                    op.Cast(reduce_sum, to=ir.DataType.INT32),
+                    op.Constant(value_int=0),
+                )
+            else:
+                total_seq_len = op.Cast(
+                    op.Gather(op.Shape(attention_mask), 1),
+                    to=ir.DataType.INT32,
+                )
 
             # Per-layer-type GQA contexts with appropriate cos/sin caches
             # and local_window_size for sliding layers.
@@ -1615,12 +1806,14 @@ class Gemma4TextModel(nn.Module):
                     attention_mask=attention_mask,
                     sliding_window=self.sliding_window,
                     dtype=self._dtype,
+                    block_sequence_ids=block_sequence_ids if use_block_overlay else None,
                 ),
                 "full_attention": create_attention_bias(
                     op,
                     input_ids=query_input,
                     attention_mask=attention_mask,
                     dtype=self._dtype,
+                    block_sequence_ids=block_sequence_ids if use_block_overlay else None,
                 ),
             }
             fallback_pos_dict = position_embeddings_dict
@@ -1666,6 +1859,7 @@ class Gemma4TextModel(nn.Module):
                 shared_kv_states=shared_kv_states,
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
+                is_causal=attn_is_causal,
             )
             # KV-shared layers borrow K,V from source layers — exclude from
             # present_key_values so the output has exactly num_kv_layers entries.
@@ -1743,6 +1937,7 @@ class Gemma4CausalLMModel(CausalLMModel):
                 state_dict.pop(key, None)
         # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
         # to our fused embedding table — no splitting needed.
+        # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(state_dict, self.config)
         return super().preprocess_weights(state_dict)
@@ -1776,15 +1971,22 @@ class _Gemma4DecoderModel(nn.Module):
         position_ids: ir.Value,
         per_layer_inputs: ir.Value | None = None,
         past_key_values: list | None = None,
+        block_sequence_ids: ir.Value | None = None,
+        input_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
+        # ``input_ids`` is forwarded alongside ``inputs_embeds`` so the text
+        # model can derive the bidirectional vision-block overlay internally
+        # (see Gemma4TextModel.forward). ``inputs_embeds`` still takes
+        # precedence for the actual token embeddings.
         hidden_states, present_key_values = self.model(
             op,
-            input_ids=None,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
+            block_sequence_ids=block_sequence_ids,
         )
         logits = self.lm_head(op, hidden_states)
         # Gemma4 applies final logit soft-capping: logit_cap * tanh(x / logit_cap)
@@ -1799,7 +2001,23 @@ class _Gemma4DecoderModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        return vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
+        per_layer_dim = self.config.hidden_size_per_layer_input
+        if per_layer_dim and self.config.split_per_layer_embedding:
+            fused_key = "model.embed_tokens_per_layer.weight"
+            if fused_key in state_dict:
+                num_layers = self.config.num_hidden_layers
+                fused = state_dict.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    state_dict[f"model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+        return state_dict
 
 
 class _Gemma4VisionEncoderModel(nn.Module):
@@ -1982,7 +2200,17 @@ class Gemma4EmbeddingModel(nn.Module):
         input_ids: ir.Value,
         image_features: ir.Value,
         audio_features: ir.Value | None = None,
-    ) -> ir.Value | tuple[ir.Value, ir.Value]:
+    ) -> dict[str, ir.Value]:
+        """Return a dict of named embedding outputs.
+
+        Always contains ``inputs_embeds``. Contains ``per_layer_inputs`` when
+        ``hidden_size_per_layer_input > 0``.
+
+        The vision-block bidirectional attention overlay is NOT emitted here:
+        the decoder derives it from ``input_ids`` directly (see
+        ``Gemma4TextModel.forward``), which avoids a cross-model tensor that
+        onnxruntime-genai cannot forward between sub-models.
+        """
         # [B, S] → [B, S, hidden]
         hidden = self.embed_tokens(op, input_ids)
 
@@ -2001,8 +2229,16 @@ class Gemma4EmbeddingModel(nn.Module):
                 op, hidden, input_ids, self.audio_token_id, audio_features
             )
 
+        outputs: dict[str, ir.Value] = {"inputs_embeds": hidden}
+
         if not self._per_layer_dim:
-            return hidden
+            return outputs
+
+        # When split_per_layer_embedding is set, the per-layer computation runs
+        # inside the decoder using split [V, D] tables.  The embedding model only
+        # emits inputs_embeds in that case.
+        if self.config.split_per_layer_embedding:
+            return outputs
 
         # Compute per-layer input embeddings (moved from the decoder).
         # 1. Project hidden states → [B, S, L*D] and scale by hidden_size**-0.5
@@ -2046,8 +2282,9 @@ class Gemma4EmbeddingModel(nn.Module):
             combined,
             op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
         )
+        outputs["per_layer_inputs"] = per_layer_inputs
 
-        return hidden, per_layer_inputs
+        return outputs
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -2132,6 +2369,256 @@ class _Gemma4AudioEncoderModel(nn.Module):
         audio_features = op.CastLike(op.Div(x_f32, rms), audio_features)
         # → projector → [B, T//4, text_hidden_size]
         return self.projector(op, audio_features), downsampled_mask
+
+
+# ---------------------------------------------------------------------------
+# gemma4_unified (gemma-4-12B) encoder-free vision / audio embedders
+# ---------------------------------------------------------------------------
+
+
+class _F32Linear(Linear):
+    """Linear that computes its MatMul in float32 regardless of model dtype.
+
+    Used by the gemma4_unified vision embedder's ``patch_dense`` projection
+    **only when the model dtype is float16**, whose output magnitude (~77000)
+    exceeds the float16 range (65504). The weights are stored in the model dtype;
+    activations and weights are upcast to float32 for the MatMul so the result
+    does not overflow to +inf. The output stays float32 (the following
+    ``_F32LayerNorm`` normalizes it back into a float16-safe range). bfloat16 and
+    float32 models have the range natively and use a plain :class:`Linear`.
+    """
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        w_t = op.Cast(
+            op.Transpose(self.weight, perm=[1, 0]), to=ir.DataType.FLOAT
+        )  # [in_features, out_features]
+        result = op.MatMul(op.Cast(x, to=ir.DataType.FLOAT), w_t)
+        if self.bias is not None:
+            result = op.Add(result, op.Cast(self.bias, to=ir.DataType.FLOAT))
+        return result  # float32
+
+
+class _F32LayerNorm(LayerNorm):
+    """LayerNorm that computes in float32 and returns a float32 output.
+
+    Pairs with :class:`_F32Linear` in the gemma4_unified vision embedder, **only
+    for float16 models**, so the large (out-of-float16-range) ``patch_dense``
+    output is normalized in float32 before being cast back to the model dtype.
+    bfloat16 and float32 models use a plain :class:`LayerNorm`.
+    """
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        return op.LayerNormalization(
+            op.Cast(hidden_states, to=ir.DataType.FLOAT),
+            op.Cast(self.weight, to=ir.DataType.FLOAT),
+            op.Cast(self.bias, to=ir.DataType.FLOAT),
+            epsilon=self.eps,
+            axis=-1,
+        )  # float32
+
+
+class _Gemma4UnifiedVisionEmbedderModel(nn.Module):
+    """Encoder-free vision embedder for ``gemma4_unified`` (gemma-4-12B).
+
+    Unlike gemma4's SigLIP tower, the unified model has **no vision encoder**.
+    Raw merged pixel patches are projected directly into language-model space.
+
+    Replicates HF ``Gemma4UnifiedVisionEmbedder``:
+
+        patch_ln1 (LayerNorm, patch_dim)
+        → patch_dense (Linear patch_dim → mm_embed_dim)
+        → patch_ln2 (LayerNorm, mm_embed_dim)
+        → + factorized 2D positional embedding
+        → pos_norm (LayerNorm, mm_embed_dim)
+        → embedding_pre_projection_norm (scale-free RMSNorm)
+        → embedding_projection (Linear mm_embed_dim → text_hidden)
+
+    ``patch_dim = (patch_size * pooling_kernel_size)^2 * 3`` (48*48*3 = 6912).
+
+    Inputs:
+    - ``pixel_values [B, N, patch_dim]``: raw merged pixel patches.
+    - ``pixel_position_ids [B, N, 2]``: integer (x, y) patch coordinates;
+      ``(-1, -1)`` marks padding patch slots.
+
+    Output:
+    - ``image_features [num_valid_patches, text_hidden_size]``: padding
+      patches (position == -1) are stripped so the output rows align 1:1 with
+      image placeholder tokens in the text sequence (matches HF, which selects
+      ``vision_outputs[~padding_mask]``).
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        vc = config.vision  # VisionConfig populated by the gemma4_unified hook
+        patch_size = (vc.patch_size if vc else None) or 16
+        pooling = (vc.pooling_kernel_size if vc else None) or 3
+        model_patch_size = patch_size * pooling
+        patch_dim = 3 * model_patch_size * model_patch_size
+        mm_embed_dim = (vc.hidden_size if vc else None) or config.hidden_size
+        posemb_size = (vc.position_embedding_size if vc else None) or 1120
+        out_proj_dim = (vc.out_hidden_size if vc else None) or mm_embed_dim
+        eps = (vc.norm_eps if vc else None) or config.rms_norm_eps or 1e-6
+        self._text_hidden_size = config.hidden_size
+
+        self.patch_ln1 = LayerNorm(patch_dim, eps=eps)
+        # patch_dense produces activations whose magnitude (~77000, measured) is
+        # outside the float16 range (max 65504); HF runs this embedder in bfloat16
+        # (max ~3.4e38). Only float16 actually overflows, so we upcast the dense
+        # projection + the following LayerNorm to float32 *only* when the model
+        # dtype is float16. bfloat16 and float32 have the range natively and keep
+        # their dtype (matching HF for bfloat16). See _F32Linear / _F32LayerNorm.
+        if config.dtype == ir.DataType.FLOAT16:
+            self.patch_dense = _F32Linear(patch_dim, mm_embed_dim, bias=True)
+            self.patch_ln2 = _F32LayerNorm(mm_embed_dim, eps=eps)
+        else:
+            self.patch_dense = Linear(patch_dim, mm_embed_dim, bias=True)
+            self.patch_ln2 = LayerNorm(mm_embed_dim, eps=eps)
+        # Factorized 2D positional embedding: HF stores a single
+        # [posemb_size, 2, mm_embed_dim] table looked up per axis. We split it
+        # into two [posemb_size, mm_embed_dim] tables (x and y) in
+        # preprocess_weights so each axis is a plain Gather.
+        self.pos_emb_x = Embedding(posemb_size, mm_embed_dim)
+        self.pos_emb_y = Embedding(posemb_size, mm_embed_dim)
+        self.pos_norm = LayerNorm(mm_embed_dim, eps=eps)
+        # Scale-free RMSNorm before the projection (HF
+        # embed_vision.multimodal_embedder.embedding_pre_projection_norm).
+        # The projection consumes the post-position-norm activations, whose
+        # last dim is mm_embed_dim (HF embedding_projection: mm_embed_dim →
+        # text_hidden). out_proj_dim is retained only as a sanity check.
+        assert out_proj_dim == mm_embed_dim, (
+            "gemma4_unified vision projector expects output_proj_dims == "
+            f"mm_embed_dim, got {out_proj_dim} != {mm_embed_dim}"
+        )
+        self.projector_norm = _Gemma4ScaleFreeRMSNorm(mm_embed_dim, eps=eps)
+        # HF embed_vision.multimodal_embedder.embedding_projection (no bias).
+        self.projector = Linear(mm_embed_dim, config.hidden_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        pixel_position_ids: ir.Value,
+    ) -> ir.Value:
+        # Patch embedding: LN → Dense → LN.  [B, N, patch_dim] → [B, N, mm_embed_dim]
+        # For float16 models patch_dense + patch_ln2 run in float32 (see __init__
+        # and _F32Linear / _F32LayerNorm): the dense projection produces activations
+        # whose magnitude exceeds the float16 range (measured absmax ~77000 > 65504;
+        # HF runs this embedder in bfloat16), so an f16 intermediate would overflow
+        # to +inf and patch_ln2 would emit NaN. patch_ln2 normalizes the result back
+        # into a float16-safe range. For bfloat16 / float32 the projection stays in
+        # the model dtype and CastLike below is a no-op.
+        h = self.patch_ln1(op, pixel_values)
+        h = self.patch_dense(op, h)  # f16 model: f16 in → f32 out; else native dtype
+        h = self.patch_ln2(op, h)  # f16 model: f32 in → f32 out (normalized)
+        h = op.CastLike(h, pixel_values)  # back to the model dtype (no-op unless upcast)
+
+        # Factorized positional embedding.  Split (x, y) coords on the last axis.
+        x_ids = op.Gather(pixel_position_ids, op.Constant(value_int=0), axis=-1)  # [B, N]
+        y_ids = op.Gather(pixel_position_ids, op.Constant(value_int=1), axis=-1)  # [B, N]
+        # Padding patches carry -1: clamp to a valid index for the Gather, then
+        # zero their contribution via the validity mask.
+        zero = op.Constant(value_int=0)
+        clamped_x = op.Max(x_ids, zero)
+        clamped_y = op.Max(y_ids, zero)
+        neg_one = op.Constant(value_int=-1)
+        valid_x = op.Unsqueeze(
+            op.CastLike(op.Not(op.Equal(x_ids, neg_one)), h), [-1]
+        )  # [B, N, 1]
+        valid_y = op.Unsqueeze(op.CastLike(op.Not(op.Equal(y_ids, neg_one)), h), [-1])
+        pos_x = op.Mul(self.pos_emb_x(op, clamped_x), valid_x)  # [B, N, mm_embed_dim]
+        pos_y = op.Mul(self.pos_emb_y(op, clamped_y), valid_y)
+        h = op.Add(h, op.Add(pos_x, pos_y))
+        h = self.pos_norm(op, h)
+
+        # Scale-free RMSNorm → projection to text hidden size.
+        h = self.projector_norm(op, h)
+        h = self.projector(op, h)  # [B, N, text_hidden]
+
+        # Strip padding patches so output rows align 1:1 with placeholder tokens.
+        h_flat = op.Reshape(h, op.Constant(value_ints=[-1, self._text_hidden_size]))
+        keep = op.Reshape(
+            op.Not(op.Equal(x_ids, neg_one)), op.Constant(value_ints=[-1])
+        )  # [B*N] BOOL
+        return _dtype_safe_compress(op, h_flat, keep, axis=0)  # [num_valid, text_hidden]
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("vision_embedder.pos_embedding"):
+                # HF [posemb_size, 2, mm_embed_dim] → two [posemb_size, mm_embed_dim]
+                renamed["pos_emb_x.weight"] = value[:, 0, :].contiguous()
+                renamed["pos_emb_y.weight"] = value[:, 1, :].contiguous()
+            elif key.startswith("vision_embedder."):
+                renamed[key[len("vision_embedder.") :]] = value
+            elif key.startswith("embed_vision.embedding_projection."):
+                renamed["projector." + key[len("embed_vision.embedding_projection.") :]] = (
+                    value
+                )
+            # embed_vision.*.embedding_pre_projection_norm: scale-free, no weight.
+        return renamed
+
+
+class _Gemma4UnifiedAudioEmbedderModel(nn.Module):
+    """Encoder-free audio embedder for ``gemma4_unified`` (gemma-4-12B).
+
+    The unified model has **no Conformer audio tower**.  Raw waveform-frame
+    features are projected directly into language-model space.
+
+    Replicates HF ``Gemma4UnifiedMultimodalEmbedder`` (the ``embed_audio``
+    branch):
+
+        embedding_pre_projection_norm (scale-free RMSNorm, audio_embed_dim)
+        → embedding_projection (Linear audio_embed_dim → text_hidden)
+
+    Inputs:
+    - ``input_features [B, T, audio_embed_dim]``: raw waveform-frame features.
+    - ``input_features_mask [B, T]``: BOOL mask, ``True`` for valid frames.
+
+    Output:
+    - ``audio_features [num_valid_frames, text_hidden_size]``: padding frames
+      are stripped so output rows align 1:1 with audio placeholder tokens
+      (matches HF, which selects ``audio_features[audio_mask]``).
+    """
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        ac = config.audio  # Gemma4AudioConfig populated by the gemma4_unified hook
+        audio_embed_dim = (ac.hidden_size if ac else None) or 640
+        # Prefer the audio config's own eps; fall back to the text decoder's.
+        eps = (ac.rms_norm_eps if ac else None) or config.rms_norm_eps or 1e-6
+        self._text_hidden_size = config.hidden_size
+        # HF embed_audio.embedding_pre_projection_norm (scale-free RMSNorm).
+        self.projector_norm = _Gemma4ScaleFreeRMSNorm(audio_embed_dim, eps=eps)
+        # HF embed_audio.embedding_projection (no bias).
+        self.projector = Linear(audio_embed_dim, config.hidden_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_features: ir.Value,
+        input_features_mask: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value | None]:
+        # [B, T, audio_embed_dim] → scale-free RMSNorm → [B, T, text_hidden]
+        h = self.projector_norm(op, input_features)
+        h = self.projector(op, h)
+        if input_features_mask is None:
+            return h, None
+        # Strip padding frames so output rows align 1:1 with placeholder tokens.
+        h_flat = op.Reshape(h, op.Constant(value_ints=[-1, self._text_hidden_size]))
+        keep = op.Reshape(input_features_mask, op.Constant(value_ints=[-1]))  # [B*T]
+        return _dtype_safe_compress(op, h_flat, keep, axis=0), None  # [num_valid, text_hidden]
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("embed_audio.embedding_projection."):
+                renamed["projector." + key[len("embed_audio.embedding_projection.") :]] = value
+            # embed_audio.embedding_pre_projection_norm: scale-free, no weight.
+        return renamed
 
 
 # ---------------------------------------------------------------------------
@@ -2306,5 +2793,148 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
+        # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
+        # The per_layer_projection weights also live in the decoder (not embedding).
+        if self.config.split_per_layer_embedding:
+            fused_key = "embedding.embed_tokens_per_layer.weight"
+            if fused_key in renamed:
+                num_layers = self.config.num_hidden_layers
+                per_layer_dim = self.config.hidden_size_per_layer_input
+                fused = renamed.pop(fused_key)
+                assert fused.shape[1] == num_layers * per_layer_dim, (
+                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+                    f"got {fused.shape[1]}"
+                )
+                chunks = fused.chunk(num_layers, dim=1)
+                for i, chunk in enumerate(chunks):
+                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+            # Re-route the projection weights from embedding.* → decoder.model.*
+            for k in list(renamed.keys()):
+                if k.startswith(
+                    (
+                        "embedding.per_layer_model_projection.",
+                        "embedding.per_layer_projection_norm.",
+                    )
+                ):
+                    renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
+
+        return renamed
+
+
+# ---------------------------------------------------------------------------
+# Gemma4UnifiedModel — gemma-4-12B encoder-free multimodal model
+# ---------------------------------------------------------------------------
+
+
+class Gemma4UnifiedModel(nn.Module):
+    """Unified gemma-4-12B (``gemma4_unified``) multimodal model.
+
+    Encoder-free counterpart to :class:`Gemma4Model`: it shares the gemma4
+    text decoder and the multimodal-fusion embedding sub-model, but replaces
+    the SigLIP vision tower and Conformer audio tower with the lightweight
+    encoder-free embedders (:class:`_Gemma4UnifiedVisionEmbedderModel` and
+    :class:`_Gemma4UnifiedAudioEmbedderModel`).
+
+    Builds a 3- or 4-model package (built by :class:`~mobius.tasks.Gemma4UnifiedTask`):
+
+    Always produced:
+    - ``decoder``: gemma4 text decoder taking ``inputs_embeds`` (and
+      ``input_ids`` for the vision-block bidirectional mask, which it derives
+      internally; dual head_dim, k_eq_v)
+    - ``vision_encoder``: raw-patch vision embedder
+    - ``embedding``: scaled word embedding + multimodal feature fusion
+
+    Added when ``config.audio is not None``:
+    - ``audio_encoder``: raw-frame audio embedder
+
+    Registered as ``gemma4_unified``.
+    """
+
+    default_task: str = "gemma4-unified"
+    category: str = "Multimodal"
+
+    def __init__(self, config: Gemma4Config):
+        super().__init__()
+        self.config = config
+        self.decoder = _Gemma4DecoderModel(config)
+        self.vision_encoder = _Gemma4UnifiedVisionEmbedderModel(config)
+        self.embedding = Gemma4EmbeddingModel(config)
+        self.audio_encoder: _Gemma4UnifiedAudioEmbedderModel | None = (
+            _Gemma4UnifiedAudioEmbedderModel(config) if config.audio is not None else None
+        )
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Gemma4UnifiedModel is a multi-model split; Gemma4UnifiedTask builds "
+            "each sub-module (decoder, vision_encoder, embedding, and optionally "
+            "audio_encoder) separately."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Rename HuggingFace ``gemma4_unified`` checkpoint keys to ONNX names.
+
+        After stripping the leading ``model.`` prefix:
+
+        - ``language_model.lm_head.*`` → ``decoder.lm_head.*``
+        - ``language_model.*`` → ``decoder.model.*`` (token embedding is also
+          shared with ``embedding.embed_tokens.weight``)
+        - ``vision_embedder.*`` → ``vision_encoder.*`` (``pos_embedding`` is
+          split into ``pos_emb_x``/``pos_emb_y``)
+        - ``embed_vision.embedding_projection.*`` → ``vision_encoder.projector.*``
+        - ``embed_audio.embedding_projection.*`` → ``audio_encoder.projector.*``
+        - ``embed_{vision,audio}.*.embedding_pre_projection_norm.*`` → skip
+          (scale-free RMSNorm, no learnable weight)
+        """
+        # Strip top-level "model." prefix used by HF multimodal checkpoints.
+        state_dict = {
+            (key[len("model.") :] if key.startswith("model.") else key): value
+            for key, value in state_dict.items()
+        }
+
+        # Synthesize lm_head from embed_tokens when weights are tied.
+        if self.config.tie_word_embeddings:
+            embed_key = "language_model.embed_tokens.weight"
+            head_key = "language_model.lm_head.weight"
+            if head_key not in state_dict and embed_key in state_dict:
+                state_dict[head_key] = state_dict[embed_key]
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("language_model."):
+                suffix = key[len("language_model.") :]
+                if suffix.startswith("lm_head"):
+                    renamed["decoder." + suffix] = value
+                else:
+                    renamed["decoder.model." + suffix] = value
+                    if suffix == "embed_tokens.weight":
+                        renamed["embedding.embed_tokens.weight"] = value
+
+            elif key.startswith("vision_embedder.pos_embedding"):
+                # [posemb_size, 2, mm_embed_dim] → two [posemb_size, mm_embed_dim]
+                renamed["vision_encoder.pos_emb_x.weight"] = value[:, 0, :].contiguous()
+                renamed["vision_encoder.pos_emb_y.weight"] = value[:, 1, :].contiguous()
+
+            elif key.startswith("vision_embedder."):
+                renamed["vision_encoder." + key[len("vision_embedder.") :]] = value
+
+            elif key.startswith("embed_vision.embedding_projection."):
+                suffix = key[len("embed_vision.embedding_projection.") :]
+                renamed["vision_encoder.projector." + suffix] = value
+
+            elif key.startswith("embed_audio.embedding_projection."):
+                suffix = key[len("embed_audio.embedding_projection.") :]
+                renamed["audio_encoder.projector." + suffix] = value
+
+            elif key.startswith(("embed_vision.", "embed_audio.")):
+                # *.embedding_pre_projection_norm.*: scale-free RMSNorm, no weight.
+                pass
+
+            else:
+                renamed[key] = value
 
         return renamed

@@ -96,7 +96,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "MatMulNBits") == 1
 
     def test_matmulnbits_domain_is_microsoft(self):
@@ -104,7 +104,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert node.domain == "com.microsoft"
@@ -117,7 +117,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -132,7 +132,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert len(node.inputs) == 3
@@ -143,7 +143,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 assert len(node.inputs) == 4
@@ -154,7 +154,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "MatMulNBits") == 1
         assert count_op_type(graph, "Add") == 1
 
@@ -163,7 +163,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         assert count_op_type(graph, "Add") == 0
 
     def test_8bit_forward(self):
@@ -171,7 +171,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -185,7 +185,7 @@ class TestQuantizedLinearForward:
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
         result = ql(op, x)
-        b._adapt_outputs([result])
+        b._adapt_outputs([result], "")
         for node in graph:
             if node.op_type == "MatMulNBits":
                 attrs = {a.name: a.value for a in node.attributes.values()}
@@ -239,3 +239,176 @@ class TestMakeQuantizedLinearFactory:
         assert instance._k == 32
         assert instance._n == 64
         assert instance.bias is None
+
+
+class TestQuantizedEmbeddingInit:
+    VOCAB = 64
+    DIM = 64
+
+    def test_creates_packed_qweight_2d(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        packed = self.DIM * 4 // 8  # 32
+        assert qe.qweight.shape == [self.VOCAB, packed]
+
+    def test_creates_scales(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        n_blocks = self.DIM // 32
+        assert qe.scales.shape == [self.VOCAB, n_blocks]
+
+    def test_zero_points_by_default(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM)
+        assert qe.zero_points is not None
+
+    def test_no_zero_points_when_symmetric(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, has_zero_point=False)
+        assert qe.zero_points is None
+
+    def test_rejects_invalid_bits(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        with pytest.raises(ValueError, match="bits must be 2, 4, or 8"):
+            QuantizedEmbedding(self.VOCAB, self.DIM, bits=3)
+
+    def test_rejects_indivisible_dim(self):
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        with pytest.raises(ValueError, match="must be divisible by"):
+            QuantizedEmbedding(self.VOCAB, 48, block_size=32)
+
+
+class TestQuantizedEmbeddingForward:
+    VOCAB = 64
+    DIM = 64
+
+    def test_graph_has_gather_block_quantized_node(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result], "")
+        assert count_op_type(graph, "GatherBlockQuantized") == 1
+
+    def test_node_domain_and_attributes(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "GatherBlockQuantized":
+                assert node.domain == "com.microsoft"
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["bits"] == 4
+                assert attrs["block_size"] == 32
+                assert attrs["gather_axis"] == 0
+                assert attrs["quantize_axis"] == 1
+                assert len(node.inputs) == 4  # qweight, ids, scales, zero_points
+                break
+        else:
+            pytest.fail("GatherBlockQuantized node not found")
+
+    def test_3_inputs_without_zero_points(self):
+        import onnx_ir as ir
+
+        from mobius.components._quantized_linear import QuantizedEmbedding
+
+        qe = QuantizedEmbedding(self.VOCAB, self.DIM, has_zero_point=False)
+        b, op, graph = create_test_builder()
+        ids = create_test_input(b, "input_ids", [1, 4], dtype=ir.DataType.INT64)
+        result = qe(op, ids)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "GatherBlockQuantized":
+                assert len(node.inputs) == 3
+                break
+        else:
+            pytest.fail("GatherBlockQuantized node not found")
+
+
+class TestTiedQuantizedLMHead:
+    VOCAB = 64
+    DIM = 64
+
+    def _make(self, **kw):
+        from mobius.components._quantized_linear import (
+            QuantizedEmbedding,
+            TiedQuantizedLMHead,
+        )
+
+        emb = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32, **kw)
+        return emb, TiedQuantizedLMHead(emb, self.DIM, self.VOCAB)
+
+    def test_shares_embedding_parameters(self):
+        emb, head = self._make()
+        # Same Parameter objects -> a single ONNX initializer each.
+        assert head.qweight is emb.qweight
+        assert head.scales is emb.scales
+        assert head.zero_points is emb.zero_points
+
+    def test_rejects_indivisible_hidden(self):
+        from mobius.components._quantized_linear import (
+            QuantizedEmbedding,
+            TiedQuantizedLMHead,
+        )
+
+        emb = QuantizedEmbedding(self.VOCAB, self.DIM, bits=4, block_size=32)
+        with pytest.raises(ValueError, match="must be divisible by"):
+            TiedQuantizedLMHead(emb, 48, self.VOCAB)
+
+    def test_graph_has_reshape_and_matmulnbits(self):
+        _, head = self._make()
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result], "")
+        assert count_op_type(graph, "MatMulNBits") == 1
+        # Reshape rewrites the shared 2-D table to the 3-D MatMulNBits layout.
+        assert count_op_type(graph, "Reshape") == 1
+
+    def test_matmulnbits_attributes(self):
+        _, head = self._make()
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["K"] == self.DIM
+                assert attrs["N"] == self.VOCAB
+                assert attrs["bits"] == 4
+                assert attrs["block_size"] == 32
+                assert node.domain == "com.microsoft"
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_no_zero_points_when_symmetric(self):
+        _, head = self._make(has_zero_point=False)
+        assert head.zero_points is None
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, self.DIM])
+        result = head(op, x)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                assert len(node.inputs) == 3  # x, weight, scales
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")

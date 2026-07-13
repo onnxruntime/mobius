@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 
 import torch
 
@@ -271,6 +272,52 @@ def rename_mlp_projections(
     )
 
 
+def rename_weight_keys(
+    state_dict: dict[str, torch.Tensor],
+    replacements: Sequence[tuple[str, str]],
+) -> dict[str, torch.Tensor]:
+    """Apply ordered substring replacements to every key in a state dict.
+
+    Centralises the ``for name, tensor in state_dict.items(): name =
+    name.replace(...)`` rename loop that is duplicated across many model
+    ``preprocess_weights`` implementations.  Each ``(old, new)`` pair is
+    applied with :py:meth:`str.replace` to the *progressively updated* key,
+    so the replacements are **ordered** and may cascade (the output of an
+    earlier replacement can match the input of a later one) — this matches
+    the semantics of the hand-written loops it replaces.  Use substrings
+    specific enough (e.g. dot-delimited like ``".attention_layernorm."``)
+    to avoid renaming unintended portions of a key.
+
+    Tensor values are shared with *state_dict* (not cloned), matching the
+    behaviour of the loops this replaces.
+
+    Args:
+        state_dict: Weight dictionary to transform (not modified).
+        replacements: Ordered sequence of ``(old, new)`` substring pairs.
+
+    Returns:
+        A new dictionary with renamed keys.
+
+    Raises:
+        ValueError: If two distinct source keys map to the same renamed key
+            (a collision that would otherwise silently drop a tensor).
+    """
+    result: dict[str, torch.Tensor] = {}
+    producers: dict[str, str] = {}
+    for name, tensor in state_dict.items():
+        new_name = name
+        for old, new in replacements:
+            new_name = new_name.replace(old, new)
+        if new_name in result:
+            raise ValueError(
+                f"Weight key collision after rename: {name!r} -> {new_name!r} "
+                f"(already produced by {producers[new_name]!r})"
+            )
+        result[new_name] = tensor
+        producers[new_name] = name
+    return result
+
+
 def split_codegen_qkv(
     weight: torch.Tensor,
     num_heads: int,
@@ -474,6 +521,39 @@ def vlm_embedding_weights(
     return renamed
 
 
+def vlm_vision_weights(
+    state_dict: dict[str, torch.Tensor],
+    prefixes: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Extract vision-tower weights for a VLM vision sub-model.
+
+    Keeps only keys starting with one of *prefixes* and renames the vision
+    MLP projections ``mlp.fc1`` → ``mlp.up_proj`` and ``mlp.fc2`` →
+    ``mlp.down_proj`` to match our ``FCMLP`` component naming.
+
+    This is the standard pattern for VLM vision sub-models (LLaVA, Gemma3,
+    Mllama) whose HuggingFace vision encoders use ``fc1``/``fc2`` MLP names.
+
+    Args:
+        state_dict: Full model state dict.
+        prefixes: Prefixes identifying vision-tower weights to keep, e.g.
+            ``("vision_tower.", "multi_modal_projector.")`` or
+            ``("vision_model.",)``.
+
+    Returns:
+        New dictionary with the kept vision weights and renamed MLP keys.
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not key.startswith(prefixes):
+            continue
+        new_key = key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+            ".mlp.fc2.", ".mlp.down_proj."
+        )
+        renamed[new_key] = value
+    return renamed
+
+
 def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor:
     """Transpose and reshape a packed qweight tensor for MatMulNBits.
 
@@ -574,6 +654,104 @@ def preprocess_gptq_weights(
 
         else:
             result[key] = value
+
+    return result
+
+
+def preprocess_olive_weights(
+    state_dict: dict[str, torch.Tensor],
+    bits: int = 4,
+    group_size: int = 128,
+    quantize_embeddings: bool = False,
+    quantize_lm_head: bool = False,
+    tie_word_embeddings: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Rename and reshape Olive-packed quantized weights.
+
+    Olive stores quantized weights with uint8 packing:
+      - ``*.qweight``: [N, packed_K] uint8
+      - ``*.scales``: [N, n_blocks]
+      - ``*.qzeros``: [N, ceil(n_blocks * bits / 8)] uint8, asymmetric only
+
+    Linear projections target ``MatMulNBits``, which expects ``weight`` as
+    [N, n_blocks, blob_size]; scales and zero-points already match the
+    expected orientation, so they are renamed but not transposed.
+
+    The input embedding table (``*.embed_tokens.qweight``) instead targets
+    ``GatherBlockQuantized``, which consumes the **2-D** uint8 ``qweight``
+    directly — so it is kept as-is (only ``qzeros`` is renamed to
+    ``zero_points``).
+
+    Tied LM head: Olive RTN drops ``lm_head.*`` when the head is tied. When the
+    head is **quantized**, no ``lm_head`` weights are produced here — the model
+    shares the embedding's packed table via :class:`TiedQuantizedLMHead` (one
+    initializer). When the head stays **float** (unquantized embedding), the
+    standard float tie is applied so ``lm_head.weight`` aliases the embedding.
+
+    Args:
+        state_dict: Model state dict with Olive quantization keys.
+        bits: Quantization bit-width (typically 4).
+        group_size: Number of elements per quantization group.
+        quantize_embeddings: Whether the embedding table is quantized.
+        quantize_lm_head: Whether the LM head is quantized.
+        tie_word_embeddings: Whether embedding and LM head share weights.
+
+    Returns:
+        State dict with renamed and reshaped weights (and, for a float tied
+        head, the aliased ``lm_head.weight``).
+    """
+    blob_size = group_size * bits // 8
+    result: dict[str, torch.Tensor] = {}
+
+    for key, value in state_dict.items():
+        if key.endswith("embed_tokens.qweight"):
+            # GatherBlockQuantized consumes the 2-D uint8 table directly.
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qweight must be uint8 for {key}, got {value.dtype}"
+                )
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive embedding qweight packed dimension for {key} "
+                    f"({value.shape[-1]}) must be divisible by blob_size ({blob_size})"
+                )
+            result[key] = value.contiguous()
+        elif key.endswith("embed_tokens.qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(
+                    f"Olive embedding qzeros must be uint8 for {key}, got {value.dtype}"
+                )
+            result[key.replace(".qzeros", ".zero_points")] = value.contiguous()
+        elif key.endswith("embed_tokens.scales"):
+            result[key] = value
+        elif key.endswith(".qweight"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
+            if value.shape[-1] % blob_size != 0:
+                raise ValueError(
+                    f"Olive qweight packed dimension for {key} ({value.shape[-1]}) "
+                    f"must be divisible by blob_size ({blob_size})"
+                )
+            new_key = key.replace(".qweight", ".weight")
+            result[new_key] = value.reshape(value.shape[0], -1, blob_size).contiguous()
+        elif key.endswith(".qzeros"):
+            if value.dtype != torch.uint8:
+                raise ValueError(f"Olive qzeros must be uint8 for {key}, got {value.dtype}")
+            new_key = key.replace(".qzeros", ".zero_points")
+            result[new_key] = value.contiguous()
+        else:
+            result[key] = value
+
+    # A tied quantized head shares the embedding's Parameters in the module
+    # (TiedQuantizedLMHead), so no lm_head initializers exist to fill here.
+    # Only a tied *float* head needs an explicit weight alias.
+    if (
+        tie_word_embeddings
+        and not quantize_lm_head
+        and "lm_head.weight" not in result
+        and "model.embed_tokens.weight" in result
+    ):
+        result["lm_head.weight"] = result["model.embed_tokens.weight"]
 
     return result
 

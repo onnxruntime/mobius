@@ -32,12 +32,14 @@ __all__ = [
     "bias_gelu_rules",
     "gelu_fusion_rules",
     "group_query_attention_rules",
+    "htp_rank4_rmsnorm_rules",
     "layer_norm_fusion_rules",
     "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
     "separate_rope_rules",
     "skip_layer_norm_rules",
     "skip_norm_rules",
+    "static_empty_kv_rules",
     "unpack_qkv_rules",
 ]
 
@@ -47,6 +49,7 @@ from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
     pack_qkv_for_gqa_rules,
 )
+from mobius.rewrite_rules._htp_rank4_rmsnorm import htp_rank4_rmsnorm_rules
 from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
@@ -54,4 +57,5 @@ from mobius.rewrite_rules._packed_attention import packed_attention_rules
 from mobius.rewrite_rules._separate_rope import separate_rope_rules
 from mobius.rewrite_rules._skip_layer_norm import skip_layer_norm_rules
 from mobius.rewrite_rules._skip_norm import skip_norm_rules
+from mobius.rewrite_rules._static_empty_kv import static_empty_kv_rules
 from mobius.rewrite_rules._unpack_qkv import unpack_qkv_rules

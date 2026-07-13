@@ -74,6 +74,56 @@ class TestCLIBuild:
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(["build", tmpdir])  # no --model or --config
 
+    def test_text_only_with_config_errors(self):
+        """--text-only is rejected on the --config (local dir) path."""
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(["build", "--config", tmpdir, tmpdir, "--text-only", "--no-weights"])
+
+    def test_text_only_with_component_errors(self):
+        """--text-only is rejected when combined with --component."""
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "google/gemma-4-12B",
+                    tmpdir,
+                    "--text-only",
+                    "--component",
+                    "vision_encoder",
+                    "--no-weights",
+                ]
+            )
+
+    def test_text_only_skips_diffusers_autodetect(self):
+        """--text-only bypasses diffusers autodetect so build() validates it.
+
+        Without this, a diffusers repo + --text-only would hit the autodetect
+        branch and silently export a diffusion pipeline, ignoring the flag.
+        """
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius._diffusers_builder._load_diffusers_pipeline_index"
+            ) as mock_diffusers,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/diffusion-repo",
+                    tmpdir,
+                    "--text-only",
+                    "--no-weights",
+                ]
+            )
+
+        mock_diffusers.assert_not_called()
+        mock_build.assert_called_once()
+        assert mock_build.call_args.kwargs.get("text_only") is True
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
@@ -212,6 +262,22 @@ class TestCLIBuildRuntime:
             main(["build", "--model", "Qwen/Qwen2.5-0.5B", tmpdir, "--no-weights"])
 
         mock_export.assert_not_called()
+
+    def test_build_dot_nemo_model_routes_to_nemo(self):
+        """A ``.nemo`` --model argument is auto-detected and routed to NeMo."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.nemo.build_from_nemo",
+                return_value=mock.MagicMock(),
+            ) as mock_build_nemo,
+            mock.patch("mobius.__main__._save_package") as mock_save,
+        ):
+            main(["build", "--model", "/some/model.nemo", tmpdir])
+
+        mock_build_nemo.assert_called_once()
+        assert mock_build_nemo.call_args.args[0] == "/some/model.nemo"
+        mock_save.assert_called_once()
 
     def test_invalid_runtime_value_errors(self):
         """An unrecognised --runtime value causes argparse to exit with an error."""

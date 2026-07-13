@@ -153,6 +153,10 @@ class CausalLMTask(ModelTask):
             num_kv_cache_heads = (
                 config.num_attention_heads if use_mla else config.num_key_value_heads
             )
+            kv_key_head_dim = (
+                (config.qk_nope_head_dim or 0) + (config.qk_rope_head_dim or 0)
+            ) or config.head_dim
+            kv_value_head_dim = config.v_head_dim or config.head_dim
 
             past_key_values = _make_kv_cache_inputs(
                 builder,
@@ -162,18 +166,22 @@ class CausalLMTask(ModelTask):
                 config.dtype,
                 batch,
                 past_seq_len,
-                key_head_dim=((config.qk_nope_head_dim or 0) + (config.qk_rope_head_dim or 0))
-                or None,
-                value_head_dim=config.v_head_dim or None,
+                key_head_dim=kv_key_head_dim,
+                value_head_dim=kv_value_head_dim,
             )
 
-        logits, present_key_values = module(
+        result = module(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        intermediate_hidden_states: list | None = None
+        if len(result) == 3:
+            logits, present_key_values, intermediate_hidden_states = result
+        else:
+            logits, present_key_values = result
 
         builder.add_output(logits, "logits")
 
@@ -184,9 +192,24 @@ class CausalLMTask(ModelTask):
                 present_key_values,
             )
         else:
+            # Stamp explicit present shapes symmetric to the past inputs so the
+            # com.microsoft::GroupQueryAttention export declares the correct
+            # head_dim (its contrib-op shape inference otherwise mis-derives it
+            # from the packed QKV hidden). total_seq = past + current sequence.
             _register_kv_cache_outputs(
                 builder,
                 present_key_values,
+                batch=batch,
+                num_kv_heads=num_kv_cache_heads,
+                key_head_dim=kv_key_head_dim,
+                value_head_dim=kv_value_head_dim,
+                total_seq_len="past_sequence_len + sequence_len",
+                dtype=config.dtype,
+            )
+
+        if intermediate_hidden_states is not None:
+            _register_intermediate_hidden_states(
+                builder, config.output_layer_indices, intermediate_hidden_states
             )
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
@@ -243,13 +266,18 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        logits, present_key_values = module(
+        result = module(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        intermediate_hidden_states: list | None = None
+        if len(result) == 3:
+            logits, present_key_values, intermediate_hidden_states = result
+        else:
+            logits, present_key_values = result
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -258,9 +286,41 @@ class HybridCausalLMTask(ModelTask):
             config.layer_types or [],
         )
 
+        if intermediate_hidden_states is not None:
+            _register_intermediate_hidden_states(
+                builder, config.output_layer_indices, intermediate_hidden_states
+            )
+
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
         return ModelPackage({"model": model}, config=config)
+
+
+def _register_intermediate_hidden_states(
+    builder: GraphBuilder,
+    indices: list[int] | None,
+    intermediate_hidden_states: list[ir.Value],
+) -> None:
+    """Register selected per-layer hidden-state tensors as graph outputs.
+
+    Each entry ``intermediate_hidden_states[i]`` is the post-residual
+    output of decoder layer ``indices[i]`` (before the final ``self.norm``).
+    The outputs are named ``hidden_states.{idx}`` so a downstream
+    speculative-decoding draft can address them by layer index.
+
+    See :class:`ArchitectureConfig.output_layer_indices` for the index
+    convention.
+    """
+    if not indices:
+        return
+    if len(indices) != len(intermediate_hidden_states):
+        raise ValueError(
+            f"output_layer_indices has {len(indices)} entries but the model "
+            f"returned {len(intermediate_hidden_states)} intermediate "
+            "hidden-state tensors."
+        )
+    for idx, hs in zip(indices, intermediate_hidden_states):
+        builder.add_output(hs, f"hidden_states.{idx}")
 
 
 def _make_static_cache_inputs(

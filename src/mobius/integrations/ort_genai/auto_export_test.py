@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import types
 from unittest import mock
 
 import numpy as np
@@ -19,9 +20,11 @@ from mobius.integrations.ort_genai.auto_export import (
     _fix_tokenizer_config,
     _graph_input_names,
     _resolve_ort_genai_model_type,
+    _select_ort_model_type,
     _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
+    auto_export,
     write_ort_genai_config,
 )
 
@@ -85,6 +88,52 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi") == "phi"
 
+    def test_gemma4_unified_model_types(self):
+        # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
+        # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
+        # text decoder ("gemma4_unified_text") maps to "gemma4_text".
+        assert _resolve_ort_genai_model_type("gemma4_unified") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_unified_text") == "gemma4_text"
+        # Released gemma4 mappings remain unchanged.
+        assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
+        assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
+
+
+class TestSelectOrtModelType:
+    """Text-only / multimodal ORT model type selection (PR: text_only export)."""
+
+    def test_decoder_only_prefers_config_type(self):
+        # Text-only gemma-4-12B: package config carries the text sibling, HF
+        # reports the multimodal type. Decoder-only -> follow the package.
+        assert (
+            _select_ort_model_type(
+                "gemma4_unified_text", "gemma4_unified", is_decoder_only=True
+            )
+            == "gemma4_text"
+        )
+
+    def test_multimodal_keeps_hf_type(self):
+        # Full multimodal export: build() unwraps the composite to its text
+        # sub-config, so config.model_type may be a text type even though the
+        # package is multimodal. Must keep the HF parent type -> gemma4.
+        assert (
+            _select_ort_model_type(
+                "gemma4_unified_text", "gemma4_unified", is_decoder_only=False
+            )
+            == "gemma4"
+        )
+
+    def test_decoder_only_falls_back_to_hf_when_config_missing(self):
+        assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
+
+    def test_decoder_only_unknown_config_falls_back_to_hf(self):
+        # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
+        # not pass straight through as an invalid ORT type; fall back to the
+        # known HF-derived mapping instead.
+        assert (
+            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True) == "qwen2"
+        )
+
 
 class TestWriteProcessorConfig:
     def test_no_vision_returns_none(self, tmp_path):
@@ -127,6 +176,15 @@ class TestWriteProcessorConfig:
         norm_attrs = transforms[4]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_gemma4_unified_skips_image_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
+        vision = mock.MagicMock()
+        vision.model_type = None
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "gemma4_unified"
+        assert _write_vision_processor_config(config, str(tmp_path)) is None
 
     def test_pixtral_vision_config(self, tmp_path):
         """Generates pixtral-specific processor config with 7 transforms."""
@@ -266,6 +324,13 @@ class TestFixChatTemplate:
         config = mock.MagicMock()
         config.audio = mock.MagicMock()
         config.model_type = "whisper"
+        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+    def test_audio_gemma4_unified_skips_audio_processor(self, tmp_path):
+        """Encoder-free gemma4_unified has no native transform: no audio_processor.json."""
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "gemma4_unified"
         assert _write_audio_processor_config(config, str(tmp_path)) is None
 
     def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):
@@ -1369,6 +1434,136 @@ class TestGemma4RealModel:
         assert data["model"]["bos_token_id"] == 2
         assert data["model"]["vision"]["spatial_merge_size"] == 2
         assert data["model"]["vision"]["config_filename"] == "image_processor.json"
+
+    def test_text_only_genai_config_is_decoder_only(self, tmp_path):
+        """text_only gemma4_unified export -> decoder-only genai config.
+
+        Reproduces ``auto_export(text_only=True)``: a single-"model" package
+        whose ``config.model_type`` is the text sibling ``gemma4_unified_text``.
+        Verifies the ORT-GenAI ``type`` is resolved from ``pkg.config.model_type``
+        (``gemma4_text``), NOT the multimodal HF config (``gemma4_unified``),
+        and that no vision/audio sections or processor files are written.
+        """
+        from mobius._builder import _strip_to_text_only, build_from_module
+        from mobius._config_resolver import _default_task_for_model
+        from mobius._configs import Gemma4Config
+        from mobius._registry import registry
+        from mobius.tasks import get_task
+
+        # Start from a multimodal-flavoured config and strip to text-only, the
+        # same transformation build(text_only=True) applies.
+        config = Gemma4Config(
+            model_type="gemma4_unified",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            image_token_id=258880,
+            bos_token_id=2,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+        )
+        config = _strip_to_text_only(config, "gemma4_unified_text")
+        assert config.model_type == "gemma4_unified_text"
+        assert config.image_token_id is None
+        assert config.use_bidirectional_attention is None
+
+        model_cls = registry.get("gemma4_unified_text")
+        module = model_cls(config)
+        task = get_task(_default_task_for_model("gemma4_unified_text"))
+        pkg = build_from_module(module, config, task=task)
+        pkg.config = config
+
+        # HF config reports the multimodal model_type; the built package's
+        # config carries the text sibling. ORT type must follow the package.
+        fake_hf = types.SimpleNamespace(
+            model_type="gemma4_unified",
+            bos_token_id=2,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+        ):
+            result = write_ort_genai_config(
+                pkg, str(tmp_path), hf_model_id="google/gemma-4-12B"
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+
+        # ORT-GenAI type resolved from pkg.config.model_type (gemma4_text),
+        # NOT the multimodal HF gemma4_unified -> gemma4.
+        assert data["model"]["type"] == "gemma4_text"
+        # Decoder-only: input_ids decoder, no multimodal sections.
+        assert "vision" not in data["model"]
+        assert "audio" not in data["model"]
+        assert "input_ids" in data["model"]["decoder"]["inputs"]
+        # No multimodal processor artifacts.
+        assert "processor_config" not in result
+        assert "audio_processor" not in result
+        assert not os.path.exists(os.path.join(str(tmp_path), "image_processor.json"))
+
+    def test_auto_export_forwards_text_only_and_build_ep(self, tmp_path):
+        """auto_export(text_only, ep) threads through to build() correctly.
+
+        - ``text_only`` is forwarded to ``build``.
+        - the runtime ``ep`` drives the build EP for non-CPU providers
+          (``cuda`` -> GroupQueryAttention fusion).
+        - ``ep="cpu"`` maps to the portable ``"default"`` build (unchanged).
+        """
+        captured: dict[str, object] = {}
+
+        def fake_build(model_id, **kwargs):
+            captured.update(kwargs)
+            return _make_fake_llm_pkg("qwen2")
+
+        def fake_export_package(pkg, output_dir, **kwargs):
+            return {"genai_config": os.path.join(output_dir, "genai_config.json")}
+
+        with (
+            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.export_package",
+                side_effect=fake_export_package,
+            ),
+        ):
+            auto_export("google/gemma-4-12B", str(tmp_path), ep="cuda", text_only=True)
+        assert captured["text_only"] is True
+        assert captured["execution_provider"] == "cuda"
+
+        captured.clear()
+        with (
+            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.export_package",
+                side_effect=fake_export_package,
+            ),
+        ):
+            auto_export("Qwen/Qwen2.5-0.5B", str(tmp_path), ep="cpu")
+        # cpu maps to the portable default build (backward compatible).
+        assert captured["execution_provider"] == "default"
+        assert captured["text_only"] is False
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""

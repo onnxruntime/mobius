@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,10 +17,10 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
-from mobius.components._moe import TopKGate
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.models.base import CausalLMModel
+from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
@@ -218,65 +217,21 @@ class Qwen35CausalLMModel(CausalLMModel):
         return super().preprocess_weights(cleaned)
 
 
-class Qwen35MoEBlock(nn.Module):
-    """Qwen3.5-MoE sparse MoE block with shared expert.
+class Qwen35MoEBlock(Qwen2MoELayer):
+    """Qwen3.5-MoE sparse MoE block: top-k routing + sigmoid-gated shared expert.
 
-    Combines top-k expert routing with a shared expert gated by sigmoid.
-    Weight names are aligned to the HuggingFace naming convention::
+    Structurally identical to Qwen2-MoE's shared-expert block
+    (:class:`~mobius.models.moe.Qwen2MoELayer`): top-k expert routing whose
+    weighted sum is added to a shared expert scaled by a sigmoid gate. Weight
+    names match the HuggingFace convention::
 
-        gate.weight            → router logits
+        gate.weight                  → router logits
         experts.N.{gate,up,down}_proj.weight
         shared_expert.{gate,up,down}_proj.weight
-        shared_expert_gate.weight   → sigmoid gate for shared expert
+        shared_expert_gate.weight    → sigmoid gate for shared expert
+
+    Retained as a named subclass for readability within the Qwen3.5 hybrid stack.
     """
-
-    def __init__(self, config: ArchitectureConfig):
-        super().__init__()
-        assert config.num_local_experts is not None
-        assert config.num_experts_per_tok is not None
-        num_experts = config.num_local_experts
-        top_k = config.num_experts_per_tok
-
-        self.gate = TopKGate(config.hidden_size, num_experts, top_k)
-
-        expert_config = dataclasses.replace(
-            config, intermediate_size=config.moe_intermediate_size
-        )
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(num_experts)])
-
-        shared_config = dataclasses.replace(
-            config,
-            intermediate_size=config.shared_expert_intermediate_size,
-        )
-        self.shared_expert = MLP(shared_config)
-        self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
-
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        routing_weights, selected_experts = self.gate(op, hidden_states)
-
-        # Loop-over-experts dispatch (same pattern as MoELayer)
-        result = None
-        for expert_idx, expert in enumerate(self.experts):
-            expert_output = expert(op, hidden_states)
-            expert_id = op.Constant(value_int=expert_idx)
-            match = op.Equal(selected_experts, expert_id)
-            match_float = op.CastLike(match, routing_weights)
-            weighted = op.Mul(routing_weights, match_float)
-            weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
-            if result is None:
-                result = contribution
-            else:
-                result = op.Add(result, contribution)
-
-        # Shared expert with sigmoid gating
-        shared_output = self.shared_expert(op, hidden_states)
-        shared_gate = self.shared_expert_gate(op, hidden_states)
-        shared_gate = op.Sigmoid(shared_gate)
-        shared_output = op.Mul(shared_output, shared_gate)
-
-        result = op.Add(result, shared_output)
-        return result
 
 
 class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):

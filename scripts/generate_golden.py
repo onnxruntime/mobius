@@ -38,6 +38,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import sys
 import time
@@ -402,10 +403,14 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Load images from testdata/
     images = [Image.open(Path("testdata") / img_path) for img_path in case.images]
 
-    # Build chat-formatted prompt with image placeholders if the
-    # processor supports apply_chat_template (Qwen-VL, Gemma-3, etc.)
+    # Build chat-formatted prompt with image placeholders if the processor has a
+    # usable chat template (Qwen-VL, Gemma-3, etc.). Base checkpoints (e.g.
+    # google/gemma-4-12B) ship no chat template, so fall back to manually
+    # prepending one image placeholder token per image — the processor then
+    # expands each into the correct number of soft tokens (mirrors how
+    # examples/gemma4_unified_ort_genai.py formats image prompts).
     prompt_text = case.prompts[0]
-    if hasattr(processor, "apply_chat_template"):
+    if getattr(processor, "chat_template", None):
         content: list[dict[str, str]] = []
         for img_path in case.images:
             content.append({"type": "image", "image": str(Path("testdata") / img_path)})
@@ -414,6 +419,8 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+    elif getattr(processor, "image_token", None):
+        prompt_text = processor.image_token * len(case.images) + prompt_text
 
     # Process multimodal inputs through the HF processor
     processed = processor(
@@ -738,7 +745,7 @@ def _prepare_speech_language_inputs(
     else:
         # Gemma4-style: text prompt + audio
         prompt_text = case.prompts[0]
-        if hasattr(processor, "apply_chat_template"):
+        if getattr(processor, "chat_template", None):
             content: list[dict[str, str]] = [
                 {"type": "audio", "audio": str(audio_path)},
                 {"type": "text", "text": prompt_text},
@@ -747,6 +754,10 @@ def _prepare_speech_language_inputs(
             prompt_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+        elif getattr(processor, "audio_token", None):
+            # Base checkpoint (no chat template): manually prepend the audio
+            # placeholder; the processor expands it to the right token count.
+            prompt_text = processor.audio_token + prompt_text
         model_device = _get_model_device(model, device)
         processed = processor(
             text=prompt_text,
@@ -804,6 +815,88 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
     )
 
 
+def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for CTC-based ASR (Wav2Vec2ForCTC / MMS).
+
+    The model output is per-frame logits over a vocabulary; we save the
+    top-K over the final frame's logit vector (matching the existing
+    audio-feature-extraction pattern), and when L5 is requested we also
+    save the CTC-greedy-decoded transcript as a token-id sequence so the
+    end-to-end test can compare against the runtime's greedy decode.
+
+    MMS specifically requires picking a target language adapter via
+    ``processor.tokenizer.set_target_lang(lang)`` and
+    ``model.load_adapter(lang)`` before the forward pass. The language is
+    read from ``case.generation_params['lang']`` (default ``"eng"``).
+    """
+    import librosa
+    import torch
+    import transformers
+
+    from mobius._testing.golden import save_generation_json, save_golden_ref
+
+    lang = case.generation_params.get("lang", "eng")
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code, target_lang=lang
+    )
+    model = transformers.Wav2Vec2ForCTC.from_pretrained(
+        case.model_id,
+        torch_dtype=torch.float32,
+        device_map=device,
+        trust_remote_code=case.trust_remote_code,
+        target_lang=lang,
+        ignore_mismatched_sizes=True,  # MMS lm_head shape changes per language
+    )
+    # For MMS, switching languages also requires loading the per-language adapter.
+    # Non-MMS Wav2Vec2ForCTC checkpoints don't have language adapters;
+    # the missing-adapter case is expected and harmless there.
+    if hasattr(model, "load_adapter"):
+        with contextlib.suppress(ValueError, KeyError, OSError):
+            model.load_adapter(lang)
+    model.eval()
+
+    audio_path = Path("testdata") / case.audio[0]
+    audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
+    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
+        next(model.parameters()).device
+    )
+
+    with torch.no_grad():
+        outputs = model(**processed)
+
+    # CTC logits: (batch, num_frames, vocab_size). Use last frame for top-K.
+    logits = outputs.logits[0]  # (num_frames, vocab_size)
+    last_logits = logits[-1].cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=np.array([[0]], dtype=np.int64),  # placeholder
+    )
+
+    if "L5" in case.level:
+        # CTC greedy decode: argmax over vocab per frame, then collapse
+        # repeats and remove blanks. Save the post-collapse token IDs (and
+        # the decoded text for human inspection) into the standard
+        # ``*_generation.json`` sidecar.
+        predicted_ids = torch.argmax(logits, dim=-1).cpu().numpy()
+        transcript = processor.batch_decode(predicted_ids[np.newaxis, :])[0]
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=str(audio_path),
+            generated_tokens=predicted_ids.tolist(),
+            generated_text=transcript,
+        )
+
+
 def _generate_image_classification(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for image classification (ViT, CLIP, etc.).
 
@@ -855,6 +948,79 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=np.array([[0]], dtype=np.int64),  # placeholder
+    )
+
+
+def _detection_forced_size(model_id: str, trust_remote_code: bool) -> dict | None:
+    """Return a fixed ``{height, width}`` size for object-detection export.
+
+    mobius exports object-detection models (e.g. YOLOS) at a *fixed* input
+    resolution taken from ``config.image_size`` (position embeddings are not
+    interpolated for arbitrary sizes).  To keep the golden reference and the
+    ONNX forward pass on the same footing, the HF image processor must be
+    forced to emit exactly that resolution instead of its default
+    aspect-preserving resize.
+    """
+    import transformers
+
+    config = transformers.AutoConfig.from_pretrained(
+        model_id, trust_remote_code=trust_remote_code
+    )
+    image_size = getattr(config, "image_size", None)
+    if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+        return {"height": int(image_size[0]), "width": int(image_size[1])}
+    if isinstance(image_size, int):
+        return {"height": image_size, "width": image_size}
+    return None
+
+
+def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for object detection (e.g. YOLOS).
+
+    The model emits per-query class ``logits`` of shape
+    ``[batch, num_queries, num_labels + 1]``.  The golden top-K is taken over
+    the *last* query's class-logit vector to match ``compare_golden``, which
+    slices ``logits[:, -1, :]``.  The image processor is forced to the model's
+    fixed export resolution so the golden and ONNX forward pass agree.
+    """
+    import torch
+    import transformers
+    from PIL import Image
+
+    from mobius._testing.golden import save_golden_ref
+
+    processor = transformers.AutoImageProcessor.from_pretrained(
+        case.model_id, trust_remote_code=case.trust_remote_code
+    )
+    model = transformers.AutoModelForObjectDetection.from_pretrained(
+        case.model_id,
+        torch_dtype=torch.float32,
+        device_map=device,
+        trust_remote_code=case.trust_remote_code,
+    ).eval()
+
+    image = Image.open(Path("testdata") / case.images[0])
+    forced_size = _detection_forced_size(case.model_id, case.trust_remote_code)
+    proc_kwargs = {"images": image, "return_tensors": "pt"}
+    if forced_size is not None:
+        proc_kwargs["size"] = forced_size
+    processed = processor(**proc_kwargs)
+    pixel_values = processed["pixel_values"].to(device)
+
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+    # logits: [batch, num_queries, num_labels + 1] -> last query's class vector
+    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    golden = _extract_logits_golden(last_logits)
+
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=np.array([[0]], dtype=np.int64),  # placeholder (no text input)
     )
 
 
@@ -1036,10 +1202,13 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
         processor = transformers.AutoProcessor.from_pretrained(
             case.model_id, trust_remote_code=True
         )
-        # Load in bfloat16 to reduce memory (14B model)
+        # Load in float32 to match the f32 runtime used by the L4/L5 tests.
+        # bf16 goldens produced flat/tied logit distributions that caused
+        # argmax instability against the f32 model output (see phi4mm L4
+        # false-failures: exact top-2 ties, top-10 spans <3 logits).
         model = transformers.AutoModelForCausalLM.from_pretrained(
             case.model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float32,
             device_map=device,
             trust_remote_code=True,
             _attn_implementation="eager",
@@ -1174,6 +1343,273 @@ def _generate_phi4mm_multimodal(case: TestCase, json_path: Path, device: str) ->
     cleanup()
 
 
+def _generate_gemma4_assistant(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for the Gemma4-Assistant MTP drafter.
+
+    The drafter does not consume a tokenized prompt directly; it consumes
+    ``inputs_embeds`` (target token embedding concatenated with the target's
+    shared hidden state) plus the target's ``shared_kv`` and a fixed
+    ``position_id``.  We reproduce exactly what HuggingFace assisted
+    generation feeds the assistant by hooking the assistant during a real
+    ``target.generate(assistant_model=...)`` run, capturing the first draft
+    round (all steps share one position with a fixed shared KV — this is the
+    ``SinglePositionMultiTokenCandidateGenerator``).
+
+    Artefacts:
+      - ``<name>.json``            L4: top-k of the first draft step's logits.
+      - ``<name>_generation.json`` L5: the drafted token sequence.
+      - ``<name>_inputs.npz``      replay tensors for the assistant ONNX graph.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from mobius._testing.golden import (
+        drafter_inputs_path_for_case,
+        save_drafter_inputs,
+        save_generation_json,
+        save_golden_ref,
+    )
+
+    # The drafter ships as ``<target>-assistant``; derive the target it pairs
+    # with (the target supplies the shared KV + hidden state).
+    assistant_id = case.model_id
+    target_id = assistant_id.removesuffix("-assistant")
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+
+    tok = AutoTokenizer.from_pretrained(target_id)
+    target = (
+        AutoModelForCausalLM.from_pretrained(target_id, dtype=torch_dtype).to(device).eval()
+    )
+    assistant = (
+        AutoModelForCausalLM.from_pretrained(assistant_id, dtype=torch_dtype).to(device).eval()
+    )
+
+    captured: list[dict] = []
+
+    def _hook(_module, _args, kwargs, output):
+        skv = kwargs.get("shared_kv_states") or {}
+        captured.append(
+            {
+                "inputs_embeds": kwargs["inputs_embeds"].detach().float().cpu().numpy(),
+                "position_ids": kwargs["position_ids"].detach().cpu().numpy().astype(np.int64),
+                "attention_mask": kwargs["attention_mask"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64),
+                "shared_kv": {
+                    lt: (
+                        kv[0].detach().float().cpu().numpy(),
+                        kv[1].detach().float().cpu().numpy(),
+                    )
+                    for lt, kv in skv.items()
+                },
+                "logits": output.logits[0, -1, :].detach().float().cpu().numpy(),
+                "projected_state": output.last_hidden_state.detach().float().cpu().numpy(),
+            }
+        )
+
+    handle = assistant.register_forward_hook(_hook, with_kwargs=True)
+    enc = tok.apply_chat_template(
+        [{"role": "user", "content": case.prompts[0]}],
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    input_ids = enc["input_ids"].to(device)
+    max_new = case.generation_params.get("max_new_tokens", 16)
+    with torch.inference_mode():
+        target.generate(
+            input_ids,
+            max_new_tokens=max_new,
+            do_sample=False,
+            assistant_model=assistant,
+            pad_token_id=tok.eos_token_id,
+        )
+    handle.remove()
+
+    if not captured:
+        raise RuntimeError("Assistant was never invoked during assisted generation.")
+
+    # First draft round = consecutive calls sharing the first position id.
+    first_pos = int(captured[0]["position_ids"].reshape(-1)[0])
+    round1 = [c for c in captured if int(c["position_ids"].reshape(-1)[0]) == first_pos]
+
+    drafted_tokens = [int(np.asarray(c["logits"]).argmax()) for c in round1]
+
+    # L4 golden: top-k of the first draft step's logits.
+    golden = _extract_logits_golden(round1[0]["logits"].astype(np.float64))
+    proj0 = round1[0]["projected_state"]
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids.cpu().numpy(),
+        component_norms={"projected_state": float(np.linalg.norm(proj0))},
+        component_shapes={
+            "projected_state": tuple(int(x) for x in proj0.shape),
+            "logits": (1, 1, int(round1[0]["logits"].shape[-1])),
+        },
+    )
+
+    # L5 golden: the drafted token sequence.
+    if "L5" in case.level:
+        gen_path = json_path.with_name(json_path.stem + "_generation.json")
+        save_generation_json(
+            gen_path,
+            model_id=case.model_id,
+            prompt=case.prompts[0],
+            generated_tokens=drafted_tokens,
+            generated_text=tok.decode(drafted_tokens, skip_special_tokens=True),
+        )
+
+    # Replay tensors: all round-1 steps share one position + shared KV; only
+    # inputs_embeds varies (autoregressive feedback). Store every step's
+    # inputs_embeds so the test can teacher-force the draft sequence.
+    arrays: dict[str, np.ndarray] = {
+        "inputs_embeds": np.concatenate([c["inputs_embeds"] for c in round1], axis=0),
+        "position_ids": round1[0]["position_ids"],
+        "attention_mask": round1[0]["attention_mask"],
+        "layer_types": np.array(list(round1[0]["shared_kv"].keys())),
+    }
+    for lt, (key, value) in round1[0]["shared_kv"].items():
+        arrays[f"skv_key_{lt}"] = key
+        arrays[f"skv_val_{lt}"] = value
+    save_drafter_inputs(drafter_inputs_path_for_case(case), arrays)
+
+
+def _generate_dflash_draft(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a DFlash speculative-decoding drafter.
+
+    The drafter consumes ``noise_embedding`` + multi-layer ``target_hidden`` + a
+    KV cache (not ``input_ids``) and outputs ``draft_hidden`` (decoded through the
+    target ``lm_head`` to get draft logits). We capture the first draft block of
+    the reference ``spec_generate`` loop by hooking the drafter, recording its
+    inputs and the reference ``draft_hidden``.
+
+    L4 is a hidden-state parity check: ``draft_hidden``'s last-token vector is
+    treated as the logit vector for the argmax + cosine gate (mirroring the
+    encoder / feature-extraction golden path). No L5 — the drafted token
+    sequence would require the target ``lm_head`` and the block-diffusion loop.
+
+    Artefacts:
+      - ``<name>.json``        L4: top-k of the first block's last-token hidden.
+      - ``<name>_inputs.npz``  replay tensors for the drafter ONNX graph.
+    """
+    import torch
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+    from mobius._testing.golden import (
+        drafter_inputs_path_for_case,
+        save_drafter_inputs,
+        save_golden_ref,
+    )
+
+    drafter_id = case.model_id
+    target_id = case.generation_params.get("target_model_id")
+    if not target_id:
+        raise ValueError(
+            "dflash-draft golden requires generation.target_model_id (the paired "
+            "target that supplies target_hidden)."
+        )
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+
+    tok = AutoTokenizer.from_pretrained(target_id)
+    target = (
+        AutoModelForCausalLM.from_pretrained(
+            target_id, torch_dtype=torch_dtype, attn_implementation="eager"
+        )
+        .to(device)
+        .eval()
+    )
+    drafter = (
+        AutoModel.from_pretrained(
+            drafter_id,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            attn_implementation="eager",
+        )
+        .to(device)
+        .eval()
+    )
+
+    captured: list[dict] = []
+
+    def _hook(_module, _args, kwargs, output):
+        hidden = (
+            output.last_hidden_state
+            if hasattr(output, "last_hidden_state")
+            else (output[0] if isinstance(output, tuple) else output)
+        )
+        captured.append(
+            {
+                "noise_embedding": kwargs["noise_embedding"].detach().float().cpu().numpy(),
+                "target_hidden": kwargs["target_hidden"].detach().float().cpu().numpy(),
+                "position_ids": kwargs["position_ids"].detach().cpu().numpy().astype(np.int64),
+                "draft_hidden": hidden.detach().float().cpu().numpy(),
+            }
+        )
+
+    handle = drafter.register_forward_hook(_hook, with_kwargs=True)
+    input_ids = tok(case.prompts[0], return_tensors="pt").input_ids.to(device)
+    stop = [tok.eos_token_id] if tok.eos_token_id is not None else None
+    with torch.inference_mode():
+        drafter.spec_generate(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=case.generation_params.get("max_new_tokens", 16),
+            stop_token_ids=stop,
+            temperature=0.0,
+        )
+    handle.remove()
+
+    if not captured:
+        raise RuntimeError("Drafter was never invoked during spec_generate.")
+
+    first = captured[0]
+    draft_hidden = first["draft_hidden"]
+    last_hidden = draft_hidden[0, -1, :].astype(np.float64)
+    golden = _extract_logits_golden(last_hidden)
+    save_golden_ref(
+        json_path,
+        top1_id=golden["top1_id"],
+        top2_id=golden["top2_id"],
+        top10_ids=golden["top10_ids"],
+        top10_logits=golden["top10_logits"],
+        logits_summary=golden["logits_summary"],
+        input_ids=input_ids.cpu().numpy(),
+        component_norms={"draft_hidden": float(np.linalg.norm(draft_hidden))},
+        component_shapes={"draft_hidden": tuple(int(x) for x in draft_hidden.shape)},
+    )
+
+    # Replay tensors: the drafter ONNX splits the reference's single position_ids
+    # into position_ids ([ctx + q]) and q_position_ids (last q). The first block
+    # call starts from an empty draft KV cache (the test supplies zero-length past
+    # tensors sized from the config).
+    pos = first["position_ids"]
+    q_len = first["noise_embedding"].shape[1]
+    arrays = {
+        "noise_embedding": first["noise_embedding"],
+        "target_hidden": first["target_hidden"],
+        "position_ids": pos,
+        "q_position_ids": pos[:, -q_len:],
+    }
+    save_drafter_inputs(drafter_inputs_path_for_case(case), arrays)
+
+
 # ---- Dispatcher ----
 
 # Map task_type strings to generator functions.
@@ -1186,12 +1622,15 @@ _GENERATORS = {
     "speech-to-text": _generate_speech_to_text,
     "speech-language": _generate_speech_language,
     "audio-feature-extraction": _generate_audio_feature_extraction,
+    "ctc-asr": _generate_ctc_asr,
     # Vision tasks that produce last_hidden_state — reuse image classification.
     "depth-estimation": _generate_image_classification,
     "image-segmentation": _generate_image_classification,
     "image-to-image": _generate_image_classification,
-    "object-detection": _generate_image_classification,
+    "object-detection": _generate_object_detection,
     "phi4mm-multimodal": _generate_phi4mm_multimodal,
+    "gemma4-assistant": _generate_gemma4_assistant,
+    "dflash-draft": _generate_dflash_draft,
 }
 
 

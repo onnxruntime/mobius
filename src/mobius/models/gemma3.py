@@ -18,7 +18,11 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+    vlm_vision_weights,
+)
 from mobius.components import (
     Gemma3MultiModalProjector,
     Linear,
@@ -88,20 +92,21 @@ class _Gemma3VisionEncoderModel(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         vision_features = self.vision_tower(op, pixel_values)
-        return self.multi_modal_projector(op, vision_features)
+        image_features = self.multi_modal_projector(op, vision_features)
+        # Projector returns (batch, tokens, hidden); squeeze the leading
+        # batch dim to (tokens, hidden) to match the 2-D ``image_features``
+        # contract expected by the embedding sub-model (Gather along axis 0)
+        # and the ort-genai runtime, which processes one image at a time.
+        #
+        # Precondition: this assumes exactly one image (leading dim == 1).
+        # True batch>1 / multi-image inference is unsupported here; callers
+        # run the vision encoder once per image and concatenate features.
+        return op.Squeeze(image_features, [0])
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        renamed: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if not key.startswith(("vision_tower.", "multi_modal_projector.")):
-                continue
-            # VisionModel MLP uses up_proj/down_proj; HF uses fc1/fc2
-            key = key.replace(".mlp.fc1.", ".mlp.up_proj.")
-            key = key.replace(".mlp.fc2.", ".mlp.down_proj.")
-            renamed[key] = value
-        return renamed
+        return vlm_vision_weights(state_dict, ("vision_tower.", "multi_modal_projector."))
 
 
 class _Gemma3EmbeddingModel(nn.Module):
@@ -201,7 +206,13 @@ class Gemma3MultiModalModel(nn.Module):
                 if key == "language_model.model.embed_tokens.weight":
                     renamed["embedding.embed_tokens.weight"] = value
             elif key.startswith("vision_tower."):
-                renamed["vision_encoder." + key] = value
+                # Vision MLP uses ``fc1``/``fc2`` in HF; rename to the
+                # ``FCMLP`` component naming (``up_proj``/``down_proj``).
+                new_key = "vision_encoder." + key
+                new_key = new_key.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                    ".mlp.fc2.", ".mlp.down_proj."
+                )
+                renamed[new_key] = value
             elif key.startswith("multi_modal_projector."):
                 renamed["vision_encoder." + key] = value
             else:

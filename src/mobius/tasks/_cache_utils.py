@@ -114,13 +114,69 @@ def _register_kv_cache_outputs(
     present_key_values: list[tuple[ir.Value, ir.Value]],
     *,
     prefix: str = "present",
+    batch: ir.SymbolicDim | str | None = None,
+    num_kv_heads: int | None = None,
+    key_head_dim: int | None = None,
+    value_head_dim: int | None = None,
+    total_seq_len: ir.SymbolicDim | str | int | None = None,
+    dtype: ir.DataType | None = None,
 ) -> None:
     """Name and register KV cache outputs on the graph.
 
-    Output shapes and dtypes are inferred by the shape inference pass
-    that runs during model optimization.
+    When every present-shape parameter (``batch``, ``num_kv_heads``,
+    ``key_head_dim``, ``value_head_dim``, ``total_seq_len``, ``dtype``) is
+    supplied, each ``present.{i}.{key,value}`` output is stamped with an
+    explicit ``[batch, num_kv_heads, total_seq_len, head_dim]`` type, symmetric
+    to the ``past_key_values`` inputs created by :func:`_make_kv_cache_inputs`.
+
+    This explicit stamp is required for ``com.microsoft::GroupQueryAttention``
+    exports: that contrib op's shape inference mis-derives the present
+    ``head_dim`` (it divides the *packed* QKV query hidden by
+    ``num_heads + 2 * kv_num_heads`` and lands on the wrong value), so the
+    ``present.*`` outputs would otherwise declare the wrong ``head_dim`` even
+    though the kernel produces correct data at runtime. The mismatch makes ORT
+    log a shape-merge warning and breaks present->past chaining in consumers
+    such as onnxruntime-genai that trust the declared shapes. The plain ONNX
+    ``Attention`` op infers the present shape correctly, so the stamp is a
+    no-op there.
+
+    When the parameters are omitted, output shapes/dtypes are left to the
+    shape inference pass that runs during model optimization.
+
+    The present-shape parameters are all-or-nothing by design: pass every one
+    to stamp the explicit type, or none to opt out and infer. A *partial* set
+    is always a wiring slip (a caller wired some dims but dropped others) and is
+    never legitimate, so it is rejected fail-closed: a partial set raises
+    :class:`ValueError` naming the provided and missing parameters, rather than
+    silently falling back to the known-wrong inference path.
     """
+    params = {
+        "batch": batch,
+        "num_kv_heads": num_kv_heads,
+        "key_head_dim": key_head_dim,
+        "value_head_dim": value_head_dim,
+        "total_seq_len": total_seq_len,
+        "dtype": dtype,
+    }
+    provided = [name for name, value in params.items() if value is not None]
+    stamp = len(provided) == len(params)
+    if provided and not stamp:
+        missing = [name for name in params if params[name] is None]
+        raise ValueError(
+            f"_register_kv_cache_outputs received a partial set of present-shape "
+            f"parameters (provided {provided}, missing {missing}); these are "
+            f"all-or-nothing. Pass all six to stamp explicit present.* types "
+            f"(required for correct GroupQueryAttention head_dim), or none to opt "
+            f"out and infer."
+        )
     for i, (present_key, present_value) in enumerate(present_key_values):
+        if stamp:
+            present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])
+            present_key.type = ir.TensorType(dtype)
+            present_value.shape = ir.Shape(
+                [batch, num_kv_heads, total_seq_len, value_head_dim]
+            )
+            present_value.type = ir.TensorType(dtype)
         builder.add_output(present_key, f"{prefix}.{i}.key")
         builder.add_output(present_value, f"{prefix}.{i}.value")
 
