@@ -27,11 +27,11 @@ class QuantizationConfig:
     # (e.g. Tencent SEQ uses 1.5).
     float_zero_point: bool = False
     # When True, the input embedding table is block-wise quantized and is
-    # looked up with GatherBlockQuantized instead of a plain Gather. Set by
-    # Olive RTN exports that pass ``embeds: true``.
+    # looked up with GatherBlockQuantized instead of a plain Gather. Used by
+    # Olive RTN exports and quantized GGUF imports.
     quantize_embeddings: bool = False
     # When True, the LM head projection is block-wise quantized (MatMulNBits).
-    # Set by Olive RTN exports that pass ``lm_head: true``.
+    # Used by Olive RTN exports and tied quantized GGUF imports.
     quantize_lm_head: bool = False
     # When True, the input embedding and LM head share one weight table. Olive
     # RTN records this in its own config (``tie_word_embeddings``) and may clear

@@ -351,7 +351,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
     if args.keep_quantized:
-        print("Quantized mode: preserving GGUF quantization as MatMulNBits...")
+        print(
+            "Quantized mode: preserving GGUF quantization as "
+            "MatMulNBits/GatherBlockQuantized..."
+        )
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
@@ -594,7 +597,10 @@ def main(argv: list[str] | None = None) -> None:
     gguf_parser.add_argument(
         "--keep-quantized",
         action="store_true",
-        help="Preserve quantization via MatMulNBits (Q4_0/Q4_1/Q8_0).",
+        help=(
+            "Preserve supported projection and embedding quantization via "
+            "MatMulNBits/GatherBlockQuantized."
+        ),
     )
     gguf_parser.add_argument(
         "--dtype",
