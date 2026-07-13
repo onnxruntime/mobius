@@ -31,36 +31,27 @@ class ComponentInfo:
     Attributes:
         name: Component name. This is the ``ModelPackage`` key mobius produces
             (and the subfolder name a multi-component export is saved under).
-        kind: Optimization role of the component, e.g. ``"decoder"``,
-            ``"encoder"``, or ``"embedding"``.
-        source_path: Optional dotted HuggingFace module path for the component
-            inside the full model. Tools can use this to optimize a submodule
-            in place before exporting the full model.
+        role: Optimization role of the component, e.g. ``"decoder"``,
+            ``"encoder"``, or ``"embedding"``. Mobius uses this to gate fusion
+            passes (only ``"decoder"`` receives GQA / QKV-packing). It is the
+            value declared in the task's ``model_roles``.
+        source_paths: Dotted HuggingFace module paths that make up this
+            component inside the full model. A single component may map to
+            multiple disjoint sub-modules (e.g. a decoder assembled from
+            ``model.layers``, ``model.norm`` and ``lm_head``), so this is a
+            tuple. Empty when the component is the whole model or the layout is
+            unknown. Tools such as Olive use these to optimize a submodule in
+            place before exporting the full model.
     """
 
     name: str
-    kind: str
-    source_path: str | None = None
+    role: str
+    source_paths: tuple[str, ...] = ()
 
 
-_QWEN_VL_COMPONENT_SOURCES = {
-    "decoder": "model.language_model",
-    "vision_encoder": "model.visual",
-    "embedding": "model.language_model.embed_tokens",
-}
-
-
-_COMPONENT_SOURCES_BY_MODEL_TYPE = {
-    "qwen2_5_vl": _QWEN_VL_COMPONENT_SOURCES,
-    "qwen2_vl": _QWEN_VL_COMPONENT_SOURCES,
-    "qwen3_5": _QWEN_VL_COMPONENT_SOURCES,
-    "qwen3_5_moe_vl": _QWEN_VL_COMPONENT_SOURCES,
-    "qwen3_5_vl": _QWEN_VL_COMPONENT_SOURCES,
-    "qwen3_vl": _QWEN_VL_COMPONENT_SOURCES,
-}
-
-
-def _resolve_task_and_model_type(model_id: str, task, trust_remote_code: bool) -> tuple[str, str | None]:
+def _resolve_task_and_model_type(
+    model_id: str, task, trust_remote_code: bool
+) -> tuple[str, str | None]:
     """Resolve the mobius task name for a model id without building it.
 
     Mirrors the model_type/task resolution in :func:`mobius.build`, limited to
@@ -131,15 +122,29 @@ def inspect_components(
         ValueError: If a config cannot be resolved for ``model_id`` (e.g. a
             diffusers pipeline, which is not supported).
     """
+    from mobius._registry import registry
     from mobius.tasks import get_task
 
     resolved_task, model_type = _resolve_task_and_model_type(model_id, task, trust_remote_code)
     task_obj = get_task(resolved_task)
     roles = task_obj.model_roles or {}
-    source_paths = _COMPONENT_SOURCES_BY_MODEL_TYPE.get(model_type, {})
+
+    # ``source_paths`` live as an ``HF_COMPONENT_SOURCES`` ClassVar on the
+    # registered module class (next to that class's ``preprocess_weights``,
+    # which routes the very same HF prefixes). Read it straight off the class
+    # so inspection stays cheap: no module construction, no weight loading.
+    component_sources: dict[str, tuple[str, ...]] = {}
+    if model_type is not None and model_type in registry:
+        module_class = registry.get(model_type)
+        component_sources = getattr(module_class, "HF_COMPONENT_SOURCES", {})
+
     components = [
-        ComponentInfo(name=name, kind=kind, source_path=source_paths.get(name))
-        for name, kind in roles.items()
+        ComponentInfo(
+            name=name,
+            role=role,
+            source_paths=tuple(component_sources.get(name, ())),
+        )
+        for name, role in roles.items()
     ]
     logger.debug(
         "inspect_components(%s): task=%s components=%s",

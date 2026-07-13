@@ -25,7 +25,7 @@ HuggingFace class: Qwen3TTSForConditionalGeneration
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -417,6 +417,19 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
     default_task: str = "tts"
     category: str = "Audio"
     config_class: type = ArchitectureConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (talker/code_predictor/embedding split under ``talker.*``).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "talker": ("talker.model.layers", "talker.model.norm", "talker.codec_head"),
+        "code_predictor": ("talker.code_predictor",),
+        "embedding": (
+            "talker.model.text_embedding",
+            "talker.text_projection",
+            "talker.model.codec_embedding",
+        ),
+        "speaker_encoder": ("speaker_encoder",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

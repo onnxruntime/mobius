@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -2593,6 +2593,20 @@ class Gemma4Model(nn.Module):
     default_task: str = "gemma4"
     category: str = "Multimodal"
 
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors preprocess_weights; outer ``model.`` prefix).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model.language_model",),
+        "vision_encoder": ("model.vision_tower", "model.embed_vision"),
+        "audio_encoder": ("model.audio_tower", "model.embed_audio"),
+        "embedding": (
+            "model.language_model.embed_tokens",
+            "model.language_model.embed_tokens_per_layer",
+            "model.language_model.per_layer_model_projection",
+            "model.language_model.per_layer_projection_norm",
+        ),
+    }
+
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
@@ -2771,6 +2785,15 @@ class Gemma4UnifiedModel(nn.Module):
 
     default_task: str = "gemma4-unified"
     category: str = "Multimodal"
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model. Encoder-free: vision/audio embedders, not towers.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model.language_model",),
+        "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
+        "audio_encoder": ("model.embed_audio",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()

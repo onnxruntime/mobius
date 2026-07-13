@@ -35,6 +35,7 @@ HuggingFace/NeMo correspondence (state-dict prefixes):
 from __future__ import annotations
 
 import math
+from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -972,6 +973,15 @@ class EncDecRNNTModel(nn.Module):
 
     default_task: str = "fastconformer-rnnt"
     category: str = "Speech-to-Text"
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model. ``encoder``/``encoder_streaming`` share the same HF encoder.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "encoder": ("encoder",),
+        "encoder_streaming": ("encoder",),
+        "decoder": ("decoder",),
+        "joint": ("joint",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

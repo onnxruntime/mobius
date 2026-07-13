@@ -21,7 +21,7 @@ HuggingFace weight names:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -193,6 +193,14 @@ class LLaVAModel(nn.Module):
 
     default_task: str = "vision-language"
     category: str = "Multimodal"
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes the sub-models' preprocess_weights route).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("language_model",),
+        "vision_encoder": ("vision_tower", "multi_modal_projector"),
+        "embedding": ("language_model.model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

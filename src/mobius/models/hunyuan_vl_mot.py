@@ -47,7 +47,7 @@ HuggingFace weight layout::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -468,6 +468,14 @@ class HunYuanVLMoTModel(nn.Module):
 
     default_task: str = "hunyuan-vl-mot"
     category: str = "Multimodal"
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes routed in preprocess_weights; outer ``model.``).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model.language_model",),
+        "vision_encoder": ("model.visual",),
+        "embedding": ("model.language_model.model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

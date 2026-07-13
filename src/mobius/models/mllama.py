@@ -17,7 +17,7 @@ The vision encoder is a ViT-based model that produces image features.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -358,6 +358,14 @@ class MllamaCausalLMModel(nn.Module):
     default_task: str = "mllama-vision-language"
     category: str = "Multimodal"
     config_class: type = MllamaConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes the sub-models' preprocess_weights route).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("language_model",),
+        "vision_encoder": ("vision_model",),
+        "embedding": ("language_model.model.embed_tokens",),
+    }
 
     def __init__(self, config: MllamaConfig):
         super().__init__()

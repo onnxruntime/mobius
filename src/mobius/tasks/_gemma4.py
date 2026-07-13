@@ -21,6 +21,8 @@ entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
@@ -201,6 +203,15 @@ class Gemma4Task(ModelTask):
         current input).  The ``Attention`` / ``GroupQueryAttention`` ops
         handle causal masking internally via ``is_causal=1``.
     """
+
+    #: decoder + vision + embedding, plus audio when ``config.audio`` is set.
+    #: ``audio_encoder`` is declared statically (it is config-gated at build time).
+    model_roles: ClassVar[dict[str, str]] = {
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
+        "audio_encoder": "encoder",
+        "embedding": "embedding",
+    }
 
     def build(
         self,

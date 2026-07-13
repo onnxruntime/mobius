@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -85,6 +85,14 @@ class Qwen25VLCausalLMModel(nn.Module):
     default_task: str = "qwen-vl"
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model", "lm_head"),
+        "vision_encoder": ("visual",),
+        "embedding": ("model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -401,6 +409,14 @@ class Qwen2VLCausalLMModel(nn.Module):
     default_task: str = "qwen-vl"
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model", "lm_head"),
+        "vision_encoder": ("visual",),
+        "embedding": ("model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -752,6 +768,14 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
     default_task: str = "qwen-vl"
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("model.language_model",),
+        "vision_encoder": ("model.visual",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

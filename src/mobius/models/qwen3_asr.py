@@ -18,6 +18,7 @@ HuggingFace class: Qwen3ASRForConditionalGeneration
 from __future__ import annotations
 
 import dataclasses
+from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -532,6 +533,14 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     default_task: str = "speech-language"
     category: str = "Speech-to-Text"
     config_class: type = ArchitectureConfig
+
+    # HF module sub-trees per ONNX component, read by inspect_components without
+    # instantiating the model (mirrors preprocess_weights; optional outer ``thinker.``).
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "audio_encoder": ("thinker.audio_tower",),
+        "embedding": ("thinker.model.embed_tokens",),
+        "decoder": ("thinker.model.layers", "thinker.model.norm", "thinker.lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
