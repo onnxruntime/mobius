@@ -31,7 +31,7 @@ class QuantizationConfig:
     # Olive RTN exports and quantized GGUF imports.
     quantize_embeddings: bool = False
     # When True, the LM head projection is block-wise quantized (MatMulNBits).
-    # Used by Olive RTN exports and tied quantized GGUF imports.
+    # Used by Olive RTN exports and quantized GGUF imports.
     quantize_lm_head: bool = False
     # When True, the input embedding and LM head share one weight table. Olive
     # RTN records this in its own config (``tie_word_embeddings``) and may clear

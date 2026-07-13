@@ -8,10 +8,11 @@ pipeline.  Two modes:
 
 - **Dequantized** (default): All quantized tensors are dequantized to
   float.  Simple, but loses the compression benefit of quantization.
-- **Quantized** (``keep_quantized=True``): Linear-layer weights are
-  normalized to a common MatMulNBits layout, including mixed presets
-  such as Q4_K_M. Compatible quantized token embeddings are repacked
-  for GatherBlockQuantized. Other tensors are dequantized.
+- **Quantized** (``keep_quantized=True``): Linear-layer weights, including
+  a quantized output head, are repacked into MatMulNBits format and token
+  embeddings into GatherBlockQuantized format. Mixed presets such as
+  Q4_K_M are normalized to one quantization layout. Other tensors are
+  dequantized.
 """
 
 from __future__ import annotations
@@ -175,6 +176,11 @@ def build_from_gguf(
             bits=bits,
             block_size=block_size,
         )
+        quantize_lm_head = (
+            quantize_embeddings
+            if config.tie_word_embeddings
+            else _can_quantize_lm_head(gguf_model, gguf_arch)
+        )
         config = dataclasses.replace(
             config,
             quantization=QuantizationConfig(
@@ -184,17 +190,19 @@ def build_from_gguf(
                 sym=is_sym,
                 float_zero_point=float_zp,
                 quantize_embeddings=quantize_embeddings,
-                quantize_lm_head=quantize_embeddings and config.tie_word_embeddings,
-                tie_word_embeddings=quantize_embeddings and config.tie_word_embeddings,
+                quantize_lm_head=quantize_lm_head,
+                tie_word_embeddings=quantize_lm_head and config.tie_word_embeddings,
             ),
         )
         logger.info(
-            "Quantized mode: bits=%d, block_size=%d, symmetric=%s, float_zp=%s, embedding=%s",
+            "Quantized mode: bits=%d, block_size=%d, symmetric=%s, "
+            "float_zp=%s, embedding=%s, lm_head=%s",
             bits,
             block_size,
             is_sym,
             float_zp,
             quantize_embeddings,
+            quantize_lm_head,
         )
 
     # 4. Look up module class and resolve task
@@ -462,6 +470,45 @@ def _can_quantize_embedding(
     return False
 
 
+def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
+    """Return whether an untied GGUF output head can be kept quantized."""
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    supported_types = {
+        "Q1_0",
+        "Q2_K",
+        "Q3_K",
+        "Q4_0",
+        "Q4_1",
+        "Q4_K",
+        "Q5_0",
+        "Q5_1",
+        "Q5_K",
+        "Q6_K",
+        "Q8_0",
+    }
+    for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
+        if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
+            continue
+        return len(shape) == 2 and getattr(qtype, "name", None) in supported_types
+    return False
+
+
+def _require_supported_requantization(
+    *,
+    bits: int,
+    block_size: int,
+    tensor_name: str,
+) -> None:
+    if bits != 4 or block_size != 32:
+        raise ValueError(
+            "keep_quantized MatMulNBits requantization currently supports only "
+            f"4-bit/block-32 targets; got bits={bits} block={block_size} "
+            f"for tensor {tensor_name}. Use keep_quantized=False or a "
+            "4-bit/block-32 target."
+        )
+
+
 def _load_dequantized_state_dict(
     gguf_model,
     gguf_arch: str,
@@ -500,10 +547,10 @@ def _load_quantized_state_dict(
 ) -> dict:
     """Load tensors, normalizing quantized projections to MatMulNBits.
 
-    Projection weights (Q/K/V/O and MLP) are converted to the graph's
-    common MatMulNBits format. Mixed source types are dequantized and
-    requantized when they do not already match that target. Compatible
-    quantized embeddings are converted for GatherBlockQuantized. Norms
+    Projection weights (Q/K/V/O, MLP, and a quantized output head) are
+    converted to the graph's common MatMulNBits format, and token embeddings
+    to GatherBlockQuantized format. Mixed or unsupported source types are
+    dequantized and requantized when they do not match that target. Norms
     and other non-linear tensors remain dequantized.
 
     For llama-family models, quantized Q/K weights receive the
@@ -603,6 +650,11 @@ def _load_quantized_state_dict(
                     shape_2d,
                 )
                 if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                    _require_supported_requantization(
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        tensor_name=hf_name,
+                    )
                     values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                     repacked = repack_dequantized_tensor(
                         values,
@@ -612,6 +664,11 @@ def _load_quantized_state_dict(
                     )
                     n_requantized += 1
             else:
+                _require_supported_requantization(
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    tensor_name=hf_name,
+                )
                 values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                 repacked = repack_dequantized_tensor(
                     values,
