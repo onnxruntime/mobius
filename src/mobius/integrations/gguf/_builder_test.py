@@ -261,6 +261,31 @@ class TestBuildQuantizedGguf:
 
         assert not _can_quantize_embedding(model, "llama", bits=4, block_size=128)
 
+    def test_detect_q4_k_m_mixed_profile(self):
+        """Q4_K presence selects a 4-bit target despite more Q5_0 tensors."""
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _MixedModel:
+            def tensor_items_raw(self):
+                for i in range(5):
+                    yield (
+                        f"blk.{i}.attn_q.weight",
+                        np.empty(0, dtype=np.uint8),
+                        GGMLQuantizationType.Q5_0,
+                        (64, 64),
+                    )
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q4_K,
+                    (64, 128),
+                )
+
+        bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
+        assert (bits, block_size, is_sym) == (4, 32, False)
+
 
 class TestRawTensorIterator:
     """Tests for GGUFModel.tensor_items_raw()."""
@@ -298,3 +323,14 @@ class TestRawTensorIterator:
         assert len(f32_items) > 0
         for _name, _raw, qtype, _shape in f32_items:
             assert qtype == GGMLQuantizationType.F32
+
+    def test_dequantize_raw_tensor_matches_get_tensor(self, q4_0_gguf: Path):
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        model = GGUFModel(q4_0_gguf)
+        name, raw, qtype, shape = next(
+            item for item in model.tensor_items_raw() if len(item[3]) == 2
+        )
+        expected = model.get_tensor(name)
+        actual = model.dequantize_raw_tensor(raw, qtype, shape)
+        np.testing.assert_array_equal(actual, expected)

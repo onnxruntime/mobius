@@ -8,10 +8,10 @@ pipeline.  Two modes:
 
 - **Dequantized** (default): All quantized tensors are dequantized to
   float.  Simple, but loses the compression benefit of quantization.
-- **Quantized** (``keep_quantized=True``): Linear-layer weights that
-  use supported GGUF types are repacked into MatMulNBits format.
-  Quantized token embeddings are repacked for GatherBlockQuantized.
-  Other tensors (norms and unsupported quant types) are dequantized.
+- **Quantized** (``keep_quantized=True``): Linear-layer weights are
+  normalized to a common MatMulNBits layout, including mixed presets
+  such as Q4_K_M. Compatible quantized token embeddings are repacked
+  for GatherBlockQuantized. Other tensors are dequantized.
 """
 
 from __future__ import annotations
@@ -108,9 +108,9 @@ def build_from_gguf(
             model type.
         dtype: Override model dtype (e.g. ``"f16"``). When ``None``,
             defaults to float32.
-        keep_quantized: When ``True``, preserve quantization for
-            supported GGUF types (Q4_0, Q4_1, Q8_0) by repacking
-            linear-layer weights into MatMulNBits format.
+        keep_quantized: When ``True``, preserve quantized linear-layer
+            weights in MatMulNBits format. Mixed Q4_K_M source types are
+            normalized to 4-bit, block-32 weights.
         execution_provider: Target execution provider for EP-aware
             optimisations (e.g. ``"cpu"`` to apply the
             GroupQueryAttention rewrite). Defaults to ``"default"``
@@ -328,16 +328,16 @@ def _normalize_gguf_weights(
 
 
 def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
-    """Detect bits, block size, and symmetry from dominant GGUF quant type.
+    """Detect the common MatMulNBits target for GGUF projection weights.
 
-    Scans block-level (projection) tensors and returns the bit-width,
-    block size, and symmetry flag of the most common repackable type.
+    Q4_K-containing mixed presets target 4-bit, block-32 asymmetric
+    MatMulNBits. Other files use the most common directly repackable type.
 
     Returns:
         ``(bits, block_size, is_symmetric)`` tuple.
 
     Raises:
-        ValueError: If no repackable quantized tensors are found.
+        ValueError: If no mapped or repackable weight tensors are found.
     """
     from gguf import GGMLQuantizationType
 
@@ -366,19 +366,39 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     counts: Counter = Counter()
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
-        if hf_name is None:
+        if hf_name is None or not hf_name.endswith(".weight"):
             continue
-        if can_repack(qtype.value if hasattr(qtype, "value") else qtype):
-            counts[qtype] += 1
+        counts[qtype] += 1
 
     if not counts:
         raise ValueError(
-            "No repackable quantized tensors found in GGUF file. "
+            "No mapped weight tensors found in GGUF file. "
             "Use keep_quantized=False for dequantized import."
         )
 
-    dominant = counts.most_common(1)[0][0]
-    params = repack_quant_params(dominant.value)
+    # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
+    # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
+    # The presence of Q4_K identifies the desired 4-bit MatMulNBits target;
+    # choosing only among already-repackable types would incorrectly select
+    # Q8_0 for the official Qwen2.5-0.5B Q4_K_M file.
+    if GGMLQuantizationType.Q4_K in counts:
+        dominant = GGMLQuantizationType.Q4_K
+    else:
+        repackable_counts = Counter(
+            {
+                qtype: count
+                for qtype, count in counts.items()
+                if can_repack(qtype.value if hasattr(qtype, "value") else qtype)
+            }
+        )
+        if not repackable_counts:
+            raise ValueError(
+                "No repackable quantized tensors found in GGUF file. "
+                "Use keep_quantized=False for dequantized import."
+            )
+        dominant = repackable_counts.most_common(1)[0][0]
+    dominant_value = dominant.value if hasattr(dominant, "value") else dominant
+    params = repack_quant_params(dominant_value)
     assert params is not None
     bits, block_size = params
     is_sym = type_symmetry[dominant]
@@ -478,12 +498,13 @@ def _load_quantized_state_dict(
     module,
     config,
 ) -> dict:
-    """Load tensors, repacking supported quantized types.
+    """Load tensors, normalizing quantized projections to MatMulNBits.
 
-    Projection weights (Q/K/V/O and MLP) that use repackable GGUF
-    types are converted to MatMulNBits format. Quantized embeddings
-    are converted to GatherBlockQuantized format. All other tensors
-    (norms and unsupported quant types) are dequantized.
+    Projection weights (Q/K/V/O and MLP) are converted to the graph's
+    common MatMulNBits format. Mixed source types are dequantized and
+    requantized when they do not already match that target. Compatible
+    quantized embeddings are converted for GatherBlockQuantized. Norms
+    and other non-linear tensors remain dequantized.
 
     For llama-family models, quantized Q/K weights receive the
     row-level reverse-permutation that ``process_tensors`` would
@@ -496,6 +517,7 @@ def _load_quantized_state_dict(
     from mobius.components import QuantizedEmbedding, QuantizedLinear
     from mobius.integrations.gguf._repacker import (
         can_repack,
+        repack_dequantized_tensor,
         repack_gguf_tensor,
     )
     from mobius.integrations.gguf._tencent_q1_0 import (
@@ -538,6 +560,10 @@ def _load_quantized_state_dict(
 
     state_dict: dict[str, torch.Tensor] = {}
     n_repacked = 0
+    n_requantized = 0
+    target_bits = config.quantization.bits
+    target_block_size = config.quantization.group_size
+    target_symmetric = config.quantization.sym
 
     for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
         gguf_model.tensor_items_raw(),
@@ -552,15 +578,14 @@ def _load_quantized_state_dict(
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
 
-        # Repack if the tensor is repackable AND its target ONNX
-        # parameter is from a QuantizedLinear module.
+        # Repack every target QuantizedLinear weight. Mixed GGUF presets
+        # otherwise leave unsupported source types as full float matrices,
+        # which cannot fit the graph's packed MatMulNBits initializer shape.
         stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
         is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
-        is_quantized_embedding = stem in quantized_embedding_stems
-        should_repack = (
-            stem is not None
-            and (stem in quantized_stems or is_quantized_embedding)
-            and (can_repack(qtype_val) or is_tencent_q1_0_tensor)
+        is_quantized_embedding = stem is not None and stem in quantized_embedding_stems
+        should_repack = stem is not None and (
+            stem in quantized_stems or is_quantized_embedding
         )
 
         if should_repack:
@@ -570,13 +595,31 @@ def _load_quantized_state_dict(
                     data_section_offset,
                     tensors_by_name[gguf_name],
                 )
-            else:
+            elif can_repack(qtype_val):
                 shape_2d = (int(np_shape[0]), int(np_shape[1]))
                 repacked = repack_gguf_tensor(
                     raw.ravel().view(np.uint8),
                     qtype_val,
                     shape_2d,
                 )
+                if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                    repacked = repack_dequantized_tensor(
+                        values,
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        symmetric=target_symmetric,
+                    )
+                    n_requantized += 1
+            else:
+                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                repacked = repack_dequantized_tensor(
+                    values,
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                n_requantized += 1
             w = torch.from_numpy(repacked.weight)
             s = torch.from_numpy(repacked.scales)
 
@@ -619,10 +662,11 @@ def _load_quantized_state_dict(
             state_dict[hf_name] = torch.from_numpy(arr)
 
     logger.info(
-        "Loaded %d tensors (%d repacked for quantized ops, %d dequantized)",
+        "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "
+        "%d requantized from mixed source types)",
         len(state_dict),
         n_repacked,
-        len(state_dict) - n_repacked,
+        n_requantized,
     )
     return state_dict
 
