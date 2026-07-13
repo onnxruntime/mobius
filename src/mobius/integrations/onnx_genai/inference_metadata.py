@@ -123,7 +123,7 @@ def _speculative_block(
             shared_kv.append({"name": lt, "target_layers": layers_by_type[lt]})
 
     return {
-        "proposal_type": "gemma4_assistant",
+        "proposal_type": "shared_kv",
         "num_speculative_tokens": num_speculative_tokens,
         "model": model_path,
         "backbone_hidden_size": backbone_hidden_size,

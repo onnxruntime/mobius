@@ -202,7 +202,7 @@ def test_speculative_block_e2b_defaults() -> None:
     cfg = _assistant_config()
     block = _speculative_block(cfg)
 
-    assert block["proposal_type"] == "gemma4_assistant"
+    assert block["proposal_type"] == "shared_kv"
     assert block["num_speculative_tokens"] == 3
     assert block["model"] == "model.onnx"
     assert block["backbone_hidden_size"] == 1536
@@ -234,7 +234,7 @@ def test_generate_metadata_includes_speculative_for_assistant() -> None:
 
     assert "speculative" in metadata
     spec = metadata["speculative"]
-    assert spec["proposal_type"] == "gemma4_assistant"
+    assert spec["proposal_type"] == "shared_kv"
     assert spec["backbone_hidden_size"] == 1536
     assert spec["vocab_size"] == 262144
     shared_names = [s["name"] for s in spec["shared_kv"]]
@@ -260,7 +260,7 @@ def test_to_yaml_speculative_block() -> None:
     yaml_text = _to_yaml(metadata)
 
     assert "speculative:" in yaml_text
-    assert "  proposal_type: gemma4_assistant" in yaml_text
+    assert "  proposal_type: shared_kv" in yaml_text
     assert "  num_speculative_tokens: 3" in yaml_text
     assert "  model: model.onnx" in yaml_text
     assert "  backbone_hidden_size: 1536" in yaml_text
@@ -282,5 +282,5 @@ def test_write_inference_metadata_yaml_for_assistant(tmp_path) -> None:
     assert "inference_metadata" in artifacts
     yaml_text = (tmp_path / "inference_metadata.yaml").read_text()
     assert "speculative:" in yaml_text
-    assert "proposal_type: gemma4_assistant" in yaml_text
+    assert "proposal_type: shared_kv" in yaml_text
     assert "backbone_hidden_size: 1536" in yaml_text
