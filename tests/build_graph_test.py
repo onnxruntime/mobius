@@ -5215,9 +5215,7 @@ class TestBuildPagedCacheGraph:
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
-        task = CausalLMTask(
-            paged_cache=True, page_size=self.PAGE_SIZE, num_pages=num_pages
-        )
+        task = CausalLMTask(paged_cache=True, page_size=self.PAGE_SIZE, num_pages=num_pages)
         pkg = task.build(module, config)
         return pkg["model"], config
 
@@ -5258,7 +5256,9 @@ class TestBuildPagedCacheGraph:
         """Verify page pools are [num_pages, page_size, kv_hidden]."""
         model, config = self._build_paged_cache_model()
         kv_hidden = config.num_key_value_heads * config.head_dim
-        pools = {inp.name: inp for inp in model.graph.inputs if inp.name.startswith("key_pool")}
+        pools = {
+            inp.name: inp for inp in model.graph.inputs if inp.name.startswith("key_pool")
+        }
         assert pools, "No key_pool inputs found"
         for inp in pools.values():
             dims = list(inp.shape)
@@ -5269,9 +5269,7 @@ class TestBuildPagedCacheGraph:
     def test_paged_cache_num_pages_dynamic_by_default(self):
         """Omitting num_pages leaves the pool's first dim symbolic."""
         model, _ = self._build_paged_cache_model(num_pages=None)
-        key_pool0 = next(
-            inp for inp in model.graph.inputs if inp.name == "key_pool.0"
-        )
+        key_pool0 = next(inp for inp in model.graph.inputs if inp.name == "key_pool.0")
         first_dim = next(iter(key_pool0.shape))
         assert not isinstance(first_dim, int), (
             f"Expected symbolic num_pages dim, got {first_dim!r}"
@@ -5286,9 +5284,7 @@ class TestBuildPagedCacheGraph:
         assert "logits" in output_names
         for i in range(num_layers):
             assert f"updated_key_pool.{i}" in output_names, f"Missing updated_key_pool.{i}"
-            assert f"updated_value_pool.{i}" in output_names, (
-                f"Missing updated_value_pool.{i}"
-            )
+            assert f"updated_value_pool.{i}" in output_names, f"Missing updated_value_pool.{i}"
         # No dynamic/static cache outputs
         assert not any(n.startswith("present.") for n in output_names)
         assert not any(n.startswith("updated_key_cache.") for n in output_names)
