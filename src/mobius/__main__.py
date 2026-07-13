@@ -301,10 +301,17 @@ def _save_package(
     elif runtime == "onnx-genai":
         from mobius.integrations.onnx_genai import write_inference_metadata
 
-        path = write_inference_metadata(
-            pkg, output_dir, max_sequence_length=getattr(args, "max_length", None)
+        hf_model_id = getattr(args, "model", None)
+        local_config_dir = getattr(args, "config", None)
+        artifacts = write_inference_metadata(
+            pkg,
+            output_dir,
+            max_sequence_length=getattr(args, "max_length", None),
+            hf_model_id=hf_model_id,
+            local_config_dir=local_config_dir,
         )
-        print(f"  inference_metadata: {path}")
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
