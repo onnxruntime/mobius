@@ -20,11 +20,14 @@ def _write_quantized_gguf(
     num_kv_heads: int = 2,
     intermediate_size: int = 128,
     vocab_size: int = 256,
+    quantize_embedding: bool = False,
+    tie_embeddings: bool = False,
 ) -> None:
     """Write a GGUF file with Q4_0 quantized projection weights.
 
-    Norms and embeddings are float32; all linear-layer weights in
-    decoder blocks are Q4_0 (4-bit symmetric, block_size=32).
+    Norms are float32; all linear-layer weights in decoder blocks are
+    Q4_0 (4-bit symmetric, block_size=32). The embedding can optionally
+    be Q4_0 and tied to the LM head.
     """
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -63,8 +66,10 @@ def _write_quantized_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
 
-    # Embeddings (float32)
-    _add_f32("token_embd.weight", (vocab_size, hidden_size))
+    if quantize_embedding:
+        _add_q4_0("token_embd.weight", vocab_size, hidden_size)
+    else:
+        _add_f32("token_embd.weight", (vocab_size, hidden_size))
 
     for i in range(num_layers):
         # Projection weights (Q4_0)
@@ -95,9 +100,10 @@ def _write_quantized_gguf(
         _add_f32(f"blk.{i}.attn_norm.weight", (hidden_size,))
         _add_f32(f"blk.{i}.ffn_norm.weight", (hidden_size,))
 
-    # Output norm + lm_head (float32)
+    # Output norm + optional untied lm_head (float32)
     _add_f32("output_norm.weight", (hidden_size,))
-    _add_f32("output.weight", (vocab_size, hidden_size))
+    if not tie_embeddings:
+        _add_f32("output.weight", (vocab_size, hidden_size))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -110,6 +116,22 @@ def q4_0_gguf(tmp_path: Path) -> Path:
     """Create a Q4_0 quantized GGUF test file."""
     path = tmp_path / "test_q4_0.gguf"
     _write_quantized_gguf(path)
+    return path
+
+
+@pytest.fixture
+def q4_0_embedding_gguf(tmp_path: Path) -> Path:
+    """Create a GGUF with a Q4_0 token embedding."""
+    path = tmp_path / "test_q4_0_embedding.gguf"
+    _write_quantized_gguf(path, quantize_embedding=True)
+    return path
+
+
+@pytest.fixture
+def q4_0_tied_embedding_gguf(tmp_path: Path) -> Path:
+    """Create a GGUF with one Q4_0 table shared by embedding and LM head."""
+    path = tmp_path / "test_q4_0_tied_embedding.gguf"
+    _write_quantized_gguf(path, quantize_embedding=True, tie_embeddings=True)
     return path
 
 
@@ -135,6 +157,39 @@ class TestBuildQuantizedGguf:
         assert "MatMulNBits" in op_types, (
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
+
+    def test_quantized_embedding_uses_gatherblockquantized(self, q4_0_embedding_gguf: Path):
+        """A quantized GGUF embedding remains packed in the ONNX graph."""
+        import onnx_ir as ir
+
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(q4_0_embedding_gguf, keep_quantized=True)["model"]
+        gather_nodes = [node for node in model.graph if node.op_type == "GatherBlockQuantized"]
+        assert len(gather_nodes) == 1
+        assert gather_nodes[0].domain == "com.microsoft"
+
+        qweight = model.graph.initializers["model.embed_tokens.qweight"]
+        assert qweight.dtype == ir.DataType.UINT8
+        assert list(qweight.shape) == [256, 32]
+        assert list(model.graph.initializers["model.embed_tokens.scales"].shape) == [
+            256,
+            2,
+        ]
+        assert "model.embed_tokens.weight" not in model.graph.initializers
+
+    def test_tied_quantized_embedding_drives_matmulnbits_head(
+        self, q4_0_tied_embedding_gguf: Path
+    ):
+        """Tied embedding/head share one packed table across both contrib ops."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(q4_0_tied_embedding_gguf, keep_quantized=True)["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert op_types.count("GatherBlockQuantized") == 1
+        assert "MatMulNBits" in op_types
+        assert "model.embed_tokens.qweight" in model.graph.initializers
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
 
     def test_norms_are_float(self, q4_0_gguf: Path):
         """Norm weights remain float, not quantized."""
@@ -174,6 +229,37 @@ class TestBuildQuantizedGguf:
         assert bits == 4
         assert block_size == 32
         assert is_sym is True
+
+    def test_embedding_quantization_check_is_metadata_only(self, monkeypatch):
+        """Embedding compatibility does not read or repack tensor data."""
+        from types import SimpleNamespace
+
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf import _tencent_q1_0
+        from mobius.integrations.gguf._builder import _can_quantize_embedding
+
+        monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: False)
+        tensor = SimpleNamespace(
+            name="token_embd.weight",
+            tensor_type=GGMLQuantizationType.Q4_0,
+            shape=(64, 256),
+        )
+        model = SimpleNamespace(_reader=SimpleNamespace(tensors=[tensor]))
+
+        assert _can_quantize_embedding(model, "llama", bits=4, block_size=32)
+
+    def test_tencent_q1_0_embedding_is_not_quantized(self, monkeypatch):
+        """Tencent Q1_0 detection short-circuits before inspecting tensors."""
+        from types import SimpleNamespace
+
+        from mobius.integrations.gguf import _tencent_q1_0
+        from mobius.integrations.gguf._builder import _can_quantize_embedding
+
+        monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: True)
+        model = SimpleNamespace()
+
+        assert not _can_quantize_embedding(model, "llama", bits=4, block_size=128)
 
 
 class TestRawTensorIterator:

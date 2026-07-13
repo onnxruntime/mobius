@@ -62,6 +62,15 @@ _GGUF_BLOCK_ELEMENTS = {
 
 _SUPPORTED_TYPES = frozenset(_BLOCK_BYTES.keys())
 
+# MatMulNBits representation produced for each supported GGUF type.
+_REPACK_PARAMS = {
+    _GGUF_Q4_0: (4, 32),
+    _GGUF_Q4_1: (4, 32),
+    _GGUF_Q8_0: (8, 32),
+    _GGUF_Q4_K: (4, 32),
+    _GGUF_Q1_0: (2, 128),
+}
+
 
 @dataclass
 class RepackedTensor:
@@ -86,7 +95,12 @@ class RepackedTensor:
 
 def can_repack(gguf_type: int) -> bool:
     """Return True if the GGUF type can be repacked to MatMulNBits."""
-    return gguf_type in _SUPPORTED_TYPES
+    return repack_quant_params(gguf_type) is not None
+
+
+def repack_quant_params(gguf_type: int) -> tuple[int, int] | None:
+    """Return the ``(bits, block_size)`` produced for a GGUF type."""
+    return _REPACK_PARAMS.get(gguf_type)
 
 
 def repack_gguf_tensor(
