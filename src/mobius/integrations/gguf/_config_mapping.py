@@ -333,6 +333,12 @@ def gguf_to_config(
         rms_norm_eps=hf_fields.get("rms_norm_eps", 1e-5),
         hidden_act=hidden_act,
         tie_word_embeddings=_infer_tie_embeddings(model),
+        # Projection biases are not in GGUF metadata; infer from tensor
+        # presence. Qwen2/Qwen3 carry Q/K/V biases — omitting them breaks
+        # attention and yields garbage output.
+        attn_qkv_bias=_infer_attn_qkv_bias(model),
+        attn_o_bias=_infer_attn_o_bias(model),
+        mlp_bias=_infer_mlp_bias(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
         # MoE fields (None when not present → non-MoE model)
@@ -567,3 +573,31 @@ def _infer_tie_embeddings(model: Any) -> bool:
     for both input and output).
     """
     return "output.weight" not in model.tensor_names
+
+
+def _infer_attn_qkv_bias(model: Any) -> bool:
+    """Infer whether Q/K/V projections have bias from tensor presence.
+
+    llama.cpp names attention projection biases ``blk.N.attn_{q,k,v}.bias``
+    (or a fused ``blk.N.attn_qkv.bias``). Models such as Qwen2/Qwen3 carry
+    these biases; if the config default (``False``) is used instead, the
+    graph builder omits the bias ``Add`` after each projection and the
+    model produces garbage output.
+    """
+    return any(
+        n.endswith(("attn_q.bias", "attn_k.bias", "attn_v.bias", "attn_qkv.bias"))
+        for n in model.tensor_names
+    )
+
+
+def _infer_attn_o_bias(model: Any) -> bool:
+    """Infer whether the attention output projection has a bias tensor."""
+    return any(n.endswith("attn_output.bias") for n in model.tensor_names)
+
+
+def _infer_mlp_bias(model: Any) -> bool:
+    """Infer whether MLP/FFN projections have bias tensors."""
+    return any(
+        n.endswith(("ffn_up.bias", "ffn_down.bias", "ffn_gate.bias"))
+        for n in model.tensor_names
+    )

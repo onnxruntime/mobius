@@ -470,6 +470,7 @@ def _load_quantized_state_dict(
 
     num_heads = getattr(config, "num_attention_heads", None)
     num_kv_heads = getattr(config, "num_key_value_heads", None)
+    model_type = getattr(config, "model_type", None)
 
     # Detect Tencent's non-mainline Q1_0 layout once per file. Reading
     # such tensors requires a custom parser keyed on the explicit
@@ -528,8 +529,10 @@ def _load_quantized_state_dict(
             s = torch.from_numpy(repacked.scales)
 
             # Apply Q/K row permutation to quantized tensors
-            # (same transform as _process_llama, on all arrays)
-            if _needs_qk_permute(hf_name, num_heads, num_kv_heads):
+            # (same transform as _process_llama, on all arrays). Only
+            # llama-family archs use the interleaved-rope permute; Qwen
+            # and others must NOT be permuted.
+            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
                 n_head = (
                     num_heads
                     if ".q_proj." in hf_name or ".qkv_proj." in hf_name
@@ -542,7 +545,7 @@ def _load_quantized_state_dict(
             state_dict[f"{stem}.scales"] = s
             if repacked.zero_points is not None:
                 zp = torch.from_numpy(repacked.zero_points)
-                if _needs_qk_permute(hf_name, num_heads, num_kv_heads):
+                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
                     zp = _reverse_permute(zp, n_head)
                 state_dict[f"{stem}.zero_points"] = zp
             n_repacked += 1
@@ -573,15 +576,24 @@ def _needs_qk_permute(
     hf_name: str,
     num_heads: int | None,
     num_kv_heads: int | None,
+    model_type: str | None = None,
 ) -> bool:
     """Check if this tensor needs Q/K reverse-permutation.
 
-    Name-based gating (``.q_proj.``, ``.k_proj.``, ``.qkv_proj.``) is
-    sufficient without a model_type guard because non-llama architectures
-    use different projection names (``.query_key_value.``, ``.c_attn.``,
-    etc.) that won't match these patterns.
+    Two conditions must hold: the tensor must be a Q/K projection weight,
+    AND the model architecture must actually use llama.cpp's
+    interleaved-rope permute. Name-based gating alone is insufficient —
+    Qwen2/Qwen3 use ``.q_proj.``/``.k_proj.`` names too but store Q/K in
+    plain HF order (NEOX rope) and must NOT be permuted, or their
+    attention heads get scrambled and the model emits garbage.
     """
+    from mobius.integrations.gguf._tensor_processors import (
+        needs_llama_qk_permute,
+    )
+
     if num_heads is None or num_kv_heads is None:
+        return False
+    if not needs_llama_qk_permute(model_type):
         return False
     return (
         ".q_proj." in hf_name or ".k_proj." in hf_name or ".qkv_proj." in hf_name
