@@ -9,6 +9,8 @@ import math
 
 import pytest
 
+from mobius._build_context import build_context
+from mobius._execution_providers import ep_registry
 from mobius._testing import (
     count_op_type,
     create_test_builder,
@@ -125,7 +127,41 @@ class TestQuantizedLinearForward:
                 assert attrs["N"] == OUT_FEATURES
                 assert attrs["bits"] == 4
                 assert attrs["block_size"] == 32
+                # No active build context -> default EP (accuracy_level 0),
+                # so the attribute is omitted and ORT keeps its default path.
+                assert "accuracy_level" not in attrs
                 break
+
+    def test_no_accuracy_level_without_context(self):
+        """Default EP omits accuracy_level (ORT default / highest precision)."""
+        ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = ql(op, x)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert "accuracy_level" not in attrs
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_cpu_ep_emits_accuracy_level_4(self):
+        """CPU EP context stamps accuracy_level=4 (int8 MLAS path)."""
+        with build_context(ep_registry.require("cpu")):
+            ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=4, block_size=32)
+            b, op, graph = create_test_builder()
+            x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+            result = ql(op, x)
+            b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["accuracy_level"] == 4
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
 
     def test_3_inputs_without_zero_points(self):
         ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES)
