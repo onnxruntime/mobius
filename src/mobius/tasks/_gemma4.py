@@ -115,6 +115,13 @@ class Gemma4TextCausalLMTask(ModelTask):
         - past_key_values.{i}.key / .value for i in 0..num_kv_layers-1
     Outputs:
         - logits: FLOAT
+        - projected_state: FLOAT32 [batch, sequence_len, hidden_size]
+          The backbone post-norm ``last_hidden_state``, always cast to Float32
+          (even in an f16 graph).  It seeds a shared-KV speculative draft model:
+          the onnx-genai runtime auto-detects the seed-hidden output as the
+          first Float32 output whose last dim equals ``backbone_hidden_size``
+          (excluding ``logits``), so this output only needs to be emitted — no
+          metadata key names it.  This is a no-op for non-speculative serving.
         - present.{i}.key / present.{i}.value for i in 0..num_kv_layers-1
     """
 
@@ -148,14 +155,20 @@ class Gemma4TextCausalLMTask(ModelTask):
 
         past_key_values = _make_gemma4_kv_cache_inputs(builder, config, batch, past_seq_len)
 
-        logits, present_key_values = module(
+        logits, present_key_values, hidden_states = module(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            return_hidden_states=True,
         )
         builder.add_output(logits, "logits")
+        # Seed-hidden output for shared-KV speculative decoding. Cast to Float32
+        # unconditionally: the runtime requires the target seed-hidden in f32
+        # even when the rest of the graph (logits, KV cache) is f16.
+        projected_state = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        builder.add_output(projected_state, "projected_state")
         _register_kv_cache_outputs(builder, present_key_values)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

@@ -284,3 +284,76 @@ def test_write_inference_metadata_yaml_for_assistant(tmp_path) -> None:
     assert "speculative:" in yaml_text
     assert "proposal_type: shared_kv" in yaml_text
     assert "backbone_hidden_size: 1536" in yaml_text
+
+
+# ---------------------------------------------------------------------------
+# Merged package: target model block + assistant speculative block
+# ---------------------------------------------------------------------------
+
+
+def _e2b_target_config():
+    """A namespace mirroring the real Gemma-4 E2B text decoder config.
+
+    35 hidden layers, 20 KV-shared → 15 exported KV layers; sliding/full
+    interleave with sliding_window_pattern=5 (full at every 5th layer).
+    """
+    from types import SimpleNamespace
+
+    layer_types = (["sliding_attention"] * 4 + ["full_attention"]) * 7
+    return SimpleNamespace(
+        layer_types=layer_types,
+        num_hidden_layers=35,
+        num_kv_shared_layers=20,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+        head_dim=256,
+        max_position_embeddings=131072,
+        sliding_window=512,
+        dtype=ir.DataType.FLOAT16,
+    )
+
+
+def test_folded_shared_kv_groups_e2b() -> None:
+    from mobius.integrations.onnx_genai.inference_metadata import _folded_shared_kv_groups
+
+    groups = _folded_shared_kv_groups(_e2b_target_config())
+    assert groups == [
+        {"name": "sliding_attention", "target_layers": [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]},
+        {"name": "full_attention", "target_layers": [4, 9, 14]},
+    ]
+    # The runtime keys each group off target_layers.last(); it must point at the
+    # last exported layer of that type (the KV-share source layer).
+    assert groups[0]["target_layers"][-1] == 13
+    assert groups[1]["target_layers"][-1] == 14
+
+
+def test_generate_merged_inference_metadata_e2b() -> None:
+    from mobius.integrations.onnx_genai import generate_merged_inference_metadata
+
+    metadata = generate_merged_inference_metadata(_e2b_target_config(), _assistant_config())
+
+    # model block describes the TARGET decoder
+    assert metadata["model"]["attention"]["num_attention_heads"] == 8
+    assert metadata["model"]["attention"]["head_dim"] == 256
+
+    spec = metadata["speculative"]
+    assert spec["model"] == "assistant/model.onnx"
+    assert spec["backbone_hidden_size"] == 1536
+    assert spec["vocab_size"] == 262144
+    # shared_kv derives from the TARGET's folded layers, not the assistant's.
+    assert spec["shared_kv"][0]["target_layers"] == [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]
+    assert spec["shared_kv"][1]["target_layers"] == [4, 9, 14]
+
+
+def test_write_merged_inference_metadata_yaml(tmp_path) -> None:
+    from mobius.integrations.onnx_genai import write_merged_inference_metadata
+
+    artifacts = write_merged_inference_metadata(
+        _e2b_target_config(), _assistant_config(), str(tmp_path)
+    )
+    assert "inference_metadata" in artifacts
+    yaml_text = (tmp_path / "inference_metadata.yaml").read_text()
+    assert "speculative:" in yaml_text
+    assert "  model: assistant/model.onnx" in yaml_text
+    assert "      target_layers: [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]" in yaml_text
+    assert "      target_layers: [4, 9, 14]" in yaml_text

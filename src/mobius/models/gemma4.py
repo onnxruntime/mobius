@@ -1906,7 +1906,17 @@ class Gemma4CausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
-    ) -> tuple[ir.Value, list]:
+        return_hidden_states: bool = False,
+    ) -> tuple[ir.Value, list] | tuple[ir.Value, list, ir.Value]:
+        """Build the text-only causal LM graph.
+
+        When ``return_hidden_states`` is True, additionally return the backbone
+        post-norm ``last_hidden_state`` (``[batch, seq, hidden_size]``) so a
+        caller (e.g. the shared-KV speculative target export) can emit it as a
+        seed-hidden output for a draft model.  The final RMSNorm output is the
+        state the Gemma4-Assistant drafter's ``post_projection`` reproduces, so
+        it is the numerically correct seed for shared-KV speculative decoding.
+        """
         hidden_states, present_key_values = self.model(
             op,
             input_ids=input_ids,
@@ -1923,6 +1933,8 @@ class Gemma4CausalLMModel(CausalLMModel):
                 logits,
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
+        if return_hidden_states:
+            return logits, present_key_values, hidden_states
         return logits, present_key_values
 
     def preprocess_weights(

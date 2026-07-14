@@ -134,6 +134,125 @@ def _speculative_block(
     }
 
 
+def _folded_shared_kv_groups(target_config: object) -> list[dict[str, Any]]:
+    """Derive ``shared_kv`` groups from a **target** decoder config.
+
+    Unlike :func:`_target_layers_by_type` (which reads an *assistant* config
+    where every layer maps 1-to-1 to a KV slot), this folds the target's KV
+    sharing: the last ``num_kv_shared_layers`` layers borrow K,V from an earlier
+    layer of the same type and are NOT exported, so only the first
+    ``num_hidden_layers - num_kv_shared_layers`` layers have their own KV cache
+    entry.  ``target_layers`` therefore index the target's **exported** KV
+    entries (post-folding), which is exactly what the runtime slicer consumes.
+
+    The runtime keys each group off ``target_layers.last()``; because a
+    KV-shared layer reuses the *last* non-shared layer of its type, listing all
+    exported entries of a type puts that source layer last automatically.  This
+    is fully generic: it derives purely from ``layer_types`` +
+    ``num_kv_shared_layers``, so it scales to any layer count (e.g. 12B).
+    """
+    layer_types: list[str] = getattr(target_config, "layer_types", None) or []
+    if not layer_types:
+        raise ValueError(
+            "merged onnx-genai metadata requires the target config to declare "
+            "layer_types to derive shared_kv groups."
+        )
+    num_hidden = getattr(target_config, "num_hidden_layers", len(layer_types))
+    num_shared = getattr(target_config, "num_kv_shared_layers", 0) or 0
+    num_kv_layers = num_hidden - num_shared
+    exported = layer_types[:num_kv_layers]
+
+    by_type: dict[str, list[int]] = {}
+    for i, lt in enumerate(exported):
+        by_type.setdefault(lt, []).append(i)
+
+    groups: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for lt in exported:
+        if lt not in seen:
+            seen.add(lt)
+            groups.append({"name": lt, "target_layers": by_type[lt]})
+    return groups
+
+
+def generate_merged_inference_metadata(
+    target_config: object,
+    assistant_config: object,
+    *,
+    max_sequence_length: int | None = None,
+    num_speculative_tokens: int = 3,
+    assistant_model_path: str = "assistant/model.onnx",
+) -> dict[str, Any]:
+    """Build merged metadata for a single-model target + shared-KV assistant.
+
+    The ``model:`` block describes the **target** decoder (``target_config``);
+    the ``speculative:`` block wires in the draft ``assistant_config`` with
+    ``shared_kv`` groups derived from the *target's* exported KV layers
+    (:func:`_folded_shared_kv_groups`), not the assistant's own layers.  This is
+    the correct wiring for a merged package where the target and assistant have
+    different layer counts (e.g. E2B: 15 exported target KV layers vs 4
+    assistant layers).
+
+    Stays model-agnostic: all shapes/wiring are read from the two configs.
+    """
+    metadata = generate_inference_metadata(
+        target_config, max_sequence_length=max_sequence_length
+    )
+    # target_config is not a Gemma4AssistantConfig, so no speculative block was
+    # added above; attach the merged one here.
+    metadata["speculative"] = {
+        "proposal_type": "shared_kv",
+        "num_speculative_tokens": num_speculative_tokens,
+        "model": assistant_model_path,
+        "backbone_hidden_size": _positive_int(assistant_config, "backbone_hidden_size"),
+        "vocab_size": _positive_int(assistant_config, "vocab_size"),
+        "projected_state_output": "projected_state",
+        "logits_output": "logits",
+        "shared_kv": _folded_shared_kv_groups(target_config),
+    }
+    return metadata
+
+
+def write_merged_inference_metadata(
+    target_config: object,
+    assistant_config: object,
+    directory: str,
+    *,
+    max_sequence_length: int | None = None,
+    num_speculative_tokens: int = 3,
+    assistant_model_path: str = "assistant/model.onnx",
+    hf_model_id: str | None = None,
+    local_config_dir: str | None = None,
+) -> dict[str, str]:
+    """Write a merged ``inference_metadata.yaml`` (target model + assistant).
+
+    See :func:`generate_merged_inference_metadata`.  Also copies tokenizer files
+    from *local_config_dir* or *hf_model_id* when provided.
+    """
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(
+            _to_yaml(
+                generate_merged_inference_metadata(
+                    target_config,
+                    assistant_config,
+                    max_sequence_length=max_sequence_length,
+                    num_speculative_tokens=num_speculative_tokens,
+                    assistant_model_path=assistant_model_path,
+                )
+            )
+        )
+    artifacts: dict[str, str] = {"inference_metadata": path}
+    if local_config_dir:
+        for name in _copy_tokenizer_files_from_local(local_config_dir, directory):
+            artifacts[name] = os.path.join(directory, name)
+    elif hf_model_id:
+        for name in _copy_tokenizer_files_from_hf(hf_model_id, directory):
+            artifacts[name] = os.path.join(directory, name)
+    return artifacts
+
+
 def generate_inference_metadata(
     config: object,
     *,

@@ -5,7 +5,14 @@
 
 from mobius.integrations.onnx_genai.inference_metadata import (
     generate_inference_metadata,
+    generate_merged_inference_metadata,
     write_inference_metadata,
+    write_merged_inference_metadata,
 )
 
-__all__ = ["generate_inference_metadata", "write_inference_metadata"]
+__all__ = [
+    "generate_inference_metadata",
+    "generate_merged_inference_metadata",
+    "write_inference_metadata",
+    "write_merged_inference_metadata",
+]
