@@ -301,6 +301,17 @@ def _register_builtins() -> None:
             max_buffer_size=268_435_456,  # 256 MiB
             requires_graph_capture_rewrite=True,
         ),
+        # MLX plugin EP for Apple silicon. Its GroupQueryAttention kernel accepts
+        # separate Q/K/V in f32, f16, and bf16 and supports in-place shared KV.
+        # Keep QKV unpacked because the plugin's GQA claim expects nine inputs.
+        EpCapabilities(
+            name="mlx",
+            gqa_dtypes=frozenset(
+                {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
+            ),
+            qkv_pack_dtypes=frozenset(),
+            supports_past_present_share_buffer=True,
+        ),
         EpCapabilities(
             name="trt-rtx",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
