@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 
@@ -9,8 +10,10 @@ from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import (
     generate_inference_metadata,
     write_inference_metadata,
+    write_input_embedding_artifact,
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
+    _find_scaled_token_embedding,
     _speculative_block,
     _target_layers_by_type,
 )
@@ -209,6 +212,7 @@ def test_speculative_block_e2b_defaults() -> None:
     assert block["vocab_size"] == 262144
     assert block["projected_state_output"] == "projected_state"
     assert block["logits_output"] == "logits"
+    assert block["input_embedding"] == "input_embedding.f32"
 
     shared_kv = block["shared_kv"]
     assert len(shared_kv) == 2
@@ -267,6 +271,7 @@ def test_to_yaml_speculative_block() -> None:
     assert "  vocab_size: 262144" in yaml_text
     assert "  projected_state_output: projected_state" in yaml_text
     assert "  logits_output: logits" in yaml_text
+    assert "  input_embedding: input_embedding.f32" in yaml_text
     assert "    - name: sliding_attention" in yaml_text
     assert "      target_layers: [0, 1, 2]" in yaml_text
     assert "    - name: full_attention" in yaml_text
@@ -355,5 +360,93 @@ def test_write_merged_inference_metadata_yaml(tmp_path) -> None:
     yaml_text = (tmp_path / "inference_metadata.yaml").read_text()
     assert "speculative:" in yaml_text
     assert "  model: assistant/model.onnx" in yaml_text
+    assert "  input_embedding: input_embedding.f32" in yaml_text
     assert "      target_layers: [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13]" in yaml_text
     assert "      target_layers: [4, 9, 14]" in yaml_text
+
+
+# ---------------------------------------------------------------------------
+# Target input-token embedding artifact (speculative.input_embedding)
+# ---------------------------------------------------------------------------
+
+
+def _target_model_with_embedding(
+    vocab: int, hidden: int, scale: float
+) -> tuple[ir.Model, np.ndarray]:
+    """A minimal target graph: input_ids -> Gather(embed) -> Mul(scale)."""
+    weight = (np.arange(vocab * hidden, dtype=np.float32) * 0.001).reshape(vocab, hidden)
+    embed = ir.val(
+        "model.embed_tokens.weight",
+        ir.DataType.FLOAT16,
+        [vocab, hidden],
+        const_value=ir.tensor(weight.astype(np.float16), name="model.embed_tokens.weight"),
+    )
+    scale_const = ir.val(
+        "embed_scale",
+        ir.DataType.FLOAT16,
+        [],
+        const_value=ir.tensor(np.array(scale, dtype=np.float16), name="embed_scale"),
+    )
+    input_ids = ir.val("input_ids", ir.DataType.INT64, ["batch", "seq"])
+    gather = ir.node(
+        "Gather", inputs=[embed, input_ids], num_outputs=1, name="embed_gather"
+    )
+    gather.outputs[0].name = "gathered"
+    mul = ir.node(
+        "Mul",
+        inputs=[gather.outputs[0], scale_const],
+        num_outputs=1,
+        name="embed_scale_mul",
+    )
+    mul.outputs[0].name = "inputs_embeds"
+    graph = ir.Graph(
+        inputs=[input_ids],
+        outputs=[mul.outputs[0]],
+        nodes=[gather, mul],
+        initializers=[embed, scale_const],
+        name="target",
+    )
+    return ir.Model(graph, ir_version=10), weight
+
+
+def test_find_scaled_token_embedding_reads_graph_scale() -> None:
+    model, weight = _target_model_with_embedding(vocab=8, hidden=4, scale=2.0)
+
+    extracted, scale = _find_scaled_token_embedding(model, hidden_size=4)
+
+    assert extracted.shape == (8, 4)
+    # Scale is read from the graph's post-embed Mul, not hardcoded.
+    assert scale == pytest.approx(2.0, abs=1e-3)
+    np.testing.assert_allclose(extracted, weight, rtol=0, atol=1e-2)
+
+
+def test_write_input_embedding_artifact_matches_layout(tmp_path) -> None:
+    model, weight = _target_model_with_embedding(vocab=8, hidden=4, scale=2.0)
+
+    name = write_input_embedding_artifact(model, str(tmp_path), hidden_size=4)
+
+    assert name == "input_embedding.f32"
+    data = np.fromfile(tmp_path / "input_embedding.f32", dtype=np.float32).reshape(8, 4)
+    # Row-major [vocab, hidden] f32, weight scaled by the graph-applied factor.
+    expected = weight.astype(np.float16).astype(np.float64) * np.float16(2.0)
+    np.testing.assert_allclose(data, expected.astype(np.float32), rtol=0, atol=1e-3)
+
+
+def test_write_merged_metadata_emits_input_embedding_artifact(tmp_path) -> None:
+    from mobius.integrations.onnx_genai import write_merged_inference_metadata
+
+    # Assistant hidden size (backbone_hidden_size) drives which target embedding
+    # table is selected; use a tiny target sized to match.
+    model, _ = _target_model_with_embedding(vocab=8, hidden=1536, scale=2.0)
+
+    artifacts = write_merged_inference_metadata(
+        _e2b_target_config(),
+        _assistant_config(),
+        str(tmp_path),
+        target_model=model,
+    )
+
+    assert "input_embedding" in artifacts
+    assert (tmp_path / "input_embedding.f32").exists()
+    data = np.fromfile(tmp_path / "input_embedding.f32", dtype=np.float32)
+    assert data.size == 8 * 1536

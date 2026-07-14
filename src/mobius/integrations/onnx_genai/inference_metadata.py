@@ -10,11 +10,17 @@ import os
 import shutil
 from typing import Any
 
+import numpy as np
 import onnx_ir as ir
 
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+# Filename of the target input-token embedding artifact a shared-KV assistant
+# package ships.  The runtime's ``LinearEmbedder`` reads this as a raw
+# little-endian ``float32`` ``[vocab, hidden]`` row-major table.
+_INPUT_EMBEDDING_FILENAME = "input_embedding.f32"
 
 _DTYPE_NAMES = {
     ir.DataType.FLOAT: "float32",
@@ -130,6 +136,7 @@ def _speculative_block(
         "vocab_size": vocab_size,
         "projected_state_output": "projected_state",
         "logits_output": "logits",
+        "input_embedding": _INPUT_EMBEDDING_FILENAME,
         "shared_kv": shared_kv,
     }
 
@@ -182,6 +189,7 @@ def generate_merged_inference_metadata(
     max_sequence_length: int | None = None,
     num_speculative_tokens: int = 3,
     assistant_model_path: str = "assistant/model.onnx",
+    input_embedding: str = _INPUT_EMBEDDING_FILENAME,
 ) -> dict[str, Any]:
     """Build merged metadata for a single-model target + shared-KV assistant.
 
@@ -192,6 +200,10 @@ def generate_merged_inference_metadata(
     the correct wiring for a merged package where the target and assistant have
     different layer counts (e.g. E2B: 15 exported target KV layers vs 4
     assistant layers).
+
+    ``speculative.input_embedding`` points at the target input-token embedding
+    artifact the runtime seeds ``inputs_embeds`` from; emit it with
+    :func:`write_input_embedding_artifact`.
 
     Stays model-agnostic: all shapes/wiring are read from the two configs.
     """
@@ -208,6 +220,7 @@ def generate_merged_inference_metadata(
         "vocab_size": _positive_int(assistant_config, "vocab_size"),
         "projected_state_output": "projected_state",
         "logits_output": "logits",
+        "input_embedding": input_embedding,
         "shared_kv": _folded_shared_kv_groups(target_config),
     }
     return metadata
@@ -218,16 +231,22 @@ def write_merged_inference_metadata(
     assistant_config: object,
     directory: str,
     *,
+    target_model: ir.Model | None = None,
     max_sequence_length: int | None = None,
     num_speculative_tokens: int = 3,
     assistant_model_path: str = "assistant/model.onnx",
+    input_embedding: str = _INPUT_EMBEDDING_FILENAME,
     hf_model_id: str | None = None,
     local_config_dir: str | None = None,
 ) -> dict[str, str]:
     """Write a merged ``inference_metadata.yaml`` (target model + assistant).
 
-    See :func:`generate_merged_inference_metadata`.  Also copies tokenizer files
-    from *local_config_dir* or *hf_model_id* when provided.
+    See :func:`generate_merged_inference_metadata`.  When *target_model* is
+    provided, the target input-token embedding artifact
+    (``speculative.input_embedding``) is extracted from it and written into
+    *directory* via :func:`write_input_embedding_artifact` — no re-export of the
+    target graph is needed, only its embedding initializer is read.  Also copies
+    tokenizer files from *local_config_dir* or *hf_model_id* when provided.
     """
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, "inference_metadata.yaml")
@@ -240,10 +259,20 @@ def write_merged_inference_metadata(
                     max_sequence_length=max_sequence_length,
                     num_speculative_tokens=num_speculative_tokens,
                     assistant_model_path=assistant_model_path,
+                    input_embedding=input_embedding,
                 )
             )
         )
     artifacts: dict[str, str] = {"inference_metadata": path}
+    if target_model is not None:
+        hidden_size = _positive_int(assistant_config, "backbone_hidden_size")
+        name = write_input_embedding_artifact(
+            target_model,
+            directory,
+            hidden_size=hidden_size,
+            filename=input_embedding,
+        )
+        artifacts["input_embedding"] = os.path.join(directory, name)
     if local_config_dir:
         for name in _copy_tokenizer_files_from_local(local_config_dir, directory):
             artifacts[name] = os.path.join(directory, name)
@@ -307,6 +336,121 @@ def generate_inference_metadata(
     return metadata
 
 
+def _find_scaled_token_embedding(
+    target_model: ir.Model, hidden_size: int
+) -> tuple[np.ndarray, float]:
+    """Locate the target's token-embedding table and the scale it applies.
+
+    Fully model-agnostic: nothing about the model, vocab, hidden size, or scale
+    is hardcoded.  The token embedding is the ``Gather`` whose data is a 2-D
+    initializer whose last dim equals *hidden_size* and whose indices derive
+    from ``input_ids``.  The scale is whatever constant the target multiplies
+    the gathered embedding by immediately afterwards (Gemma applies
+    ``sqrt(hidden)`` via a ``Mul`` right after the embed ``Gather``); models
+    that apply no embedding scale yield ``1.0``.
+
+    Args:
+        target_model: The exported target decoder graph.
+        hidden_size: Backbone hidden size (``backbone_hidden_size``), used to
+            disambiguate the token embedding from other embedding tables (e.g.
+            Gemma's per-layer embedding).
+
+    Returns:
+        ``(weight, scale)`` where ``weight`` is the raw ``[vocab, hidden]``
+        embedding table as ``float64`` (unscaled) and ``scale`` is the target's
+        post-embedding multiplier.
+    """
+    graph = target_model.graph
+    candidates: list[ir.Node] = []
+    for node in graph:
+        if node.op_type != "Gather":
+            continue
+        data = node.inputs[0]
+        if data is None or data.const_value is None:
+            continue
+        shape = data.shape
+        if shape is None or len(shape) != 2 or int(shape[1]) != hidden_size:
+            continue
+        candidates.append(node)
+
+    if len(candidates) > 1:
+        candidates = [
+            node
+            for node in candidates
+            if node.inputs[1] is not None
+            and "input_ids" in (node.inputs[1].name or "")
+        ]
+    if not candidates:
+        raise ValueError(
+            "Could not locate a token-embedding Gather with a "
+            f"[vocab, {hidden_size}] table in the target model graph. The "
+            "shared-KV assistant needs the target input-token embedding to "
+            "seed inputs_embeds."
+        )
+    if len(candidates) > 1:
+        raise ValueError(
+            "Ambiguous token-embedding Gather in the target model graph: "
+            f"{len(candidates)} candidates with last dim {hidden_size}."
+        )
+
+    embed = candidates[0]
+    weight = embed.inputs[0].const_value.numpy().astype(np.float64)
+
+    scale = 1.0
+    gathered = embed.outputs[0]
+    for use in gathered.uses():
+        consumer = use.node
+        if consumer.op_type != "Mul":
+            continue
+        for operand in consumer.inputs:
+            if operand is gathered or operand is None:
+                continue
+            const = operand.const_value
+            if const is not None and const.numpy().size == 1:
+                scale = float(np.asarray(const.numpy()).reshape(-1)[0])
+                break
+    return weight, scale
+
+
+def write_input_embedding_artifact(
+    target_model: ir.Model,
+    directory: str,
+    *,
+    hidden_size: int,
+    filename: str = _INPUT_EMBEDDING_FILENAME,
+) -> str:
+    """Write the scaled target input-token embedding table as a package artifact.
+
+    Extracts the token embedding and its scale from *target_model* (see
+    :func:`_find_scaled_token_embedding`), applies the scale, and writes a raw
+    little-endian ``float32`` ``[vocab, hidden]`` row-major table — exactly the
+    layout the runtime ``LinearEmbedder`` reads.  Nothing is re-exported: only
+    the target's embedding initializer is touched.
+
+    Args:
+        target_model: The exported target decoder graph.
+        directory: Package directory to write the artifact into.
+        hidden_size: Backbone hidden size (``backbone_hidden_size``).
+        filename: Artifact filename relative to *directory*.
+
+    Returns:
+        The artifact filename (relative to *directory*), suitable for the
+        ``speculative.input_embedding`` metadata field.
+    """
+    weight, scale = _find_scaled_token_embedding(target_model, hidden_size)
+    scaled = (weight * scale).astype(np.float32)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    scaled.tofile(path)
+    logger.info(
+        "Wrote target input-token embedding artifact %s (%s, scale=%.6f)",
+        path,
+        "x".join(str(d) for d in scaled.shape),
+        scale,
+    )
+    return filename
+
+
 def _to_yaml(metadata: dict[str, Any]) -> str:
     capabilities = metadata["required_capabilities"]
     attention = metadata["model"]["attention"]
@@ -354,6 +498,7 @@ def _to_yaml(metadata: dict[str, Any]) -> str:
                 f"  vocab_size: {spec['vocab_size']}",
                 f"  projected_state_output: {spec['projected_state_output']}",
                 f"  logits_output: {spec['logits_output']}",
+                f"  input_embedding: {spec['input_embedding']}",
                 "  shared_kv:",
             ]
         )
