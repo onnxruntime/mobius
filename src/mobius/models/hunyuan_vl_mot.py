@@ -469,10 +469,13 @@ class HunYuanVLMoTModel(nn.Module):
     default_task: str = "hunyuan-vl-mot"
     category: str = "Multimodal"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights; outer ``model.``).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model.language_model",),
+        "decoder": (
+            "model.language_model.model.layers",
+            "model.language_model.model.norm",
+            "model.language_model.lm_head",
+        ),
         "vision_encoder": ("model.visual",),
         "embedding": ("model.language_model.model.embed_tokens",),
     }

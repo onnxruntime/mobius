@@ -974,8 +974,8 @@ class EncDecRNNTModel(nn.Module):
     default_task: str = "fastconformer-rnnt"
     category: str = "Speech-to-Text"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model. ``encoder``/``encoder_streaming`` share the same HF encoder.
+    # Runtime HF sub-trees. ``encoder`` and ``encoder_streaming`` intentionally
+    # share the same encoder.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "encoder": ("encoder",),
         "encoder_streaming": ("encoder",),

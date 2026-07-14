@@ -185,11 +185,10 @@ class WhisperForConditionalGeneration(nn.Module):
     category: str = "Speech-to-Text"
     config_class: type = WhisperConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights; outer ``model.``).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "encoder": ("model.encoder",),
-        "decoder": ("model.decoder",),
+        "decoder": ("model.decoder", "proj_out"),
     }
 
     def __init__(self, config: WhisperConfig):

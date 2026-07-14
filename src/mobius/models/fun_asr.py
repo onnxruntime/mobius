@@ -505,8 +505,7 @@ class FunASRForConditionalGeneration(nn.Module):
     category: str = "Speech-to-Text"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "audio_encoder": ("audio_encoder", "audio_adaptor"),
         "embedding": ("llm.model.embed_tokens",),

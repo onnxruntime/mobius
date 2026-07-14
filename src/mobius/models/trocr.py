@@ -27,11 +27,11 @@ class TrOCRForConditionalGeneration(BartForConditionalGeneration):
     The vision encoder is a separate model (e.g. ViT, DeiT, BEiT).
     """
 
-    # TrOCR's HF decoder lives under ``decoder.*`` (no outer ``model.``) with a
-    # top-level ``output_projection`` head; the ViT encoder is a separate model.
+    # A standalone HF TrOCRForCausalLM has no encoder. Its decoder is nested
+    # under ``model.decoder`` and its output head is top-level.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "encoder": ("encoder",),
-        "decoder": ("decoder", "output_projection"),
+        "encoder": (),
+        "decoder": ("model.decoder", "output_projection"),
     }
 
     # TODO(feature): Add a VisionEncoderDecoderTask that pairs this decoder

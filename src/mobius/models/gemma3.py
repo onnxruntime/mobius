@@ -164,12 +164,16 @@ class Gemma3MultiModalModel(nn.Module):
     default_task: str = "vision-language"
     category: str = "Multimodal"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("language_model",),
-        "vision_encoder": ("vision_tower", "multi_modal_projector"),
-        "embedding": ("language_model.model.embed_tokens",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
     }
 
     def __init__(self, config: ArchitectureConfig):

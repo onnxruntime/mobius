@@ -1280,8 +1280,7 @@ class Phi4MMMultiModalModel(nn.Module):
     default_task: str = "phi4mm-multimodal"
     category: str = "Multimodal"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors _remap_phi4mm_weight_key). The speech
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The speech
     # component's ModelPackage key is ``audio_encoder``.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "vision_encoder": ("model.embed_tokens_extend.image_embed",),

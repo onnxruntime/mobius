@@ -421,10 +421,14 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model.language_model",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
         "vision_encoder": ("model.visual",),
         "embedding": ("model.language_model.embed_tokens",),
     }
@@ -611,10 +615,14 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model.language_model",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
         "vision_encoder": ("model.visual",),
         "embedding": ("model.language_model.embed_tokens",),
     }

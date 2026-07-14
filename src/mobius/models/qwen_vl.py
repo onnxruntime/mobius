@@ -86,12 +86,17 @@ class Qwen25VLCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The decoder
+    # paths deliberately exclude ``embed_tokens``, which belongs to embedding.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model", "lm_head"),
-        "vision_encoder": ("visual",),
-        "embedding": ("model.embed_tokens",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.visual",),
+        "embedding": ("model.language_model.embed_tokens",),
     }
 
     def __init__(self, config: ArchitectureConfig):
@@ -410,12 +415,17 @@ class Qwen2VLCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The decoder
+    # paths deliberately exclude ``embed_tokens``, which belongs to embedding.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model", "lm_head"),
-        "vision_encoder": ("visual",),
-        "embedding": ("model.embed_tokens",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.visual",),
+        "embedding": ("model.language_model.embed_tokens",),
     }
 
     def __init__(self, config: ArchitectureConfig):
@@ -769,10 +779,15 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The decoder
+    # paths deliberately exclude ``embed_tokens``, which belongs to embedding.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("model.language_model",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
         "vision_encoder": ("model.visual",),
         "embedding": ("model.language_model.embed_tokens",),
     }

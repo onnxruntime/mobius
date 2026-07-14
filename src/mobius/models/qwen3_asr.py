@@ -534,8 +534,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     category: str = "Speech-to-Text"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors preprocess_weights; optional outer ``thinker.``).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "audio_encoder": ("thinker.audio_tower",),
         "embedding": ("thinker.model.embed_tokens",),

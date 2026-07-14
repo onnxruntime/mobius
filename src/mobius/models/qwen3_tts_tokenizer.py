@@ -645,8 +645,7 @@ class Qwen3TTSTokenizerV2Model(nn.Module):
         config: Architecture config.
     """
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (RVQ codec encoder/decoder sub-trees).
+    # Runtime HF RVQ codec encoder/decoder sub-trees.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "encoder": ("encoder",),
         "decoder": ("decoder",),

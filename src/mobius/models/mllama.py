@@ -359,12 +359,16 @@ class MllamaCausalLMModel(nn.Module):
     category: str = "Multimodal"
     config_class: type = MllamaConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes the sub-models' preprocess_weights route).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("language_model",),
-        "vision_encoder": ("vision_model",),
-        "embedding": ("language_model.model.embed_tokens",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_model", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
     }
 
     def __init__(self, config: MllamaConfig):

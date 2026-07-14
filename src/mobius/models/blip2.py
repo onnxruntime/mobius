@@ -192,13 +192,54 @@ class Blip2Model(nn.Module):
     default_task: str = "vision-language"
     category: str = "Multimodal"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes the sub-models' preprocess_weights route).
+    # Runtime HF ``named_modules()`` paths for decoder-only (OPT) BLIP-2.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
-        "decoder": ("language_model",),
+        "decoder": (
+            "language_model.model.decoder.embed_positions",
+            "language_model.model.decoder.final_layer_norm",
+            "language_model.model.decoder.layers",
+            "language_model.lm_head",
+        ),
         "vision_encoder": ("vision_model", "qformer", "language_projection"),
-        "embedding": ("language_model.model.embed_tokens",),
+        "embedding": ("language_model.model.decoder.embed_tokens",),
     }
+    _T5_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.encoder.block",
+            "language_model.encoder.final_layer_norm",
+            "language_model.encoder.dropout",
+            "language_model.decoder.block",
+            "language_model.decoder.final_layer_norm",
+            "language_model.decoder.dropout",
+            "language_model.lm_head",
+        ),
+        "vision_encoder": ("vision_model", "qformer", "language_projection"),
+        "embedding": ("language_model.shared",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return runtime paths for the decoder-only or encoder-decoder LLM."""
+        del model_type
+        text_config = getattr(hf_config, "text_config", None)
+        text_model_type = getattr(text_config, "model_type", None)
+        decoder_only = getattr(hf_config, "use_decoder_only_language_model", None)
+        if text_model_type == "opt":
+            return cls.HF_COMPONENT_SOURCES
+        if text_model_type == "t5":
+            return cls._T5_COMPONENT_SOURCES
+        if text_model_type is not None:
+            return {}
+        if decoder_only is True:
+            return cls.HF_COMPONENT_SOURCES
+        if decoder_only is False:
+            return cls._T5_COMPONENT_SOURCES
+        return {}
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

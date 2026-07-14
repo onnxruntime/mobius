@@ -35,8 +35,9 @@ class ComponentInfo:
             ``"encoder"``, or ``"embedding"``. Mobius uses this to gate fusion
             passes (only ``"decoder"`` receives GQA / QKV-packing). It is the
             value declared in the task's ``model_roles``.
-        source_paths: Dotted HuggingFace module paths that make up this
-            component inside the full model. A single component may map to
+        source_paths: Runtime ``named_modules()`` paths that make up this
+            component inside the full HuggingFace model. These are not
+            checkpoint/state-dict key prefixes. A single component may map to
             multiple disjoint sub-modules (e.g. a decoder assembled from
             ``model.layers``, ``model.norm`` and ``lm_head``), so this is a
             tuple. Empty when the component is the whole model or the layout is
@@ -49,21 +50,19 @@ class ComponentInfo:
     source_paths: tuple[str, ...] = ()
 
 
-def _resolve_task_and_model_type(
+def _resolve_task_model_type_and_config(
     model_id: str, task, trust_remote_code: bool
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, object | None]:
     """Resolve the mobius task name for a model id without building it.
 
     Mirrors the model_type/task resolution in :func:`mobius.build`, limited to
-    what is needed to pick a task (no module construction, no weight loading).
+    what is needed to pick a task and inspect class-level component metadata
+    (no module construction, no weight loading).
     """
     import transformers
 
     from mobius._config_resolver import _default_task_for_model, _try_load_config_json
     from mobius._registry import _detect_fallback_registration, registry
-
-    if task is not None:
-        return task, None
 
     try:
         hf_config = transformers.AutoConfig.from_pretrained(
@@ -72,6 +71,10 @@ def _resolve_task_and_model_type(
     except (ValueError, KeyError, OSError):
         hf_config = _try_load_config_json(model_id)
         if hf_config is None:
+            # An explicit task is enough to report component names and roles,
+            # but source paths require a model type and therefore stay empty.
+            if task is not None:
+                return task, None, None
             raise ValueError(
                 f"Could not load a HuggingFace config for {model_id!r}. inspect_components supports "
                 "transformers/registry models; diffusers pipelines are not supported."
@@ -89,13 +92,27 @@ def _resolve_task_and_model_type(
         if any("ForCTC" in arch for arch in architectures):
             model_type = "mms"
 
+    if task is not None:
+        return task, model_type, hf_config
     if model_type in registry:
-        return _default_task_for_model(model_type), model_type
+        return _default_task_for_model(model_type), model_type, hf_config
 
     fallback = _detect_fallback_registration(hf_config)
     if fallback is not None and fallback.task is not None:
-        return fallback.task, model_type
-    return _default_task_for_model(model_type), model_type
+        return fallback.task, model_type, hf_config
+    return _default_task_for_model(model_type), model_type, hf_config
+
+
+def _get_hf_component_sources(
+    module_class: type,
+    model_type: str,
+    hf_config: object,
+) -> dict[str, tuple[str, ...]]:
+    """Read runtime HuggingFace component paths from a registered model class."""
+    resolver = getattr(module_class, "get_hf_component_sources", None)
+    if resolver is not None:
+        return resolver(model_type=model_type, hf_config=hf_config)
+    return getattr(module_class, "HF_COMPONENT_SOURCES", {})
 
 
 def inspect_components(
@@ -125,18 +142,19 @@ def inspect_components(
     from mobius._registry import registry
     from mobius.tasks import get_task
 
-    resolved_task, model_type = _resolve_task_and_model_type(model_id, task, trust_remote_code)
+    resolved_task, model_type, hf_config = _resolve_task_model_type_and_config(
+        model_id, task, trust_remote_code
+    )
     task_obj = get_task(resolved_task)
     roles = task_obj.model_roles or {}
 
-    # ``source_paths`` live as an ``HF_COMPONENT_SOURCES`` ClassVar on the
-    # registered module class (next to that class's ``preprocess_weights``,
-    # which routes the very same HF prefixes). Read it straight off the class
-    # so inspection stays cheap: no module construction, no weight loading.
+    # Runtime HF paths are owned by the registered model class. Most classes
+    # declare a fixed ``HF_COMPONENT_SOURCES`` mapping; classes shared by
+    # several HF layouts can resolve paths from the already-loaded config.
     component_sources: dict[str, tuple[str, ...]] = {}
-    if model_type is not None and model_type in registry:
+    if model_type is not None and hf_config is not None and model_type in registry:
         module_class = registry.get(model_type)
-        component_sources = getattr(module_class, "HF_COMPONENT_SOURCES", {})
+        component_sources = _get_hf_component_sources(module_class, model_type, hf_config)
 
     components = [
         ComponentInfo(

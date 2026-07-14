@@ -441,8 +441,7 @@ class T5ForConditionalGeneration(nn.Module):
     default_task = "seq2seq"
     category = "encoder-decoder"
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (mirrors the prefixes routed in preprocess_weights).
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "encoder": ("encoder",),
         "decoder": ("decoder", "lm_head"),

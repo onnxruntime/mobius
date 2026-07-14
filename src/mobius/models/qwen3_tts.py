@@ -418,8 +418,7 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
     category: str = "Audio"
     config_class: type = ArchitectureConfig
 
-    # HF module sub-trees per ONNX component, read by inspect_components without
-    # instantiating the model (talker/code_predictor/embedding split under ``talker.*``).
+    # Runtime HF sub-trees for the talker/code-predictor/embedding split.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "talker": ("talker.model.layers", "talker.model.norm", "talker.codec_head"),
         "code_predictor": ("talker.code_predictor",),
