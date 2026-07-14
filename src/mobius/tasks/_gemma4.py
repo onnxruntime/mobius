@@ -229,11 +229,18 @@ class Gemma4Task(ModelTask):
             qc = config.quantization
             if qc is not None and qc.quantize_embeddings:
                 # embedding_bits was set by the caller — use its bits value
-                pass
+                if qc.bits not in (4, 8):
+                    raise ValueError(
+                        f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
+                    )
             elif qc is not None:
                 # Existing quantization config without embedding quantization —
-                # enable it, defaulting to INT4
+                # enable it with INT4 (the existing bits may be for MatMul
+                # quantization which is unrelated, so override for embeddings)
                 config.quantization.quantize_embeddings = True
+                config.quantization.bits = 4
+                config.quantization.group_size = 32
+                config.quantization.sym = False
             else:
                 config.quantization = QuantizationConfig(
                     bits=4, group_size=32, quant_method="mobius", sym=False,

@@ -418,6 +418,13 @@ def build(
             Raises :class:`ValueError` if the resolved ``model_type`` has no
             text-only sibling. Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
+        embedding_bits: Quantization bit-width for per-layer embedding tables
+            (4 or 8). When set, large embedding tables that exceed the EP's
+            buffer limit are block-quantized with ``GatherBlockQuantized``
+            instead of stored at full precision. Only affects models that
+            split per-layer embeddings (e.g. Gemma4 on WebGPU). When ``None``
+            (default), the model task decides — currently defaults to INT4
+            when splitting is required.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -578,6 +585,8 @@ def build(
         config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
 
     if embedding_bits is not None:
+        if embedding_bits not in (4, 8):
+            raise ValueError(f"embedding_bits must be 4 or 8, got {embedding_bits}")
         from mobius._configs import QuantizationConfig
 
         if config.quantization is None:

@@ -683,15 +683,18 @@ def quantize_embedding_rtn(
         - zero_points: [num_embeddings, ceil(n_blocks * bits / 8)] uint8,
           or None if symmetric.
     """
-    assert bits in (4, 8), f"bits must be 4 or 8, got {bits}"
-    assert weight.ndim == 2
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits}")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be 2D, got {weight.ndim}D")
     num_embeddings, embedding_dim = weight.shape
-    assert embedding_dim % block_size == 0, (
-        f"embedding_dim ({embedding_dim}) must be divisible by block_size ({block_size})"
-    )
+    if embedding_dim % block_size != 0:
+        raise ValueError(
+            f"embedding_dim ({embedding_dim}) must be divisible by block_size ({block_size})"
+        )
 
     n_blocks = embedding_dim // block_size
-    w = weight.float().numpy()
+    w = weight.detach().cpu().float().numpy()
 
     import numpy as np
 

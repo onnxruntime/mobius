@@ -2057,6 +2057,10 @@ class _Gemma4DecoderModel(nn.Module):
                 qc = getattr(self.config, "quantization", None)
                 quantize_per_layer = qc is not None and getattr(qc, "quantize_embeddings", False)
                 if quantize_per_layer:
+                    if qc.bits not in (4, 8):
+                        raise ValueError(
+                            f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
+                        )
                     from mobius._weight_utils import quantize_embedding_rtn
 
                     for i, chunk in enumerate(chunks):
@@ -2868,6 +2872,10 @@ class Gemma4Model(nn.Module):
                 qc = getattr(self.config, "quantization", None)
                 quantize_per_layer = qc is not None and getattr(qc, "quantize_embeddings", False)
                 if quantize_per_layer:
+                    if qc.bits not in (4, 8):
+                        raise ValueError(
+                            f"quantize_embeddings requires bits=4 or bits=8, got {qc.bits}"
+                        )
                     from mobius._weight_utils import quantize_embedding_rtn
 
                     for i, chunk in enumerate(chunks):

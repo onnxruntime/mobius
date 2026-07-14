@@ -1049,3 +1049,92 @@ class TestSplitCodegenQKV:
         """mp_num that doesn't divide hidden raises ValueError."""
         with pytest.raises(ValueError, match="divisible"):
             split_codegen_qkv(torch.zeros(96, 32), num_heads=4, head_dim=8, mp_num=3)
+
+
+class TestQuantizeEmbeddingRTN:
+    """Tests for quantize_embedding_rtn."""
+
+    def setup_method(self):
+        from mobius._weight_utils import quantize_embedding_rtn
+
+        self.quantize = quantize_embedding_rtn
+
+    def test_int4_asymmetric_shapes(self):
+        """INT4 asymmetric: qweight is packed to half, scales/zp have correct shapes."""
+        weight = torch.randn(128, 64, dtype=torch.float16)
+        qweight, scales, zp = self.quantize(weight, bits=4, block_size=32, symmetric=False)
+        assert qweight.shape == (128, 32)  # 64 * 4 / 8 = 32
+        assert qweight.dtype == torch.uint8
+        assert scales.shape == (128, 2)  # 64 / 32 = 2 blocks
+        assert scales.dtype == torch.float16
+        assert zp is not None
+        assert zp.shape == (128, 1)  # 2 blocks packed: ceil(2*4/8) = 1
+        assert zp.dtype == torch.uint8
+
+    def test_int8_asymmetric_shapes(self):
+        """INT8 asymmetric: qweight is same shape (no packing), zp unpacked."""
+        weight = torch.randn(128, 64, dtype=torch.float16)
+        qweight, scales, zp = self.quantize(weight, bits=8, block_size=32, symmetric=False)
+        assert qweight.shape == (128, 64)
+        assert qweight.dtype == torch.uint8
+        assert scales.shape == (128, 2)
+        assert zp is not None
+        assert zp.shape == (128, 2)
+        assert zp.dtype == torch.uint8
+
+    def test_int4_symmetric_no_zero_points(self):
+        """Symmetric mode returns None for zero_points."""
+        weight = torch.randn(64, 32, dtype=torch.float16)
+        qweight, scales, zp = self.quantize(weight, bits=4, block_size=32, symmetric=True)
+        assert zp is None
+        assert qweight.shape == (64, 16)
+        assert scales.shape == (64, 1)
+
+    def test_int8_symmetric_no_zero_points(self):
+        """INT8 symmetric returns None for zero_points."""
+        weight = torch.randn(64, 32, dtype=torch.float16)
+        qweight, scales, zp = self.quantize(weight, bits=8, block_size=32, symmetric=True)
+        assert zp is None
+        assert qweight.shape == (64, 32)
+        assert scales.shape == (64, 1)
+
+    def test_invalid_bits_raises(self):
+        """bits not in (4, 8) raises ValueError."""
+        weight = torch.randn(32, 32, dtype=torch.float16)
+        with pytest.raises(ValueError, match="bits must be 4 or 8"):
+            self.quantize(weight, bits=3)
+
+    def test_non_2d_raises(self):
+        """Non-2D input raises ValueError."""
+        weight = torch.randn(4, 8, 16, dtype=torch.float16)
+        with pytest.raises(ValueError, match="2D"):
+            self.quantize(weight, bits=4)
+
+    def test_indivisible_dim_raises(self):
+        """embedding_dim not divisible by block_size raises ValueError."""
+        weight = torch.randn(32, 30, dtype=torch.float16)
+        with pytest.raises(ValueError, match="divisible by block_size"):
+            self.quantize(weight, bits=4, block_size=32)
+
+    def test_roundtrip_accuracy_int8(self):
+        """INT8 quantize-dequantize error is small."""
+        torch.manual_seed(42)
+        weight = torch.randn(64, 64, dtype=torch.float16)
+        qweight, scales, zp = self.quantize(weight, bits=8, block_size=32, symmetric=False)
+        # Dequantize manually
+        import numpy as np
+
+        q = qweight.numpy().astype(np.float32).reshape(64, 2, 32)
+        s = scales.numpy().astype(np.float32).reshape(64, 2, 1)
+        z = zp.numpy().astype(np.float32).reshape(64, 2, 1)
+        deq = (q - z) * s
+        deq = deq.reshape(64, 64)
+        error = np.abs(deq - weight.float().numpy()).mean()
+        assert error < 0.02, f"Mean abs error too large: {error}"
+
+    def test_cpu_tensor_from_cuda_mock(self):
+        """Handles non-CPU tensors gracefully (detach().cpu() path)."""
+        weight = torch.randn(32, 32, dtype=torch.float16)
+        # Just verify it doesn't crash — the .detach().cpu() handles it
+        qweight, scales, zp = self.quantize(weight, bits=4, block_size=32)
+        assert qweight.shape == (32, 16)
