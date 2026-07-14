@@ -15,6 +15,8 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
+
 # MatMulNBits packs weights into uint8 blobs.  The packed shape depends
 # on bits and block_size:
 #   packed_weights: [N, n_blocks, blob_size]  (uint8)
@@ -24,6 +26,29 @@ from onnxscript import OpBuilder, nn
 #   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
 _MICROSOFT_DOMAIN = "com.microsoft"
+
+
+def _accuracy_level_attrs(bits: int) -> dict[str, int]:
+    """Return the ``accuracy_level`` attribute for ``MatMulNBits``, if any.
+
+    Only emitted for 4-bit weights: ``accuracy_level`` is sourced from
+    ``EpCapabilities.default_int4_accuracy_level`` and its int8-accumulation
+    semantics are defined for INT4 ``MatMulNBits``. For 2-bit / 8-bit weights the
+    attribute is omitted so those paths keep ORT's default behavior.
+
+    ORT's MLAS CPU ``MatMulNBits`` kernel selects its compute path from the
+    ``accuracy_level`` attribute: unset/0 keeps the highest-precision fp32
+    dequant + fp32 GEMM path, while ``4`` dynamically quantizes activations to
+    int8 and uses int8 dot-products (SDOT/NEON on ARM, AVX-VNNI on x86) — the
+    same class of kernel llama.cpp uses, and typically 2-4x faster on CPU with
+    no observable quality loss for Q4 weights. The value is sourced from the
+    active EP's :attr:`EpCapabilities.default_int4_accuracy_level` (4 for CPU /
+    WebGPU). When it is 0 the attribute is omitted so ORT keeps its default.
+    """
+    if bits != 4:
+        return {}
+    level = ep_capabilities().default_int4_accuracy_level
+    return {"accuracy_level": level} if level else {}
 
 
 class QuantizedLinear(nn.Module):
@@ -126,6 +151,7 @@ class QuantizedLinear(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
         if self.bias is not None:
@@ -309,6 +335,7 @@ class TiedQuantizedLMHead(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
 
