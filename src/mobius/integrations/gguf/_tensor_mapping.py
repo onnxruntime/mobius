@@ -118,6 +118,12 @@ _GEMMA4_EXTRAS: dict[str, str] = {
     "blk.{bid}.inp_gate": "model.layers.{bid}.per_layer_input_gate",
     "blk.{bid}.proj": "model.layers.{bid}.per_layer_projection",
     "blk.{bid}.post_norm": "model.layers.{bid}.post_per_layer_input_norm",
+    # Top-level per-layer input tensors (E2B/E4B). GGUF stores the per-layer
+    # token embedding table, its projection, and projection norm as global
+    # (non-block) tensors that live inside the text backbone (model.*).
+    "per_layer_token_embd": "model.embed_tokens_per_layer",
+    "per_layer_model_proj": "model.per_layer_model_projection",
+    "per_layer_proj_norm": "model.per_layer_projection_norm",
 }
 
 # Phi-3 uses fused QKV and gate-up projections.

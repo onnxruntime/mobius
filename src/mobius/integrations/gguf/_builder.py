@@ -351,6 +351,14 @@ def _normalize_gguf_weights(
             result[key[: -len(".bias")]] = value
             continue
 
+        # layer_scalar.weight → layer_scalar (Gemma4 per-layer output scale is an
+        # nn.Parameter, not a module weight). GGUF stores it as
+        # blk.{i}.layer_output_scale.weight, which the tensor mapping renames to
+        # model.layers.{i}.layer_scalar.weight; strip the artefact .weight suffix.
+        if key.endswith(".layer_scalar.weight"):
+            result[key[: -len(".weight")]] = value
+            continue
+
         result[key] = value
 
     return result
