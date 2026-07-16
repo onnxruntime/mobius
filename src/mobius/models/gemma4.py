@@ -904,6 +904,21 @@ class Gemma4TextAttention(nn.Module):
             # KV-shared layers borrow K,V from a source layer (no own KV cache).
             src_key, src_value = shared_kv_states[self.kv_shared_layer_index]
 
+            # The borrowed K,V are the source layer's ``present`` outputs. In the
+            # standard (non-GQA) path those come from the opset-24 ``Attention``
+            # op, whose ``present_key``/``present_value`` outputs have NO shape
+            # inference in ORT — they arrive here rank-unknown. Left unannotated,
+            # the downstream Transpose/Reshape lose the head dimension and this
+            # layer's ``Attention`` infers a zero-width output, which then makes
+            # ``o_proj``'s MatMul fail shape inference at model-load time. The
+            # source shares the same KV-head/head-dim configuration as this
+            # layer, so pin the known 4D BNSH shape to restore inference.
+            for _kv in (src_key, src_value):
+                if _kv.shape is None or len(_kv.shape) != 4:
+                    _kv.shape = ir.Shape(
+                        ["batch", self.num_key_value_heads, "kv_sequence_length", self.head_dim]
+                    )
+
             if use_gqa:
                 # GQA path for shared KV: pass empty K/V tensors and wire the
                 # source layer's present_key/value as past_key/past_value.
