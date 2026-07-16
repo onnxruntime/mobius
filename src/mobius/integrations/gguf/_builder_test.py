@@ -25,10 +25,10 @@ def _write_quantized_gguf(
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
 ) -> None:
-    """Write a GGUF file with Q4_0 quantized projection weights.
+    """Write a GGUF file with quantized projection weights.
 
     Norms are float32; all linear-layer weights in decoder blocks are
-    Q4_0 (4-bit symmetric, block_size=32). The embedding can optionally
+    encoded with *projection_quantization*. The embedding can optionally
     be Q4_0 and tied to the LM head.
     """
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -87,6 +87,18 @@ def _write_quantized_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q8_0)
 
+    def _add_native(name: str, n_out: int, k_in: int, format_name: str) -> None:
+        """Write deterministic native blocks with embedded scales."""
+        qtype, block_bytes = {
+            "mxfp4": (GGMLQuantizationType.MXFP4, 17),
+            "iq4_nl": (GGMLQuantizationType.IQ4_NL, 18),
+        }[format_name]
+        n_blocks = (k_in + 31) // 32
+        raw = np.arange(n_out * n_blocks * block_bytes, dtype=np.uint8).reshape(
+            n_out, n_blocks * block_bytes
+        )
+        writer.add_tensor(name, raw, raw_dtype=qtype)
+
     if quantize_embedding:
         _add_q4_0("token_embd.weight", vocab_size, hidden_size)
     else:
@@ -95,6 +107,8 @@ def _write_quantized_gguf(
     add_projection = {
         "q4_0": _add_q4_0,
         "q8_0": _add_q8_0,
+        "mxfp4": lambda name, n_out, k_in: _add_native(name, n_out, k_in, "mxfp4"),
+        "iq4_nl": lambda name, n_out, k_in: _add_native(name, n_out, k_in, "iq4_nl"),
     }[projection_quantization]
 
     for i in range(num_layers):
@@ -189,6 +203,16 @@ def q8_0_projection_q4_head_gguf(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture(params=["mxfp4", "iq4_nl"])
+def native_block_gguf(tmp_path: Path, request) -> tuple[Path, str, int]:
+    """Create a GGUF whose projection weights use a runtime-native block format."""
+    format_name = request.param
+    path = tmp_path / f"test_{format_name}.gguf"
+    _write_quantized_gguf(path, projection_quantization=format_name)
+    block_bytes = 17 if format_name == "mxfp4" else 18
+    return path, format_name, block_bytes
+
+
 class TestBuildQuantizedGguf:
     """Tests for build_from_gguf(keep_quantized=True)."""
 
@@ -211,6 +235,34 @@ class TestBuildQuantizedGguf:
         assert "MatMulNBits" in op_types, (
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
+
+    def test_native_blocks_emit_block_quantized_matmul_and_preserve_bytes(
+        self,
+        native_block_gguf: tuple[Path, str, int],
+    ):
+        """MXFP4/IQ4_NL projections retain their exact GGUF block bytes."""
+        import onnx_ir as ir
+
+        from mobius.integrations.gguf import build_from_gguf
+
+        path, format_name, block_bytes = native_block_gguf
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        nodes = [node for node in model.graph if node.op_type == "BlockQuantizedMatMul"]
+        assert len(nodes) == 7
+        assert all(node.domain == "com.github.onnxruntime.genai" for node in nodes)
+        for node in nodes:
+            attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
+            assert attrs["format"] == format_name
+            assert attrs["block_layout_version"] == 1
+            assert "K" in attrs
+            assert "N" in attrs
+
+        weight = model.graph.initializers["model.layers.0.self_attn.o_proj.weight"]
+        assert weight.dtype == ir.DataType.UINT8
+        assert list(weight.shape) == [64, 2, block_bytes]
+        expected = np.arange(64 * 2 * block_bytes, dtype=np.uint8).reshape(64, 2, block_bytes)
+        np.testing.assert_array_equal(weight.const_value.numpy(), expected)
+        assert "model.layers.0.self_attn.o_proj.scales" not in model.graph.initializers
 
     def test_quantized_embedding_uses_gatherblockquantized(self, q4_0_embedding_gguf: Path):
         """A quantized GGUF embedding remains packed in the ONNX graph."""
@@ -378,6 +430,27 @@ class TestBuildQuantizedGguf:
 
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
+
+    @pytest.mark.parametrize("qtype_name", ["IQ1_S", "IQ2_XXS", "IQ3_S", "IQ4_XS"])
+    def test_unsupported_iq_formats_do_not_select_native_op(self, qtype_name: str):
+        """IQ formats rejected by the runtime remain on the existing fallback."""
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _native_block_format
+
+        assert _native_block_format(getattr(GGMLQuantizationType, qtype_name)) is None
+
+    @pytest.mark.parametrize("moe_container", ["experts", "moe.experts"])
+    def test_native_moe_tensor_maps_to_each_expert(self, moe_container: str):
+        """Stacked GGUF MoE blocks route to standard and DeepSeek expert paths."""
+        from mobius.integrations.gguf._builder import _native_block_target_stems
+
+        available = {f"model.layers.0.mlp.{moe_container}.{i}.gate_proj" for i in range(3)}
+        assert _native_block_target_stems(
+            "model.layers.0.mlp.experts.gate_proj.weight",
+            (3, 64, 64),
+            available,
+        ) == sorted(available, key=lambda name: int(name.split(".")[-2]))
 
 
 class TestRawTensorIterator:
