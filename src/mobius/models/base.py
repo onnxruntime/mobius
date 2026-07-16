@@ -83,8 +83,8 @@ class TextModel(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         if qc is not None and getattr(qc, "quantize_embeddings", False):
-            # Olive RTN (embeds: true) quantizes the embedding table; look it
-            # up with GatherBlockQuantized instead of a plain Gather.
+            # Keep the block-quantized embedding table packed and dequantize
+            # only the selected token rows.
             self.embed_tokens = QuantizedEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -456,7 +456,12 @@ class CausalLMModel(nn.Module):
                 quantize_lm_head=getattr(qc, "quantize_lm_head", False),
                 tie_word_embeddings=tie,
             )
-        if self.config.tie_word_embeddings:
+        tied_quantized_table = (
+            qc is not None
+            and getattr(qc, "quantize_embeddings", False)
+            and getattr(qc, "quantize_lm_head", False)
+        )
+        if self.config.tie_word_embeddings and not tied_quantized_table:
             # Ensure both embed_tokens.weight and lm_head.weight are present so
             # apply_weights can assign each to its initializer.  For graph-level
             # tied models (standard CausalLMModel) both ir.Values are the same
