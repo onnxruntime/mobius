@@ -262,17 +262,34 @@ class TestQuantizedLinearForward:
 
 class TestBlockQuantizedLinear:
     @pytest.mark.parametrize(
-        ("format_name", "block_bytes"),
-        [("mxfp4", 17), ("iq4_nl", 18)],
+        ("format_name", "block_elements", "block_bytes"),
+        [
+            ("mxfp4", 32, 17),
+            ("iq4_nl", 32, 18),
+            ("iq4_xs", 256, 136),
+            ("iq3_s", 256, 110),
+            ("iq3_xxs", 256, 98),
+            ("iq2_xxs", 256, 66),
+            ("iq2_xs", 256, 74),
+            ("iq2_s", 256, 82),
+            ("iq1_s", 256, 50),
+            ("iq1_m", 256, 56),
+        ],
     )
-    def test_emits_native_block_contract(self, format_name: str, block_bytes: int):
+    def test_emits_native_block_contract(
+        self,
+        format_name: str,
+        block_elements: int,
+        block_bytes: int,
+    ):
         linear = BlockQuantizedLinear(
             IN_FEATURES,
             OUT_FEATURES,
             format=format_name,
             bias=True,
         )
-        assert linear.weight.shape == [OUT_FEATURES, 2, block_bytes]
+        expected_blocks = (IN_FEATURES + block_elements - 1) // block_elements
+        assert linear.weight.shape == [OUT_FEATURES, expected_blocks, block_bytes]
 
         b, op, graph = create_test_builder()
         x = create_test_input(b, "x", [1, 4, IN_FEATURES])
@@ -292,7 +309,7 @@ class TestBlockQuantizedLinear:
 
     def test_rejects_runtime_unsupported_iq_format(self):
         with pytest.raises(ValueError, match="format must be one of"):
-            BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="iq4_xs")
+            BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
 
 
 class TestMakeQuantizedLinearFactory:

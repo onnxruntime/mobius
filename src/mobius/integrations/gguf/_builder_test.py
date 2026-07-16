@@ -89,11 +89,19 @@ def _write_quantized_gguf(
 
     def _add_native(name: str, n_out: int, k_in: int, format_name: str) -> None:
         """Write deterministic native blocks with embedded scales."""
-        qtype, block_bytes = {
-            "mxfp4": (GGMLQuantizationType.MXFP4, 17),
-            "iq4_nl": (GGMLQuantizationType.IQ4_NL, 18),
+        qtype, block_elements, block_bytes = {
+            "mxfp4": (GGMLQuantizationType.MXFP4, 32, 17),
+            "iq4_nl": (GGMLQuantizationType.IQ4_NL, 32, 18),
+            "iq4_xs": (GGMLQuantizationType.IQ4_XS, 256, 136),
+            "iq3_s": (GGMLQuantizationType.IQ3_S, 256, 110),
+            "iq3_xxs": (GGMLQuantizationType.IQ3_XXS, 256, 98),
+            "iq2_xxs": (GGMLQuantizationType.IQ2_XXS, 256, 66),
+            "iq2_xs": (GGMLQuantizationType.IQ2_XS, 256, 74),
+            "iq2_s": (GGMLQuantizationType.IQ2_S, 256, 82),
+            "iq1_s": (GGMLQuantizationType.IQ1_S, 256, 50),
+            "iq1_m": (GGMLQuantizationType.IQ1_M, 256, 56),
         }[format_name]
-        n_blocks = (k_in + 31) // 32
+        n_blocks = (k_in + block_elements - 1) // block_elements
         raw = np.arange(n_out * n_blocks * block_bytes, dtype=np.uint8).reshape(
             n_out, n_blocks * block_bytes
         )
@@ -104,12 +112,14 @@ def _write_quantized_gguf(
     else:
         _add_f32("token_embd.weight", (vocab_size, hidden_size))
 
-    add_projection = {
-        "q4_0": _add_q4_0,
-        "q8_0": _add_q8_0,
-        "mxfp4": lambda name, n_out, k_in: _add_native(name, n_out, k_in, "mxfp4"),
-        "iq4_nl": lambda name, n_out, k_in: _add_native(name, n_out, k_in, "iq4_nl"),
-    }[projection_quantization]
+    if projection_quantization in {"q4_0", "q8_0"}:
+        add_projection = {
+            "q4_0": _add_q4_0,
+            "q8_0": _add_q8_0,
+        }[projection_quantization]
+    else:
+        def add_projection(name: str, n_out: int, k_in: int) -> None:
+            _add_native(name, n_out, k_in, projection_quantization)
 
     for i in range(num_layers):
         add_projection(
@@ -203,14 +213,32 @@ def q8_0_projection_q4_head_gguf(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.fixture(params=["mxfp4", "iq4_nl"])
-def native_block_gguf(tmp_path: Path, request) -> tuple[Path, str, int]:
+@pytest.fixture(
+    params=[
+        ("mxfp4", 32, 17),
+        ("iq4_nl", 32, 18),
+        ("iq4_xs", 256, 136),
+        ("iq3_s", 256, 110),
+        ("iq3_xxs", 256, 98),
+        ("iq2_xxs", 256, 66),
+        ("iq2_xs", 256, 74),
+        ("iq2_s", 256, 82),
+        ("iq1_s", 256, 50),
+        ("iq1_m", 256, 56),
+    ]
+)
+def native_block_gguf(tmp_path: Path, request) -> tuple[Path, str, int, int]:
     """Create a GGUF whose projection weights use a runtime-native block format."""
-    format_name = request.param
+    format_name, block_elements, block_bytes = request.param
     path = tmp_path / f"test_{format_name}.gguf"
-    _write_quantized_gguf(path, projection_quantization=format_name)
-    block_bytes = 17 if format_name == "mxfp4" else 18
-    return path, format_name, block_bytes
+    _write_quantized_gguf(
+        path,
+        hidden_size=256,
+        num_kv_heads=4,
+        intermediate_size=256,
+        projection_quantization=format_name,
+    )
+    return path, format_name, block_elements, block_bytes
 
 
 class TestBuildQuantizedGguf:
@@ -238,14 +266,14 @@ class TestBuildQuantizedGguf:
 
     def test_native_blocks_emit_block_quantized_matmul_and_preserve_bytes(
         self,
-        native_block_gguf: tuple[Path, str, int],
+        native_block_gguf: tuple[Path, str, int, int],
     ):
-        """MXFP4/IQ4_NL projections retain their exact GGUF block bytes."""
+        """Runtime-native IQ/MXFP4 projections retain their exact GGUF bytes."""
         import onnx_ir as ir
 
         from mobius.integrations.gguf import build_from_gguf
 
-        path, format_name, block_bytes = native_block_gguf
+        path, format_name, block_elements, block_bytes = native_block_gguf
         model = build_from_gguf(path, keep_quantized=True)["model"]
         nodes = [node for node in model.graph if node.op_type == "BlockQuantizedMatMul"]
         assert len(nodes) == 7
@@ -254,13 +282,16 @@ class TestBuildQuantizedGguf:
             attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
             assert attrs["format"] == format_name
             assert attrs["block_layout_version"] == 1
-            assert "K" in attrs
-            assert "N" in attrs
+            assert attrs["K"] == 256
+            assert attrs["N"] == 256
 
         weight = model.graph.initializers["model.layers.0.self_attn.o_proj.weight"]
         assert weight.dtype == ir.DataType.UINT8
-        assert list(weight.shape) == [64, 2, block_bytes]
-        expected = np.arange(64 * 2 * block_bytes, dtype=np.uint8).reshape(64, 2, block_bytes)
+        n_blocks = (256 + block_elements - 1) // block_elements
+        assert list(weight.shape) == [256, n_blocks, block_bytes]
+        expected = np.arange(
+            256 * n_blocks * block_bytes, dtype=np.uint8
+        ).reshape(256, n_blocks, block_bytes)
         np.testing.assert_array_equal(weight.const_value.numpy(), expected)
         assert "model.layers.0.self_attn.o_proj.scales" not in model.graph.initializers
 
@@ -431,14 +462,13 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
 
-    @pytest.mark.parametrize("qtype_name", ["IQ1_S", "IQ2_XXS", "IQ3_S", "IQ4_XS"])
-    def test_unsupported_iq_formats_do_not_select_native_op(self, qtype_name: str):
-        """IQ formats rejected by the runtime remain on the existing fallback."""
+    def test_runtime_unsupported_format_does_not_select_native_op(self):
+        """A GGUF type outside the runtime contract remains on the fallback."""
         from gguf import GGMLQuantizationType
 
         from mobius.integrations.gguf._builder import _native_block_format
 
-        assert _native_block_format(getattr(GGMLQuantizationType, qtype_name)) is None
+        assert _native_block_format(GGMLQuantizationType.Q5_0) is None
 
     @pytest.mark.parametrize("moe_container", ["experts", "moe.experts"])
     def test_native_moe_tensor_maps_to_each_expert(self, moe_container: str):

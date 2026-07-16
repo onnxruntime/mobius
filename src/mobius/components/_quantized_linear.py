@@ -4,8 +4,8 @@
 """Quantized linear and embedding layers.
 
 ``QuantizedLinear`` uses ``MatMulNBits``; ``QuantizedEmbedding`` uses
-``GatherBlockQuantized``. ``BlockQuantizedLinear`` preserves native GGUF
-MXFP4 and IQ4_NL blocks for onnx-genai's CPU execution provider.
+``GatherBlockQuantized``. ``BlockQuantizedLinear`` preserves runtime-supported
+native GGUF IQ/MXFP4 blocks for onnx-genai's CPU execution provider.
 """
 
 from __future__ import annotations
@@ -30,8 +30,16 @@ _MICROSOFT_DOMAIN = "com.microsoft"
 _ONNX_GENAI_DOMAIN = "com.github.onnxruntime.genai"
 
 _NATIVE_BLOCK_FORMATS = {
-    "mxfp4": 17,
-    "iq4_nl": 18,
+    "mxfp4": (32, 17),
+    "iq4_nl": (32, 18),
+    "iq4_xs": (256, 136),
+    "iq3_s": (256, 110),
+    "iq3_xxs": (256, 98),
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
+    "iq1_s": (256, 50),
+    "iq1_m": (256, 56),
 }
 
 
@@ -190,9 +198,9 @@ class BlockQuantizedLinear(nn.Module):
         self._k = in_features
         self._n = out_features
         self._format = format
-        block_bytes = _NATIVE_BLOCK_FORMATS[format]
+        block_elements, block_bytes = _NATIVE_BLOCK_FORMATS[format]
         self.weight = nn.Parameter(
-            [out_features, math.ceil(in_features / 32), block_bytes],
+            [out_features, math.ceil(in_features / block_elements), block_bytes],
             dtype=ir.DataType.UINT8,
         )
         self.bias = nn.Parameter([out_features]) if bias else None

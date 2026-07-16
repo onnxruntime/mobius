@@ -10,8 +10,8 @@ pipeline.  Two modes:
   float.  Simple, but loses the compression benefit of quantization.
 - **Quantized** (``keep_quantized=True``): Affine linear-layer weights are
   repacked into MatMulNBits format and token embeddings into
-  GatherBlockQuantized format. Native MXFP4 and IQ4_NL projection blocks are
-  preserved for BlockQuantizedMatMul. Mixed presets such as Q4_K_M are
+  GatherBlockQuantized format. Runtime-supported native IQ/MXFP4 projection
+  blocks are preserved for BlockQuantizedMatMul. Mixed presets such as Q4_K_M are
   normalized to one affine layout. Other tensors are dequantized.
 """
 
@@ -97,8 +97,8 @@ def build_from_gguf(
     8. Apply weights to the ONNX model
 
     When *keep_quantized* is ``True``, supported affine tensors are repacked
-    into MatMulNBits format, while MXFP4 and IQ4_NL projection blocks are
-    retained byte-for-byte for BlockQuantizedMatMul.
+    into MatMulNBits format, while runtime-supported native IQ/MXFP4 projection
+    blocks are retained byte-for-byte for BlockQuantizedMatMul.
 
     Args:
         gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
@@ -302,26 +302,31 @@ def _is_quantized_weight(key: str, state_dict: dict) -> bool:
 
 
 def _is_native_block_weight(key: str, state_dict: dict) -> bool:
-    """Check for a packed MXFP4/IQ4_NL weight with embedded block scales."""
+    """Check for a packed runtime-native GGUF weight."""
+    from mobius.integrations.gguf._repacker import NATIVE_BLOCK_BYTE_SIZES
+
     if not key.endswith(".weight"):
         return False
     value = state_dict[key]
     return (
         value.dtype.is_floating_point is False
         and value.dim() == 3
-        and value.shape[-1] in (17, 18)
+        and value.shape[-1] in NATIVE_BLOCK_BYTE_SIZES
     )
+
+
+def _native_block_spec(qtype):
+    """Return the runtime-native layout for a GGUF quantization enum."""
+    from mobius.integrations.gguf._repacker import native_block_spec
+
+    qtype_val = qtype.value if hasattr(qtype, "value") else qtype
+    return native_block_spec(qtype_val)
 
 
 def _native_block_format(qtype) -> str | None:
     """Return the runtime format string for supported native GGUF blocks."""
-    return {
-        # ggml type IDs: IQ4_NL=20, MXFP4=39.
-        "MXFP4": "mxfp4",
-        "IQ4_NL": "iq4_nl",
-        # TODO: Keep IQ2_XXS=16, IQ1_S=19, IQ3_S=21, IQ4_XS=23 and the other
-        # IQ variants on the dequantize/requantize fallback until implemented.
-    }.get(getattr(qtype, "name", None))
+    spec = _native_block_spec(qtype)
+    return spec.format if spec is not None else None
 
 
 def _native_block_target_stems(
@@ -358,7 +363,7 @@ def _replace_child_module(root, path: str, replacement) -> None:
 
 
 def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
-    """Swap MatMulNBits scaffolding for source-native MXFP4/IQ4_NL linears."""
+    """Swap MatMulNBits scaffolding for runtime-supported native linears."""
     from mobius.components import BlockQuantizedLinear, QuantizedLinear
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
@@ -389,7 +394,7 @@ def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
 
     if replacements:
         logger.info(
-            "Preserving %d GGUF projection weights as native MXFP4/IQ4_NL blocks",
+            "Preserving %d GGUF projection weights as runtime-native IQ/MXFP4 blocks",
             len(replacements),
         )
 
@@ -623,6 +628,14 @@ def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
         "Q8_0",
         "MXFP4",
         "IQ4_NL",
+        "IQ4_XS",
+        "IQ3_S",
+        "IQ3_XXS",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ1_S",
+        "IQ1_M",
     }
     for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
         if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
@@ -763,6 +776,7 @@ def _load_quantized_state_dict(
     from mobius.components import BlockQuantizedLinear, QuantizedEmbedding, QuantizedLinear
     from mobius.integrations.gguf._repacker import (
         can_repack,
+        preserve_native_blocks,
         repack_dequantized_tensor,
         repack_gguf_tensor,
     )
@@ -842,20 +856,21 @@ def _load_quantized_state_dict(
             np_shape,
             set(native_block_stems),
         )
-        native_format = _native_block_format(qtype)
-        if native_targets and native_format is not None:
-            block_bytes = 17 if native_format == "mxfp4" else 18
+        native_spec = _native_block_spec(qtype)
+        if native_targets and native_spec is not None:
             n_out = int(np_shape[-2])
             k_in = int(np_shape[-1])
-            n_blocks = (k_in + 31) // 32
-            expected_bytes = len(native_targets) * n_out * n_blocks * block_bytes
-            packed = raw.ravel().view(np.uint8)
-            if packed.size != expected_bytes:
-                raise ValueError(
-                    f"Native {native_format} data size mismatch for {hf_name}: "
-                    f"got {packed.size} bytes, expected {expected_bytes}"
-                )
-            packed = packed.reshape(len(native_targets), n_out, n_blocks, block_bytes)
+            packed = preserve_native_blocks(
+                raw,
+                qtype_val,
+                (len(native_targets) * n_out, k_in),
+            )
+            packed = packed.reshape(
+                len(native_targets),
+                n_out,
+                packed.shape[-2],
+                native_spec.bytes,
+            )
             for index, native_stem in enumerate(native_targets):
                 w = torch.from_numpy(np.array(packed[index], copy=True))
                 target_name = f"{native_stem}.weight"
