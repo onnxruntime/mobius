@@ -134,6 +134,35 @@ def _first_not_none(*values, default=None):
     return default
 
 
+def _leading_layer_type_count(layer_types, target: str) -> int:
+    count = 0
+    for layer_type in layer_types or ():
+        if layer_type != target:
+            break
+        count += 1
+    return count
+
+
+def _deepseek_v4_compress_ratios(config) -> list[int] | None:
+    ratios = getattr(config, "compress_ratios", None)
+    if ratios is not None:
+        return list(ratios)
+    layer_types = getattr(config, "layer_types", None)
+    rates = getattr(config, "compress_rates", None)
+    if not layer_types or not rates:
+        return None
+    return [
+        (
+            rates.get("compressed_sparse_attention", 4)
+            if layer_type == "compressed_sparse_attention"
+            else rates.get("heavily_compressed_attention", 128)
+            if layer_type == "heavily_compressed_attention"
+            else 0
+        )
+        for layer_type in layer_types
+    ]
+
+
 # Models that use RoPE but hardcode rope_theta entirely in model __init__,
 # not in config JSON.  These are NOT detectable via config introspection
 # without trust_remote_code.  When a new model fails L2 with missing RoPE:
@@ -422,6 +451,20 @@ class ArchitectureConfig(BaseModelConfig):
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
     rope_interleave: bool = False
+
+    # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
+    o_groups: int = 1
+    o_lora_rank: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
+    index_topk: int | None = None
+    compress_ratios: list[int] | None = None
+    compress_rope_theta: float | None = None
+    hc_mult: int = 1
+    hc_sinkhorn_iters: int = 1
+    hc_eps: float = 1e-6
+    num_hash_layers: int = 0
+    swiglu_limit: float = 0.0
 
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
@@ -806,6 +849,25 @@ class ArchitectureConfig(BaseModelConfig):
             qk_nope_head_dim=getattr(config, "qk_nope_head_dim", None),
             qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
             v_head_dim=getattr(config, "v_head_dim", None),
+            # DeepSeek-V4 compressed sparse attention / Hyper-Connections
+            o_groups=getattr(config, "o_groups", 1),
+            o_lora_rank=getattr(config, "o_lora_rank", None),
+            index_n_heads=getattr(config, "index_n_heads", None),
+            index_head_dim=getattr(config, "index_head_dim", None),
+            index_topk=getattr(config, "index_topk", None),
+            compress_ratios=_deepseek_v4_compress_ratios(config),
+            compress_rope_theta=getattr(config, "compress_rope_theta", None),
+            hc_mult=getattr(config, "hc_mult", 1),
+            hc_sinkhorn_iters=getattr(config, "hc_sinkhorn_iters", 1),
+            hc_eps=getattr(config, "hc_eps", 1e-6),
+            num_hash_layers=(
+                getattr(config, "num_hash_layers", None)
+                or getattr(config, "n_hash_layers", 0)
+                or _leading_layer_type_count(
+                    getattr(config, "mlp_layer_types", None), "hash_moe"
+                )
+            ),
+            swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder

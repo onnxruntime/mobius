@@ -330,6 +330,35 @@ class TestCLIBuildRuntime:
         native_writer.assert_called_once()
         generic_writer.assert_not_called()
 
+    def test_runtime_onnx_genai_calls_write_inference_metadata(self):
+        """--runtime onnx-genai writes inference_metadata (not genai_config)."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_inference_metadata",
+                return_value="inference_metadata.yaml",
+            ) as mock_meta,
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                return_value={},
+            ) as mock_ort,
+            mock.patch("mobius._model_package.ModelPackage.save"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen2.5-0.5B",
+                    tmpdir,
+                    "--no-weights",
+                    "--runtime",
+                    "onnx-genai",
+                ]
+            )
+        mock_meta.assert_called_once()
+        mock_ort.assert_not_called()
+        mock_ort.assert_not_called()
+
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""
         with (

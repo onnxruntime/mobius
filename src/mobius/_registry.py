@@ -37,6 +37,7 @@ from mobius.models import (
     ChatGLMCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
+    DeepSeekV4CausalLMModel,
     DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
@@ -542,6 +543,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
@@ -908,6 +910,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -1151,6 +1154,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v2": "deepseek",
     "deepseek_v2_moe": "deepseek",
     "deepseek_v3": "deepseek",
+    "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "olmo": "olmo",
     "olmo2": "olmo",
@@ -1222,6 +1226,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
+    "deepseek_v4": "dense-hca-fallback+moe+hc",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",
