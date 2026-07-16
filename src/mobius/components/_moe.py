@@ -190,7 +190,12 @@ class MoELayer(nn.Module):
     then results are masked and weighted.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
@@ -206,7 +211,9 @@ class MoELayer(nn.Module):
             if config.moe_intermediate_size is not None
             else config
         )
-        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList(
+            [MLP(expert_config, linear_class=linear_class) for _ in range(self.num_experts)]
+        )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         routing_weights, selected_experts = self.gate(op, hidden_states)

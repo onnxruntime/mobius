@@ -322,7 +322,19 @@ def _normalize_gguf_weights(
     import torch
 
     result: dict[str, torch.Tensor] = {}
+    kv_b_parts: dict[str, dict[str, torch.Tensor]] = {}
     for key, value in state_dict.items():
+        for part in ("k", "v"):
+            suffix = f".self_attn.kv_b_proj.{part}_proj.weight"
+            if key.endswith(suffix):
+                prefix = key[: -len(suffix)]
+                kv_b_parts.setdefault(prefix, {})[part] = value
+                break
+        else:
+            part = None
+        if part is not None:
+            continue
+
         # Stacked expert weights [num_experts, out, in] → per-expert
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -351,7 +363,30 @@ def _normalize_gguf_weights(
             result[key[: -len(".bias")]] = value
             continue
 
+        if key.endswith(".gate.e_score_correction_bias.bias"):
+            result[key[: -len(".bias")]] = value
+            continue
+
         result[key] = value
+
+    for prefix, parts in kv_b_parts.items():
+        if set(parts) != {"k", "v"}:
+            missing = {"k", "v"} - set(parts)
+            raise ValueError(
+                f"Incomplete split kv_b_proj for {prefix}: missing {sorted(missing)}"
+            )
+        k_proj = parts["k"].transpose(1, 2)
+        v_proj = parts["v"]
+        if k_proj.shape[0] != v_proj.shape[0] or k_proj.shape[2] != v_proj.shape[2]:
+            raise ValueError(
+                f"Incompatible split kv_b_proj shapes for {prefix}: "
+                f"k={tuple(parts['k'].shape)}, v={tuple(v_proj.shape)}"
+            )
+        fused = torch.cat((k_proj, v_proj), dim=1).reshape(
+            -1,
+            k_proj.shape[-1],
+        )
+        result[f"{prefix}.self_attn.kv_b_proj.weight"] = fused
 
     return result
 
@@ -521,12 +556,11 @@ def _require_supported_requantization(
     block_size: int,
     tensor_name: str,
 ) -> None:
-    if bits != 4 or block_size != 32:
+    if bits not in (4, 8) or block_size != 32:
         raise ValueError(
             "keep_quantized MatMulNBits requantization currently supports only "
-            f"4-bit/block-32 targets; got bits={bits} block={block_size} "
-            f"for tensor {tensor_name}. Use keep_quantized=False or a "
-            "4-bit/block-32 target."
+            f"4-bit or 8-bit block-32 targets; got bits={bits} block={block_size} "
+            f"for tensor {tensor_name}. Use keep_quantized=False or a supported target."
         )
 
 
@@ -649,6 +683,7 @@ def _load_quantized_state_dict(
         can_repack,
         repack_dequantized_tensor,
         repack_gguf_tensor,
+        repack_quant_params,
     )
     from mobius.integrations.gguf._tencent_q1_0 import (
         is_tencent_q1_0_layout,
@@ -694,6 +729,7 @@ def _load_quantized_state_dict(
     target_bits = config.quantization.bits
     target_block_size = config.quantization.group_size
     target_symmetric = config.quantization.sym
+    split_kv_b: dict[str, dict[str, np.ndarray]] = {}
 
     for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
         gguf_model.tensor_items_raw(),
@@ -707,6 +743,112 @@ def _load_quantized_state_dict(
 
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
+
+        # GGUF stores every routed expert projection in one 3D tensor. Repack
+        # one expert at a time to avoid materializing a multi-gigabyte float
+        # tensor for GLM-5.2's 256 experts.
+        expert_proj = next(
+            (
+                proj
+                for proj in ("gate_proj", "up_proj", "down_proj")
+                if hf_name.endswith(f".mlp.experts.{proj}.weight")
+            ),
+            None,
+        )
+        if expert_proj is not None and len(np_shape) == 3:
+            num_experts, n_out, k_in = (int(dim) for dim in np_shape)
+            raw_flat = raw.reshape(-1)
+            if raw_flat.size % num_experts != 0:
+                raise ValueError(
+                    f"Cannot split GGUF expert tensor {gguf_name}: "
+                    f"{raw_flat.size} blocks across {num_experts} experts"
+                )
+            blocks_per_expert = raw_flat.size // num_experts
+            source_params = repack_quant_params(qtype_val)
+            for expert_idx in range(num_experts):
+                raw_expert = raw_flat[
+                    expert_idx * blocks_per_expert : (expert_idx + 1) * blocks_per_expert
+                ]
+                if source_params == (target_bits, target_block_size):
+                    repacked = repack_gguf_tensor(
+                        raw_expert.ravel().view(np.uint8),
+                        qtype_val,
+                        (n_out, k_in),
+                    )
+                else:
+                    _require_supported_requantization(
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        tensor_name=hf_name,
+                    )
+                    values = gguf_model.dequantize_raw_tensor(
+                        raw_expert,
+                        qtype,
+                        (n_out, k_in),
+                    )
+                    repacked = repack_dequantized_tensor(
+                        values,
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        symmetric=target_symmetric,
+                    )
+                    n_requantized += 1
+
+                expert_name = hf_name.replace(
+                    f".mlp.experts.{expert_proj}.weight",
+                    f".mlp.experts.{expert_idx}.{expert_proj}.weight",
+                )
+                expert_stem = expert_name[: -len(".weight")]
+                state_dict[expert_name] = torch.from_numpy(repacked.weight)
+                state_dict[f"{expert_stem}.scales"] = torch.from_numpy(repacked.scales)
+                if repacked.zero_points is not None:
+                    state_dict[f"{expert_stem}.zero_points"] = torch.from_numpy(
+                        repacked.zero_points
+                    )
+                n_repacked += 1
+            continue
+
+        # GLM-5.2 GGUF splits the MLA kv_b projection into per-head K and V
+        # tensors. Fuse them in float and immediately requantize the resulting
+        # 2D projection so only one layer's temporary arrays are resident.
+        kv_b_part = None
+        for part in ("k", "v"):
+            suffix = f".self_attn.kv_b_proj.{part}_proj.weight"
+            if hf_name.endswith(suffix):
+                kv_b_part = part
+                kv_b_prefix = hf_name[: -len(suffix)]
+                break
+        if kv_b_part is not None:
+            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+            parts = split_kv_b.setdefault(kv_b_prefix, {})
+            parts[kv_b_part] = values
+            if set(parts) == {"k", "v"}:
+                k_proj = parts["k"].transpose(0, 2, 1)
+                v_proj = parts["v"]
+                fused = np.concatenate((k_proj, v_proj), axis=1).reshape(
+                    -1,
+                    k_proj.shape[-1],
+                )
+                _require_supported_requantization(
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    tensor_name=f"{kv_b_prefix}.self_attn.kv_b_proj.weight",
+                )
+                repacked = repack_dequantized_tensor(
+                    fused,
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                stem = f"{kv_b_prefix}.self_attn.kv_b_proj"
+                state_dict[f"{stem}.weight"] = torch.from_numpy(repacked.weight)
+                state_dict[f"{stem}.scales"] = torch.from_numpy(repacked.scales)
+                if repacked.zero_points is not None:
+                    state_dict[f"{stem}.zero_points"] = torch.from_numpy(repacked.zero_points)
+                del split_kv_b[kv_b_prefix]
+                n_repacked += 1
+                n_requantized += 1
+            continue
 
         # Repack every target QuantizedLinear weight. Mixed GGUF presets
         # otherwise leave unsupported source types as full float matrices,
@@ -800,6 +942,9 @@ def _load_quantized_state_dict(
             else:
                 arr = dequantize(raw, qtype).reshape(np_shape)
             state_dict[hf_name] = torch.from_numpy(arr)
+
+    if split_kv_b:
+        raise ValueError(f"Incomplete split kv_b_proj tensors: {sorted(split_kv_b)}")
 
     logger.info(
         "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "

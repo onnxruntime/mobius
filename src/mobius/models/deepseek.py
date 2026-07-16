@@ -21,15 +21,32 @@ from mobius.components import (
     Embedding,
     Linear,
     MoELayer,
+    QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+
+def _linear_class(config: ArchitectureConfig) -> type:
+    qc = config.quantization
+    if qc is None or qc.quant_method == "none":
+        return Linear
+    import onnx_ir as ir
+
+    zero_point_dtype = config.dtype if qc.float_zero_point else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
 
 
 class DeepSeekMoEGate(nn.Module):
@@ -150,14 +167,19 @@ class DeepSeekMLADecoderLayer(nn.Module):
     Forward signature matches DecoderLayer for compatibility with TextModel.
     """
 
-    def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        is_moe: bool = False,
+        linear_class: type | None = None,
+    ):
         super().__init__()
-        self.self_attn = DeepSeekMLA(config)
+        self.self_attn = DeepSeekMLA(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
-            self.mlp = _DeepSeekMoEFFN(config, gate)
+            self.mlp = _DeepSeekMoEFFN(config, gate, linear_class=linear_class)
         else:
-            self.mlp = MLP(config)
+            self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -197,14 +219,19 @@ class _DeepSeekStandardDecoderLayer(nn.Module):
     Forward signature matches DeepSeekMLADecoderLayer for compatibility.
     """
 
-    def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        is_moe: bool = False,
+        linear_class: type | None = None,
+    ):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = Attention(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
-            self.mlp = _DeepSeekMoEFFN(config, gate)
+            self.mlp = _DeepSeekMoEFFN(config, gate, linear_class=linear_class)
         else:
-            self.mlp = MLP(config)
+            self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -244,15 +271,24 @@ class _DeepSeekMoEFFN(nn.Module):
     Output = moe_routed_output + shared_expert_output.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module,
+        linear_class: type | None = None,
+    ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.moe = MoELayer(config, gate=gate)
+        self.moe = MoELayer(config, gate=gate, linear_class=linear_class)
         # Shared expert uses moe_intermediate_size * n_shared_experts
         n_shared = config.n_shared_experts or 1
         shared_intermediate = config.moe_intermediate_size * n_shared
-        self.shared_experts = _SharedExpertMLP(config, shared_intermediate)
+        self.shared_experts = _SharedExpertMLP(
+            config,
+            shared_intermediate,
+            linear_class=linear_class,
+        )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         moe_output = self.moe(op, hidden_states)
@@ -263,11 +299,18 @@ class _DeepSeekMoEFFN(nn.Module):
 class _SharedExpertMLP(nn.Module):
     """Shared expert MLP (same architecture as gate/up/down SiLU MLP)."""
 
-    def __init__(self, config: ArchitectureConfig, intermediate_size: int):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        intermediate_size: int,
+        linear_class: type | None = None,
+    ):
         super().__init__()
-        self.gate_proj = Linear(config.hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, config.hidden_size, bias=False)
+        if linear_class is None:
+            linear_class = Linear
+        self.gate_proj = linear_class(config.hidden_size, intermediate_size, bias=False)
+        self.up_proj = linear_class(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = linear_class(intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate_out = self.gate_proj(op, hidden_states)
@@ -290,7 +333,19 @@ class DeepSeekV3TextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+        linear_class = _linear_class(config)
+        qc = config.quantization
+        if qc is not None and qc.quantize_embeddings:
+            self.embed_tokens = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                bits=qc.bits,
+                block_size=qc.group_size,
+                has_zero_point=not qc.sym,
+                padding_idx=config.pad_token_id,
+            )
+        else:
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self._dtype = config.dtype
 
         # Detect MLA vs standard attention
@@ -304,7 +359,7 @@ class DeepSeekV3TextModel(nn.Module):
             first_k = config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
-                LayerClass(config, is_moe=(i >= first_k))
+                LayerClass(config, is_moe=(i >= first_k), linear_class=linear_class)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -369,7 +424,11 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = DeepSeekV3TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        qc = config.quantization
+        lm_head_class = (
+            _linear_class(config) if qc is not None and qc.quantize_lm_head else Linear
+        )
+        self.lm_head = lm_head_class(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

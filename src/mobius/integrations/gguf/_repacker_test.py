@@ -665,6 +665,23 @@ class TestRepackDequantizedTensor:
         assert result.weight.shape == (3, 3, 16)
         assert result.zero_points.shape == (3, 2)
 
+    def test_asymmetric_q8_round_trip_bound(self):
+        rng = np.random.default_rng(1)
+        values = rng.normal(size=(3, 70)).astype(np.float32)
+        result = repack_dequantized_tensor(values, bits=8, block_size=32)
+
+        n_blocks = result.scales.shape[1]
+        dequantized = (
+            result.weight.astype(np.float32)
+            - result.zero_points[:, :, None].astype(np.float32)
+        ) * result.scales[:, :, None]
+        dequantized = dequantized.reshape(3, n_blocks * 32)[:, : values.shape[1]]
+
+        max_abs_diff = float(np.max(np.abs(dequantized - values)))
+        assert max_abs_diff <= float(result.scales.max()) * 0.51 + 1e-6
+        assert result.weight.shape == (3, 3, 32)
+        assert result.zero_points.shape == (3, 3)
+
 
 # ---- Q1_0 tests ----
 

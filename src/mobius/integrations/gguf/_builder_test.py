@@ -269,20 +269,18 @@ class TestBuildQuantizedGguf:
         assert list(model.graph.initializers["lm_head.scales"].shape) == [256, 2]
         assert "lm_head.weight_t" not in model.graph.initializers
 
-    def test_unsupported_requantization_target_has_clear_error(
-        self, q8_0_projection_q4_head_gguf: Path
-    ):
-        """Mixed targets outside 4-bit/block-32 fail before the Q4 repacker."""
+    def test_q8_target_requantizes_mixed_q4_head(self, q8_0_projection_q4_head_gguf: Path):
+        """A mixed Q8 target requantizes its Q4 output head to block-32 Q8."""
         from mobius.integrations.gguf import build_from_gguf
 
-        with pytest.raises(
-            ValueError,
-            match=(
-                "keep_quantized MatMulNBits requantization currently supports only "
-                r"4-bit/block-32 targets; got bits=8 block=32 for tensor lm_head\.weight"
-            ),
-        ):
-            build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)
+        model = build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)["model"]
+        head = next(
+            node
+            for node in model.graph
+            if node.op_type == "MatMulNBits" and node.outputs[0].name == "logits"
+        )
+        assert head.attributes["bits"].value == 8
+        assert head.attributes["block_size"].value == 32
 
     def test_norms_are_float(self, q4_0_gguf: Path):
         """Norm weights remain float, not quantized."""
@@ -427,3 +425,23 @@ class TestRawTensorIterator:
         expected = model.get_tensor(name)
         actual = model.dequantize_raw_tensor(raw, qtype, shape)
         np.testing.assert_array_equal(actual, expected)
+
+
+def test_normalize_glm_dsa_split_kv_b_and_router_bias():
+    import torch
+
+    from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+    k_proj = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    v_proj = torch.arange(2 * 5 * 3, dtype=torch.float32).reshape(2, 5, 3)
+    result = _normalize_gguf_weights(
+        {
+            "model.layers.0.self_attn.kv_b_proj.k_proj.weight": k_proj,
+            "model.layers.0.self_attn.kv_b_proj.v_proj.weight": v_proj,
+            "model.layers.0.mlp.gate.e_score_correction_bias.bias": torch.zeros(2),
+        }
+    )
+
+    expected = torch.cat((k_proj.transpose(1, 2), v_proj), dim=1).reshape(18, 3)
+    assert torch.equal(result["model.layers.0.self_attn.kv_b_proj.weight"], expected)
+    assert "model.layers.0.mlp.gate.e_score_correction_bias" in result

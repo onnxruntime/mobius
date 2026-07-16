@@ -187,6 +187,36 @@ _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": ("model.layers.{bid}.mlp.shared_expert.down_proj"),
 }
 
+# GLM-5.2 uses MLA with split K/V decompression weights in GGUF.
+# The temporary ``kv_b_proj.{k,v}_proj`` names are fused by
+# ``_normalize_gguf_weights`` before model-specific preprocessing.
+_GLM_DSA_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.kv_b_proj.k_proj",
+    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.kv_b_proj.v_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+}
+
 # Qwen3.5-MoE hybrid extensions: DeltaNet (SSM) + full-attention + MoE.
 # DeltaNet layers use linear_attn.* naming; full-attention layers add
 # q_norm/k_norm under self_attn; both use post_attention_layernorm.
@@ -254,7 +284,12 @@ def is_known_skip(gguf_name: str) -> bool:
     """
     if gguf_name.startswith("tokenizer."):
         return True
-    if "rope_freqs" in gguf_name or "attn_rot_embd" in gguf_name:
+    if (
+        "rope_freqs" in gguf_name
+        or "attn_rot_embd" in gguf_name
+        or ".indexer." in gguf_name
+        or ".nextn." in gguf_name
+    ):
         return True
     return False
 
@@ -305,13 +340,15 @@ def _build_mapping(
         result.update(_MOE_EXTRAS)
         if arch == "qwen35moe":
             result.update(_QWEN35MOE_EXTRAS)
+    elif arch == "glm-dsa":
+        result = dict(_GLM_DSA_MAPPING)
     else:
         supported = sorted(
             _LLAMA_FAMILY
             | _GEMMA_FAMILY
             | _MOE_FAMILY
             | _HUNYUAN_FAMILY
-            | {"gemma4", "phi3", "falcon", "gpt2", "mamba"}
+            | {"gemma4", "glm-dsa", "phi3", "falcon", "gpt2", "mamba"}
         )
         raise ValueError(
             f"Unsupported GGUF architecture: {architecture!r}. "
