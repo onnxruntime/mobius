@@ -698,9 +698,11 @@ def _glm_moe_dsa_postprocess(
     n_shared_experts = int(metadata.get(f"{arch}.expert_shared_count", 0))
     first_k_dense_replace = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
 
-    # GLM-5.2 shares one full indexer across each four-layer DSA group.
+    # Official GLM-5.2 schedule: full indexers in layers 0, 1, 2, then
+    # 6, 10, ...; each later full layer shares its selection with the next
+    # three layers.
     indexer_types = [
-        "full" if i < first_k_dense_replace or (i - 2) % 4 == 0 else "shared"
+        "full" if i <= 2 or (i >= 6 and (i - 6) % 4 == 0) else "shared"
         for i in range(num_hidden_layers)
     ]
     mlp_layer_types = [
@@ -729,7 +731,12 @@ def _glm_moe_dsa_postprocess(
         mlp_layer_types=mlp_layer_types,
         scoring_func="sigmoid",
         topk_method="noaux_tc",
+        use_dsa=True,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_rope_interleave=True,
         indexer_types=indexer_types,
+        index_share_for_mtp_iteration=n_mtp > 0,
         num_nextn_predict_layers=n_mtp,
     )
 

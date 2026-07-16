@@ -7,6 +7,7 @@ import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
 from mobius._builder import build_from_module
+from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing import count_op_type, make_config
@@ -67,6 +68,9 @@ class TestGlmMoeDsaExport:
             index_topk=8,
             index_head_dim=8,
             index_n_heads=2,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+            index_share_for_mtp_iteration=True,
         )
 
         config = ArchitectureConfig.from_transformers(hf_config)
@@ -77,23 +81,44 @@ class TestGlmMoeDsaExport:
         assert config.qk_nope_head_dim == 12
         assert config.qk_rope_head_dim == 4
         assert config.index_topk == 8
+        assert config.index_topk_freq == 4
+        assert config.index_skip_topk_offset == 3
+        assert config.index_share_for_mtp_iteration is True
         assert config.rope_interleave is True
 
     def test_registry(self):
         assert registry.get("glm_moe_dsa") is GlmMoeDsaCausalLMModel
+        assert _default_task_for_model("glm_moe_dsa") == "glm-moe-dsa"
 
     def test_builds_full_attention_mla_moe_graph(self):
         config = _tiny_glm_moe_dsa_config()
-        graph = build_from_module(GlmMoeDsaCausalLMModel(config), config)["model"].graph
+        package = build_from_module(
+            GlmMoeDsaCausalLMModel(config),
+            config,
+            task="glm-moe-dsa",
+        )
+        graph = package["model"].graph
 
         assert count_op_type(graph, "Attention") == config.num_hidden_layers
-        assert count_op_type(graph, "TopK") == config.num_hidden_layers - 1
+        assert count_op_type(graph, "ScatterElements") >= 1
         assert count_op_type(graph, "Sigmoid") >= config.num_hidden_layers - 1
-        assert not any("indexer" in name for name in graph.initializers)
+        assert any("layers.0.self_attn.indexer.wk.weight" in name for name in graph.initializers)
+        assert not any("layers.1.self_attn.indexer" in name for name in graph.initializers)
         assert {value.name for value in graph.outputs} >= {
             "logits",
             "present.0.key",
             "present.0.value",
+        }
+        assert set(package) == {"model", "mtp"}
+
+        mtp_graph = package["mtp"].graph
+        assert count_op_type(mtp_graph, "Attention") == 1
+        assert count_op_type(mtp_graph, "ScatterElements") == 1
+        assert {value.name for value in mtp_graph.outputs} == {
+            "mtp_hidden",
+            "present.0.key",
+            "present.0.value",
+            "topk_indices",
         }
 
     def test_quantized_graph_uses_matmul_nbits(self):
@@ -105,22 +130,47 @@ class TestGlmMoeDsaExport:
                 sym=False,
             )
         )
-        graph = build_from_module(GlmMoeDsaCausalLMModel(config), config)["model"].graph
+        graph = build_from_module(
+            GlmMoeDsaCausalLMModel(config),
+            config,
+            task="glm-moe-dsa",
+        )["model"].graph
         assert count_op_type(graph, "MatMulNBits") > 0
 
-    def test_preprocess_drops_indexer_and_mtp_layer(self):
+    def test_preprocess_maps_indexer_and_mtp_layer(self):
         config = _tiny_glm_moe_dsa_config()
         model = GlmMoeDsaCausalLMModel(config)
         state_dict = {
             "model.layers.1.mlp.gate.weight": torch.zeros(2, 64),
             "model.layers.1.mlp.experts.0.gate_proj.weight": torch.zeros(32, 64),
-            "model.layers.1.indexer.wk.weight": torch.zeros(8, 64),
+            "model.layers.0.self_attn.indexer.wk.weight": torch.zeros(8, 64),
             "model.layers.4.self_attn.q_a_proj.weight": torch.zeros(16, 64),
+            "model.layers.4.eh_proj.weight": torch.zeros(64, 128),
+            "model.layers.4.shared_head.norm.weight": torch.zeros(64),
         }
 
         result = model.preprocess_weights(state_dict)
 
         assert "model.layers.1.mlp.moe.gate.weight" in result
         assert "model.layers.1.mlp.moe.experts.0.gate_proj.weight" in result
-        assert not any("indexer" in key for key in result)
-        assert not any(".layers.4." in key for key in result)
+        assert "model.layers.0.self_attn.indexer.wk.weight" in result
+        assert "mtp.layer.self_attn.q_a_proj.weight" in result
+        assert "mtp.eh_proj.weight" in result
+        assert "mtp.shared_head.norm.weight" in result
+
+    def test_full_attention_fallback(self):
+        config = _tiny_glm_moe_dsa_config(
+            use_dsa=False,
+            num_nextn_predict_layers=0,
+        )
+        package = build_from_module(
+            GlmMoeDsaCausalLMModel(config),
+            config,
+            task="glm-moe-dsa",
+        )
+        graph = package["model"].graph
+
+        assert set(package) == {"model"}
+        assert count_op_type(graph, "Attention") == config.num_hidden_layers
+        assert count_op_type(graph, "ScatterElements") == 0
+        assert not any("indexer" in name for name in graph.initializers)

@@ -86,6 +86,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
+    "glm_moe_dsa": "decoder",
     # Qwen VL models all use the same GenAI pipeline as qwen2_5_vl
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen2_5_vl",
@@ -718,7 +719,11 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
-    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
+    decoder_filename = (
+        f"{decoder_key}/model.onnx"
+        if len(pkg) > 1 or decoder_key != "model"
+        else "model.onnx"
+    )
 
     # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
     # graph to write the KV cache in place. Only ``com.microsoft.
@@ -984,6 +989,42 @@ def write_ort_genai_config(
     )
 
     result: dict[str, str] = {"genai_config": genai_path}
+
+    if "mtp" in pkg:
+        mtp_path = os.path.join(directory, "mtp_config.json")
+        with open(mtp_path, "w") as f:
+            json.dump(
+                {
+                    "model": {"filename": "mtp/model.onnx"},
+                    "inputs": [
+                        "inputs_embeds",
+                        "hidden_states",
+                        "attention_mask",
+                        "position_ids",
+                        "past_key_values.0.key",
+                        "past_key_values.0.value",
+                    ],
+                    "outputs": [
+                        "mtp_hidden",
+                        "present.0.key",
+                        "present.0.value",
+                        "topk_indices",
+                    ],
+                    "num_nextn_predict_layers": getattr(
+                        config, "num_nextn_predict_layers", 0
+                    ),
+                    "index_share_for_mtp_iteration": getattr(
+                        config, "index_share_for_mtp_iteration", False
+                    ),
+                    "shared_embedding": "model.embed_tokens",
+                    "shared_lm_head": "lm_head",
+                    "runtime_orchestration": "external",
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        result["mtp_config"] = mtp_path
 
     # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
     # for --config mode where no HF model ID is available.

@@ -302,8 +302,18 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.3.exp_probs_b.bias", "glm-dsa") == (
             "model.layers.3.mlp.gate.e_score_correction_bias.bias"
         )
-        assert map_gguf_to_hf_names("blk.3.indexer.attn_k.weight", "glm-dsa") is None
-        assert map_gguf_to_hf_names("blk.78.nextn.eh_proj.weight", "glm-dsa") is None
+        assert map_gguf_to_hf_names("blk.3.indexer.attn_k.weight", "glm-dsa") == (
+            "model.layers.3.self_attn.indexer.wk.weight"
+        )
+        assert map_gguf_to_hf_names("blk.3.indexer.k_norm.bias", "glm-dsa") == (
+            "model.layers.3.self_attn.indexer.k_norm.bias"
+        )
+        assert map_gguf_to_hf_names("blk.78.nextn.eh_proj.weight", "glm-dsa") == (
+            "model.layers.78.eh_proj.weight"
+        )
+        assert map_gguf_to_hf_names(
+            "blk.78.nextn.shared_head_norm.weight", "glm-dsa"
+        ) == "model.layers.78.shared_head.norm.weight"
 
     # ---- Unsupported architecture ----
 

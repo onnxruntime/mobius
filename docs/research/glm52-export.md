@@ -40,18 +40,36 @@ weight into `attn_k_b` and `attn_v_b`, while Transformers exposes one
 
 ## Implemented scope
 
-This increment registers `glm_moe_dsa` and maps `glm-dsa` GGUF files to it.
-It exports the 78-layer, two-norm MLA backbone, the three dense FFN layers,
-the 75 routed-MoE layers, the shared expert, sigmoid/no-aux router, interleaved
-RoPE, KV cache, and untied output head. It uses the existing portable ONNX
-Attention and MoE components, so the graph can be packaged for both
-ONNX Runtime GenAI runtime spellings (`onnx-genai` and `ort-genai`).
+The exporter now preserves the 78-layer backbone, IndexShare DSA, and the
+additional improved-MTP layer. Full indexers are emitted for layers 0, 1, 2,
+6, 10, ... 74; each full layer's INT32 top-k result is reused by the following
+three shared layers. The indexer implements the checkpoint equations in fp32:
+Q-LoRA residual projection, LayerNorm+interleaved-RoPE key projection, ReLU
+scores, learned signed head weights, causal bias, and dynamic
+`min(2048, key_length)` TopK.
+
+Each full-indexer layer packs its 128-value index key beside the decompressed
+MLA key in the standard `past_key_values.N.key` tensor. Shared layers retain
+the normal MLA cache. This keeps the ORT GenAI key/value naming contract
+without duplicating the index key across 64 attention heads.
+
+The MTP component exports:
+
+1. `enorm(next-token embedding)` and `hnorm(target hidden state)`;
+2. concatenation and the `2H -> H` `eh_proj`;
+3. the complete layer-78 DSA+MoE decoder block; and
+4. `shared_head.norm`, producing `mtp_hidden` for the shared target LM head.
+
+Multi-component packages contain `model/model.onnx`, `mtp/model.onnx`, and an
+`mtp_config.json` sidecar. Both runtime aliases (`onnx-genai` and `ort-genai`)
+emit these artifacts. ORT GenAI does not yet orchestrate the sidecar itself.
 
 The importer:
 
 - derives all MLA, MoE, IndexShare, RoPE, and NextN fields from GGUF metadata;
-- removes the GGUF-only MTP block from the backbone layer count;
+- separates the GGUF MTP block from the 78-layer backbone and exports it as `mtp`;
 - fuses split `attn_k_b` and `attn_v_b` tensors into `kv_b_proj`;
+- maps `blk.N.indexer.*` and supported `blk.78.nextn.*` tensors;
 - streams stacked routed-expert tensors one expert at a time instead of
   materializing all 256 experts as one float tensor; and
 - preserves supported 4-bit and 8-bit tensors as MatMulNBits, requantizing
@@ -61,26 +79,24 @@ The generic portable MoE implementation evaluates every expert and masks the
 outputs. It is correct for routing, but a fused sparse-MoE runtime kernel will
 be required for practical GLM-5.2 execution.
 
-## Deliberately deferred
+## Runtime follow-ups
 
-### IndexShare sparse attention
+Portable ONNX preserves DSA selection numerics by converting the selected
+indices to an additive mask for the standard `Attention` operator. No custom op
+is required for correctness. Practical million-token performance still needs
+a selected-token sparse-attention kernel so the runtime avoids evaluating
+masked K/V positions.
 
-Layers 0-2 own full indexers. Starting at layer 6, one full indexer is used
-every four layers and the following three layers reuse its selected token
-indices. The current export omits indexer tensors and evaluates full causal
-MLA instead. This is a coherent backbone/exporter increment, but it does **not**
-preserve DSA numerics or its long-context cost. A follow-up should add an
-indexer component, cross-layer top-k state, sparse prefill/decode attention,
-and cache-aware position handling as one tested feature rather than partially
-wiring index weights into dense Attention.
+`index_share_for_mtp_iteration` also needs runtime orchestration. MTP step 0 can
+return `topk_indices`, but accepted speculative positions make the MTP MLA and
+indexer caches advance at different logical lengths. ORT GenAI currently has
+no separate indexer-cache/control-state contract, so steps 1+ recompute the
+index selection rather than silently applying an incorrect packed-cache reuse.
 
-### Improved MTP
+Use `--glm-full-attention` to retain the prior dense MLA fallback. The fallback
+disables the DSA-dependent MTP artifact.
 
-The final NextN block and `index_share_for_mtp_iteration` behavior are omitted.
-A follow-up should model the GLM-specific MTP inputs, shared index selection,
-cache contract, outputs, and ORT GenAI speculative-decoding configuration.
-
-## Unsloth dynamic quantization
+## Separate workstream: Unsloth dynamic quantization
 
 The six `UD-IQ1_M` GGUF shard headers were inspected. The dominant routed
 expert tensors are below the currently targeted 4-bit floor:

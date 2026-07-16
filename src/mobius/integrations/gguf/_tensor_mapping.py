@@ -209,6 +209,17 @@ _GLM_DSA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
     "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
     "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias",
+    # GLM-5.2 IndexShare DSA.
+    "blk.{bid}.indexer.attn_k": "model.layers.{bid}.self_attn.indexer.wk",
+    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
+    "blk.{bid}.indexer.k_norm": "model.layers.{bid}.self_attn.indexer.k_norm",
+    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
+    # GLM-5.2 improved MTP. The shared embedding/head tensors are tied to
+    # token_embd/output and therefore intentionally remain unmapped.
+    "blk.{bid}.nextn.eh_proj": "model.layers.{bid}.eh_proj",
+    "blk.{bid}.nextn.enorm": "model.layers.{bid}.enorm",
+    "blk.{bid}.nextn.hnorm": "model.layers.{bid}.hnorm",
+    "blk.{bid}.nextn.shared_head_norm": "model.layers.{bid}.shared_head.norm",
     "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
     "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
     "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
@@ -287,8 +298,6 @@ def is_known_skip(gguf_name: str) -> bool:
     if (
         "rope_freqs" in gguf_name
         or "attn_rot_embd" in gguf_name
-        or ".indexer." in gguf_name
-        or ".nextn." in gguf_name
     ):
         return True
     return False

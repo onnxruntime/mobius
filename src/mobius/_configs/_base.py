@@ -425,10 +425,13 @@ class ArchitectureConfig(BaseModelConfig):
     rope_interleave: bool = False
 
     # Deep Sparse Attention / IndexShare config — GLM-5.2.
-    # The dense-attention fallback preserves these fields for future DSA export.
+    use_dsa: bool = True
     index_topk: int | None = None
     index_head_dim: int | None = None
     index_n_heads: int | None = None
+    index_topk_freq: int = 4
+    index_skip_topk_offset: int = 3
+    indexer_rope_interleave: bool = True
     indexer_types: list[str] | None = None
     index_share_for_mtp_iteration: bool = False
     num_nextn_predict_layers: int = 0
@@ -818,9 +821,13 @@ class ArchitectureConfig(BaseModelConfig):
             qk_rope_head_dim=getattr(config, "qk_rope_head_dim", None),
             v_head_dim=getattr(config, "v_head_dim", None),
             # Deep Sparse Attention / IndexShare
+            use_dsa=getattr(config, "use_dsa", True),
             index_topk=getattr(config, "index_topk", None),
             index_head_dim=getattr(config, "index_head_dim", None),
             index_n_heads=getattr(config, "index_n_heads", None),
+            index_topk_freq=getattr(config, "index_topk_freq", 4),
+            index_skip_topk_offset=getattr(config, "index_skip_topk_offset", 3),
+            indexer_rope_interleave=getattr(config, "indexer_rope_interleave", True),
             indexer_types=getattr(config, "indexer_types", None),
             index_share_for_mtp_iteration=getattr(
                 config, "index_share_for_mtp_iteration", False

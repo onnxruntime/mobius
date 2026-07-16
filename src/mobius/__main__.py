@@ -218,6 +218,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
+        if args.glm_full_attention:
+            config = dataclasses.replace(
+                config,
+                use_dsa=False,
+                num_nextn_predict_layers=0,
+            )
         if task is None:
             task = _default_task_for_model(model_type)
         module_class = registry.get(model_type)
@@ -241,6 +247,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
+            config_overrides=(
+                {"use_dsa": False, "num_nextn_predict_layers": 0}
+                if args.glm_full_attention
+                else None
+            ),
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -562,6 +573,11 @@ def main(argv: list[str] | None = None) -> None:
         "--no-weights",
         action="store_true",
         help="Do not include weights in the output ONNX model.",
+    )
+    build_parser.add_argument(
+        "--glm-full-attention",
+        action="store_true",
+        help="Disable GLM-5.2 IndexShare DSA and export the dense MLA fallback.",
     )
     build_parser.add_argument(
         "--trust-remote-code",
