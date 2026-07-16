@@ -1,17 +1,21 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""DeepSeek-V4 dense-backbone export.
+"""DeepSeek-V4 export with a sink-aware dense CSA fallback and MTP sidecar.
 
 The released V4 architecture replaces V3 MLA with compressed sparse attention
 and adds Hyper-Connections. This module implements the V4 projections,
 Hyper-Connections, hash/sqrt-softplus MoE routing, and a dense causal-attention
-fallback. Learned KV compression, sparse indexing, attention sinks, and MTP are
-intentionally deferred until the runtime exposes suitable cache/sparse ops.
+fallback with the learned attention sinks. The official per-layer compression
+schedule is represented by exported compressor/indexer tensors, and the
+checkpoint's MTP block is exported as a standalone sidecar. Executing learned
+KV compression and sparse selection still requires runtime cache/sparse ops;
+until those land, the target and MTP graphs attend densely for correctness.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import onnx_ir as ir
@@ -45,6 +49,78 @@ def _projection_class(config: ArchitectureConfig):
         has_zero_point=not quantization.sym,
         zero_point_dtype=zero_point_dtype,
     )
+
+
+def _shape_anchor(op: OpBuilder, parameters: list[ir.Value]) -> ir.Value:
+    """Reference one element of each deferred-runtime tensor and produce zero."""
+    total = None
+    for parameter in parameters:
+        first = op.Gather(op.Reshape(parameter, [-1]), [0])
+        present = op.Cast(
+            op.Equal(first, first),
+            to=ir.DataType.INT64,
+        )
+        total = present if total is None else op.Add(total, present)
+    assert total is not None
+    return op.ReduceSum(op.Mul(total, 0), [0], keepdims=False)
+
+
+class DeepSeekV4DeferredProjection(nn.Module):
+    """Projection parameters exported for a runtime path not yet executed."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        in_features: int,
+        out_features: int,
+    ):
+        super().__init__()
+        quantization = config.quantization
+        self._gguf_quantized_linear = (
+            quantization is not None and quantization.quant_method != "none"
+        )
+        if quantization is None or quantization.quant_method == "none":
+            self.weight = nn.Parameter([out_features, in_features])
+            self.scales = None
+            self.zero_points = None
+            return
+
+        n_blocks = (in_features + quantization.group_size - 1) // quantization.group_size
+        blob_size = quantization.group_size * quantization.bits // 8
+        self.weight = nn.Parameter(
+            [out_features, n_blocks, blob_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.scales = nn.Parameter([out_features, n_blocks])
+        if quantization.sym:
+            self.zero_points = None
+        elif quantization.float_zero_point:
+            self.zero_points = nn.Parameter([out_features, n_blocks], dtype=config.dtype)
+        else:
+            packed_zero_points = (n_blocks * quantization.bits + 7) // 8
+            self.zero_points = nn.Parameter(
+                [out_features, packed_zero_points],
+                dtype=ir.DataType.UINT8,
+            )
+
+    def forward(self, op: OpBuilder) -> ir.Value:
+        return _shape_anchor(
+            op,
+            [
+                value
+                for value in (self.weight, self.scales, self.zero_points)
+                if value is not None
+            ],
+        )
+
+
+class DeepSeekV4DeferredNorm(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.weight = nn.Parameter([hidden_size])
+
+    def forward(self, op: OpBuilder) -> ir.Value:
+        return _shape_anchor(op, [self.weight])
 
 
 class DeepSeekV4Gate(nn.Module):
@@ -158,10 +234,62 @@ class DeepSeekV4MoE(nn.Module):
         return op.Add(result, self.shared_experts(op, hidden_states))
 
 
-class DeepSeekV4Attention(nn.Module):
-    """V4 MQA projections using dense causal attention as a safe fallback."""
+class DeepSeekV4CompressorTensors(nn.Module):
+    """Official learned compressor tensors retained for sparse-runtime handoff."""
+
+    def __init__(self, config: ArchitectureConfig, compress_ratio: int, head_dim: int):
+        super().__init__()
+        overlap_factor = 2 if compress_ratio == 4 else 1
+        self.ape = nn.Parameter([compress_ratio, overlap_factor * head_dim])
+        self.wkv = DeepSeekV4DeferredProjection(
+            config, config.hidden_size, overlap_factor * head_dim
+        )
+        self.wgate = DeepSeekV4DeferredProjection(
+            config, config.hidden_size, overlap_factor * head_dim
+        )
+        self.norm = DeepSeekV4DeferredNorm(head_dim)
+
+    def forward(self, op: OpBuilder) -> ir.Value:
+        anchor = _shape_anchor(
+            op,
+            [
+                self.ape,
+            ],
+        )
+        anchor = op.Add(anchor, self.wkv(op))
+        anchor = op.Add(anchor, self.wgate(op))
+        return op.Add(anchor, self.norm(op))
+
+
+class DeepSeekV4IndexerTensors(nn.Module):
+    """Official ratio-4 sparse indexer tensors retained in the dense graph."""
 
     def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        assert config.q_lora_rank is not None
+        assert config.index_n_heads is not None
+        assert config.index_head_dim is not None
+        self.wq_b = DeepSeekV4DeferredProjection(
+            config,
+            config.q_lora_rank,
+            config.index_n_heads * config.index_head_dim,
+        )
+        self.weights_proj = DeepSeekV4DeferredProjection(
+            config, config.hidden_size, config.index_n_heads
+        )
+        self.compressor = DeepSeekV4CompressorTensors(
+            config, compress_ratio=4, head_dim=config.index_head_dim
+        )
+
+    def forward(self, op: OpBuilder) -> ir.Value:
+        own = op.Add(self.wq_b(op), self.weights_proj(op))
+        return op.Add(own, self.compressor(op))
+
+
+class DeepSeekV4Attention(nn.Module):
+    """V4 MQA projections using sink-aware dense causal attention."""
+
+    def __init__(self, config: ArchitectureConfig, layer_id: int):
         super().__init__()
         assert config.q_lora_rank is not None
         assert config.qk_rope_head_dim is not None
@@ -198,6 +326,20 @@ class DeepSeekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
         self.rope_interleave = config.rope_interleave
+        ratios = config.compress_ratios or []
+        self.compress_ratio = ratios[layer_id] if layer_id < len(ratios) else 0
+        if self.compress_ratio not in (0, 4, 128):
+            raise ValueError(
+                "DeepSeek-V4 supports compression ratios 0, 4, and 128; "
+                f"layer {layer_id} requested {self.compress_ratio}"
+            )
+        self.attn_sink = nn.Parameter([self.num_heads], dtype=ir.DataType.FLOAT)
+        self.compressor = (
+            DeepSeekV4CompressorTensors(config, self.compress_ratio, self.head_dim)
+            if self.compress_ratio
+            else None
+        )
+        self.indexer = DeepSeekV4IndexerTensors(config) if self.compress_ratio == 4 else None
 
     def _rotate(
         self,
@@ -224,6 +366,35 @@ class DeepSeekV4Attention(nn.Module):
         rope = op.Reshape(rope, [0, 0, num_heads, self.rope_dim])
         return op.Reshape(op.Concat(nope, rope, axis=-1), [0, 0, -1])
 
+    def _expand_kv(
+        self,
+        op: OpBuilder,
+        value: ir.Value,
+        batch: ir.Value,
+        sequence_length: ir.Value,
+    ) -> ir.Value:
+        value = op.Unsqueeze(value, [2])
+        value = op.Expand(
+            value,
+            op.Concat(
+                batch,
+                [1, self.num_heads],
+                sequence_length,
+                [self.head_dim],
+                axis=0,
+            ),
+        )
+        return op.Reshape(
+            value,
+            op.Concat(
+                batch,
+                [self.num_heads],
+                sequence_length,
+                [self.head_dim],
+                axis=0,
+            ),
+        )
+
     def forward(
         self,
         op: OpBuilder,
@@ -245,19 +416,47 @@ class DeepSeekV4Attention(nn.Module):
 
         kv = self.kv_layernorm(op, self.kv_proj(op, hidden_states))
         kv = self._rotate(op, kv, position_embeddings, 1)
-        output, present_key, present_value = op.Attention(
-            query,
-            kv,
-            kv,
-            attention_bias,
-            past_key_value[0] if past_key_value is not None else None,
-            past_key_value[1] if past_key_value is not None else None,
-            q_num_heads=self.num_heads,
-            kv_num_heads=1,
-            scale=self.scale,
-            _outputs=3,
+        batch = op.Shape(query, start=0, end=1)
+        query_length = op.Shape(query, start=1, end=2)
+        query = op.Transpose(
+            op.Reshape(query, [0, 0, self.num_heads, self.head_dim]),
+            perm=[0, 2, 1, 3],
+        )
+        key = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
+        value = key
+        if past_key_value is not None:
+            key = op.Concat(past_key_value[0], key, axis=2)
+            value = op.Concat(past_key_value[1], value, axis=2)
+        present_key, present_value = key, value
+
+        kv_length = op.Shape(key, start=2, end=3)
+        key = self._expand_kv(op, key, batch, kv_length)
+        value = self._expand_kv(op, value, batch, kv_length)
+        scores = op.Mul(
+            op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
+            self.scale,
+        )
+        scores = op.Add(scores, attention_bias)
+        sinks = op.Expand(
+            op.Reshape(
+                op.CastLike(self.attn_sink, scores),
+                [1, self.num_heads, 1, 1],
+            ),
+            op.Concat(batch, [self.num_heads], query_length, [1], axis=0),
+        )
+        probabilities = op.Softmax(op.Concat(scores, sinks, axis=-1), axis=-1)
+        probabilities = op.Slice(probabilities, [0], [-1], [3])
+        output = op.Reshape(
+            op.Transpose(op.MatMul(probabilities, value), perm=[0, 2, 1, 3]),
+            [0, 0, -1],
         )
         output = self._rotate(op, output, position_embeddings, self.num_heads, inverse=True)
+
+        if self.compressor is not None:
+            anchor = self.compressor(op)
+            if self.indexer is not None:
+                anchor = op.Add(anchor, self.indexer(op))
+            output = op.Add(output, op.CastLike(anchor, output))
 
         group_width = self.num_heads * self.head_dim // self.o_groups
         groups = op.Split(
@@ -284,7 +483,7 @@ class DeepSeekV4Attention(nn.Module):
 class DeepSeekV4DecoderLayer(nn.Module):
     def __init__(self, config: ArchitectureConfig, layer_id: int):
         super().__init__()
-        self.self_attn = DeepSeekV4Attention(config)
+        self.self_attn = DeepSeekV4Attention(config, layer_id)
         self.mlp = DeepSeekV4MoE(config, layer_id)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -420,10 +619,21 @@ class DeepSeekV4TextModel(nn.Module):
         self.hc_head_scale = nn.Parameter([1])
         rope_config = config
         if config.qk_rope_head_dim is not None:
-            import dataclasses
-
             rope_config = dataclasses.replace(config, head_dim=config.qk_rope_head_dim)
-        self.rotary_emb = initialize_rope(rope_config)
+        self.rotary_emb = initialize_rope(
+            dataclasses.replace(
+                rope_config,
+                rope_type="default",
+                rope_scaling=None,
+                original_max_position_embeddings=None,
+            )
+        )
+        self.compressed_rotary_emb = initialize_rope(
+            dataclasses.replace(
+                rope_config,
+                rope_theta=config.compress_rope_theta or config.rope_theta,
+            )
+        )
         self._dtype = config.dtype
 
     def _hc_head(self, op, states):
@@ -458,6 +668,7 @@ class DeepSeekV4TextModel(nn.Module):
             [1, 1, self.hc_mult, 1],
         )
         position_embeddings = self.rotary_emb(op, position_ids)
+        compressed_position_embeddings = self.compressed_rotary_emb(op, position_ids)
         attention_bias = create_attention_bias(
             op,
             input_ids=hidden_states if input_ids is None else input_ids,
@@ -467,30 +678,104 @@ class DeepSeekV4TextModel(nn.Module):
         presents = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for layer, past_kv in zip(self.layers, past_kvs):
+            layer_position_embeddings = (
+                compressed_position_embeddings
+                if layer.self_attn.compress_ratio
+                else position_embeddings
+            )
             hidden_states, present = layer(
                 op,
                 hidden_states,
                 input_ids,
                 attention_bias,
-                position_embeddings,
+                layer_position_embeddings,
                 past_kv,
             )
             presents.append(present)
-        return self.norm(op, self._hc_head(op, hidden_states)), presents
+        return self.norm(op, self._hc_head(op, hidden_states)), presents, hidden_states
+
+
+class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
+    """Official single MTP block, sharing target embeddings and LM head externally."""
+
+    def __init__(self, config: ArchitectureConfig, layer_id: int):
+        super().__init__(config, layer_id)
+        projection = _projection_class(config)
+        self.e_proj = projection(config.hidden_size, config.hidden_size, bias=False)
+        self.h_proj = projection(config.hidden_size, config.hidden_size, bias=False)
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hc_head_fn = Linear(
+            config.hc_mult * config.hidden_size, config.hc_mult, bias=False
+        )
+        self.hc_head_base = nn.Parameter([config.hc_mult])
+        self.hc_head_scale = nn.Parameter([1])
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        rope_config = dataclasses.replace(
+            config,
+            head_dim=config.qk_rope_head_dim,
+            rope_type="default",
+            rope_scaling=None,
+            original_max_position_embeddings=None,
+        )
+        self.rotary_emb = initialize_rope(rope_config)
+        self._dtype = config.dtype
+
+    def _hc_head(self, op: OpBuilder, states: ir.Value) -> ir.Value:
+        flat = op.Reshape(states, [0, 0, -1])
+        rms = op.Sqrt(op.Add(op.ReduceMean(op.Mul(flat, flat), [-1], keepdims=True), 1e-6))
+        mixes = op.Div(self.hc_head_fn(op, flat), rms)
+        weights = op.Add(
+            op.Sigmoid(op.Add(op.Mul(mixes, self.hc_head_scale), self.hc_head_base)),
+            self.hc_eps,
+        )
+        return op.ReduceSum(op.Mul(op.Unsqueeze(weights, [-1]), states), [2], keepdims=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        hidden_states: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_value: tuple | None = None,
+    ):
+        hidden_states = op.Add(
+            op.Unsqueeze(self.e_proj(op, self.enorm(op, inputs_embeds)), [2]),
+            self.h_proj(op, self.hnorm(op, hidden_states)),
+        )
+        position_embeddings = self.rotary_emb(op, position_ids)
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=inputs_embeds,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
+        hidden_states, present = super().forward(
+            op,
+            hidden_states,
+            None,
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+        )
+        return self.norm(op, self._hc_head(op, hidden_states)), present
 
 
 class DeepSeekV4CausalLMModel(CausalLMModel):
-    """DeepSeek-V4 Causal LM with dense HCA fallback and V4 MoE/HC blocks."""
+    """DeepSeek-V4 Causal LM with dense CSA fallback and an MTP sidecar."""
 
-    default_task: str = "text-generation"
+    default_task: str = "deepseek-v4"
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
         if any(config.compress_ratios or ()):
             logger.warning(
-                "DeepSeek-V4 compressed sparse attention is not implemented; "
-                "exporting the dense causal-attention preview backbone."
+                "DeepSeek-V4 sparse cache execution requires runtime support; "
+                "exporting sink-aware dense attention with CSA/HCA tensors retained."
             )
         self.config = config
         self.model = DeepSeekV4TextModel(config)
@@ -500,6 +785,31 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
             )
         else:
             self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.num_nextn_predict_layers not in (0, 1):
+            raise ValueError("DeepSeek-V4 MTP export supports exactly one MTP layer")
+        self.mtp = nn.ModuleList(
+            [
+                DeepSeekV4Mtp(config, config.num_hidden_layers + index)
+                for index in range(config.num_nextn_predict_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        hidden_states, presents, _ = self.model(
+            op,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        )
+        return self.lm_head(op, hidden_states), presents
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -508,14 +818,7 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         renamed: dict[str, torch.Tensor] = {}
         skipped = 0
         for key, value in state_dict.items():
-            if key.startswith("mtp.") or any(
-                marker in key
-                for marker in (
-                    ".compressor.",
-                    ".indexer.",
-                    ".attn.attn_sink",
-                )
-            ):
+            if key.startswith("mtp.") and len(self.mtp) == 0:
                 skipped += 1
                 continue
             new_key = key
@@ -533,6 +836,16 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 )
             elif new_key.startswith("layers."):
                 new_key = f"model.{new_key}"
+            elif new_key.startswith("mtp."):
+                try:
+                    mtp_index = int(new_key.split(".", 2)[1])
+                except (IndexError, ValueError):
+                    skipped += 1
+                    continue
+                if mtp_index >= len(self.mtp):
+                    skipped += 1
+                    continue
+            if new_key.startswith(("model.layers.", "mtp.")):
                 new_key = new_key.replace(".attn.wq_a.", ".self_attn.q_a_proj.")
                 new_key = new_key.replace(".attn.q_norm.", ".self_attn.q_a_layernorm.")
                 new_key = new_key.replace(".attn.wq_b.", ".self_attn.q_b_proj.")
@@ -540,6 +853,7 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 new_key = new_key.replace(".attn.kv_norm.", ".self_attn.kv_layernorm.")
                 new_key = new_key.replace(".attn.wo_a.", ".self_attn.o_a_proj.")
                 new_key = new_key.replace(".attn.wo_b.", ".self_attn.o_b_proj.")
+                new_key = new_key.replace(".attn.", ".self_attn.")
                 new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
                 new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
                 new_key = new_key.replace(".ffn.gate.", ".mlp.gate.")
@@ -553,8 +867,8 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
             renamed[new_key] = value
         if skipped:
             logger.warning(
-                "Skipped %d DeepSeek-V4 CSA/HCA/MTP tensors unsupported by "
-                "the dense preview backbone.",
+                "Skipped %d DeepSeek-V4 MTP tensors outside the configured "
+                "num_nextn_predict_layers.",
                 skipped,
             )
         return super().preprocess_weights(renamed)

@@ -666,7 +666,7 @@ def _load_quantized_state_dict(
     quantized_stems = set()
     quantized_embedding_stems = set()
     for mod_name, mod in module.named_modules():
-        if isinstance(mod, QuantizedLinear):
+        if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
             quantized_stems.add(mod_name)
         elif isinstance(mod, QuantizedEmbedding):
             quantized_embedding_stems.add(mod_name)

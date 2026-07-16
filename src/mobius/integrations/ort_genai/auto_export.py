@@ -719,7 +719,9 @@ def _write_genai_config(
         decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
-    decoder_filename = f"{decoder_key}/model.onnx" if decoder_key != "model" else "model.onnx"
+    decoder_filename = (
+        f"{decoder_key}/model.onnx" if len(pkg) > 1 or decoder_key != "model" else "model.onnx"
+    )
 
     # ORT GenAI's ``past_present_share_buffer`` mode requires the decoder
     # graph to write the KV cache in place. Only ``com.microsoft.
@@ -985,6 +987,34 @@ def write_ort_genai_config(
     )
 
     result: dict[str, str] = {"genai_config": genai_path}
+
+    if "mtp" in pkg:
+        mtp_model = pkg["mtp"]
+        mtp_path = os.path.join(directory, "mtp_config.json")
+        with open(mtp_path, "w") as f:
+            json.dump(
+                {
+                    "model": {"filename": "mtp/model.onnx"},
+                    "inputs": [
+                        value.name
+                        for value in mtp_model.graph.inputs
+                        if value.name is not None
+                    ],
+                    "outputs": [
+                        value.name
+                        for value in mtp_model.graph.outputs
+                        if value.name is not None
+                    ],
+                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
+                    "shared_embedding": "model.embed_tokens",
+                    "shared_lm_head": "lm_head",
+                    "runtime_orchestration": "external",
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        result["mtp_config"] = mtp_path
 
     # Copy tokenizer files — HF Hub takes precedence; local dir is the fallback
     # for --config mode where no HF model ID is available.

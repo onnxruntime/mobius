@@ -465,6 +465,7 @@ class ArchitectureConfig(BaseModelConfig):
     hc_eps: float = 1e-6
     num_hash_layers: int = 0
     swiglu_limit: float = 0.0
+    num_nextn_predict_layers: int = 0
 
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
@@ -868,6 +869,7 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
+            num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder

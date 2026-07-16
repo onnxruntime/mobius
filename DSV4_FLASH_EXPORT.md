@@ -34,11 +34,16 @@ into `DeepSeekMLA`.
 
 This increment exports the V4 projections, full Hyper-Connections, V4 MoE
 routing/shared experts, and KV-cache-compatible **dense causal attention**.
-The dense graph is a structurally valid fallback for short-context bring-up,
-but it is not numerically equivalent to CSA/HCA's learned compressed-history
-selection. Compression, indexer tensors, attention sinks, and MTP are
-explicitly skipped during weight preprocessing, so this support remains
-preview-quality until the sparse runtime path lands.
+The fallback includes the official per-head attention sinks. It follows the
+checkpoint's `compress_ratios` schedule and retains every learned compressor
+and ratio-4 indexer tensor in the ONNX graph, but does not yet execute
+compressed-history selection. The dense path is therefore correct as causal
+attention, while not numerically equivalent to CSA/HCA at long context.
+
+The official single MTP block is exported as `mtp/model.onnx`. It consumes the
+target's raw Hyper-Connection state plus the next-token embedding, runs the
+complete MTP block, and emits `mtp_hidden` for the target's shared LM head.
+`mtp_config.json` records this external orchestration contract.
 
 ## Quantization and follow-ups
 
@@ -51,8 +56,9 @@ MatMulNBits kernels.
 Follow-ups:
 
 1. Add runtime custom ops for compressed sparse attention/cache management
-   and expose them through mobius execution-provider capability config.
+   and replace the dense fallback while reusing the exported tensors.
 2. Add a packed sub-4-bit/MXFP4 expert custom op, or track the needed
    MatMulNBits functionality in ONNX Runtime and teach the GGUF repacker to
    preserve those tensors.
-3. Export the optional MTP head as a separate speculative-decoding component.
+3. Add iterative MTP cache/state orchestration to ORT GenAI; the exported
+   sidecar currently declares `runtime_orchestration: external`.

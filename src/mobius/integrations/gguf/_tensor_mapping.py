@@ -222,6 +222,23 @@ _DEEPSEEK4_MAPPING: dict[str, str] = {
     "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_layernorm",
     "blk.{bid}.attn_output_a": "model.layers.{bid}.self_attn.o_a_proj",
     "blk.{bid}.attn_output_b": "model.layers.{bid}.self_attn.o_b_proj",
+    "blk.{bid}.attn_sinks": "model.layers.{bid}.self_attn.attn_sink@",
+    "blk.{bid}.attn_compressor_kv": "model.layers.{bid}.self_attn.compressor.wkv",
+    "blk.{bid}.attn_compressor_gate": "model.layers.{bid}.self_attn.compressor.wgate",
+    "blk.{bid}.attn_compressor_ape": "model.layers.{bid}.self_attn.compressor.ape@",
+    "blk.{bid}.attn_compressor_norm": "model.layers.{bid}.self_attn.compressor.norm",
+    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
+    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
+    "blk.{bid}.indexer_compressor_kv": ("model.layers.{bid}.self_attn.indexer.compressor.wkv"),
+    "blk.{bid}.indexer_compressor_gate": (
+        "model.layers.{bid}.self_attn.indexer.compressor.wgate"
+    ),
+    "blk.{bid}.indexer_compressor_ape": (
+        "model.layers.{bid}.self_attn.indexer.compressor.ape@"
+    ),
+    "blk.{bid}.indexer_compressor_norm": (
+        "model.layers.{bid}.self_attn.indexer.compressor.norm"
+    ),
     "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
     "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
     "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",

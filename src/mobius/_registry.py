@@ -543,7 +543,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v2_moe": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
-    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel),
+    "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
@@ -1226,7 +1226,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2": "mla",
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
-    "deepseek_v4": "dense-hca-fallback+moe+hc",
+    "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",
