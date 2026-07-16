@@ -509,6 +509,22 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             "Use keep_quantized=False for dequantized import."
         )
 
+    native_counts = Counter(
+        {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
+    )
+    if native_counts:
+        asymmetric_types = {"Q2_K", "Q4_1", "Q4_K", "Q5_1", "Q5_K"}
+        is_sym = not any(
+            getattr(qtype, "name", None) in asymmetric_types
+            for qtype in counts
+            if qtype not in native_counts
+        )
+        logger.info(
+            "Native GGUF quant types present; using 4-bit/block-32 module "
+            "scaffolding for non-native quantized tensors",
+        )
+        return 4, 32, is_sym
+
     # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
     # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
     # The presence of Q4_K identifies the desired 4-bit MatMulNBits target;
@@ -525,21 +541,6 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             }
         )
         if not repackable_counts:
-            native_counts = Counter(
-                {
-                    qtype: count
-                    for qtype, count in counts.items()
-                    if _native_block_format(qtype)
-                }
-            )
-            if native_counts:
-                dominant = native_counts.most_common(1)[0][0]
-                logger.info(
-                    "Native GGUF quant type %s selected; using temporary "
-                    "4-bit/block-32 module scaffolding",
-                    dominant,
-                )
-                return 4, 32, True
             raise ValueError(
                 "No repackable quantized tensors found in GGUF file. "
                 "Use keep_quantized=False for dequantized import."

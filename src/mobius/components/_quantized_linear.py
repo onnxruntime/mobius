@@ -206,6 +206,7 @@ class BlockQuantizedLinear(nn.Module):
         self.bias = nn.Parameter([out_features]) if bias else None
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        op.builder.graph.opset_imports[_ONNX_GENAI_DOMAIN] = 1
         output_dtype = x.dtype
         activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
         inputs: list[ir.Value | None] = [activation, self.weight]

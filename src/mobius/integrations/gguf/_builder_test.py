@@ -21,7 +21,9 @@ def _write_quantized_gguf(
     intermediate_size: int = 128,
     vocab_size: int = 256,
     quantize_embedding: bool = False,
+    embedding_quantization: str | None = None,
     projection_quantization: str = "q4_0",
+    value_projection_quantization: str | None = None,
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
 ) -> None:
@@ -87,6 +89,28 @@ def _write_quantized_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q8_0)
 
+    def _add_q5_1(name: str, n_out: int, k_in: int) -> None:
+        """Write a Q5_1-quantized weight tensor."""
+        block_size = 32
+        block_bytes = 24  # 2B scale + 2B min + 4B high bits + 16B low nibbles
+        n_blocks = k_in // block_size
+        bytes_per_row = n_blocks * block_bytes
+        raw = np.zeros((n_out, bytes_per_row), dtype=np.uint8)
+        for row in range(n_out):
+            for b in range(n_blocks):
+                off = b * block_bytes
+                scale = np.random.uniform(0.01, 1.0)
+                minimum = np.random.uniform(-0.5, 0.5)
+                raw[row, off : off + 2] = np.array([scale], dtype=np.float16).view(np.uint8)
+                raw[row, off + 2 : off + 4] = np.array([minimum], dtype=np.float16).view(
+                    np.uint8
+                )
+                raw[row, off + 4 : off + 8] = np.random.randint(0, 256, size=4, dtype=np.uint8)
+                raw[row, off + 8 : off + 24] = np.random.randint(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q5_1)
+
     def _add_native(name: str, n_out: int, k_in: int, format_name: str) -> None:
         """Write deterministic native blocks with embedded scales."""
         qtype, block_elements, block_bytes = {
@@ -109,6 +133,8 @@ def _write_quantized_gguf(
 
     if quantize_embedding:
         _add_q4_0("token_embd.weight", vocab_size, hidden_size)
+    elif embedding_quantization == "q8_0":
+        _add_q8_0("token_embd.weight", vocab_size, hidden_size)
     else:
         _add_f32("token_embd.weight", (vocab_size, hidden_size))
 
@@ -118,8 +144,13 @@ def _write_quantized_gguf(
             "q8_0": _add_q8_0,
         }[projection_quantization]
     else:
+
         def add_projection(name: str, n_out: int, k_in: int) -> None:
             _add_native(name, n_out, k_in, projection_quantization)
+
+    add_value_projection = (
+        _add_q5_1 if value_projection_quantization == "q5_1" else add_projection
+    )
 
     for i in range(num_layers):
         add_projection(
@@ -132,7 +163,7 @@ def _write_quantized_gguf(
             num_kv_heads * head_dim,
             hidden_size,
         )
-        add_projection(
+        add_value_projection(
             f"blk.{i}.attn_v.weight",
             num_kv_heads * head_dim,
             hidden_size,
@@ -241,6 +272,22 @@ def native_block_gguf(tmp_path: Path, request) -> tuple[Path, str, int, int]:
     return path, format_name, block_elements, block_bytes
 
 
+@pytest.fixture
+def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
+    """Create native IQ projections with a Q5_1 value projection and Q8 embedding."""
+    path = tmp_path / "test_mixed_native_q5_q8.gguf"
+    _write_quantized_gguf(
+        path,
+        hidden_size=256,
+        num_kv_heads=4,
+        intermediate_size=256,
+        embedding_quantization="q8_0",
+        projection_quantization="iq4_xs",
+        value_projection_quantization="q5_1",
+    )
+    return path
+
+
 class TestBuildQuantizedGguf:
     """Tests for build_from_gguf(keep_quantized=True)."""
 
@@ -289,11 +336,39 @@ class TestBuildQuantizedGguf:
         assert weight.dtype == ir.DataType.UINT8
         n_blocks = (256 + block_elements - 1) // block_elements
         assert list(weight.shape) == [256, n_blocks, block_bytes]
-        expected = np.arange(
-            256 * n_blocks * block_bytes, dtype=np.uint8
-        ).reshape(256, n_blocks, block_bytes)
+        expected = np.arange(256 * n_blocks * block_bytes, dtype=np.uint8).reshape(
+            256, n_blocks, block_bytes
+        )
         np.testing.assert_array_equal(weight.const_value.numpy(), expected)
         assert "model.layers.0.self_attn.o_proj.scales" not in model.graph.initializers
+
+        assert model.graph.opset_imports["com.github.onnxruntime.genai"] == 1
+        proto = ir.serde.serialize_model(model)
+        imports = {opset.domain: opset.version for opset in proto.opset_import}
+        assert imports["com.github.onnxruntime.genai"] == 1
+
+    def test_mixed_native_quantization_uses_q4_scaffold(self, mixed_native_q5_q8_gguf: Path):
+        """Native IQ tensors force Q5_1 fallback weights onto a Q4 scaffold."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(mixed_native_q5_q8_gguf, keep_quantized=True)["model"]
+        native_nodes = [node for node in model.graph if node.op_type == "BlockQuantizedMatMul"]
+        assert len(native_nodes) == 6
+
+        value_nodes = [
+            node
+            for node in model.graph
+            if node.op_type == "MatMulNBits"
+            and node.inputs[1].name == "model.layers.0.self_attn.v_proj.weight"
+        ]
+        assert len(value_nodes) == 1
+        assert value_nodes[0].attributes["bits"].value == 4
+        assert value_nodes[0].attributes["block_size"].value == 32
+        assert "model.layers.0.self_attn.v_proj.zero_points" in model.graph.initializers
+
+        native_weight = model.graph.initializers["model.layers.0.self_attn.o_proj.weight"]
+        expected = np.arange(256 * 136, dtype=np.uint8).reshape(256, 1, 136)
+        np.testing.assert_array_equal(native_weight.const_value.numpy(), expected)
 
     def test_quantized_embedding_uses_gatherblockquantized(self, q4_0_embedding_gguf: Path):
         """A quantized GGUF embedding remains packed in the ONNX graph."""
