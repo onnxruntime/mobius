@@ -62,12 +62,14 @@ from mobius._passes import (
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     decompose_attention_pass,
+    decompose_rope_rules,
     gelu_fusion_rules,
     group_query_attention_rules,
     htp_rank4_rmsnorm_rules,
     pack_qkv_for_gqa_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
+    tensor_scatter_to_scatternd_rules,
     skip_norm_rules,
     static_empty_kv_rules,
     unpack_qkv_rules,
@@ -318,6 +320,18 @@ def _get_optimization_passes(
     # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
+
+    # Decompose the opset-24 RotaryEmbedding op into rotate-half primitives for
+    # EPs without a RotaryEmbedding kernel (QNN HTP), where the op falls to CPU.
+    if not caps.supports_rotary_embedding:
+        lower.append(("DecomposeRotaryEmbedding", list(decompose_rope_rules())))
+
+    # Rewrite the static-cache TensorScatter KV write into ScatterND for EPs
+    # without a TensorScatter kernel (QNN HTP), where it falls to CPU.
+    if not caps.supports_tensor_scatter:
+        lower.append(
+            ("TensorScatterToScatterND", list(tensor_scatter_to_scatternd_rules()))
+        )
 
     # Decompose the fused opset-24 Attention op into SDPA primitives for EPs
     # without an Attention kernel (QNN HTP), where the fused op falls to CPU.

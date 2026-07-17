@@ -77,6 +77,16 @@ class EpCapabilities:
             DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
             ``False`` only for runtimes without an ``Attention`` kernel (QNN
             HTP), where the fused op would otherwise be forced onto CPU.
+        supports_rotary_embedding: ``False`` decomposes the opset-24
+            ``RotaryEmbedding`` op into rotate-half primitives (Reshape/Slice/
+            Mul/Sub/Add/Concat) via DecomposeRotaryEmbedding.  ``True`` leaves
+            the fused op unchanged.  Set ``False`` only for runtimes without a
+            ``RotaryEmbedding`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_tensor_scatter: ``False`` rewrites the static-cache
+            ``TensorScatter`` in-place KV write into ``ScatterND`` (batch=1) via
+            TensorScatterToScatterND.  ``True`` leaves ``TensorScatter``
+            unchanged.  Set ``False`` only for runtimes without a
+            ``TensorScatter`` kernel (QNN HTP), where it is forced onto CPU.
         supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
             (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
@@ -134,6 +144,8 @@ class EpCapabilities:
     supports_rank4_rmsnorm: bool = True
     supports_attention: bool = True
     supports_matmul_nbits: bool = True
+    supports_rotary_embedding: bool = True
+    supports_tensor_scatter: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -359,6 +371,8 @@ def _register_builtins() -> None:
             supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
             supports_attention=False,  # no HTP Attention kernel — decompose to SDPA
             supports_matmul_nbits=False,  # no HTP MatMulNBits kernel — convert to QDQ
+            supports_rotary_embedding=False,  # no HTP RotaryEmbedding — rotate-half
+            supports_tensor_scatter=False,  # no HTP TensorScatter — ScatterND (batch=1)
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via

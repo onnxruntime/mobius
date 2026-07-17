@@ -5337,6 +5337,42 @@ class TestBuildStaticCacheGraph:
         op_types = {n.op_type for n in model.graph}
         assert "TensorScatter" in op_types
 
+    def test_gemma4_static_qnn_lowering_is_htp_friendly(self):
+        """The qnn build lowers all ops the QNN HTP backend cannot run.
+
+        RotaryEmbedding -> rotate-half, TensorScatter -> ScatterND, Tile ->
+        Expand, Range -> Constant, Attention -> SDPA are all HTP-unsupported and
+        must be gone; their HTP-friendly replacements must appear.
+        """
+        from mobius._builder import build_from_module
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=3,
+            layer_types=["sliding_attention", "full_attention", "sliding_attention"],
+            num_kv_shared_layers=1,
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        model = build_from_module(
+            module,
+            config,
+            CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN),
+            execution_provider="qnn",
+        )["model"]
+        op_types = {n.op_type for n in model.graph}
+        for forbidden in ("RotaryEmbedding", "TensorScatter", "Tile", "Range", "Attention"):
+            assert forbidden not in op_types, f"{forbidden} should be lowered for qnn"
+        assert "ScatterND" in op_types  # TensorScatter replacement
+        assert "Expand" in op_types  # Tile (GQA repeat) replacement
+
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)

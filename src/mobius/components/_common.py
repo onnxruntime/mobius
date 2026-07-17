@@ -335,22 +335,28 @@ def create_static_cache_attention_bias(
         Additive bias of shape ``(B, 1, S_q, max_seq_len)``: ``0`` where the
         query may attend the slot, ``dtype.min`` where masked.
     """
-    zero_scalar = op.Constant(value_int=0)
-    one_scalar = op.Constant(value_int=1)
+    # KV positions: dense cache slot ids 0 .. max_seq_len - 1 -> (max_seq_len,).
+    # Emitted as a constant (not Range) because max_seq_len is a concrete int
+    # and the QNN HTP backend has no Range kernel (Range forces the node onto
+    # CPU). q_offsets is then a Slice of this constant to length S_q — both
+    # Constant and Slice run on HTP.
+    kv_slots = op.Constant(
+        value=ir.tensor(np.arange(max_seq_len, dtype=np.int64))
+    )  # (max_seq_len,)
 
     # Q absolute positions: write_indices[b] + arange(S_q) -> (B, S_q, 1).
-    seq_scalar = op.Squeeze(seq_len, op.Constant(value_ints=[0]))
-    q_offsets = op.Range(zero_scalar, seq_scalar, one_scalar)  # (S_q,)
+    # arange(S_q) = kv_slots[:S_q] via Slice (avoids the CPU-only Range op).
+    q_offsets = op.Slice(
+        kv_slots,
+        op.Constant(value_ints=[0]),  # start
+        seq_len,  # end == [S_q]
+        op.Constant(value_ints=[0]),  # axis
+    )  # (S_q,)
     q_abs_2d = op.Add(
         op.Unsqueeze(write_indices, [1]),  # (B, 1)
         op.Unsqueeze(q_offsets, [0]),  # (1, S_q)
     )  # (B, S_q)
     q_abs = op.Unsqueeze(q_abs_2d, [2])  # (B, S_q, 1)
-
-    # KV positions: dense cache slot ids 0 .. max_seq_len - 1 -> (max_seq_len,).
-    kv_slots = op.Range(
-        zero_scalar, op.Constant(value_int=max_seq_len), one_scalar
-    )  # (max_seq_len,)
 
     # Causal: a query at absolute position q may attend slot k iff q >= k.
     # Broadcasting (B, S_q, 1) >= (max_seq_len,) -> (B, S_q, max_seq_len).

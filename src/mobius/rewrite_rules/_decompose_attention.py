@@ -131,13 +131,18 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     present_k, present_v = k_full, v_full
 
     # Group-query attention: replicate each KV head ``group`` times.
-    # (B, Nkv, S, H) -Unsqueeze-> (B, Nkv, 1, S, H) -Tile-> (B, Nkv, G, S, H)
+    # (B, Nkv, S, H) -Unsqueeze-> (B, Nkv, 1, S, H) -Expand-> (B, Nkv, G, S, H)
     # -Reshape-> (B, Nq, S, H). Target built from runtime S/H (no static head).
+    # NOTE: Expand (broadcast) is used instead of Tile because the QNN HTP
+    # backend has no Tile kernel (forces the node onto CPU); Expand with a
+    # size-G broadcast on the inserted axis produces the identical result and
+    # runs on HTP.
     def repeat_kv(x):
         if group == 1:
             return x
         x5 = tape.op("Unsqueeze", [x, c_ints([2])])
-        x5 = tape.op("Tile", [x5, c_ints([1, 1, group, 1, 1])])
+        # Broadcast the size-1 group axis to ``group`` via Expand.
+        x5 = tape.op("Expand", [x5, c_ints([1, 1, group, 1, 1])])
         shp = tape.op("Shape", [x])  # (4,) == [B, Nkv, S, H]
         batch = tape.op("Slice", [shp, c_ints([0]), c_ints([1])])
         s_h = tape.op("Slice", [shp, c_ints([2]), c_ints([4])])
