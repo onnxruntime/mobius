@@ -391,22 +391,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
-    if mmproj_path is not None:
-        print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
-        pkg = build_from_gguf(
-            gguf_path,
-            mmproj=mmproj_path,
-            dtype=args.dtype,
-            execution_provider=args.execution_provider,
-            keep_quantized=args.keep_quantized,
-        )
-    else:
-        pkg = build_from_gguf(
-            gguf_path,
-            dtype=args.dtype,
-            keep_quantized=args.keep_quantized,
-            execution_provider=args.execution_provider,
-        )
+    if args.max_seq_len is not None and not args.static_cache:
+        raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
+    if args.max_seq_len is not None and args.max_seq_len <= 0:
+        raise SystemExit("Error: --max-seq-len must be a positive integer.")
+    if mmproj_path is not None and args.static_cache:
+        raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+
+    pkg = build_from_gguf(
+        gguf_path,
+        mmproj=mmproj_path,
+        dtype=args.dtype,
+        keep_quantized=args.keep_quantized,
+        execution_provider=args.execution_provider,
+        static_cache=args.static_cache,
+        max_seq_len=args.max_seq_len,
+    )
 
     pkg.save(
         output_dir,
@@ -731,6 +731,26 @@ def main(argv: list[str] | None = None) -> None:
             "reconstructed from the GGUF's embedded tokenizer metadata; "
             "'ort-genai' writes genai_config.json + copies tokenizer files. "
             "Either way the quantized model runs directly in the target runtime."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--static-cache",
+        action="store_true",
+        help=(
+            "Use a static KV cache (pre-allocated fixed-width buffers written "
+            "in place via TensorScatter) instead of the dynamic concat-grow "
+            "cache. Produces a fully static-shaped graph as required by "
+            "fixed-shape runtimes such as the QNN HTP backend."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum sequence length for static cache buffers. Only used with "
+            "--static-cache. Defaults to max_position_embeddings from config."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)

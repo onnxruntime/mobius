@@ -380,6 +380,58 @@ class TestBuildQuantizedGguf:
         assert (bits, block_size, is_sym) == (4, 32, False)
 
 
+class TestBuildGgufStaticCache:
+    """Tests for build_from_gguf(static_cache=True).
+
+    Static cache mode replaces the dynamic concat-grow KV cache with
+    pre-allocated fixed-width buffers (written in place via TensorScatter),
+    producing a fully static-shaped graph required by fixed-shape runtimes
+    such as the QNN HTP backend. Llama uses the base ``DecoderLayer`` which
+    supports the StaticCacheState dispatch.
+    """
+
+    def test_static_cache_emits_fixed_width_cache_io(self, q4_0_gguf: Path):
+        """Static cache build exposes fixed-width key_cache/value_cache I/O."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        max_seq_len = 128
+        model = build_from_gguf(
+            q4_0_gguf, keep_quantized=True, static_cache=True, max_seq_len=max_seq_len
+        )["model"]
+
+        input_names = {i.name for i in model.graph.inputs}
+        # Static cache uses key_cache.N / value_cache.N inputs, not the
+        # dynamic past_key_values.N.key / .value pair.
+        assert any(n and n.startswith("key_cache.") for n in input_names), (
+            f"Expected key_cache.* inputs, got {sorted(input_names)}"
+        )
+        assert not any(n and n.startswith("past_key_values.") for n in input_names), (
+            f"Static cache must not emit past_key_values.* inputs, got {sorted(input_names)}"
+        )
+
+        # The KV axis of every cache buffer must be a concrete int == max_seq_len,
+        # i.e. fully static (no symbolic dims).
+        for inp in model.graph.inputs:
+            name = inp.name or ""
+            if name.startswith(("key_cache.", "value_cache.")):
+                assert inp.shape is not None
+                assert inp.shape[1] == max_seq_len, (
+                    f"{name} KV axis {inp.shape[1]!r} != max_seq_len {max_seq_len}"
+                )
+
+    def test_static_cache_rejects_explicit_task(self, q4_0_gguf: Path):
+        """static_cache=True with an explicit task override is a ValueError."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        with pytest.raises(ValueError, match="static_cache"):
+            build_from_gguf(
+                q4_0_gguf,
+                keep_quantized=True,
+                static_cache=True,
+                task="text-generation",
+            )
+
+
 class TestRawTensorIterator:
     """Tests for GGUFModel.tensor_items_raw()."""
 
