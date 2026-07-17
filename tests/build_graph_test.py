@@ -5274,6 +5274,69 @@ class TestBuildStaticCacheGraph:
         model, _ = self._build_static_cache_model()
         _assert_outputs_have_shapes_and_dtypes({"model": model}, "qwen2-static")
 
+    def _build_gemma4_static(self):
+        """Build gemma4_text with static cache: KV-sharing + dual head_dim."""
+        from mobius._configs import Gemma4Config
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(
+            _config_cls=Gemma4Config,
+            num_hidden_layers=6,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_kv_shared_layers=2,  # first_kv_shared = 4 -> layers 0..3 own a cache
+            sliding_window=8,
+            global_head_dim=2 * TINY_HEAD_DIM,
+            global_rope_theta=10_000.0,
+            rope_local_base_freq=10_000.0,
+            attn_qk_norm=True,
+            hidden_size_per_layer_input=0,
+        )
+        module = registry.get("gemma4_text")(config)
+        pkg = CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN).build(
+            module, config
+        )
+        return pkg["model"], config
+
+    def test_gemma4_static_cache_only_for_cache_owning_layers(self):
+        """Gemma4 KV-shared layers own no cache: 4 cache buffers, not 6."""
+        model, _ = self._build_gemma4_static()
+        input_names = {inp.name for inp in model.graph.inputs}
+        # first_kv_shared_layer_idx = 6 - 2 = 4 -> cache-owning layers 0..3
+        for i in range(4):
+            assert f"key_cache.{i}" in input_names
+            assert f"value_cache.{i}" in input_names
+        # No cache for the KV-shared layers (indices 4, 5).
+        assert "key_cache.4" not in input_names
+        assert "key_cache.5" not in input_names
+        output_names = {out.name for out in model.graph.outputs}
+        for i in range(4):
+            assert f"updated_key_cache.{i}" in output_names
+        assert "updated_key_cache.4" not in output_names
+
+    def test_gemma4_static_cache_dual_head_dim(self):
+        """Sliding (head_dim) and full (global_head_dim) cache buffers differ."""
+        model, _ = self._build_gemma4_static()
+        by_name = {inp.name: inp for inp in model.graph.inputs}
+        # num_kv_heads=TINY_KV_HEADS; sliding head_dim=TINY_HEAD_DIM,
+        # full head_dim=2*TINY_HEAD_DIM. Cache-owning layer 2 is full_attention.
+        sliding_kv = int(by_name["key_cache.0"].shape[2])  # layer 0 sliding
+        full_kv = int(by_name["key_cache.2"].shape[2])  # layer 2 full
+        assert sliding_kv == TINY_KV_HEADS * TINY_HEAD_DIM
+        assert full_kv == TINY_KV_HEADS * (2 * TINY_HEAD_DIM)
+
+    def test_gemma4_static_cache_has_tensorscatter(self):
+        """Gemma4 static cache uses TensorScatter for in-place KV writes."""
+        model, _ = self._build_gemma4_static()
+        op_types = {n.op_type for n in model.graph}
+        assert "TensorScatter" in op_types
+
 
 # === Parametrized Vision-Language configs (imported from _test_configs) ===
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
