@@ -71,6 +71,17 @@ class EpCapabilities:
             (query/key norm over the head dimension) to rank-3 and back via
             HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
+        supports_attention: ``False`` decomposes the fused opset-24
+            ``Attention`` op into scaled-dot-product primitives
+            (Reshape/Transpose/MatMul/Softmax/Add, plus Tile for GQA) via
+            DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
+            ``False`` only for runtimes without an ``Attention`` kernel (QNN
+            HTP), where the fused op would otherwise be forced onto CPU.
+        supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
+            (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
+            ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
+            contrib op unchanged.  Set ``False`` only for runtimes that lack a
+            ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -121,6 +132,8 @@ class EpCapabilities:
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
+    supports_attention: bool = True
+    supports_matmul_nbits: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -344,6 +357,8 @@ def _register_builtins() -> None:
             },
             supports_past_present_share_buffer=False,  # standard-Attention KV concat
             supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
+            supports_attention=False,  # no HTP Attention kernel — decompose to SDPA
+            supports_matmul_nbits=False,  # no HTP MatMulNBits kernel — convert to QDQ
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via

@@ -61,6 +61,7 @@ from mobius._passes import (
 )
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
+    decompose_attention_pass,
     gelu_fusion_rules,
     group_query_attention_rules,
     htp_rank4_rmsnorm_rules,
@@ -318,6 +319,19 @@ def _get_optimization_passes(
     if not caps.supports_rank4_rmsnorm:
         lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
 
+    # Decompose the fused opset-24 Attention op into SDPA primitives for EPs
+    # without an Attention kernel (QNN HTP), where the fused op falls to CPU.
+    # An IR pass (not a rewrite rule) so it can rewire the op's 3 outputs, whose
+    # KV-cache present tensors are graph outputs on some layers and dead on
+    # shared-KV layers. Runs after the batched rewrite rules (lower_ir_passes).
+    if not caps.supports_attention:
+        lower.append(("DecomposeAttention", decompose_attention_pass()))
+
+    # NOTE: MatMulNBits → QDQ lowering is handled by the InlinePass mechanism
+    # (a registered com.microsoft::MatMulNBits function body), not a rewrite
+    # rule — see optimize_model()'s _should_inline and mobius.functions. It is
+    # gated by ``supports_matmul_nbits`` there.
+
     # --- Graph-capture rewrite ---
     # Supports graph capture for shared-KV layer models on WebGPU EP
     # (currently Gemma4). Pattern-based: only fires on models that emit the
@@ -419,6 +433,12 @@ def optimize_model(
             return not caps.supports_skip_layer_norm
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
+        # MatMulNBits (blockwise-INT4) → QDQ (DequantizeLinear + MatMul) for EPs
+        # without a MatMulNBits kernel (QNN HTP). Supported EPs (CPU/CUDA/…) keep
+        # the compact contrib op and its native kernel; the function body stays
+        # registered but uninlined (kernels take precedence over local functions).
+        if func.domain == "com.microsoft" and func.name == "MatMulNBits":
+            return not caps.supports_matmul_nbits
         return False
 
     inline_pass = common_passes.InlinePass(criteria=_should_inline)

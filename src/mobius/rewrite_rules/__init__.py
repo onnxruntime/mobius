@@ -30,6 +30,7 @@ Example::
 
 __all__ = [
     "bias_gelu_rules",
+    "decompose_attention_pass",
     "gelu_fusion_rules",
     "group_query_attention_rules",
     "htp_rank4_rmsnorm_rules",
@@ -44,6 +45,7 @@ __all__ = [
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
+from mobius.rewrite_rules._decompose_attention import decompose_attention_pass
 from mobius.rewrite_rules._gelu_fusion import gelu_fusion_rules
 from mobius.rewrite_rules._group_query_attention import (
     group_query_attention_rules,
