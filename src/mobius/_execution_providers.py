@@ -87,6 +87,12 @@ class EpCapabilities:
             TensorScatterToScatterND.  ``True`` leaves ``TensorScatter``
             unchanged.  Set ``False`` only for runtimes without a
             ``TensorScatter`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_range: ``False`` replaces the ONNX ``Range`` op in
+            :func:`~mobius.components.create_static_cache_attention_bias` with a
+            precomputed ``Constant(arange)`` + ``Slice``.  ``True`` (the
+            default) leaves ``Range`` unchanged.  Set ``False`` only when
+            static cache is used on runtimes that lack a ``Range`` kernel (QNN
+            HTP), where the ``Range`` node would otherwise be forced onto CPU.
         supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
             (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
@@ -146,6 +152,7 @@ class EpCapabilities:
     supports_matmul_nbits: bool = True
     supports_rotary_embedding: bool = True
     supports_tensor_scatter: bool = True
+    supports_range: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -373,6 +380,7 @@ def _register_builtins() -> None:
             supports_matmul_nbits=False,  # no HTP MatMulNBits kernel — convert to QDQ
             supports_rotary_embedding=False,  # no HTP RotaryEmbedding — rotate-half
             supports_tensor_scatter=False,  # no HTP TensorScatter — ScatterND (batch=1)
+            supports_range=False,  # no HTP Range — Constant(arange)+Slice in static bias
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
