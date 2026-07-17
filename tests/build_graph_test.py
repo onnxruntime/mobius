@@ -5576,3 +5576,185 @@ class TestResolveSlidingWindow:
             self._cfg(model_type="mistral", sliding_window=4096), "mistral"
         )
         assert cfg.sliding_window == 4096
+
+
+class TestBuildGraphParakeetMultiTalker:
+    """Verify streaming multi-talker Parakeet RNN-T builds 3 graphs."""
+
+    def _config(self):
+        from mobius.models.parakeet_multitalker import ParakeetMultiTalkerConfig
+
+        # Tiny config: reduced widths/layers, structure identical to the real
+        # NVIDIA multitalker-parakeet-streaming-0.6b-v1 model.
+        return ParakeetMultiTalkerConfig(
+            feat_in=32,
+            d_model=32,
+            num_layers=2,
+            num_heads=4,
+            ff_expansion=2,
+            conv_kernel=9,
+            subsampling_conv_channels=16,
+            subsampling_factor=8,
+            att_left_context=8,
+            att_right_context=3,
+            pred_hidden=16,
+            pred_rnn_layers=2,
+            joint_hidden=16,
+            vocab_size=20,
+        )
+
+    @staticmethod
+    def _sub_len(mel_len: int) -> int:
+        # Three causal stride-2 stages (floor(L/2)+1) then drop 2 pre-encoded.
+        length = mel_len
+        for _ in range(3):
+            length = length // 2 + 1
+        return length - 2
+
+    def _build(self):
+        from mobius.models.parakeet_multitalker import ParakeetMultiTalkerModel
+
+        config = self._config()
+        module = ParakeetMultiTalkerModel(config)
+        pkg = build_from_module(module, config, task="multitalker-rnnt")
+        return config, pkg
+
+    def test_package_builds(self):
+        """Build and verify the encoder / decoder / joint components exist."""
+        _config, pkg = self._build()
+        assert set(pkg.keys()) == {"encoder", "decoder", "joint"}
+
+    def test_encoder_io(self):
+        """Verify streaming encoder input/output names."""
+        _config, pkg = self._build()
+        model = pkg["encoder"]
+        input_names = {inp.name for inp in model.graph.inputs}
+        assert {
+            "audio_signal",
+            "length",
+            "cache_last_channel",
+            "cache_last_time",
+            "cache_last_channel_len",
+            "spk_mask",
+            "bg_mask",
+        } <= input_names
+        output_names = {o.name for o in model.graph.outputs}
+        assert output_names == {
+            "outputs",
+            "encoded_lengths",
+            "cache_last_channel_next",
+            "cache_last_time_next",
+            "cache_last_channel_len_next",
+        }
+
+    def test_task_registry_lookup(self):
+        """Verify the 'multitalker-rnnt' task resolves to MultiTalkerRNNTTask."""
+        from mobius.tasks import MultiTalkerRNNTTask, get_task
+
+        assert isinstance(get_task("multitalker-rnnt"), MultiTalkerRNNTTask)
+
+    def test_runs_with_random_weights(self):
+        """Fill random weights and run all 3 graphs through ORT."""
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        config, pkg = self._build()
+
+        def _fill(model):
+            for init in model.graph.initializers.values():
+                if init.const_value is not None:
+                    continue
+                shape = [d if isinstance(d, int) else 1 for d in init.shape]
+                arr = (np.random.randn(*shape) * 0.05).astype(np.float32)
+                init.const_value = ir.tensor(arr, name=init.name)
+
+        def _sess(model, tmp, name):
+            _fill(model)
+            path = os.path.join(tmp, f"{name}.onnx")
+            ir.save(model, path, external_data=f"{name}.onnx.data")
+            return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+        d = config.d_model
+        n_layers = config.num_layers
+        cache_c = config.last_channel_cache_size
+        cache_t = config.conv_cache_size
+        h = config.pred_hidden
+        pl = config.pred_rnn_layers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # --- Encoder ---
+            enc = _sess(pkg["encoder"], tmp, "encoder")
+            t_mel = 32
+            enc_time = self._sub_len(t_mel)
+            enc_out = enc.run(
+                None,
+                {
+                    "audio_signal": np.random.randn(1, t_mel, config.feat_in).astype(
+                        np.float32
+                    ),
+                    "length": np.array([t_mel], dtype=np.int64),
+                    "cache_last_channel": np.random.randn(
+                        1, n_layers, cache_c, d
+                    ).astype(np.float32)
+                    * 0.05,
+                    "cache_last_time": np.random.randn(1, n_layers, d, cache_t).astype(
+                        np.float32
+                    )
+                    * 0.05,
+                    "cache_last_channel_len": np.array([0], dtype=np.int64),
+                    "spk_mask": np.ones((1, enc_time), dtype=np.float32),
+                    "bg_mask": np.zeros((1, enc_time), dtype=np.float32),
+                },
+            )
+            names = [o.name for o in enc.get_outputs()]
+            res = dict(zip(names, enc_out))
+            assert res["outputs"].shape == (1, enc_time, d)
+            assert int(res["encoded_lengths"][0]) == enc_time
+            assert res["cache_last_channel_next"].shape == (1, n_layers, cache_c, d)
+            assert res["cache_last_time_next"].shape == (1, n_layers, d, cache_t)
+
+            # --- Decoder ---
+            dec = _sess(pkg["decoder"], tmp, "decoder")
+            u = 4
+            dnames = [o.name for o in dec.get_outputs()]
+            dout = dict(
+                zip(
+                    dnames,
+                    dec.run(
+                        None,
+                        {
+                            "targets": np.array(
+                                [[1, 3, 5, 2]], dtype=np.int64
+                            ),
+                            "h_in": np.zeros((pl, 1, h), np.float32),
+                            "c_in": np.zeros((pl, 1, h), np.float32),
+                        },
+                    ),
+                )
+            )
+            assert dout["decoder_output"].shape == (1, h, u)
+            assert dout["h_out"].shape == (pl, 1, h)
+            assert dout["c_out"].shape == (pl, 1, h)
+
+            # --- Joint ---
+            jt = _sess(pkg["joint"], tmp, "joint")
+            jnames = [o.name for o in jt.get_outputs()]
+            jout = dict(
+                zip(
+                    jnames,
+                    jt.run(
+                        None,
+                        {
+                            "encoder_output": np.random.randn(1, enc_time, d).astype(
+                                np.float32
+                            ),
+                            "decoder_output": np.random.randn(1, u, h).astype(
+                                np.float32
+                            ),
+                        },
+                    ),
+                )
+            )
+            assert jout["joint_output"].shape == (1, enc_time, u, config.vocab_size)
