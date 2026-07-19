@@ -77,12 +77,15 @@ class SchedulerConfig:
         """
         raw_name = str(config.get("_class_name", ""))
         name = raw_name.lower()
-        if "ancestral" in name or "sde" in name:
+        if "eulerancestral" in name:
+            kind = "euler_ancestral"
+        elif "ancestral" in name or "sde" in name:
             raise ValueError(
                 f"onnx-genai has no equivalent for the stochastic diffusers scheduler "
-                f"{raw_name!r}; supported: DDIMScheduler, EulerDiscreteScheduler"
+                f"{raw_name!r}; supported: DDIMScheduler, EulerDiscreteScheduler, "
+                f"EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler"
             )
-        if not name or "ddim" in name:
+        elif not name or "ddim" in name:
             kind = "ddim"
         elif "dpmsolvermultistep" in name or "dpm++" in name or "dpmpp" in name:
             kind = "dpmpp_2m"

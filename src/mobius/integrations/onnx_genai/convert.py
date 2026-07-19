@@ -101,6 +101,10 @@ def _diffusers_timesteps(
                 "interpolation_type": "linear",
                 "use_karras_sigmas": use_karras,
             }
+        elif kind == "euler_ancestral":
+            from diffusers import EulerAncestralDiscreteScheduler as _Sched
+
+            extra = {"timestep_spacing": "linspace"}
         elif kind == "dpmpp_2m":
             from diffusers import DPMSolverMultistepScheduler as _Sched
 
@@ -153,10 +157,11 @@ def convert_comfyui_workflow(
     wf = parse_comfyui_workflow(workflow)
     os.makedirs(output_dir, exist_ok=True)
     use_karras = wf.scheduler_spacing == "karras"
-    # Fractional inference timesteps (Euler always; any Karras schedule) need a
-    # float32 denoiser timestep to avoid truncation before the time embedding;
-    # DPM++/DDIM linspace timesteps are integer and fine as int64.
-    timestep_dtype = "float32" if (wf.scheduler_kind == "euler" or use_karras) else "int64"
+    # Fractional inference timesteps (Euler/Euler-ancestral always; any Karras
+    # schedule) need a float32 denoiser timestep to avoid truncation before the
+    # time embedding; DPM++/DDIM linspace timesteps are integer and fine as int64.
+    fractional = wf.scheduler_kind in ("euler", "euler_ancestral") or use_karras
+    timestep_dtype = "float32" if fractional else "int64"
     exported = export_checkpoint(
         checkpoint_source,
         output_dir,

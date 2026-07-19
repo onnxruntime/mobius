@@ -60,6 +60,7 @@ _LATENT_NODES = ("EmptyLatentImage", "EmptySD3LatentImage")
 # rejected until onnx-genai grows an equivalent scheduler.
 _SAMPLER_KIND = {
     "euler": "euler",
+    "euler_ancestral": "euler_ancestral",
     "ddim": "ddim",
     "dpmpp_2m": "dpmpp_2m",
     "dpm_2m": "dpmpp_2m",

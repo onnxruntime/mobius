@@ -106,9 +106,14 @@ class TestBuildDiffusionPipelineMetadata:
     def test_scheduler_defaults_to_ddim_when_class_absent(self):
         assert SchedulerConfig.from_diffusers({}).kind == "ddim"
 
+    def test_scheduler_maps_euler_ancestral(self):
+        sched = SchedulerConfig.from_diffusers({"_class_name": "EulerAncestralDiscreteScheduler"})
+        assert sched.kind == "euler_ancestral"
+
     def test_scheduler_rejects_ancestral(self):
+        # Other ancestral / SDE samplers have no onnx-genai equivalent yet.
         with pytest.raises(ValueError, match="stochastic"):
-            SchedulerConfig.from_diffusers({"_class_name": "EulerAncestralDiscreteScheduler"})
+            SchedulerConfig.from_diffusers({"_class_name": "DPMSolverSDEScheduler"})
 
     def test_scheduler_rejects_unsupported_class(self):
         with pytest.raises(ValueError, match="unsupported"):

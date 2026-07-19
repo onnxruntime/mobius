@@ -103,6 +103,13 @@ def test_dpmpp_2m_sampler_maps_to_dpmpp_2m():
     assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "dpmpp_2m"
 
 
+def test_euler_ancestral_sampler_maps():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["3"]["inputs"]["sampler_name"] = "euler_ancestral"
+    meta = translate_comfyui_workflow(wf)
+    assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler_ancestral"
+
+
 def test_karras_scheduler_enables_karras_sigmas():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["sampler_name"] = "dpmpp_2m"
