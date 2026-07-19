@@ -200,6 +200,8 @@ def convert_comfyui_workflow(
         "latent_channels": exported.in_channels,
         "cross_attention_dim": exported.cross_attention_dim,
         "model_max_length": exported.model_max_length,
+        "sdxl": exported.sdxl,
+        "pooled_dim": exported.pooled_dim,
     }
     run_params_path = os.path.join(output_dir, "run.json")
     with open(run_params_path, "w", encoding="utf-8") as handle:
