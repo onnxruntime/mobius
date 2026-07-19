@@ -164,9 +164,12 @@ def export_checkpoint(
 
     pooled_dim = 0
     cond_channels = 0
-    if controlnet:
-        if sdxl:
-            raise ValueError("SDXL + ControlNet combined export is not yet supported")
+    if controlnet and sdxl:
+        pooled_dim, cond_channels = _export_sdxl_controlnet(
+            pipe, controlnet, output_dir, latent0, timestep_arg, latent_h, latent_w, max_len,
+            opset, components, text_file, denoiser_file,
+        )
+    elif controlnet:
         cond_channels = _export_sd_controlnet(
             text_encoder, unet, controlnet, output_dir, latent0, timestep_arg, latent_h, latent_w,
             max_len, opset, components, text_file, denoiser_file,
@@ -329,6 +332,73 @@ def _export_sd_controlnet(
             opset_version=opset, dynamo=False,
         )
     return cond_channels
+
+
+def _export_sdxl_controlnet(
+    pipe, controlnet_source, output_dir, latent0, timestep_arg, latent_h, latent_w, max_len,
+    opset, components, text_file, denoiser_file,
+) -> tuple[int, int]:
+    """Export SDXL + ControlNet: the SDXL dual text encoder and a fused
+    ControlNet+SDXL-UNet denoiser (sample/timestep/encoder_hidden_states/text_embeds/
+    time_ids/controlnet_cond). Returns (pooled_dim, conditioning_channels)."""
+    import torch
+    from diffusers import ControlNetModel
+
+    unet = pipe.unet.eval()
+    # Reuse the SDXL dual-encoder export (also gives pooled_dim) and the encoder
+    # dummy tensors for the denoiser trace.
+    pooled_dim = _export_sdxl(
+        pipe, output_dir, latent0, timestep_arg, max_len, opset,
+        tuple(c for c in components if c == "text_encoder"), text_file, "__unused__.onnx",
+    )
+    te1, te2, tok2 = pipe.text_encoder.eval(), pipe.text_encoder_2.eval(), pipe.tokenizer_2
+    ids1 = torch.ones(1, max_len, dtype=torch.long)
+    ids2 = torch.ones(1, int(tok2.model_max_length), dtype=torch.long)
+    with torch.no_grad():
+        o1 = te1(ids1, output_hidden_states=True)
+        o2 = te2(ids2, output_hidden_states=True)
+        enc = torch.cat([o1.hidden_states[-2], o2.hidden_states[-2]], dim=-1)
+        pooled = o2[0]
+    time_ids = torch.zeros(1, 6, dtype=torch.float32)
+
+    if controlnet_source == "__from_unet__":
+        controlnet = ControlNetModel.from_unet(unet).eval()
+    elif os.path.isfile(controlnet_source):
+        controlnet = ControlNetModel.from_single_file(controlnet_source).eval()
+    else:
+        controlnet = ControlNetModel.from_pretrained(controlnet_source).eval()
+    cond_channels = int(getattr(controlnet.config, "conditioning_channels", 3))
+    cond_img = torch.zeros(1, cond_channels, latent_h * 8, latent_w * 8)
+
+    class _SdxlCtrlUNetWrap(torch.nn.Module):
+        def __init__(self, u, c):
+            super().__init__()
+            self.u, self.c = u, c
+
+        def forward(self, sample, timestep, encoder_hidden_states, text_embeds, time_ids, controlnet_cond):
+            added = {"text_embeds": text_embeds, "time_ids": time_ids}
+            down, mid = self.c(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                               added_cond_kwargs=added, controlnet_cond=controlnet_cond,
+                               return_dict=False)
+            return self.u(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                          added_cond_kwargs=added, down_block_additional_residuals=down,
+                          mid_block_additional_residual=mid).sample
+
+    if "denoiser" in components:
+        _LOGGER.info("exporting fused SDXL ControlNet+UNet denoiser -> %s", denoiser_file)
+        torch.onnx.export(
+            _SdxlCtrlUNetWrap(unet, controlnet),
+            (latent0, timestep_arg, enc, pooled, time_ids, cond_img),
+            os.path.join(output_dir, denoiser_file),
+            input_names=["sample", "timestep", "encoder_hidden_states", "text_embeds", "time_ids",
+                         "controlnet_cond"],
+            output_names=["noise_pred"],
+            dynamic_axes={"sample": {0: "batch", 2: "height", 3: "width"},
+                          "encoder_hidden_states": {0: "batch", 1: "sequence"},
+                          "controlnet_cond": {0: "batch", 2: "height", 3: "width"}},
+            opset_version=opset, dynamo=False,
+        )
+    return pooled_dim, cond_channels
 
 
 def _export_sdxl(
