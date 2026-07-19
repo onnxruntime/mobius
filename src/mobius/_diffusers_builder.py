@@ -186,11 +186,40 @@ def _load_diffusers_component_config(model_id: str, component_name: str) -> dict
         return json.load(f)
 
 
+def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
+    """Load each UNet LoRA ``.safetensors`` and return the baked-adapter specs +
+    the merged remapped weights.
+
+    ``unet_loras`` maps ``adapter_name -> safetensors path``. The rank is inferred
+    from each adapter's ``lora_A`` factor (``[rank, in]``); the baked scale is
+    ``1.0`` because the runtime ``lora_gate.{name}`` input supplies the effective
+    strength (0 = off, 1 = on, or a blend). Returns
+    ``(((name, rank, 1.0), ...), merged_state_dict)``.
+    """
+    from mobius.models.unet import load_unet_lora_safetensors
+
+    adapters = []
+    merged: dict = {}
+    for name, path in unet_loras.items():
+        remapped = load_unet_lora_safetensors(path, name)
+        rank = None
+        for key, value in remapped.items():
+            if f".lora_A.{name}.weight" in key:
+                rank = int(value.shape[0])
+                break
+        if rank is None:
+            raise ValueError(f"no lora_A weights found for adapter {name!r} in {path}")
+        adapters.append((name, rank, 1.0))
+        merged.update(remapped)
+    return tuple(adapters), merged
+
+
 def build_diffusers_pipeline(
     model_id: str,
     *,
     dtype: str | ir.DataType | None = None,
     load_weights: bool = True,
+    unet_loras: dict | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
 
@@ -205,6 +234,11 @@ def build_diffusers_pipeline(
         model_id: HuggingFace model repository ID for a diffusers pipeline.
         dtype: Override the model dtype.
         load_weights: Whether to download and apply weights.
+        unet_loras: Optional ``{adapter_name: lora.safetensors}`` map. Each LoRA
+            is baked into the UNet denoiser as a runtime-gated adapter (rank
+            inferred from the file); at inference a ``lora_gate.{name}`` scalar
+            input switches/blends it. Requires ``load_weights=True`` to apply the
+            adapter weights.
 
     Returns:
         A :class:`ModelPackage` containing the built component model(s).
@@ -257,6 +291,15 @@ def build_diffusers_pipeline(
 
             config = dataclasses.replace(config, dtype=dtype)
 
+        # Runtime LoRA: bake the requested adapters into the UNet denoiser and
+        # merge their (remapped) weights alongside the base weights.
+        lora_weights: dict = {}
+        if unet_loras and task_name == "denoising" and hasattr(config, "lora_adapters"):
+            import dataclasses
+
+            adapters, lora_weights = _prepare_unet_loras(unet_loras)
+            config = dataclasses.replace(config, lora_adapters=adapters)
+
         model_module = module_class(config)
 
         sub_pkg = build_from_module(model_module, config, task_name)
@@ -274,6 +317,8 @@ def build_diffusers_pipeline(
             state_dict = _download_diffusers_component_weights(model_id, component_name)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
+            if lora_weights:
+                state_dict = {**state_dict, **lora_weights}
             for model in sub_pkg.values():
                 apply_weights(model, state_dict)
 

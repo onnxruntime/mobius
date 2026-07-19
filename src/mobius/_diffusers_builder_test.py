@@ -504,3 +504,29 @@ class TestBuildDiffusersPipelineWeights:
         # apply_weights should receive the processed weights
         call_args = mock_apply_weights.call_args
         assert call_args[0][1] is processed_weights
+
+
+def test_prepare_unet_loras_infers_rank_and_merges(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from mobius._diffusers_builder import _prepare_unet_loras
+
+    path = tmp_path / "style.safetensors"
+    save_file(
+        {
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": torch.zeros(
+                8, 32
+            ),
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight": torch.zeros(
+                32, 8
+            ),
+        },
+        str(path),
+    )
+    adapters, merged = _prepare_unet_loras({"style": str(path)})
+    assert adapters == (("style", 8, 1.0),)  # rank inferred from lora_A [rank, in]
+    assert set(merged) == {
+        "down_blocks.0.attentions.0.attn1.to_q.lora_A.style.weight",
+        "down_blocks.0.attentions.0.attn1.to_q.lora_B.style.weight",
+    }
