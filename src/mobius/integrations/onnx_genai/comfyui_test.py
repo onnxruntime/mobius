@@ -103,6 +103,20 @@ def test_dpmpp_2m_sampler_maps_to_dpmpp_2m():
     assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "dpmpp_2m"
 
 
+def test_karras_scheduler_enables_karras_sigmas():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["3"]["inputs"]["sampler_name"] = "dpmpp_2m"
+    wf["3"]["inputs"]["scheduler"] = "karras"
+    parsed = parse_comfyui_workflow(wf)
+    assert parsed.scheduler_spacing == "karras"
+    assert parsed.metadata["pipeline"]["strategy"]["scheduler_config"]["use_karras_sigmas"] is True
+
+
+def test_normal_scheduler_omits_karras_sigmas():
+    meta = translate_comfyui_workflow(_DEFAULT_TXT2IMG)
+    assert "use_karras_sigmas" not in meta["pipeline"]["strategy"]["scheduler_config"]
+
+
 def test_cfg_one_disables_guidance():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["cfg"] = 1.0

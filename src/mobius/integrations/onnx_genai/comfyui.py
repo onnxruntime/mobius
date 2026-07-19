@@ -65,9 +65,9 @@ _SAMPLER_KIND = {
     "dpm_2m": "dpmpp_2m",
 }
 
-# Sigma spacings onnx-genai's Euler currently reproduces (linspace). Others
-# (karras / exponential) change the schedule and are warned about.
-_SUPPORTED_SPACINGS = {"normal", "simple", "ddim_uniform"}
+# ComfyUI sigma spacings onnx-genai reproduces. "normal"/"simple"/"ddim_uniform"
+# map to linspace; "karras" enables the Karras schedule; others are warned about.
+_SUPPORTED_SPACINGS = {"normal", "simple", "ddim_uniform", "karras"}
 
 _MAX_TRACE_DEPTH = 16
 
@@ -240,7 +240,7 @@ def parse_comfyui_workflow(
     )
     guidance = cfg if cfg != 1.0 else None
 
-    sched = scheduler or SchedulerConfig(kind=kind)
+    sched = scheduler or SchedulerConfig(kind=kind, use_karras_sigmas=(spacing == "karras"))
     if sched.kind != kind:
         _LOGGER.warning(
             "overriding sampler-derived scheduler kind %r with %r from the supplied config",

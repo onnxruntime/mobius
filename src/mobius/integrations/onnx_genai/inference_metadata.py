@@ -44,9 +44,10 @@ class SchedulerConfig:
     beta_end: float = 0.012
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
+    use_karras_sigmas: bool = False
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        meta = {
             "kind": self.kind,
             "num_train_timesteps": self.num_train_timesteps,
             "beta_start": self.beta_start,
@@ -54,6 +55,9 @@ class SchedulerConfig:
             "beta_schedule": self.beta_schedule,
             "prediction_type": self.prediction_type,
         }
+        if self.use_karras_sigmas:
+            meta["use_karras_sigmas"] = True
+        return meta
 
     @classmethod
     def from_diffusers(cls, config: dict[str, Any]) -> "SchedulerConfig":
@@ -96,6 +100,7 @@ class SchedulerConfig:
             beta_end=float(config.get("beta_end", 0.012)),
             beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
             prediction_type=str(config.get("prediction_type", "epsilon")),
+            use_karras_sigmas=bool(config.get("use_karras_sigmas", False)),
         )
 
 
