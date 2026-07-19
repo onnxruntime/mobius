@@ -65,7 +65,7 @@ class TestBuildDiffusionPipelineMetadata:
             "from": "text_encoder.last_hidden_state",
             "to": "denoiser.encoder_hidden_states",
         } in pipe["dataflow"]
-        assert {"from": "denoiser.sample", "to": "vae.latent_sample"} in pipe["dataflow"]
+        assert {"from": "denoiser.sample", "to": "vae.latent"} in pipe["dataflow"]
         assert pipe["phases"]["text_encoder"] == {"run_on": "prompt_only"}
         assert pipe["phases"]["vae"] == {"run_on": "final_only"}
         # CFG enabled -> conditioning input declared for the unconditional pass.

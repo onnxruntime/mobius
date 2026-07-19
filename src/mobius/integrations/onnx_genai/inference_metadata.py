@@ -38,6 +38,7 @@ class SchedulerConfig:
     num_train_timesteps: int = 1000
     beta_start: float = 0.00085
     beta_end: float = 0.012
+    beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
 
     def to_metadata(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class SchedulerConfig:
             "num_train_timesteps": self.num_train_timesteps,
             "beta_start": self.beta_start,
             "beta_end": self.beta_end,
+            "beta_schedule": self.beta_schedule,
             "prediction_type": self.prediction_type,
         }
 
@@ -53,9 +55,9 @@ class SchedulerConfig:
     def from_diffusers(cls, config: dict[str, Any]) -> "SchedulerConfig":
         """Build from a diffusers ``scheduler/scheduler_config.json`` dict.
 
-        Unknown/absent fields fall back to the DDIM defaults. Only the schedule
-        parameters onnx-genai consumes are read; the diffusers scheduler class
-        name is mapped to ``kind`` where recognized (currently DDIM).
+        Unknown/absent fields fall back to the (Stable Diffusion) defaults. Only
+        the schedule parameters onnx-genai consumes are read; the diffusers
+        scheduler class name is mapped to ``kind`` where recognized (DDIM).
         """
         name = str(config.get("_class_name", "")).lower()
         kind = "ddim" if "ddim" in name or not name else "ddim"
@@ -64,6 +66,7 @@ class SchedulerConfig:
             num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
             beta_start=float(config.get("beta_start", 0.00085)),
             beta_end=float(config.get("beta_end", 0.012)),
+            beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
             prediction_type=str(config.get("prediction_type", "epsilon")),
         )
 
@@ -77,9 +80,10 @@ def build_diffusion_pipeline_metadata(
     denoiser_conditioning_input: str = "encoder_hidden_states",
     denoiser_output: str = "noise_pred",
     scheduler: SchedulerConfig | None = None,
+    timesteps: list[float] | None = None,
     guidance_scale: float | None = None,
     vae_filename: str | None = None,
-    vae_latent_input: str = "latent_sample",
+    vae_latent_input: str = "latent",
     text_encoder_filename: str | None = None,
     text_encoder_output: str = "last_hidden_state",
 ) -> dict[str, Any]:
@@ -155,6 +159,13 @@ def build_diffusion_pipeline_metadata(
         "timestep_input": denoiser_timestep_input,
         "scheduler_config": scheduler.to_metadata(),
     }
+    if timesteps is not None:
+        if len(timesteps) != num_inference_steps:
+            raise ValueError(
+                f"timesteps has {len(timesteps)} entries but num_inference_steps is "
+                f"{num_inference_steps}"
+            )
+        strategy["timesteps"] = [float(t) for t in timesteps]
     if guidance_scale is not None:
         strategy["guidance_scale"] = guidance_scale
         if guidance_scale != 1.0:
