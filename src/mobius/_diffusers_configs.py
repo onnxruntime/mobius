@@ -62,6 +62,11 @@ class UNet2DConfig:
     addition_embed_type: str | None = None
     addition_time_embed_dim: int | None = None
     projection_class_embeddings_input_dim: int | None = None
+    # Runtime LoRA adapters to bake into the attention projections as
+    # `(name, rank, scale)`. Each becomes a low-rank branch gated at run time by
+    # a scalar `lora_gate.{name}` input (1.0 = on, 0.0 = off, or a blend
+    # strength). Empty = no LoRA (plain projections).
+    lora_adapters: tuple[tuple[str, int, float], ...] = ()
 
     @classmethod
     def from_diffusers(cls, config: dict) -> UNet2DConfig:

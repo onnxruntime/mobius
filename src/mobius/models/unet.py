@@ -27,6 +27,7 @@ from mobius._diffusers_configs import UNet2DConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import GroupNorm as _GroupNorm
 from mobius.components import Linear as _Linear
+from mobius.components import LoRALinear as _LoRALinear
 from mobius.components import SiLU as _SiLU
 
 if TYPE_CHECKING:
@@ -272,6 +273,7 @@ class _DownBlock2D(nn.Module):
         cross_attention_dim: int | None = None,
         attention_head_dim: int = 8,
         add_downsample: bool = True,
+        linear_class=_Linear,
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
@@ -286,7 +288,8 @@ class _DownBlock2D(nn.Module):
                 num_heads = max(1, out_channels // attention_head_dim)
                 self.attentions.append(
                     _CrossAttentionBlock(
-                        out_channels, cross_attention_dim, num_heads, norm_num_groups
+                        out_channels, cross_attention_dim, num_heads, norm_num_groups,
+                        linear_class=linear_class,
                     )
                 )
 
@@ -331,6 +334,7 @@ class _UpBlock2D(nn.Module):
         cross_attention_dim: int | None = None,
         attention_head_dim: int = 8,
         add_upsample: bool = True,
+        linear_class=_Linear,
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
@@ -347,7 +351,8 @@ class _UpBlock2D(nn.Module):
                 num_heads = max(1, out_channels // attention_head_dim)
                 self.attentions.append(
                     _CrossAttentionBlock(
-                        out_channels, cross_attention_dim, num_heads, norm_num_groups
+                        out_channels, cross_attention_dim, num_heads, norm_num_groups,
+                        linear_class=linear_class,
                     )
                 )
 
@@ -423,6 +428,7 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
         cross_attention_dim: int,
         attention_head_dim: int = 8,
         norm_num_groups: int = 32,
+        linear_class=_Linear,
     ):
         super().__init__()
         num_heads = max(1, channels // attention_head_dim)
@@ -435,7 +441,10 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
         )
         self.attentions = nn.ModuleList()
         self.attentions.append(
-            _CrossAttentionBlock(channels, cross_attention_dim, num_heads, norm_num_groups)
+            _CrossAttentionBlock(
+                channels, cross_attention_dim, num_heads, norm_num_groups,
+                linear_class=linear_class,
+            )
         )
 
     def forward(
@@ -469,6 +478,28 @@ class UNet2DConditionModel(nn.Module):
         super().__init__()
         self.config = config
 
+        # Runtime LoRA: bake the declared adapters into every attention
+        # projection and gate each at run time via a shared `_lora_gates`
+        # mapping (populated in `forward` from the `lora_gate.{name}` inputs).
+        lora_adapters = list(getattr(config, "lora_adapters", ()) or ())
+        self._lora_adapter_names = [name for name, _, _ in lora_adapters]
+        self._lora_gates: dict = {}
+        if lora_adapters:
+            gates = self._lora_gates
+
+            def _lora_linear(in_features: int, out_features: int, bias: bool = True):
+                return _LoRALinear(
+                    in_features,
+                    out_features,
+                    bias=bias,
+                    lora_adapters=lora_adapters,
+                    gate_holder=gates,
+                )
+
+            linear_class = _lora_linear
+        else:
+            linear_class = _Linear
+
         block_out_channels = config.block_out_channels
         time_embed_dim = block_out_channels[0] * 4
 
@@ -498,6 +529,7 @@ class UNet2DConditionModel(nn.Module):
                     cross_attention_dim=config.cross_attention_dim,
                     attention_head_dim=config.attention_head_dim,
                     add_downsample=not is_final,
+                    linear_class=linear_class,
                 )
             )
 
@@ -508,6 +540,7 @@ class UNet2DConditionModel(nn.Module):
             cross_attention_dim=config.cross_attention_dim,
             attention_head_dim=config.attention_head_dim,
             norm_num_groups=config.norm_num_groups,
+            linear_class=linear_class,
         )
 
         # Up blocks (reversed)
@@ -530,6 +563,7 @@ class UNet2DConditionModel(nn.Module):
                     cross_attention_dim=config.cross_attention_dim,
                     attention_head_dim=config.attention_head_dim,
                     add_upsample=not is_final,
+                    linear_class=linear_class,
                 )
             )
 
@@ -546,6 +580,7 @@ class UNet2DConditionModel(nn.Module):
         sample: ir.Value,
         timestep: ir.Value,
         encoder_hidden_states: ir.Value,
+        lora_gates: dict | None = None,
     ):
         """Forward pass for denoising.
 
@@ -554,10 +589,18 @@ class UNet2DConditionModel(nn.Module):
             sample: Noisy latent [batch, in_channels, height, width]
             timestep: Diffusion timestep [batch]
             encoder_hidden_states: Text encoder output [batch, seq_len, cross_dim]
+            lora_gates: Optional ``{adapter_name: scalar ir.Value}`` runtime gates
+                for the baked LoRA adapters (1.0 = active, 0.0 = inactive, or a
+                blend strength). Shared with every ``LoRALinear`` via the module's
+                ``_lora_gates`` mapping.
 
         Returns:
             noise_pred: Predicted noise [batch, out_channels, height, width]
         """
+        # Publish the runtime LoRA gates so every baked LoRALinear reads them.
+        if lora_gates:
+            self._lora_gates.update(lora_gates)
+
         # Time embedding: sinusoidal position encoding + MLP
         # Using half_dim = dim // 2 sinusoidal encoding
         t_emb = self._get_timestep_embedding(op, timestep)

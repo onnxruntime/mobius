@@ -84,3 +84,49 @@ def test_lora_gate_holder_applies_runtime_gate():
     builder._adapt_outputs([output], "")
 
     assert "lora_gate.test" in _referenced_names(graph)
+
+
+def test_full_unet_declares_lora_gate_inputs():
+    # Build a small full UNet with a baked adapter through the denoising task and
+    # assert the runtime gate input + adapter params are present end-to-end.
+    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.models.unet import UNet2DConditionModel
+    from mobius.tasks._denoising import DenoisingTask
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        lora_adapters=(("style", 4, 1.0),),
+    )
+    module = UNet2DConditionModel(config)
+    package = DenoisingTask().build(module, config)
+    graph = package["model"].graph
+
+    input_names = {value.name for value in graph.inputs}
+    assert "lora_gate.style" in input_names
+    assert "sample" in input_names and "encoder_hidden_states" in input_names
+    names = _referenced_names(graph)
+    assert any("lora_A.style.weight" in name for name in names)
+    assert any("lora_B.style.weight" in name for name in names)
+
+
+def test_full_unet_without_lora_has_no_gate_inputs():
+    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.models.unet import UNet2DConditionModel
+    from mobius.tasks._denoising import DenoisingTask
+
+    config = UNet2DConfig(
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        cross_attention_dim=16,
+    )
+    module = UNet2DConditionModel(config)
+    graph = DenoisingTask().build(module, config)["model"].graph
+    assert not any(
+        value.name and "lora_gate" in value.name for value in graph.inputs
+    )
