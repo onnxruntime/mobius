@@ -123,6 +123,13 @@ def test_parse_non_square_dims():
     assert (parsed.width, parsed.height) == (768, 512)
 
 
+def test_parse_batch_size():
+    assert parse_comfyui_workflow(_DEFAULT_TXT2IMG).batch_size == 1
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["5"]["inputs"]["batch_size"] = 4
+    assert parse_comfyui_workflow(wf).batch_size == 4
+
+
 
 def test_ddim_sampler_maps_to_ddim():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))

@@ -87,6 +87,7 @@ class ComfyUIWorkflow:
     negative_prompt: str | None
     width: int
     height: int
+    batch_size: int
     seed: int
     steps: int
     cfg: float
@@ -166,16 +167,17 @@ def _follow_prompt_text(nodes: dict[str, Any], ref: Any) -> str | None:
     return None
 
 
-def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int]:
-    """Resolve a KSampler latent link to (width, height); default 512x512."""
+def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int, int]:
+    """Resolve a KSampler latent link to (width, height, batch_size); defaults 512x512x1."""
     node = _resolve(nodes, ref)
     if node is not None and node.get("class_type") in _LATENT_NODES:
         inputs = node.get("inputs", {})
         try:
-            return int(inputs.get("width", 512)), int(inputs.get("height", 512))
+            return (int(inputs.get("width", 512)), int(inputs.get("height", 512)),
+                    max(1, int(inputs.get("batch_size", 1))))
         except (TypeError, ValueError):
             pass
-    return 512, 512
+    return 512, 512, 1
 
 
 def _trace_checkpoint(nodes: dict[str, Any], ref: Any) -> str | None:
@@ -284,7 +286,7 @@ def parse_comfyui_workflow(
 
     prompt = _follow_prompt_text(nodes, inputs.get("positive"))
     negative_prompt = _follow_prompt_text(nodes, inputs.get("negative"))
-    width, height = _follow_dims(nodes, inputs.get("latent_image"))
+    width, height, batch_size = _follow_dims(nodes, inputs.get("latent_image"))
     checkpoint = _trace_checkpoint(nodes, inputs.get("model"))
     loras = tuple(_trace_loras(nodes, inputs.get("model")))
     controlnet = _find_controlnet(nodes)
@@ -322,6 +324,7 @@ def parse_comfyui_workflow(
         negative_prompt=negative_prompt,
         width=width,
         height=height,
+        batch_size=batch_size,
         seed=seed,
         steps=steps,
         cfg=cfg,
