@@ -79,7 +79,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             tokenizer files), use
             :func:`mobius.integrations.ort_genai.export_package` instead. For
             onnx-genai, call
-            :func:`mobius.integrations.onnx_genai.write_inference_metadata`
+            :func:`mobius.integrations.onnx_genai.write_onnx_genai_config`
             after saving, or use ``mobius build --runtime onnx-genai``.
 
         Args:
