@@ -102,6 +102,20 @@ def test_parse_no_loras_by_default():
     assert parse_comfyui_workflow(_DEFAULT_TXT2IMG).loras == ()
 
 
+def test_parse_collects_controlnet():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["10"] = {"class_type": "ControlNetLoader", "inputs": {"control_net_name": "canny.safetensors"}}
+    wf["11"] = {"class_type": "ControlNetApply", "inputs": {
+        "conditioning": ["6", 0], "control_net": ["10", 0], "image": ["99", 0], "strength": 0.7}}
+    wf["3"]["inputs"]["positive"] = ["11", 0]
+    parsed = parse_comfyui_workflow(wf)
+    assert parsed.controlnet == ("canny.safetensors", 0.7)
+
+
+def test_parse_no_controlnet_by_default():
+    assert parse_comfyui_workflow(_DEFAULT_TXT2IMG).controlnet is None
+
+
 def test_parse_non_square_dims():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["5"]["inputs"].update({"width": 768, "height": 512})

@@ -151,6 +151,7 @@ def convert_comfyui_workflow(
     *,
     opset: int = 17,
     lora_paths: dict[str, str] | None = None,
+    controlnet_paths: dict[str, str] | None = None,
 ) -> ConversionResult:
     """Convert a ComfyUI workflow + checkpoint into a runnable onnx-genai pipeline dir.
 
@@ -183,6 +184,16 @@ def convert_comfyui_workflow(
             loras.append((path, strength))
         else:
             _LOGGER.warning("LoRA %r not resolved to a file (pass lora_paths); skipping", name)
+    controlnet_source = None
+    if wf.controlnet is not None:
+        cn_name, _cn_strength = wf.controlnet
+        controlnet_source = (controlnet_paths or {}).get(
+            cn_name, cn_name if os.path.isdir(cn_name) or os.path.isfile(cn_name) else None
+        )
+        if controlnet_source is None:
+            _LOGGER.warning(
+                "ControlNet %r not resolved to a path (pass controlnet_paths); skipping", cn_name
+            )
     exported = export_checkpoint(
         checkpoint_source,
         output_dir,
@@ -191,6 +202,7 @@ def convert_comfyui_workflow(
         opset=opset,
         timestep_dtype=timestep_dtype,
         loras=loras or None,
+        controlnet=controlnet_source,
     )
     timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps, use_karras)
     metadata = build_pipeline_metadata_for_workflow(wf, exported, timesteps=timesteps)
@@ -215,6 +227,8 @@ def convert_comfyui_workflow(
         "model_max_length": exported.model_max_length,
         "sdxl": exported.sdxl,
         "pooled_dim": exported.pooled_dim,
+        "controlnet": exported.controlnet,
+        "conditioning_channels": exported.conditioning_channels,
     }
     run_params_path = os.path.join(output_dir, "run.json")
     with open(run_params_path, "w", encoding="utf-8") as handle:

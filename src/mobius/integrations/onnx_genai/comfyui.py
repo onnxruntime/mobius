@@ -97,6 +97,7 @@ class ComfyUIWorkflow:
     denoise: float = 1.0
     start_step: int = 0
     loras: tuple[tuple[str, float], ...] = ()
+    controlnet: tuple[str, float] | None = None
 
 
 def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +223,25 @@ def _trace_loras(nodes: dict[str, Any], ref: Any) -> list[tuple[str, float]]:
     return loras
 
 
+def _find_controlnet(nodes: dict[str, Any]) -> tuple[str, float] | None:
+    """Find a ControlNetApply node's (control_net_name, strength), if any."""
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") in ("ControlNetApply", "ControlNetApplyAdvanced"):
+            inputs = node.get("inputs", {})
+            strength = float(inputs.get("strength", 1.0))
+            loader = _resolve(nodes, inputs.get("control_net"))
+            if loader is not None and loader.get("class_type") in (
+                "ControlNetLoader",
+                "DiffControlNetLoader",
+            ):
+                name = loader.get("inputs", {}).get("control_net_name")
+                if isinstance(name, str):
+                    return (name, strength)
+    return None
+
+
 def parse_comfyui_workflow(
     workflow: dict[str, Any],
     *,
@@ -267,6 +287,7 @@ def parse_comfyui_workflow(
     width, height = _follow_dims(nodes, inputs.get("latent_image"))
     checkpoint = _trace_checkpoint(nodes, inputs.get("model"))
     loras = tuple(_trace_loras(nodes, inputs.get("model")))
+    controlnet = _find_controlnet(nodes)
 
     has_text_encoder = any(
         isinstance(n, dict) and n.get("class_type") in _TEXT_ENCODE_NODES for n in nodes.values()
@@ -309,6 +330,7 @@ def parse_comfyui_workflow(
         denoise=denoise,
         start_step=start_step,
         loras=loras,
+        controlnet=controlnet,
     )
 
 

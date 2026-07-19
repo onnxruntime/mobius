@@ -55,6 +55,10 @@ class ExportedCheckpoint:
     # SDXL: two text encoders (concatenated) + a pooled text_embeds + time_ids.
     sdxl: bool = False
     pooled_dim: int = 0
+    # ControlNet: the denoiser is a fused ControlNet+UNet taking an extra constant
+    # `controlnet_cond` image input; `conditioning_channels` is its channel count.
+    controlnet: bool = False
+    conditioning_channels: int = 3
 
 
 def _looks_like_single_file(source: str) -> bool:
@@ -89,6 +93,7 @@ def export_checkpoint(
     components: tuple[str, ...] = ("text_encoder", "denoiser", "vae"),
     timestep_dtype: str = "int64",
     loras: list[tuple[str, float]] | None = None,
+    controlnet: str | None = None,
 ) -> ExportedCheckpoint:
     """Export a checkpoint's components to ONNX in ``output_dir``.
 
@@ -158,7 +163,15 @@ def export_checkpoint(
             return self.v.decode(latent / self.scale).sample
 
     pooled_dim = 0
-    if sdxl:
+    cond_channels = 0
+    if controlnet:
+        if sdxl:
+            raise ValueError("SDXL + ControlNet combined export is not yet supported")
+        cond_channels = _export_sd_controlnet(
+            text_encoder, unet, controlnet, output_dir, latent0, timestep_arg, latent_h, latent_w,
+            max_len, opset, components, text_file, denoiser_file,
+        )
+    elif sdxl:
         pooled_dim = _export_sdxl(
             pipe, output_dir, latent0, timestep_arg, max_len, opset, components, text_file,
             denoiser_file,
@@ -193,6 +206,8 @@ def export_checkpoint(
         beta_schedule=str(getattr(sched.config, "beta_schedule", "scaled_linear")),
         sdxl=sdxl,
         pooled_dim=pooled_dim,
+        controlnet=bool(controlnet),
+        conditioning_channels=cond_channels,
     )
 
 
@@ -244,6 +259,76 @@ def _export_sd(
             },
             opset_version=opset, dynamo=False,
         )
+
+
+def _export_sd_controlnet(
+    text_encoder, unet, controlnet_source, output_dir, latent0, timestep_arg, latent_h, latent_w,
+    max_len, opset, components, text_file, denoiser_file,
+) -> int:
+    """Export an SD text encoder + a **fused ControlNet+UNet** denoiser.
+
+    The denoiser takes an extra constant ``controlnet_cond`` image input: the
+    ControlNet runs each step producing down/mid residuals that are injected into
+    the UNet. Returns the ControlNet conditioning channel count.
+    """
+    import torch
+    from diffusers import ControlNetModel, UNet2DConditionModel
+
+    if controlnet_source == "__from_unet__":
+        controlnet = ControlNetModel.from_unet(unet).eval()
+    elif os.path.isfile(controlnet_source):
+        controlnet = ControlNetModel.from_single_file(controlnet_source).eval()
+    else:
+        controlnet = ControlNetModel.from_pretrained(controlnet_source).eval()
+    cond_channels = int(getattr(controlnet.config, "conditioning_channels", 3))
+
+    ids = torch.ones(1, max_len, dtype=torch.long)
+    with torch.no_grad():
+        emb = text_encoder(ids)[0]
+    cond_img = torch.zeros(1, cond_channels, latent_h * 8, latent_w * 8)
+
+    class _TextWrap(torch.nn.Module):
+        def __init__(self, t):
+            super().__init__()
+            self.t = t
+
+        def forward(self, input_ids):
+            return self.t(input_ids)[0]
+
+    class _CtrlUNetWrap(torch.nn.Module):
+        def __init__(self, u, c):
+            super().__init__()
+            self.u, self.c = u, c
+
+        def forward(self, sample, timestep, encoder_hidden_states, controlnet_cond):
+            down, mid = self.c(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                               controlnet_cond=controlnet_cond, return_dict=False)
+            return self.u(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                          down_block_additional_residuals=down,
+                          mid_block_additional_residual=mid).sample
+
+    if "text_encoder" in components:
+        _LOGGER.info("exporting text_encoder -> %s", text_file)
+        torch.onnx.export(
+            _TextWrap(text_encoder), (ids,), os.path.join(output_dir, text_file),
+            input_names=["input_ids"], output_names=["last_hidden_state"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
+            opset_version=opset, dynamo=False,
+        )
+    if "denoiser" in components:
+        _LOGGER.info("exporting fused ControlNet+UNet denoiser -> %s", denoiser_file)
+        torch.onnx.export(
+            _CtrlUNetWrap(unet, controlnet),
+            (latent0, timestep_arg, emb, cond_img),
+            os.path.join(output_dir, denoiser_file),
+            input_names=["sample", "timestep", "encoder_hidden_states", "controlnet_cond"],
+            output_names=["noise_pred"],
+            dynamic_axes={"sample": {0: "batch", 2: "height", 3: "width"},
+                          "encoder_hidden_states": {0: "batch", 1: "sequence"},
+                          "controlnet_cond": {0: "batch", 2: "height", 3: "width"}},
+            opset_version=opset, dynamo=False,
+        )
+    return cond_channels
 
 
 def _export_sdxl(

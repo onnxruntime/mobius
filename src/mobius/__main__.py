@@ -407,8 +407,15 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         if not path:
             raise SystemExit(f"--lora expects NAME=PATH, got {entry!r}")
         lora_paths[name] = path
+    controlnet_paths = {}
+    for entry in getattr(args, "controlnet", None) or []:
+        name, _, path = entry.partition("=")
+        if not path:
+            raise SystemExit(f"--controlnet expects NAME=PATH, got {entry!r}")
+        controlnet_paths[name] = path
     result = convert_comfyui_workflow(
-        workflow, args.checkpoint, args.output, opset=args.opset, lora_paths=lora_paths or None
+        workflow, args.checkpoint, args.output, opset=args.opset,
+        lora_paths=lora_paths or None, controlnet_paths=controlnet_paths or None,
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -721,6 +728,13 @@ def main(argv: list[str] | None = None) -> None:
         metavar="NAME=PATH",
         help="Resolve a ComfyUI LoRA filename to a .safetensors path; the LoRA is "
         "fused into the exported model. Repeatable.",
+    )
+    comfy_parser.add_argument(
+        "--controlnet",
+        action="append",
+        metavar="NAME=PATH",
+        help="Resolve a ComfyUI ControlNet name to a diffusers dir/.safetensors; the "
+        "ControlNet is fused into the exported denoiser. Repeatable.",
     )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
