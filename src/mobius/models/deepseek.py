@@ -19,6 +19,7 @@ from mobius.components import (
     MLP,
     Attention,
     Embedding,
+    FusedQuantizedMoE,
     Linear,
     MoELayer,
     QuantizedEmbedding,
@@ -120,7 +121,45 @@ class DeepSeekMoEGate(nn.Module):
 
         return routing_weights, selected_experts
 
-    def _group_topk_selection(self, op, scores_for_choice):
+    def route_for_qmoe(self, op: OpBuilder, hidden_states: ir.Value):
+        """Routing outputs shaped for the fused ``com.microsoft::QMoE`` op.
+
+        Returns a triple ``(scores_for_choice, routing_weights, selected_experts)``
+        computed identically to :meth:`forward`, but also exposes
+        ``scores_for_choice`` — the per-expert selection scores (sigmoid + bias
+        for V3, softmax for V2, with group masking already applied). The QMoE
+        kernel performs its own top-k over ``scores_for_choice`` (passed as
+        ``router_probs``), so feeding these masked scores reproduces GLM's
+        group-limited / noaux_tc selection exactly. ``routing_weights`` and
+        ``selected_experts`` are scattered into a dense aggregation tensor by the
+        caller and consumed via the optional ``router_weights`` input, so the
+        combine weights (normalized sigmoid * routed_scaling_factor) match the
+        per-expert path bit-for-bit.
+        """
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.MatMul(op.Cast(hidden_states, to=1), weight_t)
+
+        if self.scoring_func == "sigmoid":
+            scores = op.Sigmoid(router_logits)
+            scores_for_choice = op.Add(scores, self.e_score_correction_bias)
+        else:
+            scores = op.Softmax(router_logits, axis=-1)
+            scores_for_choice = scores
+
+        if self.n_group > 1 and self.topk_method != "greedy":
+            scores_for_choice = self._group_topk_selection(op, scores_for_choice)
+
+        k_val = op.Constant(value_ints=[self.top_k])
+        _, selected_experts = op.TopK(scores_for_choice, k_val, axis=-1, _outputs=2)
+
+        routing_weights = op.GatherElements(scores, selected_experts, axis=-1)
+        if self.norm_topk_prob:
+            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
+            eps = 1e-20
+            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
+        routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
+
+        return scores_for_choice, routing_weights, selected_experts
         """Group-based expert selection: pick topk_group groups first."""
         experts_per_group = self.num_experts // self.n_group
 
@@ -280,7 +319,16 @@ class _DeepSeekMoEFFN(nn.Module):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.moe = MoELayer(config, gate=gate, linear_class=linear_class)
+        qc = config.quantization
+        use_fused_qmoe = (
+            config.fused_quantized_moe
+            and qc is not None
+            and qc.quant_method != "none"
+        )
+        if use_fused_qmoe:
+            self.moe = FusedQuantizedMoE(config, gate=gate)
+        else:
+            self.moe = MoELayer(config, gate=gate, linear_class=linear_class)
         # Shared expert uses moe_intermediate_size * n_shared_experts
         n_shared = config.n_shared_experts or 1
         shared_intermediate = config.moe_intermediate_size * n_shared

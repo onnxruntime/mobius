@@ -171,7 +171,33 @@ class TestGlmMoeDsaExport:
         )["model"].graph
         assert count_op_type(graph, "MatMulNBits") > 0
 
-    def test_preprocess_maps_indexer_and_mtp_layer(self):
+    def test_fused_quantized_moe_emits_qmoe(self):
+        config = _tiny_glm_moe_dsa_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=True,
+            ),
+            fused_quantized_moe=True,
+        )
+        graph = build_from_module(
+            GlmMoeDsaCausalLMModel(config),
+            config,
+            task="glm-moe-dsa",
+        )["model"].graph
+        # Routed experts collapse into a single fused QMoE node per MoE layer.
+        n_moe_layers = config.num_hidden_layers - config.first_k_dense_replace
+        assert count_op_type(graph, "QMoE") == n_moe_layers
+        # Routed experts no longer emit per-expert MatMulNBits: the only
+        # MatMulNBits left come from attention, the dense layer, shared experts,
+        # and lm_head — none named under the routed-expert ``moe.experts`` scope.
+        routed = [
+            node.name
+            for node in graph
+            if node.op_type == "MatMulNBits" and "moe.experts" in (node.name or "")
+        ]
+        assert routed == [], f"routed experts still emit MatMulNBits: {routed}"
         config = _tiny_glm_moe_dsa_config()
         model = GlmMoeDsaCausalLMModel(config)
         state_dict = {

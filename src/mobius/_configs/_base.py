@@ -415,6 +415,10 @@ class ArchitectureConfig(BaseModelConfig):
     first_k_dense_replace: int = 0
     n_shared_experts: int | None = None
     mlp_layer_types: list[str] | None = None
+    # When True (and quantization is active), routed MoE experts are emitted as a
+    # single fused ``com.microsoft::QMoE`` op instead of a per-expert unroll of
+    # ``MatMulNBits``. Only wired for the GLM/DeepSeek MoE path today.
+    fused_quantized_moe: bool = False
 
     # Multi-head Latent Attention (MLA) config — DeepSeek-V2/V3
     q_lora_rank: int | None = None

@@ -8,13 +8,14 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._mlp import MLP
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
+    pass
 
 
 class TopKGate(nn.Module):
@@ -233,3 +234,168 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+class FusedQuantizedMoE(nn.Module):
+    """Routed MoE experts emitted as a single fused ``com.microsoft::QMoE`` op.
+
+    Replaces the per-expert ``MatMulNBits`` unroll (:class:`MoELayer`) for
+    weight-only int-quantized MoE. All routed experts are packed into
+    expert-major integer weight tensors laid out exactly as the ORT contrib
+    ``QMoE`` kernel expects::
+
+        fc1_experts_weights: [E, 2*inter, hidden // pack_size]   uint8
+        fc1_scales:          [E, 2*inter, hidden // block_size]  float32
+        fc2_experts_weights: [E, hidden, inter // pack_size]     uint8
+        fc2_scales:          [E, hidden, inter // block_size]    float32
+
+    where ``pack_size = 8 // bits``. ``fc1`` fuses the SwiGLU gate/up
+    projections in the **interleaved** layout ``[g_0, u_0, g_1, u_1, ...]`` and is
+    consumed with ``swiglu_fusion=1`` (the only SwiGLU layout the ORT CPU QMoE
+    kernel supports), so the kernel computes ``silu(gate) * up`` — matching
+    GLM/DeepSeek's SiLU-gated experts (``activation_alpha=1``, ``activation_beta=0``,
+    ``swiglu_limit=inf``, all ORT defaults).
+
+    Routing is delegated to ``gate.route_for_qmoe`` (GLM sigmoid + noaux_tc /
+    DeepSeek softmax group-limited). The kernel re-derives top-k selection from
+    ``router_probs`` (the gate's ``scores_for_choice``); the exact combine
+    weights are scattered into a dense ``[rows, E]`` aggregation tensor and fed
+    through the optional ``router_weights`` input with
+    ``normalize_routing_weights=0``, so the fused op reproduces the per-expert
+    path's routing bit-for-bit.
+
+    Symmetric int quantization is used (no zero-points): the kernel defaults the
+    per-block zero-point to ``1 << (bits - 1)``.
+    """
+
+    _MICROSOFT_DOMAIN = "com.microsoft"
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module,
+    ):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        assert config.moe_intermediate_size is not None
+        assert config.quantization is not None
+        if not hasattr(gate, "route_for_qmoe"):
+            raise TypeError(
+                f"gate {type(gate).__name__} does not support the fused QMoE path "
+                "(missing route_for_qmoe); use MoELayer instead"
+            )
+
+        qc = config.quantization
+        bits = qc.bits
+        block_size = qc.group_size
+        if bits not in (1, 2, 4, 8):
+            raise ValueError(f"QMoE expert_weight_bits must be 1/2/4/8, got {bits}")
+        if block_size < 16 or (block_size & (block_size - 1)):
+            raise ValueError(f"QMoE block_size must be a power of 2 >= 16, got {block_size}")
+
+        self.gate = gate
+        self._num_experts = config.num_local_experts
+        self._top_k = config.num_experts_per_tok
+        self._hidden = config.hidden_size
+        self._inter = config.moe_intermediate_size
+        self._bits = bits
+        self._block_size = block_size
+
+        if self._hidden % block_size != 0:
+            raise ValueError(
+                f"hidden_size {self._hidden} must be divisible by block_size {block_size}"
+            )
+        if self._inter % block_size != 0:
+            raise ValueError(
+                f"moe_intermediate_size {self._inter} must be divisible by "
+                f"block_size {block_size}"
+            )
+
+        pack_size = 8 // bits
+        e = self._num_experts
+        fc1_out = 2 * self._inter  # interleaved [g_0, u_0, ...] for swiglu_fusion=1
+        # fc1: [E, 2*inter, hidden] quantized along hidden (K)
+        self.fc1_experts_weights = nn.Parameter(
+            [e, fc1_out, self._hidden // pack_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc1_scales = nn.Parameter(
+            [e, fc1_out, self._hidden // block_size],
+            dtype=ir.DataType.FLOAT,
+        )
+        # fc2: [E, hidden, inter] quantized along inter (K)
+        self.fc2_experts_weights = nn.Parameter(
+            [e, self._hidden, self._inter // pack_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc2_scales = nn.Parameter(
+            [e, self._hidden, self._inter // block_size],
+            dtype=ir.DataType.FLOAT,
+        )
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        hidden = self._hidden
+
+        # QMoE requires 2-D router_probs, so flatten [B, S, H] -> [rows, H].
+        orig_shape = op.Shape(hidden_states)
+        flat = op.Reshape(hidden_states, op.Constant(value_ints=[-1, hidden]))
+        # QMoE input/router_probs must be float32.
+        flat_f32 = op.Cast(flat, to=1)
+
+        scores_for_choice, routing_weights, selected_experts = self._route(op, flat_f32)
+
+        # Dense [rows, E] aggregation weights: combine weight at each selected
+        # expert position, 0 elsewhere. QMoE reads these at its own top-k picks.
+        zeros = op.Mul(scores_for_choice, 0.0)
+        aggregation = op.ScatterElements(
+            zeros, selected_experts, routing_weights, axis=-1
+        )
+
+        moe_out = op.QMoE(
+            flat_f32,  # 0: input
+            scores_for_choice,  # 1: router_probs (selection logits)
+            self.fc1_experts_weights,  # 2
+            self.fc1_scales,  # 3
+            None,  # 4: fc1_experts_bias
+            self.fc2_experts_weights,  # 5
+            self.fc2_scales,  # 6
+            None,  # 7: fc2_experts_bias
+            None,  # 8: fc3_experts_weights
+            None,  # 9: fc3_scales
+            None,  # 10: fc3_experts_bias
+            None,  # 11: fc1_zero_points
+            None,  # 12: fc2_zero_points
+            None,  # 13: fc3_zero_points
+            aggregation,  # 14: router_weights (explicit combine weights)
+            activation_type="swiglu",
+            k=self._top_k,
+            normalize_routing_weights=0,
+            swiglu_fusion=1,
+            expert_weight_bits=self._bits,
+            block_size=self._block_size,
+            quant_type="int",
+            _domain=self._MICROSOFT_DOMAIN,
+        )
+        moe_out = op.CastLike(moe_out, hidden_states)
+        return op.Reshape(moe_out, orig_shape)
+
+    def _route(self, op: OpBuilder, hidden_states: ir.Value):
+        """Invoke ``gate.route_for_qmoe`` under the gate's module scope.
+
+        ``route_for_qmoe`` is a plain method (not ``forward``), so it never goes
+        through :meth:`nn.Module.__call__`. We replicate the parameter-realization
+        step here so the gate's ``weight`` / ``e_score_correction_bias`` are
+        registered as graph initializers under the ``...moe.gate`` scope (matching
+        the per-expert path) instead of dangling as unqualified names.
+        """
+        builder = op.builder
+        module_name = self.gate._name or "gate"
+        class_name = type(self.gate).__qualname__
+        builder.push_module(module_name, class_name)
+        try:
+            for param in self.gate._parameters.values():
+                param._realize(builder)
+            return self.gate.route_for_qmoe(op, hidden_states)
+        finally:
+            builder.pop_module()
