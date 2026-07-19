@@ -59,6 +59,9 @@ class ExportedCheckpoint:
     # `controlnet_cond` image input; `conditioning_channels` is its channel count.
     controlnet: bool = False
     conditioning_channels: int = 3
+    # Inpainting: a 9-channel UNet; the denoiser takes extra constant `mask` (1ch)
+    # and `masked_latent` (4ch) inputs concatenated to the latent.
+    inpaint: bool = False
 
 
 def _looks_like_single_file(source: str) -> bool:
@@ -136,14 +139,20 @@ def export_checkpoint(
     sdxl = getattr(pipe, "text_encoder_2", None) is not None
 
     scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
-    in_channels = int(unet.config.in_channels)
+    # An inpainting UNet takes 9 input channels (latent[4] + mask[1] + masked_latent[4])
+    # but still predicts a 4-channel latent. The loop-carried latent is `out_channels`;
+    # mask + masked_latent are extra constant conditioning.
+    unet_in = int(unet.config.in_channels)
+    latent_channels = int(getattr(unet.config, "out_channels", unet_in))
+    inpaint = unet_in == latent_channels + 5
+    in_channels = latent_channels
     cross_attention_dim = int(unet.config.cross_attention_dim)
     unet_sample = int(getattr(unet.config, "sample_size", 64))
     latent_h = (height // 8) if height else unet_sample
     latent_w = (width // 8) if width else unet_sample
     max_len = int(tokenizer.model_max_length)
 
-    latent0 = torch.zeros(1, in_channels, latent_h, latent_w)
+    latent0 = torch.zeros(1, latent_channels, latent_h, latent_w)
     if timestep_dtype == "float32":
         timestep_arg = torch.tensor([1.0], dtype=torch.float32)
     else:
@@ -173,6 +182,11 @@ def export_checkpoint(
         cond_channels = _export_sd_controlnet(
             text_encoder, unet, controlnet, output_dir, latent0, timestep_arg, latent_h, latent_w,
             max_len, opset, components, text_file, denoiser_file,
+        )
+    elif inpaint:
+        _export_sd_inpaint(
+            text_encoder, unet, output_dir, latent0, timestep_arg, max_len, opset, components,
+            text_file, denoiser_file,
         )
     elif sdxl:
         pooled_dim = _export_sdxl(
@@ -211,6 +225,7 @@ def export_checkpoint(
         pooled_dim=pooled_dim,
         controlnet=bool(controlnet),
         conditioning_channels=cond_channels,
+        inpaint=inpaint,
     )
 
 
@@ -260,6 +275,65 @@ def _export_sd(
                 "sample": {0: "batch", 2: "height", 3: "width"},
                 "encoder_hidden_states": {0: "batch", 1: "sequence"},
             },
+            opset_version=opset, dynamo=False,
+        )
+
+
+def _export_sd_inpaint(
+    text_encoder, unet, output_dir, latent0, timestep_arg, max_len, opset, components,
+    text_file, denoiser_file,
+) -> None:
+    """Export an SD text encoder + a 9-channel inpainting UNet denoiser.
+
+    The denoiser takes the 4-channel loop-carried `sample` plus two extra constant
+    inputs — `mask` (1ch) and `masked_latent` (4ch) — which it concatenates to form
+    the UNet's 9-channel input and predicts the 4-channel noise.
+    """
+    import torch
+
+    ids = torch.ones(1, max_len, dtype=torch.long)
+    with torch.no_grad():
+        emb = text_encoder(ids)[0]
+    b, _, h, w = latent0.shape
+    mask0 = torch.zeros(b, 1, h, w)
+    masked0 = torch.zeros_like(latent0)
+
+    class _TextWrap(torch.nn.Module):
+        def __init__(self, t):
+            super().__init__()
+            self.t = t
+
+        def forward(self, input_ids):
+            return self.t(input_ids)[0]
+
+    class _InpaintUNetWrap(torch.nn.Module):
+        def __init__(self, u):
+            super().__init__()
+            self.u = u
+
+        def forward(self, sample, timestep, encoder_hidden_states, mask, masked_latent):
+            latent_in = torch.cat([sample, mask, masked_latent], dim=1)
+            return self.u(latent_in, timestep, encoder_hidden_states=encoder_hidden_states).sample
+
+    if "text_encoder" in components:
+        _LOGGER.info("exporting text_encoder -> %s", text_file)
+        torch.onnx.export(
+            _TextWrap(text_encoder), (ids,), os.path.join(output_dir, text_file),
+            input_names=["input_ids"], output_names=["last_hidden_state"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
+            opset_version=opset, dynamo=False,
+        )
+    if "denoiser" in components:
+        _LOGGER.info("exporting inpainting (9-channel) denoiser -> %s", denoiser_file)
+        torch.onnx.export(
+            _InpaintUNetWrap(unet), (latent0, timestep_arg, emb, mask0, masked0),
+            os.path.join(output_dir, denoiser_file),
+            input_names=["sample", "timestep", "encoder_hidden_states", "mask", "masked_latent"],
+            output_names=["noise_pred"],
+            dynamic_axes={"sample": {0: "batch", 2: "height", 3: "width"},
+                          "encoder_hidden_states": {0: "batch", 1: "sequence"},
+                          "mask": {0: "batch", 2: "height", 3: "width"},
+                          "masked_latent": {0: "batch", 2: "height", 3: "width"}},
             opset_version=opset, dynamo=False,
         )
 
