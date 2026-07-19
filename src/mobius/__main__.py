@@ -127,9 +127,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if args.max_seq_len is not None and args.max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
 
-    if args.max_length is not None and args.runtime != "onnx-genai":
+    max_length = getattr(args, "max_length", None)
+    if max_length is not None and args.runtime != "onnx-genai":
         raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
-    if args.max_length is not None and args.max_length <= 0:
+    if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
 
     # Validate --static-cache + --task compatibility

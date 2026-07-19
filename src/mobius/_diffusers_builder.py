@@ -128,41 +128,43 @@ def _download_diffusers_component_weights(
     from huggingface_hub.utils import EntryNotFoundError
 
     prefix = f"{component_name}/"
-    # Diffusers uses two naming conventions for weight files
-    weight_basenames = ["diffusion_pytorch_model", "model"]
+    # Diffusers uses two naming conventions for the weight basename, and either
+    # safetensors (preferred) or PyTorch .bin serialization. Some real repos
+    # (e.g. OFA-Sys/small-stable-diffusion-v0) ship only .bin.
+    weight_basenames = ["diffusion_pytorch_model", "pytorch_model", "model"]
 
     all_files = None
-    for basename in weight_basenames:
-        try:
-            index_path = hf_hub_download(
-                repo_id=model_id,
-                filename=f"{prefix}{basename}.safetensors.index.json",
-            )
-            with open(index_path) as f:
-                index = json.load(f)
-            all_files = sorted(set(index["weight_map"].values()))
-            break
-        except EntryNotFoundError:
-            continue
-
-    if all_files is None:
-        # No index file found — try single-file weights
+    for ext in ("safetensors", "bin"):
+        # Sharded weights: <basename>.<ext>.index.json maps params -> shard files.
         for basename in weight_basenames:
             try:
-                hf_hub_download(
+                index_path = hf_hub_download(
                     repo_id=model_id,
-                    filename=f"{prefix}{basename}.safetensors",
+                    filename=f"{prefix}{basename}.{ext}.index.json",
                 )
-                all_files = [f"{basename}.safetensors"]
+                with open(index_path) as f:
+                    index = json.load(f)
+                all_files = sorted(set(index["weight_map"].values()))
                 break
             except EntryNotFoundError:
                 continue
+        if all_files is not None:
+            break
+        # Single-file weights.
+        for basename in weight_basenames:
+            try:
+                hf_hub_download(repo_id=model_id, filename=f"{prefix}{basename}.{ext}")
+                all_files = [f"{basename}.{ext}"]
+                break
+            except EntryNotFoundError:
+                continue
+        if all_files is not None:
+            break
 
     if all_files is None:
         raise FileNotFoundError(
             f"Could not find weight files for component '{component_name}' "
-            f"in '{model_id}'. Tried diffusion_pytorch_model.safetensors "
-            f"and model.safetensors."
+            f"in '{model_id}'. Tried {weight_basenames} with .safetensors and .bin."
         )
 
     paths = _parallel_download(
@@ -173,7 +175,10 @@ def _download_diffusers_component_weights(
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc=f"Loading {component_name} weights"):
-        state_dict.update(safetensors.torch.load_file(path))
+        if path.endswith(".safetensors"):
+            state_dict.update(safetensors.torch.load_file(path))
+        else:
+            state_dict.update(torch.load(path, map_location="cpu", weights_only=True))
     return state_dict
 
 
