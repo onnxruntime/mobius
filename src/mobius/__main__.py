@@ -299,12 +299,12 @@ def _save_package(
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
-        from mobius.integrations.onnx_genai import write_inference_metadata
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
 
-        path = write_inference_metadata(
-            pkg, output_dir, max_sequence_length=getattr(args, "max_length", None)
-        )
-        print(f"  inference_metadata: {path}")
+        config = getattr(pkg, "config", None)
+        artifacts = write_onnx_genai_config(pkg, output_dir, config=config)
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
@@ -567,25 +567,15 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument(
         "--runtime",
         default=None,
-        choices=["onnx-genai", "ort-genai"],
+        choices=["ort-genai", "onnx-genai"],
         metavar="RUNTIME",
         help=(
-            "Generate runtime-specific config files after building. "
-            "Supports: 'onnx-genai' (writes inference_metadata.yaml) and "
-            "'ort-genai' (writes genai_config.json and copies tokenizer files). "
-            "For ort-genai, --model downloads tokenizer files from HuggingFace "
-            "and --config copies them from the local directory."
-        ),
-    )
-    build_parser.add_argument(
-        "--max-length",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Serving KV capacity written to onnx-genai inference metadata. "
-            "Only used with --runtime onnx-genai. Defaults to the smaller of "
-            "4096 and the model's max_position_embeddings."
+            "Generate runtime-specific config files after building. Supports: "
+            "'ort-genai' (writes genai_config.json + copies tokenizer files) and "
+            "'onnx-genai' (writes inference_metadata.yaml — a decoder attention/KV "
+            "document for LLMs, or an iterative pipeline document for diffusion). "
+            "When used with --model, tokenizer files are downloaded from HuggingFace; "
+            "with --config (local directory), they are copied from that directory."
         ),
     )
     build_parser.add_argument(
