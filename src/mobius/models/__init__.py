@@ -68,6 +68,7 @@ __all__ = [
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
+    "LLaDAModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "LongcatFlashCausalLMModel",
@@ -198,6 +199,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.llada import LLaDAModel
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
