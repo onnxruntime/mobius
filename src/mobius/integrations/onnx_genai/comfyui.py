@@ -61,6 +61,8 @@ _LATENT_NODES = ("EmptyLatentImage", "EmptySD3LatentImage")
 _SAMPLER_KIND = {
     "euler": "euler",
     "ddim": "ddim",
+    "dpmpp_2m": "dpmpp_2m",
+    "dpm_2m": "dpmpp_2m",
 }
 
 # Sigma spacings onnx-genai's Euler currently reproduces (linspace). Others

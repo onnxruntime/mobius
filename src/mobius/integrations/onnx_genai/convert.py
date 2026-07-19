@@ -93,6 +93,17 @@ def _diffusers_timesteps(kind: str, exported: ExportedCheckpoint, steps: int) ->
             from diffusers import EulerDiscreteScheduler as _Sched
 
             extra = {"timestep_spacing": "linspace", "interpolation_type": "linear"}
+        elif kind == "dpmpp_2m":
+            from diffusers import DPMSolverMultistepScheduler as _Sched
+
+            extra = {
+                "algorithm_type": "dpmsolver++",
+                "solver_order": 2,
+                "solver_type": "midpoint",
+                "use_karras_sigmas": False,
+                "timestep_spacing": "linspace",
+                "final_sigmas_type": "zero",
+            }
         else:
             from diffusers import DDIMScheduler as _Sched
 

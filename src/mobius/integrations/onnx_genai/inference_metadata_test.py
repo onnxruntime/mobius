@@ -99,6 +99,10 @@ class TestBuildDiffusionPipelineMetadata:
         assert sched.kind == "euler"
         assert sched.beta_schedule == "scaled_linear"
 
+    def test_scheduler_maps_dpmsolver_class(self):
+        sched = SchedulerConfig.from_diffusers({"_class_name": "DPMSolverMultistepScheduler"})
+        assert sched.kind == "dpmpp_2m"
+
     def test_scheduler_defaults_to_ddim_when_class_absent(self):
         assert SchedulerConfig.from_diffusers({}).kind == "ddim"
 
@@ -108,7 +112,7 @@ class TestBuildDiffusionPipelineMetadata:
 
     def test_scheduler_rejects_unsupported_class(self):
         with pytest.raises(ValueError, match="unsupported"):
-            SchedulerConfig.from_diffusers({"_class_name": "DPMSolverMultistepScheduler"})
+            SchedulerConfig.from_diffusers({"_class_name": "LMSDiscreteScheduler"})
 
     def test_load_scheduler_from_local_checkpoint(self, tmp_path):
         import json
@@ -135,7 +139,7 @@ class TestBuildDiffusionPipelineMetadata:
         sd = tmp_path / "scheduler"
         sd.mkdir()
         (sd / "scheduler_config.json").write_text(
-            json.dumps({"_class_name": "DPMSolverMultistepScheduler"})
+            json.dumps({"_class_name": "LMSDiscreteScheduler"})
         )
         # Unsupported scheduler must not raise from the loader; returns None so
         # the caller falls back to the DDIM default.

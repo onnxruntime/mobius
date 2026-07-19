@@ -96,6 +96,13 @@ def test_ddim_sampler_maps_to_ddim():
     assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "ddim"
 
 
+def test_dpmpp_2m_sampler_maps_to_dpmpp_2m():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["3"]["inputs"]["sampler_name"] = "dpmpp_2m"
+    meta = translate_comfyui_workflow(wf)
+    assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "dpmpp_2m"
+
+
 def test_cfg_one_disables_guidance():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["cfg"] = 1.0
@@ -110,7 +117,7 @@ def test_prompt_wrapper_is_accepted():
 
 def test_unsupported_sampler_rejected():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
-    wf["3"]["inputs"]["sampler_name"] = "dpmpp_2m"
+    wf["3"]["inputs"]["sampler_name"] = "dpmpp_2m_sde"
     with pytest.raises(ValueError, match="no onnx-genai equivalent"):
         translate_comfyui_workflow(wf)
 

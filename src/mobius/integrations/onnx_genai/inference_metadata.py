@@ -80,6 +80,8 @@ class SchedulerConfig:
             )
         if not name or "ddim" in name:
             kind = "ddim"
+        elif "dpmsolvermultistep" in name or "dpm++" in name or "dpmpp" in name:
+            kind = "dpmpp_2m"
         elif "euler" in name:
             kind = "euler"
         else:
