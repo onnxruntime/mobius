@@ -1,151 +1,189 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Generate onnx-genai ``inference_metadata.yaml`` sidecars."""
+"""Emit onnx-genai ``inference_metadata`` for diffusion pipelines.
+
+Mobius builds the neural components of a diffusion model (denoiser transformer,
+VAE, and — externally — a text encoder) as separate ONNX graphs, but does not
+itself carry a scheduler loop. onnx-genai's *iterative* pipeline supplies that
+loop declaratively: given an ``inference_metadata`` document describing the
+components, the loop-carried dataflow, a timestep input, a scheduler, and
+(optionally) classifier-free guidance, it drives the denoise loop and returns
+the decoded output.
+
+This module produces that document from the component filenames + a scheduler
+config. It reads no torch/diffusers state — only plain values — so it is cheap
+to unit-test and safe to call anywhere.
+
+The emitted contract matches onnx-genai's pipeline schema:
+``schema/inference_metadata.schema.json`` (kind ``iterative`` with
+``denoiser`` / ``num_steps`` / ``timestep_input`` / ``scheduler_config`` /
+``cfg_conditioning_input`` and denoiser self-edge loop-carried dataflow).
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Any
 
-import onnx_ir as ir
-
-from mobius._model_package import ModelPackage
-
-_DTYPE_NAMES = {
-    ir.DataType.FLOAT: "float32",
-    ir.DataType.FLOAT16: "float16",
-    ir.DataType.BFLOAT16: "bfloat16",
-}
-_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+import yaml
 
 
-def _positive_int(config: object, name: str) -> int:
-    value = getattr(config, name, None)
-    if not isinstance(value, int) or value <= 0:
-        raise ValueError(
-            f"onnx-genai inference metadata requires a positive {name}, got {value!r}."
+@dataclasses.dataclass(frozen=True)
+class SchedulerConfig:
+    """Diffusion noise-schedule parameters for onnx-genai's DDIM scheduler."""
+
+    kind: str = "ddim"
+    num_train_timesteps: int = 1000
+    beta_start: float = 0.00085
+    beta_end: float = 0.012
+    prediction_type: str = "epsilon"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "num_train_timesteps": self.num_train_timesteps,
+            "beta_start": self.beta_start,
+            "beta_end": self.beta_end,
+            "prediction_type": self.prediction_type,
+        }
+
+    @classmethod
+    def from_diffusers(cls, config: dict[str, Any]) -> "SchedulerConfig":
+        """Build from a diffusers ``scheduler/scheduler_config.json`` dict.
+
+        Unknown/absent fields fall back to the DDIM defaults. Only the schedule
+        parameters onnx-genai consumes are read; the diffusers scheduler class
+        name is mapped to ``kind`` where recognized (currently DDIM).
+        """
+        name = str(config.get("_class_name", "")).lower()
+        kind = "ddim" if "ddim" in name or not name else "ddim"
+        return cls(
+            kind=kind,
+            num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
+            beta_start=float(config.get("beta_start", 0.00085)),
+            beta_end=float(config.get("beta_end", 0.012)),
+            prediction_type=str(config.get("prediction_type", "epsilon")),
         )
-    return value
 
 
-def _kv_dtype(config: object) -> str:
-    dtype = getattr(config, "dtype", None)
-    try:
-        return _DTYPE_NAMES[dtype]
-    except KeyError:
-        raise ValueError(
-            "onnx-genai inference metadata supports float32, float16, or bfloat16 "
-            f"KV caches, got {dtype!r}."
-        ) from None
-
-
-def _max_sequence_length(config: object, requested: int | None) -> int:
-    model_max = _positive_int(config, "max_position_embeddings")
-    if requested is None:
-        return min(model_max, _DEFAULT_MAX_SEQUENCE_LENGTH)
-    if not isinstance(requested, int) or requested <= 0:
-        raise ValueError(
-            f"onnx-genai max_sequence_length must be a positive integer, got {requested!r}."
-        )
-    if requested > model_max:
-        raise ValueError(
-            f"onnx-genai max_sequence_length {requested} exceeds the model limit {model_max}."
-        )
-    return requested
-
-
-def generate_inference_metadata(
-    config: object, *, max_sequence_length: int | None = None
+def build_diffusion_pipeline_metadata(
+    *,
+    num_inference_steps: int,
+    denoiser_filename: str = "denoiser.onnx",
+    denoiser_sample_input: str = "sample",
+    denoiser_timestep_input: str = "timestep",
+    denoiser_conditioning_input: str = "encoder_hidden_states",
+    denoiser_output: str = "noise_pred",
+    scheduler: SchedulerConfig | None = None,
+    guidance_scale: float | None = None,
+    vae_filename: str | None = None,
+    vae_latent_input: str = "latent_sample",
+    text_encoder_filename: str | None = None,
+    text_encoder_output: str = "last_hidden_state",
 ) -> dict[str, Any]:
-    """Map a decoder config to metadata with a conservative serving KV capacity."""
-    num_attention_heads = _positive_int(config, "num_attention_heads")
-    num_kv_heads = _positive_int(config, "num_key_value_heads")
-    head_dim = _positive_int(config, "head_dim")
-    max_sequence_length = _max_sequence_length(config, max_sequence_length)
-    kv_dtype = _kv_dtype(config)
+    """Build the onnx-genai ``inference_metadata`` dict for a diffusion pipeline.
 
-    is_gqa = num_kv_heads != num_attention_heads
-    capabilities = ["grouped_query_attention" if is_gqa else "multi_head_attention"]
+    The denoiser runs an iterative loop: its ``denoiser_output`` (a noise
+    prediction) is fed back to ``denoiser_sample_input`` each step (a
+    loop-carried self-edge), the scheduler combines it with the current latent,
+    the per-step timestep is injected into ``denoiser_timestep_input``, and the
+    conditioning is supplied on ``denoiser_conditioning_input``.
 
-    attention: dict[str, Any] = {
-        "type": "group_query_attention" if is_gqa else "multi_head_attention",
-        "num_kv_heads": num_kv_heads,
-        "num_attention_heads": num_attention_heads,
-        "head_dim": head_dim,
+    Args:
+        num_inference_steps: Number of denoise steps (``strategy.num_steps``).
+        denoiser_*: Denoiser component filename and I/O port names.
+        scheduler: Noise-schedule config (defaults to DDIM defaults).
+        guidance_scale: When set and != 1.0, enables classifier-free guidance
+            (the conditioning input is zeroed on the unconditional pass).
+        vae_filename: Optional VAE decoder; runs ``final_only`` on the final
+            latent (``denoiser_sample_input``).
+        vae_latent_input: VAE latent input port name.
+        text_encoder_filename: Optional text encoder; runs ``prompt_only`` and
+            feeds ``denoiser_conditioning_input``.
+        text_encoder_output: Text encoder output port name.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key, ready to serialize to
+        ``inference_metadata.yaml``.
+    """
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be >= 1")
+    scheduler = scheduler or SchedulerConfig()
+
+    models: dict[str, Any] = {
+        "denoiser": {"filename": denoiser_filename, "type": "denoiser"},
     }
-    sliding_window = getattr(config, "sliding_window", None)
-    if isinstance(sliding_window, int) and sliding_window > 0:
-        attention["sliding_window"] = sliding_window
-
-    return {
-        "required_capabilities": capabilities,
-        "model": {
-            "attention": attention,
-            "max_sequence_length": max_sequence_length,
-            "runtime_configurable": {"kv_cache": {"dtype": [kv_dtype]}},
+    dataflow: list[dict[str, Any]] = [
+        # Loop-carried self-edge: previous step's prediction seeds the next.
+        {
+            "from": f"denoiser.{denoiser_output}",
+            "to": f"denoiser.{denoiser_sample_input}",
         },
-        "kv_cache": {"native_dtype": kv_dtype},
+    ]
+    phases: dict[str, Any] = {}
+
+    if text_encoder_filename is not None:
+        models["text_encoder"] = {
+            "filename": text_encoder_filename,
+            "type": "encoder",
+        }
+        dataflow.append(
+            {
+                "from": f"text_encoder.{text_encoder_output}",
+                "to": f"denoiser.{denoiser_conditioning_input}",
+            }
+        )
+        phases["text_encoder"] = {"run_on": "prompt_only"}
+
+    if vae_filename is not None:
+        models["vae"] = {"filename": vae_filename, "type": "vae"}
+        # The VAE decodes the final post-scheduler latent (the sample port).
+        dataflow.append(
+            {
+                "from": f"denoiser.{denoiser_sample_input}",
+                "to": f"vae.{vae_latent_input}",
+            }
+        )
+        phases["vae"] = {"run_on": "final_only"}
+
+    strategy: dict[str, Any] = {
+        "kind": "iterative",
+        "denoiser": "denoiser",
+        "num_steps": num_inference_steps,
+        "timestep_input": denoiser_timestep_input,
+        "scheduler_config": scheduler.to_metadata(),
     }
+    if guidance_scale is not None:
+        strategy["guidance_scale"] = guidance_scale
+        if guidance_scale != 1.0:
+            strategy["cfg_conditioning_input"] = denoiser_conditioning_input
+
+    pipeline: dict[str, Any] = {
+        "models": models,
+        "dataflow": dataflow,
+        "strategy": strategy,
+    }
+    if phases:
+        pipeline["phases"] = phases
+    return {"pipeline": pipeline}
 
 
-def _to_yaml(metadata: dict[str, Any]) -> str:
-    capabilities = metadata["required_capabilities"]
-    attention = metadata["model"]["attention"]
-    kv_dtypes = metadata["model"]["runtime_configurable"]["kv_cache"]["dtype"]
-
-    lines = ["required_capabilities:"]
-    if capabilities:
-        lines.extend(f"  - {capability}" for capability in capabilities)
-    else:
-        lines[-1] += " []"
-
-    lines.extend(
-        [
-            "model:",
-            "  attention:",
-            f"    type: {attention['type']}",
-            f"    num_kv_heads: {attention['num_kv_heads']}",
-            f"    num_attention_heads: {attention['num_attention_heads']}",
-            f"    head_dim: {attention['head_dim']}",
-        ]
-    )
-    if "sliding_window" in attention:
-        lines.append(f"    sliding_window: {attention['sliding_window']}")
-    lines.extend(
-        [
-            f"  max_sequence_length: {metadata['model']['max_sequence_length']}",
-            "  runtime_configurable:",
-            "    kv_cache:",
-            "      dtype:",
-            *(f"        - {dtype}" for dtype in kv_dtypes),
-            "kv_cache:",
-            f"  native_dtype: {metadata['kv_cache']['native_dtype']}",
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
-def write_inference_metadata(
-    pkg: ModelPackage,
+def write_diffusion_pipeline_metadata(
     directory: str,
     *,
-    max_sequence_length: int | None = None,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
 ) -> str:
-    """Write ``inference_metadata.yaml`` for an already-built model package."""
-    config = getattr(pkg, "config", None)
-    if config is None:
-        raise ValueError(
-            "write_inference_metadata requires ModelPackage.config to be set. "
-            "This is set automatically when building with mobius.build()."
-        )
+    """Build and write ``inference_metadata.yaml`` into ``directory``.
 
+    Extra keyword arguments are forwarded to
+    :func:`build_diffusion_pipeline_metadata`. Returns the written path.
+    """
+    metadata = build_diffusion_pipeline_metadata(**kwargs)
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "inference_metadata.yaml")
-    with open(path, "w", encoding="utf-8") as file:
-        file.write(
-            _to_yaml(
-                generate_inference_metadata(config, max_sequence_length=max_sequence_length)
-            )
-        )
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
     return path

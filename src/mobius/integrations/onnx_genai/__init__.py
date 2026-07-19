@@ -1,11 +1,27 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""onnx-genai integration for inference metadata generation."""
+"""onnx-genai integration: inference_metadata.yaml generation.
+
+onnx-genai (https://github.com/justinchuby/onnx-genai) is a standard-driven
+runtime whose behavior is declared by an ``inference_metadata`` document rather
+than hardcoded per-model dispatch. This module emits the pipeline section for
+multi-model diffusion packages (denoiser + optional VAE / text encoder) so a
+Mobius-built diffusion package is directly runnable by onnx-genai's iterative
+pipeline (`PipelineEngine::run_pipeline`).
+
+The core model/task/component layers remain runtime-agnostic; all onnx-genai
+specific code lives here.
+"""
 
 from mobius.integrations.onnx_genai.inference_metadata import (
-    generate_inference_metadata,
-    write_inference_metadata,
+    SchedulerConfig,
+    build_diffusion_pipeline_metadata,
+    write_diffusion_pipeline_metadata,
 )
 
-__all__ = ["generate_inference_metadata", "write_inference_metadata"]
+__all__ = [
+    "SchedulerConfig",
+    "build_diffusion_pipeline_metadata",
+    "write_diffusion_pipeline_metadata",
+]
