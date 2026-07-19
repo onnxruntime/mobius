@@ -127,9 +127,7 @@ def test_full_unet_without_lora_has_no_gate_inputs():
     )
     module = UNet2DConditionModel(config)
     graph = DenoisingTask().build(module, config)["model"].graph
-    assert not any(
-        value.name and "lora_gate" in value.name for value in graph.inputs
-    )
+    assert not any(value.name and "lora_gate" in value.name for value in graph.inputs)
 
 
 def test_remap_diffusers_lora_keys():
@@ -176,7 +174,11 @@ def test_remapped_keys_match_baked_unet_param_names():
         lora_adapters=(("style", 4, 1.0),),
     )
     graph = DenoisingTask().build(UNet2DConditionModel(config), config)["model"].graph
-    baked = {name for name in _referenced_names(graph) if "lora_A.style" in name or "lora_B.style" in name}
+    baked = {
+        name
+        for name in _referenced_names(graph)
+        if "lora_A.style" in name or "lora_B.style" in name
+    }
     assert baked  # sanity
 
     # A diffusers key for a projection that exists in this tiny UNet.

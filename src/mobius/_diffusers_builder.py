@@ -187,8 +187,7 @@ def _load_diffusers_component_config(model_id: str, component_name: str) -> dict
 
 
 def _prepare_unet_loras(unet_loras: dict) -> tuple[tuple, dict]:
-    """Load each UNet LoRA ``.safetensors`` and return the baked-adapter specs +
-    the merged remapped weights.
+    """Load each UNet LoRA ``.safetensors``; return baked-adapter specs + merged weights.
 
     ``unet_loras`` maps ``adapter_name -> safetensors path``. The rank is inferred
     from each adapter's ``lora_A`` factor (``[rank, in]``); the baked scale is

@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -63,7 +64,7 @@ class SchedulerConfig:
         return meta
 
     @classmethod
-    def from_diffusers(cls, config: dict[str, Any]) -> "SchedulerConfig":
+    def from_diffusers(cls, config: dict[str, Any]) -> SchedulerConfig:
         """Build from a diffusers ``scheduler/scheduler_config.json`` dict.
 
         Unknown/absent schedule parameters fall back to the (Stable Diffusion)
@@ -106,8 +107,8 @@ class SchedulerConfig:
             beta_end=float(config.get("beta_end", 0.012)),
             beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
             prediction_type=str(config.get("prediction_type", "epsilon")),
-            use_karras_sigmas=bool(config.get("use_karras_sigmas", False)),
-            use_exponential_sigmas=bool(config.get("use_exponential_sigmas", False)),
+            use_karras_sigmas=bool(config.get("use_karras_sigmas")),
+            use_exponential_sigmas=bool(config.get("use_exponential_sigmas")),
         )
 
 
@@ -139,7 +140,7 @@ def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | Non
             path = hf_hub_download(source, "scheduler/scheduler_config.json")
             with open(path, encoding="utf-8") as handle:
                 raw = json.load(handle)
-        except Exception as err:  # noqa: BLE001 - network/hub errors are non-fatal
+        except Exception as err:
             _LOGGER.info("no diffusers scheduler config for %r (%s)", source, err)
             return None
     try:
@@ -162,8 +163,9 @@ def build_language_diffusion_pipeline_metadata(
     temperature: float | None = None,
     guidance_scale: float | None = None,
 ) -> dict[str, Any]:
-    """Build the onnx-genai ``inference_metadata`` for a masked (discrete)
-    language-diffusion model (e.g. LLaDA / Dream).
+    """Build the onnx-genai ``inference_metadata`` for a masked language-diffusion model.
+
+    For a masked (discrete) language-diffusion model (e.g. LLaDA / Dream).
 
     The model is a mask predictor: it takes an int64 token sequence on
     ``input_ids_port`` (prompt tokens plus a masked generation region) and emits
@@ -208,7 +210,7 @@ def build_language_diffusion_pipeline_metadata(
         "num_steps": num_inference_steps,
         "scheduler_config": scheduler_config,
     }
-    if guidance_scale is not None and guidance_scale != 1.0:
+    if guidance_scale is not None and not math.isclose(guidance_scale, 1.0):
         strategy["guidance_scale"] = guidance_scale
 
     pipeline: dict[str, Any] = {
@@ -322,7 +324,7 @@ def build_diffusion_pipeline_metadata(
         strategy["timesteps"] = [float(t) for t in timesteps]
     if guidance_scale is not None:
         strategy["guidance_scale"] = guidance_scale
-        if guidance_scale != 1.0:
+        if not math.isclose(guidance_scale, 1.0):
             strategy["cfg_conditioning_input"] = denoiser_conditioning_input
     if start_step:
         if not 0 < start_step < num_inference_steps:

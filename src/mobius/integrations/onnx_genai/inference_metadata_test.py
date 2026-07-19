@@ -71,7 +71,7 @@ class TestBuildDiffusionPipelineMetadata:
         assert pipe["phases"]["text_encoder"] == {"run_on": "prompt_only"}
         assert pipe["phases"]["vae"] == {"run_on": "final_only"}
         # CFG enabled -> conditioning input declared for the unconditional pass.
-        assert pipe["strategy"]["guidance_scale"] == 7.5
+        assert pipe["strategy"]["guidance_scale"] == pytest.approx(7.5)
         assert pipe["strategy"]["cfg_conditioning_input"] == "encoder_hidden_states"
 
     def test_sdxl_dual_conditioning_edges(self):
@@ -86,14 +86,14 @@ class TestBuildDiffusionPipelineMetadata:
             ],
         )
         flow = meta["pipeline"]["dataflow"]
-        assert {"from": "text_encoder.encoder_hidden_states",
-                "to": "denoiser.encoder_hidden_states"} in flow
+        assert {
+            "from": "text_encoder.encoder_hidden_states",
+            "to": "denoiser.encoder_hidden_states",
+        } in flow
         assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow
 
     def test_guidance_scale_one_does_not_enable_cfg(self):
-        meta = build_diffusion_pipeline_metadata(
-            num_inference_steps=2, guidance_scale=1.0
-        )
+        meta = build_diffusion_pipeline_metadata(num_inference_steps=2, guidance_scale=1.0)
         assert "cfg_conditioning_input" not in meta["pipeline"]["strategy"]
 
     def test_scheduler_from_diffusers_config(self):
@@ -107,7 +107,7 @@ class TestBuildDiffusionPipelineMetadata:
             }
         )
         assert sched.kind == "ddim"
-        assert sched.beta_end == 0.02
+        assert sched.beta_end == pytest.approx(0.02)
 
     def test_scheduler_maps_euler_class(self):
         sched = SchedulerConfig.from_diffusers(
@@ -124,7 +124,9 @@ class TestBuildDiffusionPipelineMetadata:
         assert SchedulerConfig.from_diffusers({}).kind == "ddim"
 
     def test_scheduler_maps_euler_ancestral(self):
-        sched = SchedulerConfig.from_diffusers({"_class_name": "EulerAncestralDiscreteScheduler"})
+        sched = SchedulerConfig.from_diffusers(
+            {"_class_name": "EulerAncestralDiscreteScheduler"}
+        )
         assert sched.kind == "euler_ancestral"
 
     def test_scheduler_rejects_ancestral(self):
@@ -142,14 +144,12 @@ class TestBuildDiffusionPipelineMetadata:
         sd = tmp_path / "scheduler"
         sd.mkdir()
         (sd / "scheduler_config.json").write_text(
-            json.dumps(
-                {"_class_name": "EulerDiscreteScheduler", "beta_end": 0.015}
-            )
+            json.dumps({"_class_name": "EulerDiscreteScheduler", "beta_end": 0.015})
         )
         sched = load_diffusers_scheduler_config(str(tmp_path))
         assert sched is not None
         assert sched.kind == "euler"
-        assert sched.beta_end == 0.015
+        assert sched.beta_end == pytest.approx(0.015)
 
     def test_load_scheduler_none_when_absent(self, tmp_path):
         assert load_diffusers_scheduler_config(str(tmp_path)) is None
@@ -175,7 +175,8 @@ class TestBuildDiffusionPipelineMetadata:
         path = write_diffusion_pipeline_metadata(
             str(tmp_path), num_inference_steps=3, vae_filename="vae.onnx"
         )
-        loaded = yaml.safe_load(open(path))
+        with open(path) as handle:
+            loaded = yaml.safe_load(handle)
         assert loaded["pipeline"]["strategy"]["num_steps"] == 3
         assert "vae" in loaded["pipeline"]["models"]
 
@@ -232,9 +233,9 @@ class TestLanguageDiffusionMetadata:
             guidance_scale=2.5,  # LLaDA cfg_scale=1.5 => cfg_scale + 1
         )
         strategy = meta["pipeline"]["strategy"]
-        assert strategy["guidance_scale"] == 2.5
+        assert strategy["guidance_scale"] == pytest.approx(2.5)
         assert strategy["scheduler_config"]["block_length"] == 32
-        assert strategy["scheduler_config"]["temperature"] == 0.2
+        assert strategy["scheduler_config"]["temperature"] == pytest.approx(0.2)
 
     def test_custom_ports(self):
         meta = build_language_diffusion_pipeline_metadata(
@@ -246,15 +247,11 @@ class TestLanguageDiffusionMetadata:
         )
         pipeline = meta["pipeline"]
         assert pipeline["models"]["denoiser"]["filename"] == "llada.onnx"
-        assert pipeline["dataflow"] == [
-            {"from": "denoiser.scores", "to": "denoiser.tokens"}
-        ]
+        assert pipeline["dataflow"] == [{"from": "denoiser.scores", "to": "denoiser.tokens"}]
 
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError):
-            build_language_diffusion_pipeline_metadata(
-                mask_token_id=1, num_inference_steps=0
-            )
+            build_language_diffusion_pipeline_metadata(mask_token_id=1, num_inference_steps=0)
 
     def test_matches_onnx_genai_json_schema(self):
         schema_path = _onnx_genai_schema_path()

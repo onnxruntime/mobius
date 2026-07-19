@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -53,9 +54,11 @@ class ConversionResult:
 def _scheduler_for_workflow(
     workflow: ComfyUIWorkflow, checkpoint_source: str | None
 ) -> SchedulerConfig:
-    """Build the scheduler config: sampler *kind*/*spacing* from the ComfyUI graph,
-    noise *schedule* (betas) from the diffusers checkpoint config (SD defaults if
-    unavailable)."""
+    """Build the scheduler config from the workflow + diffusers checkpoint config.
+
+    Sampler *kind*/*spacing* come from the ComfyUI graph; the noise *schedule*
+    (betas) from the diffusers checkpoint config (SD defaults if unavailable).
+    """
     base = load_diffusers_scheduler_config(checkpoint_source) if checkpoint_source else None
     return SchedulerConfig(
         kind=workflow.scheduler_kind,
@@ -84,7 +87,7 @@ def build_pipeline_metadata_for_workflow(
     """
     has_vae = "vae" in workflow.metadata["pipeline"]["models"]
     has_text = "text_encoder" in workflow.metadata["pipeline"]["models"]
-    guidance = workflow.cfg if workflow.cfg != 1.0 else None
+    guidance = workflow.cfg if not math.isclose(workflow.cfg, 1.0) else None
     # SDXL routes two conditioning edges (concatenated hidden states + pooled
     # text_embeds); its time_ids is an external denoiser input the driver supplies.
     text_encoder_edges = None
@@ -114,8 +117,11 @@ def _diffusers_timesteps(
     use_karras: bool = False,
     use_exponential: bool = False,
 ) -> list[float] | None:
-    """Compute the exact inference timesteps diffusers would use, so the denoiser
-    is fed the right timestep values. Best-effort; ``None`` on any failure."""
+    """Compute the exact diffusers inference timesteps for the denoiser.
+
+    So the denoiser is fed the right timestep values. Best-effort; ``None`` on
+    any failure.
+    """
     try:
         if kind == "euler":
             from diffusers import EulerDiscreteScheduler as _Sched
@@ -156,7 +162,7 @@ def _diffusers_timesteps(
         )
         sched.set_timesteps(steps)
         return [float(t) for t in sched.timesteps]
-    except Exception as err:  # noqa: BLE001 - timesteps are an optimization, not required
+    except Exception as err:
         _LOGGER.warning("could not compute diffusers timesteps (%s); omitting", err)
         return None
 

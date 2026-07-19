@@ -317,7 +317,10 @@ class _DownBlock2D(nn.Module):
                 num_heads = attention_head_dim
                 self.attentions.append(
                     _CrossAttentionBlock(
-                        out_channels, cross_attention_dim, num_heads, norm_num_groups,
+                        out_channels,
+                        cross_attention_dim,
+                        num_heads,
+                        norm_num_groups,
                         linear_class=linear_class,
                         use_linear_projection=use_linear_projection,
                     )
@@ -388,7 +391,10 @@ class _UpBlock2D(nn.Module):
                 num_heads = attention_head_dim
                 self.attentions.append(
                     _CrossAttentionBlock(
-                        out_channels, cross_attention_dim, num_heads, norm_num_groups,
+                        out_channels,
+                        cross_attention_dim,
+                        num_heads,
+                        norm_num_groups,
                         linear_class=linear_class,
                         use_linear_projection=use_linear_projection,
                     )
@@ -482,7 +488,10 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
         self.attentions = nn.ModuleList()
         self.attentions.append(
             _CrossAttentionBlock(
-                channels, cross_attention_dim, num_heads, norm_num_groups,
+                channels,
+                cross_attention_dim,
+                num_heads,
+                norm_num_groups,
                 linear_class=linear_class,
                 use_linear_projection=use_linear_projection,
             )
@@ -710,11 +719,8 @@ class UNet2DConditionModel(nn.Module):
         return renamed
 
 
-def remap_diffusers_unet_lora(
-    lora_state_dict: dict, adapter_name: str
-) -> dict:
-    """Remap a diffusers-format UNet LoRA state dict to this UNet's baked
-    ``LoRALinear`` parameter names.
+def remap_diffusers_unet_lora(lora_state_dict: dict, adapter_name: str) -> dict:
+    """Remap a diffusers-format UNet LoRA state dict to this UNet's baked param names.
 
     diffusers (via ``convert_state_dict_to_diffusers`` / PEFT) names the low-rank
     factors under a per-attention ``transformer_blocks.{i}`` level and without an
@@ -755,8 +761,9 @@ def remap_diffusers_unet_lora(
 
 
 def load_unet_lora_safetensors(path: str, adapter_name: str) -> dict:
-    """Load a diffusers-format UNet LoRA ``.safetensors`` and remap its keys onto
-    this UNet's baked ``LoRALinear`` params for ``adapter_name``.
+    """Load a diffusers-format UNet LoRA ``.safetensors`` and remap onto baked params.
+
+    Remaps for ``adapter_name`` onto this UNet's baked ``LoRALinear`` params.
 
     The returned dict is ready to merge into the UNet component's state dict
     (baked slots come from ``UNet2DConfig.lora_adapters``) before

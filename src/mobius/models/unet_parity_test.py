@@ -66,9 +66,7 @@ def test_cross_attention_block_matches_diffusers():
     with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
         onnx_ir.save(model, handle.name)
         session = ort.InferenceSession(handle.name)
-        actual = session.run(
-            None, {"hidden": hidden.numpy(), "context": context.numpy()}
-        )[0]
+        actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
     assert np.abs(actual - expected).max() < 1e-4
 
 

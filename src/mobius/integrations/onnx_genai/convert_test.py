@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mobius.integrations.onnx_genai.comfyui import parse_comfyui_workflow
 from mobius.integrations.onnx_genai.convert import build_pipeline_metadata_for_workflow
 from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
@@ -45,17 +47,15 @@ _SCHEDULER = SchedulerConfig(
 def test_reconciles_workflow_sampler_with_checkpoint_schedule():
     wf = parse_comfyui_workflow(_WF)
     fake_ts = [float(x) for x in range(25)]
-    meta = build_pipeline_metadata_for_workflow(
-        wf, _SCHEDULER, timesteps=fake_ts
-    )
+    meta = build_pipeline_metadata_for_workflow(wf, _SCHEDULER, timesteps=fake_ts)
     strat = meta["pipeline"]["strategy"]
     # sampler kind/steps/cfg from the ComfyUI graph ...
     assert strat["num_steps"] == 25
     assert strat["scheduler_config"]["kind"] == "ddim"
-    assert strat["guidance_scale"] == 6.5
+    assert strat["guidance_scale"] == pytest.approx(6.5)
     assert strat["timesteps"] == fake_ts
     # ... betas from the checkpoint (never present in the ComfyUI JSON).
-    assert strat["scheduler_config"]["beta_start"] == 0.00085
+    assert strat["scheduler_config"]["beta_start"] == pytest.approx(0.00085)
     assert strat["scheduler_config"]["beta_schedule"] == "scaled_linear"
     models = meta["pipeline"]["models"]
     assert {"denoiser", "vae", "text_encoder"} <= set(models)
@@ -81,6 +81,8 @@ def test_sdxl_exported_routes_dual_conditioning():
     wf = parse_comfyui_workflow(_WF)
     meta = build_pipeline_metadata_for_workflow(wf, _SCHEDULER, sdxl=True)
     flow = meta["pipeline"]["dataflow"]
-    assert {"from": "text_encoder.encoder_hidden_states",
-            "to": "denoiser.encoder_hidden_states"} in flow
+    assert {
+        "from": "text_encoder.encoder_hidden_states",
+        "to": "denoiser.encoder_hidden_states",
+    } in flow
     assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow

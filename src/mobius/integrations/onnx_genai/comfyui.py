@@ -40,6 +40,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 from typing import Any
 
 from mobius.integrations.onnx_genai.inference_metadata import (
@@ -125,7 +126,9 @@ def _resolve(nodes: dict[str, Any], ref: Any) -> dict[str, Any] | None:
     return node if isinstance(node, dict) else None
 
 
-def _find_single(nodes: dict[str, Any], class_types: tuple[str, ...], what: str) -> tuple[str, dict]:
+def _find_single(
+    nodes: dict[str, Any], class_types: tuple[str, ...], what: str
+) -> tuple[str, dict]:
     hits = [
         (nid, node)
         for nid, node in nodes.items()
@@ -173,8 +176,11 @@ def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int, int]:
     if node is not None and node.get("class_type") in _LATENT_NODES:
         inputs = node.get("inputs", {})
         try:
-            return (int(inputs.get("width", 512)), int(inputs.get("height", 512)),
-                    max(1, int(inputs.get("batch_size", 1))))
+            return (
+                int(inputs.get("width", 512)),
+                int(inputs.get("height", 512)),
+                max(1, int(inputs.get("batch_size", 1))),
+            )
         except (TypeError, ValueError):
             pass
     return 512, 512, 1
@@ -292,16 +298,20 @@ def parse_comfyui_workflow(
     controlnet = _find_controlnet(nodes)
 
     has_text_encoder = any(
-        isinstance(n, dict) and n.get("class_type") in _TEXT_ENCODE_NODES for n in nodes.values()
+        isinstance(n, dict) and n.get("class_type") in _TEXT_ENCODE_NODES
+        for n in nodes.values()
     )
     has_vae = any(
-        isinstance(n, dict) and n.get("class_type") in _VAE_DECODE_NODES for n in nodes.values()
+        isinstance(n, dict) and n.get("class_type") in _VAE_DECODE_NODES
+        for n in nodes.values()
     )
-    guidance = cfg if cfg != 1.0 else None
+    guidance = cfg if not math.isclose(cfg, 1.0) else None
 
     sched = scheduler or SchedulerConfig(
-        kind=kind, use_karras_sigmas=(spacing == "karras"),
-        use_exponential_sigmas=(spacing == "exponential"))
+        kind=kind,
+        use_karras_sigmas=(spacing == "karras"),
+        use_exponential_sigmas=(spacing == "exponential"),
+    )
     if sched.kind != kind:
         _LOGGER.warning(
             "overriding sampler-derived scheduler kind %r with %r from the supplied config",
@@ -349,8 +359,7 @@ def translate_comfyui_workflow(workflow: dict[str, Any], **kwargs: Any) -> dict[
 
 
 def parse_comfyui_workflow_file(path: str, **kwargs: Any) -> ComfyUIWorkflow:
-    """Load a ComfyUI API-format JSON file and parse it (see
-    :func:`parse_comfyui_workflow`)."""
+    """Load and parse a ComfyUI API-format JSON file (see :func:`parse_comfyui_workflow`)."""
     with open(path, encoding="utf-8") as handle:
         workflow = json.load(handle)
     return parse_comfyui_workflow(workflow, **kwargs)
