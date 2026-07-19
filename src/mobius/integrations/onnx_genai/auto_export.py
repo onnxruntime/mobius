@@ -17,6 +17,7 @@ from typing import Any
 from mobius.integrations.onnx_genai.decoder_metadata import write_decoder_metadata
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
 )
 
@@ -40,6 +41,7 @@ def write_onnx_genai_config(
     num_inference_steps: int = 30,
     scheduler: SchedulerConfig | None = None,
     guidance_scale: float | None = None,
+    source: str | None = None,
     **kwargs: Any,
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
@@ -48,10 +50,14 @@ def write_onnx_genai_config(
     dimensions. For a diffusion package, the denoiser/VAE/text-encoder filenames
     are taken from ``kwargs`` (see :func:`build_diffusion_pipeline_metadata`) or
     defaulted; ``num_inference_steps`` / ``scheduler`` / ``guidance_scale`` set
-    the loop.
+    the loop. When ``scheduler`` is not given and ``source`` (the diffusers
+    checkpoint dir or HF id) is provided, the scheduler is auto-read from the
+    checkpoint's ``scheduler/scheduler_config.json`` (falling back to DDIM).
     """
     os.makedirs(output_dir, exist_ok=True)
     if _looks_like_diffusion(pkg):
+        if scheduler is None:
+            scheduler = load_diffusers_scheduler_config(source)
         path = write_diffusion_pipeline_metadata(
             output_dir,
             num_inference_steps=num_inference_steps,

@@ -42,3 +42,20 @@ def test_dispatch_diffusion(tmp_path):
     meta = yaml.safe_load(open(arts["inference_metadata"]))
     assert meta["pipeline"]["strategy"]["kind"] == "iterative"
     assert "vae" in meta["pipeline"]["models"]
+
+
+def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
+    import json
+
+    src = tmp_path / "ckpt"
+    (src / "scheduler").mkdir(parents=True)
+    (src / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps({"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"})
+    )
+    out = tmp_path / "out"
+    pkg = _DiffusionPkg({"denoiser": object()})
+    arts = write_onnx_genai_config(
+        pkg, str(out), num_inference_steps=15, source=str(src),
+    )
+    meta = yaml.safe_load(open(arts["inference_metadata"]))
+    assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler"

@@ -24,15 +24,19 @@ The emitted contract matches onnx-genai's pipeline schema:
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import os
 from typing import Any
 
 import yaml
 
+_LOGGER = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass(frozen=True)
 class SchedulerConfig:
-    """Diffusion noise-schedule parameters for onnx-genai's DDIM scheduler."""
+    """Diffusion noise-schedule parameters for an onnx-genai scheduler."""
 
     kind: str = "ddim"
     num_train_timesteps: int = 1000
@@ -55,12 +59,34 @@ class SchedulerConfig:
     def from_diffusers(cls, config: dict[str, Any]) -> "SchedulerConfig":
         """Build from a diffusers ``scheduler/scheduler_config.json`` dict.
 
-        Unknown/absent fields fall back to the (Stable Diffusion) defaults. Only
-        the schedule parameters onnx-genai consumes are read; the diffusers
-        scheduler class name is mapped to ``kind`` where recognized (DDIM).
+        Unknown/absent schedule parameters fall back to the (Stable Diffusion)
+        defaults. The diffusers scheduler class name (``_class_name``) is mapped
+        to an onnx-genai scheduler ``kind``:
+
+        * ``DDIMScheduler``  -> ``ddim``
+        * ``EulerDiscreteScheduler`` (non-ancestral) -> ``euler``
+
+        Ancestral samplers (which inject fresh noise every step) have no
+        deterministic onnx-genai equivalent and are rejected, as are scheduler
+        classes onnx-genai does not implement, so a Mobius-built package never
+        silently runs the wrong denoise dynamics.
         """
-        name = str(config.get("_class_name", "")).lower()
-        kind = "ddim" if "ddim" in name or not name else "ddim"
+        raw_name = str(config.get("_class_name", ""))
+        name = raw_name.lower()
+        if "ancestral" in name or "sde" in name:
+            raise ValueError(
+                f"onnx-genai has no equivalent for the stochastic diffusers scheduler "
+                f"{raw_name!r}; supported: DDIMScheduler, EulerDiscreteScheduler"
+            )
+        if not name or "ddim" in name:
+            kind = "ddim"
+        elif "euler" in name:
+            kind = "euler"
+        else:
+            raise ValueError(
+                f"unsupported diffusers scheduler {raw_name!r} for onnx-genai; "
+                f"supported kinds: ddim (DDIMScheduler), euler (EulerDiscreteScheduler)"
+            )
         return cls(
             kind=kind,
             num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
@@ -69,6 +95,46 @@ class SchedulerConfig:
             beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
             prediction_type=str(config.get("prediction_type", "epsilon")),
         )
+
+
+def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | None:
+    """Best-effort load of a diffusers ``scheduler/scheduler_config.json``.
+
+    ``source`` may be a local diffusers checkpoint directory or a Hugging Face
+    model id. Returns a :class:`SchedulerConfig` on success, or ``None`` when the
+    config cannot be found or names a scheduler onnx-genai does not implement
+    (in which case a warning is logged and the caller should fall back to the
+    DDIM default). This never raises for a missing/unsupported scheduler so a
+    model build is not blocked by scheduler-metadata resolution.
+    """
+    if not source:
+        return None
+    raw: dict[str, Any] | None = None
+    local = os.path.join(source, "scheduler", "scheduler_config.json")
+    if os.path.isfile(local):
+        try:
+            with open(local, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError) as err:
+            _LOGGER.warning("could not read %s: %s", local, err)
+            return None
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(source, "scheduler/scheduler_config.json")
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception as err:  # noqa: BLE001 - network/hub errors are non-fatal
+            _LOGGER.info("no diffusers scheduler config for %r (%s)", source, err)
+            return None
+    try:
+        return SchedulerConfig.from_diffusers(raw)
+    except ValueError as err:
+        _LOGGER.warning(
+            "%s; falling back to onnx-genai's default DDIM scheduler metadata", err
+        )
+        return None
 
 
 def build_diffusion_pipeline_metadata(

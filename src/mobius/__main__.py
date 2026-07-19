@@ -302,7 +302,8 @@ def _save_package(
         from mobius.integrations.onnx_genai import write_onnx_genai_config
 
         config = getattr(pkg, "config", None)
-        artifacts = write_onnx_genai_config(pkg, output_dir, config=config)
+        source = getattr(args, "config", None) or getattr(args, "model", None)
+        artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
 

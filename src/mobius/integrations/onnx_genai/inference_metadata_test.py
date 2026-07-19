@@ -13,6 +13,7 @@ import yaml
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
+    load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
 )
 
@@ -90,6 +91,55 @@ class TestBuildDiffusionPipelineMetadata:
         )
         assert sched.kind == "ddim"
         assert sched.beta_end == 0.02
+
+    def test_scheduler_maps_euler_class(self):
+        sched = SchedulerConfig.from_diffusers(
+            {"_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear"}
+        )
+        assert sched.kind == "euler"
+        assert sched.beta_schedule == "scaled_linear"
+
+    def test_scheduler_defaults_to_ddim_when_class_absent(self):
+        assert SchedulerConfig.from_diffusers({}).kind == "ddim"
+
+    def test_scheduler_rejects_ancestral(self):
+        with pytest.raises(ValueError, match="stochastic"):
+            SchedulerConfig.from_diffusers({"_class_name": "EulerAncestralDiscreteScheduler"})
+
+    def test_scheduler_rejects_unsupported_class(self):
+        with pytest.raises(ValueError, match="unsupported"):
+            SchedulerConfig.from_diffusers({"_class_name": "DPMSolverMultistepScheduler"})
+
+    def test_load_scheduler_from_local_checkpoint(self, tmp_path):
+        import json
+
+        sd = tmp_path / "scheduler"
+        sd.mkdir()
+        (sd / "scheduler_config.json").write_text(
+            json.dumps(
+                {"_class_name": "EulerDiscreteScheduler", "beta_end": 0.015}
+            )
+        )
+        sched = load_diffusers_scheduler_config(str(tmp_path))
+        assert sched is not None
+        assert sched.kind == "euler"
+        assert sched.beta_end == 0.015
+
+    def test_load_scheduler_none_when_absent(self, tmp_path):
+        assert load_diffusers_scheduler_config(str(tmp_path)) is None
+        assert load_diffusers_scheduler_config(None) is None
+
+    def test_load_scheduler_falls_back_on_unsupported(self, tmp_path):
+        import json
+
+        sd = tmp_path / "scheduler"
+        sd.mkdir()
+        (sd / "scheduler_config.json").write_text(
+            json.dumps({"_class_name": "DPMSolverMultistepScheduler"})
+        )
+        # Unsupported scheduler must not raise from the loader; returns None so
+        # the caller falls back to the DDIM default.
+        assert load_diffusers_scheduler_config(str(tmp_path)) is None
 
     def test_rejects_zero_steps(self):
         with pytest.raises(ValueError):
