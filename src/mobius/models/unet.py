@@ -126,9 +126,19 @@ class _CrossAttentionBlock(nn.Module):
         num_heads: int,
         norm_num_groups: int = 32,
         linear_class=_Linear,
+        use_linear_projection: bool = False,
     ):
         super().__init__()
+        self._use_linear_projection = use_linear_projection
         self.norm = _GroupNorm(norm_num_groups, channels)
+        # Transformer2DModel input/output projection: a 1x1 Conv (SD 1.x) or a
+        # Linear (SD 2.x / SDXL), around the flattened-spatial transformer block.
+        if use_linear_projection:
+            self.proj_in = _Linear(channels, channels)
+            self.proj_out = _Linear(channels, channels)
+        else:
+            self.proj_in = _Conv2d(channels, channels, kernel_size=1)
+            self.proj_out = _Conv2d(channels, channels, kernel_size=1)
         # Self-attention
         self.attn1 = _BasicAttention(channels, channels, num_heads, linear_class=linear_class)
         # Cross-attention (K, V from encoder_hidden_states)
@@ -155,10 +165,18 @@ class _CrossAttentionBlock(nn.Module):
 
         hidden_states = self.norm(op, hidden_states)
 
+        # 1x1 Conv proj_in runs on [B, C, H, W] before the spatial flatten.
+        if not self._use_linear_projection:
+            hidden_states = self.proj_in(op, hidden_states)
+
         # Reshape [B, C, H, W] → [B, H*W, C]
         spatial = op.Mul(height, width)
         hidden_states = op.Reshape(hidden_states, op.Concat(batch, channels, spatial, axis=0))
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
+
+        # Linear proj_in runs on the flattened [B, H*W, C].
+        if self._use_linear_projection:
+            hidden_states = self.proj_in(op, hidden_states)
 
         # Self-attention
         norm_hs = self.norm1(op, hidden_states)
@@ -173,11 +191,19 @@ class _CrossAttentionBlock(nn.Module):
         norm_hs = self.norm3(op, hidden_states)
         hidden_states = op.Add(self.ff(op, norm_hs), hidden_states)
 
+        # Linear proj_out runs before the reshape back.
+        if self._use_linear_projection:
+            hidden_states = self.proj_out(op, hidden_states)
+
         # Reshape back [B, H*W, C] → [B, C, H, W]
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
         hidden_states = op.Reshape(
             hidden_states, op.Concat(batch, channels, height, width, axis=0)
         )
+
+        # 1x1 Conv proj_out runs on [B, C, H, W] after the reshape back.
+        if not self._use_linear_projection:
+            hidden_states = self.proj_out(op, hidden_states)
 
         return op.Add(hidden_states, residual)
 
@@ -199,10 +225,12 @@ class _BasicAttention(nn.Module):
         linear_class=_Linear,
     ):
         super().__init__()
-        self.to_q = linear_class(query_dim, query_dim)
-        self.to_k = linear_class(context_dim, query_dim)
-        self.to_v = linear_class(context_dim, query_dim)
-        self.to_out = nn.Sequential(linear_class(query_dim, query_dim))
+        # Stable Diffusion attention uses no bias on q/k/v; only the output
+        # projection (to_out.0) is biased.
+        self.to_q = linear_class(query_dim, query_dim, bias=False)
+        self.to_k = linear_class(context_dim, query_dim, bias=False)
+        self.to_v = linear_class(context_dim, query_dim, bias=False)
+        self.to_out = nn.Sequential(linear_class(query_dim, query_dim, bias=True))
         self._num_heads = num_heads
         self._head_dim = query_dim // num_heads
 
@@ -274,6 +302,7 @@ class _DownBlock2D(nn.Module):
         attention_head_dim: int = 8,
         add_downsample: bool = True,
         linear_class=_Linear,
+        use_linear_projection: bool = False,
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
@@ -285,11 +314,12 @@ class _DownBlock2D(nn.Module):
                 _ResNetBlock2DWithTime(res_in, out_channels, time_embed_dim, norm_num_groups)
             )
             if cross_attention_dim:
-                num_heads = max(1, out_channels // attention_head_dim)
+                num_heads = attention_head_dim
                 self.attentions.append(
                     _CrossAttentionBlock(
                         out_channels, cross_attention_dim, num_heads, norm_num_groups,
                         linear_class=linear_class,
+                        use_linear_projection=use_linear_projection,
                     )
                 )
 
@@ -335,24 +365,32 @@ class _UpBlock2D(nn.Module):
         attention_head_dim: int = 8,
         add_upsample: bool = True,
         linear_class=_Linear,
+        use_linear_projection: bool = False,
     ):
         super().__init__()
         self.resnets = nn.ModuleList()
         self.attentions = nn.ModuleList() if cross_attention_dim else None
 
         for i in range(num_layers):
-            # First layer takes concatenated skip connection
-            res_skip_channels = prev_output_channels if i == 0 else out_channels
-            res_in = (in_channels if i == 0 else out_channels) + res_skip_channels
+            # Skip-connection channels: the last resnet takes the up block's
+            # input channels, the others take out_channels (diffusers convention).
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channels if i == 0 else out_channels
             self.resnets.append(
-                _ResNetBlock2DWithTime(res_in, out_channels, time_embed_dim, norm_num_groups)
+                _ResNetBlock2DWithTime(
+                    resnet_in_channels + res_skip_channels,
+                    out_channels,
+                    time_embed_dim,
+                    norm_num_groups,
+                )
             )
             if cross_attention_dim:
-                num_heads = max(1, out_channels // attention_head_dim)
+                num_heads = attention_head_dim
                 self.attentions.append(
                     _CrossAttentionBlock(
                         out_channels, cross_attention_dim, num_heads, norm_num_groups,
                         linear_class=linear_class,
+                        use_linear_projection=use_linear_projection,
                     )
                 )
 
@@ -402,10 +440,11 @@ class _Upsample2D(nn.Module):
         self.conv = _Conv2d(channels, channels, kernel_size=3, padding=1)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        # Upsample 2x using nearest neighbor
+        # Upsample 2x using nearest neighbor. Resize inputs are (X, roi, scales);
+        # pass scales as the 3rd argument (an extra None would push it into the
+        # int64 `sizes` slot and fail type checking).
         hidden_states = op.Resize(
             hidden_states,
-            None,
             None,
             op.Constant(value_floats=[1.0, 1.0, 2.0, 2.0]),
             mode="nearest",
@@ -429,9 +468,10 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
         attention_head_dim: int = 8,
         norm_num_groups: int = 32,
         linear_class=_Linear,
+        use_linear_projection: bool = False,
     ):
         super().__init__()
-        num_heads = max(1, channels // attention_head_dim)
+        num_heads = attention_head_dim
         self.resnets = nn.ModuleList()
         self.resnets.append(
             _ResNetBlock2DWithTime(channels, channels, time_embed_dim, norm_num_groups)
@@ -444,6 +484,7 @@ class _UNetMidBlock2DCrossAttn(nn.Module):
             _CrossAttentionBlock(
                 channels, cross_attention_dim, num_heads, norm_num_groups,
                 linear_class=linear_class,
+                use_linear_projection=use_linear_projection,
             )
         )
 
@@ -530,6 +571,7 @@ class UNet2DConditionModel(nn.Module):
                     attention_head_dim=config.attention_head_dim,
                     add_downsample=not is_final,
                     linear_class=linear_class,
+                    use_linear_projection=config.use_linear_projection,
                 )
             )
 
@@ -541,17 +583,18 @@ class UNet2DConditionModel(nn.Module):
             attention_head_dim=config.attention_head_dim,
             norm_num_groups=config.norm_num_groups,
             linear_class=linear_class,
+            use_linear_projection=config.use_linear_projection,
         )
 
         # Up blocks (reversed)
         reversed_channels = list(reversed(block_out_channels))
         self.up_blocks = nn.ModuleList()
         output_channel = reversed_channels[0]
-        for i, ch in enumerate(reversed_channels):
-            input_channel = output_channel
-            output_channel = ch
-            prev_output_channel = reversed_channels[min(i + 1, len(reversed_channels) - 1)]
-            is_final = i == len(reversed_channels) - 1
+        for i in range(len(block_out_channels)):
+            prev_output_channel = output_channel
+            output_channel = reversed_channels[i]
+            input_channel = reversed_channels[min(i + 1, len(block_out_channels) - 1)]
+            is_final = i == len(block_out_channels) - 1
             self.up_blocks.append(
                 _UpBlock2D(
                     in_channels=input_channel,
@@ -564,6 +607,7 @@ class UNet2DConditionModel(nn.Module):
                     attention_head_dim=config.attention_head_dim,
                     add_upsample=not is_final,
                     linear_class=linear_class,
+                    use_linear_projection=config.use_linear_projection,
                 )
             )
 
@@ -647,8 +691,23 @@ class UNet2DConditionModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """No renaming needed — parameter names match diffusers directly."""
-        return state_dict
+        """Align diffusers UNet weight names to this from-scratch UNet.
+
+        The from-scratch attention flattens diffusers' per-attention
+        ``transformer_blocks.{i}`` level, and names the GEGLU feed-forward
+        ``ff.proj_in`` / ``ff.proj_out`` (diffusers: ``ff.net.0.proj`` /
+        ``ff.net.2``). Everything else matches diffusers directly.
+        """
+        import re
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = re.sub(r"transformer_blocks\.\d+\.", "", key)
+            new_key = new_key.replace("ff.net.0.proj.", "ff.proj_in.").replace(
+                "ff.net.2.", "ff.proj_out."
+            )
+            renamed[new_key] = value
+        return renamed
 
 
 def remap_diffusers_unet_lora(

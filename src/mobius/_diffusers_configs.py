@@ -62,6 +62,9 @@ class UNet2DConfig:
     addition_embed_type: str | None = None
     addition_time_embed_dim: int | None = None
     projection_class_embeddings_input_dim: int | None = None
+    # Whether the Transformer2D blocks use a Linear (True) or 1x1 Conv (False,
+    # Stable Diffusion 1.x default) for their proj_in/proj_out.
+    use_linear_projection: bool = False
     # Runtime LoRA adapters to bake into the attention projections as
     # `(name, rank, scale)`. Each becomes a low-rank branch gated at run time by
     # a scalar `lora_gate.{name}` input (1.0 = on, 0.0 = off, or a blend
@@ -88,6 +91,7 @@ class UNet2DConfig:
             projection_class_embeddings_input_dim=config.get(
                 "projection_class_embeddings_input_dim"
             ),
+            use_linear_projection=config.get("use_linear_projection", False),
         )
 
 
