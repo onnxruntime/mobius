@@ -78,6 +78,7 @@ def build_pipeline_metadata_for_workflow(
         num_inference_steps=wf.steps,
         scheduler=scheduler,
         guidance_scale=guidance,
+        start_step=wf.start_step or None,
         timesteps=timesteps,
         denoiser_filename=exported.denoiser_filename,
         vae_filename=exported.vae_filename if has_vae else None,

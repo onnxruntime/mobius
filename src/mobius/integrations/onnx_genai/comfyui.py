@@ -93,6 +93,8 @@ class ComfyUIWorkflow:
     scheduler_kind: str
     scheduler_spacing: str
     checkpoint: str | None
+    denoise: float = 1.0
+    start_step: int = 0
 
 
 def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +220,7 @@ def parse_comfyui_workflow(
     sampler_name = str(inputs.get("sampler_name", "euler"))
     spacing = str(inputs.get("scheduler", "normal"))
     seed = int(inputs.get("seed", inputs.get("noise_seed", 0)))
+    denoise = float(inputs.get("denoise", 1.0))
 
     kind = _sampler_kind(sampler_name)
     if spacing not in _SUPPORTED_SPACINGS:
@@ -226,6 +229,12 @@ def parse_comfyui_workflow(
             "linspace); results may differ slightly",
             spacing,
         )
+
+    # img2img: a KSampler `denoise` < 1.0 skips the earliest (noisiest) steps.
+    # Matches diffusers get_timesteps: start_step = num_steps - round(num_steps*denoise).
+    start_step = 0
+    if 0.0 < denoise < 1.0:
+        start_step = max(0, min(steps - 1, steps - round(steps * denoise)))
 
     prompt = _follow_prompt_text(nodes, inputs.get("positive"))
     negative_prompt = _follow_prompt_text(nodes, inputs.get("negative"))
@@ -252,6 +261,7 @@ def parse_comfyui_workflow(
         num_inference_steps=steps,
         scheduler=sched,
         guidance_scale=guidance,
+        start_step=start_step or None,
         denoiser_filename=denoiser_filename,
         vae_filename=vae_filename if has_vae else None,
         text_encoder_filename=text_encoder_filename if has_text_encoder else None,
@@ -269,6 +279,8 @@ def parse_comfyui_workflow(
         scheduler_kind=sched.kind,
         scheduler_spacing=spacing,
         checkpoint=checkpoint,
+        denoise=denoise,
+        start_step=start_step,
     )
 
 

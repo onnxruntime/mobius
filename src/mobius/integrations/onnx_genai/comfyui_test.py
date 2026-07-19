@@ -117,6 +117,20 @@ def test_normal_scheduler_omits_karras_sigmas():
     assert "use_karras_sigmas" not in meta["pipeline"]["strategy"]["scheduler_config"]
 
 
+def test_denoise_less_than_one_sets_start_step():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["3"]["inputs"]["denoise"] = 0.5  # steps=20 -> start_step = 20 - round(10) = 10
+    parsed = parse_comfyui_workflow(wf)
+    assert parsed.denoise == 0.5
+    assert parsed.start_step == 10
+    assert parsed.metadata["pipeline"]["strategy"]["start_step"] == 10
+
+
+def test_denoise_one_omits_start_step():
+    meta = translate_comfyui_workflow(_DEFAULT_TXT2IMG)
+    assert "start_step" not in meta["pipeline"]["strategy"]
+
+
 def test_cfg_one_disables_guidance():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["cfg"] = 1.0

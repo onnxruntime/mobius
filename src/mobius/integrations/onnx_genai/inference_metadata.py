@@ -155,6 +155,7 @@ def build_diffusion_pipeline_metadata(
     scheduler: SchedulerConfig | None = None,
     timesteps: list[float] | None = None,
     guidance_scale: float | None = None,
+    start_step: int | None = None,
     vae_filename: str | None = None,
     vae_latent_input: str = "latent",
     text_encoder_filename: str | None = None,
@@ -243,6 +244,12 @@ def build_diffusion_pipeline_metadata(
         strategy["guidance_scale"] = guidance_scale
         if guidance_scale != 1.0:
             strategy["cfg_conditioning_input"] = denoiser_conditioning_input
+    if start_step:
+        if not 0 < start_step < num_inference_steps:
+            raise ValueError(
+                f"start_step ({start_step}) must be in 1..{num_inference_steps - 1}"
+            )
+        strategy["start_step"] = start_step
 
     pipeline: dict[str, Any] = {
         "models": models,
