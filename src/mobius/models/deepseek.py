@@ -160,6 +160,8 @@ class DeepSeekMoEGate(nn.Module):
         routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))
 
         return scores_for_choice, routing_weights, selected_experts
+
+    def _group_topk_selection(self, op, scores_for_choice):
         """Group-based expert selection: pick topk_group groups first."""
         experts_per_group = self.num_experts // self.n_group
 
