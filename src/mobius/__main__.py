@@ -402,7 +402,10 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
     with open(args.workflow, encoding="utf-8") as handle:
         workflow = json.load(handle)
     result = convert_comfyui_workflow(
-        workflow, args.checkpoint, args.output, sdxl=getattr(args, "sdxl", False),
+        workflow,
+        args.checkpoint,
+        args.output,
+        sdxl=getattr(args, "sdxl", False),
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")

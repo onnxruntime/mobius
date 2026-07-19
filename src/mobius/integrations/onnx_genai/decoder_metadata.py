@@ -69,8 +69,7 @@ def build_decoder_metadata(
     kv = num_kv_heads or num_attention_heads
     if kv < 1 or kv > num_attention_heads or num_attention_heads % kv != 0:
         raise ValueError(
-            f"num_kv_heads ({kv}) must divide num_attention_heads "
-            f"({num_attention_heads})"
+            f"num_kv_heads ({kv}) must divide num_attention_heads ({num_attention_heads})"
         )
     if attention_type is None:
         attention_type = "grouped_query" if kv < num_attention_heads else "multi_head"
@@ -105,7 +104,9 @@ def build_decoder_metadata(
     return metadata
 
 
-def decoder_metadata_from_config(config: Any, *, kv_native_dtype: str | None = None) -> dict[str, Any]:
+def decoder_metadata_from_config(
+    config: Any, *, kv_native_dtype: str | None = None
+) -> dict[str, Any]:
     """Build decoder metadata from a Mobius ``BaseModelConfig``/``ArchitectureConfig``.
 
     Unset fields (Mobius' ``DEFAULT_INT`` sentinel) are dropped. ``head_dim``
@@ -132,7 +133,8 @@ def decoder_metadata_from_config(config: Any, *, kv_native_dtype: str | None = N
         max_sequence_length=_clean_int(getattr(config, "max_position_embeddings", None)),
         sliding_window=sliding,
         kv_native_dtype=kv_native_dtype,
-        architecture=getattr(config, "architecture", None) or getattr(config, "model_type", None),
+        architecture=getattr(config, "architecture", None)
+        or getattr(config, "model_type", None),
     )
 
 

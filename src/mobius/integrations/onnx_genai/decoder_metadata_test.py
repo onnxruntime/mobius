@@ -48,8 +48,11 @@ class _FakeConfig:
 class TestDecoderMetadata:
     def test_grouped_query_attention(self):
         meta = build_decoder_metadata(
-            num_attention_heads=32, num_kv_heads=8, head_dim=128,
-            max_sequence_length=131072, kv_native_dtype="bf16",
+            num_attention_heads=32,
+            num_kv_heads=8,
+            head_dim=128,
+            max_sequence_length=131072,
+            kv_native_dtype="bf16",
         )
         assert meta["required_capabilities"] == ["kv_cache", "grouped_query_attention"]
         att = meta["model"]["attention"]
@@ -97,7 +100,8 @@ class TestDecoderMetadata:
 
     def test_write_roundtrips_yaml(self, tmp_path):
         path = write_decoder_metadata(str(tmp_path), config=_FakeConfig())
-        loaded = yaml.safe_load(open(path))
+        with open(path) as handle:
+            loaded = yaml.safe_load(handle)
         assert loaded["model"]["attention"]["num_kv_heads"] == 8
 
     def test_matches_onnx_genai_schema(self):
@@ -108,6 +112,9 @@ class TestDecoderMetadata:
 
         import jsonschema
 
-        schema = json.load(open(schema_path))
-        meta = decoder_metadata_from_config(_FakeConfig(sliding_window=4096), kv_native_dtype="bf16")
+        with open(schema_path) as handle:
+            schema = json.load(handle)
+        meta = decoder_metadata_from_config(
+            _FakeConfig(sliding_window=4096), kv_native_dtype="bf16"
+        )
         jsonschema.validate(instance=meta, schema=schema)

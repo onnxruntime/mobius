@@ -28,8 +28,11 @@ class _DiffusionPkg(dict):
 
 
 def test_dispatch_decoder(tmp_path):
-    arts = write_onnx_genai_config(object(), str(tmp_path), config=_Cfg(), kv_native_dtype="bf16")
-    meta = yaml.safe_load(open(arts["inference_metadata"]))
+    arts = write_onnx_genai_config(
+        object(), str(tmp_path), config=_Cfg(), kv_native_dtype="bf16"
+    )
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
     assert meta["model"]["attention"]["type"] == "grouped_query"
     assert meta["kv_cache"]["native_dtype"] == "bf16"
 
@@ -37,9 +40,13 @@ def test_dispatch_decoder(tmp_path):
 def test_dispatch_diffusion(tmp_path):
     pkg = _DiffusionPkg({"denoiser": object(), "vae": object()})
     arts = write_onnx_genai_config(
-        pkg, str(tmp_path), num_inference_steps=20, vae_filename="vae.onnx",
+        pkg,
+        str(tmp_path),
+        num_inference_steps=20,
+        vae_filename="vae.onnx",
     )
-    meta = yaml.safe_load(open(arts["inference_metadata"]))
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
     assert meta["pipeline"]["strategy"]["kind"] == "iterative"
     assert "vae" in meta["pipeline"]["models"]
 
@@ -55,7 +62,11 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     out = tmp_path / "out"
     pkg = _DiffusionPkg({"denoiser": object()})
     arts = write_onnx_genai_config(
-        pkg, str(out), num_inference_steps=15, source=str(src),
+        pkg,
+        str(out),
+        num_inference_steps=15,
+        source=str(src),
     )
-    meta = yaml.safe_load(open(arts["inference_metadata"]))
+    with open(arts["inference_metadata"]) as handle:
+        meta = yaml.safe_load(handle)
     assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler"
