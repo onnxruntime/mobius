@@ -45,6 +45,7 @@ class SchedulerConfig:
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
     use_karras_sigmas: bool = False
+    use_exponential_sigmas: bool = False
 
     def to_metadata(self) -> dict[str, Any]:
         meta = {
@@ -57,6 +58,8 @@ class SchedulerConfig:
         }
         if self.use_karras_sigmas:
             meta["use_karras_sigmas"] = True
+        if self.use_exponential_sigmas:
+            meta["use_exponential_sigmas"] = True
         return meta
 
     @classmethod
@@ -104,6 +107,7 @@ class SchedulerConfig:
             beta_schedule=str(config.get("beta_schedule", "scaled_linear")),
             prediction_type=str(config.get("prediction_type", "epsilon")),
             use_karras_sigmas=bool(config.get("use_karras_sigmas", False)),
+            use_exponential_sigmas=bool(config.get("use_exponential_sigmas", False)),
         )
 
 

@@ -72,6 +72,7 @@ def build_pipeline_metadata_for_workflow(
         beta_schedule=exported.beta_schedule,
         prediction_type="epsilon",
         use_karras_sigmas=(wf.scheduler_spacing == "karras"),
+        use_exponential_sigmas=(wf.scheduler_spacing == "exponential"),
     )
     guidance = wf.cfg if wf.cfg != 1.0 else None
     # SDXL routes two conditioning edges (concatenated hidden states + pooled
@@ -97,7 +98,8 @@ def build_pipeline_metadata_for_workflow(
 
 
 def _diffusers_timesteps(
-    kind: str, exported: ExportedCheckpoint, steps: int, use_karras: bool = False
+    kind: str, exported: ExportedCheckpoint, steps: int, use_karras: bool = False,
+    use_exponential: bool = False,
 ) -> list[float] | None:
     """Compute the exact inference timesteps diffusers would use, so the denoiser
     is fed the right timestep values. Best-effort; ``None`` on any failure."""
@@ -109,6 +111,7 @@ def _diffusers_timesteps(
                 "timestep_spacing": "linspace",
                 "interpolation_type": "linear",
                 "use_karras_sigmas": use_karras,
+                "use_exponential_sigmas": use_exponential,
             }
         elif kind == "euler_ancestral":
             from diffusers import EulerAncestralDiscreteScheduler as _Sched
@@ -122,6 +125,7 @@ def _diffusers_timesteps(
                 "solver_order": 2,
                 "solver_type": "midpoint",
                 "use_karras_sigmas": use_karras,
+                "use_exponential_sigmas": use_exponential,
                 "timestep_spacing": "linspace",
                 "final_sigmas_type": "zero",
             }
@@ -172,10 +176,11 @@ def convert_comfyui_workflow(
     wf = parse_comfyui_workflow(workflow)
     os.makedirs(output_dir, exist_ok=True)
     use_karras = wf.scheduler_spacing == "karras"
+    use_exponential = wf.scheduler_spacing == "exponential"
     # Fractional inference timesteps (Euler/Euler-ancestral always; any Karras
     # schedule) need a float32 denoiser timestep to avoid truncation before the
     # time embedding; DPM++/DDIM linspace timesteps are integer and fine as int64.
-    fractional = wf.scheduler_kind in ("euler", "euler_ancestral") or use_karras
+    fractional = wf.scheduler_kind in ("euler", "euler_ancestral") or use_karras or use_exponential
     timestep_dtype = "float32" if fractional else "int64"
     loras: list[tuple[str, float]] = []
     for name, strength in wf.loras:
@@ -204,7 +209,7 @@ def convert_comfyui_workflow(
         loras=loras or None,
         controlnet=controlnet_source,
     )
-    timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps, use_karras)
+    timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps, use_karras, use_exponential)
     metadata = build_pipeline_metadata_for_workflow(wf, exported, timesteps=timesteps)
 
     metadata_path = os.path.join(output_dir, "inference_metadata.yaml")

@@ -68,7 +68,7 @@ _SAMPLER_KIND = {
 
 # ComfyUI sigma spacings onnx-genai reproduces. "normal"/"simple"/"ddim_uniform"
 # map to linspace; "karras" enables the Karras schedule; others are warned about.
-_SUPPORTED_SPACINGS = {"normal", "simple", "ddim_uniform", "karras"}
+_SUPPORTED_SPACINGS = {"normal", "simple", "ddim_uniform", "karras", "exponential"}
 
 _MAX_TRACE_DEPTH = 16
 
@@ -297,7 +297,9 @@ def parse_comfyui_workflow(
     )
     guidance = cfg if cfg != 1.0 else None
 
-    sched = scheduler or SchedulerConfig(kind=kind, use_karras_sigmas=(spacing == "karras"))
+    sched = scheduler or SchedulerConfig(
+        kind=kind, use_karras_sigmas=(spacing == "karras"),
+        use_exponential_sigmas=(spacing == "exponential"))
     if sched.kind != kind:
         _LOGGER.warning(
             "overriding sampler-derived scheduler kind %r with %r from the supplied config",

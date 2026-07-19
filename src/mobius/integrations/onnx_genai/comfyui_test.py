@@ -159,6 +159,14 @@ def test_normal_scheduler_omits_karras_sigmas():
     assert "use_karras_sigmas" not in meta["pipeline"]["strategy"]["scheduler_config"]
 
 
+def test_exponential_scheduler_enables_exponential_sigmas():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["3"]["inputs"]["scheduler"] = "exponential"
+    parsed = parse_comfyui_workflow(wf)
+    assert parsed.scheduler_spacing == "exponential"
+    assert parsed.metadata["pipeline"]["strategy"]["scheduler_config"]["use_exponential_sigmas"] is True
+
+
 def test_denoise_less_than_one_sets_start_step():
     wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
     wf["3"]["inputs"]["denoise"] = 0.5  # steps=20 -> start_step = 20 - round(10) = 10
