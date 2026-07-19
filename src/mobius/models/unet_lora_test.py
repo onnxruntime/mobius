@@ -130,3 +130,84 @@ def test_full_unet_without_lora_has_no_gate_inputs():
     assert not any(
         value.name and "lora_gate" in value.name for value in graph.inputs
     )
+
+
+def test_remap_diffusers_lora_keys():
+    from mobius.models.unet import remap_diffusers_unet_lora
+
+    # Classic diffusers `lora.down`/`lora.up` spelling.
+    src = {
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": 1,
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight": 2,
+        "mid_block.attentions.0.transformer_blocks.0.attn2.to_out.0.lora.down.weight": 3,
+    }
+    out = remap_diffusers_unet_lora(src, "style")
+    assert out == {
+        "down_blocks.0.attentions.0.attn1.to_q.lora_A.style.weight": 1,
+        "down_blocks.0.attentions.0.attn1.to_q.lora_B.style.weight": 2,
+        "mid_block.attentions.0.attn2.to_out.0.lora_A.style.weight": 3,
+    }
+    # Newer PEFT `lora_A`/`lora_B` spelling maps identically.
+    peft_src = {
+        "up_blocks.1.attentions.0.transformer_blocks.0.attn1.to_v.lora_A.weight": 4,
+        "up_blocks.1.attentions.0.transformer_blocks.0.attn1.to_v.lora_B.weight": 5,
+    }
+    peft_out = remap_diffusers_unet_lora(peft_src, "style")
+    assert peft_out == {
+        "up_blocks.1.attentions.0.attn1.to_v.lora_A.style.weight": 4,
+        "up_blocks.1.attentions.0.attn1.to_v.lora_B.style.weight": 5,
+    }
+
+
+def test_remapped_keys_match_baked_unet_param_names():
+    # The remapped keys must land on real baked LoRALinear params of the UNet.
+    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.models.unet import UNet2DConditionModel, remap_diffusers_unet_lora
+    from mobius.tasks._denoising import DenoisingTask
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        lora_adapters=(("style", 4, 1.0),),
+    )
+    graph = DenoisingTask().build(UNet2DConditionModel(config), config)["model"].graph
+    baked = {name for name in _referenced_names(graph) if "lora_A.style" in name or "lora_B.style" in name}
+    assert baked  # sanity
+
+    # A diffusers key for a projection that exists in this tiny UNet.
+    src = {
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": 0,
+    }
+    remapped_key = next(iter(remap_diffusers_unet_lora(src, "style")))
+    assert remapped_key in baked, (remapped_key, sorted(baked)[:5])
+
+
+def test_load_unet_lora_safetensors(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from mobius.models.unet import load_unet_lora_safetensors
+
+    path = tmp_path / "style.safetensors"
+    save_file(
+        {
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": torch.zeros(
+                4, 32
+            ),
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight": torch.zeros(
+                32, 4
+            ),
+        },
+        str(path),
+    )
+    loaded = load_unet_lora_safetensors(str(path), "style")
+    assert set(loaded) == {
+        "down_blocks.0.attentions.0.attn1.to_q.lora_A.style.weight",
+        "down_blocks.0.attentions.0.attn1.to_q.lora_B.style.weight",
+    }
+    assert loaded["down_blocks.0.attentions.0.attn1.to_q.lora_A.style.weight"].shape == (4, 32)

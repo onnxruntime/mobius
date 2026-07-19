@@ -649,3 +649,60 @@ class UNet2DConditionModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """No renaming needed — parameter names match diffusers directly."""
         return state_dict
+
+
+def remap_diffusers_unet_lora(
+    lora_state_dict: dict, adapter_name: str
+) -> dict:
+    """Remap a diffusers-format UNet LoRA state dict to this UNet's baked
+    ``LoRALinear`` parameter names.
+
+    diffusers (via ``convert_state_dict_to_diffusers`` / PEFT) names the low-rank
+    factors under a per-attention ``transformer_blocks.{i}`` level and without an
+    adapter name, e.g.::
+
+        down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight
+        down_blocks.1.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight
+
+    The from-scratch UNet flattens the single transformer block into
+    ``attn1``/``attn2`` and names each baked adapter ``lora_A.{name}.weight`` /
+    ``lora_B.{name}.weight`` (``down`` -> ``A`` = ``[rank, in]``, ``up`` -> ``B``
+    = ``[out, rank]``). This maps the former onto the latter for
+    ``adapter_name`` so the loaded weights land on the right initializers.
+
+    Both the classic ``lora.down``/``lora.up`` and the newer PEFT
+    ``lora_A``/``lora_B`` source spellings are accepted. Keys that are not LoRA
+    factors are passed through unchanged.
+    """
+    import re
+
+    remapped: dict = {}
+    for key, value in lora_state_dict.items():
+        new_key = re.sub(r"\.transformer_blocks\.\d+", "", key)
+        if new_key.endswith(".lora.down.weight"):
+            new_key = new_key[: -len(".lora.down.weight")] + f".lora_A.{adapter_name}.weight"
+        elif new_key.endswith(".lora.up.weight"):
+            new_key = new_key[: -len(".lora.up.weight")] + f".lora_B.{adapter_name}.weight"
+        elif new_key.endswith(".lora_A.weight"):
+            new_key = new_key[: -len(".lora_A.weight")] + f".lora_A.{adapter_name}.weight"
+        elif new_key.endswith(".lora_B.weight"):
+            new_key = new_key[: -len(".lora_B.weight")] + f".lora_B.{adapter_name}.weight"
+        else:
+            # Not a recognized LoRA factor (e.g. an alpha scalar); pass through.
+            remapped[new_key] = value
+            continue
+        remapped[new_key] = value
+    return remapped
+
+
+def load_unet_lora_safetensors(path: str, adapter_name: str) -> dict:
+    """Load a diffusers-format UNet LoRA ``.safetensors`` and remap its keys onto
+    this UNet's baked ``LoRALinear`` params for ``adapter_name``.
+
+    The returned dict is ready to merge into the UNet component's state dict
+    (baked slots come from ``UNet2DConfig.lora_adapters``) before
+    :func:`mobius.apply_weights`.
+    """
+    from safetensors.torch import load_file
+
+    return remap_diffusers_unet_lora(load_file(path), adapter_name)
