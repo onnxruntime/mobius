@@ -393,6 +393,29 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print(f"Saved {name} to {path}")
 
 
+def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
+    """Execute the 'convert-comfyui' subcommand."""
+    import json
+
+    from mobius.integrations.onnx_genai import convert_comfyui_workflow
+
+    with open(args.workflow, encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    result = convert_comfyui_workflow(
+        workflow, args.checkpoint, args.output, opset=args.opset
+    )
+    wf = result.workflow
+    print(f"Converted ComfyUI workflow -> {result.output_dir}")
+    print(f"  metadata: {result.metadata_path}")
+    print(f"  run params: {result.run_params_path}")
+    print(
+        f"  {wf.steps} steps, cfg {wf.cfg}, sampler {wf.sampler_name} "
+        f"(scheduler {wf.scheduler_kind}), {wf.width}x{wf.height}"
+    )
+    if wf.prompt is not None:
+        print(f"  prompt: {wf.prompt!r}")
+
+
 def _cmd_info(args: argparse.Namespace) -> None:
     """Execute the 'info' subcommand."""
     from mobius._diffusers_builder import (
@@ -665,6 +688,26 @@ def main(argv: list[str] | None = None) -> None:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     info_parser.set_defaults(func=_cmd_info)
+
+    # --- convert-comfyui ---
+    comfy_parser = subparsers.add_parser(
+        "convert-comfyui",
+        help="Convert a ComfyUI API-format workflow JSON into a runnable "
+        "onnx-genai pipeline (translates the graph + exports the checkpoint to ONNX).",
+    )
+    comfy_parser.add_argument("workflow", help="Path to the ComfyUI API-format workflow JSON.")
+    comfy_parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Checkpoint to export: a .safetensors/.ckpt file, a diffusers "
+        "directory, or a Hugging Face model id. (ComfyUI references checkpoints "
+        "by name; resolve that name to a real source here.)",
+    )
+    comfy_parser.add_argument(
+        "--output", "-o", required=True, help="Output directory for the ONNX components + metadata."
+    )
+    comfy_parser.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
+    comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
     args = parser.parse_args(argv)
     args.func(args)

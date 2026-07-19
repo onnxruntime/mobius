@@ -4,7 +4,9 @@
 """Translate a ComfyUI *API-format* workflow JSON into onnx-genai pipeline metadata.
 
 ComfyUI is a node-graph UI for diffusion. Its "Save (API Format)" export is a flat
-dict ``{node_id: {"class_type": str, "inputs": {port: value | [src_id, slot]}}}``.
+dict ``{node_id: {"class_type": str, "inputs": {port: value | [src_id, slot]}}}``
+where a value of the form ``[src_id, slot]`` is a *link* to another node's output.
+
 The canonical text-to-image graph is *KSampler-centric* and maps directly onto
 onnx-genai's composite iterative pipeline:
 
@@ -12,24 +14,30 @@ onnx-genai's composite iterative pipeline:
     CLIPTextEncode(+/-) ─┘  (positive / negative → CFG cond / uncond)
     CheckpointLoaderSimple ─► model / clip / vae
 
-Mapping to :func:`build_diffusion_pipeline_metadata`:
+This module walks that graph to recover everything needed to *run* the pipeline:
 
     KSampler.steps            -> num_inference_steps
     KSampler.cfg              -> guidance_scale (CFG; 1.0 disables)
     KSampler.sampler_name     -> scheduler kind (euler, ddim)
+    KSampler.seed             -> seed
+    KSampler.positive/negative-> prompt / negative_prompt (followed to CLIPTextEncode)
+    KSampler.latent_image     -> width / height (followed to EmptyLatentImage)
+    KSampler.model            -> checkpoint name (traced to CheckpointLoaderSimple)
     CLIPTextEncode (present)  -> text_encoder component (prompt phase)
     VAEDecode (present)       -> vae component (final phase)
 
-This is a topology/params translator only — it does not carry weights. The actual
-ONNX component graphs come from a Mobius build of the same checkpoint; the ComfyUI
-JSON supplies *how to run them* (loop shape, scheduler, guidance).
+The translator carries topology + run parameters only; it does NOT carry weights.
+The actual ONNX component graphs come from exporting the referenced ``.safetensors``
+checkpoint (see :mod:`mobius.integrations.onnx_genai.checkpoint_export`).
 
-Only the core txt2img subset is supported today; unsupported samplers or nodes
-raise a clear ``ValueError`` rather than silently producing wrong dynamics.
+Only the core txt2img subset is supported today; unsupported samplers or missing
+sampler nodes raise a clear ``ValueError`` rather than silently producing wrong
+dynamics.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from typing import Any
@@ -43,6 +51,9 @@ _LOGGER = logging.getLogger(__name__)
 
 _SAMPLER_NODES = ("KSampler", "KSamplerAdvanced")
 _VAE_DECODE_NODES = ("VAEDecode", "VAEDecodeTiled")
+_TEXT_ENCODE_NODES = ("CLIPTextEncode",)
+_CHECKPOINT_NODES = ("CheckpointLoaderSimple", "CheckpointLoader", "UNETLoader")
+_LATENT_NODES = ("EmptyLatentImage", "EmptySD3LatentImage")
 
 # ComfyUI sampler_name -> onnx-genai scheduler kind. Only deterministic samplers
 # with an onnx-genai implementation are mapped; ancestral / multistep solvers are
@@ -53,8 +64,33 @@ _SAMPLER_KIND = {
 }
 
 # Sigma spacings onnx-genai's Euler currently reproduces (linspace). Others
-# (karras/exponential) change the schedule and are warned about.
+# (karras / exponential) change the schedule and are warned about.
 _SUPPORTED_SPACINGS = {"normal", "simple", "ddim_uniform"}
+
+_MAX_TRACE_DEPTH = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class ComfyUIWorkflow:
+    """Everything needed to run a translated ComfyUI txt2img workflow.
+
+    ``metadata`` is the onnx-genai ``inference_metadata`` document (topology +
+    scheduler + guidance). The remaining fields are the per-run inputs recovered
+    from the graph so a caller can actually drive the pipeline.
+    """
+
+    metadata: dict[str, Any]
+    prompt: str | None
+    negative_prompt: str | None
+    width: int
+    height: int
+    seed: int
+    steps: int
+    cfg: float
+    sampler_name: str
+    scheduler_kind: str
+    scheduler_spacing: str
+    checkpoint: str | None
 
 
 def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -62,6 +98,23 @@ def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
     if "prompt" in workflow and isinstance(workflow["prompt"], dict):
         return workflow["prompt"]
     return workflow
+
+
+def _is_link(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+    )
+
+
+def _resolve(nodes: dict[str, Any], ref: Any) -> dict[str, Any] | None:
+    """Follow a ``[src_id, slot]`` link to the referenced node dict."""
+    if not _is_link(ref):
+        return None
+    node = nodes.get(ref[0])
+    return node if isinstance(node, dict) else None
 
 
 def _find_single(nodes: dict[str, Any], class_types: tuple[str, ...], what: str) -> tuple[str, dict]:
@@ -90,25 +143,64 @@ def _sampler_kind(sampler_name: str) -> str:
         ) from None
 
 
-def translate_comfyui_workflow(
+def _follow_prompt_text(nodes: dict[str, Any], ref: Any) -> str | None:
+    """Resolve a KSampler conditioning link to its CLIPTextEncode prompt text."""
+    node = _resolve(nodes, ref)
+    if node is None:
+        return None
+    if node.get("class_type") in _TEXT_ENCODE_NODES:
+        text = node.get("inputs", {}).get("text")
+        return text if isinstance(text, str) else None
+    # Some graphs wrap conditioning (e.g. ConditioningCombine/SetArea); follow a
+    # single "conditioning" link one hop as a best effort.
+    inner = node.get("inputs", {}).get("conditioning")
+    if _is_link(inner):
+        return _follow_prompt_text(nodes, inner)
+    return None
+
+
+def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int]:
+    """Resolve a KSampler latent link to (width, height); default 512x512."""
+    node = _resolve(nodes, ref)
+    if node is not None and node.get("class_type") in _LATENT_NODES:
+        inputs = node.get("inputs", {})
+        try:
+            return int(inputs.get("width", 512)), int(inputs.get("height", 512))
+        except (TypeError, ValueError):
+            pass
+    return 512, 512
+
+
+def _trace_checkpoint(nodes: dict[str, Any], ref: Any) -> str | None:
+    """Trace a KSampler.model link back to a checkpoint filename.
+
+    Follows intermediate model-transforming nodes (LoraLoader, ModelSamplingDiscrete,
+    ...) by their ``model`` input up to a bounded depth.
+    """
+    for _ in range(_MAX_TRACE_DEPTH):
+        node = _resolve(nodes, ref)
+        if node is None:
+            return None
+        inputs = node.get("inputs", {})
+        for key in ("ckpt_name", "unet_name", "model_name"):
+            name = inputs.get(key)
+            if isinstance(name, str):
+                return name
+        ref = inputs.get("model")
+        if not _is_link(ref):
+            return None
+    return None
+
+
+def parse_comfyui_workflow(
     workflow: dict[str, Any],
     *,
     denoiser_filename: str = "denoiser.onnx",
     vae_filename: str = "vae.onnx",
     text_encoder_filename: str = "text_encoder.onnx",
     scheduler: SchedulerConfig | None = None,
-) -> dict[str, Any]:
-    """Translate a ComfyUI API-format workflow into onnx-genai pipeline metadata.
-
-    Args:
-        workflow: Parsed ComfyUI API-format JSON (or a ``{"prompt": {...}}`` wrap).
-        denoiser_filename / vae_filename / text_encoder_filename: ONNX component
-            filenames the emitted metadata should reference (from a Mobius build).
-        scheduler: Override the scheduler noise-schedule params (betas, etc.). When
-            omitted, the sampler_name sets the ``kind`` and SD defaults fill the rest.
-
-    Returns:
-        The onnx-genai ``inference_metadata`` dict (top-level ``pipeline`` key).
+) -> ComfyUIWorkflow:
+    """Parse a ComfyUI API-format workflow into a structured :class:`ComfyUIWorkflow`.
 
     Raises:
         ValueError: No/duplicate sampler, or an unsupported sampler.
@@ -123,6 +215,7 @@ def translate_comfyui_workflow(
     cfg = float(inputs.get("cfg", 1.0))
     sampler_name = str(inputs.get("sampler_name", "euler"))
     spacing = str(inputs.get("scheduler", "normal"))
+    seed = int(inputs.get("seed", inputs.get("noise_seed", 0)))
 
     kind = _sampler_kind(sampler_name)
     if spacing not in _SUPPORTED_SPACINGS:
@@ -132,9 +225,14 @@ def translate_comfyui_workflow(
             spacing,
         )
 
-    # A negative CLIPTextEncode + cfg != 1.0 means classifier-free guidance.
-    text_nodes = [n for n in nodes.values() if isinstance(n, dict) and n.get("class_type") == "CLIPTextEncode"]
-    has_text_encoder = bool(text_nodes)
+    prompt = _follow_prompt_text(nodes, inputs.get("positive"))
+    negative_prompt = _follow_prompt_text(nodes, inputs.get("negative"))
+    width, height = _follow_dims(nodes, inputs.get("latent_image"))
+    checkpoint = _trace_checkpoint(nodes, inputs.get("model"))
+
+    has_text_encoder = any(
+        isinstance(n, dict) and n.get("class_type") in _TEXT_ENCODE_NODES for n in nodes.values()
+    )
     has_vae = any(
         isinstance(n, dict) and n.get("class_type") in _VAE_DECODE_NODES for n in nodes.values()
     )
@@ -148,7 +246,7 @@ def translate_comfyui_workflow(
             sched.kind,
         )
 
-    return build_diffusion_pipeline_metadata(
+    metadata = build_diffusion_pipeline_metadata(
         num_inference_steps=steps,
         scheduler=sched,
         guidance_scale=guidance,
@@ -156,11 +254,39 @@ def translate_comfyui_workflow(
         vae_filename=vae_filename if has_vae else None,
         text_encoder_filename=text_encoder_filename if has_text_encoder else None,
     )
+    return ComfyUIWorkflow(
+        metadata=metadata,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        seed=seed,
+        steps=steps,
+        cfg=cfg,
+        sampler_name=sampler_name,
+        scheduler_kind=sched.kind,
+        scheduler_spacing=spacing,
+        checkpoint=checkpoint,
+    )
+
+
+def translate_comfyui_workflow(workflow: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    """Translate a ComfyUI workflow to just the onnx-genai ``inference_metadata`` dict.
+
+    Convenience wrapper over :func:`parse_comfyui_workflow` for callers that only
+    need the pipeline document (see that function for the full run parameters).
+    """
+    return parse_comfyui_workflow(workflow, **kwargs).metadata
+
+
+def parse_comfyui_workflow_file(path: str, **kwargs: Any) -> ComfyUIWorkflow:
+    """Load a ComfyUI API-format JSON file and parse it (see
+    :func:`parse_comfyui_workflow`)."""
+    with open(path, encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    return parse_comfyui_workflow(workflow, **kwargs)
 
 
 def translate_comfyui_workflow_file(path: str, **kwargs: Any) -> dict[str, Any]:
-    """Load a ComfyUI API-format JSON file and translate it (see
-    :func:`translate_comfyui_workflow`)."""
-    with open(path, encoding="utf-8") as handle:
-        workflow = json.load(handle)
-    return translate_comfyui_workflow(workflow, **kwargs)
+    """Load a ComfyUI API-format JSON file and translate it to metadata."""
+    return parse_comfyui_workflow_file(path, **kwargs).metadata

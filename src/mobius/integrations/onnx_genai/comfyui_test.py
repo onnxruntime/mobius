@@ -10,6 +10,8 @@ import json
 import pytest
 
 from mobius.integrations.onnx_genai.comfyui import (
+    ComfyUIWorkflow,
+    parse_comfyui_workflow,
     translate_comfyui_workflow,
     translate_comfyui_workflow_file,
 )
@@ -51,6 +53,40 @@ def test_translate_default_txt2img():
     assert strat["cfg_conditioning_input"] == "encoder_hidden_states"
     models = meta["pipeline"]["models"]
     assert "denoiser" in models and "vae" in models and "text_encoder" in models
+
+
+def test_parse_recovers_full_run_params():
+    wf = parse_comfyui_workflow(_DEFAULT_TXT2IMG)
+    assert isinstance(wf, ComfyUIWorkflow)
+    assert wf.prompt == "a cat"
+    assert wf.negative_prompt == ""
+    assert (wf.width, wf.height) == (512, 512)
+    assert wf.seed == 42
+    assert wf.steps == 20
+    assert wf.cfg == 8.0
+    assert wf.sampler_name == "euler"
+    assert wf.scheduler_kind == "euler"
+    assert wf.checkpoint == "v1-5.safetensors"
+
+
+def test_parse_traces_checkpoint_through_lora():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    # Insert a LoraLoader between the checkpoint and the sampler's model input.
+    wf["11"] = {
+        "class_type": "LoraLoader",
+        "inputs": {"lora_name": "x.safetensors", "model": ["4", 0], "clip": ["4", 1]},
+    }
+    wf["3"]["inputs"]["model"] = ["11", 0]
+    parsed = parse_comfyui_workflow(wf)
+    assert parsed.checkpoint == "v1-5.safetensors"
+
+
+def test_parse_non_square_dims():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    wf["5"]["inputs"].update({"width": 768, "height": 512})
+    parsed = parse_comfyui_workflow(wf)
+    assert (parsed.width, parsed.height) == (768, 512)
+
 
 
 def test_ddim_sampler_maps_to_ddim():
