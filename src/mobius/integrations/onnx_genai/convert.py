@@ -222,6 +222,7 @@ def convert_comfyui_workflow(
         "seed": wf.seed,
         "width": wf.width,
         "height": wf.height,
+        "batch_size": wf.batch_size,
         "steps": wf.steps,
         "cfg": wf.cfg,
         "sampler_name": wf.sampler_name,
