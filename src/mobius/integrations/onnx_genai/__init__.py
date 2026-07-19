@@ -39,6 +39,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
+    build_language_diffusion_pipeline_metadata,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "SchedulerConfig",
     "build_decoder_metadata",
     "build_diffusion_pipeline_metadata",
+    "build_language_diffusion_pipeline_metadata",
     "build_pipeline_metadata_for_workflow",
     "convert_comfyui_workflow",
     "decoder_metadata_from_config",

@@ -13,6 +13,7 @@ import yaml
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
+    build_language_diffusion_pipeline_metadata,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
 )
@@ -196,4 +197,80 @@ class TestBuildDiffusionPipelineMetadata:
             guidance_scale=7.5,
         )
         # Validate the whole InferenceMetadata document.
+        jsonschema.validate(instance=meta, schema=schema)
+
+
+class TestLanguageDiffusionMetadata:
+    def test_minimal_masked_diffusion_pipeline(self):
+        meta = build_language_diffusion_pipeline_metadata(
+            mask_token_id=126336, num_inference_steps=128
+        )
+        pipeline = meta["pipeline"]
+        assert pipeline["models"]["denoiser"] == {
+            "filename": "model.onnx",
+            "type": "denoiser",
+        }
+        # Loop-carried self-edge: logits refine the token sequence.
+        assert pipeline["dataflow"] == [
+            {"from": "denoiser.logits", "to": "denoiser.input_ids"}
+        ]
+        strategy = pipeline["strategy"]
+        assert strategy["kind"] == "iterative"
+        assert strategy["num_steps"] == 128
+        assert strategy["scheduler_config"] == {
+            "kind": "masked_diffusion",
+            "mask_token_id": 126336,
+        }
+        assert "guidance_scale" not in strategy
+
+    def test_semi_autoregressive_with_temperature_and_cfg(self):
+        meta = build_language_diffusion_pipeline_metadata(
+            mask_token_id=5,
+            num_inference_steps=64,
+            block_length=32,
+            temperature=0.2,
+            guidance_scale=2.5,  # LLaDA cfg_scale=1.5 => cfg_scale + 1
+        )
+        strategy = meta["pipeline"]["strategy"]
+        assert strategy["guidance_scale"] == 2.5
+        assert strategy["scheduler_config"]["block_length"] == 32
+        assert strategy["scheduler_config"]["temperature"] == 0.2
+
+    def test_custom_ports(self):
+        meta = build_language_diffusion_pipeline_metadata(
+            mask_token_id=1,
+            num_inference_steps=8,
+            model_filename="llada.onnx",
+            input_ids_port="tokens",
+            logits_port="scores",
+        )
+        pipeline = meta["pipeline"]
+        assert pipeline["models"]["denoiser"]["filename"] == "llada.onnx"
+        assert pipeline["dataflow"] == [
+            {"from": "denoiser.scores", "to": "denoiser.tokens"}
+        ]
+
+    def test_rejects_zero_steps(self):
+        with pytest.raises(ValueError):
+            build_language_diffusion_pipeline_metadata(
+                mask_token_id=1, num_inference_steps=0
+            )
+
+    def test_matches_onnx_genai_json_schema(self):
+        schema_path = _onnx_genai_schema_path()
+        if schema_path is None:
+            pytest.skip("onnx-genai schema not found (set ONNX_GENAI_SCHEMA)")
+        import json
+
+        import jsonschema
+
+        with open(schema_path) as handle:
+            schema = json.load(handle)
+        meta = build_language_diffusion_pipeline_metadata(
+            mask_token_id=126336,
+            num_inference_steps=64,
+            block_length=32,
+            temperature=0.0,
+            guidance_scale=2.5,
+        )
         jsonschema.validate(instance=meta, schema=schema)
