@@ -86,6 +86,48 @@ def _load_pipeline(source: str) -> Any:
         return load(source)
 
 
+def _fast_tokenizer(source: str, tokenizer: Any, subfolder: str) -> Any:
+    """Return a *fast* CLIP tokenizer whose ids match the (possibly slow)
+    diffusers ``tokenizer``.
+
+    Proven equivalence: ``CLIPTokenizerFast.from_pretrained(..).backend_tokenizer``
+    produces a ``tokenizer.json`` whose ids exactly match the slow
+    ``CLIPTokenizer`` with ``padding="max_length", max_length=77, truncation=True``.
+    """
+    if hasattr(tokenizer, "backend_tokenizer"):
+        return tokenizer
+    from transformers import CLIPTokenizerFast
+
+    try:
+        return CLIPTokenizerFast.from_pretrained(source, subfolder=subfolder)
+    except Exception as exc:  # single-file checkpoints have no tokenizer subfolder
+        _LOGGER.warning(
+            "could not load a fast tokenizer from %s/%s (%s); converting the loaded tokenizer",
+            source,
+            subfolder,
+            exc,
+        )
+        from transformers.convert_slow_tokenizer import convert_slow_tokenizer
+
+        return CLIPTokenizerFast(tokenizer_object=convert_slow_tokenizer(tokenizer))
+
+
+def _save_tokenizer_json(
+    source: str,
+    tokenizer: Any,
+    output_dir: str,
+    filename: str = "tokenizer.json",
+    subfolder: str = "tokenizer",
+) -> str:
+    """Write a self-contained fast-format ``tokenizer.json`` into ``output_dir``
+    so the exported package can be tokenized natively without the HF cache."""
+    fast = _fast_tokenizer(source, tokenizer, subfolder)
+    path = os.path.join(output_dir, filename)
+    fast.backend_tokenizer.save(path)
+    _LOGGER.info("wrote tokenizer -> %s", path)
+    return path
+
+
 def export_checkpoint(
     source: str,
     output_dir: str,
@@ -229,6 +271,19 @@ def export_checkpoint(
             input_names=["image"], output_names=["latent"],
             dynamic_axes={"image": {0: "batch", 2: "height", 3: "width"}},
             opset_version=opset, dynamo=False,
+        )
+
+    # Emit a self-contained fast-format tokenizer.json (and tokenizer_2.json for
+    # SDXL) into the package root so the native runner tokenizes prompts without
+    # the HF cache (which only carries vocab.json + merges.txt).
+    _save_tokenizer_json(source, tokenizer, output_dir)
+    if sdxl:
+        _save_tokenizer_json(
+            source,
+            getattr(pipe, "tokenizer_2", None),
+            output_dir,
+            filename="tokenizer_2.json",
+            subfolder="tokenizer_2",
         )
 
     return ExportedCheckpoint(
