@@ -401,8 +401,14 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
 
     with open(args.workflow, encoding="utf-8") as handle:
         workflow = json.load(handle)
+    lora_paths = {}
+    for entry in getattr(args, "lora", None) or []:
+        name, _, path = entry.partition("=")
+        if not path:
+            raise SystemExit(f"--lora expects NAME=PATH, got {entry!r}")
+        lora_paths[name] = path
     result = convert_comfyui_workflow(
-        workflow, args.checkpoint, args.output, opset=args.opset
+        workflow, args.checkpoint, args.output, opset=args.opset, lora_paths=lora_paths or None
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -412,6 +418,8 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         f"  {wf.steps} steps, cfg {wf.cfg}, sampler {wf.sampler_name} "
         f"(scheduler {wf.scheduler_kind}), {wf.width}x{wf.height}"
     )
+    if wf.loras:
+        print(f"  loras: {', '.join(f'{n}@{s}' for n, s in wf.loras)}")
     if wf.prompt is not None:
         print(f"  prompt: {wf.prompt!r}")
 
@@ -707,6 +715,13 @@ def main(argv: list[str] | None = None) -> None:
         "--output", "-o", required=True, help="Output directory for the ONNX components + metadata."
     )
     comfy_parser.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
+    comfy_parser.add_argument(
+        "--lora",
+        action="append",
+        metavar="NAME=PATH",
+        help="Resolve a ComfyUI LoRA filename to a .safetensors path; the LoRA is "
+        "fused into the exported model. Repeatable.",
+    )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
     args = parser.parse_args(argv)

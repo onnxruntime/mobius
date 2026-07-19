@@ -150,6 +150,7 @@ def convert_comfyui_workflow(
     output_dir: str,
     *,
     opset: int = 17,
+    lora_paths: dict[str, str] | None = None,
 ) -> ConversionResult:
     """Convert a ComfyUI workflow + checkpoint into a runnable onnx-genai pipeline dir.
 
@@ -159,6 +160,10 @@ def convert_comfyui_workflow(
             id to export (ComfyUI references checkpoints by name; the caller resolves
             that name to a real source).
         output_dir: Destination directory for the ONNX components + metadata.
+        lora_paths: Optional map from the ComfyUI LoRA filename (as it appears in a
+            LoraLoader node) to a real ``.safetensors`` path. LoRAs referenced by the
+            workflow are **fused** into the exported model. Unresolved names are
+            skipped with a warning.
 
     Returns:
         A :class:`ConversionResult` with the written paths and parsed workflow.
@@ -171,6 +176,13 @@ def convert_comfyui_workflow(
     # time embedding; DPM++/DDIM linspace timesteps are integer and fine as int64.
     fractional = wf.scheduler_kind in ("euler", "euler_ancestral") or use_karras
     timestep_dtype = "float32" if fractional else "int64"
+    loras: list[tuple[str, float]] = []
+    for name, strength in wf.loras:
+        path = (lora_paths or {}).get(name, name if os.path.isfile(name) else None)
+        if path:
+            loras.append((path, strength))
+        else:
+            _LOGGER.warning("LoRA %r not resolved to a file (pass lora_paths); skipping", name)
     exported = export_checkpoint(
         checkpoint_source,
         output_dir,
@@ -178,6 +190,7 @@ def convert_comfyui_workflow(
         width=wf.width,
         opset=opset,
         timestep_dtype=timestep_dtype,
+        loras=loras or None,
     )
     timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps, use_karras)
     metadata = build_pipeline_metadata_for_workflow(wf, exported, timesteps=timesteps)

@@ -74,11 +74,32 @@ def test_parse_traces_checkpoint_through_lora():
     # Insert a LoraLoader between the checkpoint and the sampler's model input.
     wf["11"] = {
         "class_type": "LoraLoader",
-        "inputs": {"lora_name": "x.safetensors", "model": ["4", 0], "clip": ["4", 1]},
+        "inputs": {"lora_name": "x.safetensors", "strength_model": 0.8, "model": ["4", 0], "clip": ["4", 1]},
     }
     wf["3"]["inputs"]["model"] = ["11", 0]
     parsed = parse_comfyui_workflow(wf)
     assert parsed.checkpoint == "v1-5.safetensors"
+
+
+def test_parse_collects_stacked_loras_in_order():
+    wf = json.loads(json.dumps(_DEFAULT_TXT2IMG))
+    # Two stacked LoRAs: checkpoint -> loraA -> loraB -> sampler.
+    wf["11"] = {
+        "class_type": "LoraLoader",
+        "inputs": {"lora_name": "a.safetensors", "strength_model": 0.5, "model": ["4", 0], "clip": ["4", 1]},
+    }
+    wf["12"] = {
+        "class_type": "LoraLoader",
+        "inputs": {"lora_name": "b.safetensors", "strength_model": 1.0, "model": ["11", 0], "clip": ["11", 1]},
+    }
+    wf["3"]["inputs"]["model"] = ["12", 0]
+    parsed = parse_comfyui_workflow(wf)
+    # Applied base-first: a then b.
+    assert parsed.loras == (("a.safetensors", 0.5), ("b.safetensors", 1.0))
+
+
+def test_parse_no_loras_by_default():
+    assert parse_comfyui_workflow(_DEFAULT_TXT2IMG).loras == ()
 
 
 def test_parse_non_square_dims():

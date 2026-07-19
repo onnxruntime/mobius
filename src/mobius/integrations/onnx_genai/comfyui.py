@@ -96,6 +96,7 @@ class ComfyUIWorkflow:
     checkpoint: str | None
     denoise: float = 1.0
     start_step: int = 0
+    loras: tuple[tuple[str, float], ...] = ()
 
 
 def _nodes(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -197,6 +198,30 @@ def _trace_checkpoint(nodes: dict[str, Any], ref: Any) -> str | None:
     return None
 
 
+def _trace_loras(nodes: dict[str, Any], ref: Any) -> list[tuple[str, float]]:
+    """Collect LoraLoader nodes along a KSampler.model chain, in application order.
+
+    ComfyUI stacks LoraLoaders (each `model` input chains to the previous); returns
+    ``[(lora_name, strength_model), ...]`` from the base checkpoint outward.
+    """
+    loras: list[tuple[str, float]] = []
+    for _ in range(_MAX_TRACE_DEPTH):
+        node = _resolve(nodes, ref)
+        if node is None:
+            break
+        inputs = node.get("inputs", {})
+        if node.get("class_type") in ("LoraLoader", "LoraLoaderModelOnly"):
+            name = inputs.get("lora_name")
+            if isinstance(name, str):
+                strength = float(inputs.get("strength_model", inputs.get("strength", 1.0)))
+                loras.append((name, strength))
+        ref = inputs.get("model")
+        if not _is_link(ref):
+            break
+    loras.reverse()  # base checkpoint applies first
+    return loras
+
+
 def parse_comfyui_workflow(
     workflow: dict[str, Any],
     *,
@@ -241,6 +266,7 @@ def parse_comfyui_workflow(
     negative_prompt = _follow_prompt_text(nodes, inputs.get("negative"))
     width, height = _follow_dims(nodes, inputs.get("latent_image"))
     checkpoint = _trace_checkpoint(nodes, inputs.get("model"))
+    loras = tuple(_trace_loras(nodes, inputs.get("model")))
 
     has_text_encoder = any(
         isinstance(n, dict) and n.get("class_type") in _TEXT_ENCODE_NODES for n in nodes.values()
@@ -282,6 +308,7 @@ def parse_comfyui_workflow(
         checkpoint=checkpoint,
         denoise=denoise,
         start_step=start_step,
+        loras=loras,
     )
 
 

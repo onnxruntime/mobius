@@ -88,6 +88,7 @@ def export_checkpoint(
     opset: int = 17,
     components: tuple[str, ...] = ("text_encoder", "denoiser", "vae"),
     timestep_dtype: str = "int64",
+    loras: list[tuple[str, float]] | None = None,
 ) -> ExportedCheckpoint:
     """Export a checkpoint's components to ONNX in ``output_dir``.
 
@@ -103,6 +104,9 @@ def export_checkpoint(
             ``"float32"``. Schedulers with *fractional* inference timesteps (Euler
             linspace) need ``"float32"`` so the value is not truncated before the
             UNet's continuous time embedding.
+        loras: Optional ``[(path, strength), ...]`` LoRA weights to **fuse** into
+            the base model before export (so the exported ONNX already carries the
+            LoRA deltas — no runtime LoRA support needed). Applied in order.
 
     Returns:
         An :class:`ExportedCheckpoint` describing the emitted files and the
@@ -114,6 +118,11 @@ def export_checkpoint(
         raise ValueError(f"timestep_dtype must be 'int64' or 'float32', got {timestep_dtype!r}")
     os.makedirs(output_dir, exist_ok=True)
     pipe = _load_pipeline(source)
+    for path, strength in loras or []:
+        _LOGGER.info("fusing LoRA %s (strength %s)", path, strength)
+        pipe.load_lora_weights(path)
+        pipe.fuse_lora(lora_scale=float(strength))
+        pipe.unload_lora_weights()
     unet = pipe.unet.eval()
     vae = pipe.vae.eval()
     text_encoder = pipe.text_encoder.eval()
