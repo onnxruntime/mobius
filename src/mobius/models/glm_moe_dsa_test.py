@@ -121,6 +121,40 @@ class TestGlmMoeDsaExport:
             "topk_indices",
         }
 
+    def test_indexer_rotary_uses_full_rotation(self):
+        """Regression: indexer RoPE must rotate the full index_head_dim.
+
+        The indexer key shares the model's rotary_emb cos/sin cache (sized
+        qk_rope_head_dim / 2). The opset-24 RotaryEmbedding op validates that
+        the cos cache last dim equals head_size / 2 or rotary_embedding_dim / 2.
+        Passing ``rotary_embedding_dim = index_head_dim // 2`` made the op
+        expect a cache of that_value / 2, which mismatched the shared cache and
+        raised "cos_cache dimension 2 should be same as head_size / 2 or
+        rotary_embedding_dim / 2" at runtime. Full rotation (0) matches the
+        shared cache like the main MLA q_rope/k_rope calls do.
+        """
+        config = _tiny_glm_moe_dsa_config()
+        package = build_from_module(
+            GlmMoeDsaCausalLMModel(config),
+            config,
+            task="glm-moe-dsa",
+        )
+        graph = package["model"].graph
+
+        indexer_rope_nodes = [
+            node
+            for node in graph
+            if node.op_type == "RotaryEmbedding" and "indexer" in (node.name or "")
+        ]
+        assert indexer_rope_nodes, "expected at least one indexer RotaryEmbedding node"
+        for node in indexer_rope_nodes:
+            attr = node.attributes.get("rotary_embedding_dim")
+            dim = attr.value if attr is not None else 0
+            assert dim == 0, (
+                f"indexer RotaryEmbedding {node.name!r} must use full rotation "
+                f"(rotary_embedding_dim=0) to match the shared cos cache, got {dim}"
+            )
+
     def test_quantized_graph_uses_matmul_nbits(self):
         config = _tiny_glm_moe_dsa_config(
             quantization=QuantizationConfig(

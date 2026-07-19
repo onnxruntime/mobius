@@ -81,12 +81,18 @@ class GlmMoeDsaIndexer(nn.Module):
         position_embeddings: tuple,
     ) -> ir.Value:
         key = self.k_norm(op, self.wk(op, hidden_states))
+        # The indexer key shares the model's rotary_emb cos/sin cache (sized
+        # qk_rope_head_dim / 2). RoPE rotates the *entire* index_head_dim, so
+        # rotary_embedding_dim must be 0 (full rotation) — matching the main
+        # MLA q_rope/k_rope calls. Passing index_head_dim // 2 here makes the
+        # opset-24 RotaryEmbedding op expect a cos cache of that_value / 2,
+        # which mismatches the shared cache and fails shape validation.
         return apply_rotary_pos_emb(
             op,
             key,
             position_embeddings,
             num_heads=1,
-            rotary_embedding_dim=self.index_head_dim // 2,
+            rotary_embedding_dim=0,
             interleaved=self.rope_interleave,
         )
 
