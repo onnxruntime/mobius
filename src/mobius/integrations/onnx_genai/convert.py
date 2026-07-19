@@ -1,18 +1,22 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""One-shot ComfyUI workflow -> runnable onnx-genai pipeline directory.
+"""Translate a ComfyUI workflow into an onnx-genai pipeline metadata directory.
 
-Ties the three pieces together:
+This ties the *translation* pieces together (no model export — Mobius builds the
+neural ONNX components from scratch via :func:`build_diffusers_pipeline`):
 
 1. :func:`parse_comfyui_workflow` — recover run params + topology from the JSON.
-2. :func:`export_checkpoint` — export the referenced ``.safetensors`` to the ONNX
-   components the pipeline runs.
-3. Reconcile the ComfyUI sampler (kind / steps / cfg) with the checkpoint's own
-   noise schedule (betas / num_train_timesteps), emit ``inference_metadata.yaml``,
-   and write a ``run.json`` capturing the prompt / seed / resolution.
+2. Reconcile the ComfyUI sampler (kind / steps / cfg / spacing) with the
+   checkpoint's own noise schedule (betas / ``num_train_timesteps``), read from
+   the diffusers ``scheduler/scheduler_config.json`` (the ComfyUI JSON never
+   carries betas), and emit ``inference_metadata.yaml`` + a ``run.json``.
 
-The result is a directory onnx-genai can load and run.
+The ONNX component graphs (denoiser / VAE / text encoder) are produced
+separately by Mobius's from-scratch builder — see
+:func:`mobius.build_diffusers_pipeline` and
+:func:`mobius.integrations.onnx_genai.write_onnx_genai_config`. This module does
+**not** export or fuse any weights.
 """
 
 from __future__ import annotations
@@ -25,10 +29,6 @@ from typing import Any
 
 import yaml
 
-from mobius.integrations.onnx_genai.checkpoint_export import (
-    ExportedCheckpoint,
-    export_checkpoint,
-)
 from mobius.integrations.onnx_genai.comfyui import (
     ComfyUIWorkflow,
     parse_comfyui_workflow,
@@ -36,6 +36,7 @@ from mobius.integrations.onnx_genai.comfyui import (
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
+    load_diffusers_scheduler_config,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,56 +50,68 @@ class ConversionResult:
     workflow: ComfyUIWorkflow
 
 
+def _scheduler_for_workflow(
+    workflow: ComfyUIWorkflow, checkpoint_source: str | None
+) -> SchedulerConfig:
+    """Build the scheduler config: sampler *kind*/*spacing* from the ComfyUI graph,
+    noise *schedule* (betas) from the diffusers checkpoint config (SD defaults if
+    unavailable)."""
+    base = load_diffusers_scheduler_config(checkpoint_source) if checkpoint_source else None
+    return SchedulerConfig(
+        kind=workflow.scheduler_kind,
+        num_train_timesteps=base.num_train_timesteps if base else 1000,
+        beta_start=base.beta_start if base else 0.00085,
+        beta_end=base.beta_end if base else 0.012,
+        beta_schedule=base.beta_schedule if base else "scaled_linear",
+        prediction_type="epsilon",
+        use_karras_sigmas=(workflow.scheduler_spacing == "karras"),
+        use_exponential_sigmas=(workflow.scheduler_spacing == "exponential"),
+    )
+
+
 def build_pipeline_metadata_for_workflow(
-    wf: ComfyUIWorkflow,
-    exported: ExportedCheckpoint,
+    workflow: ComfyUIWorkflow,
+    scheduler: SchedulerConfig,
     *,
+    sdxl: bool = False,
     timesteps: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Reconcile a parsed workflow with an exported checkpoint into pipeline metadata.
+    """Reconcile a parsed workflow with a scheduler config into pipeline metadata.
 
     The sampler *kind* / *steps* / *cfg* come from the ComfyUI graph; the noise
-    *schedule* (betas, ``num_train_timesteps``) come from the checkpoint — the
-    ComfyUI JSON never carries betas, so reading them from the model is the only
-    correct source.
+    *schedule* comes from ``scheduler`` (read from the checkpoint's diffusers
+    config — the ComfyUI JSON never carries betas).
     """
-    has_vae = "vae" in wf.metadata["pipeline"]["models"]
-    has_text = "text_encoder" in wf.metadata["pipeline"]["models"]
-    scheduler = SchedulerConfig(
-        kind=wf.scheduler_kind,
-        num_train_timesteps=exported.num_train_timesteps,
-        beta_start=exported.beta_start,
-        beta_end=exported.beta_end,
-        beta_schedule=exported.beta_schedule,
-        prediction_type="epsilon",
-        use_karras_sigmas=(wf.scheduler_spacing == "karras"),
-        use_exponential_sigmas=(wf.scheduler_spacing == "exponential"),
-    )
-    guidance = wf.cfg if wf.cfg != 1.0 else None
+    has_vae = "vae" in workflow.metadata["pipeline"]["models"]
+    has_text = "text_encoder" in workflow.metadata["pipeline"]["models"]
+    guidance = workflow.cfg if workflow.cfg != 1.0 else None
     # SDXL routes two conditioning edges (concatenated hidden states + pooled
     # text_embeds); its time_ids is an external denoiser input the driver supplies.
     text_encoder_edges = None
-    if exported.sdxl:
+    if sdxl:
         text_encoder_edges = [
             ("encoder_hidden_states", "encoder_hidden_states"),
             ("text_embeds", "text_embeds"),
         ]
     return build_diffusion_pipeline_metadata(
-        num_inference_steps=wf.steps,
+        num_inference_steps=workflow.steps,
         scheduler=scheduler,
         guidance_scale=guidance,
-        start_step=wf.start_step or None,
+        start_step=workflow.start_step or None,
         timesteps=timesteps,
-        denoiser_filename=exported.denoiser_filename,
-        vae_filename=exported.vae_filename if has_vae else None,
+        denoiser_filename="denoiser.onnx",
+        vae_filename="vae.onnx" if has_vae else None,
         vae_latent_input="latent",
-        text_encoder_filename=exported.text_encoder_filename if has_text else None,
+        text_encoder_filename="text_encoder.onnx" if has_text else None,
         text_encoder_edges=text_encoder_edges,
     )
 
 
 def _diffusers_timesteps(
-    kind: str, exported: ExportedCheckpoint, steps: int, use_karras: bool = False,
+    kind: str,
+    scheduler: SchedulerConfig,
+    steps: int,
+    use_karras: bool = False,
     use_exponential: bool = False,
 ) -> list[float] | None:
     """Compute the exact inference timesteps diffusers would use, so the denoiser
@@ -134,10 +147,10 @@ def _diffusers_timesteps(
 
             extra = {"set_alpha_to_one": True, "steps_offset": 0, "clip_sample": False}
         sched = _Sched(
-            num_train_timesteps=exported.num_train_timesteps,
-            beta_start=exported.beta_start,
-            beta_end=exported.beta_end,
-            beta_schedule=exported.beta_schedule,
+            num_train_timesteps=scheduler.num_train_timesteps,
+            beta_start=scheduler.beta_start,
+            beta_end=scheduler.beta_end,
+            beta_schedule=scheduler.beta_schedule,
             prediction_type="epsilon",
             **extra,
         )
@@ -150,25 +163,30 @@ def _diffusers_timesteps(
 
 def convert_comfyui_workflow(
     workflow: dict[str, Any],
-    checkpoint_source: str,
+    checkpoint_source: str | None,
     output_dir: str,
     *,
-    opset: int = 17,
-    lora_paths: dict[str, str] | None = None,
-    controlnet_paths: dict[str, str] | None = None,
+    sdxl: bool = False,
+    compute_timesteps: bool = True,
 ) -> ConversionResult:
-    """Convert a ComfyUI workflow + checkpoint into a runnable onnx-genai pipeline dir.
+    """Translate a ComfyUI workflow into an onnx-genai pipeline metadata directory.
+
+    Writes ``inference_metadata.yaml`` (topology + reconciled scheduler) and
+    ``run.json`` (prompt / seed / resolution). It does **not** build or export the
+    ONNX component graphs — Mobius builds those from scratch; see
+    :func:`mobius.build_diffusers_pipeline` +
+    :func:`mobius.integrations.onnx_genai.write_onnx_genai_config`.
 
     Args:
         workflow: Parsed ComfyUI API-format JSON.
-        checkpoint_source: The ``.safetensors``/``.ckpt`` file, diffusers dir, or HF
-            id to export (ComfyUI references checkpoints by name; the caller resolves
-            that name to a real source).
-        output_dir: Destination directory for the ONNX components + metadata.
-        lora_paths: Optional map from the ComfyUI LoRA filename (as it appears in a
-            LoraLoader node) to a real ``.safetensors`` path. LoRAs referenced by the
-            workflow are **fused** into the exported model. Unresolved names are
-            skipped with a warning.
+        checkpoint_source: The diffusers directory or HF id whose
+            ``scheduler/scheduler_config.json`` supplies the noise-schedule betas.
+            May be ``None`` (Stable Diffusion beta defaults are used).
+        output_dir: Destination directory for the metadata files.
+        sdxl: Whether the target is an SDXL pipeline (routes the dual-encoder
+            conditioning edges).
+        compute_timesteps: Whether to precompute the diffusers inference timesteps
+            (requires ``diffusers``); when False they are omitted.
 
     Returns:
         A :class:`ConversionResult` with the written paths and parsed workflow.
@@ -177,40 +195,16 @@ def convert_comfyui_workflow(
     os.makedirs(output_dir, exist_ok=True)
     use_karras = wf.scheduler_spacing == "karras"
     use_exponential = wf.scheduler_spacing == "exponential"
-    # Fractional inference timesteps (Euler/Euler-ancestral always; any Karras
-    # schedule) need a float32 denoiser timestep to avoid truncation before the
-    # time embedding; DPM++/DDIM linspace timesteps are integer and fine as int64.
-    fractional = wf.scheduler_kind in ("euler", "euler_ancestral") or use_karras or use_exponential
-    timestep_dtype = "float32" if fractional else "int64"
-    loras: list[tuple[str, float]] = []
-    for name, strength in wf.loras:
-        path = (lora_paths or {}).get(name, name if os.path.isfile(name) else None)
-        if path:
-            loras.append((path, strength))
-        else:
-            _LOGGER.warning("LoRA %r not resolved to a file (pass lora_paths); skipping", name)
-    controlnet_source = None
-    if wf.controlnet is not None:
-        cn_name, _cn_strength = wf.controlnet
-        controlnet_source = (controlnet_paths or {}).get(
-            cn_name, cn_name if os.path.isdir(cn_name) or os.path.isfile(cn_name) else None
+    scheduler = _scheduler_for_workflow(wf, checkpoint_source)
+
+    timesteps = None
+    if compute_timesteps:
+        timesteps = _diffusers_timesteps(
+            wf.scheduler_kind, scheduler, wf.steps, use_karras, use_exponential
         )
-        if controlnet_source is None:
-            _LOGGER.warning(
-                "ControlNet %r not resolved to a path (pass controlnet_paths); skipping", cn_name
-            )
-    exported = export_checkpoint(
-        checkpoint_source,
-        output_dir,
-        height=wf.height,
-        width=wf.width,
-        opset=opset,
-        timestep_dtype=timestep_dtype,
-        loras=loras or None,
-        controlnet=controlnet_source,
+    metadata = build_pipeline_metadata_for_workflow(
+        wf, scheduler, sdxl=sdxl, timesteps=timesteps
     )
-    timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps, use_karras, use_exponential)
-    metadata = build_pipeline_metadata_for_workflow(wf, exported, timesteps=timesteps)
 
     metadata_path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(metadata_path, "w", encoding="utf-8") as handle:
@@ -228,20 +222,13 @@ def convert_comfyui_workflow(
         "sampler_name": wf.sampler_name,
         "scheduler_kind": wf.scheduler_kind,
         "checkpoint": wf.checkpoint,
-        "latent_channels": exported.in_channels,
-        "cross_attention_dim": exported.cross_attention_dim,
-        "model_max_length": exported.model_max_length,
-        "sdxl": exported.sdxl,
-        "pooled_dim": exported.pooled_dim,
-        "controlnet": exported.controlnet,
-        "conditioning_channels": exported.conditioning_channels,
-        "inpaint": exported.inpaint,
+        "sdxl": sdxl,
     }
     run_params_path = os.path.join(output_dir, "run.json")
     with open(run_params_path, "w", encoding="utf-8") as handle:
         json.dump(run_params, handle, indent=2)
 
-    _LOGGER.info("wrote runnable onnx-genai pipeline to %s", output_dir)
+    _LOGGER.info("wrote onnx-genai pipeline metadata to %s", output_dir)
     return ConversionResult(
         output_dir=output_dir,
         metadata_path=metadata_path,

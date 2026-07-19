@@ -401,21 +401,8 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
 
     with open(args.workflow, encoding="utf-8") as handle:
         workflow = json.load(handle)
-    lora_paths = {}
-    for entry in getattr(args, "lora", None) or []:
-        name, _, path = entry.partition("=")
-        if not path:
-            raise SystemExit(f"--lora expects NAME=PATH, got {entry!r}")
-        lora_paths[name] = path
-    controlnet_paths = {}
-    for entry in getattr(args, "controlnet", None) or []:
-        name, _, path = entry.partition("=")
-        if not path:
-            raise SystemExit(f"--controlnet expects NAME=PATH, got {entry!r}")
-        controlnet_paths[name] = path
     result = convert_comfyui_workflow(
-        workflow, args.checkpoint, args.output, opset=args.opset,
-        lora_paths=lora_paths or None, controlnet_paths=controlnet_paths or None,
+        workflow, args.checkpoint, args.output, sdxl=getattr(args, "sdxl", False),
     )
     wf = result.workflow
     print(f"Converted ComfyUI workflow -> {result.output_dir}")
@@ -707,34 +694,25 @@ def main(argv: list[str] | None = None) -> None:
     # --- convert-comfyui ---
     comfy_parser = subparsers.add_parser(
         "convert-comfyui",
-        help="Convert a ComfyUI API-format workflow JSON into a runnable "
-        "onnx-genai pipeline (translates the graph + exports the checkpoint to ONNX).",
+        help="Translate a ComfyUI API-format workflow JSON into an onnx-genai "
+        "pipeline metadata directory (inference_metadata.yaml + run.json). The "
+        "ONNX component graphs are built separately by Mobius's diffusers builder.",
     )
     comfy_parser.add_argument("workflow", help="Path to the ComfyUI API-format workflow JSON.")
     comfy_parser.add_argument(
         "--checkpoint",
-        required=True,
-        help="Checkpoint to export: a .safetensors/.ckpt file, a diffusers "
-        "directory, or a Hugging Face model id. (ComfyUI references checkpoints "
-        "by name; resolve that name to a real source here.)",
+        default=None,
+        help="Optional diffusers directory or Hugging Face model id whose "
+        "scheduler config supplies the noise-schedule betas (Stable Diffusion "
+        "defaults are used when omitted).",
     )
     comfy_parser.add_argument(
-        "--output", "-o", required=True, help="Output directory for the ONNX components + metadata."
-    )
-    comfy_parser.add_argument("--opset", type=int, default=17, help="ONNX opset version.")
-    comfy_parser.add_argument(
-        "--lora",
-        action="append",
-        metavar="NAME=PATH",
-        help="Resolve a ComfyUI LoRA filename to a .safetensors path; the LoRA is "
-        "fused into the exported model. Repeatable.",
+        "--output", "-o", required=True, help="Output directory for the pipeline metadata."
     )
     comfy_parser.add_argument(
-        "--controlnet",
-        action="append",
-        metavar="NAME=PATH",
-        help="Resolve a ComfyUI ControlNet name to a diffusers dir/.safetensors; the "
-        "ControlNet is fused into the exported denoiser. Repeatable.",
+        "--sdxl",
+        action="store_true",
+        help="Target an SDXL pipeline (routes the dual text-encoder conditioning edges).",
     )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 

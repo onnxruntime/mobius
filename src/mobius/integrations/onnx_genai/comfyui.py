@@ -27,8 +27,8 @@ This module walks that graph to recover everything needed to *run* the pipeline:
     VAEDecode (present)       -> vae component (final phase)
 
 The translator carries topology + run parameters only; it does NOT carry weights.
-The actual ONNX component graphs come from exporting the referenced ``.safetensors``
-checkpoint (see :mod:`mobius.integrations.onnx_genai.checkpoint_export`).
+The actual ONNX component graphs are built from scratch by Mobius's diffusers
+builder (see :func:`mobius.build_diffusers_pipeline`).
 
 Only the core txt2img subset is supported today; unsupported samplers or missing
 sampler nodes raise a clear ``ValueError`` rather than silently producing wrong
