@@ -129,3 +129,93 @@ def test_unet_matches_diffusers():
             },
         )[0]
     assert np.abs(actual - expected).max() < 2e-4
+
+
+def test_unet_lora_gate_parity():
+    """Runtime LoRA parity: gate=0 == diffusers base, gate=1 == diffusers+LoRA."""
+    pytest.importorskip("diffusers")
+    pytest.importorskip("peft")
+    import onnx_ir
+    import onnxruntime as ort
+    import torch
+    from diffusers import UNet2DConditionModel as HFUNet
+    from diffusers.utils import convert_state_dict_to_diffusers
+    from peft import LoraConfig
+    from peft.utils import get_peft_model_state_dict
+
+    from mobius._diffusers_configs import UNet2DConfig
+    from mobius._weight_loading import apply_weights
+    from mobius.models.unet import (
+        UNet2DConditionModel,
+        remap_diffusers_unet_lora,
+    )
+    from mobius.tasks._denoising import DenoisingTask
+
+    torch.manual_seed(0)
+    unet_kwargs = dict(
+        sample_size=8,
+        in_channels=4,
+        out_channels=4,
+        layers_per_block=1,
+        block_out_channels=(32, 64),
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        norm_num_groups=32,
+        down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
+        up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+    )
+    hf = HFUNet(**unet_kwargs).eval()
+    base_state = dict(hf.state_dict())  # clean base weights (pre-adapter)
+
+    sample = torch.randn(1, 4, 8, 8)
+    timestep = torch.tensor([1])
+    encoder_hidden_states = torch.randn(1, 4, 16)
+    with torch.no_grad():
+        base_out = hf(sample, timestep, encoder_hidden_states).sample.numpy()
+
+    rank = 4
+    hf.add_adapter(
+        LoraConfig(
+            r=rank,
+            lora_alpha=rank,  # scale = alpha/rank = 1.0
+            init_lora_weights=False,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        )
+    )
+    with torch.no_grad():
+        lora_out = hf(sample, timestep, encoder_hidden_states).sample.numpy()
+    lora_state = convert_state_dict_to_diffusers(get_peft_model_state_dict(hf))
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        use_linear_projection=False,
+        lora_adapters=(("test", rank, 1.0),),
+    )
+    module = UNet2DConditionModel(config)
+    model = DenoisingTask().build(module, config)["model"]
+    weights = module.preprocess_weights(base_state)
+    weights.update(remap_diffusers_unet_lora(lora_state, "test"))
+    apply_weights(model, weights)
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
+        onnx_ir.save(model, handle.name)
+        session = ort.InferenceSession(handle.name)
+        feed = {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.int64),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        }
+        off = session.run(None, {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)})[0]
+        on = session.run(None, {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)})[0]
+
+    # gate=0 disables the adapter (base); gate=1 applies it (diffusers+LoRA).
+    assert np.abs(off - base_out).max() < 2e-4, np.abs(off - base_out).max()
+    assert np.abs(on - lora_out).max() < 2e-4, np.abs(on - lora_out).max()
+    # And the LoRA must actually change the output (non-trivial adapter).
+    assert np.abs(base_out - lora_out).max() > 1e-3
