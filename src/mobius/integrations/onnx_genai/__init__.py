@@ -15,6 +15,10 @@ specific code lives here.
 """
 
 from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
+from mobius.integrations.onnx_genai.comfyui import (
+    translate_comfyui_workflow,
+    translate_comfyui_workflow_file,
+)
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
@@ -33,6 +37,8 @@ __all__ = [
     "build_diffusion_pipeline_metadata",
     "decoder_metadata_from_config",
     "load_diffusers_scheduler_config",
+    "translate_comfyui_workflow",
+    "translate_comfyui_workflow_file",
     "write_decoder_metadata",
     "write_diffusion_pipeline_metadata",
     "write_onnx_genai_config",
