@@ -78,6 +78,7 @@ def export_checkpoint(
     width: int | None = None,
     opset: int = 17,
     components: tuple[str, ...] = ("text_encoder", "denoiser", "vae"),
+    timestep_dtype: str = "int64",
 ) -> ExportedCheckpoint:
     """Export a checkpoint's components to ONNX in ``output_dir``.
 
@@ -89,6 +90,10 @@ def export_checkpoint(
             exported graphs keep dynamic spatial axes; these only size the trace.
         opset: ONNX opset version.
         components: Which components to export (subset of the three).
+        timestep_dtype: ``"int64"`` (default, integer timesteps as DDIM uses) or
+            ``"float32"``. Schedulers with *fractional* inference timesteps (Euler
+            linspace) need ``"float32"`` so the value is not truncated before the
+            UNet's continuous time embedding.
 
     Returns:
         An :class:`ExportedCheckpoint` describing the emitted files and the
@@ -96,6 +101,8 @@ def export_checkpoint(
     """
     import torch
 
+    if timestep_dtype not in ("int64", "float32"):
+        raise ValueError(f"timestep_dtype must be 'int64' or 'float32', got {timestep_dtype!r}")
     os.makedirs(output_dir, exist_ok=True)
     pipe = _load_pipeline(source)
     unet = pipe.unet.eval()
@@ -116,6 +123,10 @@ def export_checkpoint(
     with torch.no_grad():
         emb = text_encoder(ids)[0]
     latent0 = torch.zeros(1, in_channels, latent_h, latent_w)
+    if timestep_dtype == "float32":
+        timestep_arg = torch.tensor([1.0], dtype=torch.float32)
+    else:
+        timestep_arg = torch.tensor([1], dtype=torch.long)
 
     denoiser_file = "denoiser.onnx"
     vae_file = "vae.onnx"
@@ -158,7 +169,7 @@ def export_checkpoint(
         _LOGGER.info("exporting denoiser (unet) -> %s", denoiser_file)
         torch.onnx.export(
             _UNetWrap(unet),
-            (latent0, torch.tensor([1], dtype=torch.long), emb),
+            (latent0, timestep_arg, emb),
             os.path.join(output_dir, denoiser_file),
             input_names=["sample", "timestep", "encoder_hidden_states"],
             output_names=["noise_pred"],

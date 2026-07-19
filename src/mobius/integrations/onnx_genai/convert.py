@@ -133,8 +133,17 @@ def convert_comfyui_workflow(
     """
     wf = parse_comfyui_workflow(workflow)
     os.makedirs(output_dir, exist_ok=True)
+    # Euler's linspace inference timesteps are fractional, so the denoiser must
+    # take a float32 timestep to avoid truncating them before the time embedding;
+    # DDIM's integer timesteps are fine as int64.
+    timestep_dtype = "float32" if wf.scheduler_kind == "euler" else "int64"
     exported = export_checkpoint(
-        checkpoint_source, output_dir, height=wf.height, width=wf.width, opset=opset
+        checkpoint_source,
+        output_dir,
+        height=wf.height,
+        width=wf.width,
+        opset=opset,
+        timestep_dtype=timestep_dtype,
     )
     timesteps = _diffusers_timesteps(wf.scheduler_kind, exported, wf.steps)
     metadata = build_pipeline_metadata_for_workflow(wf, exported, timesteps=timesteps)
