@@ -129,6 +129,76 @@ def test_unet_matches_diffusers():
     assert np.abs(actual - expected).max() < 2e-4
 
 
+def test_unet_sd1x_mixed_block_types_matches_diffusers():
+    """Parity for the classic SD 1.x block pattern (plain last-down/first-up).
+
+    Stable Diffusion 1.x uses ``CrossAttnDownBlock2D`` for the first down blocks
+    and a plain ``DownBlock2D`` for the last, mirrored on the up path. This
+    verifies the from-scratch UNet honors ``down_block_types`` / ``up_block_types``
+    so cross-attention is present only where diffusers places it.
+    """
+    pytest.importorskip("diffusers")
+    import onnx_ir
+    import onnxruntime as ort
+    import torch
+    from diffusers import UNet2DConditionModel as HFUNet
+
+    from mobius._diffusers_configs import UNet2DConfig
+    from mobius._weight_loading import apply_weights
+    from mobius.models.unet import UNet2DConditionModel
+    from mobius.tasks._denoising import DenoisingTask
+
+    torch.manual_seed(0)
+    down_block_types = ("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")
+    up_block_types = ("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")
+    hf = HFUNet(
+        sample_size=8,
+        in_channels=4,
+        out_channels=4,
+        layers_per_block=1,
+        block_out_channels=(32, 64, 64),
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        norm_num_groups=32,
+        down_block_types=down_block_types,
+        up_block_types=up_block_types,
+    ).eval()
+    sample = torch.randn(1, 4, 8, 8)
+    timestep = torch.tensor([1])
+    encoder_hidden_states = torch.randn(1, 4, 16)
+    with torch.no_grad():
+        expected = hf(sample, timestep, encoder_hidden_states).sample.numpy()
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        down_block_types=down_block_types,
+        up_block_types=up_block_types,
+        use_linear_projection=False,
+    )
+    module = UNet2DConditionModel(config)
+    model = DenoisingTask().build(module, config)["model"]
+    apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
+
+    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
+        onnx_ir.save(model, handle.name)
+        session = ort.InferenceSession(handle.name)
+        actual = session.run(
+            None,
+            {
+                "sample": sample.numpy(),
+                "timestep": timestep.numpy().astype(np.int64),
+                "encoder_hidden_states": encoder_hidden_states.numpy(),
+            },
+        )[0]
+    assert np.abs(actual - expected).max() < 2e-4
+
+
 def test_unet_lora_gate_parity():
     """Runtime LoRA parity: gate=0 == diffusers base, gate=1 == diffusers+LoRA."""
     pytest.importorskip("diffusers")

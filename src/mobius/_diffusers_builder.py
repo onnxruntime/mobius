@@ -43,11 +43,14 @@ def _init_diffusers_class_map() -> None:
         return
 
     from mobius._diffusers_configs import (
+        CLIPTextConfig,
         CogVideoXConfig,
         QwenImageConfig,
         QwenImageVAEConfig,
+        UNet2DConfig,
         VAEConfig,
     )
+    from mobius.models.clip import CLIPTextModel
     from mobius.models.cogvideox import (
         CogVideoXTransformer3DModel,
     )
@@ -61,6 +64,7 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.hunyuan_dit import HunyuanDiT2DModel, HunyuanDiTConfig
     from mobius.models.qwen_image import QwenImageTransformer2DModel
     from mobius.models.qwen_image_vae import AutoencoderKLQwenImageModel
+    from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
     from mobius.models.video_vae import VideoAutoencoderModel, VideoVAEConfig
 
@@ -71,6 +75,14 @@ def _init_diffusers_class_map() -> None:
             "PixArtTransformer2DModel": (DiTTransformer2DModel, DiTConfig, "denoising"),
             "FluxTransformer2DModel": (FluxTransformer2DModel, FluxConfig, "denoising"),
             "SD3Transformer2DModel": (SD3Transformer2DModel, SD3Config, "denoising"),
+            # Classic Stable Diffusion 1.x/2.x: cross-attention UNet denoiser plus
+            # a CLIP text prompt encoder, both built from scratch by Mobius.
+            "UNet2DConditionModel": (
+                UNet2DConditionModel,
+                UNet2DConfig,
+                "denoising",
+            ),
+            "CLIPTextModel": (CLIPTextModel, CLIPTextConfig, "feature-extraction"),
             "QwenImageTransformer2DModel": (
                 QwenImageTransformer2DModel,
                 QwenImageConfig,

@@ -565,10 +565,14 @@ class UNet2DConditionModel(nn.Module):
         # Down blocks
         self.down_blocks = nn.ModuleList()
         output_channel = block_out_channels[0]
+        down_block_types = config.down_block_types or tuple(
+            "CrossAttnDownBlock2D" for _ in block_out_channels
+        )
         for i, ch in enumerate(block_out_channels):
             input_channel = output_channel
             output_channel = ch
             is_final = i == len(block_out_channels) - 1
+            has_cross_attention = "CrossAttn" in down_block_types[i]
             self.down_blocks.append(
                 _DownBlock2D(
                     in_channels=input_channel,
@@ -576,7 +580,9 @@ class UNet2DConditionModel(nn.Module):
                     time_embed_dim=time_embed_dim,
                     num_layers=config.layers_per_block,
                     norm_num_groups=config.norm_num_groups,
-                    cross_attention_dim=config.cross_attention_dim,
+                    cross_attention_dim=(
+                        config.cross_attention_dim if has_cross_attention else None
+                    ),
                     attention_head_dim=config.attention_head_dim,
                     add_downsample=not is_final,
                     linear_class=linear_class,
@@ -599,11 +605,15 @@ class UNet2DConditionModel(nn.Module):
         reversed_channels = list(reversed(block_out_channels))
         self.up_blocks = nn.ModuleList()
         output_channel = reversed_channels[0]
+        up_block_types = config.up_block_types or tuple(
+            "CrossAttnUpBlock2D" for _ in block_out_channels
+        )
         for i in range(len(block_out_channels)):
             prev_output_channel = output_channel
             output_channel = reversed_channels[i]
             input_channel = reversed_channels[min(i + 1, len(block_out_channels) - 1)]
             is_final = i == len(block_out_channels) - 1
+            has_cross_attention = "CrossAttn" in up_block_types[i]
             self.up_blocks.append(
                 _UpBlock2D(
                     in_channels=input_channel,
@@ -612,7 +622,9 @@ class UNet2DConditionModel(nn.Module):
                     time_embed_dim=time_embed_dim,
                     num_layers=config.layers_per_block + 1,
                     norm_num_groups=config.norm_num_groups,
-                    cross_attention_dim=config.cross_attention_dim,
+                    cross_attention_dim=(
+                        config.cross_attention_dim if has_cross_attention else None
+                    ),
                     attention_head_dim=config.attention_head_dim,
                     add_upsample=not is_final,
                     linear_class=linear_class,

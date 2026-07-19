@@ -29,7 +29,40 @@ def _looks_like_diffusion(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    return any(k in names for k in _DENOISER_KEYS) or "vae" in names
+    return any(k in names for k in _DENOISER_KEYS) or any(
+        k in names for k in ("vae", "vae_decoder", "vae_encoder")
+    )
+
+
+def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
+    """Derive diffusion-pipeline metadata filenames from a package's component keys.
+
+    Mobius saves a multi-component package into ``<component>/model.onnx``
+    subfolders. This inspects the built package's keys and returns the
+    ``denoiser_filename`` / ``text_encoder_filename`` / ``vae_filename`` (and the
+    VAE latent port) that :func:`build_diffusion_pipeline_metadata` expects, so a
+    classic Stable Diffusion package (``text_encoder`` + ``unet`` +
+    ``vae_decoder``) is described in full instead of only its denoiser. Values
+    already supplied by the caller take precedence and are never overridden.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return {}
+
+    derived: dict[str, Any] = {}
+    for key in _DENOISER_KEYS:
+        if key in names:
+            derived["denoiser_filename"] = f"{key}/model.onnx"
+            break
+    if "text_encoder" in names:
+        derived["text_encoder_filename"] = "text_encoder/model.onnx"
+    if "vae_decoder" in names:
+        derived["vae_filename"] = "vae_decoder/model.onnx"
+        derived["vae_latent_input"] = "latent_sample"
+    elif "vae" in names:
+        derived["vae_filename"] = "vae/model.onnx"
+    return derived
 
 
 def write_onnx_genai_config(
@@ -58,6 +91,15 @@ def write_onnx_genai_config(
     if _looks_like_diffusion(pkg):
         if scheduler is None:
             scheduler = load_diffusers_scheduler_config(source)
+        # Fill in component filenames from the package layout, letting any
+        # caller-supplied values win.
+        derived = _diffusion_component_kwargs(pkg)
+        for name, value in derived.items():
+            kwargs.setdefault(name, value)
+        # Classic text-conditioned diffusion (a text encoder is present) uses
+        # classifier-free guidance by default; SD's canonical scale is 7.5.
+        if guidance_scale is None and "text_encoder_filename" in kwargs:
+            guidance_scale = 7.5
         path = write_diffusion_pipeline_metadata(
             output_dir,
             num_inference_steps=num_inference_steps,
