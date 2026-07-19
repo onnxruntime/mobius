@@ -229,6 +229,7 @@ def convert_comfyui_workflow(
         "pooled_dim": exported.pooled_dim,
         "controlnet": exported.controlnet,
         "conditioning_channels": exported.conditioning_channels,
+        "inpaint": exported.inpaint,
     }
     run_params_path = os.path.join(output_dir, "run.json")
     with open(run_params_path, "w", encoding="utf-8") as handle:

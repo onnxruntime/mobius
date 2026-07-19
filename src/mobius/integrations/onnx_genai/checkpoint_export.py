@@ -208,6 +208,29 @@ def export_checkpoint(
             opset_version=opset, dynamo=False,
         )
 
+    # Inpainting needs a VAE ENCODER (image -> latent) so a driver can compute the
+    # masked-image latent. Exported as vae_encoder.onnx when the model is inpaint
+    # (or explicitly requested via components).
+    if inpaint or "vae_encoder" in components:
+
+        class _VaeEncWrap(torch.nn.Module):
+            def __init__(self, v, scale):
+                super().__init__()
+                self.v, self.scale = v, scale
+
+            def forward(self, image):
+                return self.v.encode(image).latent_dist.mean * self.scale
+
+        img0 = torch.zeros(1, 3, latent_h * 8, latent_w * 8)
+        _LOGGER.info("exporting vae_encoder -> vae_encoder.onnx")
+        torch.onnx.export(
+            _VaeEncWrap(vae, scaling_factor), (img0,),
+            os.path.join(output_dir, "vae_encoder.onnx"),
+            input_names=["image"], output_names=["latent"],
+            dynamic_axes={"image": {0: "batch", 2: "height", 3: "width"}},
+            opset_version=opset, dynamo=False,
+        )
+
     return ExportedCheckpoint(
         denoiser_filename=denoiser_file,
         vae_filename=vae_file,
