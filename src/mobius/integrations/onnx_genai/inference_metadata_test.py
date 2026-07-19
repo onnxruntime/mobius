@@ -73,6 +73,22 @@ class TestBuildDiffusionPipelineMetadata:
         assert pipe["strategy"]["guidance_scale"] == 7.5
         assert pipe["strategy"]["cfg_conditioning_input"] == "encoder_hidden_states"
 
+    def test_sdxl_dual_conditioning_edges(self):
+        meta = build_diffusion_pipeline_metadata(
+            num_inference_steps=4,
+            vae_filename="vae.onnx",
+            text_encoder_filename="text_encoder.onnx",
+            guidance_scale=7.5,
+            text_encoder_edges=[
+                ("encoder_hidden_states", "encoder_hidden_states"),
+                ("text_embeds", "text_embeds"),
+            ],
+        )
+        flow = meta["pipeline"]["dataflow"]
+        assert {"from": "text_encoder.encoder_hidden_states",
+                "to": "denoiser.encoder_hidden_states"} in flow
+        assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow
+
     def test_guidance_scale_one_does_not_enable_cfg(self):
         meta = build_diffusion_pipeline_metadata(
             num_inference_steps=2, guidance_scale=1.0

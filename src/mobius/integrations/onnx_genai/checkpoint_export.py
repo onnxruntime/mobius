@@ -52,6 +52,9 @@ class ExportedCheckpoint:
     beta_start: float
     beta_end: float
     beta_schedule: str
+    # SDXL: two text encoders (concatenated) + a pooled text_embeds + time_ids.
+    sdxl: bool = False
+    pooled_dim: int = 0
 
 
 def _looks_like_single_file(source: str) -> bool:
@@ -59,15 +62,21 @@ def _looks_like_single_file(source: str) -> bool:
 
 
 def _load_pipeline(source: str) -> Any:
-    """Load a diffusers ``StableDiffusionPipeline`` from a checkpoint file, a
-    diffusers directory, or a Hugging Face repo id."""
-    from diffusers import StableDiffusionPipeline
+    """Load a diffusers pipeline (auto-selecting SD vs SDXL) from a checkpoint
+    file, a diffusers directory, or a Hugging Face repo id."""
+    from diffusers import DiffusionPipeline
 
-    if _looks_like_single_file(source):
-        _LOGGER.info("loading single-file checkpoint %s", source)
-        return StableDiffusionPipeline.from_single_file(source, safety_checker=None)
-    _LOGGER.info("loading diffusers checkpoint %s", source)
-    return StableDiffusionPipeline.from_pretrained(source, safety_checker=None)
+    load = (
+        DiffusionPipeline.from_single_file
+        if _looks_like_single_file(source)
+        else DiffusionPipeline.from_pretrained
+    )
+    _LOGGER.info("loading checkpoint %s", source)
+    try:
+        return load(source, safety_checker=None)
+    except TypeError:
+        # SDXL pipelines don't take a `safety_checker` argument.
+        return load(source)
 
 
 def export_checkpoint(
@@ -110,6 +119,7 @@ def export_checkpoint(
     text_encoder = pipe.text_encoder.eval()
     tokenizer = pipe.tokenizer
     sched = pipe.scheduler
+    sdxl = getattr(pipe, "text_encoder_2", None) is not None
 
     scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
     in_channels = int(unet.config.in_channels)
@@ -119,9 +129,6 @@ def export_checkpoint(
     latent_w = (width // 8) if width else unet_sample
     max_len = int(tokenizer.model_max_length)
 
-    ids = torch.ones(1, max_len, dtype=torch.long)
-    with torch.no_grad():
-        emb = text_encoder(ids)[0]
     latent0 = torch.zeros(1, in_channels, latent_h, latent_w)
     if timestep_dtype == "float32":
         timestep_arg = torch.tensor([1.0], dtype=torch.float32)
@@ -132,22 +139,6 @@ def export_checkpoint(
     vae_file = "vae.onnx"
     text_file = "text_encoder.onnx"
 
-    class _UNetWrap(torch.nn.Module):
-        def __init__(self, u):
-            super().__init__()
-            self.u = u
-
-        def forward(self, sample, timestep, encoder_hidden_states):
-            return self.u(sample, timestep, encoder_hidden_states=encoder_hidden_states).sample
-
-    class _TextWrap(torch.nn.Module):
-        def __init__(self, t):
-            super().__init__()
-            self.t = t
-
-        def forward(self, input_ids):
-            return self.t(input_ids)[0]
-
     class _VaeWrap(torch.nn.Module):
         def __init__(self, v, scale):
             super().__init__()
@@ -157,28 +148,18 @@ def export_checkpoint(
         def forward(self, latent):
             return self.v.decode(latent / self.scale).sample
 
-    if "text_encoder" in components:
-        _LOGGER.info("exporting text_encoder -> %s", text_file)
-        torch.onnx.export(
-            _TextWrap(text_encoder), (ids,), os.path.join(output_dir, text_file),
-            input_names=["input_ids"], output_names=["last_hidden_state"],
-            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
-            opset_version=opset, dynamo=False,
+    pooled_dim = 0
+    if sdxl:
+        pooled_dim = _export_sdxl(
+            pipe, output_dir, latent0, timestep_arg, max_len, opset, components, text_file,
+            denoiser_file,
         )
-    if "denoiser" in components:
-        _LOGGER.info("exporting denoiser (unet) -> %s", denoiser_file)
-        torch.onnx.export(
-            _UNetWrap(unet),
-            (latent0, timestep_arg, emb),
-            os.path.join(output_dir, denoiser_file),
-            input_names=["sample", "timestep", "encoder_hidden_states"],
-            output_names=["noise_pred"],
-            dynamic_axes={
-                "sample": {0: "batch", 2: "height", 3: "width"},
-                "encoder_hidden_states": {0: "batch", 1: "sequence"},
-            },
-            opset_version=opset, dynamo=False,
+    else:
+        _export_sd(
+            text_encoder, unet, output_dir, latent0, timestep_arg, max_len, opset, components,
+            text_file, denoiser_file,
         )
+
     if "vae" in components:
         _LOGGER.info("exporting vae -> %s", vae_file)
         torch.onnx.export(
@@ -201,4 +182,124 @@ def export_checkpoint(
         beta_start=float(getattr(sched.config, "beta_start", 0.00085)),
         beta_end=float(getattr(sched.config, "beta_end", 0.012)),
         beta_schedule=str(getattr(sched.config, "beta_schedule", "scaled_linear")),
+        sdxl=sdxl,
+        pooled_dim=pooled_dim,
     )
+
+
+def _export_sd(
+    text_encoder, unet, output_dir, latent0, timestep_arg, max_len, opset, components,
+    text_file, denoiser_file,
+) -> None:
+    """Export a single-text-encoder SD 1.x pipeline's text encoder + UNet."""
+    import torch
+
+    ids = torch.ones(1, max_len, dtype=torch.long)
+    with torch.no_grad():
+        emb = text_encoder(ids)[0]
+
+    class _UNetWrap(torch.nn.Module):
+        def __init__(self, u):
+            super().__init__()
+            self.u = u
+
+        def forward(self, sample, timestep, encoder_hidden_states):
+            return self.u(sample, timestep, encoder_hidden_states=encoder_hidden_states).sample
+
+    class _TextWrap(torch.nn.Module):
+        def __init__(self, t):
+            super().__init__()
+            self.t = t
+
+        def forward(self, input_ids):
+            return self.t(input_ids)[0]
+
+    if "text_encoder" in components:
+        _LOGGER.info("exporting text_encoder -> %s", text_file)
+        torch.onnx.export(
+            _TextWrap(text_encoder), (ids,), os.path.join(output_dir, text_file),
+            input_names=["input_ids"], output_names=["last_hidden_state"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}},
+            opset_version=opset, dynamo=False,
+        )
+    if "denoiser" in components:
+        _LOGGER.info("exporting denoiser (unet) -> %s", denoiser_file)
+        torch.onnx.export(
+            _UNetWrap(unet), (latent0, timestep_arg, emb),
+            os.path.join(output_dir, denoiser_file),
+            input_names=["sample", "timestep", "encoder_hidden_states"],
+            output_names=["noise_pred"],
+            dynamic_axes={
+                "sample": {0: "batch", 2: "height", 3: "width"},
+                "encoder_hidden_states": {0: "batch", 1: "sequence"},
+            },
+            opset_version=opset, dynamo=False,
+        )
+
+
+def _export_sdxl(
+    pipe, output_dir, latent0, timestep_arg, max_len, opset, components, text_file, denoiser_file,
+) -> int:
+    """Export an SDXL pipeline: a combined dual text encoder (concatenated
+    penultimate hidden states + pooled ``text_embeds``) and the SDXL UNet
+    (``sample``/``timestep``/``encoder_hidden_states``/``text_embeds``/``time_ids``).
+    Returns the pooled ``text_embeds`` dim."""
+    import torch
+
+    te1, te2 = pipe.text_encoder.eval(), pipe.text_encoder_2.eval()
+    tok2 = pipe.tokenizer_2
+    unet = pipe.unet.eval()
+    max_len_2 = int(tok2.model_max_length)
+
+    ids1 = torch.ones(1, max_len, dtype=torch.long)
+    ids2 = torch.ones(1, max_len_2, dtype=torch.long)
+
+    class _SdxlTextWrap(torch.nn.Module):
+        def __init__(self, a, b):
+            super().__init__()
+            self.a, self.b = a, b
+
+        def forward(self, input_ids, input_ids_2):
+            o1 = self.a(input_ids, output_hidden_states=True)
+            o2 = self.b(input_ids_2, output_hidden_states=True)
+            # SDXL uses the penultimate hidden layer of both encoders, concatenated,
+            # plus the pooled projection from the second (bigG) encoder.
+            enc = torch.cat([o1.hidden_states[-2], o2.hidden_states[-2]], dim=-1)
+            return enc, o2[0]
+
+    with torch.no_grad():
+        enc, pooled = _SdxlTextWrap(te1, te2)(ids1, ids2)
+    time_ids = torch.zeros(1, 6, dtype=torch.float32)
+
+    class _SdxlUNetWrap(torch.nn.Module):
+        def __init__(self, u):
+            super().__init__()
+            self.u = u
+
+        def forward(self, sample, timestep, encoder_hidden_states, text_embeds, time_ids):
+            added = {"text_embeds": text_embeds, "time_ids": time_ids}
+            return self.u(sample, timestep, encoder_hidden_states=encoder_hidden_states,
+                          added_cond_kwargs=added).sample
+
+    if "text_encoder" in components:
+        _LOGGER.info("exporting SDXL dual text_encoder -> %s", text_file)
+        torch.onnx.export(
+            _SdxlTextWrap(te1, te2), (ids1, ids2), os.path.join(output_dir, text_file),
+            input_names=["input_ids", "input_ids_2"],
+            output_names=["encoder_hidden_states", "text_embeds"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"},
+                          "input_ids_2": {0: "batch", 1: "sequence"}},
+            opset_version=opset, dynamo=False,
+        )
+    if "denoiser" in components:
+        _LOGGER.info("exporting SDXL denoiser (unet) -> %s", denoiser_file)
+        torch.onnx.export(
+            _SdxlUNetWrap(unet), (latent0, timestep_arg, enc, pooled, time_ids),
+            os.path.join(output_dir, denoiser_file),
+            input_names=["sample", "timestep", "encoder_hidden_states", "text_embeds", "time_ids"],
+            output_names=["noise_pred"],
+            dynamic_axes={"sample": {0: "batch", 2: "height", 3: "width"},
+                          "encoder_hidden_states": {0: "batch", 1: "sequence"}},
+            opset_version=opset, dynamo=False,
+        )
+    return int(pooled.shape[-1])

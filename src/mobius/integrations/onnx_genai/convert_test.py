@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 from mobius.integrations.onnx_genai.checkpoint_export import ExportedCheckpoint
@@ -82,3 +83,13 @@ def test_cfg_one_reconciles_without_guidance():
     wf = parse_comfyui_workflow(wf_json)
     meta = build_pipeline_metadata_for_workflow(wf, _EXPORTED)
     assert "guidance_scale" not in meta["pipeline"]["strategy"]
+
+
+def test_sdxl_exported_routes_dual_conditioning():
+    wf = parse_comfyui_workflow(_WF)
+    sdxl_exported = dataclasses.replace(_EXPORTED, sdxl=True, pooled_dim=1280)
+    meta = build_pipeline_metadata_for_workflow(wf, sdxl_exported)
+    flow = meta["pipeline"]["dataflow"]
+    assert {"from": "text_encoder.encoder_hidden_states",
+            "to": "denoiser.encoder_hidden_states"} in flow
+    assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow

@@ -163,6 +163,7 @@ def build_diffusion_pipeline_metadata(
     vae_latent_input: str = "latent",
     text_encoder_filename: str | None = None,
     text_encoder_output: str = "last_hidden_state",
+    text_encoder_edges: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the onnx-genai ``inference_metadata`` dict for a diffusion pipeline.
 
@@ -210,12 +211,15 @@ def build_diffusion_pipeline_metadata(
             "filename": text_encoder_filename,
             "type": "encoder",
         }
-        dataflow.append(
-            {
-                "from": f"text_encoder.{text_encoder_output}",
-                "to": f"denoiser.{denoiser_conditioning_input}",
-            }
-        )
+        # Route each text-encoder output to its denoiser conditioning input. SD
+        # has one edge (hidden states -> encoder_hidden_states); SDXL has two
+        # (concatenated hidden states + pooled text_embeds). `time_ids` is not
+        # routed here — it is an external denoiser input the caller supplies.
+        edges = text_encoder_edges or [(text_encoder_output, denoiser_conditioning_input)]
+        for enc_out, denoiser_in in edges:
+            dataflow.append(
+                {"from": f"text_encoder.{enc_out}", "to": f"denoiser.{denoiser_in}"}
+            )
         phases["text_encoder"] = {"run_on": "prompt_only"}
 
     if vae_filename is not None:

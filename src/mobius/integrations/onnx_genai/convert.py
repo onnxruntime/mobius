@@ -74,6 +74,14 @@ def build_pipeline_metadata_for_workflow(
         use_karras_sigmas=(wf.scheduler_spacing == "karras"),
     )
     guidance = wf.cfg if wf.cfg != 1.0 else None
+    # SDXL routes two conditioning edges (concatenated hidden states + pooled
+    # text_embeds); its time_ids is an external denoiser input the driver supplies.
+    text_encoder_edges = None
+    if exported.sdxl:
+        text_encoder_edges = [
+            ("encoder_hidden_states", "encoder_hidden_states"),
+            ("text_embeds", "text_embeds"),
+        ]
     return build_diffusion_pipeline_metadata(
         num_inference_steps=wf.steps,
         scheduler=scheduler,
@@ -84,6 +92,7 @@ def build_pipeline_metadata_for_workflow(
         vae_filename=exported.vae_filename if has_vae else None,
         vae_latent_input="latent",
         text_encoder_filename=exported.text_encoder_filename if has_text else None,
+        text_encoder_edges=text_encoder_edges,
     )
 
 
