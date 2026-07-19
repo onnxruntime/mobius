@@ -124,13 +124,16 @@ class _CrossAttentionBlock(nn.Module):
         cross_attention_dim: int,
         num_heads: int,
         norm_num_groups: int = 32,
+        linear_class=_Linear,
     ):
         super().__init__()
         self.norm = _GroupNorm(norm_num_groups, channels)
         # Self-attention
-        self.attn1 = _BasicAttention(channels, channels, num_heads)
+        self.attn1 = _BasicAttention(channels, channels, num_heads, linear_class=linear_class)
         # Cross-attention (K, V from encoder_hidden_states)
-        self.attn2 = _BasicAttention(channels, cross_attention_dim, num_heads)
+        self.attn2 = _BasicAttention(
+            channels, cross_attention_dim, num_heads, linear_class=linear_class
+        )
         # FFN
         self.ff = _FeedForward(channels, channels * 4)
         self.norm1 = _LayerNorm1D(channels)
@@ -179,14 +182,26 @@ class _CrossAttentionBlock(nn.Module):
 
 
 class _BasicAttention(nn.Module):
-    """Simple multi-head attention: Q from input, K/V from context."""
+    """Simple multi-head attention: Q from input, K/V from context.
 
-    def __init__(self, query_dim: int, context_dim: int, num_heads: int):
+    ``linear_class`` is the factory used for the q/k/v/out projections; pass a
+    ``LoRALinear`` factory (see :mod:`mobius.components._lora`) to build
+    LoRA-adapted, optionally runtime-gated projections. Defaults to plain
+    ``Linear``.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        context_dim: int,
+        num_heads: int,
+        linear_class=_Linear,
+    ):
         super().__init__()
-        self.to_q = _Linear(query_dim, query_dim)
-        self.to_k = _Linear(context_dim, query_dim)
-        self.to_v = _Linear(context_dim, query_dim)
-        self.to_out = nn.Sequential(_Linear(query_dim, query_dim))
+        self.to_q = linear_class(query_dim, query_dim)
+        self.to_k = linear_class(context_dim, query_dim)
+        self.to_v = linear_class(context_dim, query_dim)
+        self.to_out = nn.Sequential(linear_class(query_dim, query_dim))
         self._num_heads = num_heads
         self._head_dim = query_dim // num_heads
 
