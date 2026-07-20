@@ -398,15 +398,16 @@ def write_onnx_genai_config(
             artifacts["tokenizer"] = tokenizer_path
         return artifacts
 
-    # A nested multi-decoder TTS stack (talker + code_predictor) is a designed
-    # but not-yet-executable shape — give a precise, actionable error rather than
-    # the generic multi-component message below.
+    # A nested multi-decoder TTS stack (talker + code_predictor) uses the
+    # nested_autoregressive strategy, which the onnx-genai runtime now supports;
+    # this emitter does not yet map the Qwen3-TTS component graph, so fail with a
+    # precise, actionable error rather than the generic multi-component message.
     if _looks_like_multi_decoder_tts(pkg):
         raise NotImplementedError(
             "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
-            "need the nested_autoregressive strategy, which is designed but not yet "
-            "implemented in the onnx-genai runtime or this emitter — see "
-            "onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+            "use the nested_autoregressive strategy. The onnx-genai runtime supports "
+            "it, but this emitter does not yet map the multi-decoder TTS component "
+            "graph to it — see onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
         )
 
     # Fallback: a single-component decoder language model. A multi-component
