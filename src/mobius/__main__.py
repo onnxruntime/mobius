@@ -393,6 +393,22 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
 
+    if getattr(args, "runtime", None) == "onnx-genai":
+        from mobius.integrations.gguf import write_gguf_tokenizer_json
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+        # A GGUF checkpoint has no Hugging Face source directory, so the
+        # tokenizer is reconstructed from the file's embedded ggml metadata
+        # rather than copied from a `source`.
+        tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
+        if tokenizer_path is not None:
+            print(f"  tokenizer: {tokenizer_path}")
+        artifacts = write_onnx_genai_config(
+            pkg, output_dir, config=getattr(pkg, "config", None), source=None
+        )
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
+
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
     """Execute the 'convert-comfyui' subcommand."""
@@ -665,6 +681,17 @@ def main(argv: list[str] | None = None) -> None:
             "Target execution provider for EP-aware graph optimisations "
             "(e.g. 'cpu' to apply the GroupQueryAttention rewrite). "
             "Defaults to 'default' (portable ONNX, no vendor fusions)."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--runtime",
+        choices=["onnx-genai"],
+        default=None,
+        help=(
+            "Generate runtime-specific config files after building. "
+            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
+            "reconstructed from the GGUF's embedded tokenizer metadata, so the "
+            "quantized model runs directly in the onnx-genai runtime."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
