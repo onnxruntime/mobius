@@ -5576,3 +5576,122 @@ class TestResolveSlidingWindow:
             self._cfg(model_type="mistral", sliding_window=4096), "mistral"
         )
         assert cfg.sliding_window == 4096
+
+
+class TestBuildGraphSortformer:
+    """Verify Sortformer diarization builds with DiarizationTask."""
+
+    def _sortformer_config(self):
+        from mobius.models.sortformer import SortformerConfig
+
+        # Tiny config: reduced widths/layers, structure identical to the real
+        # nvidia/diar_streaming_sortformer_4spk model.
+        return SortformerConfig(
+            feat_in=32,
+            fc_d_model=64,
+            fc_num_layers=2,
+            fc_num_heads=4,
+            fc_ff_expansion=4,
+            fc_conv_kernel=9,
+            fc_subsampling_conv_channels=16,
+            fc_subsampling_factor=8,
+            tf_d_model=32,
+            tf_num_layers=2,
+            tf_num_heads=4,
+            tf_inner_size=64,
+            num_spks=4,
+        )
+
+    def test_package_builds(self):
+        """Build Sortformer and verify a single 'model' component."""
+        from mobius.models.sortformer import SortformerDiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._sortformer_config()
+        module = SortformerDiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+
+        assert "model" in pkg
+
+    def test_model_io(self):
+        """Verify diarization input/output names and shapes."""
+        from mobius.models.sortformer import SortformerDiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._sortformer_config()
+        module = SortformerDiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        output_names = {out.name for out in model.graph.outputs}
+        assert "input_features" in input_names
+        assert "speaker_probs" in output_names
+
+        # input_features: [batch, feat_in, time]
+        feat_dim = model.graph.inputs[0].shape[1]
+        assert feat_dim == config.feat_in
+        # speaker_probs last dim == num_spks
+        spk_dim = model.graph.outputs[0].shape[2]
+        assert spk_dim == config.num_spks
+
+    def test_has_initializers(self):
+        """Verify encoder / transformer / head initializers are present."""
+        from mobius.models.sortformer import SortformerDiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._sortformer_config()
+        module = SortformerDiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        init_names = list(pkg["model"].graph.initializers)
+
+        assert any(n.startswith("encoder.") for n in init_names)
+        assert any(n.startswith("transformer_encoder.") for n in init_names)
+        assert any(n.startswith("sortformer_modules.") for n in init_names)
+
+    def test_task_registry_lookup(self):
+        """Verify the 'diarization' task resolves to DiarizationTask."""
+        from mobius.tasks import DiarizationTask, get_task
+
+        assert isinstance(get_task("diarization"), DiarizationTask)
+
+    def test_runs_with_random_weights(self):
+        """Fill random weights and run a forward pass through ORT."""
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.sortformer import SortformerDiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._sortformer_config()
+        module = SortformerDiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        # Fill each empty initializer with small random values.  Batch-norm
+        # running variance must stay positive to avoid NaNs.
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            if "running_var" in init.name:
+                arr = np.ones(shape, dtype=np.float32)
+            elif "running_mean" in init.name:
+                arr = np.zeros(shape, dtype=np.float32)
+            else:
+                arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            n_time = 40  # multiple of subsampling factor (8) -> 5 output frames
+            feats = np.random.randn(1, config.feat_in, n_time).astype(np.float32)
+            out = sess.run(None, {sess.get_inputs()[0].name: feats})[0]
+
+        assert out.shape == (1, n_time // config.fc_subsampling_factor, config.num_spks)
+        # Sigmoid output must lie in [0, 1].
+        assert out.min() >= 0.0 and out.max() <= 1.0
