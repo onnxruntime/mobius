@@ -34,7 +34,11 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig, Gemma4Config
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    preprocess_olive_weights,
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+)
 from mobius.components import (
     MLP,
     ClippableLinear,
@@ -88,6 +92,18 @@ def _text_linear_class(config: Gemma4Config) -> type | None:
     quantization_config = _text_quantization_config(config)
     if quantization_config is None:
         return None
+    if (
+        quantization_config.quant_method == "olive"
+        and quantization_config.quantize_embeddings
+    ):
+        raise NotImplementedError(
+            "Gemma 4 does not yet support Olive-packed quantized token embeddings."
+        )
+    if quantization_config.group_size <= 0:
+        raise ValueError(
+            f"{quantization_config.quant_method} group_size must be resolved "
+            "before building Gemma 4."
+        )
     zero_point_dtype = (
         config.dtype
         if getattr(quantization_config, "float_zero_point", False)
@@ -200,18 +216,84 @@ class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
         return op.Mul(embeddings, self.embed_scale)
 
 
+_PER_LAYER_EMBEDDING_PREFIXES = (
+    "embed_tokens_per_layer.",
+    "per_layer_model_projection.",
+    "per_layer_projection_norm.",
+)
+
+
+def _per_layer_model_projection_class(config: Gemma4Config) -> type:
+    """Keep Olive GPTQ's uncalibrated pre-decoder projection in floating point."""
+    quantization = config.quantization
+    if quantization is not None and quantization.quant_method == "compressed-tensors":
+        return _text_linear_class(config) or Linear
+    return Linear
+
+
+def _preprocess_olive_checkpoint(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> dict[str, torch.Tensor]:
+    """Convert renamed Olive-packed tensors to Gemma 4 ONNX initializer layouts."""
+    quantization = config.quantization
+    if quantization is None or quantization.quant_method != "olive":
+        return state_dict
+    return preprocess_olive_weights(
+        state_dict,
+        bits=quantization.bits,
+        group_size=quantization.group_size,
+        quantize_embeddings=quantization.quantize_embeddings,
+        quantize_lm_head=quantization.quantize_lm_head,
+        # Gemma 4 synthesizes and routes tied weights before this conversion.
+        tie_word_embeddings=False,
+    )
+
+
+def _route_split_per_layer_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> None:
+    """Move oversized per-layer embedding weights into the decoder for WebGPU."""
+    if not config.split_per_layer_embedding:
+        return
+
+    fused_key = "embedding.embed_tokens_per_layer.weight"
+    if fused_key in state_dict:
+        num_layers = config.num_hidden_layers
+        per_layer_dim = config.hidden_size_per_layer_input
+        fused = state_dict.pop(fused_key)
+        assert fused.shape[1] == num_layers * per_layer_dim, (
+            f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
+            f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
+            f"got {fused.shape[1]}"
+        )
+        for i, chunk in enumerate(fused.chunk(num_layers, dim=1)):
+            state_dict[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
+
+    for key in list(state_dict):
+        if key.startswith(
+            (
+                "embedding.per_layer_model_projection.",
+                "embedding.per_layer_projection_norm.",
+            )
+        ):
+            state_dict[key.replace("embedding.", "decoder.model.", 1)] = state_dict.pop(key)
+
+
 def _dtype_safe_compress(
     op: OpBuilder, data: ir.Value, condition: ir.Value, *, axis: int
 ) -> ir.Value:
-    """Row-select ``data`` by ``condition`` in a dtype that ORT supports.
+    """Row-select ``data`` by a one-dimensional boolean ``condition``.
 
-    ORT does not register a ``Compress`` kernel for ``bfloat16``, so a bf16
-    package would fail to load. Run the selection in float32 and cast the
-    result back to ``data``'s dtype. The float16/bfloat16 round-trip through
-    float32 is lossless, so this is exact for every supported build dtype.
+    ``Compress`` does not support bfloat16 and its CUDA graph transformer can
+    introduce provider-less helper nodes. Convert the mask to ordered indices
+    and use ``Gather`` in float32 instead. The float16/bfloat16 round-trip
+    through float32 is lossless.
     """
     data_f32 = op.Cast(data, to=ir.DataType.FLOAT)
-    selected = op.Compress(data_f32, condition, axis=axis)
+    indices = op.Squeeze(op.NonZero(condition), [0])
+    selected = op.Gather(data_f32, indices, axis=axis)
     return op.CastLike(selected, data)
 
 
@@ -1270,12 +1352,13 @@ class Gemma4DecoderLayer(nn.Module):
         intermediate_size = config.intermediate_size * (
             2 if (config.use_double_wide_mlp and is_kv_shared) else 1
         )
+        linear_class = _text_linear_class(config)
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
             activation=config.hidden_act,
             bias=config.mlp_bias,
-            linear_class=_text_linear_class(config),
+            linear_class=linear_class or Linear,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1288,10 +1371,10 @@ class Gemma4DecoderLayer(nn.Module):
 
         self._per_layer_dim = config.hidden_size_per_layer_input
         if self._per_layer_dim > 0:
-            self.per_layer_input_gate = Linear(
+            self.per_layer_input_gate = linear_class(
                 config.hidden_size, self._per_layer_dim, bias=False
             )
-            self.per_layer_projection = Linear(
+            self.per_layer_projection = linear_class(
                 self._per_layer_dim, config.hidden_size, bias=False
             )
             self.post_per_layer_input_norm = RMSNorm(
@@ -1760,7 +1843,7 @@ class Gemma4TextModel(nn.Module):
                     for _ in range(self._num_layers)
                 ]
             )
-            self.per_layer_model_projection = Linear(
+            self.per_layer_model_projection = _per_layer_model_projection_class(config)(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
                 bias=False,
@@ -2249,7 +2332,9 @@ class _Gemma4VisionEncoderModel(nn.Module):
             pooled, op.Constant(value_ints=[-1, self._vision_hidden_size])
         )  # [B*length, vision_hidden]
         valid_mask = op.Reshape(valid_mask, op.Constant(value_ints=[-1]))  # [B*length]
-        vision_features = op.Compress(pooled, valid_mask, axis=0)  # [num_valid, vision_hidden]
+        vision_features = _dtype_safe_compress(
+            op, pooled, valid_mask, axis=0
+        )  # [num_valid, vision_hidden]
 
         # Scale-free norm + linear projection -> [num_valid, text_hidden]
         vision_features = self.projector_norm(op, vision_features)
@@ -2334,7 +2419,7 @@ class Gemma4EmbeddingModel(nn.Module):
                 self._num_layers * self._per_layer_dim,
                 float(self._per_layer_dim**0.5),
             )
-            self.per_layer_model_projection = Linear(
+            self.per_layer_model_projection = _per_layer_model_projection_class(config)(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
                 bias=False,
@@ -2891,26 +2976,23 @@ class Gemma4Model(nn.Module):
         # float checkpoint this copies ``embed_tokens.weight``; for a quantized
         # checkpoint the tied MatMulNBits head tensors (weight/scales/
         # zero_points) are emitted directly by the loader, so nothing to do here.
-        if self.config.tie_word_embeddings:
+        quantization = self.config.quantization
+        if self.config.tie_word_embeddings and not (
+            quantization is not None and quantization.quantize_lm_head
+        ):
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}
-        # Per-layer weight prefixes that should route to the embedding model
-        per_layer_prefixes = (
-            "embed_tokens_per_layer.",
-            "per_layer_model_projection.",
-            "per_layer_projection_norm.",
-        )
         for key, value in state_dict.items():
             if key.startswith("language_model."):
                 suffix = key[len("language_model.") :]
                 if suffix.startswith("lm_head"):
                     # lm_head lives directly under decoder (not decoder.model)
                     renamed["decoder." + suffix] = value
-                elif any(suffix.startswith(p) for p in per_layer_prefixes):
+                elif any(suffix.startswith(p) for p in _PER_LAYER_EMBEDDING_PREFIXES):
                     # Per-layer embedding weights → embedding sub-model
                     renamed["embedding." + suffix] = value
                 else:
@@ -2986,34 +3068,11 @@ class Gemma4Model(nn.Module):
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
 
-        # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
-        # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
-        # The per_layer_projection weights also live in the decoder (not embedding).
-        if self.config.split_per_layer_embedding:
-            fused_key = "embedding.embed_tokens_per_layer.weight"
-            if fused_key in renamed:
-                num_layers = self.config.num_hidden_layers
-                per_layer_dim = self.config.hidden_size_per_layer_input
-                fused = renamed.pop(fused_key)
-                assert fused.shape[1] == num_layers * per_layer_dim, (
-                    f"{fused_key} dim 1 expected {num_layers * per_layer_dim} "
-                    f"({num_layers} layers x {per_layer_dim} per_layer_dim), "
-                    f"got {fused.shape[1]}"
-                )
-                chunks = fused.chunk(num_layers, dim=1)
-                for i, chunk in enumerate(chunks):
-                    renamed[f"decoder.model.embed_tokens_per_layer_split.{i}.weight"] = chunk
-            # Re-route the projection weights from embedding.* → decoder.model.*
-            for k in list(renamed.keys()):
-                if k.startswith(
-                    (
-                        "embedding.per_layer_model_projection.",
-                        "embedding.per_layer_projection_norm.",
-                    )
-                ):
-                    renamed[k.replace("embedding.", "decoder.model.", 1)] = renamed.pop(k)
+        # For WebGPU, split the fused per-layer embedding and move its projections
+        # into the decoder, which owns the split tables in that configuration.
+        _route_split_per_layer_weights(renamed, self.config)
 
-        return renamed
+        return _preprocess_olive_checkpoint(renamed, self.config)
 
 
 # ---------------------------------------------------------------------------
@@ -3089,7 +3148,10 @@ class Gemma4UnifiedModel(nn.Module):
         }
 
         # Synthesize lm_head from embed_tokens when weights are tied.
-        if self.config.tie_word_embeddings:
+        quantization = self.config.quantization
+        if self.config.tie_word_embeddings and not (
+            quantization is not None and quantization.quantize_lm_head
+        ):
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
@@ -3101,6 +3163,8 @@ class Gemma4UnifiedModel(nn.Module):
                 suffix = key[len("language_model.") :]
                 if suffix.startswith("lm_head"):
                     renamed["decoder." + suffix] = value
+                elif any(suffix.startswith(p) for p in _PER_LAYER_EMBEDDING_PREFIXES):
+                    renamed["embedding." + suffix] = value
                 else:
                     renamed["decoder.model." + suffix] = value
                     if suffix == "embed_tokens.weight":
@@ -3129,4 +3193,5 @@ class Gemma4UnifiedModel(nn.Module):
             else:
                 renamed[key] = value
 
-        return renamed
+        _route_split_per_layer_weights(renamed, self.config)
+        return _preprocess_olive_checkpoint(renamed, self.config)

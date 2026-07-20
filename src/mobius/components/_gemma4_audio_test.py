@@ -11,8 +11,11 @@ All tests build ONNX graphs without weights.  They verify:
 
 from __future__ import annotations
 
+import onnx_ir as ir
+
 from mobius._testing import create_test_builder, create_test_input
 from mobius.components._gemma4_audio import (
+    ClippableLinear,
     Gemma4Attention,
     Gemma4AudioEncoder,
     Gemma4AudioLayer,
@@ -29,6 +32,23 @@ HIDDEN = 64
 HEADS = 4
 HEAD_DIM = HIDDEN // HEADS  # 16
 CTX_LEFT = 5
+
+
+class TestClippableLinear:
+    def test_bfloat16_clips_in_float32(self):
+        comp = ClippableLinear(HIDDEN, HIDDEN)
+        for parameter in comp.parameters():
+            parameter.type = ir.TensorType(ir.DataType.BFLOAT16)
+
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 2, HIDDEN], ir.DataType.BFLOAT16)
+        result = comp(op, x)
+        b._adapt_outputs([result], "")
+
+        clips = [node for node in graph if node.op_type == "Clip"]
+        assert len(clips) == 2
+        assert all(node.inputs[0].dtype == ir.DataType.FLOAT for node in clips)
+        assert result.dtype == ir.DataType.BFLOAT16
 
 
 def _build(comp, inputs):
