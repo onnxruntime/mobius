@@ -484,8 +484,8 @@ def write_multimodal_pipeline_metadata(
 
 def build_speech_to_text_pipeline_metadata(
     *,
-    encoder_filename: str = "encoder.onnx",
-    decoder_filename: str = "decoder.onnx",
+    encoder_filename: str = "encoder/model.onnx",
+    decoder_filename: str = "decoder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -567,8 +567,8 @@ def write_speech_to_text_pipeline_metadata(
 
 def build_audio_codec_pipeline_metadata(
     *,
-    encoder_filename: str = "encoder.onnx",
-    decoder_filename: str = "decoder.onnx",
+    encoder_filename: str = "encoder/model.onnx",
+    decoder_filename: str = "decoder/model.onnx",
     codes_dtype: str = "int64",
 ) -> dict[str, Any]:
     """Build metadata for an audio-to-audio neural codec pipeline.

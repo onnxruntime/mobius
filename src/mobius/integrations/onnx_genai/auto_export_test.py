@@ -251,9 +251,9 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     assert metadata["kv_cache"] == {"native_dtype": "bf16"}
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
-        "encoder": {"filename": "encoder.onnx", "type": "encoder"},
+        "encoder": {"filename": "encoder/model.onnx", "type": "encoder"},
         "decoder": {
-            "filename": "decoder.onnx",
+            "filename": "decoder/model.onnx",
             "type": "decoder",
             "tokenizer": "tokenizer.json",
         },
@@ -293,8 +293,8 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
     assert "model" not in metadata
     pipeline = metadata["pipeline"]
     assert pipeline["models"] == {
-        "encoder": {"filename": "encoder.onnx", "type": "audio_encoder"},
-        "decoder": {"filename": "decoder.onnx", "type": "vocoder"},
+        "encoder": {"filename": "encoder/model.onnx", "type": "audio_encoder"},
+        "decoder": {"filename": "decoder/model.onnx", "type": "vocoder"},
     }
     assert pipeline["dataflow"] == [
         {
