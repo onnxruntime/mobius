@@ -228,6 +228,27 @@ def write_onnx_genai_config(
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
 
+    This is the single entry point that inspects a built ``ModelPackage`` and
+    emits the onnx-genai runtime contract for it. Package shapes are matched in
+    order of decreasing specificity; the first match wins:
+
+    ===================== ============================================ =================================
+    Pipeline shape        Structural signal (detector)                 Emitted ``strategy``
+    ===================== ============================================ =================================
+    Diffusion             denoiser / VAE present                       ``iterative``
+    Audio codec           encoder→``codes``→decoder, no cross-attn     ``composite`` (two single_pass)
+    Multimodal VLM        decoder + vision/audio encoder + fusion      ``composite`` (encoders→fuse→AR)
+    Speech-to-text (ASR)  decoder consumes ``encoder_hidden_states``   ``composite`` (encode→AR)
+    Decoder LM            fallback (a config is required)              bare decoder (``kv_cache`` + attn)
+    ===================== ============================================ =================================
+
+    Detection is **structural** (graph input/output names + component roles),
+    not name-based, so a codec is never mistaken for ASR and vice versa. To add a
+    modality, add a ``_looks_like_X`` structural detector plus a
+    ``build_X_pipeline_metadata`` builder and insert a dispatch branch ordered by
+    specificity. Tensor-only pipelines (diffusion, codec) are matched before the
+    ``config`` requirement because they carry no autoregressive decoder.
+
     For decoder and multimodal packages, ``config`` (or ``pkg.config``) supplies
     the decoder attention dimensions. Diffusion component filenames are taken
     from ``kwargs`` or discovered from the package; ``num_inference_steps`` /
@@ -300,6 +321,23 @@ def write_onnx_genai_config(
             **kwargs,
         )
         return {"inference_metadata": path}
+
+    # Fallback: a single-component decoder language model. A multi-component
+    # package that matched none of the composite shapes above (e.g. a
+    # multi-decoder TTS stack: talker + code_predictor + vocoder) would be
+    # silently mis-emitted as a bare decoder — fail loudly instead so an
+    # unsupported shape is obvious rather than producing wrong metadata.
+    try:
+        component_names = sorted(pkg.keys())
+    except (AttributeError, TypeError):
+        component_names = []
+    if len(component_names) > 1:
+        raise ValueError(
+            "onnx-genai config emission does not recognize this multi-component "
+            f"package shape (components: {component_names}). Supported composite "
+            "shapes: diffusion, audio codec, multimodal VLM, speech-to-text. "
+            "Multi-decoder pipelines such as TTS require a dedicated emitter."
+        )
 
     path = write_decoder_metadata(
         output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype

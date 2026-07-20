@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
 import yaml
 
 from mobius.integrations.onnx_genai import write_onnx_genai_config
@@ -308,3 +309,17 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
         "single_pass",
         "single_pass",
     ]
+
+
+def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
+    # A multi-decoder TTS-like stack matches no composite shape and must NOT be
+    # silently emitted as a bare decoder.
+    pkg = _EncoderDecoderPkg(
+        {
+            "talker": _FakeModel(["inputs_embeds"]),
+            "code_predictor": _FakeModel(["inputs_embeds"]),
+            "vocoder": _FakeModel(["codes"]),
+        }
+    )
+    with pytest.raises(ValueError, match="multi-component"):
+        write_onnx_genai_config(pkg, str(tmp_path))
