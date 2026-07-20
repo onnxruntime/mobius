@@ -11,6 +11,7 @@ the onnx-genai analogue of :func:`mobius.integrations.ort_genai.write_ort_genai_
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -21,7 +22,62 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     write_diffusion_pipeline_metadata,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 _DENOISER_KEYS = ("denoiser", "transformer", "unet")
+
+
+def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
+    """Emit ``tokenizer.json`` for a text-conditioned diffusion package.
+
+    Classic Stable Diffusion conditions on a CLIP text encoder, and the
+    onnx-genai runners (e.g. ``render_sd``) load ``<package>/tokenizer.json`` —
+    the ``tokenizers``-library fast-tokenizer serialization. This builds that
+    file from the source pipeline's ``tokenizer/`` subfolder (via a fast
+    ``CLIPTokenizerFast``, which is constructed from ``vocab.json`` + ``merges.txt``
+    even when the repo ships no ``tokenizer.json``), so the package is
+    self-contained. Best-effort: returns ``None`` (with a warning) if transformers
+    is unavailable or the source has no CLIP tokenizer, without failing the build.
+
+    Args:
+        output_dir: Package directory to write ``tokenizer.json`` into.
+        source: The diffusers checkpoint directory or Hugging Face id the
+            components were built from.
+
+    Returns:
+        The written ``tokenizer.json`` path, or ``None`` if it could not be emitted.
+    """
+    if not source:
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        _LOGGER.warning(
+            "transformers is not available; skipping tokenizer.json emission. "
+            "The onnx-genai runners will need a tokenizer.json supplied separately."
+        )
+        return None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(source, subfolder="tokenizer", use_fast=True)
+    except Exception as error:  # best-effort; never block the build
+        _LOGGER.warning(
+            "Could not load a CLIP tokenizer from %r (subfolder 'tokenizer'): %s; "
+            "skipping tokenizer.json emission.",
+            source,
+            error,
+        )
+        return None
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        _LOGGER.warning(
+            "Loaded a slow tokenizer for %r with no fast backend; skipping "
+            "tokenizer.json emission.",
+            source,
+        )
+        return None
+    path = os.path.join(output_dir, "tokenizer.json")
+    backend.save(path)
+    return path
 
 
 def _looks_like_diffusion(pkg: Any) -> bool:
@@ -107,7 +163,14 @@ def write_onnx_genai_config(
             guidance_scale=guidance_scale,
             **kwargs,
         )
-        return {"inference_metadata": path}
+        artifacts = {"inference_metadata": path}
+        # Emit the CLIP tokenizer.json for text-conditioned pipelines so the
+        # onnx-genai runners can tokenize prompts from the package alone.
+        if "text_encoder_filename" in kwargs:
+            tokenizer_path = _write_clip_tokenizer(output_dir, source)
+            if tokenizer_path is not None:
+                artifacts["tokenizer"] = tokenizer_path
+        return artifacts
 
     cfg = config if config is not None else getattr(pkg, "config", None)
     if cfg is None:

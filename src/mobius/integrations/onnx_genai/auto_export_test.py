@@ -51,6 +51,61 @@ def test_dispatch_diffusion(tmp_path):
     assert "vae" in meta["pipeline"]["models"]
 
 
+def test_dispatch_diffusion_emits_clip_tokenizer(tmp_path, monkeypatch):
+    """Emit tokenizer.json for a text-conditioned diffusion package.
+
+    The onnx-genai runners can then tokenize prompts from the package alone.
+    """
+    import os
+
+    class _Backend:
+        def save(self, path):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+
+    class _Tokenizer:
+        backend_tokenizer = _Backend()
+
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _Tokenizer()
+    )
+    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object(), "vae": object()})
+    arts = write_onnx_genai_config(
+        pkg,
+        str(tmp_path),
+        num_inference_steps=20,
+        vae_filename="vae.onnx",
+        text_encoder_filename="text_encoder.onnx",
+        source="fake/model",
+    )
+    assert "tokenizer" in arts
+    assert os.path.basename(arts["tokenizer"]) == "tokenizer.json"
+    assert os.path.isfile(arts["tokenizer"])
+
+
+def test_dispatch_diffusion_tokenizer_skip_is_non_fatal(tmp_path, monkeypatch):
+    """Skip the tokenizer artifact without failing when none can be loaded.
+
+    If the source has no CLIP tokenizer (or transformers can't load one), the
+    build still succeeds and simply omits the tokenizer artifact.
+    """
+
+    def _boom(*args, **kwargs):
+        raise OSError("no tokenizer here")
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _boom)
+    pkg = _DiffusionPkg({"denoiser": object(), "text_encoder": object()})
+    arts = write_onnx_genai_config(
+        pkg,
+        str(tmp_path),
+        num_inference_steps=20,
+        text_encoder_filename="text_encoder.onnx",
+        source="fake/model",
+    )
+    assert "inference_metadata" in arts
+    assert "tokenizer" not in arts
+
+
 def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     import json
 
