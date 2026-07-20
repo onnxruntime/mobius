@@ -895,6 +895,63 @@ class TestQuantizationConfig:
         assert qc.quantize_embeddings is True
         assert qc.quantize_lm_head is True
 
+    def test_from_transformers_compressed_tensors(self):
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "pack-quantized",
+                    "config_groups": {
+                        "group_0": {
+                            "format": "pack-quantized",
+                            "targets": ["Linear"],
+                            "weights": {"num_bits": 4},
+                        }
+                    },
+                }
+            },
+        )()
+
+        qc = QuantizationConfig.from_transformers(hf)
+
+        assert qc is not None
+        assert qc.quant_method == "compressed-tensors"
+        assert qc.format == "pack-quantized"
+        assert qc.bits == 4
+        assert qc.group_size == 0
+        assert qc.sym is True
+
+    @pytest.mark.parametrize(
+        "group_update,config_update,error",
+        [
+            ({"input_activations": {}}, {}, "weight-only"),
+            ({"weights": {"num_bits": 4, "actorder": "group"}}, {}, "activation-ordered"),
+            ({"weights": {"num_bits": 4, "type": "float"}}, {}, "integer weights"),
+            ({}, {"kv_cache_scheme": {}}, "quantized KV caches"),
+        ],
+    )
+    def test_from_transformers_rejects_unsupported_compressed_tensors(
+        self, group_update, config_update, error
+    ):
+        group = {
+            "format": "pack-quantized",
+            "targets": ["Linear"],
+            "weights": {"num_bits": 4},
+        }
+        group.update(group_update)
+        config = {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {"group_0": group},
+        }
+        config.update(config_update)
+        hf = type("HFConfig", (), {"quantization_config": config})()
+
+        with pytest.raises(ValueError, match=error):
+            QuantizationConfig.from_transformers(hf)
+
     def test_quantize_embed_lm_head_default_false(self):
         qc = QuantizationConfig()
         assert qc.quantize_embeddings is False

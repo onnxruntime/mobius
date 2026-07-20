@@ -37,6 +37,9 @@ class QuantizationConfig:
     # RTN records this in its own config (``tie_word_embeddings``) and may clear
     # the model's top-level flag, so it is tracked here independently.
     tie_word_embeddings: bool = False
+    # Serialized checkpoint format. This distinguishes formats that share the
+    # same quant_method but use different tensor layouts.
+    format: str | None = None
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -60,6 +63,75 @@ class QuantizationConfig:
         # QuantizedLinear block quantization.
         if method == "fp8":
             return None
+
+        if method == "compressed-tensors":
+            config_groups = qc.get("config_groups")
+            if not isinstance(config_groups, dict) or len(config_groups) != 1:
+                raise ValueError(
+                    "Mobius currently supports compressed-tensors checkpoints "
+                    "with exactly one quantization config group."
+                )
+            group = next(iter(config_groups.values()))
+            if not isinstance(group, dict):
+                raise ValueError("Invalid compressed-tensors config group.")
+            weights = group.get("weights")
+            if not isinstance(weights, dict):
+                raise ValueError(
+                    "Compressed-tensors config group must define weight quantization."
+                )
+            if weights.get("type", "int") != "int":
+                raise ValueError(
+                    "Mobius compressed-tensors import only supports integer weights."
+                )
+            if (
+                group.get("input_activations") is not None
+                or group.get("output_activations") is not None
+            ):
+                raise ValueError(
+                    "Mobius compressed-tensors import currently supports weight-only "
+                    "quantization; activation quantization is not supported."
+                )
+            if weights.get("actorder") is not None:
+                raise ValueError(
+                    "Mobius compressed-tensors import does not support activation-ordered weights."
+                )
+            if qc.get("kv_cache_scheme") is not None:
+                raise ValueError(
+                    "Mobius compressed-tensors import does not support quantized KV caches."
+                )
+            checkpoint_format = group.get("format", qc.get("format"))
+            if checkpoint_format != "pack-quantized":
+                raise ValueError(
+                    "Mobius only supports the compressed-tensors "
+                    f"'pack-quantized' format, got {checkpoint_format!r}."
+                )
+            targets = group.get("targets")
+            if targets != ["Linear"]:
+                raise ValueError(
+                    "Mobius currently supports compressed-tensors groups targeting "
+                    f"exactly ['Linear'], got {targets!r}."
+                )
+            bits = weights.get("num_bits")
+            if bits not in (2, 4, 8):
+                raise ValueError(
+                    "Compressed-tensors MatMulNBits import requires 2, 4, or 8 "
+                    f"weight bits, got {bits!r}."
+                )
+            if not weights.get("symmetric", True):
+                raise ValueError(
+                    "Asymmetric compressed-tensors checkpoints are not yet supported."
+                )
+            return cls(
+                bits=bits,
+                # Some checkpoints, including Gemma 4 W4A16, omit group_size
+                # from config.json. It is inferred from weight_scale shapes
+                # before graph construction.
+                group_size=weights.get("group_size", 0),
+                quant_method=method,
+                sym=True,
+                format=checkpoint_format,
+            )
+
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
@@ -68,4 +140,5 @@ class QuantizationConfig:
             quantize_embeddings=bool(qc.get("embeds", False)),
             quantize_lm_head=bool(qc.get("lm_head", False)),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings", False)),
+            format=qc.get("format"),
         )

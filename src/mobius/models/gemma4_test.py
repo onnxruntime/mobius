@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config
+from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -118,6 +118,138 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.per_expert_scale"
         assert key in result
         assert torch.allclose(result[key], torch.ones(4))
+
+
+class TestGemma4CompressedTensors:
+    def test_uses_matmulnbits_for_packed_language_projections(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            attention_k_eq_v=False,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="compressed-tensors",
+                sym=True,
+                format="pack-quantized",
+            ),
+        )
+
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+        decoder_ops = [node.op_type for node in pkg["decoder"].graph]
+        embedding_ops = [node.op_type for node in pkg["embedding"].graph]
+        vision_ops = [node.op_type for node in pkg["vision_encoder"].graph]
+
+        # Per decoder layer: Q/K/V/O (4), MLP (3), and PLE gate/proj (2).
+        assert decoder_ops.count("MatMulNBits") == 2 * 9
+        assert embedding_ops.count("MatMulNBits") == 1
+        assert vision_ops.count("MatMulNBits") == 0
+        assert "Compress" not in vision_ops
+
+
+class TestGemma4OlivePacked:
+    """Olive-native GPTQ checkpoints use ORT-oriented uint8 packed tensors."""
+
+    @staticmethod
+    def _config(
+        *,
+        quantize_lm_head: bool = False,
+        quantize_embeddings: bool = False,
+        tie_word_embeddings: bool = False,
+    ) -> Gemma4Config:
+        return _tiny_gemma4_config(
+            enable_moe_block=False,
+            attention_k_eq_v=False,
+            num_kv_shared_layers=0,
+            hidden_size_per_layer_input=32,
+            vocab_size_per_layer_input=256,
+            tie_word_embeddings=tie_word_embeddings,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="olive",
+                sym=False,
+                quantize_embeddings=quantize_embeddings,
+                quantize_lm_head=quantize_lm_head,
+            ),
+        )
+
+    def test_uses_matmulnbits_for_decoder_projections(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+        decoder_ops = [node.op_type for node in pkg["decoder"].graph]
+        embedding_ops = [node.op_type for node in pkg["embedding"].graph]
+        vision_ops = [node.op_type for node in pkg["vision_encoder"].graph]
+
+        # Per decoder layer: Q/K/V/O (4), MLP (3), and PLE gate/proj (2).
+        assert decoder_ops.count("MatMulNBits") == 2 * 9
+        assert embedding_ops.count("MatMulNBits") == 0
+        assert vision_ops.count("MatMulNBits") == 0
+
+    def test_converts_and_routes_packed_decoder_weights(self):
+        config = self._config()
+        model = Gemma4Model(config)
+        qweight = torch.randint(0, 255, (64, 32), dtype=torch.uint8)
+        scales = torch.randn(64, 2)
+        qzeros = torch.randint(0, 255, (64, 1), dtype=torch.uint8)
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.qweight": qweight,
+                "model.language_model.layers.0.self_attn.q_proj.scales": scales,
+                "model.language_model.layers.0.self_attn.q_proj.qzeros": qzeros,
+            }
+        )
+
+        prefix = "decoder.model.layers.0.self_attn.q_proj"
+        assert result[f"{prefix}.weight"].shape == (64, 2, 16)
+        assert result[f"{prefix}.weight"].dtype == torch.uint8
+        assert result[f"{prefix}.scales"] is scales
+        assert result[f"{prefix}.zero_points"] is qzeros
+        assert not any(key.endswith((".qweight", ".qzeros")) for key in result)
+
+    def test_quantizes_lm_head_when_checkpoint_requests_it(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config(quantize_lm_head=True)
+        pkg = Gemma4Task().build(Gemma4Model(config), config)
+        decoder_ops = [node.op_type for node in pkg["decoder"].graph]
+
+        assert decoder_ops.count("MatMulNBits") == 2 * 9 + 1
+
+    def test_tied_quantized_lm_head_is_not_overwritten_by_float_embedding(self):
+        config = self._config(quantize_lm_head=True, tie_word_embeddings=True)
+        model = Gemma4Model(config)
+        embed = torch.randn(256, 64)
+        qweight = torch.randint(0, 255, (256, 32), dtype=torch.uint8)
+        scales = torch.randn(256, 2)
+        qzeros = torch.randint(0, 255, (256, 1), dtype=torch.uint8)
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.embed_tokens.weight": embed,
+                "model.language_model.lm_head.qweight": qweight,
+                "model.language_model.lm_head.scales": scales,
+                "model.language_model.lm_head.qzeros": qzeros,
+            }
+        )
+
+        assert result["decoder.lm_head.weight"].shape == (256, 2, 16)
+        assert result["decoder.lm_head.weight"].dtype == torch.uint8
+        assert result["embedding.embed_tokens.weight"] is embed
+
+    def test_rejects_quantized_token_embeddings(self):
+        import pytest
+
+        config = self._config(quantize_embeddings=True)
+        with pytest.raises(NotImplementedError, match="quantized token embeddings"):
+            Gemma4Model(config)
 
 
 class TestGemma4EmbeddingModel:
@@ -364,6 +496,36 @@ class TestGemma4UnifiedPreprocessWeights:
         assert not any(k.startswith("vision_embedder.") for k in result)
         assert not any(k.startswith("embed_vision.") for k in result)
         assert not any(k.startswith("language_model.") for k in result)
+
+    def test_routes_olive_packed_per_layer_projection_to_embedding(self):
+        from mobius.models.gemma4 import Gemma4UnifiedModel
+
+        config = _tiny_gemma4_unified_config(
+            hidden_size_per_layer_input=32,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="olive",
+                sym=False,
+            ),
+        )
+        model = Gemma4UnifiedModel(config)
+        qweight = torch.randint(0, 255, (64, 32), dtype=torch.uint8)
+        scales = torch.randn(64, 2)
+        qzeros = torch.randint(0, 255, (64, 1), dtype=torch.uint8)
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.per_layer_model_projection.qweight": qweight,
+                "model.language_model.per_layer_model_projection.scales": scales,
+                "model.language_model.per_layer_model_projection.qzeros": qzeros,
+            }
+        )
+
+        prefix = "embedding.per_layer_model_projection"
+        assert result[f"{prefix}.weight"].shape == (64, 2, 16)
+        assert result[f"{prefix}.scales"] is scales
+        assert result[f"{prefix}.zero_points"] is qzeros
 
     def test_vision_embedder_preprocess_standalone(self):
         from mobius.models.gemma4 import _Gemma4UnifiedVisionEmbedderModel

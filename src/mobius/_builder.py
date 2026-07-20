@@ -43,6 +43,10 @@ from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._weight_loading import _download_weights
+from mobius._weight_utils import (
+    infer_compressed_tensors_group_size,
+    preprocess_compressed_tensors_weights,
+)
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
@@ -577,6 +581,37 @@ def build(
         # states.  See ``ArchitectureConfig.output_layer_indices``.
         config = dataclasses.replace(config, output_layer_indices=list(output_layer_indices))
 
+    state_dict: dict[str, torch.Tensor] | None = None
+    quantization = getattr(config, "quantization", None)
+    if (
+        load_weights
+        and quantization is not None
+        and quantization.quant_method == "compressed-tensors"
+    ):
+        state_dict = _download_weights(model_id)
+        inferred_group_size = infer_compressed_tensors_group_size(
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size if quantization.group_size > 0 else None,
+        )
+        if quantization.group_size > 0 and quantization.group_size != inferred_group_size:
+            raise ValueError(
+                "Compressed-tensors config group_size does not match checkpoint "
+                f"scales: config={quantization.group_size}, "
+                f"checkpoint={inferred_group_size}."
+            )
+        quantization = dataclasses.replace(quantization, group_size=inferred_group_size)
+        config = dataclasses.replace(config, quantization=quantization)
+    elif (
+        quantization is not None
+        and quantization.quant_method == "compressed-tensors"
+        and quantization.group_size <= 0
+    ):
+        raise ValueError(
+            "Cannot build a compressed-tensors graph without weights when "
+            "config.json omits group_size."
+        )
+
     if task is None:
         task = _default_task_for_model(model_type)
 
@@ -592,7 +627,18 @@ def build(
     for name, model in pkg.items():
         model.graph.name = f"{model_id}/{name}"
 
-    if load_weights:
+    if state_dict is not None:
+        if hasattr(model_module, "preprocess_weights"):
+            state_dict = model_module.preprocess_weights(state_dict)
+        if quantization is not None and quantization.quant_method == "compressed-tensors":
+            state_dict = preprocess_compressed_tensors_weights(
+                state_dict,
+                bits=quantization.bits,
+                group_size=quantization.group_size,
+            )
+        prefix_map = getattr(model_module, "weight_prefix_map", None)
+        pkg.apply_weights(state_dict, prefix_map=prefix_map)
+    elif load_weights:
         state_dict = _download_weights(model_id)
         if hasattr(model_module, "preprocess_weights"):
             state_dict = model_module.preprocess_weights(state_dict)
