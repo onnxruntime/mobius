@@ -41,9 +41,11 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
+    QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
@@ -53,6 +55,147 @@ from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
     from mobius.components._attention import GQAContext
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision quantization helpers
+#
+# Gemma4 is a multimodal model whose text decoder + token embeddings may be
+# weight-quantized (MatMulNBits / GatherBlockQuantized) while its vision and
+# audio encoders stay float.  The vision/audio encoder modules deliberately do
+# NOT consult ``config.quantization`` — they always build plain ``Linear``
+# layers — so enabling quantization only affects the text path.  The helpers
+# below are the single place the text components read the quantization config,
+# which keeps that "text quantized, vision/audio float" contract explicit.
+# ---------------------------------------------------------------------------
+
+
+def _text_quantization_config(config: Gemma4Config):
+    """Return the active weight-quantization config, or ``None`` when off."""
+    quantization_config = getattr(config, "quantization", None)
+    if quantization_config is None or quantization_config.quant_method == "none":
+        return None
+    return quantization_config
+
+
+def _text_linear_class(config: Gemma4Config) -> type | None:
+    """Return a QuantizedLinear factory for text projections, or ``None``.
+
+    ``None`` means "use a plain float :class:`Linear`". Only the text decoder
+    projections (attention Q/K/V/O + MLP + LM head) use this; vision and audio
+    linears are always float.
+    """
+    quantization_config = _text_quantization_config(config)
+    if quantization_config is None:
+        return None
+    zero_point_dtype = (
+        config.dtype
+        if getattr(quantization_config, "float_zero_point", False)
+        else ir.DataType.UINT8
+    )
+    return make_quantized_linear_factory(
+        bits=quantization_config.bits,
+        block_size=quantization_config.group_size,
+        has_zero_point=not quantization_config.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
+
+
+def _text_embeddings_quantized(config: Gemma4Config) -> bool:
+    """Whether the text token-embedding tables use GatherBlockQuantized."""
+    quantization_config = _text_quantization_config(config)
+    return quantization_config is not None and bool(
+        getattr(quantization_config, "quantize_embeddings", False)
+    )
+
+
+def _text_lm_head_quantized(config: Gemma4Config) -> bool:
+    """Whether the text LM head projection uses MatMulNBits."""
+    quantization_config = _text_quantization_config(config)
+    return quantization_config is not None and bool(
+        getattr(quantization_config, "quantize_lm_head", False)
+    )
+
+
+def _make_scaled_word_embedding(
+    config: Gemma4Config,
+    num_embeddings: int,
+    embedding_dim: int,
+    embed_scale: float,
+):
+    """Build a scaled token embedding, quantized when the config requests it.
+
+    Returns a :class:`Gemma4ScaledQuantizedWordEmbedding` (GatherBlockQuantized
+    lookup) when embedding quantization is enabled and the embedding dimension
+    is block-aligned, otherwise a float :class:`Gemma3TextScaledWordEmbedding`.
+    """
+    quantization_config = _text_quantization_config(config)
+    if (
+        _text_embeddings_quantized(config)
+        and embedding_dim % quantization_config.group_size == 0
+    ):
+        return Gemma4ScaledQuantizedWordEmbedding(
+            num_embeddings,
+            embedding_dim,
+            config.pad_token_id,
+            embed_scale=embed_scale,
+            bits=quantization_config.bits,
+            block_size=quantization_config.group_size,
+            has_zero_point=not quantization_config.sym,
+        )
+    return Gemma3TextScaledWordEmbedding(
+        num_embeddings,
+        embedding_dim,
+        config.pad_token_id,
+        embed_scale=embed_scale,
+    )
+
+
+def _make_lm_head(config: Gemma4Config) -> nn.Module:
+    """Build the LM head projection, quantized (MatMulNBits) when requested.
+
+    The multimodal decoder and embedding live in separate ONNX graphs, so a
+    quantized head cannot share the embedding's packed table — it always gets
+    its own independent MatMulNBits weight (populated from the same repacked
+    token-embedding data at load time).
+    """
+    if _text_lm_head_quantized(config):
+        return _text_linear_class(config)(config.hidden_size, config.vocab_size, bias=False)
+    return Linear(config.hidden_size, config.vocab_size, bias=False)
+
+
+class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
+    """GatherBlockQuantized token embedding scaled by ``embed_scale``.
+
+    Quantized counterpart of :class:`Gemma3TextScaledWordEmbedding`: the packed
+    embedding rows are gathered and dequantized by ``GatherBlockQuantized`` and
+    then multiplied by the Gemma ``sqrt(hidden_size)`` (or per-layer) scale.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int,
+        embed_scale: float = 1.0,
+        *,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            bits=bits,
+            block_size=block_size,
+            has_zero_point=has_zero_point,
+            padding_idx=padding_idx,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        embeddings = super().forward(op, input_ids)
+        return op.Mul(embeddings, self.embed_scale)
 
 
 def _dtype_safe_compress(
@@ -695,23 +838,27 @@ class Gemma4TextAttention(nn.Module):
                 == len(prev_layers) - 1 - prev_layers[::-1].index(layer_types[layer_idx])
             )
 
+        # Text-decoder projections are quantized (MatMulNBits) when the config
+        # requests it; otherwise plain float Linear. Attention norms stay float.
+        linear_class = _text_linear_class(config) or Linear
+
         # All layers have Q projection + Q norm + output projection
-        self.q_proj = Linear(
+        self.q_proj = linear_class(
             config.hidden_size, config.num_attention_heads * head_dim, bias=False
         )
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             config.num_attention_heads * head_dim, config.hidden_size, bias=False
         )
 
         # KV-shared layers borrow K,V — no projections needed
         if not self.is_kv_shared_layer:
-            self.k_proj = Linear(
+            self.k_proj = linear_class(
                 config.hidden_size, self.num_key_value_heads * head_dim, bias=False
             )
             # Alternative attention (k_eq_v): V = K, no separate v_proj
             if not self._use_alternative_attention:
-                self.v_proj = Linear(
+                self.v_proj = linear_class(
                     config.hidden_size, self.num_key_value_heads * head_dim, bias=False
                 )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -809,10 +956,21 @@ class Gemma4TextAttention(nn.Module):
                 # the FULL sequence (with RoPE applied).  Transpose it to the 3D
                 # layout the Attention op expects:
                 #   [batch, kv_len, kv_heads * head_dim].
+                #
+                # Reshape to the STATIC ``kv_heads * head_dim`` hidden size (not a
+                # dynamic ``-1``): the source present-value comes out of an
+                # Attention op whose head_dim onnxruntime does not always
+                # propagate, so a ``-1`` here leaves the Attention op's value
+                # head size (and therefore this layer's attention output width)
+                # unknown.  onnxruntime then infers a mismatched o_proj input dim
+                # and rejects the graph at session creation with a MatMul
+                # "Incompatible dimensions" shape-inference error.  A concrete
+                # last dim lets it infer the attention output width correctly.
+                shared_kv_hidden = self.num_key_value_heads * self.head_dim
                 src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
-                src_key = op.Reshape(src_key, [0, 0, -1])
+                src_key = op.Reshape(src_key, [0, 0, shared_kv_hidden])
                 src_value = op.Transpose(src_value, perm=[0, 2, 1, 3])
-                src_value = op.Reshape(src_value, [0, 0, -1])
+                src_value = op.Reshape(src_value, [0, 0, shared_kv_hidden])
 
                 # IMPORTANT: pass is_causal=0 here, NOT the caller's is_causal.
                 #
@@ -1100,6 +1258,7 @@ class Gemma4DecoderLayer(nn.Module):
             intermediate_size=intermediate_size,
             activation=config.hidden_act,
             bias=config.mlp_bias,
+            linear_class=_text_linear_class(config),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1482,11 +1641,11 @@ class Gemma4TextModel(nn.Module):
         self._dtype = config.dtype
 
         embed_scale = math.sqrt(config.hidden_size)
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+        self.embed_tokens = _make_scaled_word_embedding(
+            config,
             config.vocab_size,
             config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
+            embed_scale,
         )
 
         layer_types = config.layer_types or ["sliding_attention"] * config.num_hidden_layers
@@ -1562,11 +1721,11 @@ class Gemma4TextModel(nn.Module):
             vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
             # Fused [V, L*D] table — used when split_per_layer_embedding is False.
             # Requires ORT >= 1.27 for CUDA Gather int64 index support (onnxruntime#28107).
-            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = _make_scaled_word_embedding(
+                config,
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
-                config.pad_token_id,
-                embed_scale=float(self._per_layer_dim**0.5),
+                float(self._per_layer_dim**0.5),
             )
             # Split [V, D] tables — used when split_per_layer_embedding is True
             # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
@@ -1896,7 +2055,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = Gemma4TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _make_lm_head(config)
 
     def forward(
         self,
@@ -1961,7 +2120,7 @@ class _Gemma4DecoderModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = Gemma4TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _make_lm_head(config)
 
     def forward(
         self,
@@ -2124,11 +2283,11 @@ class Gemma4EmbeddingModel(nn.Module):
         super().__init__()
         self.config = config
         embed_scale = math.sqrt(config.hidden_size)
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+        self.embed_tokens = _make_scaled_word_embedding(
+            config,
             config.vocab_size,
             config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
+            embed_scale,
         )
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
@@ -2143,11 +2302,11 @@ class Gemma4EmbeddingModel(nn.Module):
             # Single fused [V, L*D] embedding table matching HuggingFace's
             # ``embed_tokens_per_layer.weight`` shape.  The ORT CUDA Gather
             # int32 overflow (onnxruntime#28107) is now fixed.
-            self.embed_tokens_per_layer = Gemma3TextScaledWordEmbedding(
+            self.embed_tokens_per_layer = _make_scaled_word_embedding(
+                config,
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
-                config.pad_token_id,
-                embed_scale=float(self._per_layer_dim**0.5),
+                float(self._per_layer_dim**0.5),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -2702,7 +2861,10 @@ class Gemma4Model(nn.Module):
             for key, value in state_dict.items()
         }
 
-        # Synthesize lm_head from embed_tokens when weights are tied
+        # Synthesize lm_head from embed_tokens when weights are tied. For a
+        # float checkpoint this copies ``embed_tokens.weight``; for a quantized
+        # checkpoint the tied MatMulNBits head tensors (weight/scales/
+        # zero_points) are emitted directly by the loader, so nothing to do here.
         if self.config.tie_word_embeddings:
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
@@ -2729,9 +2891,13 @@ class Gemma4Model(nn.Module):
                     # All other text weights nest under decoder.model.*
                     onnx_key = "decoder.model." + suffix
                     renamed[onnx_key] = value
-                    if suffix == "embed_tokens.weight":
-                        # Token embedding is shared with the embedding sub-model
-                        renamed["embedding.embed_tokens.weight"] = value
+                    if suffix.startswith("embed_tokens."):
+                        # Token embedding is shared with the embedding sub-model.
+                        # The suffix tail (``weight`` for float, or ``qweight`` /
+                        # ``scales`` / ``zero_points`` for a GatherBlockQuantized
+                        # table) is preserved so both float and quantized
+                        # embeddings route correctly.
+                        renamed["embedding." + suffix] = value
 
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]

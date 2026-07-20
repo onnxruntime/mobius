@@ -226,3 +226,165 @@ class TestVisionEncoderBuildAndRun:
         assert image_features.ndim == 2
         assert image_features.shape[1] == _TEXT_HIDDEN
         assert np.isfinite(image_features).all()
+
+
+def _component_op_types(model) -> set[str]:
+    """Collect every ONNX op type used across a component's graph."""
+    return {node.op_type for node in model.graph}
+
+
+class TestKeepQuantizedMixedPrecision:
+    """A ``keep_quantized`` multimodal build must be mixed precision.
+
+    The Gemma4 *text* decoder + token embedding honour ``config.quantization``
+    (MatMulNBits / GatherBlockQuantized), while the mmproj-sourced vision
+    encoder stays float — see ``build_gemma4_vlm_from_gguf``'s "Mixed
+    precision" note. This asserts that property directly on the built graphs,
+    using the same ``Gemma4Model`` + ``Gemma4Task`` build path the multimodal
+    builder uses, without needing a full quantized text GGUF.
+    """
+
+    def test_decoder_and_embedding_quantized_vision_stays_float(self, clip_mmproj_gguf: Path):
+        import dataclasses
+
+        from mobius._configs import Gemma4Config, QuantizationConfig
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models.gemma4 import Gemma4Model
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        vision_config = read_mmproj_vision_config(GGUFModel(str(clip_mmproj_gguf)))
+        assert vision_config is not None
+
+        config = Gemma4Config(
+            hidden_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=16,
+            num_global_key_value_heads=1,
+            vocab_size=64,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            num_kv_shared_layers=1,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=64,
+            intermediate_size=64,
+            hidden_act="gelu_pytorch_tanh",
+            vision=vision_config,
+        )
+        # A single module-global quantization config: only the Gemma4 text
+        # components read it; the vision encoder ignores it and stays float.
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=False,
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+            ),
+        )
+
+        package = Gemma4Task().build(Gemma4Model(config), config)
+        assert set(package) == {"decoder", "vision_encoder", "embedding"}
+
+        decoder_ops = _component_op_types(package["decoder"])
+        embedding_ops = _component_op_types(package["embedding"])
+        vision_ops = _component_op_types(package["vision_encoder"])
+
+        # Text decoder projections are packed 4-bit matmuls.
+        assert "MatMulNBits" in decoder_ops
+        # Token-embedding table stays packed (int4 gather).
+        assert "GatherBlockQuantized" in embedding_ops
+        # The mmproj-sourced vision encoder is float — no quantized ops.
+        assert "MatMulNBits" not in vision_ops
+        assert "GatherBlockQuantized" not in vision_ops
+
+    def test_quantized_decoder_loads_in_onnxruntime(
+        self, clip_mmproj_gguf: Path, tmp_path: Path
+    ):
+        """The quantized decoder (incl. KV-shared layers) loads in ORT.
+
+        Session creation runs onnxruntime's shape inference, which is where the
+        pre-fix graph failed for KV-shared layers with a MatMul "Incompatible
+        dimensions" error. This guards the fix that gives KV-shared layers'
+        shared K/V a static hidden size so onnxruntime can shape-infer the
+        attention output width.
+        """
+        import dataclasses
+
+        import onnx
+        import onnx_ir as ir
+        import onnxruntime as ort
+
+        from mobius._configs import Gemma4Config, QuantizationConfig
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models.gemma4 import _Gemma4DecoderModel
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        vision_config = read_mmproj_vision_config(GGUFModel(str(clip_mmproj_gguf)))
+        config = Gemma4Config(
+            hidden_size=32,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=16,
+            num_global_key_value_heads=1,
+            vocab_size=64,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            num_kv_shared_layers=2,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=64,
+            intermediate_size=64,
+            hidden_act="gelu_pytorch_tanh",
+            vision=vision_config,
+        )
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=False,
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+            ),
+        )
+
+        model = Gemma4Task()._build_decoder(_Gemma4DecoderModel(config), config)
+        # Fill random data so the graph can be serialized and loaded by ORT.
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = tuple(d if isinstance(d, int) else 1 for d in init.shape)
+            np_dtype = init.dtype.numpy() if init.dtype is not None else np.float32
+            if np.issubdtype(np_dtype, np.integer):
+                values = np.random.randint(0, 7, size=shape).astype(np_dtype)
+            else:
+                values = (np.random.rand(*shape).astype(np.float32) * 0.1).astype(np_dtype)
+            init.const_value = ir.tensor(values)
+
+        decoder_path = tmp_path / "decoder.onnx"
+        onnx.save(ir.to_proto(model), str(decoder_path))
+
+        # Session creation runs shape inference — the KV-shared fix is what keeps
+        # this from failing with a MatMul "Incompatible dimensions" error.
+        session = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
+        input_names = {graph_input.name for graph_input in session.get_inputs()}
+        assert "inputs_embeds" in input_names

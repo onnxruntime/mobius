@@ -367,15 +367,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     mmproj_path = getattr(args, "mmproj", None)
 
     if args.keep_quantized:
-        if mmproj_path is not None:
-            print(
-                "Note: --keep-quantized is ignored when building a multimodal (--mmproj) package."
-            )
-        else:
-            print(
-                "Quantized mode: preserving GGUF quantization as "
-                "MatMulNBits/GatherBlockQuantized..."
-            )
+        print(
+            "Quantized mode: preserving GGUF quantization as "
+            "MatMulNBits/GatherBlockQuantized..."
+        )
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
@@ -390,6 +385,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             mmproj_path,
             dtype=args.dtype,
             execution_provider=args.execution_provider,
+            keep_quantized=args.keep_quantized,
         )
     else:
         pkg = build_from_gguf(

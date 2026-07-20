@@ -509,6 +509,68 @@ def _require_supported_requantization(
         )
 
 
+def repack_gguf_weight_to_target(
+    gguf_model,
+    raw,
+    qtype,
+    np_shape,
+    *,
+    target_bits: int,
+    target_block_size: int,
+    target_symmetric: bool,
+    tensor_name: str,
+):
+    """Repack one 2-D GGUF weight to the graph's common MatMulNBits target.
+
+    Reuses the shared repacker machinery: a tensor whose native repacked layout
+    already matches ``(target_bits, target_block_size)`` is repacked directly;
+    otherwise it is dequantized and requantized to the target layout. This is
+    the single-tensor building block reused by both the text-only
+    (:func:`_load_quantized_state_dict`) and the multimodal quantized loaders.
+
+    Args:
+        gguf_model: The source :class:`GGUFModel`.
+        raw: Raw tensor bytes (as returned by ``tensor_items_raw``).
+        qtype: The GGUF quantization type of the tensor.
+        np_shape: The tensor's logical ``(N, K)`` shape.
+        target_bits: Target MatMulNBits bit width.
+        target_block_size: Target MatMulNBits block size.
+        target_symmetric: Whether the requantization path should omit
+            zero-points (symmetric). Only used when requantizing.
+        tensor_name: Name used for error messages.
+
+    Returns:
+        A ``RepackedTensor`` with the target ``(bits, block_size)`` layout.
+    """
+    import numpy as np
+
+    from mobius.integrations.gguf._repacker import (
+        can_repack,
+        repack_dequantized_tensor,
+        repack_gguf_tensor,
+    )
+
+    qtype_val = qtype.value if hasattr(qtype, "value") else qtype
+    if can_repack(qtype_val):
+        shape_2d = (int(np_shape[0]), int(np_shape[1]))
+        repacked = repack_gguf_tensor(raw.ravel().view(np.uint8), qtype_val, shape_2d)
+        if repacked.bits == target_bits and repacked.block_size == target_block_size:
+            return repacked
+
+    _require_supported_requantization(
+        bits=target_bits,
+        block_size=target_block_size,
+        tensor_name=tensor_name,
+    )
+    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+    return repack_dequantized_tensor(
+        values,
+        bits=target_bits,
+        block_size=target_block_size,
+        symmetric=target_symmetric,
+    )
+
+
 def _load_dequantized_state_dict(
     gguf_model,
     gguf_arch: str,

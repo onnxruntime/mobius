@@ -134,6 +134,35 @@ def _resolve_local_path(path: str | Path) -> str:
     return _resolve_gguf_path(path)
 
 
+# Text-GGUF tensors whose names are not covered by the block ``gemma4`` text
+# mapping; they route to their HF language-model names directly.
+_PER_LAYER_TOP_HF_NAMES = {
+    "per_layer_token_embd.weight": "language_model.embed_tokens_per_layer.weight",
+    "per_layer_model_proj.weight": "language_model.per_layer_model_projection.weight",
+    "per_layer_proj_norm.weight": "language_model.per_layer_projection_norm.weight",
+}
+
+
+def _text_gguf_name_to_hf_multimodal(gguf_name: str) -> str | None:
+    """Map one text-GGUF tensor name to its HF multimodal (``language_model.*``) name.
+
+    Returns ``None`` for tensors that have no multimodal counterpart.
+    """
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    if gguf_name in _PER_LAYER_TOP_HF_NAMES:
+        return _PER_LAYER_TOP_HF_NAMES[gguf_name]
+    text_hf = map_gguf_to_hf_names(gguf_name, "gemma4")
+    if text_hf is None:
+        return None
+    # gemma4 text mapping yields ``model.*`` / ``lm_head.*``; nest under the
+    # multimodal ``language_model.`` namespace (HF Gemma4 stores the decoder
+    # layers directly under language_model, so strip the ``model.`` prefix).
+    if text_hf.startswith("model."):
+        return "language_model." + text_hf[len("model.") :]
+    return "language_model." + text_hf
+
+
 def _text_gguf_to_hf_multimodal(text_gguf: Any) -> dict:
     """Load text-backbone GGUF tensors as HF multimodal (``language_model.*``).
 
@@ -143,34 +172,122 @@ def _text_gguf_to_hf_multimodal(text_gguf: Any) -> dict:
     """
     import torch
 
-    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
-
-    # The three top-level per-layer-input tensors are not covered by the block
-    # text mapping; route them to their HF language-model names directly.
-    per_layer_top = {
-        "per_layer_token_embd.weight": "language_model.embed_tokens_per_layer.weight",
-        "per_layer_model_proj.weight": "language_model.per_layer_model_projection.weight",
-        "per_layer_proj_norm.weight": "language_model.per_layer_projection_norm.weight",
-    }
-
     state_dict: dict[str, torch.Tensor] = {}
     for gguf_name, array in text_gguf.tensor_items():
-        if gguf_name in per_layer_top:
-            hf_name = per_layer_top[gguf_name]
-        else:
-            text_hf = map_gguf_to_hf_names(gguf_name, "gemma4")
-            if text_hf is None:
-                continue
-            # gemma4 text mapping yields ``model.*`` / ``lm_head.*``; nest under
-            # the multimodal ``language_model.`` namespace (HF Gemma4 stores the
-            # decoder layers directly under language_model, so strip ``model.``).
-            if text_hf.startswith("model."):
-                hf_name = "language_model." + text_hf[len("model.") :]
-            else:
-                hf_name = "language_model." + text_hf
+        hf_name = _text_gguf_name_to_hf_multimodal(gguf_name)
+        if hf_name is None:
+            continue
 
         values = np.array(array).astype(np.float32)
         # layer_scalar is an nn.Parameter (no ``.weight`` module suffix, shape [1]).
+        if hf_name.endswith(".layer_scalar.weight"):
+            hf_name = hf_name[: -len(".weight")]
+            values = values.reshape(-1)[:1]
+        state_dict[hf_name] = torch.from_numpy(values)
+    return state_dict
+
+
+# HF projection-weight name suffixes (under ``language_model.layers.N.``) that
+# become MatMulNBits QuantizedLinear layers in the quantized text decoder.
+_QUANTIZED_LINEAR_SUFFIXES = (
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
+)
+
+# HF token-embedding weight names that become GatherBlockQuantized tables.
+_QUANTIZED_EMBEDDING_NAMES = (
+    "language_model.embed_tokens.weight",
+    "language_model.embed_tokens_per_layer.weight",
+)
+
+
+def _text_gguf_to_hf_multimodal_quantized(
+    text_gguf: Any,
+    config: Any,
+    *,
+    bits: int,
+    block_size: int,
+    symmetric: bool,
+) -> dict:
+    """Load text-backbone GGUF tensors, quantizing the decoder + token embeddings.
+
+    Mirrors :func:`_text_gguf_to_hf_multimodal` but keeps the text decoder
+    projections in MatMulNBits form (``.weight`` uint8 + ``.scales`` [+
+    ``.zero_points``]) and the token-embedding tables in GatherBlockQuantized
+    form (``.qweight`` + ``.scales`` [+ ``.zero_points``]).  Norms and the
+    float per-layer projections stay dequantized.  Vision/audio weights are
+    loaded separately and always stay float.
+
+    Names are the HF multimodal ``language_model.*`` names that
+    :meth:`Gemma4Model.preprocess_weights` expects.
+    """
+    import torch
+
+    from mobius.integrations.gguf._builder import repack_gguf_weight_to_target
+
+    quantize_lm_head = bool(getattr(config.quantization, "quantize_lm_head", False))
+    tie_word_embeddings = bool(config.tie_word_embeddings)
+
+    def _emit_linear(state_dict: dict, stem: str, repacked) -> None:
+        state_dict[f"{stem}.weight"] = torch.from_numpy(repacked.weight)
+        state_dict[f"{stem}.scales"] = torch.from_numpy(repacked.scales)
+        if repacked.zero_points is not None:
+            state_dict[f"{stem}.zero_points"] = torch.from_numpy(repacked.zero_points)
+
+    def _emit_embedding(state_dict: dict, stem: str, repacked) -> None:
+        weight = repacked.weight
+        state_dict[f"{stem}.qweight"] = torch.from_numpy(weight.reshape(weight.shape[0], -1))
+        state_dict[f"{stem}.scales"] = torch.from_numpy(repacked.scales)
+        if repacked.zero_points is not None:
+            state_dict[f"{stem}.zero_points"] = torch.from_numpy(repacked.zero_points)
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for gguf_name, raw, qtype, np_shape in text_gguf.tensor_items_raw():
+        hf_name = _text_gguf_name_to_hf_multimodal(gguf_name)
+        if hf_name is None:
+            continue
+
+        is_quant_linear = hf_name.endswith(_QUANTIZED_LINEAR_SUFFIXES) or (
+            quantize_lm_head and hf_name == "language_model.lm_head.weight"
+        )
+        is_quant_embedding = hf_name in _QUANTIZED_EMBEDDING_NAMES
+
+        if (is_quant_linear or is_quant_embedding) and len(np_shape) == 2:
+            repacked = repack_gguf_weight_to_target(
+                text_gguf,
+                raw,
+                qtype,
+                np_shape,
+                target_bits=bits,
+                target_block_size=block_size,
+                target_symmetric=symmetric,
+                tensor_name=hf_name,
+            )
+            stem = hf_name[: -len(".weight")]
+            if is_quant_embedding:
+                _emit_embedding(state_dict, stem, repacked)
+                # A tied quantized LM head shares the token-embedding table but,
+                # because the decoder is a separate ONNX graph, needs its own
+                # MatMulNBits copy (same repacked bytes, linear layout).
+                if (
+                    hf_name == "language_model.embed_tokens.weight"
+                    and quantize_lm_head
+                    and tie_word_embeddings
+                ):
+                    _emit_linear(state_dict, "language_model.lm_head", repacked)
+            else:
+                _emit_linear(state_dict, stem, repacked)
+            continue
+
+        # Everything else (norms, float per-layer projections) stays float.
+        values = np.array(text_gguf.dequantize_raw_tensor(raw, qtype, np_shape)).astype(
+            np.float32
+        )
         if hf_name.endswith(".layer_scalar.weight"):
             hf_name = hf_name[: -len(".weight")]
             values = values.reshape(-1)[:1]
@@ -209,6 +326,7 @@ def build_gemma4_vlm_from_gguf(
     execution_provider: str = "default",
     image_token_id: int | None = None,
     include_audio: bool = False,
+    keep_quantized: bool = False,
 ) -> ModelPackage:
     """Build a full Gemma4 multimodal ONNX package from text + mmproj GGUFs.
 
@@ -222,10 +340,25 @@ def build_gemma4_vlm_from_gguf(
             value carried by the text config is used (if any).
         include_audio: When ``True``, also build the (experimental) audio
             encoder. Off by default — see the module docstring.
+        keep_quantized: When ``True``, preserve the text backbone's GGUF
+            quantization: the decoder projections become MatMulNBits and the
+            token-embedding tables become GatherBlockQuantized (int4), roughly
+            an 8x size reduction over the dequantized package. The
+            vision (and audio) encoder always stay float because their weights
+            come from the mmproj as F16 — see the "Mixed precision" note below.
 
     Returns:
         A :class:`ModelPackage` with ``decoder`` + ``vision_encoder`` +
         ``embedding`` components (plus ``audio_encoder`` if ``include_audio``).
+
+    Mixed precision:
+        ``keep_quantized`` yields a mixed-precision package. Only the Gemma4
+        *text* components read ``config.quantization`` (see
+        :func:`mobius.models.gemma4._text_linear_class`); the vision/audio
+        encoder modules always build float ``Linear`` layers, so a single
+        module-global :class:`QuantizationConfig` quantizes the decoder +
+        embedding while leaving the mmproj-sourced vision encoder float — no
+        per-module quantization opt-out is required.
     """
     import dataclasses
 
@@ -267,13 +400,68 @@ def build_gemma4_vlm_from_gguf(
         if resolved is not None:
             config = dataclasses.replace(config, dtype=resolved)
 
+    # 1b. Quantized mode: set the module-global quantization config from the
+    # text GGUF BEFORE building so the text graph emits MatMulNBits /
+    # GatherBlockQuantized. The vision/audio encoders ignore it and stay float.
+    quant_params: tuple[int, int, bool] | None = None
+    if keep_quantized:
+        from mobius._configs import QuantizationConfig
+        from mobius.integrations.gguf._builder import (
+            _can_quantize_embedding,
+            _can_quantize_lm_head,
+            _detect_quant_params,
+        )
+
+        bits, block_size, is_symmetric = _detect_quant_params(text_gguf, "gemma4")
+        quant_params = (bits, block_size, is_symmetric)
+        quantize_embeddings = _can_quantize_embedding(
+            text_gguf, "gemma4", bits=bits, block_size=block_size
+        )
+        quantize_lm_head = (
+            quantize_embeddings
+            if config.tie_word_embeddings
+            else _can_quantize_lm_head(text_gguf, "gemma4")
+        )
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=bits,
+                group_size=block_size,
+                quant_method="gguf",
+                sym=is_symmetric,
+                quantize_embeddings=quantize_embeddings,
+                quantize_lm_head=quantize_lm_head,
+                tie_word_embeddings=quantize_lm_head and config.tie_word_embeddings,
+            ),
+        )
+        logger.info(
+            "Quantized multimodal mode: bits=%d, block_size=%d, symmetric=%s, "
+            "embedding=%s, lm_head=%s (vision/audio stay float)",
+            bits,
+            block_size,
+            is_symmetric,
+            quantize_embeddings,
+            quantize_lm_head,
+        )
+
     # 2. Build the multimodal graph (decoder + vision + embedding [+ audio]).
     module = Gemma4Model(config)
     pkg = Gemma4Task().build(module, config)
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
-    # 3. Assemble the combined HF-multimodal state dict from both GGUFs.
-    state_dict = _text_gguf_to_hf_multimodal(text_gguf)
+    # 3. Assemble the combined HF-multimodal state dict from both GGUFs. The
+    #    text backbone is quantized when requested; vision/audio always float.
+    if keep_quantized:
+        bits, block_size, is_symmetric = quant_params
+        state_dict = _text_gguf_to_hf_multimodal_quantized(
+            text_gguf,
+            config,
+            bits=bits,
+            block_size=block_size,
+            symmetric=is_symmetric,
+        )
+    else:
+        state_dict = _text_gguf_to_hf_multimodal(text_gguf)
     state_dict.update(_mmproj_vision_to_hf(mmproj_gguf))
     if include_audio:
         state_dict.update(_mmproj_audio_to_hf(mmproj_gguf))
