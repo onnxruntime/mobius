@@ -143,6 +143,10 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    # --- Specialized-test models (covered by a co-located test class) ---
+    "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
+    "(graph build + diffusers-parity + bidirectionality); no small public "
+    "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
