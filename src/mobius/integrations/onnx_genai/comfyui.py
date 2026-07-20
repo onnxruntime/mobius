@@ -53,7 +53,6 @@ _LOGGER = logging.getLogger(__name__)
 _SAMPLER_NODES = ("KSampler", "KSamplerAdvanced")
 _VAE_DECODE_NODES = ("VAEDecode", "VAEDecodeTiled")
 _TEXT_ENCODE_NODES = ("CLIPTextEncode",)
-_CHECKPOINT_NODES = ("CheckpointLoaderSimple", "CheckpointLoader", "UNETLoader")
 _LATENT_NODES = ("EmptyLatentImage", "EmptySD3LatentImage")
 
 # ComfyUI sampler_name -> onnx-genai scheduler kind. Only deterministic samplers

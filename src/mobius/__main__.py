@@ -396,8 +396,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
     """Execute the 'convert-comfyui' subcommand."""
-    import json
-
     from mobius.integrations.onnx_genai import convert_comfyui_workflow
 
     with open(args.workflow, encoding="utf-8") as handle:
