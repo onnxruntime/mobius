@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Emit onnx-genai ``inference_metadata`` for diffusion pipelines.
+"""Emit onnx-genai ``inference_metadata`` for multi-model pipelines.
 
 Mobius builds the neural components of a diffusion model (denoiser transformer,
 VAE, and — externally — a text encoder) as separate ONNX graphs, but does not
@@ -20,12 +20,10 @@ The emitted contract matches onnx-genai's pipeline schema:
 ``denoiser`` / ``num_steps`` / ``timestep_input`` / ``scheduler_config`` /
 ``cfg_conditioning_input`` and denoiser self-edge loop-carried dataflow).
 
-Note:
-    This module covers *diffusion* pipelines only. Autoregressive
-    decoder-only LLM metadata (``model.attention`` + ``kv_cache``) lives in the
-    sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata` module;
-    :func:`mobius.integrations.onnx_genai.write_onnx_genai_config` dispatches to
-    whichever applies for a built package.
+Autoregressive decoder-only LLM metadata (``model.attention`` + ``kv_cache``)
+lives in the sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata`
+module. Composite multimodal pipelines retain those decoder properties while
+declaring their encoder, fusion, and decoder execution stages here.
 """
 
 from __future__ import annotations
@@ -348,6 +346,140 @@ def build_diffusion_pipeline_metadata(
     if phases:
         pipeline["phases"] = phases
     return {"pipeline": pipeline}
+
+
+def build_multimodal_pipeline_metadata(
+    *,
+    decoder_filename: str = "decoder.onnx",
+    embedding_filename: str = "embedding.onnx",
+    vision_encoder_filename: str | None = None,
+    audio_encoder_filename: str | None = None,
+    tokenizer_filename: str = "tokenizer.json",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for an encoder-to-fusion-to-decoder multimodal pipeline.
+
+    At least one modality encoder is required. Each encoder and the embedding
+    fusion model runs once for the prompt; the decoder then runs
+    autoregressively for every generation step.
+
+    Args:
+        decoder_filename: Decoder ONNX filename relative to the package root.
+        embedding_filename: Embedding fusion ONNX filename.
+        vision_encoder_filename: Optional vision encoder ONNX filename.
+        audio_encoder_filename: Optional audio encoder ONNX filename.
+        tokenizer_filename: Tokenizer filename used by the decoder.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`. Its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    if vision_encoder_filename is None and audio_encoder_filename is None:
+        raise ValueError("a multimodal pipeline requires a vision or audio encoder")
+
+    models: dict[str, Any] = {}
+    dataflow: list[dict[str, Any]] = []
+    stages: list[dict[str, Any]] = []
+    phases: dict[str, Any] = {}
+
+    def add_encoder(
+        name: str,
+        filename: str,
+        model_type: str,
+        output_name: str,
+        stage_name: str,
+    ) -> None:
+        models[name] = {"filename": filename, "type": model_type}
+        dataflow.append(
+            {
+                "from": f"{name}.{output_name}",
+                "to": f"embedding.{output_name}",
+                "dtype": "fp32",
+                "device_transfer": False,
+            }
+        )
+        stages.append(
+            {
+                "name": stage_name,
+                "strategy": {"kind": "single_pass", "model": name},
+                "run_on": "prompt_only",
+            }
+        )
+        phases[name] = {"run_on": "prompt_only"}
+
+    if vision_encoder_filename is not None:
+        add_encoder(
+            "vision_encoder",
+            vision_encoder_filename,
+            "vision_encoder",
+            "image_features",
+            "encode_vision",
+        )
+    if audio_encoder_filename is not None:
+        add_encoder(
+            "audio_encoder",
+            audio_encoder_filename,
+            "audio_encoder",
+            "audio_features",
+            "encode_audio",
+        )
+
+    models["embedding"] = {"filename": embedding_filename, "type": "encoder"}
+    models["decoder"] = {
+        "filename": decoder_filename,
+        "type": "decoder",
+        "tokenizer": tokenizer_filename,
+    }
+    dataflow.append(
+        {
+            "from": "embedding.inputs_embeds",
+            "to": "decoder.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        }
+    )
+    stages.extend(
+        [
+            {
+                "name": "fuse_embeddings",
+                "strategy": {"kind": "single_pass", "model": "embedding"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "decode",
+                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                "run_on": "every_step",
+            },
+        ]
+    )
+    phases["embedding"] = {"run_on": "prompt_only"}
+    phases["decoder"] = {"run_on": "every_step"}
+
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": models,
+        "dataflow": dataflow,
+        "strategy": {"kind": "composite", "stages": stages},
+        "phases": phases,
+    }
+    return metadata
+
+
+def write_multimodal_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite multimodal metadata into ``directory``."""
+    metadata = build_multimodal_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
 
 
 def write_diffusion_pipeline_metadata(

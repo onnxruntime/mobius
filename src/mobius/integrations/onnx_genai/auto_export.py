@@ -4,9 +4,10 @@
 """Write onnx-genai ``inference_metadata.yaml`` for a built Mobius package.
 
 Dispatches on the package/config: a decoder-only LLM emits the
-``model.attention`` + ``kv_cache`` document; a diffusion package (denoiser +
-optional VAE / text encoder) emits the iterative ``pipeline`` document. This is
-the onnx-genai analogue of :func:`mobius.integrations.ort_genai.write_ort_genai_config`.
+``model.attention`` + ``kv_cache`` document; a multimodal package emits a
+composite encoder/fusion/decoder pipeline; and a diffusion package emits an
+iterative pipeline. This is the onnx-genai analogue of
+:func:`mobius.integrations.ort_genai.write_ort_genai_config`.
 """
 
 from __future__ import annotations
@@ -15,11 +16,15 @@ import logging
 import os
 from typing import Any
 
-from mobius.integrations.onnx_genai.decoder_metadata import write_decoder_metadata
+from mobius.integrations.onnx_genai.decoder_metadata import (
+    decoder_metadata_from_config,
+    write_decoder_metadata,
+)
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
+    write_multimodal_pipeline_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,6 +95,32 @@ def _looks_like_diffusion(pkg: Any) -> bool:
     )
 
 
+def _looks_like_multimodal(pkg: Any) -> bool:
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    return "decoder" in names and bool(names & {"vision_encoder", "audio_encoder"})
+
+
+def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
+    """Derive multimodal component filenames from a package's component keys."""
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return {}
+
+    derived = {
+        "decoder_filename": "decoder/model.onnx",
+        "embedding_filename": "embedding/model.onnx",
+    }
+    if "vision_encoder" in names:
+        derived["vision_encoder_filename"] = "vision_encoder/model.onnx"
+    if "audio_encoder" in names:
+        derived["audio_encoder_filename"] = "audio_encoder/model.onnx"
+    return derived
+
+
 def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
     """Derive diffusion-pipeline metadata filenames from a package's component keys.
 
@@ -135,13 +166,10 @@ def write_onnx_genai_config(
 ) -> dict[str, str]:
     """Write ``inference_metadata.yaml`` into ``output_dir`` and return its path.
 
-    For a decoder LLM, ``config`` (or ``pkg.config``) supplies the attention
-    dimensions. For a diffusion package, the denoiser/VAE/text-encoder filenames
-    are taken from ``kwargs`` (see :func:`build_diffusion_pipeline_metadata`) or
-    defaulted; ``num_inference_steps`` / ``scheduler`` / ``guidance_scale`` set
-    the loop. When ``scheduler`` is not given and ``source`` (the diffusers
-    checkpoint dir or HF id) is provided, the scheduler is auto-read from the
-    checkpoint's ``scheduler/scheduler_config.json`` (falling back to DDIM).
+    For decoder and multimodal packages, ``config`` (or ``pkg.config``) supplies
+    the decoder attention dimensions. Diffusion component filenames are taken
+    from ``kwargs`` or discovered from the package; ``num_inference_steps`` /
+    ``scheduler`` / ``guidance_scale`` set the loop.
     """
     os.makedirs(output_dir, exist_ok=True)
     if _looks_like_diffusion(pkg):
@@ -178,6 +206,20 @@ def write_onnx_genai_config(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
         )
+    if _looks_like_multimodal(pkg):
+        derived = _multimodal_component_kwargs(pkg)
+        for name, value in derived.items():
+            kwargs.setdefault(name, value)
+        decoder_metadata = decoder_metadata_from_config(
+            resolved_config, kv_native_dtype=kv_native_dtype
+        )
+        path = write_multimodal_pipeline_metadata(
+            output_dir,
+            decoder_metadata=decoder_metadata,
+            **kwargs,
+        )
+        return {"inference_metadata": path}
+
     path = write_decoder_metadata(
         output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
     )

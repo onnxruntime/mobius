@@ -27,6 +27,10 @@ class _DiffusionPkg(dict):
     pass
 
 
+class _MultimodalPkg(dict):
+    config = _Cfg()
+
+
 def test_dispatch_decoder(tmp_path):
     arts = write_onnx_genai_config(
         object(), str(tmp_path), config=_Cfg(), kv_native_dtype="bf16"
@@ -125,3 +129,83 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     with open(arts["inference_metadata"]) as handle:
         meta = yaml.safe_load(handle)
     assert meta["pipeline"]["strategy"]["scheduler_config"]["kind"] == "euler"
+
+
+def test_dispatch_vision_multimodal_pipeline(tmp_path):
+    pkg = _MultimodalPkg(
+        {
+            "decoder": object(),
+            "vision_encoder": object(),
+            "embedding": object(),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    assert metadata["required_capabilities"] == [
+        "kv_cache",
+        "grouped_query_attention",
+    ]
+    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    pipeline = metadata["pipeline"]
+    assert pipeline["models"] == {
+        "vision_encoder": {
+            "filename": "vision_encoder/model.onnx",
+            "type": "vision_encoder",
+        },
+        "embedding": {
+            "filename": "embedding/model.onnx",
+            "type": "encoder",
+        },
+        "decoder": {
+            "filename": "decoder/model.onnx",
+            "type": "decoder",
+            "tokenizer": "tokenizer.json",
+        },
+    }
+    assert pipeline["strategy"]["kind"] == "composite"
+
+
+def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
+    pkg = _MultimodalPkg(
+        {
+            "decoder": object(),
+            "vision_encoder": object(),
+            "audio_encoder": object(),
+            "embedding": object(),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    pipeline = metadata["pipeline"]
+    assert pipeline["dataflow"] == [
+        {
+            "from": "vision_encoder.image_features",
+            "to": "embedding.image_features",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+        {
+            "from": "audio_encoder.audio_features",
+            "to": "embedding.audio_features",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+        {
+            "from": "embedding.inputs_embeds",
+            "to": "decoder.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+    ]
+    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
+        "encode_vision",
+        "encode_audio",
+        "fuse_embeddings",
+        "decode",
+    ]

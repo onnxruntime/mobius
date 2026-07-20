@@ -14,6 +14,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
+    build_multimodal_pipeline_metadata,
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
 )
@@ -271,3 +272,141 @@ class TestLanguageDiffusionMetadata:
             guidance_scale=2.5,
         )
         jsonschema.validate(instance=meta, schema=schema)
+
+
+class TestBuildMultimodalPipelineMetadata:
+    def test_vision_only_pipeline(self):
+        metadata = build_multimodal_pipeline_metadata(
+            vision_encoder_filename="vision_encoder.onnx"
+        )
+
+        assert metadata == {
+            "pipeline": {
+                "models": {
+                    "vision_encoder": {
+                        "filename": "vision_encoder.onnx",
+                        "type": "vision_encoder",
+                    },
+                    "embedding": {"filename": "embedding.onnx", "type": "encoder"},
+                    "decoder": {
+                        "filename": "decoder.onnx",
+                        "type": "decoder",
+                        "tokenizer": "tokenizer.json",
+                    },
+                },
+                "dataflow": [
+                    {
+                        "from": "vision_encoder.image_features",
+                        "to": "embedding.image_features",
+                        "dtype": "fp32",
+                        "device_transfer": False,
+                    },
+                    {
+                        "from": "embedding.inputs_embeds",
+                        "to": "decoder.inputs_embeds",
+                        "dtype": "fp32",
+                        "device_transfer": False,
+                    },
+                ],
+                "strategy": {
+                    "kind": "composite",
+                    "stages": [
+                        {
+                            "name": "encode_vision",
+                            "strategy": {
+                                "kind": "single_pass",
+                                "model": "vision_encoder",
+                            },
+                            "run_on": "prompt_only",
+                        },
+                        {
+                            "name": "fuse_embeddings",
+                            "strategy": {
+                                "kind": "single_pass",
+                                "model": "embedding",
+                            },
+                            "run_on": "prompt_only",
+                        },
+                        {
+                            "name": "decode",
+                            "strategy": {
+                                "kind": "autoregressive",
+                                "decoder": "decoder",
+                            },
+                            "run_on": "every_step",
+                        },
+                    ],
+                },
+                "phases": {
+                    "vision_encoder": {"run_on": "prompt_only"},
+                    "embedding": {"run_on": "prompt_only"},
+                    "decoder": {"run_on": "every_step"},
+                },
+            }
+        }
+
+    def test_vision_and_audio_pipeline(self):
+        metadata = build_multimodal_pipeline_metadata(
+            vision_encoder_filename="vision_encoder.onnx",
+            audio_encoder_filename="audio_encoder.onnx",
+        )
+        pipeline = metadata["pipeline"]
+
+        assert pipeline["models"] == {
+            "vision_encoder": {
+                "filename": "vision_encoder.onnx",
+                "type": "vision_encoder",
+            },
+            "audio_encoder": {
+                "filename": "audio_encoder.onnx",
+                "type": "audio_encoder",
+            },
+            "embedding": {"filename": "embedding.onnx", "type": "encoder"},
+            "decoder": {
+                "filename": "decoder.onnx",
+                "type": "decoder",
+                "tokenizer": "tokenizer.json",
+            },
+        }
+        assert pipeline["dataflow"] == [
+            {
+                "from": "vision_encoder.image_features",
+                "to": "embedding.image_features",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+            {
+                "from": "audio_encoder.audio_features",
+                "to": "embedding.audio_features",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+            {
+                "from": "embedding.inputs_embeds",
+                "to": "decoder.inputs_embeds",
+                "dtype": "fp32",
+                "device_transfer": False,
+            },
+        ]
+        assert pipeline["strategy"]["stages"] == [
+            {
+                "name": "encode_vision",
+                "strategy": {"kind": "single_pass", "model": "vision_encoder"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "encode_audio",
+                "strategy": {"kind": "single_pass", "model": "audio_encoder"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "fuse_embeddings",
+                "strategy": {"kind": "single_pass", "model": "embedding"},
+                "run_on": "prompt_only",
+            },
+            {
+                "name": "decode",
+                "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                "run_on": "every_step",
+            },
+        ]
