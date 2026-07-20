@@ -71,6 +71,19 @@ _GEMMA2_EXTRAS: dict[str, str] = {
     "blk.{bid}.post_ffn_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
 }
 
+# Gemma3 uses the llama.cpp Gemma tensor names (same as Gemma4's norm subset),
+# NOT the ``pre_ffn_norm``/``post_ffn_norm`` names in _GEMMA2_EXTRAS: ``ffn_norm``
+# is the pre-feedforward norm (overriding the Llama post-attention mapping),
+# ``post_ffw_norm`` is the post-feedforward norm, ``post_attention_norm`` is the
+# post-attention norm, and each attention block carries per-head Q/K norms.
+_GEMMA3_EXTRAS: dict[str, str] = {
+    "blk.{bid}.ffn_norm": ("model.layers.{bid}.pre_feedforward_layernorm"),
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    "blk.{bid}.post_ffw_norm": ("model.layers.{bid}.post_feedforward_layernorm"),
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 # Gemma 4 extras on top of the Llama base + Gemma2 extras.
 # Gemma 4 GGUF tensor names are taken from llama.cpp constants (gguf-py/gguf/constants.py).
 #
@@ -259,6 +272,13 @@ def _build_mapping(
 
     if arch in _LLAMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
+    elif arch == "gemma3":
+        # Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the
+        # pre-feedforward norm, plus post_attention/post_ffw norms and Q/K
+        # norms), distinct from the older _GEMMA2_EXTRAS names — keep it out of
+        # the shared _GEMMA_FAMILY path.
+        result = dict(_LLAMA_MAPPING)
+        result.update(_GEMMA3_EXTRAS)
     elif arch in _GEMMA_FAMILY:
         result = dict(_LLAMA_MAPPING)
         result.update(_GEMMA2_EXTRAS)

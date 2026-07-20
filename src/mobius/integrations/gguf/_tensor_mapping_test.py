@@ -115,6 +115,40 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", "gemma2")
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    # ---- Gemma 3 ----
+
+    def test_gemma3_uses_llama_cpp_norm_names(self) -> None:
+        # Gemma3 GGUF uses the llama.cpp Gemma tensor names (like Gemma4), NOT
+        # the pre_ffn_norm/post_ffn_norm names used for Gemma2.
+        assert (
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma3")
+            == "model.layers.0.pre_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma3")
+            == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma3")
+            == "model.layers.0.post_attention_layernorm.weight"
+        )
+
+    def test_gemma3_maps_qk_norms(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "gemma3")
+            == "model.layers.0.self_attn.q_norm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "gemma3")
+            == "model.layers.0.self_attn.k_norm.weight"
+        )
+
+    def test_gemma3_inherits_llama_base(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.2.attn_q.weight", "gemma3")
+            == "model.layers.2.self_attn.q_proj.weight"
+        )
+
     # ---- Gemma 4 ----
 
     def test_gemma4_inherits_llama_base(self) -> None:
