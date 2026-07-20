@@ -19,6 +19,13 @@ The emitted contract matches onnx-genai's pipeline schema:
 ``schema/inference_metadata.schema.json`` (kind ``iterative`` with
 ``denoiser`` / ``num_steps`` / ``timestep_input`` / ``scheduler_config`` /
 ``cfg_conditioning_input`` and denoiser self-edge loop-carried dataflow).
+
+Note:
+    This module covers *diffusion* pipelines only. Autoregressive
+    decoder-only LLM metadata (``model.attention`` + ``kv_cache``) lives in the
+    sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata` module;
+    :func:`mobius.integrations.onnx_genai.write_onnx_genai_config` dispatches to
+    whichever applies for a built package.
 """
 
 from __future__ import annotations

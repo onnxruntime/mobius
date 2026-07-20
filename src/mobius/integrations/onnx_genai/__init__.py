@@ -5,10 +5,19 @@
 
 onnx-genai (https://github.com/justinchuby/onnx-genai) is a standard-driven
 runtime whose behavior is declared by an ``inference_metadata`` document rather
-than hardcoded per-model dispatch. This module emits the pipeline section for
-multi-model diffusion packages (denoiser + optional VAE / text encoder) so a
-Mobius-built diffusion package is directly runnable by onnx-genai's iterative
-pipeline (`PipelineEngine::run_pipeline`).
+than hardcoded per-model dispatch. This package emits that document for both
+model families Mobius builds:
+
+* **Decoder-only language models** — :func:`write_decoder_metadata` /
+  :func:`decoder_metadata_from_config` (in ``decoder_metadata``) emit the
+  ``model.attention`` + ``kv_cache`` sections for an autoregressive LLM.
+* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` and the
+  builders in ``inference_metadata`` emit the iterative ``pipeline`` section for
+  a multi-model package (denoiser + optional VAE / text encoder).
+
+:func:`write_onnx_genai_config` is the unified entry point: it inspects the
+built package and dispatches to the decoder or diffusion writer, so
+``mobius build --runtime onnx-genai`` works for LLMs and diffusion models alike.
 
 The core model/task/component layers remain runtime-agnostic; all onnx-genai
 specific code lives here.
