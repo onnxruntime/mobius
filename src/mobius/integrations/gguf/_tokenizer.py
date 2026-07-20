@@ -90,7 +90,7 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
     round-trip fails.
     """
     try:
-        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
+        from tokenizers import Tokenizer, decoders, pre_tokenizers, processors
         from tokenizers.models import BPE
 
         from mobius.integrations.gguf._reader import GGUFModel
@@ -119,7 +119,7 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
         merges = [
             (parts[0], parts[1])
             for merge in merges_raw
-            if len((parts := merge.split(" "))) == 2
+            if len(parts := merge.split(" ")) == 2
         ]
         unknown_token = tokens[unknown_id] if unknown_id < len(tokens) else None
 
@@ -183,10 +183,6 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
 
         path = os.path.join(str(output_dir), "tokenizer.json")
         tokenizer.save(path)
-        _LOGGER.info(
-            "Reconstructed tokenizer.json from GGUF metadata (%d tokens).", len(tokens)
-        )
-        return path
     except Exception as error:  # best-effort; never block the build
         _LOGGER.warning(
             "Failed to reconstruct tokenizer from GGUF metadata %r: %s; "
@@ -195,3 +191,8 @@ def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) ->
             error,
         )
         return None
+    else:
+        _LOGGER.info(
+            "Reconstructed tokenizer.json from GGUF metadata (%d tokens).", len(tokens)
+        )
+        return path
