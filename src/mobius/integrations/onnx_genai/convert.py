@@ -197,19 +197,23 @@ def convert_comfyui_workflow(
     Returns:
         A :class:`ConversionResult` with the written paths and parsed workflow.
     """
-    wf = parse_comfyui_workflow(workflow)
+    parsed_workflow = parse_comfyui_workflow(workflow)
     os.makedirs(output_dir, exist_ok=True)
-    use_karras = wf.scheduler_spacing == "karras"
-    use_exponential = wf.scheduler_spacing == "exponential"
-    scheduler = _scheduler_for_workflow(wf, checkpoint_source)
+    use_karras = parsed_workflow.scheduler_spacing == "karras"
+    use_exponential = parsed_workflow.scheduler_spacing == "exponential"
+    scheduler = _scheduler_for_workflow(parsed_workflow, checkpoint_source)
 
     timesteps = None
     if compute_timesteps:
         timesteps = _diffusers_timesteps(
-            wf.scheduler_kind, scheduler, wf.steps, use_karras, use_exponential
+            parsed_workflow.scheduler_kind,
+            scheduler,
+            parsed_workflow.steps,
+            use_karras,
+            use_exponential,
         )
     metadata = build_pipeline_metadata_for_workflow(
-        wf, scheduler, sdxl=sdxl, timesteps=timesteps
+        parsed_workflow, scheduler, sdxl=sdxl, timesteps=timesteps
     )
 
     metadata_path = os.path.join(output_dir, "inference_metadata.yaml")
@@ -217,17 +221,17 @@ def convert_comfyui_workflow(
         yaml.safe_dump(metadata, handle, sort_keys=False)
 
     run_params = {
-        "prompt": wf.prompt,
-        "negative_prompt": wf.negative_prompt,
-        "seed": wf.seed,
-        "width": wf.width,
-        "height": wf.height,
-        "batch_size": wf.batch_size,
-        "steps": wf.steps,
-        "cfg": wf.cfg,
-        "sampler_name": wf.sampler_name,
-        "scheduler_kind": wf.scheduler_kind,
-        "checkpoint": wf.checkpoint,
+        "prompt": parsed_workflow.prompt,
+        "negative_prompt": parsed_workflow.negative_prompt,
+        "seed": parsed_workflow.seed,
+        "width": parsed_workflow.width,
+        "height": parsed_workflow.height,
+        "batch_size": parsed_workflow.batch_size,
+        "steps": parsed_workflow.steps,
+        "cfg": parsed_workflow.cfg,
+        "sampler_name": parsed_workflow.sampler_name,
+        "scheduler_kind": parsed_workflow.scheduler_kind,
+        "checkpoint": parsed_workflow.checkpoint,
         "sdxl": sdxl,
     }
     run_params_path = os.path.join(output_dir, "run.json")
@@ -239,5 +243,5 @@ def convert_comfyui_workflow(
         output_dir=output_dir,
         metadata_path=metadata_path,
         run_params_path=run_params_path,
-        workflow=wf,
+        workflow=parsed_workflow,
     )

@@ -172,11 +172,13 @@ def write_onnx_genai_config(
                 artifacts["tokenizer"] = tokenizer_path
         return artifacts
 
-    cfg = config if config is not None else getattr(pkg, "config", None)
-    if cfg is None:
+    resolved_config = config if config is not None else getattr(pkg, "config", None)
+    if resolved_config is None:
         raise ValueError(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
         )
-    path = write_decoder_metadata(output_dir, config=cfg, kv_native_dtype=kv_native_dtype)
+    path = write_decoder_metadata(
+        output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
+    )
     return {"inference_metadata": path}

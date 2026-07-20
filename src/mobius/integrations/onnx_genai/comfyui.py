@@ -117,11 +117,11 @@ def _is_link(value: Any) -> bool:
     )
 
 
-def _resolve(nodes: dict[str, Any], ref: Any) -> dict[str, Any] | None:
+def _resolve(nodes: dict[str, Any], link: Any) -> dict[str, Any] | None:
     """Follow a ``[src_id, slot]`` link to the referenced node dict."""
-    if not _is_link(ref):
+    if not _is_link(link):
         return None
-    node = nodes.get(ref[0])
+    node = nodes.get(link[0])
     return node if isinstance(node, dict) else None
 
 
@@ -153,9 +153,9 @@ def _sampler_kind(sampler_name: str) -> str:
         ) from None
 
 
-def _follow_prompt_text(nodes: dict[str, Any], ref: Any) -> str | None:
+def _follow_prompt_text(nodes: dict[str, Any], link: Any) -> str | None:
     """Resolve a KSampler conditioning link to its CLIPTextEncode prompt text."""
-    node = _resolve(nodes, ref)
+    node = _resolve(nodes, link)
     if node is None:
         return None
     if node.get("class_type") in _TEXT_ENCODE_NODES:
@@ -169,9 +169,9 @@ def _follow_prompt_text(nodes: dict[str, Any], ref: Any) -> str | None:
     return None
 
 
-def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int, int]:
+def _follow_dims(nodes: dict[str, Any], link: Any) -> tuple[int, int, int]:
     """Resolve a KSampler latent link to (width, height, batch_size); defaults 512x512x1."""
-    node = _resolve(nodes, ref)
+    node = _resolve(nodes, link)
     if node is not None and node.get("class_type") in _LATENT_NODES:
         inputs = node.get("inputs", {})
         try:
@@ -185,14 +185,14 @@ def _follow_dims(nodes: dict[str, Any], ref: Any) -> tuple[int, int, int]:
     return 512, 512, 1
 
 
-def _trace_checkpoint(nodes: dict[str, Any], ref: Any) -> str | None:
+def _trace_checkpoint(nodes: dict[str, Any], link: Any) -> str | None:
     """Trace a KSampler.model link back to a checkpoint filename.
 
     Follows intermediate model-transforming nodes (LoraLoader, ModelSamplingDiscrete,
     ...) by their ``model`` input up to a bounded depth.
     """
     for _ in range(_MAX_TRACE_DEPTH):
-        node = _resolve(nodes, ref)
+        node = _resolve(nodes, link)
         if node is None:
             return None
         inputs = node.get("inputs", {})
@@ -200,13 +200,13 @@ def _trace_checkpoint(nodes: dict[str, Any], ref: Any) -> str | None:
             name = inputs.get(key)
             if isinstance(name, str):
                 return name
-        ref = inputs.get("model")
-        if not _is_link(ref):
+        link = inputs.get("model")
+        if not _is_link(link):
             return None
     return None
 
 
-def _trace_loras(nodes: dict[str, Any], ref: Any) -> list[tuple[str, float]]:
+def _trace_loras(nodes: dict[str, Any], link: Any) -> list[tuple[str, float]]:
     """Collect LoraLoader nodes along a KSampler.model chain, in application order.
 
     ComfyUI stacks LoraLoaders (each `model` input chains to the previous); returns
@@ -214,7 +214,7 @@ def _trace_loras(nodes: dict[str, Any], ref: Any) -> list[tuple[str, float]]:
     """
     loras: list[tuple[str, float]] = []
     for _ in range(_MAX_TRACE_DEPTH):
-        node = _resolve(nodes, ref)
+        node = _resolve(nodes, link)
         if node is None:
             break
         inputs = node.get("inputs", {})
@@ -223,8 +223,8 @@ def _trace_loras(nodes: dict[str, Any], ref: Any) -> list[tuple[str, float]]:
             if isinstance(name, str):
                 strength = float(inputs.get("strength_model", inputs.get("strength", 1.0)))
                 loras.append((name, strength))
-        ref = inputs.get("model")
-        if not _is_link(ref):
+        link = inputs.get("model")
+        if not _is_link(link):
             break
     loras.reverse()  # base checkpoint applies first
     return loras

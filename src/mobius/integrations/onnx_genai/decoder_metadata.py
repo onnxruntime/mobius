@@ -74,8 +74,8 @@ def build_decoder_metadata(
     if attention_type is None:
         attention_type = "grouped_query" if kv < num_attention_heads else "multi_head"
 
-    caps = ["kv_cache"]
-    caps.append(
+    capabilities = ["kv_cache"]
+    capabilities.append(
         "grouped_query_attention"
         if attention_type == "grouped_query"
         else "multi_head_attention"
@@ -98,7 +98,7 @@ def build_decoder_metadata(
     if max_sequence_length:
         model["max_sequence_length"] = max_sequence_length
 
-    metadata: dict[str, Any] = {"required_capabilities": caps, "model": model}
+    metadata: dict[str, Any] = {"required_capabilities": capabilities, "model": model}
     if kv_native_dtype:
         metadata["kv_cache"] = {"native_dtype": kv_native_dtype}
     return metadata
