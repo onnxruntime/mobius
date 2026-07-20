@@ -169,6 +169,55 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert pipeline["strategy"]["kind"] == "composite"
 
 
+def test_dispatch_audio_only_multimodal_pipeline(tmp_path):
+    # The audio-only fusion shape used by speech-language ASR models such as
+    # qwen3_asr and fun_asr: audio_encoder -> embedding fusion -> AR decoder.
+    pkg = _MultimodalPkg(
+        {
+            "decoder": object(),
+            "audio_encoder": object(),
+            "embedding": object(),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    pipeline = metadata["pipeline"]
+    assert pipeline["models"] == {
+        "audio_encoder": {
+            "filename": "audio_encoder/model.onnx",
+            "type": "audio_encoder",
+        },
+        "embedding": {"filename": "embedding/model.onnx", "type": "encoder"},
+        "decoder": {
+            "filename": "decoder/model.onnx",
+            "type": "decoder",
+            "tokenizer": "tokenizer.json",
+        },
+    }
+    assert pipeline["dataflow"] == [
+        {
+            "from": "audio_encoder.audio_features",
+            "to": "embedding.audio_features",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+        {
+            "from": "embedding.inputs_embeds",
+            "to": "decoder.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+    ]
+    assert [stage["name"] for stage in pipeline["strategy"]["stages"]] == [
+        "encode_audio",
+        "fuse_embeddings",
+        "decode",
+    ]
+
+
 def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
     pkg = _MultimodalPkg(
         {
