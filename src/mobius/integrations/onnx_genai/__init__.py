@@ -1,11 +1,70 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""onnx-genai integration for inference metadata generation."""
+"""onnx-genai integration: inference_metadata.yaml generation.
 
+onnx-genai (https://github.com/justinchuby/onnx-genai) is a standard-driven
+runtime whose behavior is declared by an ``inference_metadata`` document rather
+than hardcoded per-model dispatch. This package emits that document for both
+model families Mobius builds:
+
+* **Decoder-only language models** — :func:`write_decoder_metadata` /
+  :func:`decoder_metadata_from_config` (in ``decoder_metadata``) emit the
+  ``model.attention`` + ``kv_cache`` sections for an autoregressive LLM.
+* **Diffusion pipelines** — :func:`write_diffusion_pipeline_metadata` and the
+  builders in ``inference_metadata`` emit the iterative ``pipeline`` section for
+  a multi-model package (denoiser + optional VAE / text encoder).
+
+:func:`write_onnx_genai_config` is the unified entry point: it inspects the
+built package and dispatches to the decoder or diffusion writer, so
+``mobius build --runtime onnx-genai`` works for LLMs and diffusion models alike.
+
+The core model/task/component layers remain runtime-agnostic; all onnx-genai
+specific code lives here.
+"""
+
+from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
+from mobius.integrations.onnx_genai.comfyui import (
+    ComfyUIWorkflow,
+    parse_comfyui_workflow,
+    parse_comfyui_workflow_file,
+    translate_comfyui_workflow,
+    translate_comfyui_workflow_file,
+)
+from mobius.integrations.onnx_genai.convert import (
+    ConversionResult,
+    build_pipeline_metadata_for_workflow,
+    convert_comfyui_workflow,
+)
+from mobius.integrations.onnx_genai.decoder_metadata import (
+    build_decoder_metadata,
+    decoder_metadata_from_config,
+    write_decoder_metadata,
+)
 from mobius.integrations.onnx_genai.inference_metadata import (
-    generate_inference_metadata,
-    write_inference_metadata,
+    SchedulerConfig,
+    build_diffusion_pipeline_metadata,
+    build_language_diffusion_pipeline_metadata,
+    load_diffusers_scheduler_config,
+    write_diffusion_pipeline_metadata,
 )
 
-__all__ = ["generate_inference_metadata", "write_inference_metadata"]
+__all__ = [
+    "ComfyUIWorkflow",
+    "ConversionResult",
+    "SchedulerConfig",
+    "build_decoder_metadata",
+    "build_diffusion_pipeline_metadata",
+    "build_language_diffusion_pipeline_metadata",
+    "build_pipeline_metadata_for_workflow",
+    "convert_comfyui_workflow",
+    "decoder_metadata_from_config",
+    "load_diffusers_scheduler_config",
+    "parse_comfyui_workflow",
+    "parse_comfyui_workflow_file",
+    "translate_comfyui_workflow",
+    "translate_comfyui_workflow_file",
+    "write_decoder_metadata",
+    "write_diffusion_pipeline_metadata",
+    "write_onnx_genai_config",
+]

@@ -53,6 +53,8 @@ class TestInitDiffusersClassMap:
             "FluxTransformer2DModel",
             "SD3Transformer2DModel",
             "QwenImageTransformer2DModel",
+            "UNet2DConditionModel",
+            "CLIPTextModel",
             "AutoencoderKL",
             "AutoencoderKLQwenImage",
             "AutoencoderKLCogVideoX",
@@ -73,7 +75,15 @@ class TestInitDiffusersClassMap:
 
     def test_task_names_are_valid(self):
         _init_diffusers_class_map()
-        valid_tasks = {"denoising", "vae", "qwen-image-vae", "video-denoising"}
+        # Classic Stable Diffusion adds the CLIP text encoder ("feature-extraction")
+        # and the UNet denoiser ("denoising").
+        valid_tasks = {
+            "denoising",
+            "vae",
+            "qwen-image-vae",
+            "video-denoising",
+            "feature-extraction",
+        }
         for class_name, (_, _, task_name) in _DIFFUSERS_CLASS_MAP.items():
             assert task_name in valid_tasks, f"Unknown task '{task_name}' for {class_name}"
 
@@ -194,7 +204,7 @@ class TestBuildDiffusersPipelineFiltering:
         mock_load_index.return_value = {
             "_class_name": "FluxPipeline",
             "scheduler": ["diffusers", "EulerDiscreteScheduler"],
-            "text_encoder": ["transformers", "CLIPTextModel"],
+            "text_encoder": ["transformers", "T5EncoderModel"],
         }
         with pytest.raises(ValueError, match="No supported neural network"):
             build_diffusers_pipeline("fake/model", load_weights=False)
@@ -330,7 +340,7 @@ class TestBuildDiffusersPipelineSuccess:
             {
                 "transformer": ["diffusers", "FluxTransformer2DModel"],
                 "vae": ["diffusers", "AutoencoderKL"],
-                # This should be skipped (unregistered)
+                # Classic-SD CLIP text encoder is now a supported component too.
                 "text_encoder": ["transformers", "CLIPTextModel"],
             }
         )
@@ -345,7 +355,7 @@ class TestBuildDiffusersPipelineSuccess:
         result = build_diffusers_pipeline("fake/flux", load_weights=False)
         assert "transformer" in result
         assert "vae" in result
-        assert "text_encoder" not in result
+        assert "text_encoder" in result
 
     @patch("mobius._diffusers_builder.build_from_module")
     @patch(
@@ -504,3 +514,29 @@ class TestBuildDiffusersPipelineWeights:
         # apply_weights should receive the processed weights
         call_args = mock_apply_weights.call_args
         assert call_args[0][1] is processed_weights
+
+
+def test_prepare_unet_loras_infers_rank_and_merges(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from mobius._diffusers_builder import _prepare_unet_loras
+
+    path = tmp_path / "style.safetensors"
+    save_file(
+        {
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.down.weight": torch.zeros(
+                8, 32
+            ),
+            "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight": torch.zeros(
+                32, 8
+            ),
+        },
+        str(path),
+    )
+    adapters, merged = _prepare_unet_loras({"style": str(path)})
+    assert adapters == (("style", 8, 1.0),)  # rank inferred from lora_A [rank, in]
+    assert set(merged) == {
+        "down_blocks.0.attentions.0.attn1.to_q.lora_A.style.weight",
+        "down_blocks.0.attentions.0.attn1.to_q.lora_B.style.weight",
+    }

@@ -127,9 +127,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if args.max_seq_len is not None and args.max_seq_len <= 0:
         raise SystemExit("Error: --max-seq-len must be a positive integer.")
 
-    if args.max_length is not None and args.runtime != "onnx-genai":
+    max_length = getattr(args, "max_length", None)
+    if max_length is not None and args.runtime != "onnx-genai":
         raise SystemExit("Error: --max-length can only be used with --runtime onnx-genai.")
-    if args.max_length is not None and args.max_length <= 0:
+    if max_length is not None and max_length <= 0:
         raise SystemExit("Error: --max-length must be a positive integer.")
 
     # Validate --static-cache + --task compatibility
@@ -299,12 +300,13 @@ def _save_package(
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":
-        from mobius.integrations.onnx_genai import write_inference_metadata
+        from mobius.integrations.onnx_genai import write_onnx_genai_config
 
-        path = write_inference_metadata(
-            pkg, output_dir, max_sequence_length=getattr(args, "max_length", None)
-        )
-        print(f"  inference_metadata: {path}")
+        config = getattr(pkg, "config", None)
+        source = getattr(args, "config", None) or getattr(args, "model", None)
+        artifacts = write_onnx_genai_config(pkg, output_dir, config=config, source=source)
+        for name, path in artifacts.items():
+            print(f"  {name}: {path}")
 
 
 def _cmd_list(args: argparse.Namespace) -> None:
@@ -390,6 +392,32 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         else:
             path = os.path.join(output_dir, "model.onnx")
         print(f"Saved {name} to {path}")
+
+
+def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
+    """Execute the 'convert-comfyui' subcommand."""
+    from mobius.integrations.onnx_genai import convert_comfyui_workflow
+
+    with open(args.workflow, encoding="utf-8") as handle:
+        workflow = json.load(handle)
+    result = convert_comfyui_workflow(
+        workflow,
+        args.checkpoint,
+        args.output,
+        sdxl=getattr(args, "sdxl", False),
+    )
+    wf = result.workflow
+    print(f"Converted ComfyUI workflow -> {result.output_dir}")
+    print(f"  metadata: {result.metadata_path}")
+    print(f"  run params: {result.run_params_path}")
+    print(
+        f"  {wf.steps} steps, cfg {wf.cfg}, sampler {wf.sampler_name} "
+        f"(scheduler {wf.scheduler_kind}), {wf.width}x{wf.height}"
+    )
+    if wf.loras:
+        print(f"  loras: {', '.join(f'{n}@{s}' for n, s in wf.loras)}")
+    if wf.prompt is not None:
+        print(f"  prompt: {wf.prompt!r}")
 
 
 def _cmd_info(args: argparse.Namespace) -> None:
@@ -567,25 +595,15 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument(
         "--runtime",
         default=None,
-        choices=["onnx-genai", "ort-genai"],
+        choices=["ort-genai", "onnx-genai"],
         metavar="RUNTIME",
         help=(
-            "Generate runtime-specific config files after building. "
-            "Supports: 'onnx-genai' (writes inference_metadata.yaml) and "
-            "'ort-genai' (writes genai_config.json and copies tokenizer files). "
-            "For ort-genai, --model downloads tokenizer files from HuggingFace "
-            "and --config copies them from the local directory."
-        ),
-    )
-    build_parser.add_argument(
-        "--max-length",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Serving KV capacity written to onnx-genai inference metadata. "
-            "Only used with --runtime onnx-genai. Defaults to the smaller of "
-            "4096 and the model's max_position_embeddings."
+            "Generate runtime-specific config files after building. Supports: "
+            "'ort-genai' (writes genai_config.json + copies tokenizer files) and "
+            "'onnx-genai' (writes inference_metadata.yaml — a decoder attention/KV "
+            "document for LLMs, or an iterative pipeline document for diffusion). "
+            "When used with --model, tokenizer files are downloaded from HuggingFace; "
+            "with --config (local directory), they are copied from that directory."
         ),
     )
     build_parser.add_argument(
@@ -674,6 +692,31 @@ def main(argv: list[str] | None = None) -> None:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     info_parser.set_defaults(func=_cmd_info)
+
+    # --- convert-comfyui ---
+    comfy_parser = subparsers.add_parser(
+        "convert-comfyui",
+        help="Translate a ComfyUI API-format workflow JSON into an onnx-genai "
+        "pipeline metadata directory (inference_metadata.yaml + run.json). The "
+        "ONNX component graphs are built separately by Mobius's diffusers builder.",
+    )
+    comfy_parser.add_argument("workflow", help="Path to the ComfyUI API-format workflow JSON.")
+    comfy_parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional diffusers directory or Hugging Face model id whose "
+        "scheduler config supplies the noise-schedule betas (Stable Diffusion "
+        "defaults are used when omitted).",
+    )
+    comfy_parser.add_argument(
+        "--output", "-o", required=True, help="Output directory for the pipeline metadata."
+    )
+    comfy_parser.add_argument(
+        "--sdxl",
+        action="store_true",
+        help="Target an SDXL pipeline (routes the dual text-encoder conditioning edges).",
+    )
+    comfy_parser.set_defaults(func=_cmd_convert_comfyui)
 
     args = parser.parse_args(argv)
     args.func(args)

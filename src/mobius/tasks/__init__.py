@@ -43,6 +43,7 @@ __all__ = [
     "ImageClassificationTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
+    "MaskedDiffusionTask",
     "MoshiDepformerTask",
     "MoshiTemporalTask",
     "MultiModalTask",
@@ -98,6 +99,7 @@ from mobius.tasks._gemma4 import (
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -134,6 +136,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
     "feature-extraction": FeatureExtractionTask,
+    "masked-diffusion": MaskedDiffusionTask,
     "image-classification": ImageClassificationTask,
     "object-detection": ObjectDetectionTask,
     "seq2seq": Seq2SeqTask,
