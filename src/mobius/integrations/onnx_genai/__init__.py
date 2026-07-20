@@ -44,10 +44,12 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
+    build_audio_codec_pipeline_metadata,
     build_diffusion_pipeline_metadata,
     build_language_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     load_diffusers_scheduler_config,
+    write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
@@ -60,6 +62,7 @@ __all__ = [
     "build_decoder_metadata",
     "build_diffusion_pipeline_metadata",
     "build_language_diffusion_pipeline_metadata",
+    "build_audio_codec_pipeline_metadata",
     "build_multimodal_pipeline_metadata",
     "build_pipeline_metadata_for_workflow",
     "convert_comfyui_workflow",
@@ -71,6 +74,7 @@ __all__ = [
     "translate_comfyui_workflow_file",
     "write_decoder_metadata",
     "write_diffusion_pipeline_metadata",
+    "write_audio_codec_pipeline_metadata",
     "write_multimodal_pipeline_metadata",
     "write_speech_to_text_pipeline_metadata",
     "write_onnx_genai_config",

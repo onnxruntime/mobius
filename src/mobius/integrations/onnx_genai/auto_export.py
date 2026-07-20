@@ -23,6 +23,7 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     load_diffusers_scheduler_config,
+    write_audio_codec_pipeline_metadata,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
     write_speech_to_text_pipeline_metadata,
@@ -126,6 +127,44 @@ def _looks_like_speech_to_text(pkg: Any) -> bool:
     return "encoder_hidden_states" in decoder_inputs
 
 
+def _looks_like_audio_codec(pkg: Any) -> bool:
+    """Detect an audio-to-audio neural codec package.
+
+    The signal is structural: an ``encoder`` that outputs ``codes`` feeding a
+    ``decoder`` that consumes ``codes`` via a pure single-pass path (no
+    ``encoder_hidden_states`` cross-attention, no autoregressive text decode).
+    This separates a codec from Whisper-style ASR and from an image VAE (which
+    exchanges ``latent``/``sample`` rather than ``codes``).
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if not {"encoder", "decoder"} <= names:
+        return False
+    try:
+        encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}
+        decoder_inputs = {value.name for value in pkg["decoder"].graph.inputs}
+    except AttributeError:
+        return False
+    return (
+        "codes" in encoder_outputs
+        and "codes" in decoder_inputs
+        and "encoder_hidden_states" not in decoder_inputs
+    )
+
+
+def _audio_codec_codes_dtype(pkg: Any) -> str:
+    """Return the metadata dtype of the codec ``codes`` tensor (default int64)."""
+    try:
+        for value in pkg["decoder"].graph.inputs:
+            if value.name == "codes" and value.dtype is not None:
+                return "fp32" if "FLOAT" in value.dtype.name else "int64"
+    except (AttributeError, KeyError):
+        pass
+    return "int64"
+
+
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
     """Derive multimodal component filenames from a package's component keys."""
     try:
@@ -222,6 +261,14 @@ def write_onnx_genai_config(
             if tokenizer_path is not None:
                 artifacts["tokenizer"] = tokenizer_path
         return artifacts
+
+    if _looks_like_audio_codec(pkg):
+        # A neural codec produces tensors (waveform), not tokens, so it needs no
+        # decoder config — emit before the config requirement below.
+        path = write_audio_codec_pipeline_metadata(
+            output_dir, codes_dtype=_audio_codec_codes_dtype(pkg)
+        )
+        return {"inference_metadata": path}
 
     resolved_config = config if config is not None else getattr(pkg, "config", None)
     if resolved_config is None:

@@ -212,20 +212,22 @@ def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
 
 
 class _FakeValue:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, dtype: object | None = None) -> None:
         self.name = name
+        self.dtype = dtype
 
 
 class _FakeGraph:
-    def __init__(self, input_names: list[str]) -> None:
+    def __init__(self, input_names: list[str], output_names: list[str] | None = None) -> None:
         self.inputs = [_FakeValue(name) for name in input_names]
+        self.outputs = [_FakeValue(name) for name in (output_names or [])]
 
 
 class _FakeModel:
-    """Minimal stand-in for an ir.Model exposing graph input names."""
+    """Minimal stand-in for an ir.Model exposing graph input/output names."""
 
-    def __init__(self, input_names: list[str]) -> None:
-        self.graph = _FakeGraph(input_names)
+    def __init__(self, input_names: list[str], output_names: list[str] | None = None) -> None:
+        self.graph = _FakeGraph(input_names, output_names)
 
 
 class _EncoderDecoderPkg(dict):
@@ -236,7 +238,7 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     # Whisper-style ASR: the decoder consumes encoder_hidden_states (cross-attn).
     pkg = _EncoderDecoderPkg(
         {
-            "encoder": _FakeModel(["input_features"]),
+            "encoder": _FakeModel(["input_features"], ["encoder_hidden_states"]),
             "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"]),
         }
     )
@@ -272,13 +274,13 @@ def test_dispatch_speech_to_text_pipeline(tmp_path):
     ]
 
 
-def test_codec_not_treated_as_speech_to_text(tmp_path):
-    # A codec has encoder+decoder but no encoder_hidden_states cross-attention,
-    # so it must NOT be emitted as a Whisper-style ASR pipeline.
+def test_dispatch_audio_codec_pipeline(tmp_path):
+    # A neural codec: encoder outputs codes consumed by a single-pass decoder,
+    # with no cross-attention. It is a pure tensor pipeline (no decoder config).
     pkg = _EncoderDecoderPkg(
         {
-            "encoder": _FakeModel(["waveform"]),
-            "decoder": _FakeModel(["codes"]),
+            "encoder": _FakeModel(["waveform"], ["codes"]),
+            "decoder": _FakeModel(["codes"], ["waveform"]),
         }
     )
     artifacts = write_onnx_genai_config(pkg, str(tmp_path))
@@ -286,4 +288,23 @@ def test_codec_not_treated_as_speech_to_text(tmp_path):
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
 
-    assert "pipeline" not in metadata
+    # No decoder capabilities (produces tensors, not tokens).
+    assert "model" not in metadata
+    pipeline = metadata["pipeline"]
+    assert pipeline["models"] == {
+        "encoder": {"filename": "encoder.onnx", "type": "audio_encoder"},
+        "decoder": {"filename": "decoder.onnx", "type": "vocoder"},
+    }
+    assert pipeline["dataflow"] == [
+        {
+            "from": "encoder.codes",
+            "to": "decoder.codes",
+            "dtype": "int64",
+            "device_transfer": False,
+        }
+    ]
+    stages = pipeline["strategy"]["stages"]
+    assert [stage["strategy"]["kind"] for stage in stages] == [
+        "single_pass",
+        "single_pass",
+    ]

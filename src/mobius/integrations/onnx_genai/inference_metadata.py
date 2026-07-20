@@ -565,6 +565,82 @@ def write_speech_to_text_pipeline_metadata(
     return path
 
 
+def build_audio_codec_pipeline_metadata(
+    *,
+    encoder_filename: str = "encoder.onnx",
+    decoder_filename: str = "decoder.onnx",
+    codes_dtype: str = "int64",
+) -> dict[str, Any]:
+    """Build metadata for an audio-to-audio neural codec pipeline.
+
+    This is the pure single-pass composite shape (DESIGN.md §20): an audio
+    encoder maps a waveform to ``codes``, and a decoder reconstructs a waveform
+    from those codes. Both stages run once over the shared tensor pool (there is
+    no autoregressive decode and no tokenizer), wired ``encoder.codes ->
+    decoder.codes``.
+
+    Args:
+        encoder_filename: Waveform-to-codes encoder ONNX filename.
+        decoder_filename: Codes-to-waveform decoder ONNX filename.
+        codes_dtype: Metadata dtype of the ``codes`` tensor exchanged between the
+            two stages (neural codecs typically emit ``int64`` code indices).
+
+    Returns:
+        A dict with a top-level ``pipeline`` key. No decoder capabilities are
+        emitted because the pipeline produces tensors, not tokens.
+    """
+    return {
+        "pipeline": {
+            "models": {
+                "encoder": {"filename": encoder_filename, "type": "audio_encoder"},
+                "decoder": {"filename": decoder_filename, "type": "vocoder"},
+            },
+            "dataflow": [
+                {
+                    "from": "encoder.codes",
+                    "to": "decoder.codes",
+                    "dtype": codes_dtype,
+                    "device_transfer": False,
+                }
+            ],
+            "strategy": {
+                "kind": "composite",
+                "stages": [
+                    {
+                        "name": "encode_waveform",
+                        "strategy": {"kind": "single_pass", "model": "encoder"},
+                        "run_on": "prompt_only",
+                    },
+                    {
+                        "name": "decode_waveform",
+                        "strategy": {"kind": "single_pass", "model": "decoder"},
+                        "run_on": "prompt_only",
+                    },
+                ],
+            },
+            "phases": {
+                "encoder": {"run_on": "prompt_only"},
+                "decoder": {"run_on": "prompt_only"},
+            },
+        }
+    }
+
+
+def write_audio_codec_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite audio-codec metadata into ``directory``."""
+    metadata = build_audio_codec_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
 def write_diffusion_pipeline_metadata(
     directory: str,
     *,
