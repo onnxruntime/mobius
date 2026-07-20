@@ -209,3 +209,81 @@ def test_dispatch_vision_and_audio_multimodal_pipeline(tmp_path):
         "fuse_embeddings",
         "decode",
     ]
+
+
+class _FakeValue:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeGraph:
+    def __init__(self, input_names: list[str]) -> None:
+        self.inputs = [_FakeValue(name) for name in input_names]
+
+
+class _FakeModel:
+    """Minimal stand-in for an ir.Model exposing graph input names."""
+
+    def __init__(self, input_names: list[str]) -> None:
+        self.graph = _FakeGraph(input_names)
+
+
+class _EncoderDecoderPkg(dict):
+    config = _Cfg()
+
+
+def test_dispatch_speech_to_text_pipeline(tmp_path):
+    # Whisper-style ASR: the decoder consumes encoder_hidden_states (cross-attn).
+    pkg = _EncoderDecoderPkg(
+        {
+            "encoder": _FakeModel(["input_features"]),
+            "decoder": _FakeModel(["decoder_input_ids", "encoder_hidden_states"]),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path), kv_native_dtype="bf16")
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    assert metadata["kv_cache"] == {"native_dtype": "bf16"}
+    pipeline = metadata["pipeline"]
+    assert pipeline["models"] == {
+        "encoder": {"filename": "encoder.onnx", "type": "encoder"},
+        "decoder": {
+            "filename": "decoder.onnx",
+            "type": "decoder",
+            "tokenizer": "tokenizer.json",
+        },
+    }
+    assert pipeline["dataflow"] == [
+        {
+            "from": "encoder.encoder_hidden_states",
+            "to": "decoder.encoder_hidden_states",
+            "dtype": "fp32",
+            "device_transfer": False,
+        }
+    ]
+    stages = pipeline["strategy"]["stages"]
+    assert pipeline["strategy"]["kind"] == "composite"
+    assert [stage["name"] for stage in stages] == ["encode_audio", "decode_transcript"]
+    assert [stage["strategy"]["kind"] for stage in stages] == [
+        "single_pass",
+        "autoregressive",
+    ]
+
+
+def test_codec_not_treated_as_speech_to_text(tmp_path):
+    # A codec has encoder+decoder but no encoder_hidden_states cross-attention,
+    # so it must NOT be emitted as a Whisper-style ASR pipeline.
+    pkg = _EncoderDecoderPkg(
+        {
+            "encoder": _FakeModel(["waveform"]),
+            "decoder": _FakeModel(["codes"]),
+        }
+    )
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    with open(artifacts["inference_metadata"]) as handle:
+        metadata = yaml.safe_load(handle)
+
+    assert "pipeline" not in metadata

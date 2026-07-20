@@ -25,6 +25,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
+    write_speech_to_text_pipeline_metadata,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -101,6 +102,28 @@ def _looks_like_multimodal(pkg: Any) -> bool:
     except AttributeError:
         return False
     return "decoder" in names and bool(names & {"vision_encoder", "audio_encoder"})
+
+
+def _looks_like_speech_to_text(pkg: Any) -> bool:
+    """Detect a cross-attention encoder-decoder ASR package (e.g. Whisper).
+
+    The signal is structural rather than name-based: an ``encoder`` and a
+    ``decoder`` component where the decoder consumes ``encoder_hidden_states``
+    (cross-attention). This separates Whisper-style ASR from a codec, whose
+    ``encoder``/``decoder`` are pure single-pass and share no such input.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if not {"encoder", "decoder"} <= names:
+        return False
+    decoder = pkg["decoder"]
+    try:
+        decoder_inputs = {value.name for value in decoder.graph.inputs}
+    except AttributeError:
+        return False
+    return "encoder_hidden_states" in decoder_inputs
 
 
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
@@ -214,6 +237,17 @@ def write_onnx_genai_config(
             resolved_config, kv_native_dtype=kv_native_dtype
         )
         path = write_multimodal_pipeline_metadata(
+            output_dir,
+            decoder_metadata=decoder_metadata,
+            **kwargs,
+        )
+        return {"inference_metadata": path}
+
+    if _looks_like_speech_to_text(pkg):
+        decoder_metadata = decoder_metadata_from_config(
+            resolved_config, kv_native_dtype=kv_native_dtype
+        )
+        path = write_speech_to_text_pipeline_metadata(
             output_dir,
             decoder_metadata=decoder_metadata,
             **kwargs,

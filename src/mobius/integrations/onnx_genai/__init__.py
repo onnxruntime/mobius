@@ -50,6 +50,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     load_diffusers_scheduler_config,
     write_diffusion_pipeline_metadata,
     write_multimodal_pipeline_metadata,
+    write_speech_to_text_pipeline_metadata,
 )
 
 __all__ = [
@@ -71,5 +72,6 @@ __all__ = [
     "write_decoder_metadata",
     "write_diffusion_pipeline_metadata",
     "write_multimodal_pipeline_metadata",
+    "write_speech_to_text_pipeline_metadata",
     "write_onnx_genai_config",
 ]

@@ -482,6 +482,89 @@ def write_multimodal_pipeline_metadata(
     return path
 
 
+def build_speech_to_text_pipeline_metadata(
+    *,
+    encoder_filename: str = "encoder.onnx",
+    decoder_filename: str = "decoder.onnx",
+    tokenizer_filename: str = "tokenizer.json",
+    decoder_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata for a cross-attention encoder-decoder ASR pipeline.
+
+    This is the Whisper-style speech-to-text shape (DESIGN.md §20): the audio
+    encoder runs once for the prompt and produces ``encoder_hidden_states``,
+    which the autoregressive decoder consumes via cross-attention (distinct from
+    the multimodal ``inputs_embeds`` fusion shape). The decoder then runs for
+    every generation step.
+
+    Args:
+        encoder_filename: Audio encoder ONNX filename relative to the package
+            root.
+        decoder_filename: Decoder ONNX filename relative to the package root.
+        tokenizer_filename: Tokenizer filename used by the decoder.
+        decoder_metadata: Optional output from
+            :func:`decoder_metadata_from_config`; its decoder capabilities are
+            retained at the document top level.
+
+    Returns:
+        A dict with a top-level ``pipeline`` key and any decoder capabilities.
+    """
+    metadata = dict(decoder_metadata or {})
+    metadata["pipeline"] = {
+        "models": {
+            "encoder": {"filename": encoder_filename, "type": "encoder"},
+            "decoder": {
+                "filename": decoder_filename,
+                "type": "decoder",
+                "tokenizer": tokenizer_filename,
+            },
+        },
+        "dataflow": [
+            {
+                "from": "encoder.encoder_hidden_states",
+                "to": "decoder.encoder_hidden_states",
+                "dtype": "fp32",
+                "device_transfer": False,
+            }
+        ],
+        "strategy": {
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "encode_audio",
+                    "strategy": {"kind": "single_pass", "model": "encoder"},
+                    "run_on": "prompt_only",
+                },
+                {
+                    "name": "decode_transcript",
+                    "strategy": {"kind": "autoregressive", "decoder": "decoder"},
+                    "run_on": "every_step",
+                },
+            ],
+        },
+        "phases": {
+            "encoder": {"run_on": "prompt_only"},
+            "decoder": {"run_on": "every_step"},
+        },
+    }
+    return metadata
+
+
+def write_speech_to_text_pipeline_metadata(
+    directory: str,
+    *,
+    filename: str = "inference_metadata.yaml",
+    **kwargs: Any,
+) -> str:
+    """Build and write composite speech-to-text metadata into ``directory``."""
+    metadata = build_speech_to_text_pipeline_metadata(**kwargs)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
 def write_diffusion_pipeline_metadata(
     directory: str,
     *,
