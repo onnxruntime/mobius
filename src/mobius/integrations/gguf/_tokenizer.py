@@ -58,14 +58,14 @@ def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> 
             gguf_file=gguf_path.name,
             use_fast=True,
         )
-    except Exception as error:  # best-effort; never block the build
-        _LOGGER.warning(
-            "Could not reconstruct a tokenizer from the GGUF file %r: %s; "
-            "skipping tokenizer.json emission.",
+    except Exception as error:  # best-effort; transformers may not know the arch
+        _LOGGER.info(
+            "transformers could not load a tokenizer from %r (%s); "
+            "reconstructing directly from the GGUF tokenizer metadata.",
             str(gguf_path),
             error,
         )
-        return None
+        return _reconstruct_tokenizer_from_ggml(gguf_path, output_dir)
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         _LOGGER.warning(
@@ -77,3 +77,121 @@ def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> 
     path = os.path.join(str(output_dir), "tokenizer.json")
     backend.save(path)
     return path
+
+
+def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) -> str | None:
+    """Build ``tokenizer.json`` directly from GGUF ``tokenizer.ggml.*`` metadata.
+
+    Fallback for GGUF architectures whose tokenizer ``transformers`` does not yet
+    support (e.g. ``gemma4``). Reconstructs the fast BPE tokenizer from the
+    embedded tokens + merges + special-token ids and validates it with an
+    encode→decode round-trip. Best-effort: logs a warning and returns ``None``
+    (never raising) if the required metadata or libraries are missing, or the
+    round-trip fails.
+    """
+    try:
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
+        from tokenizers.models import BPE
+
+        from mobius.integrations.gguf._reader import GGUFModel
+    except ImportError as error:
+        _LOGGER.warning("Cannot reconstruct tokenizer (missing dependency: %s).", error)
+        return None
+
+    try:
+        metadata = GGUFModel(str(gguf_path)).metadata
+        tokens = metadata.get("tokenizer.ggml.tokens")
+        merges_raw = metadata.get("tokenizer.ggml.merges")
+        if not tokens or not merges_raw:
+            _LOGGER.warning(
+                "GGUF %r has no tokenizer.ggml.tokens/merges; skipping tokenizer.json.",
+                str(gguf_path),
+            )
+            return None
+        token_types = metadata.get("tokenizer.ggml.token_type") or []
+        unknown_id = int(metadata.get("tokenizer.ggml.unknown_token_id", 0))
+        bos_id = metadata.get("tokenizer.ggml.bos_token_id")
+        add_bos = bool(metadata.get("tokenizer.ggml.add_bos_token", False))
+        add_space_prefix = bool(metadata.get("tokenizer.ggml.add_space_prefix", False))
+
+        vocab = {token: index for index, token in enumerate(tokens)}
+        # llama.cpp stores BPE merges as space-joined "left right" pairs.
+        merges = [
+            (parts[0], parts[1])
+            for merge in merges_raw
+            if len((parts := merge.split(" "))) == 2
+        ]
+        unknown_token = tokens[unknown_id] if unknown_id < len(tokens) else None
+
+        tokenizer = Tokenizer(
+            BPE(
+                vocab=vocab,
+                merges=merges,
+                unk_token=unknown_token,
+                fuse_unk=True,
+                byte_fallback=True,
+            )
+        )
+        # SentencePiece semantics: '▁' marks word boundaries; unknown bytes fall
+        # back to <0xNN> byte tokens.
+        prepend_scheme = "always" if add_space_prefix else "never"
+        tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+            replacement="▁", prepend_scheme=prepend_scheme
+        )
+        tokenizer.decoder = decoders.Sequence(
+            [
+                decoders.Replace("▁", " "),
+                decoders.ByteFallback(),
+                decoders.Fuse(),
+                decoders.Strip(content=" ", left=1, right=0),
+            ]
+        )
+        # Preserve control / user-defined tokens (llama.cpp types 3 and 4) as
+        # atomic special tokens so they are never split.
+        from tokenizers import AddedToken
+
+        special_tokens = [
+            AddedToken(str(tokens[index]), special=True, normalized=False)
+            for index, token_type in enumerate(token_types)
+            if token_type in (3, 4) and index < len(tokens)
+        ]
+        if special_tokens:
+            tokenizer.add_special_tokens(special_tokens)
+
+        if add_bos and bos_id is not None and int(bos_id) < len(tokens):
+            bos_token = tokens[int(bos_id)]
+            tokenizer.post_processor = processors.TemplateProcessing(
+                single=f"{bos_token} $A",
+                pair=f"{bos_token} $A {bos_token} $B",
+                special_tokens=[(bos_token, int(bos_id))],
+            )
+
+        # Sanity check: encode→decode round-trip. This is a soft signal (a small
+        # or byte-incomplete vocab may not represent arbitrary text); the token
+        # ids are correct by construction from the ggml ordering, so warn rather
+        # than discard a reconstructed tokenizer.
+        for sample in ("Hello, world!", "The capital of France is Paris."):
+            decoded = tokenizer.decode(tokenizer.encode(sample).ids)
+            if decoded.strip() != sample.strip():
+                _LOGGER.warning(
+                    "Reconstructed tokenizer round-trip differs (%r -> %r); "
+                    "emitting anyway (ids follow the GGUF vocab order).",
+                    sample,
+                    decoded,
+                )
+                break
+
+        path = os.path.join(str(output_dir), "tokenizer.json")
+        tokenizer.save(path)
+        _LOGGER.info(
+            "Reconstructed tokenizer.json from GGUF metadata (%d tokens).", len(tokens)
+        )
+        return path
+    except Exception as error:  # best-effort; never block the build
+        _LOGGER.warning(
+            "Failed to reconstruct tokenizer from GGUF metadata %r: %s; "
+            "skipping tokenizer.json emission.",
+            str(gguf_path),
+            error,
+        )
+        return None

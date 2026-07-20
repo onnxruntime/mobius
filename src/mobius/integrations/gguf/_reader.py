@@ -91,17 +91,19 @@ def _parse_array(data: list[int], parts: list, element_type) -> list[Any]:
     from gguf import GGUFValueType
 
     if element_type == GGUFValueType.STRING:
-        # String arrays: each part after the header is a string
+        # String arrays: `data` holds the value-part indices (skipping the field
+        # key name and length-prefix parts), exactly like the numeric path below.
+        # Iterating parts directly would wrongly include the field key name as the
+        # first element, shifting every string by one.
         result = []
-        for part in parts[:-1]:
-            # Skip non-data parts (length prefixes, type markers)
-            if part.dtype == np.uint8 and len(part) > 0:
-                try:
-                    result.append(array("B", list(part)).tobytes().decode())
-                except UnicodeDecodeError:
-                    result.append(
-                        array("B", list(part)).tobytes().decode("utf-8", errors="replace")
-                    )
+        for idx in data:
+            part = parts[idx]
+            try:
+                result.append(array("B", list(part)).tobytes().decode())
+            except UnicodeDecodeError:
+                result.append(
+                    array("B", list(part)).tobytes().decode("utf-8", errors="replace")
+                )
         return result
 
     # Numeric arrays: data indices point into the parts list
