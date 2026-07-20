@@ -62,3 +62,61 @@ class TestGemma3Postprocess:
             "sliding_attention",
             "full_attention",
         ]
+
+
+class TestGemma4DoubleWideMlp:
+    """Gemma4 per-layer feed_forward_length arrays collapse to a scalar base."""
+
+    def _base_config(self, intermediate_size, num_layers=4):
+        from mobius._configs import ArchitectureConfig
+
+        return ArchitectureConfig(
+            hidden_size=1536,
+            num_hidden_layers=num_layers,
+            num_attention_heads=8,
+            num_key_value_heads=1,
+            vocab_size=262144,
+            intermediate_size=intermediate_size,
+        )
+
+    def test_uniform_array_collapses_to_scalar(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _gemma4_postprocess
+
+        result = _gemma4_postprocess(self._base_config([8192, 8192, 8192, 8192]), {})
+
+        assert result.intermediate_size == 8192
+        assert result.use_double_wide_mlp is False
+
+    def test_double_wide_tail_layers_set_flag(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _gemma4_postprocess
+
+        # Last 2 KV-shared layers are double-wide (2x the base).
+        result = _gemma4_postprocess(
+            self._base_config([6144, 6144, 12288, 12288]),
+            {"gemma4.attention.shared_kv_layers": 2},
+        )
+
+        assert result.intermediate_size == 6144
+        assert result.use_double_wide_mlp is True
+        assert result.num_kv_shared_layers == 2
+
+    def test_scalar_intermediate_size_unchanged(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _gemma4_postprocess
+
+        result = _gemma4_postprocess(self._base_config(8192), {})
+
+        assert result.intermediate_size == 8192
+        assert result.use_double_wide_mlp is False
+
+    def test_mismatched_double_wide_pattern_raises(self) -> None:
+        import pytest
+
+        from mobius.integrations.gguf._config_mapping import _gemma4_postprocess
+
+        # Double-wide layers must be the trailing KV-shared layers; a leading
+        # wide layer does not match the expected pattern.
+        with pytest.raises(ValueError, match="double-wide-MLP pattern"):
+            _gemma4_postprocess(
+                self._base_config([12288, 6144, 6144, 6144]),
+                {"gemma4.attention.shared_kv_layers": 2},
+            )

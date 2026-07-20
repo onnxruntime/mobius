@@ -16,6 +16,11 @@ Usage::
 from __future__ import annotations
 
 from mobius.integrations.gguf._builder import build_from_gguf
+from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 from mobius.integrations.gguf._tokenizer import write_gguf_tokenizer_json
 
-__all__ = ["build_from_gguf", "write_gguf_tokenizer_json"]
+__all__ = [
+    "build_from_gguf",
+    "build_gemma4_vlm_from_gguf",
+    "write_gguf_tokenizer_json",
+]

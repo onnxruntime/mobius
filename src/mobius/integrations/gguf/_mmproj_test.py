@@ -1,0 +1,228 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for GGUF ``clip`` mmproj config extraction and vision-encoder build.
+
+Builds a small synthetic ``clip`` mmproj GGUF with :class:`GGUFWriter` (mirroring
+``_builder_test.py``), then exercises the mmproj config readers and the vision
+encoder build+run path end-to-end on CPU.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+# Small synthetic vision encoder dimensions.
+_VISION_HIDDEN = 16
+_VISION_FFN = 32
+_VISION_LAYERS = 2
+_VISION_HEADS = 2
+_IMAGE_SIZE = 16
+_PATCH_SIZE = 4
+_POS_EMB_SIZE = 8
+_TEXT_HIDDEN = 32
+
+# Small synthetic audio encoder dimensions.
+_AUDIO_HIDDEN = 16
+_AUDIO_FFN = 32
+_AUDIO_LAYERS = 2
+_AUDIO_HEADS = 2
+_NUM_MEL_BINS = 8
+_AUDIO_CONV0 = 16
+_AUDIO_CONV1 = 16
+_AUDIO_PROJ_OUT = 24
+
+
+def _write_clip_mmproj_gguf(path: Path, *, with_audio: bool = True) -> None:
+    """Write a small synthetic Gemma4 ``clip`` mmproj GGUF for tests."""
+    from gguf import GGUFWriter
+
+    head_dim = _VISION_HIDDEN // _VISION_HEADS
+    writer = GGUFWriter(str(path), "clip")
+
+    # --- vision metadata ---
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_string("clip.vision.projector_type", "gemma4v")
+    writer.add_uint32("clip.vision.embedding_length", _VISION_HIDDEN)
+    writer.add_uint32("clip.vision.feed_forward_length", _VISION_FFN)
+    writer.add_uint32("clip.vision.block_count", _VISION_LAYERS)
+    writer.add_uint32("clip.vision.attention.head_count", _VISION_HEADS)
+    writer.add_uint32("clip.vision.image_size", _IMAGE_SIZE)
+    writer.add_uint32("clip.vision.patch_size", _PATCH_SIZE)
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+
+    def _f32(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    # patch embed (conv layout) + position table + projector.
+    _f32("v.patch_embd.weight", (_VISION_HIDDEN, 3, _PATCH_SIZE, _PATCH_SIZE))
+    _f32("v.position_embd.weight", (2, _POS_EMB_SIZE, _VISION_HIDDEN))
+    _f32("mm.input_projection.weight", (_TEXT_HIDDEN, _VISION_HIDDEN))
+    # A companion activation-range stat tensor that must be skipped.
+    _f32("mm.input_projection.weight.input_max", (1,))
+
+    for layer in range(_VISION_LAYERS):
+        prefix = f"v.blk.{layer}."
+        for norm in ("ln1", "ln2", "attn_post_norm", "ffn_post_norm"):
+            _f32(prefix + norm + ".weight", (_VISION_HIDDEN,))
+        for proj in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _f32(prefix + proj + ".weight", (_VISION_HIDDEN, _VISION_HIDDEN))
+        for qk_norm in ("attn_q_norm", "attn_k_norm"):
+            _f32(prefix + qk_norm + ".weight", (head_dim,))
+        _f32(prefix + "ffn_gate.weight", (_VISION_FFN, _VISION_HIDDEN))
+        _f32(prefix + "ffn_up.weight", (_VISION_FFN, _VISION_HIDDEN))
+        _f32(prefix + "ffn_down.weight", (_VISION_HIDDEN, _VISION_FFN))
+        # Stat tensor next to a quantizable linear — must be skipped.
+        _f32(prefix + "attn_q.weight.output_min", (1,))
+
+    # --- audio metadata (best-effort, for config-extraction tests) ---
+    if with_audio:
+        writer.add_bool("clip.has_audio_encoder", True)
+        writer.add_string("clip.audio.projector_type", "gemma4a")
+        writer.add_uint32("clip.audio.embedding_length", _AUDIO_HIDDEN)
+        writer.add_uint32("clip.audio.feed_forward_length", _AUDIO_FFN)
+        writer.add_uint32("clip.audio.block_count", _AUDIO_LAYERS)
+        writer.add_uint32("clip.audio.attention.head_count", _AUDIO_HEADS)
+        writer.add_uint32("clip.audio.num_mel_bins", _NUM_MEL_BINS)
+        writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-6)
+        _f32("a.conv1d.0.weight", (_AUDIO_CONV0, 1, 3, 3))
+        _f32("a.conv1d.1.weight", (_AUDIO_CONV1, _AUDIO_CONV0, 3, 3))
+        _f32("mm.a.input_projection.weight", (_AUDIO_HIDDEN, _AUDIO_PROJ_OUT))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+@pytest.fixture
+def clip_mmproj_gguf(tmp_path: Path) -> Path:
+    path = tmp_path / "mmproj.gguf"
+    _write_clip_mmproj_gguf(path)
+    return path
+
+
+class TestReadVisionConfig:
+    def test_extracts_expected_fields(self, clip_mmproj_gguf: Path):
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        config = read_mmproj_vision_config(GGUFModel(str(clip_mmproj_gguf)))
+
+        assert config is not None
+        assert config.hidden_size == _VISION_HIDDEN
+        assert config.intermediate_size == _VISION_FFN
+        assert config.num_hidden_layers == _VISION_LAYERS
+        assert config.num_attention_heads == _VISION_HEADS
+        assert config.image_size == _IMAGE_SIZE
+        assert config.patch_size == _PATCH_SIZE
+        assert config.position_embedding_size == _POS_EMB_SIZE
+        assert config.use_clipped_linears is False
+        assert config.norm_eps == pytest.approx(1e-6)
+
+    def test_returns_none_without_vision_encoder(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "audio_only.gguf"
+        _write_clip_mmproj_gguf(path, with_audio=True)
+        model = GGUFModel(str(path))
+        model.metadata["clip.has_vision_encoder"] = False
+        assert read_mmproj_vision_config(model) is None
+
+
+class TestReadAudioConfig:
+    def test_extracts_expected_fields(self, clip_mmproj_gguf: Path):
+        from mobius.integrations.gguf._mmproj import read_mmproj_audio_config
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        config = read_mmproj_audio_config(GGUFModel(str(clip_mmproj_gguf)))
+
+        assert config is not None
+        assert config.hidden_size == _AUDIO_HIDDEN
+        assert config.num_layers == _AUDIO_LAYERS
+        assert config.attention_heads == _AUDIO_HEADS
+        assert config.input_size == _NUM_MEL_BINS
+        assert config.subsampling_conv_channels == [_AUDIO_CONV0, _AUDIO_CONV1]
+        assert config.output_proj_dims == _AUDIO_PROJ_OUT
+
+    def test_returns_none_without_audio_encoder(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import read_mmproj_audio_config
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "vision_only.gguf"
+        _write_clip_mmproj_gguf(path, with_audio=False)
+        assert read_mmproj_audio_config(GGUFModel(str(path))) is None
+
+
+class TestVisionEncoderBuildAndRun:
+    """Build the Gemma4 vision encoder from the synthetic mmproj and run it."""
+
+    def test_builds_applies_and_runs(self, clip_mmproj_gguf: Path, tmp_path: Path):
+        import onnxruntime as ort
+        import torch
+
+        from mobius._configs import Gemma4Config
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._mmproj_mapping import map_mmproj_vision_to_hf
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        gguf_model = GGUFModel(str(clip_mmproj_gguf))
+        vision_config = read_mmproj_vision_config(gguf_model)
+        config = Gemma4Config(
+            hidden_size=_TEXT_HIDDEN,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            vocab_size=64,
+            vision=vision_config,
+        )
+
+        module = _Gemma4VisionEncoderModel(config)
+        model = Gemma4Task()._build_vision(module, config)
+        package = ModelPackage({"vision_encoder": model}, config=config)
+
+        # Map mmproj vision tensors → HF names, then through the module's own
+        # preprocessing (vision_tower.* / embed_vision.* → module params).
+        state_dict: dict[str, torch.Tensor] = {}
+        for name in gguf_model.tensor_names:
+            if not (name.startswith("v.") or name == "mm.input_projection.weight"):
+                continue
+            hf_name = map_mmproj_vision_to_hf(name)
+            if hf_name is None:
+                continue
+            values = np.array(gguf_model.get_tensor(name)).astype(np.float32)
+            if name == "v.patch_embd.weight":
+                values = values.reshape(values.shape[0], -1)
+            state_dict[hf_name] = torch.from_numpy(values)
+
+        state_dict = module.preprocess_weights(state_dict)
+        package.apply_weights(state_dict)
+
+        out_dir = tmp_path / "vision_out"
+        package.save(str(out_dir), progress_bar=False)
+
+        session = ort.InferenceSession(
+            str(out_dir / "model.onnx"), providers=["CPUExecutionProvider"]
+        )
+        grid = _IMAGE_SIZE // _PATCH_SIZE
+        num_patches = grid * grid
+        pixel_values = np.random.rand(1, num_patches, 3 * _PATCH_SIZE * _PATCH_SIZE).astype(
+            np.float32
+        )
+        xs, ys = np.meshgrid(np.arange(grid), np.arange(grid), indexing="ij")
+        pixel_position_ids = np.stack([xs.ravel(), ys.ravel()], axis=-1)[None].astype(np.int64)
+
+        outputs = session.run(
+            None,
+            {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids},
+        )
+        image_features = outputs[0]
+        assert image_features.ndim == 2
+        assert image_features.shape[1] == _TEXT_HIDDEN
+        assert np.isfinite(image_features).all()

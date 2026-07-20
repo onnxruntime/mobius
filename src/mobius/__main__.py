@@ -364,22 +364,40 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
 
+    mmproj_path = getattr(args, "mmproj", None)
+
     if args.keep_quantized:
-        print(
-            "Quantized mode: preserving GGUF quantization as "
-            "MatMulNBits/GatherBlockQuantized..."
-        )
+        if mmproj_path is not None:
+            print(
+                "Note: --keep-quantized is ignored when building a multimodal (--mmproj) package."
+            )
+        else:
+            print(
+                "Quantized mode: preserving GGUF quantization as "
+                "MatMulNBits/GatherBlockQuantized..."
+            )
 
     gguf_path = args.gguf_path
     output_dir = args.output or os.path.splitext(gguf_path)[0] + "_onnx"
     os.makedirs(output_dir, exist_ok=True)
 
-    pkg = build_from_gguf(
-        gguf_path,
-        dtype=args.dtype,
-        keep_quantized=args.keep_quantized,
-        execution_provider=args.execution_provider,
-    )
+    if mmproj_path is not None:
+        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
+
+        print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
+        pkg = build_gemma4_vlm_from_gguf(
+            gguf_path,
+            mmproj_path,
+            dtype=args.dtype,
+            execution_provider=args.execution_provider,
+        )
+    else:
+        pkg = build_from_gguf(
+            gguf_path,
+            dtype=args.dtype,
+            keep_quantized=args.keep_quantized,
+            execution_provider=args.execution_provider,
+        )
 
     pkg.save(
         output_dir,
@@ -650,6 +668,17 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         metavar="DIR",
         help="Output directory (default: <gguf_stem>_onnx/).",
+    )
+    gguf_parser.add_argument(
+        "--mmproj",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
+            "When set, builds a full multimodal package (decoder + "
+            "vision_encoder + embedding) instead of a text-only model. "
+            "Currently supports Gemma4 vision; audio is experimental."
+        ),
     )
     gguf_parser.add_argument(
         "--keep-quantized",
