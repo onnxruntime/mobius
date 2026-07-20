@@ -87,6 +87,58 @@ def _write_clip_tokenizer(output_dir: str, source: str | None) -> str | None:
     return path
 
 
+def _write_hf_tokenizer(output_dir: str, source: str | None) -> str | None:
+    """Emit ``tokenizer.json`` for a text-producing package from its HF source.
+
+    Decoder-LM, multimodal (VLM / speech-language ASR), and Whisper-style ASR
+    packages all reference ``<package>/tokenizer.json`` in their emitted metadata
+    so the onnx-genai runtime can tokenize prompts from the package alone. This
+    reconstructs that file from the source model's fast tokenizer, mirroring the
+    diffusion CLIP tokenizer helper. Best-effort: it logs a warning and returns
+    ``None`` (never raising) when ``transformers`` is unavailable, no ``source``
+    is known, or the source has no fast tokenizer, so the build is not blocked.
+
+    Args:
+        output_dir: Package directory to write ``tokenizer.json`` into.
+        source: The Hugging Face model id or local directory carrying the
+            tokenizer.
+
+    Returns:
+        The written ``tokenizer.json`` path, or ``None`` if it could not be
+        emitted.
+    """
+    if not source:
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        _LOGGER.warning(
+            "transformers is not available; skipping tokenizer.json emission. "
+            "The onnx-genai runners will need a tokenizer.json supplied separately."
+        )
+        return None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+    except Exception as error:  # best-effort; never block the build
+        _LOGGER.warning(
+            "Could not load a tokenizer from %r: %s; skipping tokenizer.json emission.",
+            source,
+            error,
+        )
+        return None
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        _LOGGER.warning(
+            "Loaded a slow tokenizer for %r with no fast backend; skipping "
+            "tokenizer.json emission.",
+            source,
+        )
+        return None
+    path = os.path.join(output_dir, "tokenizer.json")
+    backend.save(path)
+    return path
+
+
 def _looks_like_diffusion(pkg: Any) -> bool:
     try:
         names = set(pkg.keys())
@@ -325,7 +377,11 @@ def write_onnx_genai_config(
             decoder_metadata=decoder_metadata,
             **kwargs,
         )
-        return {"inference_metadata": path}
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
 
     if _looks_like_speech_to_text(pkg):
         decoder_metadata = decoder_metadata_from_config(
@@ -336,7 +392,11 @@ def write_onnx_genai_config(
             decoder_metadata=decoder_metadata,
             **kwargs,
         )
-        return {"inference_metadata": path}
+        artifacts = {"inference_metadata": path}
+        tokenizer_path = _write_hf_tokenizer(output_dir, source)
+        if tokenizer_path is not None:
+            artifacts["tokenizer"] = tokenizer_path
+        return artifacts
 
     # A nested multi-decoder TTS stack (talker + code_predictor) is a designed
     # but not-yet-executable shape — give a precise, actionable error rather than
@@ -368,4 +428,8 @@ def write_onnx_genai_config(
     path = write_decoder_metadata(
         output_dir, config=resolved_config, kv_native_dtype=kv_native_dtype
     )
-    return {"inference_metadata": path}
+    artifacts = {"inference_metadata": path}
+    tokenizer_path = _write_hf_tokenizer(output_dir, source)
+    if tokenizer_path is not None:
+        artifacts["tokenizer"] = tokenizer_path
+    return artifacts

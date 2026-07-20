@@ -385,3 +385,37 @@ def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
     )
     with pytest.raises(ValueError, match="multi-component"):
         write_onnx_genai_config(pkg, str(tmp_path))
+
+
+def test_decoder_emits_tokenizer_from_source(tmp_path):
+    # A text-producing package emits tokenizer.json from its HF source so the
+    # onnx-genai package is self-contained.
+    from unittest import mock
+
+    saved = {}
+
+    class _FakeBackend:
+        def save(self, path):
+            saved["path"] = path
+            with open(path, "w") as handle:
+                handle.write("{}")
+
+    fake_tok = mock.Mock()
+    fake_tok.backend_tokenizer = _FakeBackend()
+    fake_tf = mock.Mock()
+    fake_tf.AutoTokenizer.from_pretrained.return_value = fake_tok
+
+    with mock.patch.dict("sys.modules", {"transformers": fake_tf}):
+        artifacts = write_onnx_genai_config(
+            object(), str(tmp_path), config=_Cfg(), source="some/model-id"
+        )
+
+    assert artifacts.get("tokenizer") == str(tmp_path / "tokenizer.json")
+    assert (tmp_path / "tokenizer.json").exists()
+    fake_tf.AutoTokenizer.from_pretrained.assert_called_once()
+
+
+def test_decoder_without_source_skips_tokenizer(tmp_path):
+    artifacts = write_onnx_genai_config(object(), str(tmp_path), config=_Cfg())
+    assert "tokenizer" not in artifacts
+    assert not (tmp_path / "tokenizer.json").exists()
