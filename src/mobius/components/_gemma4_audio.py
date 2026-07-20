@@ -59,11 +59,25 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def _clip_in_float32(
+    op: OpBuilder,
+    x: ir.Value,
+    min_value: ir.Value,
+    max_value: ir.Value,
+) -> ir.Value:
+    """Clamp an activation through the portable float32 ``Clip`` kernel."""
+    x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
+    min_f32 = op.Cast(min_value, to=ir.DataType.FLOAT)
+    max_f32 = op.Cast(max_value, to=ir.DataType.FLOAT)
+    clipped = op.Clip(x_f32, min_f32, max_f32)
+    return op.CastLike(clipped, x)
+
+
 def _gradient_clip(op: OpBuilder, x: ir.Value, clip_val: float = 1e9) -> ir.Value:
     """Clamp activations to ±clip_val (gradient clipping for numerical stability)."""
     lo = op.CastLike(op.Constant(value_float=-clip_val), x)
     hi = op.CastLike(op.Constant(value_float=clip_val), x)
-    return op.Clip(x, lo, hi)
+    return _clip_in_float32(op, x, lo, hi)
 
 
 def _glu(op: OpBuilder, x: ir.Value) -> ir.Value:
@@ -116,14 +130,14 @@ class ClippableLinear(nn.Module):
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         # Clamp input activations
-        x = op.Clip(x, self.input_min, self.input_max)
+        x = _clip_in_float32(op, x, self.input_min, self.input_max)
         # Linear: x @ weight.T [+ bias]
         w_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, w_t)
         if self.bias is not None:
             result = op.Add(result, self.bias)
         # Clamp output activations
-        return op.Clip(result, self.output_min, self.output_max)
+        return _clip_in_float32(op, result, self.output_min, self.output_max)
 
 
 class Gemma4ConvSubsampling(nn.Module):

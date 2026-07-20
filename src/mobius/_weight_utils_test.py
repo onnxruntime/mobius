@@ -9,8 +9,10 @@ import pytest
 import torch
 
 from mobius._weight_utils import (
+    infer_compressed_tensors_group_size,
     merge_lora_weights,
     preprocess_awq_weights,
+    preprocess_compressed_tensors_weights,
     preprocess_gptq_weights,
     preprocess_olive_weights,
     rename_weight_keys,
@@ -24,6 +26,113 @@ from mobius._weight_utils import (
     vlm_embedding_weights,
     vlm_vision_weights,
 )
+
+
+class TestPreprocessCompressedTensorsWeights:
+    """Tests for compressed-tensors ``pack-quantized`` import."""
+
+    BITS = 4
+    GROUP_SIZE = 32
+    N = 2
+    K = 64
+    N_BLOCKS = K // GROUP_SIZE
+    BLOB_SIZE = GROUP_SIZE * BITS // 8
+
+    @staticmethod
+    def _packed_weight() -> tuple[torch.Tensor, torch.Tensor]:
+        # Signed INT4 -8..7 maps to unsigned codes 0..15. Compressed-tensors
+        # stores each earlier code in the lower nibble, exactly like ORT.
+        codes = torch.arange(16, dtype=torch.uint8).repeat(4)
+        packed_bytes = (codes[0::2] | (codes[1::2] << 4)).repeat(2, 1)
+        return packed_bytes.contiguous().view(torch.int32), packed_bytes
+
+    def _state_dict(self) -> dict[str, torch.Tensor]:
+        packed, _ = self._packed_weight()
+        return {
+            "q_proj.weight_packed": packed,
+            "q_proj.weight_shape": torch.tensor([self.N, self.K]),
+            "q_proj.weight_scale": torch.arange(
+                self.N * self.N_BLOCKS, dtype=torch.float16
+            ).reshape(self.N, self.N_BLOCKS),
+            "q_proj.input_min": torch.tensor(-1.0),
+            "q_proj.input_max": torch.tensor(1.0),
+            "norm.weight": torch.ones(self.K),
+        }
+
+    def test_infers_group_size_from_scale_shape(self):
+        assert (
+            infer_compressed_tensors_group_size(self._state_dict(), bits=self.BITS)
+            == self.GROUP_SIZE
+        )
+
+    def test_configured_group_size_allows_partial_final_block(self):
+        k = 48
+        n_blocks = 2
+        state_dict = {
+            "q_proj.weight_packed": torch.zeros(
+                self.N, k * self.BITS // 32, dtype=torch.int32
+            ),
+            "q_proj.weight_shape": torch.tensor([self.N, k]),
+            "q_proj.weight_scale": torch.ones(self.N, n_blocks),
+        }
+
+        assert (
+            infer_compressed_tensors_group_size(
+                state_dict,
+                bits=self.BITS,
+                group_size=self.GROUP_SIZE,
+            )
+            == self.GROUP_SIZE
+        )
+        assert (
+            infer_compressed_tensors_group_size(state_dict, bits=self.BITS) == self.GROUP_SIZE
+        )
+
+    def test_repack_preserves_bytes_and_scales(self):
+        state_dict = self._state_dict()
+        _, expected_bytes = self._packed_weight()
+
+        result = preprocess_compressed_tensors_weights(
+            state_dict, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["q_proj.weight"].shape == (
+            self.N,
+            self.N_BLOCKS,
+            self.BLOB_SIZE,
+        )
+        assert torch.equal(result["q_proj.weight"].reshape(self.N, -1), expected_bytes)
+        assert (
+            result["q_proj.scales"].data_ptr() == state_dict["q_proj.weight_scale"].data_ptr()
+        )
+
+    def test_drops_shape_and_preserves_clipping_metadata(self):
+        result = preprocess_compressed_tensors_weights(
+            self._state_dict(), bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert "q_proj.weight_shape" not in result
+        assert "q_proj.input_min" in result
+        assert "q_proj.input_max" in result
+        assert "norm.weight" in result
+
+    def test_rejects_asymmetric_zero_point(self):
+        state_dict = self._state_dict()
+        state_dict["q_proj.weight_zero_point"] = torch.zeros(self.N, self.N_BLOCKS)
+
+        with pytest.raises(ValueError, match="Asymmetric"):
+            preprocess_compressed_tensors_weights(
+                state_dict, bits=self.BITS, group_size=self.GROUP_SIZE
+            )
+
+    def test_rejects_activation_order(self):
+        state_dict = self._state_dict()
+        state_dict["q_proj.weight_g_idx"] = torch.arange(self.K)
+
+        with pytest.raises(ValueError, match="Activation-ordered"):
+            preprocess_compressed_tensors_weights(
+                state_dict, bits=self.BITS, group_size=self.GROUP_SIZE
+            )
 
 
 class TestSplitFusedQKV:

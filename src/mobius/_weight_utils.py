@@ -633,6 +633,191 @@ def pack_qmoe_expert_weights(
     return packed
 
 
+def infer_compressed_tensors_group_size(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    bits: int,
+    group_size: int | None = None,
+) -> int:
+    """Infer and validate a uniform group size from packed checkpoint tensors.
+
+    ``pack-quantized`` checkpoints do not always serialize ``group_size`` in
+    ``config.json``. Each packed matrix does serialize its logical shape and
+    per-group scales, which determine the group size without reading or
+    dequantizing the weights.
+    """
+    group_size_candidates: set[int] | None = None
+    packed_keys = [key for key in state_dict if key.endswith(".weight_packed")]
+    if not packed_keys:
+        raise ValueError(
+            "Compressed-tensors checkpoint contains no '*.weight_packed' tensors."
+        )
+
+    for packed_key in packed_keys:
+        stem = packed_key[: -len(".weight_packed")]
+        shape_key = f"{stem}.weight_shape"
+        scale_key = f"{stem}.weight_scale"
+        if shape_key not in state_dict or scale_key not in state_dict:
+            raise ValueError(
+                f"Compressed tensor {packed_key!r} requires both {shape_key!r} "
+                f"and {scale_key!r}."
+            )
+
+        logical_shape = tuple(int(dim) for dim in state_dict[shape_key].tolist())
+        if len(logical_shape) != 2:
+            raise ValueError(
+                f"Compressed tensor {packed_key!r} must describe a 2D weight, "
+                f"got shape {logical_shape}."
+            )
+        n, k = logical_shape
+        scales = state_dict[scale_key]
+        if scales.ndim != 2 or scales.shape[0] != n:
+            raise ValueError(
+                f"Scale tensor {scale_key!r} must have shape [N, n_blocks] "
+                f"for N={n}, got {list(scales.shape)}."
+            )
+        n_blocks = scales.shape[1]
+        if n_blocks <= 0:
+            raise ValueError(f"Scale tensor {scale_key!r} must contain at least one block.")
+        if group_size is not None:
+            expected_blocks = math.ceil(k / group_size)
+            if n_blocks != expected_blocks:
+                raise ValueError(
+                    f"Scale tensor {scale_key!r} must contain {expected_blocks} "
+                    f"blocks for K={k} and group_size={group_size}, got {n_blocks}."
+                )
+        else:
+            max_candidate = max(16, 1 << (k - 1).bit_length())
+            tensor_candidates = {
+                candidate
+                for exponent in range(4, max_candidate.bit_length())
+                if math.ceil(k / (candidate := 1 << exponent)) == n_blocks
+            }
+            if not tensor_candidates:
+                raise ValueError(
+                    f"Cannot infer a MatMulNBits group size for {packed_key!r}: "
+                    f"K={k}, n_blocks={n_blocks}."
+                )
+            if group_size_candidates is None:
+                group_size_candidates = tensor_candidates
+            else:
+                group_size_candidates &= tensor_candidates
+
+        packed = state_dict[packed_key]
+        expected_words = math.ceil(k * bits / 32)
+        if packed.dtype != torch.int32 or list(packed.shape) != [n, expected_words]:
+            raise ValueError(
+                f"Packed tensor {packed_key!r} must be int32 with shape "
+                f"[{n}, {expected_words}], got {packed.dtype} {list(packed.shape)}."
+            )
+
+    if group_size is None:
+        if not group_size_candidates:
+            raise ValueError(
+                "No uniform MatMulNBits group size matches all compressed tensors."
+            )
+        # Multiple candidates are only possible when every affected matrix has
+        # one scale block. The smallest candidate avoids unnecessary padding;
+        # all candidates have identical dequantization in that case.
+        group_size = min(group_size_candidates)
+    if group_size < 16 or group_size & (group_size - 1):
+        raise ValueError(
+            f"MatMulNBits group size must be a power of two >= 16, got {group_size}."
+        )
+    return group_size
+
+
+def preprocess_compressed_tensors_weights(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    bits: int,
+    group_size: int,
+) -> dict[str, torch.Tensor]:
+    """Repack compressed-tensors INT weights for ORT ``MatMulNBits``.
+
+    Compressed-tensors and ORT both store signed quantized values as unsigned
+    bit patterns offset by ``2**(bits - 1)``, with the earliest value in the
+    least-significant bits. The conversion therefore only reinterprets each
+    contiguous INT32 row as bytes and reshapes those bytes into ORT blocks.
+    Scales are preserved bit-for-bit; no dequantization or rounding occurs.
+    """
+    if bits not in (2, 4, 8):
+        raise ValueError(f"MatMulNBits supports 2, 4, or 8 bits, got {bits}.")
+    if group_size < 16 or group_size & (group_size - 1):
+        raise ValueError(f"group_size must be a power of two >= 16, got {group_size}.")
+
+    result: dict[str, torch.Tensor] = {}
+    packed_stems = {
+        key[: -len(".weight_packed")] for key in state_dict if key.endswith(".weight_packed")
+    }
+    for key, value in state_dict.items():
+        if key.endswith(".weight_g_idx"):
+            raise ValueError(
+                "Activation-ordered compressed-tensors weights are not supported: "
+                f"found {key!r}."
+            )
+        if key.endswith(".weight_zero_point"):
+            raise ValueError(
+                "Asymmetric compressed-tensors checkpoints are not yet supported: "
+                f"found {key!r}."
+            )
+        if key.endswith(".weight_shape"):
+            continue
+        if key.endswith(".weight_scale"):
+            stem = key[: -len(".weight_scale")]
+            if stem in packed_stems:
+                result[f"{stem}.scales"] = value.contiguous()
+            else:
+                result[key] = value
+            continue
+        if not key.endswith(".weight_packed"):
+            result[key] = value
+            continue
+
+        stem = key[: -len(".weight_packed")]
+        shape_key = f"{stem}.weight_shape"
+        scale_key = f"{stem}.weight_scale"
+        if shape_key not in state_dict or scale_key not in state_dict:
+            raise ValueError(
+                f"Compressed tensor {key!r} requires both {shape_key!r} and {scale_key!r}."
+            )
+        logical_shape = tuple(int(dim) for dim in state_dict[shape_key].tolist())
+        if len(logical_shape) != 2:
+            raise ValueError(
+                f"Compressed tensor {key!r} must describe a 2D weight, "
+                f"got shape {logical_shape}."
+            )
+        n, k = logical_shape
+        n_blocks = math.ceil(k / group_size)
+        blob_size = group_size * bits // 8
+        expected_words = math.ceil(k * bits / 32)
+        if value.dtype != torch.int32 or list(value.shape) != [n, expected_words]:
+            raise ValueError(
+                f"Packed tensor {key!r} must be int32 with shape "
+                f"[{n}, {expected_words}], got {value.dtype} {list(value.shape)}."
+            )
+        scales = state_dict[scale_key]
+        if list(scales.shape) != [n, n_blocks]:
+            raise ValueError(
+                f"Scale tensor {scale_key!r} must have shape [{n}, {n_blocks}], "
+                f"got {list(scales.shape)}."
+            )
+
+        packed_bytes = value.contiguous().view(torch.uint8)
+        required_bytes = math.ceil(k * bits / 8)
+        packed_bytes = packed_bytes[:, :required_bytes]
+        padded_bytes = n_blocks * blob_size
+        if required_bytes < padded_bytes:
+            zero_code = 1 << (bits - 1)
+            zero_byte = sum(zero_code << shift for shift in range(0, 8, bits))
+            packed_bytes = torch.nn.functional.pad(
+                packed_bytes, (0, padded_bytes - required_bytes), value=zero_byte
+            )
+        result[f"{stem}.weight"] = packed_bytes.reshape(n, n_blocks, blob_size).contiguous()
+
+    return result
+
+
 def preprocess_gptq_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
