@@ -311,14 +311,27 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
     ]
 
 
-def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
-    # A multi-decoder TTS-like stack matches no composite shape and must NOT be
-    # silently emitted as a bare decoder.
+def test_multi_decoder_tts_raises_precise_not_implemented(tmp_path):
+    # A nested multi-decoder TTS stack (talker + code_predictor) is a designed
+    # but unimplemented shape and must fail with a precise, actionable error.
     pkg = _EncoderDecoderPkg(
         {
             "talker": _FakeModel(["inputs_embeds"]),
             "code_predictor": _FakeModel(["inputs_embeds"]),
-            "vocoder": _FakeModel(["codes"]),
+            "embedding": _FakeModel(["text_ids"]),
+        }
+    )
+    with pytest.raises(NotImplementedError, match="nested_autoregressive"):
+        write_onnx_genai_config(pkg, str(tmp_path))
+
+
+def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
+    # A multi-component package matching no known shape must not be silently
+    # emitted as a bare decoder.
+    pkg = _EncoderDecoderPkg(
+        {
+            "widget": _FakeModel(["x"]),
+            "gadget": _FakeModel(["y"]),
         }
     )
     with pytest.raises(ValueError, match="multi-component"):

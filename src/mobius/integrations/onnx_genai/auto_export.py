@@ -165,6 +165,22 @@ def _audio_codec_codes_dtype(pkg: Any) -> str:
     return "int64"
 
 
+def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
+    """Detect a nested multi-decoder TTS package (e.g. Qwen3-TTS).
+
+    The defining signal is a ``talker`` plus a ``code_predictor`` decoder — a
+    dual, nested autoregressive shape (the code_predictor expands each talker
+    frame's residual codebooks). This shape is designed but not yet executable by
+    the onnx-genai composite runtime (see DESIGN.md §20.3), so it is detected
+    only to raise a precise, actionable error rather than mis-emitting.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    return {"talker", "code_predictor"} <= names
+
+
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:
     """Derive multimodal component filenames from a package's component keys."""
     try:
@@ -322,11 +338,21 @@ def write_onnx_genai_config(
         )
         return {"inference_metadata": path}
 
+    # A nested multi-decoder TTS stack (talker + code_predictor) is a designed
+    # but not-yet-executable shape — give a precise, actionable error rather than
+    # the generic multi-component message below.
+    if _looks_like_multi_decoder_tts(pkg):
+        raise NotImplementedError(
+            "Multi-decoder TTS packages (talker + code_predictor, e.g. Qwen3-TTS) "
+            "need the nested_autoregressive strategy, which is designed but not yet "
+            "implemented in the onnx-genai runtime or this emitter — see "
+            "onnx-genai docs/DESIGN.md §20.3 'Multi-decoder TTS'."
+        )
+
     # Fallback: a single-component decoder language model. A multi-component
-    # package that matched none of the composite shapes above (e.g. a
-    # multi-decoder TTS stack: talker + code_predictor + vocoder) would be
-    # silently mis-emitted as a bare decoder — fail loudly instead so an
-    # unsupported shape is obvious rather than producing wrong metadata.
+    # package that matched none of the composite shapes above would be silently
+    # mis-emitted as a bare decoder — fail loudly instead so an unsupported shape
+    # is obvious rather than producing wrong metadata.
     try:
         component_names = sorted(pkg.keys())
     except (AttributeError, TypeError):
