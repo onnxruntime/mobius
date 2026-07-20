@@ -3,11 +3,12 @@
 
 """TTS 4-model split task for Qwen3-TTS.
 
-Builds four separate ONNX models:
+Builds separate ONNX models:
 1. **talker**: inputs_embeds → logits (first code group) + last_hidden_state + KV cache
 2. **code_predictor**: inputs_embeds → hidden_states + KV cache (1D RoPE)
 3. **embedding**: text_ids + codec_ids → text_embeds + codec_embeds
-4. **speaker_encoder**: mel_input → speaker_embedding
+4. **talker_step_embedder**: frame_codes + text_embed → inputs_embeds
+5. **speaker_encoder**: mel_input → speaker_embedding
 
 Used by Qwen3TTSForConditionalGeneration.
 """
@@ -51,12 +52,14 @@ class TTSTask(ModelTask):
         "talker": "decoder",
         "code_predictor": "decoder",
         "embedding": "embedding",
+        "talker_step_embedder": "embedding",
         "speaker_encoder": "encoder",
     }
     components: ClassVar[ComponentSpec] = ComponentSpec(
         talker="talker",
         code_predictor="code_predictor",
         embedding="embedding",
+        talker_step_embedder="talker_step_embedder",
     )
 
     def build(
@@ -70,6 +73,9 @@ class TTSTask(ModelTask):
         models["talker"] = self._build_talker(module.talker, config)
         models["code_predictor"] = self._build_code_predictor(module.code_predictor, config)
         models["embedding"] = self._build_embedding(module.embedding, config)
+        models["talker_step_embedder"] = self._build_talker_step_embedder(
+            module.talker_step_embedder, config
+        )
         if module.speaker_encoder is not None:
             models["speaker_encoder"] = self._build_speaker_encoder(
                 module.speaker_encoder, config
@@ -248,6 +254,46 @@ class TTSTask(ModelTask):
 
         builder.add_output(text_embeds, "text_embeds")
         builder.add_output(codec_embeds, "codec_embeds")
+        return _make_model(graph)
+
+    def _build_talker_step_embedder(
+        self,
+        talker_step_embedder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build talker step embedder: frame_codes + text_embed → inputs_embeds.
+
+        Materializes the per-step talker ``codec_sum`` construction in-graph:
+        ``codec_sum = talker.codec_embed(code_0) + Σ cp_codec_weights[i][code]``
+        and returns ``codec_sum + text_embed``. Lets a generic runtime loop
+        drive the talker from the previous frame's raw integer codes instead
+        of a pre-built ``inputs_embeds``.
+        """
+        tts = config.tts
+        num_code_groups = tts.num_code_groups if tts else 16
+
+        batch = ir.SymbolicDim("batch")
+
+        graph, builder = _make_graph(name="talker_step_embedder")
+
+        frame_codes = builder.input(
+            "frame_codes",
+            dtype=ir.DataType.INT64,
+            shape=[batch, num_code_groups],
+        )
+        text_embed = builder.input(
+            "text_embed",
+            dtype=config.dtype,
+            shape=[batch, 1, config.hidden_size],
+        )
+
+        inputs_embeds = talker_step_embedder(
+            builder.op,
+            frame_codes=frame_codes,
+            text_embed=text_embed,
+        )
+
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
     def _build_speaker_encoder(

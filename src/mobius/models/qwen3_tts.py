@@ -356,6 +356,93 @@ class Qwen3TTSEmbeddingModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Talker step embedder (pre-embedding component)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3TTSTalkerStepEmbedder(nn.Module):
+    r"""Materializes the per-step talker ``codec_sum`` construction in ONNX.
+
+    In the reference generation loop the talker's per-step ``inputs_embeds``
+    is built in Python as::
+
+        codec_sum = talker.codec_embed(code_0)
+                    + Σ_{i=0..14} cp_codec_weights[i][codes[i + 1]]
+        inputs_embeds = codec_sum + text_embed
+
+    where ``talker.codec_embed`` is the talker codec-embedding table (the
+    embedding model's ``codec_embedding.weight``) and ``cp_codec_weights`` is
+    the code predictor's stacked codec-embedding table
+    (``[num_code_groups - 1, cp_vocab, hidden]``).
+
+    This module folds that construction into a graph so a generic runtime loop
+    can drive the talker by feeding the previous frame's raw integer codes
+    (plus the already-embedded trailing-text vector) instead of a pre-built
+    ``inputs_embeds``. The text projection stays on the embedding model; this
+    component only holds the two codec-embedding tables (shared weights, not
+    re-quantized) and does the Gather + Add.
+
+    Inputs:
+      - ``frame_codes``: (batch, num_code_groups) int64 — the previous frame's
+        codes (``code_0`` followed by ``codes[1..num_code_groups - 1]``).
+      - ``text_embed``: (batch, 1, hidden) float — the trailing-text (or pad)
+        embedding for this step, produced by the embedding model.
+
+    Output:
+      - ``inputs_embeds``: (batch, 1, hidden) float — exactly
+        ``codec_sum + text_embed``.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        tts = config.tts
+        hidden = config.hidden_size
+        # Talker codec-embedding table (audio codes → hidden). Same weights as
+        # the embedding model's ``codec_embedding``; shared, not re-quantized.
+        self.codec_embedding = nn.Parameter([config.vocab_size, hidden])
+
+        # Code predictor stacked codec-embedding table, stored in talker_hidden
+        # space: (num_code_groups - 1, cp_vocab, hidden). Same weights as the
+        # code predictor's ``stacked_codec_embedding`` (exposed as its
+        # ``codec_embeddings`` graph output).
+        num_extra_groups = (tts.num_code_groups if tts else 16) - 1
+        cp = tts.code_predictor if tts else None
+        cp_vocab = cp.vocab_size if cp else 2048
+        self.stacked_codec_embedding = nn.Parameter([num_extra_groups, cp_vocab, hidden])
+        self._num_extra_groups = num_extra_groups
+
+    def forward(
+        self,
+        op: OpBuilder,
+        frame_codes: ir.Value,
+        text_embed: ir.Value,
+    ):
+        """Compute ``codec_sum + text_embed`` from raw frame codes.
+
+        Args:
+            frame_codes: (batch, num_code_groups) int64 previous-frame codes.
+            text_embed: (batch, 1, hidden) float trailing-text/pad embedding.
+
+        Returns:
+            inputs_embeds: (batch, 1, hidden) float.
+        """
+        # code_0 → talker codec embedding. Keep the length-1 group axis so the
+        # result is (batch, 1, hidden) and broadcasts cleanly against text.
+        code_0 = op.Gather(frame_codes, [0], axis=1)  # (batch, 1)
+        codec_sum = op.Gather(self.codec_embedding, code_0, axis=0)  # (batch, 1, hidden)
+
+        # codes[1..num_extra_groups] → per-group code predictor codec embedding.
+        for i in range(self._num_extra_groups):
+            code_i = op.Gather(frame_codes, [i + 1], axis=1)  # (batch, 1)
+            table_i = op.Gather(self.stacked_codec_embedding, [i], axis=0)
+            table_i = op.Squeeze(table_i, [0])  # (cp_vocab, hidden)
+            emb_i = op.Gather(table_i, code_i, axis=0)  # (batch, 1, hidden)
+            codec_sum = op.Add(codec_sum, emb_i)
+
+        return op.Add(codec_sum, text_embed)
+
+
+# ---------------------------------------------------------------------------
 # Speaker encoder model (model 4 of 4)
 # ---------------------------------------------------------------------------
 
@@ -424,6 +511,7 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
         self.talker = Qwen3TTSTalkerDecoderModel(config)
         self.code_predictor = Qwen3TTSCodePredictorModel(config)
         self.embedding = Qwen3TTSEmbeddingModel(config)
+        self.talker_step_embedder = Qwen3TTSTalkerStepEmbedder(config)
         # Speaker encoder is optional — not all TTS models include it
         tts = config.tts
         if tts and tts.speaker_encoder:
@@ -494,6 +582,10 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
             if inner.startswith("model.codec_embedding."):
                 emb_key = inner.replace("model.codec_embedding.", "codec_embedding.")
                 cleaned[f"embedding.{emb_key}"] = value
+                # Share the same table with the talker step embedder so it can
+                # materialize codec_sum in-graph (talker.codec_embed(code_0)).
+                if emb_key == "codec_embedding.weight":
+                    cleaned["talker_step_embedder.codec_embedding"] = value
                 continue
 
             # Codec head → talker lm_head
@@ -601,6 +693,9 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
             num_groups = max(codec_emb_weights.keys()) + 1
             stacked = torch.stack([codec_emb_weights[i] for i in range(num_groups)])
             remaining["codec_embeddings"] = stacked
+            # Share the same stacked table with the talker step embedder so it
+            # can materialize codec_sum in-graph (Σ cp_codec_weights[i][code]).
+            remaining["talker_step_embedder.stacked_codec_embedding"] = stacked
 
         # Stack lm_heads: (num_groups-1, cp_vocab, cp_hidden)
         if lm_head_weights:
