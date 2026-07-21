@@ -1,9 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""TTS 4-model split task for Qwen3-TTS.
+"""TTS multi-model split task for Qwen3-TTS.
 
-Builds separate ONNX models:
+Builds separate ONNX models (five required + one optional speaker encoder):
 1. **talker**: inputs_embeds → logits (first code group) + last_hidden_state + KV cache
 2. **code_predictor**: inputs_embeds → hidden_states + KV cache (1D RoPE)
 3. **embedding**: text_ids + codec_ids → text_embeds + codec_embeds
@@ -36,13 +36,17 @@ from mobius.tasks._cache_utils import (
 
 
 class TTSTask(ModelTask):
-    """4-model split for Qwen3-TTS.
+    """Multi-model split for Qwen3-TTS.
 
-    The module must provide three required sub-modules and one optional:
+    The module must provide five required sub-modules and one optional:
 
     - ``talker``: Decoder producing logits + last_hidden_state
     - ``code_predictor``: Small decoder for remaining code groups
     - ``embedding``: Text + codec embedding model
+    - ``talker_step_embedder``: Per-frame ``frame_codes [+ text_embed] ->
+      inputs_embeds`` pre-embedder for the talker
+    - ``talker_prefill_embedder``: ``text_ids -> prefill_embeds +
+      trailing_text_embeds`` prefill/trailing-text builder
     - ``speaker_encoder``: ECAPA-TDNN speaker encoder *(optional — omitted
       when the model uses a pre-computed speaker embedding instead)*
 

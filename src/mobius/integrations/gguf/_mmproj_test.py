@@ -320,7 +320,6 @@ class TestKeepQuantizedMixedPrecision:
         """
         import dataclasses
 
-        import onnx
         import onnx_ir as ir
         import onnxruntime as ort
 
@@ -381,7 +380,7 @@ class TestKeepQuantizedMixedPrecision:
             init.const_value = ir.tensor(values)
 
         decoder_path = tmp_path / "decoder.onnx"
-        onnx.save(ir.to_proto(model), str(decoder_path))
+        ir.save(model, str(decoder_path))
 
         # Session creation runs shape inference — the KV-shared fix is what keeps
         # this from failing with a MatMul "Incompatible dimensions" error.

@@ -10,7 +10,14 @@ Usage::
 
     from mobius.integrations.gguf import build_from_gguf
 
+    # Text-only model
     pkg = build_from_gguf("path/to/model.gguf")
+
+    # Multimodal (text + companion mmproj vision/audio encoder)
+    pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
+
+:func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
+to :func:`build_gemma4_vlm_from_gguf` for the multimodal assembly.
 """
 
 from __future__ import annotations

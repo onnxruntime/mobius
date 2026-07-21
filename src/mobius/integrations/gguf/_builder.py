@@ -83,6 +83,7 @@ def build_from_gguf(
     dtype: str | None = None,
     keep_quantized: bool = False,
     execution_provider: str = "default",
+    mmproj: str | Path | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -116,6 +117,12 @@ def build_from_gguf(
             optimisations (e.g. ``"cpu"`` to apply the
             GroupQueryAttention rewrite). Defaults to ``"default"``
             (portable, no vendor fusions).
+        mmproj: Optional path (or HF ref) to a companion ``clip``
+            multimodal-projector GGUF. When set, this becomes the single
+            entry point for a multimodal build: the text GGUF and the
+            mmproj vision/audio encoder are fused into one multimodal
+            :class:`ModelPackage` (delegates to
+            :func:`build_gemma4_vlm_from_gguf`).
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -126,6 +133,20 @@ def build_from_gguf(
         KeyError: If the GGUF architecture is not in the registry.
     """
     import dataclasses
+
+    # A companion mmproj GGUF turns this into a multimodal build: the text +
+    # vision/audio encoders are assembled by the dedicated VLM builder. Keep
+    # build_from_gguf as the single public entry point (text-only or multimodal).
+    if mmproj is not None:
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+
+        return build_gemma4_vlm_from_gguf(
+            gguf_path,
+            mmproj,
+            dtype=dtype,
+            execution_provider=execution_provider,
+            keep_quantized=keep_quantized,
+        )
 
     from mobius._builder import (
         build_from_module,

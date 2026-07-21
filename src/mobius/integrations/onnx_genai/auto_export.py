@@ -209,12 +209,16 @@ def _looks_like_audio_codec(pkg: Any) -> bool:
 
 def _audio_codec_codes_dtype(pkg: Any) -> str:
     """Return the metadata dtype of the codec ``codes`` tensor (default int64)."""
+    # ONNX elem-type names -> onnx-genai metadata dtype tags. Float codes keep
+    # their precision (fp16/bf16/fp32) so the runtime binds the right buffer type.
+    float_dtypes = {"FLOAT": "fp32", "FLOAT16": "fp16", "BFLOAT16": "bf16"}
     try:
         for value in pkg["decoder"].graph.inputs:
             if value.name == "codes" and value.dtype is not None:
-                return "fp32" if "FLOAT" in value.dtype.name else "int64"
+                return float_dtypes.get(value.dtype.name, "int64")
     except (AttributeError, KeyError):
-        pass
+        # Missing/partial codec structure: fall back to the documented default.
+        return "int64"
     return "int64"
 
 
@@ -223,9 +227,12 @@ def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
 
     The defining signal is a ``talker`` plus a ``code_predictor`` decoder — a
     dual, nested autoregressive shape (the code_predictor expands each talker
-    frame's residual codebooks). This shape is designed but not yet executable by
-    the onnx-genai composite runtime (see DESIGN.md §20.3), so it is detected
-    only to raise a precise, actionable error rather than mis-emitting.
+    frame's residual codebooks). When the package also carries the
+    ``talker_step_embedder`` pre-embedder (see :func:`_has_tts_pre_embedder`),
+    the dispatcher emits a runnable ``pre_embedder``-driven
+    ``nested_autoregressive`` contract; without it the component graph is not yet
+    mappable, so detection triggers a precise, actionable error rather than
+    mis-emitting (see DESIGN.md §20.3).
     """
     try:
         names = set(pkg.keys())

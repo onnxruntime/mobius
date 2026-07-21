@@ -377,12 +377,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     if mmproj_path is not None:
-        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
-
         print(f"Multimodal mode: fusing vision/audio encoder from mmproj {mmproj_path}...")
-        pkg = build_gemma4_vlm_from_gguf(
+        pkg = build_from_gguf(
             gguf_path,
-            mmproj_path,
+            mmproj=mmproj_path,
             dtype=args.dtype,
             execution_provider=args.execution_provider,
             keep_quantized=args.keep_quantized,
@@ -710,13 +708,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     gguf_parser.add_argument(
         "--runtime",
-        choices=["onnx-genai"],
+        choices=["ort-genai", "onnx-genai"],
         default=None,
         help=(
             "Generate runtime-specific config files after building. "
             "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
-            "reconstructed from the GGUF's embedded tokenizer metadata, so the "
-            "quantized model runs directly in the onnx-genai runtime."
+            "reconstructed from the GGUF's embedded tokenizer metadata; "
+            "'ort-genai' writes genai_config.json + copies tokenizer files. "
+            "Either way the quantized model runs directly in the target runtime."
         ),
     )
     gguf_parser.set_defaults(func=_cmd_build_gguf)
