@@ -874,15 +874,18 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
 
         # Stack codec embeddings: (num_groups-1, cp_vocab, talker_hidden).
         # The code predictor exposes this table via `op.Identity(stacked_codec_embedding)`
-        # as its `codec_embeddings` graph output, and onnx-ir folds the Identity so
+        # as its `codec_embeddings` graph output. onnx-ir normally folds the Identity so
         # the sole initializer takes the OUTPUT name `codec_embeddings` (unprefixed) —
-        # unlike every other code_predictor initializer. Key the stacked weight to that
-        # exact initializer name so it is applied (apply_weights routes an unprefixed
-        # name to the only component that declares it).
+        # unlike every other code_predictor initializer. To avoid depending on that IR
+        # rewrite, key the stacked weight under BOTH names: whichever initializer the
+        # build actually emits (`codec_embeddings` when folded, else
+        # `code_predictor.stacked_codec_embedding`) is populated, and the other key is
+        # harmlessly logged as unmapped (apply_weights does not error on extra keys).
         if codec_emb_weights:
             num_groups = max(codec_emb_weights.keys()) + 1
             stacked = torch.stack([codec_emb_weights[i] for i in range(num_groups)])
             remaining["codec_embeddings"] = stacked
+            remaining["code_predictor.stacked_codec_embedding"] = stacked
             # Share the same stacked table with the talker step embedder so it
             # can materialize codec_sum in-graph (Σ cp_codec_weights[i][code]).
             remaining["talker_step_embedder.stacked_codec_embedding"] = stacked
