@@ -648,6 +648,7 @@ def build_tts_pipeline_metadata(
     talker_filename: str = "talker/model.onnx",
     code_predictor_filename: str = "code_predictor/model.onnx",
     pre_embedder_filename: str = "talker_step_embedder/model.onnx",
+    prefill_embedder_filename: str | None = "talker_prefill_embedder/model.onnx",
     tokenizer_filename: str = "tokenizer.json",
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -662,14 +663,20 @@ def build_tts_pipeline_metadata(
     codes by the ``talker_step_embedder`` pre-embedder (``frame_codes
     [+ text_embed] -> inputs_embeds``), keeping the engine generic.
 
-    Only the three engine-driven components are emitted (``talker``,
-    ``code_predictor``, ``talker_step_embedder``). The package's ``embedding``
-    and optional ``speaker_encoder`` models feed the trailing-text ``text_embed``
-    and prefill-embeds path, which the runtime does not yet consume (it feeds a
-    zero ``text_embed`` — see DESIGN.md §20.3); emitting them here would declare
-    models the engine cannot place, so they are deliberately omitted until that
-    follow-up lands. There is **no in-package vocoder** — the assembled
-    ``talker.output_codes`` are decoded to a waveform by a separate codec model.
+    When ``prefill_embedder_filename`` is set (the default), a
+    ``talker_prefill_embedder`` prompt-phase component is also emitted. It maps
+    the tokenized prompt ``text_ids -> prefill_embeds + trailing_text_embeds``:
+    the runtime feeds ``prefill_embeds`` to the talker on frame 0 and threads
+    ``trailing_text_embeds[:, k-1, :]`` as the pre-embedder's ``text_embed`` on
+    frames k>=1 (see the ``prefill_embedder`` field). Pass ``None`` to emit the
+    prefill-less shape (talker frame 0 + ``text_embed`` fed zeros).
+
+    The engine-driven components are emitted (``talker``, ``code_predictor``,
+    ``talker_step_embedder``, and ``talker_prefill_embedder`` when present). The
+    package's ``embedding`` and optional ``speaker_encoder`` models are internal
+    weight sources already folded into the pre-/prefill-embedders, so they are
+    not declared as pipeline models. There is **no in-package vocoder** — the
+    assembled ``talker.output_codes`` are decoded by a separate codec model.
 
     Args:
         num_code_groups: Codes collected per outer frame (RVQ residual count).
@@ -677,6 +684,8 @@ def build_tts_pipeline_metadata(
         talker_filename: Outer decoder (talker) ONNX filename.
         code_predictor_filename: Inner decoder ONNX filename.
         pre_embedder_filename: ``talker_step_embedder`` ONNX filename.
+        prefill_embedder_filename: ``talker_prefill_embedder`` ONNX filename, or
+            ``None`` to omit the prefill/trailing-text path.
         tokenizer_filename: Tokenizer filename used by the talker.
         decoder_metadata: Optional output from
             :func:`decoder_metadata_from_config`; its decoder capabilities are
@@ -690,59 +699,75 @@ def build_tts_pipeline_metadata(
     if max_frames < 1:
         raise ValueError("max_frames must be at least 1")
 
+    models: dict[str, Any] = {
+        "talker": {
+            "filename": talker_filename,
+            "type": "decoder",
+            "tokenizer": tokenizer_filename,
+        },
+        "talker_step_embedder": {
+            "filename": pre_embedder_filename,
+            "type": "embedding",
+        },
+        "code_predictor": {
+            "filename": code_predictor_filename,
+            "type": "decoder",
+        },
+    }
+    dataflow: list[dict[str, Any]] = [
+        {
+            "from": "talker_step_embedder.inputs_embeds",
+            "to": "talker.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+        {
+            "from": "talker.last_hidden_state",
+            "to": "code_predictor.inputs_embeds",
+            "dtype": "fp32",
+            "device_transfer": False,
+        },
+    ]
+    stage_strategy: dict[str, Any] = {
+        "kind": "nested_autoregressive",
+        "outer": "talker",
+        "inner": "code_predictor",
+        "pre_embedder": "talker_step_embedder",
+        "num_code_groups": num_code_groups,
+        "max_tokens": max_frames,
+    }
+    phases: dict[str, Any] = {
+        "talker": {"run_on": "every_step"},
+        "talker_step_embedder": {"run_on": "on_demand"},
+        "code_predictor": {"run_on": "every_step"},
+    }
+
+    if prefill_embedder_filename is not None:
+        models["talker_prefill_embedder"] = {
+            "filename": prefill_embedder_filename,
+            "type": "embedding",
+        }
+        # Runs once in the prompt phase; the runtime auto-seeds its `text_ids`
+        # with the tokenized prompt and reads prefill_embeds/trailing_text_embeds
+        # from the pool (resolved by name — no dataflow edges needed).
+        stage_strategy["prefill_embedder"] = "talker_prefill_embedder"
+        phases["talker_prefill_embedder"] = {"run_on": "prompt_only"}
+
     metadata = dict(decoder_metadata or {})
     metadata["pipeline"] = {
-        "models": {
-            "talker": {
-                "filename": talker_filename,
-                "type": "decoder",
-                "tokenizer": tokenizer_filename,
-            },
-            "talker_step_embedder": {
-                "filename": pre_embedder_filename,
-                "type": "embedding",
-            },
-            "code_predictor": {
-                "filename": code_predictor_filename,
-                "type": "decoder",
-            },
-        },
-        "dataflow": [
-            {
-                "from": "talker_step_embedder.inputs_embeds",
-                "to": "talker.inputs_embeds",
-                "dtype": "fp32",
-                "device_transfer": False,
-            },
-            {
-                "from": "talker.last_hidden_state",
-                "to": "code_predictor.inputs_embeds",
-                "dtype": "fp32",
-                "device_transfer": False,
-            },
-        ],
+        "models": models,
+        "dataflow": dataflow,
         "strategy": {
             "kind": "composite",
             "stages": [
                 {
                     "name": "generate_codes",
-                    "strategy": {
-                        "kind": "nested_autoregressive",
-                        "outer": "talker",
-                        "inner": "code_predictor",
-                        "pre_embedder": "talker_step_embedder",
-                        "num_code_groups": num_code_groups,
-                        "max_tokens": max_frames,
-                    },
+                    "strategy": stage_strategy,
                     "run_on": "every_step",
                 },
             ],
         },
-        "phases": {
-            "talker": {"run_on": "every_step"},
-            "talker_step_embedder": {"run_on": "on_demand"},
-            "code_predictor": {"run_on": "every_step"},
-        },
+        "phases": phases,
     }
     return metadata
 

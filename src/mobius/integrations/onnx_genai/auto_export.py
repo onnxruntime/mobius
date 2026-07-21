@@ -268,12 +268,24 @@ def _tts_component_kwargs(pkg: Any, config: Any) -> dict[str, Any]:
         raise ValueError(
             "TTS metadata requires config.tts.num_code_groups (RVQ codes per frame)"
         )
-    return {
+    kwargs: dict[str, Any] = {
         "num_code_groups": num_code_groups,
         "talker_filename": "talker/model.onnx",
         "code_predictor_filename": "code_predictor/model.onnx",
         "pre_embedder_filename": "talker_step_embedder/model.onnx",
     }
+    # Emit the prefill/trailing-text component only when the package carries it;
+    # otherwise the prefill-less shape (talker frame 0 + zero text_embed) is used.
+    try:
+        names = set(pkg.keys())
+    except (AttributeError, TypeError):
+        names = set()
+    kwargs["prefill_embedder_filename"] = (
+        "talker_prefill_embedder/model.onnx"
+        if "talker_prefill_embedder" in names
+        else None
+    )
+    return kwargs
 
 
 def _multimodal_component_kwargs(pkg: Any) -> dict[str, str]:

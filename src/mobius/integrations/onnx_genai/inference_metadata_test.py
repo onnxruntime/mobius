@@ -418,7 +418,9 @@ class TestBuildTTSPipelineMetadata:
     """Pre-embedder-driven multi-decoder TTS (Qwen3-TTS) metadata."""
 
     def test_minimal_nested_autoregressive_with_pre_embedder(self):
-        meta = build_tts_pipeline_metadata(num_code_groups=16, max_frames=1000)
+        meta = build_tts_pipeline_metadata(
+            num_code_groups=16, max_frames=1000, prefill_embedder_filename=None
+        )
         pipe = meta["pipeline"]
         assert set(pipe["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
         assert pipe["models"]["talker"]["type"] == "decoder"
@@ -430,6 +432,7 @@ class TestBuildTTSPipelineMetadata:
         assert stage["outer"] == "talker"
         assert stage["inner"] == "code_predictor"
         assert stage["pre_embedder"] == "talker_step_embedder"
+        assert "prefill_embedder" not in stage
         assert stage["num_code_groups"] == 16
         assert stage["max_tokens"] == 1000
 
@@ -450,6 +453,16 @@ class TestBuildTTSPipelineMetadata:
         assert "vocoder" not in pipe["models"]
         # Pre-embedder is a loop-internal on_demand component.
         assert pipe["phases"]["talker_step_embedder"]["run_on"] == "on_demand"
+
+    def test_with_prefill_embedder(self):
+        # Default emits the prefill/trailing-text component (prompt phase).
+        meta = build_tts_pipeline_metadata(num_code_groups=16)
+        pipe = meta["pipeline"]
+        assert "talker_prefill_embedder" in pipe["models"]
+        assert pipe["models"]["talker_prefill_embedder"]["type"] == "embedding"
+        stage = pipe["strategy"]["stages"][0]["strategy"]
+        assert stage["prefill_embedder"] == "talker_prefill_embedder"
+        assert pipe["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
 
     def test_rejects_invalid_code_groups(self):
         with pytest.raises(ValueError, match="num_code_groups"):

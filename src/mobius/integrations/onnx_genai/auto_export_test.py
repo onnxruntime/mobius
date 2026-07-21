@@ -390,12 +390,16 @@ class _TTSPkg(dict):
 
 def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     # The real Qwen3-TTS shape: talker + code_predictor + talker_step_embedder
-    # emits the pre_embedder-driven nested_autoregressive contract.
+    # (+ talker_prefill_embedder) emits the pre_embedder/prefill-driven
+    # nested_autoregressive contract.
     pkg = _TTSPkg(
         {
             "talker": _FakeModel(["inputs_embeds"], ["logits", "last_hidden_state"]),
             "code_predictor": _FakeModel(["inputs_embeds"], ["logits"]),
             "talker_step_embedder": _FakeModel(["frame_codes"], ["inputs_embeds"]),
+            "talker_prefill_embedder": _FakeModel(
+                ["text_ids"], ["prefill_embeds", "trailing_text_embeds"]
+            ),
             "embedding": _FakeModel(["text_ids"]),
         }
     )
@@ -405,11 +409,18 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
         metadata = yaml.safe_load(handle)
 
     pipeline = metadata["pipeline"]
-    assert set(pipeline["models"]) == {"talker", "talker_step_embedder", "code_predictor"}
+    assert set(pipeline["models"]) == {
+        "talker",
+        "talker_step_embedder",
+        "code_predictor",
+        "talker_prefill_embedder",
+    }
     stage = pipeline["strategy"]["stages"][0]["strategy"]
     assert stage["kind"] == "nested_autoregressive"
     assert stage["pre_embedder"] == "talker_step_embedder"
+    assert stage["prefill_embedder"] == "talker_prefill_embedder"
     assert stage["num_code_groups"] == 16
+    assert pipeline["phases"]["talker_prefill_embedder"]["run_on"] == "prompt_only"
     assert {
         "from": "talker_step_embedder.inputs_embeds",
         "to": "talker.inputs_embeds",
