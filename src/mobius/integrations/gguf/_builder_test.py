@@ -445,3 +445,110 @@ def test_normalize_glm_dsa_split_kv_b_and_router_bias():
     expected = torch.cat((k_proj.transpose(1, 2), v_proj), dim=1).reshape(18, 3)
     assert torch.equal(result["model.layers.0.self_attn.kv_b_proj.weight"], expected)
     assert "model.layers.0.mlp.gate.e_score_correction_bias" in result
+
+
+def test_load_quantized_glm_experts_repacked_individually(monkeypatch):
+    from types import SimpleNamespace
+
+    from gguf import GGMLQuantizationType
+
+    from mobius.integrations.gguf import _repacker, _tencent_q1_0, _tensor_mapping
+    from mobius.integrations.gguf._builder import _load_quantized_state_dict
+
+    repacked_inputs = []
+
+    def _repack(raw, qtype, shape):
+        repacked_inputs.append((raw.copy(), qtype, shape))
+        return SimpleNamespace(
+            weight=np.full((2, 1, 16), len(repacked_inputs), dtype=np.uint8),
+            scales=np.ones((2, 1), dtype=np.float32),
+            zero_points=None,
+        )
+
+    monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: False)
+    monkeypatch.setattr(
+        _tensor_mapping,
+        "map_gguf_to_hf_names",
+        lambda _name, _arch: "model.layers.0.mlp.experts.gate_proj.weight",
+    )
+    monkeypatch.setattr(_repacker, "repack_quant_params", lambda _qtype: (4, 32))
+    monkeypatch.setattr(_repacker, "repack_gguf_tensor", _repack)
+
+    raw = np.arange(8, dtype=np.uint8)
+    model = SimpleNamespace(
+        _tensor_index={"experts": object()},
+        tensor_items_raw=lambda: [("experts", raw, GGMLQuantizationType.Q4_0, (2, 2, 2))],
+    )
+    module = SimpleNamespace(named_modules=list)
+    config = SimpleNamespace(
+        quantization=SimpleNamespace(bits=4, group_size=32, sym=True),
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        model_type="glm_moe_dsa",
+    )
+
+    result = _load_quantized_state_dict(model, "glm-dsa", module, config)
+
+    assert [call[2] for call in repacked_inputs] == [(2, 2), (2, 2)]
+    assert np.array_equal(repacked_inputs[0][0], raw[:4])
+    assert np.array_equal(repacked_inputs[1][0], raw[4:])
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight" in result
+    assert "model.layers.0.mlp.experts.1.gate_proj.weight" in result
+
+
+def test_load_quantized_glm_fuses_split_kv_b(monkeypatch):
+    from types import SimpleNamespace
+
+    from gguf import GGMLQuantizationType
+
+    from mobius.integrations.gguf import _repacker, _tencent_q1_0, _tensor_mapping
+    from mobius.integrations.gguf._builder import _load_quantized_state_dict
+
+    fused_values = []
+
+    def _repack(values, **_kwargs):
+        fused_values.append(values.copy())
+        return SimpleNamespace(
+            weight=np.zeros((18, 1, 16), dtype=np.uint8),
+            scales=np.ones((18, 1), dtype=np.float32),
+            zero_points=np.zeros((18, 1), dtype=np.uint8),
+        )
+
+    names = {
+        "k": "model.layers.0.self_attn.kv_b_proj.k_proj.weight",
+        "v": "model.layers.0.self_attn.kv_b_proj.v_proj.weight",
+    }
+    monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: False)
+    monkeypatch.setattr(
+        _tensor_mapping,
+        "map_gguf_to_hf_names",
+        lambda name, _arch: names[name],
+    )
+    monkeypatch.setattr(_repacker, "repack_dequantized_tensor", _repack)
+
+    k_proj = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+    v_proj = np.arange(2 * 5 * 3, dtype=np.float32).reshape(2, 5, 3)
+    tensors = [
+        ("k", k_proj, GGMLQuantizationType.F32, k_proj.shape),
+        ("v", v_proj, GGMLQuantizationType.F32, v_proj.shape),
+    ]
+    model = SimpleNamespace(
+        _tensor_index={"k": object(), "v": object()},
+        tensor_items_raw=lambda: tensors,
+        dequantize_raw_tensor=lambda raw, _qtype, _shape: raw,
+    )
+    module = SimpleNamespace(named_modules=list)
+    config = SimpleNamespace(
+        quantization=SimpleNamespace(bits=4, group_size=32, sym=False),
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        model_type="glm_moe_dsa",
+    )
+
+    result = _load_quantized_state_dict(model, "glm-dsa", module, config)
+
+    expected = np.concatenate((k_proj.transpose(0, 2, 1), v_proj), axis=1).reshape(18, 3)
+    np.testing.assert_array_equal(fused_values[0], expected)
+    assert "model.layers.0.self_attn.kv_b_proj.weight" in result
+    assert "model.layers.0.self_attn.kv_b_proj.scales" in result
+    assert "model.layers.0.self_attn.kv_b_proj.zero_points" in result
