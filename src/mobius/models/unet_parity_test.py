@@ -10,11 +10,24 @@ by ``tests/integration_test.py`` for the QwenImage VAE. Guarded on diffusers.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+
+@contextlib.contextmanager
+def _onnx_session(model):
+    import onnx_ir
+    import onnxruntime as ort
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_path = str(Path(temp_dir) / "model.onnx")
+        onnx_ir.save(model, model_path)
+        yield ort.InferenceSession(model_path)
 
 
 def _remap_transformer(state_dict: dict) -> dict:
@@ -31,7 +44,6 @@ def _remap_transformer(state_dict: dict) -> dict:
 def test_cross_attention_block_matches_diffusers():
     pytest.importorskip("diffusers")
     import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
@@ -63,17 +75,13 @@ def test_cross_attention_block_matches_diffusers():
     model = _make_model(graph)
     apply_weights(model, _remap_transformer(hf.state_dict()))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    with _onnx_session(model) as session:
         actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
     assert np.abs(actual - expected).max() < 1e-4
 
 
 def test_unet_matches_diffusers():
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
@@ -115,9 +123,7 @@ def test_unet_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    with _onnx_session(model) as session:
         actual = session.run(
             None,
             {
@@ -138,8 +144,6 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     so cross-attention is present only where diffusers places it.
     """
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
@@ -185,9 +189,7 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    with _onnx_session(model) as session:
         actual = session.run(
             None,
             {
@@ -203,8 +205,6 @@ def test_unet_lora_gate_parity():
     """Runtime LoRA parity: gate=0 == diffusers base, gate=1 == diffusers+LoRA."""
     pytest.importorskip("diffusers")
     pytest.importorskip("peft")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
     from diffusers.utils import convert_state_dict_to_diffusers
@@ -271,9 +271,7 @@ def test_unet_lora_gate_parity():
     weights.update(remap_diffusers_unet_lora(lora_state, "test"))
     apply_weights(model, weights)
 
-    with tempfile.NamedTemporaryFile(suffix=".onnx") as handle:
-        onnx_ir.save(model, handle.name)
-        session = ort.InferenceSession(handle.name)
+    with _onnx_session(model) as session:
         feed = {
             "sample": sample.numpy(),
             "timestep": timestep.numpy().astype(np.int64),
